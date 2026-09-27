@@ -1,0 +1,32 @@
+/target/
+/result
+/result-*
+/.direnv/
+/.awtar-checkout.json
+/.agents/plans/evidence/host/
+/.agents/plans/evidence/browser-host/
+/.agents/plans/evidence/native-target/
+/.agents/plans/evidence/native-target-warnings/
+/.agents/plans/evidence/cargo-home*/
+.env
+*.key
+__pycache__/
+*.pyc
+
+# Private device integration and phase packaging
+*.bundle
+*.bundle.sha256
+*.key
+device-grant*.json
+device-link*.json
+receipt-ledger*.json
+
+# Real invitation/directory configs belong outside the source tree.
+team-private*.json
+
+# Reviewable CI evidence exports, not source inputs
+/.agents/plans/evidence/ci-export/
+
+# Browser UI build cache; compiled assets are committed/embedded.
+/web/node_modules/
+/web/.vite/

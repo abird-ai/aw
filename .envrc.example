@@ -1,0 +1,2 @@
+# Rename to .envrc and explicitly `direnv allow` only after reviewing the flake.
+use flake

@@ -1,0 +1,4 @@
+# Ask a real Cargo resolver to prefer transitive dependencies supporting the
+# package's declared Rust baseline. Cargo.lock must still be generated and tested.
+[resolver]
+incompatible-rust-versions = "fallback"

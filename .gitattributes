@@ -1,0 +1,3 @@
+# Vite/Shiki generated bundles contain semantic trailing spaces inside bundled
+# grammar template literals. Source JS/JSX/CSS remains under normal whitespace checks.
+web/dist/*.js -whitespace

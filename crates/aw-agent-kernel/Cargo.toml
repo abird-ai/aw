@@ -1,0 +1,16 @@
+[package]
+name = "aw-agent-kernel"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Portable aw core-only capabilities and alloc turn transitions"
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[lints.rust]
+unsafe_code = "forbid"
