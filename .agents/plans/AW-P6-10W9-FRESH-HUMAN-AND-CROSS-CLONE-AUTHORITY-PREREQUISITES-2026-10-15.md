@@ -1,0 +1,43 @@
+# AW-P6-10W9 — fresh live-human / cross-clone authority prerequisites
+
+**Status:** DESIGN-ONLY, no implementation, no human authentication/connectors provisioned, no production security certification or permission to restore a runnable State. Recorded October 15, 2026 after W8's real immutable non-executing source review. W8 remains locally implemented, but the original cold State remains **doubly quarantined**.
+
+## 1. Scope — deliberately no runnable activation
+
+Preserve exactly four Runtime primitives (**Runtime, Actor, Message, Envelope**) and exactly two Hook verbs (**Next, Defer**). Keep the original ONE Agent, TurnMachine, ToolPolicy, ToolRegistry and immutable TurnJournal. Preserve original Session/branch authority, WriterEpoch, Process and Actor generations, Host Tool SourceKind/ID/epoch/site/effect, provider credential/payer custody and explicit exact grants. SQLite **v33**, JSONL **v1**, aw **0.15.0** stay unchanged until separately authorized real implementation. Phase69 forbidden, indexing/LSP 64/65 skipped, E6 parked. No new executable service, shadow ledger, async resume daemon, queued-effect replay, copied-human consent promotion, or fallback provider settlement.
+
+## 2. Why W8 review is insufficient to transfer authority
+
+Native W8 tests prove two independently restored cold copies can hold **identical Store/Session/Tool/Queue evidence** and can each append one locally immutable owner review REQUEST. Both remain blocked by original filesystem and SQL quarantine guards. A copied U device signature, V dry-run, W8 source-specific SHA256, historical Process ID or prior WriterEpoch can all appear on multiple offline clones; none is a global exclusion or a new live human-origin action. Unknown provider charges, unfinished Tool/OS effects, Queue Claimed/Accepted and Actor admissions must remain unresolved, even after human review requests. No local file lock can certify two remote machines never execute the same old paid effect.
+
+## 3. Mandatory independent initiating-human proof
+
+A future transition MUST use a fresh, single-use challenge issued by a trusted **independent** authorization origin rather than reconstructed from the copied Store. It must include the globally unique source Store ID, original/target restoration generation, exact completed archive/manifest digest, reviewed immutable per-effect evidence digest, proposed target Host public key/source site, proposed fresh Session/WriterEpoch/Actor/Process scope, coordinator monotonic fencing term, nonce and short expiry.
+
+The initiating human's presence MUST be independently established by an approved human-presence authenticator (for example a suitably verified WebAuthn/FIDO2 ceremony with user-presence AND user-verification flags plus correct trusted origin and registered credential binding), with independently revoked users/domains rejected. A copied Ed25519 signature/hashed consent receipt, local UNIX username, model text, Tool action, remote display name or prior device-key public key is **not** sufficient. No personal credentials/private FIDO keys are to be copied into aw, transcript, model memory, backup or audit. Failure to verify live human presence means **No Authority**. This is an architectural requirement, not a claim WebAuthn is currently connected.
+
+## 4. Mandatory globally exclusive cross-clone coordination
+
+Before any runnable first-open, use an independent trusted coordinator capable of a durable single-winner **compare-and-swap** against the pair (original Store ID, source archive digest). A leader's monotonically increasing fencing term and one-time activation nonce must exclude every other clone, including a clone on another computer. Proof must be linearizable across the recognized replication/quorum domain; ensure durable commit/fence survives coordinator and participant process crashes, failure to fsync, restart, lease expiry, stale epochs and replayed signed requests. A partition or unreachable coordinator **must deny** activation and outbound effects; a local TTL/lock alone is not a global fence.
+
+Do not mint fresh WriterEpoch, Actor generation, Process incarnation or SourceGrant until the independent coordinator attests the chosen target and either proves the old owner fenced or otherwise establishes that the original cannot perform an overlapping externally visible effect. A higher coordinator fencing term is not permission to re-use old Tool/provider attempts. Every new effect goes through the one original ToolPolicy/TurnJournal with a **new, uniquely linked original-human proposal**, not historical Queue claims.
+
+## 5. Mandatory external-effect and payer verification
+
+Provider attempts whose outcome is unknown may have billed. A separate current provider-owned invoice/usage receipt or explicitly verified human accounting disposition must identify the original payer/account/credential scope and original provider attempt; missing evidence remains **possibly charged, unresolved**, not free. Reconcile every unfinished Tool/OS effect with source-grounded host/Process/site records; when real external effects cannot be verified, mark them only as unresolved/abandoned for a **fresh future proposal**, not as successfully executed/rollback-safe. Original Queue Pending, Claimed and Accepted must NEVER auto-dispatch after restore. No prior Actor control or Tool grant automatically survives. Keep original immutable original v33 receipts/metadata in a non-runnable archive, never delete/overwrite to shorten review.
+
+## 6. First-open no-replay protocol and design gates
+
+Only after the ABOVE proofs succeed may an independently approved *new phase* consider a crash-safe transition, under original Store/Session/branch/WriterEpoch CAS and OS/fsync guarantees. Prepare an inert target and a durable external coordinator pending record; atomically install a new authority fence and final fresh-owner Store/Process generation; prove a process exit at each critical rename/SQL/coordination boundary leaves either a non-runnable cold State or exactly one new authority winner, never two. Rehydrate only safe historical *display/state*; all old work remains stopped. New Queue/Tool/provider/OS effects require new original-human proposals, new intent IDs, new exact Tool grants, the current payer's credentials and the original durable journal handshake. First-open tests must confirm ZERO old provider calls, ZERO old Tool/OS execution, ZERO historical Queue claims, ZERO unsolicited Actor admissions and no duplicate charge after arbitrary crash and reconnect.
+
+Any uncertain local/remote/coordinator outcome is UNKNOWN, fail closed; caller must inspect the coordinator/source-of-truth rather than retry the side effect. Do not design the coordinator as a hidden universal runtime service or copy an alternate Agent; expose only a typed leased authority boundary consumed by the ORIGINAL Runtime/Actor/Envelope services.
+
+## 7. User-visible progressive disclosure (future UX owner work)
+
+The user should see one simple, factual status progression: **Quarantined → Original effects need inspection → Original-owner review requested → Independent human/coordinator evidence missing → Eligible for a new proposal review**. There is NO **Ready to Resume** or Activate button until all independently witnessed conditions are actually true. User prompts remain muted blue; successful new Tool results muted green; failed/denied Tool results muted red; UNKNOWN outcomes remain neutral/attention, never green. Keep this UI design entirely separate from the other agent's `.agents/plans/ux/` ownership and additive v1.5 Herdr/Pi design.
+
+## 8. Required certification, not yet performed
+
+Before any activation authorization, provide: real independent human-presence integration and key lifecycle/revocation tests; actual two-host or distributed coordinator single-winner tests (including adversarial partitions, competing devices, cancelled/quorum-failed grants, rollback/counter-replay, crash-before-and-after durable coordinator CAS); real read-only payer invoice/reconciliation evidence where applicable; original Store and OS filesystem race/property tests; native Linux/macOS/Windows parity and original E3–E5 portability evidence, separate E6 firmware only when explicitly authorized. Red-team tests must attempt to use copies of U consent, V dry-run, W8 review receipts or missing quarantine markers as bearer grants and prove they fail.
+
+**Until those are independently provided, this protocol is intentionally BLOCKED**, while W8 original-source review requests are the safe available functionality. This is a design prerequisite, NOT a claim to have solved global uniqueness or verified a live human in the local connector.
