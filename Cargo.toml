@@ -4,6 +4,7 @@ members = [
     "crates/aw-agent-kernel",
     "crates/aw-routing",
     "crates/aw-pipeline",
+    "examples/process-extension-rust",
 ]
 
 [workspace.dependencies]

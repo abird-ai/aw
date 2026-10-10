@@ -1,0 +1,14 @@
+[package]
+name = "aw-process-extension-rust-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Independent versioned JSONL tool/hook extension example"
+
+[dependencies]
+serde_json = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
