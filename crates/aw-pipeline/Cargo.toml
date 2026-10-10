@@ -1,0 +1,17 @@
+[package]
+name = "aw-pipeline"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Bounded transport-neutral pipeline definitions and deterministic step kernel for aw"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "=0.10.9"
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

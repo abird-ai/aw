@@ -7,6 +7,16 @@ name = "aw-agent-kernel"
 version = "0.15.0"
 
 [[package]]
+name = "aw-pipeline"
+version = "0.15.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "aw-routing"
 version = "0.15.0"
 dependencies = [

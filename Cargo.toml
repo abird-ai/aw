@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aw-agent-kernel",
     "crates/aw-routing",
+    "crates/aw-pipeline",
 ]
 
 [workspace.dependencies]
