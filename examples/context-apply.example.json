@@ -1,0 +1,17 @@
+{
+  "op": "apply",
+  "request": {
+    "artifact_id": "REPLACE_ARTIFACT_ID",
+    "target": {
+      "session_id": "REPLACE_TARGET_SESSION",
+      "branch_id": "REPLACE_TARGET_BRANCH",
+      "head": "REPLACE_HEAD_NODE",
+      "revision": 0
+    },
+    "mode": {
+      "kind": "append"
+    },
+    "request_id": "attach-reviewed-unique-id",
+    "confirmed_disclosure": true
+  }
+}

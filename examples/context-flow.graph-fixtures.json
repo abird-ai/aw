@@ -1,0 +1,366 @@
+{
+  "status": "independent_design_fixture_not_accepted_aw_config",
+  "purpose": "Qualified node identity, LCA selection and explicit ordered evidence union only. No production authorization or model invocation.",
+  "graphs": {
+    "s1": {
+      "r": {
+        "parent": null,
+        "content": false
+      },
+      "p": {
+        "parent": "r",
+        "content": true
+      },
+      "a": {
+        "parent": "p",
+        "content": true
+      },
+      "a2": {
+        "parent": "a",
+        "content": true
+      },
+      "b": {
+        "parent": "p",
+        "content": true
+      },
+      "b2": {
+        "parent": "b",
+        "content": true
+      },
+      "i": {
+        "parent": "p",
+        "content": true
+      },
+      "i2": {
+        "parent": "i",
+        "content": true
+      }
+    },
+    "s2": {
+      "r": {
+        "parent": null,
+        "content": false
+      },
+      "p": {
+        "parent": "r",
+        "content": true
+      },
+      "a": {
+        "parent": "p",
+        "content": true
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "sibling carryover",
+      "target": {
+        "session": "s1",
+        "head": "i2"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "a"
+        ],
+        [
+          "s1",
+          "a2"
+        ]
+      ]
+    },
+    {
+      "name": "earlier fork",
+      "target": {
+        "session": "s1",
+        "head": "p"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "a"
+        ],
+        [
+          "s1",
+          "a2"
+        ]
+      ]
+    },
+    {
+      "name": "same head",
+      "target": {
+        "session": "s1",
+        "head": "a2"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "delta"
+        }
+      ],
+      "expected": []
+    },
+    {
+      "name": "source already in target ancestry",
+      "target": {
+        "session": "s1",
+        "head": "a2"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a",
+          "scope": "delta"
+        }
+      ],
+      "expected": []
+    },
+    {
+      "name": "two sources common prefix once",
+      "target": {
+        "session": "s1",
+        "head": "r"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "delta"
+        },
+        {
+          "session": "s1",
+          "head": "b2",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "p"
+        ],
+        [
+          "s1",
+          "a"
+        ],
+        [
+          "s1",
+          "a2"
+        ],
+        [
+          "s1",
+          "b"
+        ],
+        [
+          "s1",
+          "b2"
+        ]
+      ]
+    },
+    {
+      "name": "overlapping source ranges",
+      "target": {
+        "session": "s1",
+        "head": "i2"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "delta"
+        },
+        {
+          "session": "s1",
+          "head": "a",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "a"
+        ],
+        [
+          "s1",
+          "a2"
+        ]
+      ]
+    },
+    {
+      "name": "independent session same local ids distinct",
+      "target": {
+        "session": "s1",
+        "head": "a2"
+      },
+      "sources": [
+        {
+          "session": "s2",
+          "head": "a",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s2",
+          "p"
+        ],
+        [
+          "s2",
+          "a"
+        ]
+      ]
+    },
+    {
+      "name": "standalone can include shared background",
+      "target": {
+        "session": "s1",
+        "head": "i2"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "standalone"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "p"
+        ],
+        [
+          "s1",
+          "a"
+        ],
+        [
+          "s1",
+          "a2"
+        ]
+      ]
+    },
+    {
+      "name": "explicit one node range",
+      "target": null,
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "range",
+          "after": "a"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "a2"
+        ]
+      ]
+    },
+    {
+      "name": "new session no invented common ancestor",
+      "target": null,
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a2",
+          "scope": "delta"
+        },
+        {
+          "session": "s1",
+          "head": "b2",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "p"
+        ],
+        [
+          "s1",
+          "a"
+        ],
+        [
+          "s1",
+          "a2"
+        ],
+        [
+          "s1",
+          "b"
+        ],
+        [
+          "s1",
+          "b2"
+        ]
+      ]
+    },
+    {
+      "name": "two independent sessions do not deduplicate by text",
+      "target": null,
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a",
+          "scope": "delta"
+        },
+        {
+          "session": "s2",
+          "head": "a",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "p"
+        ],
+        [
+          "s1",
+          "a"
+        ],
+        [
+          "s2",
+          "p"
+        ],
+        [
+          "s2",
+          "a"
+        ]
+      ]
+    },
+    {
+      "name": "later committed endpoint is explicit",
+      "target": {
+        "session": "s1",
+        "head": "p"
+      },
+      "sources": [
+        {
+          "session": "s1",
+          "head": "a",
+          "scope": "delta"
+        }
+      ],
+      "expected": [
+        [
+          "s1",
+          "a"
+        ]
+      ]
+    }
+  ]
+}

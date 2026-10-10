@@ -1,0 +1,15 @@
+# Explicit owner-held common account. This is NOT a personal-user key upload.
+# Copy/edit alongside a private team config, outside the source repository.
+[profiles.team-local]
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "YOUR_INSTALLED_MODEL"
+
+# Optional server-funded account. Listing here alone grants no participant use.
+# Add its opaque profile name to selected participants' shared_profiles explicitly.
+[profiles.team-api]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+model = "YOUR_SUPPORTED_API_MODEL"
+api_key_env = "AW_TEAM_API_KEY"
+include_usage = true

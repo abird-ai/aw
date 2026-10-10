@@ -1,0 +1,38 @@
+# Copy to ~/.config/aw/config.toml (or use --config explicitly).
+# No keys or passwords here: only environment-variable names.
+default_profile = "ollama"
+
+[profiles.ollama]
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+# model = "your-installed-model"
+# think = false  # only if the loaded model supports this option
+# max_tokens = 2048
+
+[profiles.llama]
+kind = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+# model = "the-alias-configured-in-your-llama-server"
+token_field = "max_tokens"
+
+[profiles.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+# model = "a-chat-completions-model-your-API-account-can-use"
+token_field = "max_completion_tokens"
+
+# Arbitrary compatible endpoint: explicit destination, protocol and account.
+# A local-server URL is not proof the server itself runs inference locally.
+[profiles.private-server]
+kind = "openai"
+base_url = "https://llm.example.internal/v1"
+api_key_env = "PRIVATE_LLM_KEY"
+# ca_file = "internal-ca.pem"
+# model = "your-model-alias"
+
+
+# Presentation follows the surrounding terminal/browser theme by default.
+# Use "light" or "dark" for an explicit aw-owned palette.
+[ui]
+theme = "system"

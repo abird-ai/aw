@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "root": {
+    "type": "split",
+    "axis": "columns",
+    "ratio": 2400,
+    "first": {
+      "type": "pane",
+      "id": 1
+    },
+    "second": {
+      "type": "pane",
+      "id": 2
+    }
+  },
+  "panes": {
+    "1": {
+      "type": "navigator",
+      "kind": "sessions"
+    },
+    "2": {
+      "type": "group",
+      "tabs": [
+        3,
+        4
+      ],
+      "active": 3
+    }
+  },
+  "tabs": {
+    "3": {
+      "id": 3,
+      "target": {
+        "kind": "conversation"
+      },
+      "pinned": true
+    },
+    "4": {
+      "id": 4,
+      "target": {
+        "kind": "activity"
+      },
+      "pinned": true
+    }
+  },
+  "focused": 2,
+  "next_id": 5
+}

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "socket": "/ABSOLUTE/PRIVATE/device.sock",
+  "key_file": "/ABSOLUTE/PRIVATE/pair.key",
+  "account_id": "personal-laptop",
+  "executor_id": "my-laptop",
+  "model": "YOUR_INSTALLED_MODEL",
+  "grant_id": "grant-unique-01"
+}

@@ -1,0 +1,28 @@
+{
+  "op": "prepare",
+  "request": {
+    "target": {
+      "session_id": "REPLACE_TARGET_SESSION",
+      "branch_id": "REPLACE_TARGET_BRANCH",
+      "head": "REPLACE_HEAD_NODE",
+      "revision": 0
+    },
+    "sources": [
+      {
+        "session_id": "REPLACE_SOURCE_SESSION",
+        "branch": "REPLACE_SOURCE_BRANCH",
+        "head": null,
+        "selection": {
+          "kind": "standalone"
+        }
+      }
+    ],
+    "kind": {
+      "kind": "import"
+    },
+    "focus": "Source-qualified decisions, tests, conflicts and next steps.",
+    "max_input_bytes": 131072,
+    "max_output_bytes": 16384,
+    "timeout_seconds": 120
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "realm": "engineering",
+  "directory": "/ABSOLUTE/checkout",
+  "state_dir": "/ABSOLUTE/PRIVATE/team-state",
+  "timeout_seconds": 120,
+  "participants": [
+    {
+      "id": "alice",
+      "display_name": "Alice",
+      "shared_profiles": ["team-local"],
+      "device_links": [],
+      "default_account": "team-local",
+      "default_model": "YOUR_INSTALLED_MODEL"
+    },
+    {
+      "id": "bob",
+      "display_name": "Bob",
+      "shared_profiles": ["team-local"],
+      "device_links": [],
+      "default_account": "team-local",
+      "default_model": "YOUR_INSTALLED_MODEL"
+    }
+  ]
+}

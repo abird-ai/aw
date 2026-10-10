@@ -1,0 +1,20 @@
+{
+  "op": "prepare",
+  "request": {
+    "target": {
+      "session_id": "REPLACE_TARGET_SESSION",
+      "branch_id": "REPLACE_TARGET_BRANCH",
+      "head": "REPLACE_HEAD_NODE",
+      "revision": 0
+    },
+    "sources": [],
+    "kind": {
+      "kind": "compact",
+      "keep_recent_turns": 2
+    },
+    "focus": "Preserve decisions, constraints and outstanding work.",
+    "max_input_bytes": 131072,
+    "max_output_bytes": 16384,
+    "timeout_seconds": 120
+  }
+}

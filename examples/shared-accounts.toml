@@ -1,0 +1,14 @@
+# Replace placeholders with actual accessible models. No real keys in this file.
+# Used by aw web --config examples/shared-accounts.toml --profile local-owner --shared-profile team-account
+[profiles.local-owner]
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "YOUR_INSTALLED_MODEL"
+
+[profiles.team-account]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+model = "YOUR_SUPPORTED_API_MODEL"
+api_key_env = "TEAM_OPENAI_API_KEY"
+include_usage = true
+# This env name is resolved on the web OWNER. It is not fetched from a remote browser.

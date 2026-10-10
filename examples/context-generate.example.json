@@ -1,0 +1,8 @@
+{
+  "op": "generate",
+  "plan_id": "REPLACE_PLAN_ID",
+  "request_id": "summary-review-unique-id",
+  "account_id": "REPLACE_OWN_ALLOWED_ACCOUNT",
+  "model": "REPLACE_ALLOWED_MODEL",
+  "confirmed_disclosure": true
+}
