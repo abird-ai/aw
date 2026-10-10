@@ -6,6 +6,7 @@ members = [
     "crates/aw-pipeline",
     "examples/process-extension-rust",
     "crates/aw-editor",
+    "crates/aw-ui-extension",
 ]
 
 [workspace.dependencies]

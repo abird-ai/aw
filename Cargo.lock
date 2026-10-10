@@ -43,6 +43,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-ui-extension"
+version = "0.15.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

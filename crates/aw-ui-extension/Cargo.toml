@@ -1,0 +1,15 @@
+[package]
+name = "aw-ui-extension"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Transport-neutral UI extension protocol and compiled-in registry for aw"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
