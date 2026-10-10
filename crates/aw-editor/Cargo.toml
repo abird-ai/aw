@@ -1,0 +1,16 @@
+[package]
+name = "aw-editor"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Bounded grapheme-aware text editor primitive shared by aw TUIs"
+
+[dependencies]
+thiserror = { workspace = true }
+unicode-segmentation = "=1.12.0"
+unicode-width = "=0.2.1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
