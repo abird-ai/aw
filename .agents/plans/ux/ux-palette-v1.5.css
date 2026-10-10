@@ -1,0 +1,83 @@
+/* V1.5 unified command palette: mirror existing aw ratatui palette structure.
+   One modal (not a second quick switch); all operations remain mock-only. */
+.ux-frame[data-version="v1.5"] .v15-palette-layer{
+ position:absolute;inset:0;z-index:40;display:grid;place-items:center;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-backdrop{
+ position:absolute;inset:0;width:100%;height:100%;
+ background:rgba(7,8,14,.59)!important;cursor:default;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-dialog{
+ position:relative;z-index:1;display:flex;flex-direction:column;overflow:hidden;
+ width:min(730px,calc(100% - 26px));
+ max-height:min(480px,calc(100% - 32px));
+ background:var(--panel);border:1px solid var(--line);
+ border-radius:5px;box-shadow:0 15px 40px rgba(0,0,0,.35);
+ font-size:11.5px;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-header{
+ display:flex;align-items:center;justify-content:space-between;gap:8px;
+ padding:10px 12px 8px;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-search{
+ display:flex;align-items:center;gap:8px;margin:0 11px 9px;
+ padding:8px 10px;border:1px solid var(--line);background:var(--bg);
+}
+.ux-frame[data-version="v1.5"] .v15-palette-search input{
+ border:0;outline:0;min-width:0;flex:1;background:transparent;
+ color:var(--text);font:inherit;font-size:12px;letter-spacing:0;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-search input::placeholder{
+ color:var(--faint);font-size:10.5px;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-categories{
+ display:flex;align-items:center;flex-wrap:wrap;column-gap:8px;row-gap:5px;
+ padding:0 11px 10px;border-bottom:1px solid var(--line);
+}
+.ux-frame[data-version="v1.5"] .v15-palette-category{
+ font-size:10.5px!important;white-space:nowrap;color:var(--muted)!important;
+ padding:2px 2px!important;border-bottom:1px solid transparent!important;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-category.selected{
+ color:var(--text)!important;border-bottom-color:var(--purple)!important;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-cat-separator{
+ color:var(--faint);font-size:10px;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-results{
+ overflow:auto;min-height:70px;max-height:305px;padding:6px;
+ scrollbar-color:var(--faint) transparent;scrollbar-width:thin;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-result{
+ padding:8px 9px!important;display:flex!important;gap:12px;
+ align-items:flex-start;width:100%;text-align:left!important;border-radius:2px;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-result.selected{
+ background:var(--select)!important;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-row-kind{
+ flex:0 0 78px;width:78px;font-weight:700;font-size:10.5px;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-row-body{
+ flex:1;min-width:0;display:flex;flex-wrap:wrap;gap:2px 8px;align-items:baseline;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-row-label{
+ color:var(--text);font-weight:650;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-row-description{
+ color:var(--faint);font-size:10.4px;
+}
+.ux-frame[data-version="v1.5"] .v15-palette-empty{
+ padding:25px 12px;color:var(--muted);
+}
+.ux-frame[data-version="v1.5"] .v15-palette-footer{
+ display:flex;justify-content:space-between;align-items:center;gap:8px;
+ border-top:1px solid var(--line);padding:8px 12px;font-size:10px;
+ color:var(--muted);
+}
+@media(max-width:660px){
+ .ux-frame[data-version="v1.5"] .v15-palette-dialog{width:calc(100% - 14px);}
+ .ux-frame[data-version="v1.5"] .v15-palette-row-kind{flex-basis:58px;width:58px;}
+ .ux-frame[data-version="v1.5"] .v15-palette-cat-separator{display:none;}
+ .ux-frame[data-version="v1.5"] .v15-palette-categories{gap:4px 9px;}
+}

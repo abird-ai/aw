@@ -1,0 +1,40 @@
+ aw / abird ▾ / aw ◆ main                                                                               ● x2 ● a1 ▾
+ recents          # [~]   │ [Review] [Agent] [Files] [Git] [▤ tool.rs ×] [+]
+                          │ ┌──────────────────────────────────────────────────────────────────────────────────────❐──┐
+  ▤ Review                │ │                                                                                         │
+  ◉ coordinator           │ │ aw/main · pvl-x2 · read-only                                                            │
+  * dotlink               │ │                                                                                         │
+  # tests · a1            │ │                                                                                         │
+  # tool.rs               │ │  71  pub fn authorize(tool: Tool) {                                                     │
+                          │ │  72    let source = tool.source;                                                        │
+                          │ │  73    let effect = tool.effect;                                                        │
+         ┌─Command Palette───────────────────────────────────────────────────────────────────────────────────┐        │
+         │                                                                                                   │        │
+         │  › @tool                                                                                          │        │
+         │                                                                                                   │        │
+         │ > Actions  ·  ! Windows  ·  @ Files  ·  # Sessions  ·  $ Terminals                                │        │
+         │ / Commands  ·  & Agents                                                                           │        │
+         │───────────────────────────────────────────────────────────────────────────────────────────────────│        │
+         │ Files        tool.rs                 File · aw-agent-core/src · x2                                │        │
+         │ Files        tool.rs · Diff          Unstaged · aw/main · x2                                      │        │
+         │                                                                                                   │        │
+         │                                                                                                   │        │
+         │                                                                                                   │        │
+         │                                                                                                   │        │
+─────────│                                                                                                   │        │
+ files M4│                                                                                                   │        │
+         │                                                                                                   │        │
+  aw/main│───────────────────────────────────────────────────────────────────────────────────────────────────│        │
+  v crate│ ↑ ↓ select  ·  Enter open  ·  Esc close                                                           │        │
+    v aw-└───────────────────────────────────────────────────────────────────────────────────────────────────┘        │
+      v src               │ │                                                                                         │
+        M tool.rs         │ │                                                                                         │
+        M hooks.rs        │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ └─────────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+ abird / aw ◆ main M 4                                                                 ●● 3 working ◐ 1 attention

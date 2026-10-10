@@ -1,0 +1,24 @@
+ aw / abird v / aw * main                                       o x2 o a1 v
+
+   context 4 files . 3 skills . 8 granted tools
+
+
+   > Review the runtime authorization changes.
+
+
+   I'll inspect exact source/epoch grants and run the relevant tests.
+
+
+   v read . tool.rs
+   v tests . 47 passed
+
+
+   The remaining concern is revocation while a child waits for approval.
+
+
+
+   --------------------------------------------------------------------------
+   > Ask anything ...
+
+
+ abird / aw * main M 4                         o 3 working o 1 attention

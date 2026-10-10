@@ -1,0 +1,40 @@
+ aw / abird v / aw * main                                                                               o x2 o a1 v
+ projects        [#] [~]  | [Review] [Agent] [Git] [Files] [Build] [+]
+                          | Review . aw * main . pvl-x2
+  v aw          M 4       | +-o coordinator . Agent . x2--------------------++-Diff . tool.rs-------------------------+
+    * main . x2           | |                                               ||                                        |
+    * feat/hooks . a1     | | context 4 files . 3 skills . 8 granted tools  || @@ -72,4 +72,8 @@                      |
+  > dotlink               | |                                               || fn authorize(tool) {                   |
+  > abird-health          | |  Review the runtime authorization changes.    || - allow_by_name(tool);                 |
+                          | |                                               || + envelope.check(                      |
+                          | |                                               || +   source, effect,                    |
+                          | |                                               || +   actor, site)?;                     |
+                          | | The exact grant path was inspected, and       ||   dispatch(tool)                       |
+                          | | model-visible tools are source-bound.         || }                                      |
+                          | |                                               ||                                        |
+                          | |                                               ||                                        |
+                          | |  v tests . 47 passed                          ||                                        |
+                          | |                                               ||                                        |
+                          | |                                               ||                                        |
+                          | |  o hooks lead . approval requested            ||                                        |
+                          | |                                               ||                                        |
+                          | |                                               ||                                        |
+                          | |                                               ||                                        |
+                          | |                                               ||                                        |
+--------------------------| |                                               ||                                        |
+ files M4       o  [+] [#]| |                                               ||                                        |
+                          | | --------------------------------------------- ||                                        |
+  aw/main . x2            | | > Ask anything ...                            ||                                        |
+  v crates                | |                                               ||                                        |
+    v aw-agent-core       | +-----------------------------------------------++----------------------------------------+
+      v src               | +-tests . pvl-a1---------------------------------------------------------------viewer-----+
+        M tool.rs         | |                                                                                         |
+        M hooks.rs        | | $ cargo test --locked -p aw-agent-core                                                  |
+                          | | v 47 passed . 0 failed                                                                  |
+                          | |                                                                                         |
+                          | | $ |                                                                                     |
+                          | |                                                                                         |
+                          | |                                                                                         |
+                          | +-----------------------------------------------------------------------------------------+
+                          |
+ abird / aw * main M 4                                                                 o 3 working o 1 attention

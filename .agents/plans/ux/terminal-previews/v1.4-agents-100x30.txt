@@ -1,0 +1,30 @@
+ aw / abird ▾ / aw ◆ main                                                           ● x2 ● a1 ▾
+ recents          # [~]   │
+                          │   context 4 files · 3 skills · 8 granted tools
+  ▤ Review                │
+  ◉ coordinator           │
+  * dotlink               │   › Review the runtime authorization changes.
+  # tests · a1            │
+  # tool.rs               │
+                          │   I'll inspect exact source/epoch grants and run the relevant tests.
+                          │
+                          │
+                          │   ✓ read · tool.rs
+                          │   ✓ tests · 47 passed
+                          │
+                          │
+                          │   ● runtime lead · working
+                          │   +-- v tests complete
+──────────────────────────│
+ activity o1   [o] [+] [#]│   ◐ hooks lead · awaiting review
+                          │
+  ▾ Recents         3     │
+    # Review              │
+    @ coordinator         │
+    * dotlink             │
+  ▸ Now             3     │
+  ▸ Automations      2    │   ───────────────────────────────────────────────────────────────────
+                          │   › Ask anything ...
+                          │
+                          │
+ abird / aw ◆ main M 4                                             ● 3 working ◐ 1 attention

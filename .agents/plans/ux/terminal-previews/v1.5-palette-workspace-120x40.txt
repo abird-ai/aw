@@ -1,0 +1,40 @@
+ aw / abird ▾ / aw ◆ main                                                                               ● x2 ● a1 ▾
+ projects        [#] [~]  │ [Review] [Agent] [Files] [Git] [Build] [+]
+                          │ ┌─● coordinator · native Agent · aw/main──────❐──┐┌─Diff · tool.rs ↗ ⛶─────────────────❐──┐
+  ▾ aw          M 4       │ │                                                ││                                       │
+    ◆ main · x2           │ │ context · tools 8 · 2 children                 ││ unstaged · aw/main · pvl-x2           │
+    ◆ feat/hooks · a1     │ │                                                ││                                       │
+  ▸ dotlink               │ │  Review the authorization boundaries.          ││                                       │
+  ▸ abird-health          │ │                                                ││ @@ -72,4 +72,8 @@                     │
+                          │ │                                                ││ fn authorize(..) {                    │
+                          │ │ The current provider and Actor Envelope must   ││ - allow_by_name(tool)?;               │
+         ┌─Command Palette───────────────────────────────────────────────────────────────────────────────────┐        │
+         │                                                                                                   │        │
+         │  › Search actions, windows, files, sessions, terminals, commands, agents                          │        │
+         │                                                                                                   │        │
+         │ > Actions  ·  ! Windows  ·  @ Files  ·  # Sessions  ·  $ Terminals                                │        │
+         │ / Commands  ·  & Agents                                                                           │        │
+         │───────────────────────────────────────────────────────────────────────────────────────────────────│        │
+         │ Actions      New workspace tab       visual layout only                                           │        │
+         │ Windows      Review                  saved Workspace layout                                       │        │
+         │ Files        tool.rs                 File · aw-agent-core/src · x2                                │        │
+         │ Sessions     aw/main                 durable conversation                                         │ng or r │
+         │ Terminals    tests                   PTY · a1 · viewer                                            │        │
+         │ Commands     /think                  Agent slash command                                          │        │
+─────────│ Agents       runtime lead            working · child · x2                                         │        │
+ activity│                                                                                                   │        │
+         │                                                                                                   │        │
+  ▾ Recen│───────────────────────────────────────────────────────────────────────────────────────────────────│        │
+    # Rev│ ↑ ↓ select  ·  Enter open  ·  Esc close                                                           │        │
+    @ coo└───────────────────────────────────────────────────────────────────────────────────────────────────┘────────┘
+    * dotlink             │ ┌─● tests · real PTY · pvl-a1──────────────────────────────────────────────────────────❐──┐
+  ▸ Now             3     │ │                                                                                         │
+  ▸ Automations      2    │ │                                                                                         │
+                          │ │ $ cargo test --locked -p aw-agent-core                                                  │
+                          │ │ ✓ 47 passed · 0 failed                                                                  │
+                          │ │                                                                                         │
+                          │ │ $ ▍                                                                                     │
+                          │ │                                                                                         │
+                          │ └─────────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+ abird / aw ◆ main M 4        viewer (read only) · resize requires actual PTY owner    ●● 3 working ◐ 1 attention

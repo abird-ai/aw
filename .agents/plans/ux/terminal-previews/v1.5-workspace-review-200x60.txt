@@ -1,0 +1,60 @@
+ aw / abird ▾ / aw ◆ main                                                                                                                                                               ● x2 ● a1 ▾
+ projects                [#] [~]  │ [Review] [Agent] [Files] [Git] [Build] [+]
+                                  │ ┌─● coordinator · native Agent · aw/main─────────────────────────────────────────────❐──┐┌─Diff · tool.rs ↗ ⛶──────────────────────────────────────────────────❐──┐
+  ▾ aw          M 4               │ │                                                                                       ││                                                                        │
+    ◆ main · x2                   │ │ context · tools 8 · 2 children                                                        ││ unstaged · aw/main · pvl-x2                                            │
+    ◆ feat/hooks · a1             │ │                                                                                       ││                                                                        │
+  ▸ dotlink                       │ │  Review the authorization boundaries.                                                 ││                                                                        │
+  ▸ abird-health                  │ │                                                                                       ││ @@ -72,4 +72,8 @@                                                      │
+                                  │ │                                                                                       ││ fn authorize(..) {                                                     │
+                                  │ │ The current provider and Actor Envelope must both authorize the selected tool.        ││ - allow_by_name(tool)?;                                                │
+                                  │ │                                                                                       ││ + envelope.check(                                                      │
+                                  │ │                                                                                       ││ +   source, effect,                                                    │
+                                  │ │                                                                                       ││ +   actor, site)?;                                                     │
+                                  │ │  ✓ tests · 47 passed                                                                  ││   dispatch(..)                                                         │
+                                  │ │                                                                                       ││ }                                                                      │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │ ├─ ● runtime · working                                                                ││                                                                        │
+                                  │ │ └─ ◐ hooks · awaiting approval                                                        ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││ Read-only until explicit staging or revert.                            │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+──────────────────────────────────│ │                                                                                       ││                                                                        │
+ activity o1           [o] [+] [#]│ │                                                                                       ││                                                                        │
+                                  │ │                                                                                       ││                                                                        │
+  ▾ Recents         3             │ │                                                                                       ││                                                                        │
+    # Review                      │ │                                                                                       ││                                                                        │
+    @ coordinator                 │ │ ───────────────────────────────────────────────────────────────────────────────────── ││                                                                        │
+    * dotlink                     │ │ ❯ Message coordinator…                                                                ││                                                                        │
+  ▸ Now             3             │ │                                                                                       ││                                                                        │
+  ▸ Automations      2            │ └───────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
+                                  │ ┌─● tests · real PTY · pvl-a1──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────❐──┐
+                                  │ │                                                                                                                                                                 │
+                                  │ │                                                                                                                                                                 │
+                                  │ │ $ cargo test --locked -p aw-agent-core                                                                                                                          │
+                                  │ │ ✓ 47 passed · 0 failed                                                                                                                                          │
+                                  │ │                                                                                                                                                                 │
+                                  │ │ $ ▍                                                                                                                                                             │
+                                  │ │                                                                                                                                                                 │
+                                  │ │                                                                                                                                                                 │
+                                  │ │                                                                                                                                                                 │
+                                  │ │ viewer (read only) · resize requires actual PTY owner                                                                                                           │
+                                  │ │                                                                                                                                                                 │
+                                  │ │                                                                                                                                                                 │
+                                  │ └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                  │
+ abird / aw ◆ main M 4                                                                                                                                                 ●● 3 working ◐ 1 attention

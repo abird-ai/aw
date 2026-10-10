@@ -1,0 +1,40 @@
+ aw / abird ▾ / aw ◆ main                                                                               ● x2 ● a1 ▾
+ projects        [#] [~]  │ [Review] [Agent] [Files] [Git] [Build] [+]
+                          │ ┌─● coordinator · native Agent · aw/main───────────────────────────────────────────────❐──┐
+  ▾ aw          M 4       │ │                                                                                         │
+    ◆ main · x2           │ │ context · tools 8 · 2 children                                                          │
+    ◆ feat/hooks · a1     │ │                                                                                         │
+  ▸ dotlink               │ │  Review the authorization boundaries.                                                   │
+  ▸ abird-health          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │ The current provider and Actor Envelope must both authorize the selected tool.          │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │  ✓ tests · 47 passed                                                                    │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │ ├─ ● runtime · working                                                                  │
+                          │ │ └─ ◐ hooks · awaiting approval                                                          │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+──────────────────────────│ │                                                                                         │
+ activity o1   [o] [+] [#]│ │                                                                                         │
+                          │ │                                                                                         │
+  ▾ Recents         3     │ │                                                                                         │
+    # Review              │ │                                                                                         │
+    @ coordinator         │ │                                                                                         │
+    * dotlink             │ │                                                                                         │
+  ▸ Now             3     │ │                                                                                         │
+  ▸ Automations      2    │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │ ─────────────────────────────────────────────────────────────────────────────────────── │
+                          │ │ ❯ Message coordinator…                                                                  │
+                          │ │                                                                                         │
+                          │ └─────────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+ abird / aw ◆ main M 4                                                                 ●● 3 working ◐ 1 attention

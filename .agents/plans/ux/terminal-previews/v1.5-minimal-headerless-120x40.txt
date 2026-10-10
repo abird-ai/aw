@@ -1,0 +1,40 @@
+
+
+  › Review the runtime authorization changes.
+
+
+  I'll check source and epoch grants without touching other Agent work.
+
+
+
+   ✓ read · tool.rs
+   ✓ tests · 47 passed
+
+
+
+  The grants are intact. One reviewer is waiting for approval.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  › Ask anything…
+
+ aw / aw ◆ main M4                                                                 GPT-6 · ctx 18% · ◐1 attention

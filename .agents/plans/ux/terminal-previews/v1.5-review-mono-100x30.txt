@@ -1,0 +1,30 @@
+ aw / abird v / aw * main                                                           o x2 o a1 v
+ recents          # [~]   | [Review] [Agent] [Files] [Git] [Build] [+]
+                          | +-o coordinator . native Agent . aw/main---------------------------?--+
+  # Review                | |                                                                     |
+  @ coordinator           | | context . tools 8 . 2 children                                      |
+  * dotlink               | |                                                                     |
+  # tests . a1            | |  Review the authorization boundaries.                               |
+  # tool.rs               | |                                                                     |
+                          | |                                                                     |
+                          | | The current provider and Actor Envelope must both authorize the     |
+                          | | selected tool.                                                      |
+                          | |                                                                     |
+                          | |                                                                     |
+                          | |  v tests . 47 passed                                                |
+                          | |                                                                     |
+                          | |                                                                     |
+                          | | +- o runtime . working                                              |
+--------------------------| | +- o hooks . awaiting approval                                      |
+ activity o1   [o] [+] [#]| |                                                                     |
+                          | |                                                                     |
+  v Recents         3     | |                                                                     |
+    # Review              | |                                                                     |
+    @ coordinator         | |                                                                     |
+    * dotlink             | |                                                                     |
+  > Now             3     | | ------------------------------------------------------------------- |
+  > Automations      2    | | ? Message coordinator.                                              |
+                          | |                                                                     |
+                          | +---------------------------------------------------------------------+
+                          |
+ abird / aw * main M 4                                             oo 3 working o 1 attention

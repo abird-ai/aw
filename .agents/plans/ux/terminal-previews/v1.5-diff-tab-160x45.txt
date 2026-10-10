@@ -1,0 +1,45 @@
+ aw / abird ▾ / aw ◆ main                                                                                                                       ● x2 ● a1 ▾
+ projects              [#] [~]  │ [Review] [Agent] [Files] [Git] [± hooks.rs ×] [+]
+                                │ ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────❐──┐
+  ▾ aw          M 4             │ │                                                                                                                           │
+    ◆ main · x2                 │ │ unstaged · aw/main · pvl-x2                                                                                               │
+    ◆ feat/hooks · a1           │ │                                                                                                                           │
+  ▸ dotlink                     │ │                                                                                                                           │
+  ▸ abird-health                │ │ @@ -72,4 +72,8 @@                                                                                                         │
+                                │ │ fn authorize(..) {                                                                                                        │
+                                │ │ - allow_by_name(tool)?;                                                                                                   │
+                                │ │ + envelope.check(                                                                                                         │
+                                │ │ +   source, effect,                                                                                                       │
+                                │ │ +   actor, site)?;                                                                                                        │
+                                │ │   dispatch(..)                                                                                                            │
+                                │ │ }                                                                                                                         │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │ Read-only until explicit staging or revert.                                                                               │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+────────────────────────────────│ │                                                                                                                           │
+ git M4               o  [+] [#]│ │                                                                                                                           │
+                                │ │                                                                                                                           │
+  aw/main · x2                  │ │                                                                                                                           │
+  v Unstaged        4           │ │                                                                                                                           │
+    M tool.rs     +52           │ │                                                                                                                           │
+    M hooks.rs     +47          │ │                                                                                                                           │
+    M message.rs   +27          │ │                                                                                                                           │
+  ▸ Staged          0           │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ │                                                                                                                           │
+                                │ └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                │
+ abird / aw ◆ main M 4                                                                                                         ●● 3 working ◐ 1 attention

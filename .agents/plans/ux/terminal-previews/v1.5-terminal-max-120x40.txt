@@ -1,0 +1,40 @@
+ aw / abird ▾ / aw ◆ main                                                                               ● x2 ● a1 ▾
+ projects        [#] [~]  │ [Review] [Agent] [Files] [Git] [Build] [+]
+                          │ ┌─● tests · real PTY · pvl-a1──────────────────────────────────────────────────────────❐──┐
+  ▾ aw          M 4       │ │                                                                                         │
+    ◆ main · x2           │ │                                                                                         │
+    ◆ feat/hooks · a1     │ │ $ cargo test --locked -p aw-agent-core                                                  │
+  ▸ dotlink               │ │ ✓ 47 passed · 0 failed                                                                  │
+  ▸ abird-health          │ │                                                                                         │
+                          │ │ $ ▍                                                                                     │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │ viewer (read only) · resize requires actual PTY owner                                   │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+──────────────────────────│ │                                                                                         │
+ activity o1   [o] [+] [#]│ │                                                                                         │
+                          │ │                                                                                         │
+  ▾ Recents         3     │ │                                                                                         │
+    # Review              │ │                                                                                         │
+    @ coordinator         │ │                                                                                         │
+    * dotlink             │ │                                                                                         │
+  ▸ Now             3     │ │                                                                                         │
+  ▸ Automations      2    │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ └─────────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+ abird / aw ◆ main M 4                                                                 ●● 3 working ◐ 1 attention

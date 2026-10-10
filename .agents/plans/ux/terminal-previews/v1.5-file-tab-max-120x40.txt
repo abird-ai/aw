@@ -1,0 +1,40 @@
+ ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────❐──┐
+ │                                                                                                                    │
+ │ tool.rs · aw/main · pvl-x2 · read-only                                                                             │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │  71  pub fn authorize(tool: Tool) {                                                                                │
+ │  72    let source = tool.source;                                                                                   │
+ │  73    let effect = tool.effect;                                                                                   │
+ │  74    envelope.authorize(                                                                                         │
+ │  75        source, effect)?;                                                                                       │
+ │  76    journal.intent(..)?;                                                                                        │
+ │  77    dispatch(tool)                                                                                              │
+ │  78  }                                                                                                             │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │ ↗ breaks out; ⛶ maximizes; opening is never a write.                                                               │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ │                                                                                                                    │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ abird / aw ◆ main M 4                                                                  ● 3 working ◐ 1 attention

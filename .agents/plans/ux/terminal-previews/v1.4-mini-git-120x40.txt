@@ -1,0 +1,40 @@
+ aw / abird ▾ / aw ◆ main                                                                               ● x2 ● a1 ▾
+ projects        [#] [~]  │ [Review] [Agent] [Git] [Files] [Build] [+]
+                          │ Review · aw * main · pvl-x2
+  ▾ aw          M 4       │ ┌─● coordinator · Agent · x2────────────────────┐┌─Diff · tool.rs─────────────────────────┐
+    ◆ main · x2           │ │                                               ││                                        │
+    ◆ feat/hooks · a1     │ │ context 4 files · 3 skills · 8 granted tools  ││ @@ -72,4 +72,8 @@                      │
+  ▸ dotlink               │ │                                               ││ fn authorize(tool) {                   │
+  ▸ abird-health          │ │  Review the runtime authorization changes.    ││ - allow_by_name(tool);                 │
+                          │ │                                               ││ + envelope.check(                      │
+                          │ │                                               ││ +   source, effect,                    │
+                          │ │                                               ││ +   actor, site)?;                     │
+                          │ │ The exact grant path was inspected, and       ││   dispatch(tool)                       │
+                          │ │ model-visible tools are source-bound.         ││ }                                      │
+                          │ │                                               ││                                        │
+                          │ │                                               ││                                        │
+                          │ │  ✓ tests · 47 passed                          ││                                        │
+                          │ │                                               ││                                        │
+                          │ │                                               ││                                        │
+                          │ │  ◐ hooks lead · approval requested            ││                                        │
+                          │ │                                               ││                                        │
+                          │ │                                               ││                                        │
+                          │ │                                               ││                                        │
+                          │ │                                               ││                                        │
+──────────────────────────│ │                                               ││                                        │
+ git M4         o  [+] [#]│ │                                               ││                                        │
+                          │ │ ───────────────────────────────────────────── ││                                        │
+  aw/main · x2            │ │ › Ask anything ...                            ││                                        │
+  v Unstaged        4     │ │                                               ││                                        │
+    M tool.rs     +52     │ └───────────────────────────────────────────────┘└────────────────────────────────────────┘
+    M hooks.rs     +47    │ ┌─tests · pvl-a1───────────────────────────────────────────────────────────────viewer─────┐
+    M message.rs   +27    │ │                                                                                         │
+  ▸ Staged          0     │ │ $ cargo test --locked -p aw-agent-core                                                  │
+                          │ │ ✓ 47 passed · 0 failed                                                                  │
+                          │ │                                                                                         │
+                          │ │ $ |                                                                                     │
+                          │ │                                                                                         │
+                          │ │                                                                                         │
+                          │ └─────────────────────────────────────────────────────────────────────────────────────────┘
+                          │
+ abird / aw ◆ main M 4                                                                 ● 3 working ◐ 1 attention

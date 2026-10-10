@@ -1,0 +1,30 @@
+ aw / abird ▾ / aw ◆ main                                                           ● x2 ● a1 ▾
+ projects        [#] [~]  │ [Review] [Agent] [Git] [Files] [Build] [+]
+                          │ Review · aw * main · pvl-x2
+  ▾ aw          M 4       │ ┌─● coordinator · Agent · x2──────────────────────────────────────────┐
+    ◆ main · x2           │ │                                                                     │
+    ◆ feat/hooks · a1     │ │ context 4 files · 3 skills · 8 granted tools                        │
+  ▸ dotlink               │ │                                                                     │
+  ▸ abird-health          │ │  Review the runtime authorization changes.                          │
+                          │ │                                                                     │
+                          │ │                                                                     │
+                          │ │                                                                     │
+                          │ │ The exact grant path was inspected, and model-visible tools are     │
+                          │ │ source-bound.                                                       │
+                          │ │                                                                     │
+                          │ │                                                                     │
+                          │ │  ✓ tests · 47 passed                                                │
+                          │ │                                                                     │
+──────────────────────────│ │                                                                     │
+ activity o1   [o] [+] [#]│ │  ◐ hooks lead · approval requested                                  │
+                          │ │                                                                     │
+  ▾ Recents         3     │ │                                                                     │
+    # Review              │ │                                                                     │
+    @ coordinator         │ │                                                                     │
+    * dotlink             │ │                                                                     │
+  ▸ Now             3     │ │ ─────────────────────────────────────────────────────────────────── │
+  ▸ Automations      2    │ │ › Ask anything ...                                                  │
+                          │ │                                                                     │
+                          │ └─────────────────────────────────────────────────────────────────────┘
+                          │
+ abird / aw ◆ main M 4                                             ● 3 working ◐ 1 attention

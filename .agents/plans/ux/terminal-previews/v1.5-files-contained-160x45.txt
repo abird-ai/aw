@@ -1,0 +1,45 @@
+ aw / abird ▾ / aw ◆ main                                                                                                                       ● x2 ● a1 ▾
+ projects              [#] [~]  │ [Review] [Agent] [Files] [Git] [Build] [+]
+                                │ ┌─Files · aw/main──────────────────────────────┐┌─tool.rs · Rust · read only─────────────────────────────────────────────↗ ⛶┐
+  ▾ aw          M 4             │ │                                              ││                                                                           │
+    ◆ main · x2                 │ │ v crates                                     ││ 71 pub fn authorize(..) {                                                 │
+    ◆ feat/hooks · a1           │ │   v aw-agent-core                            ││ 72   let source = tool.source;                                            │
+  ▸ dotlink                     │ │     v src                                    ││ 73   let effect = tool.effect;                                            │
+  ▸ abird-health                │ │       M tool.rs                              ││ 74   envelope.authorize(                                                  │
+                                │ │       M hooks.rs                             ││ 75     source, effect)?;                                                  │
+                                │ │       agent.rs                               ││ 76   journal.intent(..)?;                                                 │
+                                │ │   > aw-agent-kernel                          ││ 77   dispatch(..)                                                         │
+                                │ │ > .agents                                    ││ 78 }                                                                      │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+────────────────────────────────│ │                                              ││                                                                           │
+ files M4             o  [+] [#]│ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+  aw/main · x2                  │ │                                              ││                                                                           │
+  v crates                      │ │                                              ││                                                                           │
+    v aw-agent-core             │ │                                              ││                                                                           │
+      v src                     │ │                                              ││                                                                           │
+        M tool.rs               │ │                                              ││                                                                           │
+        M hooks.rs              │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ │                                              ││                                                                           │
+                                │ └──────────────────────────────────────────────┘└───────────────────────────────────────────────────────────────────────────┘
+                                │
+ abird / aw ◆ main M 4                                                                                                         ●● 3 working ◐ 1 attention

@@ -1,0 +1,24 @@
+
+
+  >+-Command Palette--------------------------------------------------------+
+   |                                                                        |
+   |  > Search actions, files, sessions, agents.                            |
+  I|                                                                        |
+   | > Actions  .  ! Windows  .  @ Files  .  # Sessions  .  $ Terminals     |
+   | / Commands  .  & Agents                                                |
+   |------------------------------------------------------------------------|
+   | Actions      New workspace tab       visual layout only                |
+   | Windows      Review                  saved Workspace layout            |
+   | Files        tool.rs                 File . aw-agent-core/src . x2     |
+   | Sessions     aw/main                 durable conversation              |
+   | Terminals    tests                   PTY . a1 . viewer                 |
+  T| Commands     /think                  Agent slash command               |
+   | Agents       runtime lead            working . child . x2              |
+   |                                                                        |
+   |                                                                        |
+   |------------------------------------------------------------------------|
+   | ? ? select  .  Enter open  .  Esc close                                |
+  -+------------------------------------------------------------------------+-
+  > Ask anything.
+
+ aw / aw * main M4                         GPT-6 . ctx 18% . o1 attention
