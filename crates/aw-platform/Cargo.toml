@@ -1,0 +1,21 @@
+[package]
+name = "aw-platform"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Target-selected platform facade for aw"
+
+[features]
+default = []
+local-ipc = ["aw-platform-unix/local-ipc"]
+
+[target.'cfg(unix)'.dependencies]
+aw-platform-unix = { path = "../aw-platform-unix", version = "=0.15.0" }
+
+[target.'cfg(windows)'.dependencies]
+aw-platform-win = { path = "../aw-platform-win", version = "=0.15.0" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

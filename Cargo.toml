@@ -8,6 +8,7 @@ members = [
     "crates/aw-editor",
     "crates/aw-ui-extension",
     "crates/aw-collab",
+    "crates/aw-platform",
 ]
 
 [workspace.dependencies]
