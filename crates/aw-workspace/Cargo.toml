@@ -1,0 +1,16 @@
+[package]
+name = "aw-workspace"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Headless workspace layout, tab identity and editor state for aw frontends"
+
+[dependencies]
+aw-editor = { path = "../aw-editor", version = "=0.15.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

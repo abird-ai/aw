@@ -149,6 +149,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-workspace"
+version = "0.15.0"
+dependencies = [
+ "aw-editor",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

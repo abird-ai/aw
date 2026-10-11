@@ -15,6 +15,7 @@ members = [
     "crates/aw-identity",
     "examples/sdk-kernel",
     "crates/aw-embedded",
+    "crates/aw-workspace",
 ]
 
 [workspace.dependencies]
