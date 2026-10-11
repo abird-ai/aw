@@ -1,0 +1,843 @@
+[
+  {
+    "name": "default_wide",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 120,
+      "height": 40
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 1,
+        "area": {
+          "x": 0,
+          "y": 0,
+          "width": 28,
+          "height": 40
+        }
+      },
+      {
+        "pane": 2,
+        "area": {
+          "x": 28,
+          "y": 0,
+          "width": 92,
+          "height": 40
+        }
+      }
+    ],
+    "hidden": 0
+  },
+  {
+    "name": "exact_minimum",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 60,
+      "height": 8
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 1,
+        "area": {
+          "x": 0,
+          "y": 0,
+          "width": 20,
+          "height": 8
+        }
+      },
+      {
+        "pane": 2,
+        "area": {
+          "x": 20,
+          "y": 0,
+          "width": 40,
+          "height": 8
+        }
+      }
+    ],
+    "hidden": 0
+  },
+  {
+    "name": "narrow",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 59,
+      "height": 30
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 2,
+        "area": {
+          "x": 0,
+          "y": 0,
+          "width": 59,
+          "height": 30
+        }
+      }
+    ],
+    "hidden": 1
+  },
+  {
+    "name": "short",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 120,
+      "height": 7
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 2,
+        "area": {
+          "x": 0,
+          "y": 0,
+          "width": 120,
+          "height": 7
+        }
+      }
+    ],
+    "hidden": 1
+  },
+  {
+    "name": "zero_width",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 30
+    },
+    "maximize": false,
+    "visible": [],
+    "hidden": 2
+  },
+  {
+    "name": "zero_height",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 120,
+      "height": 0
+    },
+    "maximize": false,
+    "visible": [],
+    "hidden": 2
+  },
+  {
+    "name": "maximized",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 1,
+      "y": 1,
+      "width": 120,
+      "height": 40
+    },
+    "maximize": true,
+    "visible": [
+      {
+        "pane": 2,
+        "area": {
+          "x": 1,
+          "y": 1,
+          "width": 120,
+          "height": 40
+        }
+      }
+    ],
+    "hidden": 1
+  },
+  {
+    "name": "ratio_clamp",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 9000,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 70,
+      "height": 30
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 1,
+        "area": {
+          "x": 0,
+          "y": 0,
+          "width": 30,
+          "height": 30
+        }
+      },
+      {
+        "pane": 2,
+        "area": {
+          "x": 30,
+          "y": 0,
+          "width": 40,
+          "height": 30
+        }
+      }
+    ],
+    "hidden": 0
+  },
+  {
+    "name": "focus_nav_when_narrow",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "pane",
+          "id": 2
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 1,
+      "next_id": 5
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 50,
+      "height": 30
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 1,
+        "area": {
+          "x": 0,
+          "y": 0,
+          "width": 50,
+          "height": 30
+        }
+      }
+    ],
+    "hidden": 1
+  },
+  {
+    "name": "three_columns",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "split",
+          "axis": "columns",
+          "ratio": 5000,
+          "first": {
+            "type": "pane",
+            "id": 2
+          },
+          "second": {
+            "type": "pane",
+            "id": 5
+          }
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        },
+        "5": {
+          "type": "group",
+          "tabs": [],
+          "active": null
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 6
+    },
+    "area": {
+      "x": 0,
+      "y": 1,
+      "width": 160,
+      "height": 38
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 1,
+        "area": {
+          "x": 0,
+          "y": 1,
+          "width": 38,
+          "height": 38
+        }
+      },
+      {
+        "pane": 2,
+        "area": {
+          "x": 38,
+          "y": 1,
+          "width": 61,
+          "height": 38
+        }
+      },
+      {
+        "pane": 5,
+        "area": {
+          "x": 99,
+          "y": 1,
+          "width": 61,
+          "height": 38
+        }
+      }
+    ],
+    "hidden": 0
+  },
+  {
+    "name": "right_stack",
+    "workspace": {
+      "version": 1,
+      "root": {
+        "type": "split",
+        "axis": "columns",
+        "ratio": 2400,
+        "first": {
+          "type": "pane",
+          "id": 1
+        },
+        "second": {
+          "type": "split",
+          "axis": "rows",
+          "ratio": 5000,
+          "first": {
+            "type": "pane",
+            "id": 2
+          },
+          "second": {
+            "type": "pane",
+            "id": 5
+          }
+        }
+      },
+      "panes": {
+        "1": {
+          "type": "navigator",
+          "kind": "sessions"
+        },
+        "2": {
+          "type": "group",
+          "tabs": [
+            3,
+            4
+          ],
+          "active": 3
+        },
+        "5": {
+          "type": "group",
+          "tabs": [],
+          "active": null
+        }
+      },
+      "tabs": {
+        "3": {
+          "id": 3,
+          "target": {
+            "kind": "conversation"
+          },
+          "pinned": true
+        },
+        "4": {
+          "id": 4,
+          "target": {
+            "kind": "activity"
+          },
+          "pinned": true
+        }
+      },
+      "focused": 2,
+      "next_id": 6
+    },
+    "area": {
+      "x": 0,
+      "y": 0,
+      "width": 120,
+      "height": 40
+    },
+    "maximize": false,
+    "visible": [
+      {
+        "pane": 1,
+        "area": {
+          "x": 0,
+          "y": 0,
+          "width": 28,
+          "height": 40
+        }
+      },
+      {
+        "pane": 2,
+        "area": {
+          "x": 28,
+          "y": 0,
+          "width": 92,
+          "height": 20
+        }
+      },
+      {
+        "pane": 5,
+        "area": {
+          "x": 28,
+          "y": 20,
+          "width": 92,
+          "height": 20
+        }
+      }
+    ],
+    "hidden": 0
+  }
+]
