@@ -11,6 +11,7 @@ members = [
     "crates/aw-platform",
     "crates/aw-platform-unix",
     "crates/aw-platform-win",
+    "examples/sdk-rpc-client",
 ]
 
 [workspace.dependencies]

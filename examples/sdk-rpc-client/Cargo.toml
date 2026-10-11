@@ -1,0 +1,10 @@
+[package]
+name = "aw-rpc-client-example"
+version = "0.15.0"
+edition = "2021"
+publish = false
+description = "Independent versioned JSONL stdin/stdout external client for aw; never replays uncertain prompts"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

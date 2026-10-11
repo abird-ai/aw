@@ -109,6 +109,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-rpc-client-example"
+version = "0.15.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aw-ui-extension"
 version = "0.15.0"
 dependencies = [
