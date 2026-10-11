@@ -59,6 +59,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-identity"
+version = "0.15.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "aw-pipeline"
 version = "0.15.0"
 dependencies = [

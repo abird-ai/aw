@@ -1,0 +1,15 @@
+[package]
+name = "aw-identity"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Bounded internal participant directory and stable principal names; no authentication transport"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
