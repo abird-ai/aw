@@ -1,0 +1,21 @@
+[package]
+name = "aw-platform-win"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Windows platform primitives for aw"
+
+[dependencies]
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem"
+] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
