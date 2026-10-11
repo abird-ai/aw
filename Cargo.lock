@@ -59,6 +59,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-embedded"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-kernel",
+ "serde_json",
+]
+
+[[package]]
 name = "aw-identity"
 version = "0.15.0"
 dependencies = [

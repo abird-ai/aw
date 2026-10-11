@@ -1,0 +1,20 @@
+[package]
+name = "aw-embedded"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Host-driven no_std+alloc Agent adapter using aw-agent-kernel shared transitions"
+
+[features]
+default = ["std"]
+std = ["alloc", "aw-agent-kernel/std", "serde_json/std"]
+alloc = ["aw-agent-kernel/alloc"]
+
+[dependencies]
+aw-agent-kernel = { version = "=0.15.0", path = "../aw-agent-kernel", default-features = false }
+serde_json = { version = "=1.0.145", default-features = false, features = ["alloc"] }
+
+[lints.rust]
+unsafe_code = "forbid"
