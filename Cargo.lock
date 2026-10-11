@@ -68,6 +68,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-kernel-embed-example"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-kernel",
+]
+
+[[package]]
 name = "aw-pipeline"
 version = "0.15.0"
 dependencies = [

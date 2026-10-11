@@ -1,0 +1,21 @@
+[package]
+name = "aw-kernel-embed-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Independent no_std consumer of shared aw capability invariants"
+
+[features]
+default = []
+
+[lib]
+name = "aw_kernel_embed_example"
+path = "src/lib.rs"
+
+[dependencies]
+aw-agent-kernel = { version = "=0.15.0", path = "../../crates/aw-agent-kernel", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
