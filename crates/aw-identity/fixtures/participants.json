@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "scope": "Identity naming/roster fixtures, NOT authentication evidence",
+  "vectors": [
+    {"realm":"engineering","id":"alice","label":"Alice","principal":"internal:engineering:alice","valid":true},
+    {"realm":"engineering","id":"bob","label":"Bob","principal":"internal:engineering:bob","valid":true},
+    {"realm":"another-team","id":"alice","label":"Alice","principal":"internal:another-team:alice","valid":true},
+    {"realm":"r","id":"u-1_2","label":"இயக்கம்","principal":"internal:r:u-1_2","valid":true},
+    {"realm":"r","id":"user","label":"<button>Plain text</button>","principal":"internal:r:user","valid":true},
+    {"realm":"r","id":"../alice","label":"Alice","valid":false},
+    {"realm":"r","id":"a:b","label":"Alice","valid":false},
+    {"realm":"r","id":"ALICE","label":"Alice","valid":false},
+    {"realm":"r","id":"","label":"Alice","valid":false},
+    {"realm":"r","id":"alice","label":"","valid":false},
+    {"realm":"r","id":"alice","label":"A\nB","valid":false},
+    {"realm":"r","id":"alice","label":"\u202eadmin","valid":false},
+    {"realm":"r/path","id":"alice","label":"Alice","valid":false}
+  ]
+}
