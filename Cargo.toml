@@ -17,6 +17,7 @@ members = [
     "crates/aw-embedded",
     "crates/aw-workspace",
     "crates/aw-client",
+    "crates/aw-terminal",
 ]
 
 [workspace.dependencies]

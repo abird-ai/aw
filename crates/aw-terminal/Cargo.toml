@@ -1,0 +1,17 @@
+[package]
+name = "aw-terminal"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Explicit local PTY ownership and bounded terminal state, independent of agents and UI"
+
+[dependencies]
+aw-platform = { version = "=0.15.0", path = "../aw-platform" }
+portable-pty = "=0.9.0"
+vt100 = "=0.16.2"
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
