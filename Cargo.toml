@@ -19,6 +19,7 @@ members = [
     "crates/aw-client",
     "crates/aw-terminal",
     "crates/aw-git",
+    "examples/sdk-identity",
 ]
 
 [workspace.dependencies]

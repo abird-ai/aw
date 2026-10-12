@@ -111,6 +111,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-identity-example"
+version = "0.15.0"
+dependencies = [
+ "aw-identity",
+]
+
+[[package]]
 name = "aw-kernel-embed-example"
 version = "0.15.0"
 dependencies = [

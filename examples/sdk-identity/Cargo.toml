@@ -1,0 +1,10 @@
+[package]
+name = "aw-identity-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+
+[dependencies]
+aw-identity = { path = "../../crates/aw-identity", version = "=0.15.0" }
