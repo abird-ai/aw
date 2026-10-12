@@ -1,0 +1,12 @@
+[package]
+name = "aw-layout-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Independent consumer of aw's pure workspace layout SDK"
+
+[dependencies]
+aw-workspace = { path = "../../crates/aw-workspace", version = "=0.15.0" }
+serde_json = { workspace = true }
