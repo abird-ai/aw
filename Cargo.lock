@@ -91,6 +91,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-embedded-example"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-kernel",
+ "aw-embedded",
+ "serde_json",
+]
+
+[[package]]
 name = "aw-git"
 version = "0.15.0"
 dependencies = [

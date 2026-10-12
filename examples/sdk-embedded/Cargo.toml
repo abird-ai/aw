@@ -1,0 +1,23 @@
+[package]
+name = "aw-embedded-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Independent real host-driven no_std+alloc aw Agent turn fixture"
+
+[lib]
+name = "aw_embedded_example"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+aw-embedded = { version = "=0.15.0", path = "../../crates/aw-embedded", default-features = false, features = ["alloc"] }
+aw-agent-kernel = { version = "=0.15.0", path = "../../crates/aw-agent-kernel", default-features = false, features = ["alloc"] }
+serde_json = { version = "=1.0.145", default-features = false, features = ["alloc"] }
+
+[lints.rust]
+unsafe_code = "forbid"
