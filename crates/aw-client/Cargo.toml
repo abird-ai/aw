@@ -1,0 +1,22 @@
+[package]
+name = "aw-client"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Typed same-user Unix-socket client for an explicitly running aw owner"
+
+[dependencies]
+aw-platform = { version = "=0.15.0", path = "../aw-platform", features = ["local-ipc"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "=1.48.0", features = ["net", "io-util", "time"] }
+getrandom = "=0.3.4"
+
+[dev-dependencies]
+tokio = { version = "=1.48.0", features = ["macros", "rt", "sync"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
