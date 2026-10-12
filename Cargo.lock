@@ -91,6 +91,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-git"
+version = "0.15.0"
+dependencies = [
+ "aw-platform",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "aw-identity"
 version = "0.15.0"
 dependencies = [
