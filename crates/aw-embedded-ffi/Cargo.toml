@@ -1,0 +1,23 @@
+[package]
+name = "aw-embedded-ffi"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Bounded versioned C ABI over the shared no_std+alloc aw embedded Agent"
+
+[lib]
+name = "aw_embedded_ffi"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = ["alloc"]
+alloc = ["aw-embedded/alloc", "aw-agent-kernel/alloc"]
+std = ["alloc", "aw-embedded/std", "aw-agent-kernel/std", "serde_json/std"]
+
+[dependencies]
+aw-embedded = { version = "=0.15.0", path = "../aw-embedded", default-features = false }
+aw-agent-kernel = { version = "=0.15.0", path = "../aw-agent-kernel", default-features = false }
+serde_json = { version = "=1.0.145", default-features = false, features = ["alloc"] }
