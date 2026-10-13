@@ -1,0 +1,16 @@
+[package]
+name = "aw-store-api"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Backend-neutral persistence/session capability API for aw"
+
+[dependencies]
+aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

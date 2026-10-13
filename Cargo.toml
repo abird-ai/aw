@@ -30,6 +30,7 @@ members = [
     "examples/sdk-embedded-ffi-staticlib",
     "crates/aw-mcp",
     "crates/aw-extensions",
+    "crates/aw-store-api",
 ]
 
 [workspace.dependencies]

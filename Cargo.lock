@@ -385,6 +385,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-store-api"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aw-terminal"
 version = "0.15.0"
 dependencies = [
