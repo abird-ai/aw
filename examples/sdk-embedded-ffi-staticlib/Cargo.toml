@@ -1,0 +1,16 @@
+[package]
+name = "aw-embedded-ffi-staticlib-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Native std C-link test packaging over portable aw-embedded-ffi no_std rlib"
+
+[lib]
+name = "aw_embedded_ffi_staticlib_example"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+aw-embedded-ffi = { version = "=0.15.0", path = "../../crates/aw-embedded-ffi", default-features = false, features = ["alloc"] }

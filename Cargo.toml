@@ -27,6 +27,7 @@ members = [
     "examples/sdk-terminal",
     "examples/sdk-review",
     "crates/aw-agent-core",
+    "examples/sdk-embedded-ffi-staticlib",
 ]
 
 [workspace.dependencies]

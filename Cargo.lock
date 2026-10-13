@@ -135,6 +135,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-embedded-ffi-staticlib-example"
+version = "0.15.0"
+dependencies = [
+ "aw-embedded-ffi",
+]
+
+[[package]]
 name = "aw-git"
 version = "0.15.0"
 dependencies = [
