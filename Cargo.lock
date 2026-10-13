@@ -233,6 +233,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-extensions"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "aw-agent-kernel",
+ "clap",
+ "futures-util",
+ "getrandom 0.3.4",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "aw-git"
 version = "0.15.0"
 dependencies = [

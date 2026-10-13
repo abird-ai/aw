@@ -29,6 +29,7 @@ members = [
     "crates/aw-agent-core",
     "examples/sdk-embedded-ffi-staticlib",
     "crates/aw-mcp",
+    "crates/aw-extensions",
 ]
 
 [workspace.dependencies]
