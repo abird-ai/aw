@@ -151,6 +151,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-owner-client-example"
+version = "0.15.0"
+dependencies = [
+ "aw-client",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aw-pipeline"
 version = "0.15.0"
 dependencies = [

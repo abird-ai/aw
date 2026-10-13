@@ -23,6 +23,7 @@ members = [
     "examples/sdk-embedded",
     "crates/aw-embedded-ffi",
     "examples/sdk-layout",
+    "examples/sdk-client",
 ]
 
 [workspace.dependencies]
