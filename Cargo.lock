@@ -228,6 +228,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-terminal-example"
+version = "0.15.0"
+dependencies = [
+ "aw-terminal",
+]
+
+[[package]]
 name = "aw-ui-extension"
 version = "0.15.0"
 dependencies = [
