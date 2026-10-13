@@ -200,6 +200,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-review-example"
+version = "0.15.0"
+dependencies = [
+ "aw-git",
+]
+
+[[package]]
 name = "aw-routing"
 version = "0.15.0"
 dependencies = [

@@ -25,6 +25,7 @@ members = [
     "examples/sdk-layout",
     "examples/sdk-client",
     "examples/sdk-terminal",
+    "examples/sdk-review",
 ]
 
 [workspace.dependencies]
