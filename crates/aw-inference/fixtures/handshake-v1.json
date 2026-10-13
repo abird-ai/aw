@@ -1,0 +1,19 @@
+{
+  "purpose": "PUBLIC TEST VECTOR ONLY; never use this known key for a real device link",
+  "test_key_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "hello": {
+    "version": 1,
+    "epoch": "abababababababababababababababababababababababababababababababab",
+    "challenge": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "binding": {
+      "actor": "unix:1000",
+      "account_id": "personal",
+      "executor_id": "device-a",
+      "model": "fixture",
+      "grant_id": "grant-1"
+    }
+  },
+  "worker_nonce": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+  "worker_proof": "358f495844ea0dbf7a2da2b4b13d764bff582b1df30a10a0b581da8c22c4cedb",
+  "owner_proof": "0564d9113e6245984b7ca243a45c17ab25f4bdbfca30bdfd8c1e14a138c20e18"
+}
