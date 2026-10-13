@@ -1,0 +1,33 @@
+[package]
+name = "aw-agent-core"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Headless aw agent SDK: conversations, providers, hooks, cancellation and events"
+readme = "README.md"
+publish = false
+
+[features]
+default = []
+routing = ["dep:aw-routing"]
+planner = ["dep:aw-pipeline"]
+reviewer = ["dep:aw-pipeline"]
+
+[dependencies]
+left-right = "=0.11.8"
+aw-agent-kernel = { version = "=0.15.0", path = "../aw-agent-kernel" }
+sha2 = "=0.10.9"
+aw-routing = { version = "=0.15.0", path = "../aw-routing", optional = true }
+aw-pipeline = { version = "=0.15.0", path = "../aw-pipeline", optional = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { version = "=0.3.31", default-features = false, features = ["std"] }
+tokio = { version = "=1.48.0", default-features = false, features = ["rt", "time", "sync", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dev-dependencies]
+aw-embedded-example = { version = "=0.15.0", path = "../../examples/sdk-embedded" }

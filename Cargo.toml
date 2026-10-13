@@ -26,6 +26,7 @@ members = [
     "examples/sdk-client",
     "examples/sdk-terminal",
     "examples/sdk-review",
+    "crates/aw-agent-core",
 ]
 
 [workspace.dependencies]
