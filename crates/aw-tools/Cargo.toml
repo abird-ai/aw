@@ -1,0 +1,26 @@
+[package]
+name = "aw-tools"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Explicit local filesystem and trusted-shell tools for aw-agent-core"
+
+[features]
+default = []
+pty = ["dep:aw-terminal"]
+
+[dependencies]
+aw-terminal = { path = "../aw-terminal", version = "=0.15.0", optional = true }
+aw-platform = { version = "=0.15.0", path = "../aw-platform" }
+aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = "=1.12.3"
+globset = "=0.4.18"
+ignore = "=0.4.25"
+tokio = { version = "=1.48.0", features = ["rt", "macros", "process", "io-util", "time", "sync"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

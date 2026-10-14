@@ -32,6 +32,7 @@ members = [
     "crates/aw-extensions",
     "crates/aw-store-api",
     "crates/aw-inference",
+    "crates/aw-tools",
 ]
 
 [workspace.dependencies]
