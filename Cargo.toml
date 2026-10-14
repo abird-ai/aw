@@ -36,6 +36,7 @@ members = [
     "crates/aw-providers",
     "examples/rust-extension",
     "examples/sdk-accounts",
+    "crates/aw-store-jsonl",
 ]
 
 [workspace.dependencies]
