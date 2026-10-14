@@ -37,6 +37,7 @@ members = [
     "examples/rust-extension",
     "examples/sdk-accounts",
     "crates/aw-store-jsonl",
+    "crates/aw-session-format",
 ]
 
 [workspace.dependencies]
