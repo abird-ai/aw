@@ -1,0 +1,10 @@
+[package]
+name = "aw-example-extension"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+
+[dependencies]
+aw-agent-core = { version = "=0.15.0", path = "../../crates/aw-agent-core" }

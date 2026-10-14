@@ -233,6 +233,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-example-extension"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+]
+
+[[package]]
 name = "aw-extensions"
 version = "0.15.0"
 dependencies = [

@@ -34,6 +34,7 @@ members = [
     "crates/aw-inference",
     "crates/aw-tools",
     "crates/aw-providers",
+    "examples/rust-extension",
 ]
 
 [workspace.dependencies]
