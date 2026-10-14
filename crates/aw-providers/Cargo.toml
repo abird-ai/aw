@@ -1,0 +1,26 @@
+[package]
+name = "aw-providers"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Ollama and OpenAI-compatible HTTP providers for aw-agent-core"
+readme = "README.md"
+publish = false
+
+[dependencies]
+zeroize = "=1.9.0"
+sha2 = "=0.10.9"
+getrandom = "=0.3.4"
+aw-agent-core = { version = "=0.15.0", path = "../aw-agent-core" }
+aw-platform = { version = "=0.15.0", path = "../aw-platform" }
+futures-util = { version = "=0.3.31", default-features = false, features = ["std"] }
+fs2 = "=0.4.3"
+reqwest = { version = "=0.12.24", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "=1.48.0", features = ["time", "sync"] }
+toml = "=0.8.23"
+
+[lints.rust]
+unsafe_code = "forbid"
