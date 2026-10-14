@@ -1,0 +1,23 @@
+[package]
+name = "aw-inference"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Explicitly granted device inference transport; provider credentials never enter its protocol"
+
+[dependencies]
+aw-platform = { path = "../aw-platform", version = "=0.15.0" }
+aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
+aw-client = { path = "../aw-client", version = "=0.15.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "=1.48.0", features = ["rt", "macros", "net", "sync", "time", "io-util"] }
+sha2 = "=0.10.9"
+hmac = "=0.12.1"
+getrandom = "=0.3.4"
+fs2 = "=0.4.3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
