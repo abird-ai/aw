@@ -42,6 +42,7 @@ members = [
     "examples/sdk-inference",
     "crates/aw-surfaces",
     "examples/sdk-host",
+    "examples/sdk-context",
 ]
 
 [workspace.dependencies]

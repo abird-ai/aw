@@ -200,6 +200,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-context-example"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "aw-store",
+ "tokio",
+]
+
+[[package]]
 name = "aw-editor"
 version = "0.15.0"
 dependencies = [
