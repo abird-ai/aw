@@ -1,0 +1,19 @@
+[package]
+name = "aw-surfaces"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Explicit host-owned workspace surfaces, independent of HTTP and UI"
+
+[dependencies]
+aw-git = { version = "=0.15.0", path = "../aw-git" }
+aw-terminal = { version = "=0.15.0", path = "../aw-terminal" }
+aw-tools = { version = "=0.15.0", path = "../aw-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "=0.10.9"
+getrandom = "=0.3.4"
+url = "=2.5.7"

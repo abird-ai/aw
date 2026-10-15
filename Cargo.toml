@@ -40,6 +40,7 @@ members = [
     "crates/aw-session-format",
     "crates/aw-store",
     "examples/sdk-inference",
+    "crates/aw-surfaces",
 ]
 
 [workspace.dependencies]

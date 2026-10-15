@@ -505,6 +505,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-surfaces"
+version = "0.15.0"
+dependencies = [
+ "aw-git",
+ "aw-terminal",
+ "aw-tools",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.17",
+ "url",
+]
+
+[[package]]
 name = "aw-terminal"
 version = "0.15.0"
 dependencies = [
