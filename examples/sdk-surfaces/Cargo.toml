@@ -1,0 +1,10 @@
+[package]
+name = "aw-surfaces-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+[dependencies]
+aw-surfaces = { path = "../../crates/aw-surfaces", version = "=0.15.0" }
+serde_json = "=1.0.145"

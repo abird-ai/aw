@@ -547,6 +547,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-surfaces-example"
+version = "0.15.0"
+dependencies = [
+ "aw-surfaces",
+ "serde_json",
+]
+
+[[package]]
 name = "aw-terminal"
 version = "0.15.0"
 dependencies = [
