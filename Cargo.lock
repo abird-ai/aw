@@ -446,6 +446,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-sdk-example"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "aw-example-extension",
+ "tokio",
+]
+
+[[package]]
 name = "aw-session-format"
 version = "0.15.0"
 dependencies = [
