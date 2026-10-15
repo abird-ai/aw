@@ -1,0 +1,14 @@
+[package]
+name = "aw-inference-example"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+
+[dependencies]
+aw-platform = { path = "../../crates/aw-platform", version = "=0.15.0" }
+aw-agent-core = { path = "../../crates/aw-agent-core", version = "=0.15.0" }
+aw-inference = { path = "../../crates/aw-inference", version = "=0.15.0" }
+serde_json = { workspace = true }
+tokio = { version = "=1.48.0", features = ["rt", "macros", "io-util", "sync", "time"] }

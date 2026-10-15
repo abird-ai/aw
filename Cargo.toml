@@ -39,6 +39,7 @@ members = [
     "crates/aw-store-jsonl",
     "crates/aw-session-format",
     "crates/aw-store",
+    "examples/sdk-inference",
 ]
 
 [workspace.dependencies]

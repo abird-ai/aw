@@ -308,6 +308,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-inference-example"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "aw-inference",
+ "aw-platform",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aw-kernel-embed-example"
 version = "0.15.0"
 dependencies = [
