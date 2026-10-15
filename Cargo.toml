@@ -38,6 +38,7 @@ members = [
     "examples/sdk-accounts",
     "crates/aw-store-jsonl",
     "crates/aw-session-format",
+    "crates/aw-store",
 ]
 
 [workspace.dependencies]

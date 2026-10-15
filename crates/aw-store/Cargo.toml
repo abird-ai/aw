@@ -1,0 +1,37 @@
+[package]
+name = "aw-store"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+description = "Explicit SQLite session trees and durable journal for the aw agent SDK"
+
+[features]
+default = []
+multiplayer = ["dep:aw-collab"]
+pipelines = ["dep:aw-pipeline", "aw-agent-core/planner", "aw-agent-core/reviewer"]
+routing = ["dep:aw-routing", "aw-agent-core/routing"]
+
+[dependencies]
+aw-platform = { version = "=0.15.0", path = "../aw-platform" }
+aw-store-api = { version = "=0.15.0", path = "../aw-store-api" }
+aw-agent-core = { version = "=0.15.0", path = "../aw-agent-core" }
+aw-collab = { version = "=0.15.0", path = "../aw-collab", optional = true }
+aw-pipeline = { version = "=0.15.0", path = "../aw-pipeline", optional = true }
+aw-routing = { version = "=0.15.0", path = "../aw-routing", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { version = "=0.37.0", features = ["bundled", "backup"] }
+getrandom = "=0.3.4"
+sha2 = "=0.10.9"
+ring = "=0.17.14"
+zeroize = "=1.9.0"
+url = "=2.5.7"
+base64 = "=0.22.1"
+ed25519-dalek = "=3.0.0"
+fs2 = "=0.4.3"
+tokio = { version = "=1.48.0", default-features = false, features = ["rt", "sync", "macros"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
