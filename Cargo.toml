@@ -1,53 +1,163 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/aw-agent-kernel",
-    "crates/aw-routing",
-    "crates/aw-pipeline",
-    "examples/process-extension-rust",
-    "crates/aw-editor",
-    "crates/aw-ui-extension",
-    "crates/aw-collab",
-    "crates/aw-platform",
-    "crates/aw-platform-unix",
-    "crates/aw-platform-win",
-    "examples/sdk-rpc-client",
-    "crates/aw-identity",
-    "examples/sdk-kernel",
-    "crates/aw-embedded",
-    "crates/aw-workspace",
-    "crates/aw-client",
-    "crates/aw-terminal",
-    "crates/aw-git",
-    "examples/sdk-identity",
-    "examples/sdk-embedded",
-    "crates/aw-embedded-ffi",
-    "examples/sdk-layout",
-    "examples/sdk-client",
-    "examples/sdk-terminal",
-    "examples/sdk-review",
-    "crates/aw-agent-core",
-    "examples/sdk-embedded-ffi-staticlib",
-    "crates/aw-mcp",
-    "crates/aw-extensions",
-    "crates/aw-store-api",
-    "crates/aw-inference",
-    "crates/aw-tools",
-    "crates/aw-providers",
-    "examples/rust-extension",
-    "examples/sdk-accounts",
-    "crates/aw-store-jsonl",
-    "crates/aw-session-format",
-    "crates/aw-store",
-    "examples/sdk-inference",
-    "crates/aw-surfaces",
-    "examples/sdk-host",
-    "examples/sdk-context",
-    "examples/sdk-state",
-    "examples/sdk-surfaces",
-]
+    "crates/aw-agent-kernel", "examples/sdk-kernel", "crates/aw-embedded", "examples/sdk-embedded",
+    "crates/aw-embedded-ffi", "examples/sdk-embedded-ffi-staticlib",
+    "crates/aw-mcp", "crates/aw-extensions", "examples/process-extension-rust",
+    "crates/aw-editor", "crates/aw-ui-extension", "crates/aw-collab", "crates/aw-pipeline", "crates/aw-routing",
+    "crates/aw-platform", "crates/aw-platform-unix", "crates/aw-platform-win",
+    "crates/aw-store-api", "crates/aw-store-jsonl", "crates/aw-session-format",
+    "examples/sdk-context", "examples/sdk-rpc-client",
+    "crates/aw-identity", "examples/sdk-identity",
+    "crates/aw-inference", "examples/sdk-inference",
+    "crates/aw-client", "examples/sdk-client",
+    "examples/sdk-surfaces","crates/aw-surfaces", "crates/aw-agent-core", "crates/aw-providers", "crates/aw-tools", "crates/aw-store", "crates/aw-workspace", "crates/aw-git", "crates/aw-terminal", "examples/sdk-review", "examples/sdk-terminal", "examples/sdk-layout", "examples/sdk-state", "examples/rust-extension", "examples/sdk-host", "examples/sdk-accounts"]
+default-members = ["."]
 
 [workspace.dependencies]
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
 thiserror = "=2.0.17"
+
+[package]
+name = "aw-cli"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "aw: one durable agent/workspace binary with Domain, Workspace, Session, Machine, Fleet and direct AwNet pairing foundations"
+default-run = "aw"
+
+[lib]
+name = "aw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aw"
+path = "src/main.rs"
+
+[features]
+default = ["full"]
+
+# Agent-first, lightweight local product. Explicitly opt in with
+# `--no-default-features --features minimal`; SQLite and distributed services
+# remain excluded. The JSONL journal is the durable effect boundary.
+minimal = ["jsonl"]
+
+# Full durable control-plane backend. Today this selects SQLite because Domain,
+# coordination, multi-user and distributed-resource commands require its full
+# capability set. Session-only JSONL is a separate lightweight backend.
+sqlite = ["dep:aw-store"]
+durable = ["sqlite", "dep:aw-store-api", "dep:sha2", "dep:zeroize", "dep:getrandom"]
+jsonl = ["dep:aw-store-jsonl", "dep:aw-store-api", "session-interop"]
+session-interop = ["dep:aw-session-format"]
+
+# Product surfaces.
+web = ["durable", "dep:aw-client", "dep:axum", "dep:futures-util", "dep:getrandom", "dep:sha2", "dep:subtle"]
+surfaces = ["dep:aw-surfaces"]
+web-workspace = ["web", "surfaces"]
+workspace = ["durable", "dep:aw-workspace", "dep:aw-git", "dep:aw-terminal", "dep:futures-util", "dep:syntect"]
+
+# Durable authority/coordination layers.
+coordination = ["durable"]
+multiuser = ["durable", "dep:aw-identity"]
+multiplayer = ["multiuser", "dep:aw-collab", "aw-store/multiplayer", "dep:base64"]
+pipelines = ["durable", "dep:aw-pipeline", "aw-store/pipelines", "aw-agent-core/planner", "aw-agent-core/reviewer"]
+routing = ["durable", "dep:aw-routing", "aw-agent-core/routing", "aw-store/routing"]
+team = ["web", "device", "multiuser", "dep:tower"]
+net = ["durable", "dep:aw-client", "dep:aw-git", "dep:base64", "dep:ed25519-dalek", "dep:getrandom", "dep:quinn", "dep:rcgen", "dep:rustls", "dep:subtle"]
+device = ["durable", "dep:aw-inference", "dep:aw-client", "dep:getrandom"]
+client = ["durable", "dep:aw-client", "dep:rustyline"]
+oidc = ["durable", "dep:reqwest", "dep:ring", "dep:url", "dep:base64", "dep:getrandom"]
+
+# Compatibility/release aggregate. Normal/default builds use the complete product;
+# --no-default-features remains the intentionally tiny stateless agent.
+full = [
+  "web-workspace", "workspace", "client", "device", "team", "net", "oidc",
+  "jsonl", "session-interop", "coordination", "multiuser", "multiplayer", "pipelines", "routing"
+]
+
+[dependencies]
+aw-identity = { version = "=0.15.0", path = "crates/aw-identity", optional = true }
+tower = { version = "=0.5.2", features = ["util"], optional = true }
+aw-inference = { version = "=0.15.0", path = "crates/aw-inference", optional = true }
+aw-client = { version = "=0.15.0", path = "crates/aw-client", optional = true }
+aw-surfaces = { version = "=0.15.0", path = "crates/aw-surfaces", optional = true }
+aw-agent-core = { version = "=0.15.0", path = "crates/aw-agent-core" }
+aw-agent-kernel = { version = "=0.15.0", path = "crates/aw-agent-kernel" }
+aw-mcp = { version = "=0.15.0", path = "crates/aw-mcp" }
+aw-extensions = { version = "=0.15.0", path = "crates/aw-extensions" }
+aw-editor = { version = "=0.15.0", path = "crates/aw-editor" }
+aw-ui-extension = { version = "=0.15.0", path = "crates/aw-ui-extension" }
+aw-collab = { version = "=0.15.0", path = "crates/aw-collab", optional = true }
+aw-pipeline = { version = "=0.15.0", path = "crates/aw-pipeline", optional = true }
+aw-routing = { version = "=0.15.0", path = "crates/aw-routing", optional = true }
+aw-platform = { version = "=0.15.0", path = "crates/aw-platform" }
+aw-store-api = { version = "=0.15.0", path = "crates/aw-store-api", optional = true }
+aw-store-jsonl = { version = "=0.15.0", path = "crates/aw-store-jsonl", optional = true }
+aw-session-format = { version = "=0.15.0", path = "crates/aw-session-format", optional = true }
+aw-providers = { version = "=0.15.0", path = "crates/aw-providers" }
+aw-tools = { version = "=0.15.0", path = "crates/aw-tools" }
+aw-store = { version = "=0.15.0", path = "crates/aw-store", optional = true }
+aw-workspace = { version = "=0.15.0", path = "crates/aw-workspace", optional = true }
+ratatui = { version = "=0.30.0", default-features = false, features = ["crossterm_0_28"] }
+crossterm = { version = "=0.28.1", features = ["event-stream"] }
+
+unicode-segmentation = "=1.12.0"
+unicode-width = "=0.2.1"
+syntect = { version = "=5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "yaml-load"], optional = true }
+clap = { version = "=4.5.50", features = ["derive", "env", "string"] }
+futures-util = { version = "=0.3.31", default-features = false, features = ["std"], optional = true }
+fs2 = "=0.4.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustyline = { version = "=17.0.2", default-features = false, features = ["custom-bindings"], optional = true }
+tokio = { version = "=1.48.0", features = ["rt", "macros", "net", "time", "signal", "io-util", "sync"] }
+axum = { version = "=0.8.6", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
+getrandom = { version = "=0.3.4", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+zeroize = { version = "=1.9.0", optional = true }
+reqwest = { version = "=0.12.24", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+ring = { version = "=0.17.14", optional = true }
+url = { version = "=2.5.7", optional = true }
+subtle = { version = "=2.6.1", optional = true }
+base64 = { version = "=0.22.1", optional = true }
+ed25519-dalek = { version = "=3.0.0", optional = true }
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"], optional = true }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"], optional = true }
+
+aw-git = { path = "crates/aw-git", version = "=0.15.0", optional = true }
+aw-terminal = { path = "crates/aw-terminal", version = "=0.15.0", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "=0.3.18"
+
+[dev-dependencies]
+tower = { version = "=0.5.2", features = ["util"] }
+
+# Local dev/test builds keep incremental compilation enabled for a fast
+# edit->rebuild loop, but debug info is capped: ~94% of each cached object is
+# DWARF, so this dramatically shrinks target/debug/incremental and deps while
+# keeping file:line in backtraces. Dependencies carry no debug info at all.
+# (test inherits from dev; stated explicitly to keep intent obvious.)
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
