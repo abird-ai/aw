@@ -1,0 +1,26 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "SolidJS source for the embedded aw browser workspace; build output is committed and embedded in the Rust binary.",
+  "scripts": {
+    "build": "vite build",
+    "check": "vite build --emptyOutDir"
+  },
+  "dependencies": {
+    "@codemirror/merge": "^6.10.2",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.38.6",
+    "@shikijs/core": "^4.5.0",
+    "@shikijs/engine-javascript": "^4.5.0",
+    "@shikijs/langs": "^4.5.0",
+    "@shikijs/themes": "^4.5.0",
+    "markdown-it": "15.0.2",
+    "solid-js": "1.9.15",
+    "yjs": "13.6.33"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "vite": "8.3.2",
+    "vite-plugin-solid": "2.11.14"
+  }
+}

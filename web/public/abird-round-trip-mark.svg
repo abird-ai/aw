@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 134 128" role="img" aria-labelledby="title desc">
+  <title id="title">Abird Round Trip mark</title>
+  <desc id="desc">A circular green bird with a blue returning sweep, a dark eye, and a naturally asymmetric orange beak shortened by ten percent.</desc>
+  <g>
+    <defs>
+      <clipPath id="round-trip-mark-clip">
+        <circle cx="60" cy="64" r="52"/>
+      </clipPath>
+    </defs>
+    <path fill="#FF8547" d="M103.9 39.5
+  C112.72 43.5 120.1 49.8 124.42 56.3
+  C125.68 58.2 125.5 60.5 123.88 62.2
+  C118.84 67.3 112.63 72 104.8 76.2 Z"/>
+    <circle cx="60" cy="64" r="52" fill="#60B786"/>
+    <path clip-path="url(#round-trip-mark-clip)" fill="#3868C7" d="M7.8 64
+  C8 53.5 15.2 47 25.6 47
+  C35.2 47 42.7 54.2 42.7 64
+  C42.7 81.2 56.5 95 74.2 95
+  C95.1 95 112.2 81.4 112.2 64
+  L112.2 116.2
+  L7.8 116.2 Z"/>
+    <circle cx="86.5" cy="46.5" r="5.5" fill="#1C211F"/>
+  </g>
+</svg>

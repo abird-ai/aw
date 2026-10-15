@@ -1,0 +1,58 @@
+:root {
+  --aw-boot-bg: #fcfcfb;
+  --aw-boot-fg: #242725;
+  color-scheme: light;
+}
+:root[data-effective-theme="dark"] {
+  --aw-boot-bg: #181c1a;
+  --aw-boot-fg: #edf1ee;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-effective-theme]) {
+    --aw-boot-bg: #181c1a;
+    --aw-boot-fg: #edf1ee;
+    color-scheme: dark;
+  }
+}
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: var(--aw-boot-bg);
+  color: var(--aw-boot-fg);
+  overflow: hidden;
+}
+#root { opacity: 0; }
+#aw-boot {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: transparent;
+  opacity: 1;
+  visibility: visible;
+}
+#aw-boot img {
+  width: 68px;
+  height: 68px;
+  display: block;
+  opacity: .92;
+}
+html.aw-app-ready #root {
+  opacity: 1;
+  transition: opacity 120ms ease;
+}
+html.aw-app-ready #aw-boot {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 120ms ease, visibility 0s linear 120ms;
+}
+@media (prefers-reduced-motion: reduce) {
+  html.aw-app-ready #root,
+  html.aw-app-ready #aw-boot { transition: none; }
+}
