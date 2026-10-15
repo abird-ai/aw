@@ -475,6 +475,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-state-example"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "aw-store",
+ "tokio",
+]
+
+[[package]]
 name = "aw-store"
 version = "0.15.0"
 dependencies = [

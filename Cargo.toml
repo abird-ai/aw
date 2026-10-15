@@ -43,6 +43,7 @@ members = [
     "crates/aw-surfaces",
     "examples/sdk-host",
     "examples/sdk-context",
+    "examples/sdk-state",
 ]
 
 [workspace.dependencies]
