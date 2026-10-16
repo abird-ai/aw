@@ -1,6 +1,6 @@
 # Release readiness
 
-Accepted/provenance checkpoint: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 This carries unfinished validation/distribution work, not release authorization.
 Source version 0.15.0, SQLite v33 and JSONL v1 are unchanged.
 

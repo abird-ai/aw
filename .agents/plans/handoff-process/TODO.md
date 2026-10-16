@@ -1,6 +1,6 @@
 # Simple TODO handoff process
 
-Accepted/provenance checkpoint: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 Implemented at `9e01369`; later results retain their own command/commit scope.
 
 ## Completed

@@ -9,7 +9,7 @@
    commits in the plan, then mark its index line done when nothing remains.
 
 The accepted historical checkpoint is
-`9f90e3df52ef684674ee9c103f157a2f5fbc07d3`. Use Git history for older detail;
+`47ee8a03abecbb3aee84a49c0a590096d76ed1a7`. Use Git history for older detail;
 there is no mandatory master reread, generated handoff or evidence archive.
 Unchecked work remains pending regardless of that acceptance.
 

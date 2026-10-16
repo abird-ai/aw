@@ -1,6 +1,6 @@
 # Remaining native and browser UX convergence
 
-Accepted/provenance checkpoint: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 
 Continue only authorized bounded slices after current validation. This is additive visual/interaction work, not permission to remove capabilities, implement another Agent or touch the separately owned UX subtree.
 

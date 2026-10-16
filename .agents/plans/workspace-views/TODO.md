@@ -1,6 +1,6 @@
 # Read-only Agent views and composable Files/Git
 
-Accepted/provenance checkpoint: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 
 Design only; no independent viewer/container implementation is claimed. Preserve [Domain authority](../../docs/DOMAIN-MODEL.md), [Workspace behavior](../../docs/WORKSPACE.md) and the existing Agent/SurfaceHost owners.
 

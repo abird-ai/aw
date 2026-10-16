@@ -6,7 +6,7 @@ Read the relevant live documentation under `.agents/docs/` and actual source
 before changing behavior. Git, source and executed tests outrank dated prose.
 There is no requirement to reconstruct or read old comprehensive handoffs.
 
-The user accepted `9f90e3df52ef684674ee9c103f157a2f5fbc07d3` as the checkpoint
+The user accepted `47ee8a03abecbb3aee84a49c0a590096d76ed1a7` as the checkpoint
 for previously verified work. That acceptance does not complete the unchecked
 tests, release or external gates in current plans.
 

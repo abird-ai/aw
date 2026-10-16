@@ -1,6 +1,6 @@
 # Plans
 
-Accepted history: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted history: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 Read one plan, keep agent-owned scratch checklists under `.agents/runs/`, and
 reconcile completion through the coordinator. Git retains older detail.
 

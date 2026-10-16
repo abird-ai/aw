@@ -1,6 +1,6 @@
 # Blocked restored-State authority prerequisites
 
-Accepted/provenance checkpoint: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 
 Design-only and blocked. No runnable activation, quarantine removal, final external-effect settlement or old Queue delivery is authorized. Keep the original Agent/TurnMachine/ToolPolicy/TurnJournal and Runtime, Actor, Message, Envelope with Next/Defer; snapshots and UI focus never mint authority.
 

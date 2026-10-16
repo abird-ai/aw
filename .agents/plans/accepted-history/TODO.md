@@ -1,6 +1,7 @@
 # Accepted source checkpoint and completed work
 
-Accepted/provenance checkpoint: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
+Other commit hashes in this historical record refer to the pre-rewrite history, preserved in the off-repo pre-rewrite bundle.
 
 The user accepted this Git checkpoint and requested concise TODOs instead of recursive handoffs and duplicated evidence. Git retains the original documents and commits. These checked items describe completed scope; pending validation and design stay in the linked plans.
 

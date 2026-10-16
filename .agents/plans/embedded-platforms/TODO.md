@@ -1,6 +1,6 @@
 # Optional embedded targets and independent certification
 
-Accepted/provenance checkpoint: `9f90e3df52ef684674ee9c103f157a2f5fbc07d3`.
+Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 
 Parked optional work; desktop/WASM/native ABI evidence does not certify hardware, hostile-network security or live billing. Reopen only when separately authorized.
 
