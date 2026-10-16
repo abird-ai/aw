@@ -111,19 +111,36 @@ continuation. Queues, approvals, routing and child Sessions compose over these.
 **Domain → Workspace → Session.** Sessions hold branches and immutable history;
 Machines/Fleets identify targets. Views cannot retarget running work.
 
-## FAQ
+## Engineering
 
-**Which providers?** Native Ollama, OpenAI Chat Completions/Responses, Anthropic,
-Gemini and explicit OpenAI-compatible endpoints. [Provider guide](crates/aw-providers/README.md).
+- [Runtime](.agents/docs/RUNTIME-FOUR-PRIMITIVES-AND-SERVICES-2026-10-11.md)
+- [Hook/trust policies](.agents/docs/RUNTIME-HOOKS-TRUST-AND-POLICY-2026-10-11.md)
+- [SDK](.agents/docs/SDK.md)
+- [C ABI](crates/aw-embedded-ffi/README.md)
+- [CLI](.agents/docs/CLI.md)
+- [State](.agents/docs/STATE.md)
+- [Validation/release TODOs](.agents/plans/release-readiness/TODO.md)
+- [Development handoff](.agents/plans/START_HERE.md)
 
-**Without SQLite or a UI?** Minimal uses JSONL; stateless uses memory. Rust/C hosts
-can embed the engine without terminal, HTTP or SQLite dependencies.
+Full builds are the default. Build minimal with:
 
-**Are extensions sandboxed?** Process extensions are explicitly started trusted
-programs. MCP discovery grants nothing; tool access requires exact host approval.
+```sh
+cargo build --locked -p aw-cli --bin aw --no-default-features --features minimal
+```
 
-**After a crash?** Receipts preserve known results and unknown outcomes. Restored
-backups cannot execute historical work.
+Omit `--features minimal` for stateless. Implementation detail lives in
+[.agents/docs](.agents/docs/) and [.agents/plans](.agents/plans/).
+
+Build and audit all release artifacts into a dedicated output directory:
+
+```sh
+bash scripts/build-release-artifacts.sh dist
+```
+
+The previous output is replaced atomically only after the new artifacts are
+staged. Build failures preserve it; directories containing unrelated files are
+refused. Cross-builds do not establish native Windows/macOS/ARM runtime
+qualification or authorize publication.
 
 ## Implementation status and roadmap
 
@@ -152,47 +169,25 @@ resource prefixes. Native and browser interaction, focus and visual checks are
 verified locally. Further UX v1.5 viewers, compound Files/Git views, docks and
 breakouts remain in the [workspace views plan](.agents/plans/workspace-views/TODO.md).
 
-## Engineering
+## FAQ
 
-[Runtime](.agents/docs/RUNTIME-FOUR-PRIMITIVES-AND-SERVICES-2026-10-11.md) ·
-[Hook/trust policies](.agents/docs/RUNTIME-HOOKS-TRUST-AND-POLICY-2026-10-11.md) ·
-[SDK](.agents/docs/SDK.md) · [C ABI](crates/aw-embedded-ffi/README.md) ·
-[CLI](.agents/docs/CLI.md) · [State](.agents/docs/STATE.md) ·
-[Validation/release TODOs](.agents/plans/release-readiness/TODO.md) ·
-[Development handoff](.agents/plans/START_HERE.md)
+**Which providers?** Native Ollama, OpenAI Chat Completions/Responses, Anthropic,
+Gemini and explicit OpenAI-compatible endpoints. [Provider guide](crates/aw-providers/README.md).
 
-Full builds are the default. Build minimal with:
+**Without SQLite or a UI?** Minimal uses JSONL; stateless uses memory. Rust/C hosts
+can embed the engine without terminal, HTTP or SQLite dependencies.
 
-```sh
-cargo build --locked -p aw-cli --bin aw --no-default-features --features minimal
-```
+**Are extensions sandboxed?** Process extensions are explicitly started trusted
+programs. MCP discovery grants nothing; tool access requires exact host approval.
 
-Omit `--features minimal` for stateless. Implementation detail lives in
-[.agents/docs](.agents/docs/) and [.agents/plans](.agents/plans/).
-
-On Linux x86_64, evaluate the five-platform release graph without compiling it:
-
-```sh
-nix build .#checks.x86_64-linux.release-evaluation --no-link
-```
-
-Build and audit all release artifacts into a dedicated output directory:
-
-```sh
-bash scripts/build-release-artifacts.sh dist
-```
-
-The previous output is replaced atomically only after the new artifacts pass
-the audit. Build or audit failures preserve it; directories containing unrelated
-files are refused. Cross-builds do not establish native Windows/macOS/ARM runtime
-qualification or authorize publication.
+**After a crash?** Receipts preserve known results and unknown outcomes. Restored
+backups cannot execute historical work.
 
 ## Contributing
 
 **We are building aw in the open with you.** We'd love your ideas, architectural
-challenges, research, and thoughtful improvements. I (**Prasanna Loganathar**)
-believe the best way to develop software is with human-led design and AI-led
-implementation. Bring a use case, reproducible failure or focused change.
+challenges, research, and thoughtful improvements. We believe the best way to
+develop software is with human-led design and AI-led implementation. Bring a use case, reproducible failure or focused change.
 
 ## AI disclosure
 
@@ -204,5 +199,5 @@ reproducible tests, engineering evidence, and continuous validation.
 
 ## License
 
-[MIT](LICENSE) © 2026 aw contributors. Third-party libraries and assets retain their
+[MIT](LICENSE) © 2026 Prasanna Loganathar and aw contributors. Third-party libraries and assets retain their
 respective licenses.
