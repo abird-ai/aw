@@ -1,0 +1,82 @@
+# Single checkpoint gate and product build.
+#
+# There is no validation harness or smoke/phase script: these are the same
+# commands recorded in the plan TODOs (see .agents/plans/TODO-SPEC.md). The
+# Nix dev shell supplies the pinned toolchain and the AW_BASH/AW_GIT values the
+# aw-tools and aw-git tests require.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Single checkpoint gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Format, Rust tests and web-model suites
+        run: |
+          nix develop --no-write-lock-file --command bash -c '
+            set -euo pipefail
+            cargo fmt --all -- --check
+            cargo test --workspace --locked
+            npm ci --prefix web --ignore-scripts --no-audit --no-fund
+            node --test tests/web_model.test.mjs tests/web_workspace.test.mjs \
+              tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs \
+              tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs
+          '
+
+  build:
+    name: Nix product build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build the aw binary
+        run: |
+          set -euo pipefail
+          out=$(nix build .#aw --no-link --print-out-paths --no-update-lock-file)
+          cp "$out/bin/aw" aw-binary
+          ./aw-binary --version
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aw-binary-${{ github.run_id }}
+          path: aw-binary
+          if-no-files-found: error
+          retention-days: 14
