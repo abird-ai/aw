@@ -17,6 +17,27 @@ pub mod scoped_fs;
 
 pub const FAMILY: &str = "unix";
 
+/// An observed directory identity, retained without locking its pathname.
+/// Callers must still account for external writers racing a later path operation.
+#[derive(Debug)]
+pub struct DirectoryIdentity(File);
+impl DirectoryIdentity {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(Self(file))
+    }
+
+    pub fn is_current(&self, path: &Path) -> io::Result<bool> {
+        let current = Self::open(path)?;
+        let original = self.0.metadata()?;
+        let current = current.0.metadata()?;
+        Ok(original.dev() == current.dev() && original.ino() == current.ino())
+    }
+}
+
 pub fn local_principal() -> io::Result<String> {
     // SAFETY: geteuid has no arguments or memory-safety preconditions.
     Ok(format!("unix:{}", unsafe { libc::geteuid() }))

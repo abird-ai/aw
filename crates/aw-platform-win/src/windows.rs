@@ -20,7 +20,8 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, MOVEFILE_REPLACE_EXISTING,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH,
     },
     System::Threading::{
@@ -32,6 +33,46 @@ use windows_sys::Win32::{
 pub mod scoped_fs;
 
 pub const FAMILY: &str = "windows";
+
+/// An observed directory identity, retained without denying external renames.
+/// Identity validation does not lock a later pathname-based operation.
+#[derive(Debug)]
+pub struct DirectoryIdentity(File);
+impl DirectoryIdentity {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory identity requires a directory without a reparse point",
+            ));
+        }
+        Ok(Self(file))
+    }
+
+    pub fn is_current(&self, path: &Path) -> io::Result<bool> {
+        fn identity(file: &File) -> io::Result<(u32, u64)> {
+            // SAFETY: the handle remains owned by file and info is writable.
+            unsafe {
+                let mut info = std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>();
+                if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok((
+                    info.dwVolumeSerialNumber,
+                    (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+                ))
+            }
+        }
+        let current = Self::open(path)?;
+        Ok(identity(&self.0)? == identity(&current.0)?)
+    }
+}
 
 fn win_error() -> io::Error {
     io::Error::last_os_error()
@@ -304,4 +345,63 @@ pub fn trusted_direct_filesystem_supported(_path: &Path) -> io::Result<bool> {
 
 pub fn secure_private_files_supported() -> bool {
     false
+}
+
+#[cfg(test)]
+mod directory_identity_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "aw-directory-identity-{}-{stamp}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn opened_directory_identity_survives_ordinary_child_changes() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("directory");
+        fs::create_dir(&directory).unwrap();
+        let identity = DirectoryIdentity::open(&directory).unwrap();
+        assert!(identity.is_current(&directory).unwrap());
+        fs::write(directory.join("child"), b"first").unwrap();
+        fs::write(directory.join("child"), b"second").unwrap();
+        assert!(identity.is_current(&directory).unwrap());
+        assert!(DirectoryIdentity::open(&directory.join("child")).is_err());
+    }
+
+    #[test]
+    fn observed_identity_allows_rename_and_rejects_same_path_replacement() {
+        let fixture = Fixture::new();
+        let original = fixture.0.join("directory");
+        let moved = fixture.0.join("retained");
+        fs::create_dir(&original).unwrap();
+        let identity = DirectoryIdentity::open(&original).unwrap();
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        assert!(!identity.is_current(&original).unwrap());
+        assert!(identity.is_current(&moved).unwrap());
+        assert!(DirectoryIdentity::open(&original)
+            .unwrap()
+            .is_current(&original)
+            .unwrap());
+    }
 }

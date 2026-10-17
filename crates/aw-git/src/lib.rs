@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -162,7 +163,15 @@ pub struct Repository {
     git: PathBuf,
     root: PathBuf,
     common: PathBuf,
+    git_dir: PathBuf,
+    identity: Option<Arc<RepositoryIdentity>>,
     timeout: Duration,
+}
+#[derive(Debug)]
+struct RepositoryIdentity {
+    root: aw_platform::DirectoryIdentity,
+    git_dir: aw_platform::DirectoryIdentity,
+    common: aw_platform::DirectoryIdentity,
 }
 #[derive(Clone, Debug)]
 pub struct Review {
@@ -220,6 +229,8 @@ impl Repository {
             git,
             root: directory.as_ref().canonicalize()?,
             common: PathBuf::new(),
+            git_dir: PathBuf::new(),
+            identity: None,
             timeout: Duration::from_secs(10),
         };
         let top = repo.run(
@@ -234,6 +245,14 @@ impl Repository {
             false,
         )?;
         repo.common = output_path(&common)?.canonicalize()?;
+        let git_dir = repo.run(&["rev-parse", "--absolute-git-dir"], None, false)?;
+        repo.git_dir = output_path(&git_dir)?.canonicalize()?;
+        repo.identity = Some(Arc::new(RepositoryIdentity {
+            root: aw_platform::DirectoryIdentity::open(&repo.root)?,
+            git_dir: aw_platform::DirectoryIdentity::open(&repo.git_dir)?,
+            common: aw_platform::DirectoryIdentity::open(&repo.common)?,
+        }));
+        repo.validate_binding()?;
         Ok(repo)
     }
     pub fn root(&self) -> &Path {
@@ -244,6 +263,45 @@ impl Repository {
     }
     pub fn git(&self) -> &Path {
         &self.git
+    }
+    /// Reject an observed checkout/admin-directory replacement or changed Git
+    /// mapping. These retained identities are observations, not filesystem locks:
+    /// non-cooperating external writers can still race a subsequent Git process.
+    pub fn validate_binding(&self) -> Result<()> {
+        self.validate_directories()?;
+        for (args, expected) in [
+            (
+                &["rev-parse", "--path-format=absolute", "--show-toplevel"][..],
+                &self.root,
+            ),
+            (&["rev-parse", "--absolute-git-dir"][..], &self.git_dir),
+            (
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"][..],
+                &self.common,
+            ),
+        ] {
+            let actual = output_path(&self.run(args, None, false)?)?.canonicalize()?;
+            if &actual != expected {
+                return Err(Error::Invalid(
+                    "repository mapping changed; reopen explicitly",
+                ));
+            }
+        }
+        self.validate_directories()
+    }
+
+    fn validate_directories(&self) -> Result<()> {
+        if let Some(identity) = &self.identity {
+            if !identity.root.is_current(&self.root)?
+                || !identity.git_dir.is_current(&self.git_dir)?
+                || !identity.common.is_current(&self.common)?
+            {
+                return Err(Error::Invalid(
+                    "repository directory changed; reopen explicitly",
+                ));
+            }
+        }
+        Ok(())
     }
     pub fn status(&self) -> Result<Status> {
         self.guard_local_content()?;
@@ -261,6 +319,7 @@ impl Repository {
         )?)
     }
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
+        self.validate_binding()?;
         parse_worktrees(&self.run(&["worktree", "list", "--porcelain", "-z"], None, false)?)
     }
 
@@ -380,6 +439,7 @@ impl Repository {
         Ok(next)
     }
     pub fn branches(&self) -> Result<Vec<Branch>> {
+        self.validate_binding()?;
         parse_branches(&self.run(
             &[
                 "for-each-ref",
@@ -532,6 +592,7 @@ impl Repository {
     /// review, then apply precisely those reviewed bytes to the index, never the
     /// worktree. External writers can race; Git's cached preimage check is final.
     pub fn apply_index(&self, review: &Review, action: IndexAction) -> Result<()> {
+        self.validate_binding()?;
         if review.root != self.root || !review.can_apply(action) {
             return Err(Error::Unsupported("this review cannot be staged/unstaged"));
         }
@@ -552,6 +613,7 @@ impl Repository {
         check.push("-");
         self.run(&check, Some(&review.patch), false)?;
         args.push("-");
+        self.validate_binding()?;
         match self.run(&args, Some(&review.patch), false) {
             Ok(_) => Ok(()),
             Err(Error::Exit(code)) => Err(Error::Exit(code)),
@@ -559,6 +621,7 @@ impl Repository {
         }
     }
     fn guard_local_content(&self) -> Result<()> {
+        self.validate_binding()?;
         // Git diff may invoke clean/process filters even with --no-textconv.
         // Refuse rather than changing the repository's conversion semantics.
         let filters = self.run(
@@ -674,6 +737,7 @@ impl Repository {
         )
     }
     fn run_os(&self, args: &[OsString], input: Option<&[u8]>, allow_one: bool) -> Result<Vec<u8>> {
+        self.validate_directories()?;
         process::run(&self.git, &self.root, args, input, self.timeout, allow_one)
     }
 }

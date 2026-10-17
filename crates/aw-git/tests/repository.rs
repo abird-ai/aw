@@ -124,6 +124,78 @@ fn stale_review_is_rejected() {
         Err(Error::Stale)
     ));
 }
+
+#[test]
+fn retained_repository_rejects_same_path_checkout_replacement() {
+    let f = Fixture::new();
+    f.write("a.txt", b"changed\n");
+    let repo = f.repo();
+    let change = f.entry(ChangeGroup::Unstaged);
+    let review = repo.review(&change).unwrap();
+    let retained = f.parent.join("retained");
+    std::fs::rename(&f.root, &retained).unwrap();
+    std::fs::create_dir(&f.root).unwrap();
+    f.run(&["init", "--initial-branch=main"]);
+    f.write("a.txt", b"replacement\n");
+    let replacement_index = f.run(&["ls-files", "--stage"]).stdout;
+    assert!(repo.status().is_err());
+    assert!(repo.review(&change).is_err());
+    assert!(repo.apply_index(&review, IndexAction::Stage).is_err());
+    assert_eq!(f.run(&["ls-files", "--stage"]).stdout, replacement_index);
+    assert_eq!(
+        std::fs::read(f.root.join("a.txt")).unwrap(),
+        b"replacement\n"
+    );
+    assert_eq!(std::fs::read(retained.join("a.txt")).unwrap(), b"changed\n");
+}
+
+#[test]
+fn retained_repository_rejects_replaced_admin_directory() {
+    let f = Fixture::new();
+    f.write("a.txt", b"changed\n");
+    let repo = f.repo();
+    let review = repo.review(&f.entry(ChangeGroup::Unstaged)).unwrap();
+    let original_admin = f.parent.join("original-admin");
+    std::fs::rename(f.root.join(".git"), original_admin).unwrap();
+    f.run(&["init", "--initial-branch=main"]);
+    let replacement_index = f.run(&["ls-files", "--stage"]).stdout;
+    assert!(repo.validate_binding().is_err());
+    assert!(repo.worktrees().is_err());
+    assert!(repo.branches().is_err());
+    assert!(repo.apply_index(&review, IndexAction::Stage).is_err());
+    assert_eq!(f.run(&["ls-files", "--stage"]).stdout, replacement_index);
+}
+
+#[test]
+fn retained_worktree_rejects_repointed_git_file_with_original_directories_alive() {
+    let f = Fixture::new();
+    let first = f.parent.join("first");
+    let second = f.parent.join("second");
+    f.run(&["worktree", "add", "-b", "first", first.to_str().unwrap()]);
+    f.run(&["worktree", "add", "-b", "second", second.to_str().unwrap()]);
+    std::fs::write(first.join("a.txt"), b"first\n").unwrap();
+    let repo = Repository::discover(&f.git, &first).unwrap();
+    let change = repo.status().unwrap().changes.remove(0);
+    let review = repo.review(&change).unwrap();
+    let first_index = std::fs::read(f.root.join(".git/worktrees/first/index")).unwrap();
+    let second_index = std::fs::read(f.root.join(".git/worktrees/second/index")).unwrap();
+    std::fs::write(
+        first.join(".git"),
+        std::fs::read(second.join(".git")).unwrap(),
+    )
+    .unwrap();
+    assert!(repo.validate_binding().is_err());
+    assert!(repo.status().is_err());
+    assert!(repo.apply_index(&review, IndexAction::Stage).is_err());
+    assert_eq!(
+        std::fs::read(f.root.join(".git/worktrees/first/index")).unwrap(),
+        first_index
+    );
+    assert_eq!(
+        std::fs::read(f.root.join(".git/worktrees/second/index")).unwrap(),
+        second_index
+    );
+}
 #[test]
 fn untracked_snapshot_is_staged_as_reviewed() {
     let f = Fixture::new();
