@@ -2,6 +2,7 @@
 // is correlation, not a capability. Receiver independently authenticates and
 // reads the exact retained source before accepting. No plaintext or grants
 // cross browser windows in a message or ticket.
+import { boundedPresentation, documentFingerprint } from "./document-presentation.js";
 const ticketSyntax = /^[a-f0-9]{64}$/u;
 const opaqueIdSyntax = /^[A-Za-z0-9_-]{1,128}$/u;
 const MAX_WAIT_MS = 90_000;
@@ -17,14 +18,24 @@ export function createDocumentDocking({
   api, views, currentOwner, select, close, popup,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   timeoutMs = MAX_WAIT_MS, onProgress = () => {}, isRendered = () => true,
+  capture = () => null, restore = async () => true,
   navigate = (window, ticket) => {
     window.opener = null;
     window.location.replace(new URL("#aw-dock=" + ticket, location.href).href);
   },
 }) {
-  if ([api, currentOwner, select, close, popup, sleep, onProgress, isRendered, navigate]
+  if ([api, currentOwner, select, close, popup, sleep, onProgress, isRendered, capture, restore, navigate]
     .some(callback => typeof callback !== "function")) throw new Error("Read-only document docking needs original-browser callbacks.");
   let disposed = false;
+  let staged = null;
+  // Called on the real button's pointerdown before browser focus moves away
+  // from Find/the editor. Keyboard actions capture at send as a fallback.
+  function stage(documentId) {
+    staged = { documentId, snapshot: capture(documentId), createdAt: Date.now() };
+  }
+  function cancelStage(documentId) {
+    if (staged?.documentId === documentId) staged = null;
+  }
   const ownerMatches = expected => {
     const now = currentOwner();
     return !disposed && now?.source_id === expected.source_id
@@ -52,6 +63,12 @@ export function createDocumentDocking({
         ...source, kind, source_id: target.source_id, scope_id: target.scope_id,
       })) throw new Error("Only a currently authorized, loaded File or immutable Review can move to another window.");
     const initial = document;
+    // A pointer press can be cancelled before click. Never reuse a stale
+    // captured Find/caret from a previous gesture or different document.
+    const captured = staged?.documentId === documentId
+      && Date.now() - staged.createdAt <= 2000
+      ? staged.snapshot : capture(documentId);
+    staged = null;
     const expected = { ...source };
     const originalContainer = initial.containerId;
     const originalResource = exactResource;
@@ -59,7 +76,7 @@ export function createDocumentDocking({
       const active = views.getDocument(documentId);
       return ownerMatches(expected) && active
         && active.containerId === originalContainer && active.target === initial.target
-        && active.kind === kind && !active.unavailable && active.data
+        && active.kind === kind && !active.unavailable && active.data === initial.data
         && (kind !== "review" || active.data.id === originalResource);
     };
     const nextWindow = popup(); // Must execute during the direct user click.
@@ -67,6 +84,13 @@ export function createDocumentDocking({
     let origin, ticket, released = false, navigated = false;
     onProgress(documentId, true);
     try {
+      // The browser computes the digest from already-authorized local data.
+      // No plaintext is included in server ticket metadata or popup URL.
+      const presentation = captured ? boundedPresentation(kind, {
+        ...captured, version: 1,
+        fingerprint: await documentFingerprint(kind, initial.data),
+      }) : null;
+      if (!sameDocument()) throw new Error("The original document changed during handoff.");
       origin = await api("/api/dock/register", {});
       if (!sameDocument() || origin.source_id !== expected.source_id
         || origin.scope_id !== expected.scope_id || origin.owner_epoch !== expected.owner_epoch) {
@@ -77,6 +101,7 @@ export function createDocumentDocking({
         owner_epoch: expected.owner_epoch, source_id: expected.source_id,
         scope_id: target.scope_id, document_id: documentId,
         ...(kind === "file" ? { path: originalResource } : { review_id: originalResource }),
+        ...(presentation ? { presentation } : {}),
       });
       ticket = prepared.ticket;
       if (!ticketSyntax.test(ticket)) throw new Error("Invalid owner handoff identity.");
@@ -157,6 +182,23 @@ export function createDocumentDocking({
         // The new browser performs its own authorized read and renders the
         // result before asking the owner to accept the transfer.
         if (!item.pending && item.data && isRendered(documentId)) {
+          if (description.presentation) {
+            const presentation = boundedPresentation(kind, description.presentation);
+            const fingerprint = await documentFingerprint(kind, item.data);
+            if (fingerprint !== presentation.fingerprint) {
+              throw new Error("The source content changed during handoff; refresh the original document and retry.");
+            }
+            if (!await restore(documentId, presentation)) {
+              throw new Error("Receiving editor is no longer available to restore.");
+            }
+            // Restoration awaits receiver layout; deny a closed/replaced view
+            // or a changed workspace before accepting the single-use ticket.
+            const current = views.getDocument(documentId);
+            if (!ownerMatches(description) || current !== item
+              || !isRendered(documentId)) {
+              throw new Error("Receiving document changed during presentation restoration.");
+            }
+          }
           acceptanceAttempted = true;
           const result = await api("/api/dock/accept", body);
           if (result.state !== "accepted") {
@@ -187,5 +229,5 @@ export function createDocumentDocking({
     }
   }
 
-  return Object.freeze({ send, receive, dispose() { disposed = true; } });
+  return Object.freeze({ stage, cancelStage, send, receive, dispose() { disposed = true; staged = null; } });
 }

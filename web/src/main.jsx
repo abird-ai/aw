@@ -1793,6 +1793,11 @@ function App() {
   const [workspaceSource, setWorkspaceSource] = createSignal(null);
   const [workspaceToken, setWorkspaceToken] = createSignal({});
   const [selectedContainers, setSelectedContainers] = createSignal({ files: null, git: null });
+  const presentationControllers = new Map();
+  const bindPresentation = (documentId, controller) => {
+    if (controller) presentationControllers.set(documentId, controller);
+    else presentationControllers.delete(documentId);
+  };
   const workspaceViews = createWorkspaceViews({
     request: async (body, { signal }) => {
       const lifetime = observationLifetime;
@@ -1804,6 +1809,7 @@ function App() {
     },
     externalDocumentCount: () => tabs().filter(tab => tab.kind !== "file" && tab.kind !== "review").length,
     onChange: event => untrack(() => {
+      if (event.type === "clear" || event.type === "source") presentationControllers.clear();
       setWorkspaceChange({});
       const documents = workspaceViews.listDocuments();
       const live = new Set(documents.map(document => document.id));
@@ -1837,6 +1843,8 @@ function App() {
   }
   const documentDocking = createDocumentDocking({
     api, views: workspaceViews,
+    capture: documentId => presentationControllers.get(documentId)?.capture() || null,
+    restore: (documentId, state) => presentationControllers.get(documentId)?.restore(state) || false,
     currentOwner: () => {
       const scope = workspaceSource(), owner = snapshot();
       return scope && owner ? {
@@ -2473,6 +2481,7 @@ function App() {
   });
   onCleanup(() => {
     documentDocking.dispose();
+    presentationControllers.clear();
     observationLifetime = {};
     const previous = source;
     source = null;
@@ -3177,6 +3186,9 @@ function App() {
                           ? "Move this immutable Git Review into another authenticated browser window"
                           : "Move this read-only File into another authenticated browser window"}
                         disabled={Boolean(dockingDocument())}
+                        onPointerDown={() => documentDocking.stage(id)}
+                        onPointerLeave={() => documentDocking.cancelStage(id)}
+                        onPointerCancel={() => documentDocking.cancelStage(id)}
                         onClick={() => void documentDocking.send(id).catch(error => setError(error.message))}>
                         <Icon name="popout" size={13} />
                       </button>
@@ -3186,8 +3198,10 @@ function App() {
                   <Show when={document()?.pending}><div class="document-state" role="status">Loading…</div></Show>
                   <Show when={document()?.error}><div class="document-state" role="status">{document().error}</div></Show>
                   <Show when={data()} fallback={<div class="navigator-empty">{document()?.pending ? "" : "This document is unavailable. Refresh to try again."}</div>}>
-                    <Show when={document()?.kind === "file"} fallback={<CodeDiff review={data()} active={activeTab() === id} onCheckAccess={checkAccess} />}>
-                      <CodeFile text={data()?.text || ""} path={data()?.path || ""} active={activeTab() === id} onCheckAccess={checkAccess} />
+                    <Show when={document()?.kind === "file"} fallback={<CodeDiff review={data()} active={activeTab() === id} onCheckAccess={checkAccess}
+                      onPresentationReady={controller => bindPresentation(id, controller)} />}>
+                      <CodeFile text={data()?.text || ""} path={data()?.path || ""} active={activeTab() === id} onCheckAccess={checkAccess}
+                        onPresentationReady={controller => bindPresentation(id, controller)} />
                     </Show>
                   </Show>
                 </div>;

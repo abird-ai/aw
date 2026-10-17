@@ -421,3 +421,83 @@ async fn declined_receiver_aborts_pending_handoff_without_erasing_other_views() 
         before
     );
 }
+
+fn synthetic_file_presentation(text: &str) -> serde_json::Value {
+    let digest = hash(format!("file\0{text}").as_bytes())
+        .iter().map(|b| format!("{b:02x}")).collect::<String>();
+    serde_json::json!({"version":1,"fingerprint":digest,"query":"not HTML",
+        "selected":0,"focus":"find",
+        "panes":[{"anchor":3,"head":7,"from":1,"top":245,"left":0}]})
+}
+#[tokio::test]
+async fn file_presentation_is_bounded_and_rechecked_on_owner_read_and_release() {
+    let (router,state,calls,root)=surface_app();
+    let cookie=paired(&router).await;
+    let origin=dock_window(&router,&cookie).await;
+    let receiver=dock_window(&router,&cookie).await;
+    let original=std::fs::read_to_string(root.0.join("sample.rs")).unwrap();
+    let view=synthetic_file_presentation(&original);
+    let mut prepared_body=prepare_body(&origin,"sample.rs");
+    prepared_body["presentation"]=view.clone();
+    let (status,prepared)=request_dock(&router,Some(&cookie),"prepare",prepared_body).await;
+    assert_eq!(status,StatusCode::OK,"{prepared}");
+    assert!(prepared.get("presentation").is_none(),"sender does not receive search query");
+    let ticket=prepared["ticket"].as_str().unwrap();
+    let origin_env=credentials(&origin,ticket);
+    let receiver_env=credentials(&receiver,ticket);
+    let (status,descriptor)=request_dock(&router,Some(&cookie),"inspect",receiver_env.clone()).await;
+    assert_eq!(status,StatusCode::OK);
+    assert_eq!(descriptor["presentation"],view);
+    assert!(!descriptor.to_string().contains(&original),"source plaintext never transferred");
+    std::fs::write(root.0.join("sample.rs"),"changed authorized source bytes").unwrap();
+    assert_eq!(request_dock(&router,Some(&cookie),"accept",receiver_env.clone()).await.0,
+        StatusCode::CONFLICT);
+    assert_eq!(request_dock(&router,Some(&cookie),"status",origin_env.clone()).await.1["state"],
+        "prepared");
+    std::fs::write(root.0.join("sample.rs"),&original).unwrap();
+    assert_eq!(request_dock(&router,Some(&cookie),"accept",receiver_env).await.0,StatusCode::OK);
+    std::fs::write(root.0.join("sample.rs"),"changed after receiver accepted").unwrap();
+    assert_eq!(request_dock(&router,Some(&cookie),"release",origin_env.clone()).await.0,
+        StatusCode::CONFLICT);
+    std::fs::write(root.0.join("sample.rs"),&original).unwrap();
+    assert_eq!(request_dock(&router,Some(&cookie),"release",origin_env).await.1["state"],
+        "released");
+    assert!(lock(&state.0.session.persistence).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst),0);
+}
+#[tokio::test]
+async fn malformed_presentation_rejected_before_ticket_admission() {
+    let (router,_state,calls,root)=surface_app();
+    let cookie=paired(&router).await;
+    let origin=dock_window(&router,&cookie).await;
+    let data=std::fs::read_to_string(root.0.join("sample.rs")).unwrap();
+    let valid=synthetic_file_presentation(&data);
+    for (key,replacement) in [
+        ("version",serde_json::json!(2)),
+        ("fingerprint",serde_json::json!("e".repeat(63))),
+        ("fingerprint",serde_json::json!("G".repeat(64))),
+        ("query",serde_json::json!("long".repeat(150))),
+        ("query",serde_json::json!("contains\nnewline")),
+        ("selected",serde_json::json!(4096)),
+        ("selected",serde_json::json!(-2)),
+        ("focus",serde_json::json!("pane1")),
+        ("focus",serde_json::json!("invalid")),
+        ("panes",serde_json::json!([])),
+        ("panes",serde_json::json!([{"anchor":4194305,"head":0,"from":0,"top":0,"left":0}])),
+        ("panes",serde_json::json!([{"anchor":0,"head":0,"from":0,"top":33554433,"left":0}])),
+    ] {
+        let mut presentation=valid.clone();
+        presentation[key]=replacement;
+        let mut body=prepare_body(&origin,"sample.rs");
+        body["presentation"]=presentation;
+        assert_eq!(request_dock(&router,Some(&cookie),"prepare",body).await.0,
+            StatusCode::BAD_REQUEST,"{key}");
+    }
+    let mut extra=prepare_body(&origin,"sample.rs");
+    let mut presentation=valid;
+    presentation["content"]=serde_json::json!("source text not permitted");
+    extra["presentation"]=presentation;
+    assert_eq!(request_dock(&router,Some(&cookie),"prepare",extra).await.0,
+        StatusCode::BAD_REQUEST);
+    assert_eq!(calls.load(Ordering::SeqCst),0);
+}

@@ -232,6 +232,10 @@ function scrubEditor(view) {
 function labelAttributes(label) {
   return EditorView.contentAttributes.of({
     "aria-label": label,
+    // A read-only CodeMirror document must still admit keyboard focus,
+    // navigation and selection. EditorState.readOnly and editable:false
+    // remain enforced; this does not grant write permission.
+    tabindex: "0",
     spellcheck: "false",
   });
 }
@@ -320,6 +324,17 @@ function createCodeFind(views) {
     paint();
   }
   function focus() { input?.focus(); input?.select(); }
+  function focusRestored() { input?.focus({ preventScroll: true }); }
+  function capture() {
+    return { query: query(), selected: selected(), focused: document.activeElement === input };
+  }
+  function restore(queryValue, selectedIndex) {
+    // Never implicitly reveal the first match: the independently restored
+    // viewport, caret and pane focus are the explicit presentation authority.
+    setQuery(queryValue);
+    setSelected(selectedIndex);
+    rebuild(false);
+  }
   function Toolbar() {
     return <div class="code-find" role="search" aria-label="Find in this document">
       <input ref={input} aria-label="Find in this document" placeholder="Find in this document" maxlength="512" value={query()}
@@ -334,7 +349,56 @@ function createCodeFind(views) {
       <button class="mini-icon" type="button" aria-label="Clear Find" disabled={!query()} onClick={clear}>×</button>
     </div>;
   }
-  return { Toolbar, rebuild, clear, focus };
+  return { Toolbar, rebuild, clear, focus, focusRestored, capture, restore };
+}
+
+function captureCodePresentation(views, find) {
+  const panes = views();
+  if (!panes.length || panes.some(view => view.destroyed)) return null;
+  const search = find.capture();
+  const focused = panes.findIndex(view => view.hasFocus);
+  return {
+    query: search.query, selected: search.selected,
+    focus: search.focused ? "find" : focused < 0 ? "none" : `pane${focused}`,
+    panes: panes.map(view => ({
+      anchor: view.state.selection.main.anchor,
+      head: view.state.selection.main.head,
+      from: view.viewport.from,
+      top: Math.round(view.scrollDOM.scrollTop),
+      left: Math.round(view.scrollDOM.scrollLeft),
+    })),
+  };
+}
+async function restoreCodePresentation(views, find, snapshot) {
+  const panes = views();
+  if (!snapshot || panes.length !== snapshot.panes.length
+    || panes.some(view => view.destroyed)
+    || snapshot.panes.some((pane, index) => pane.anchor > panes[index].state.doc.length
+      || pane.head > panes[index].state.doc.length
+      || pane.from > panes[index].state.doc.length)) {
+    throw new Error("The original editor positions no longer match this document.");
+  }
+  find.restore(snapshot.query, snapshot.selected);
+  for (let index = 0; index < panes.length; index++) {
+    const pane = snapshot.panes[index];
+    panes[index].dispatch({ selection: { anchor: pane.anchor, head: pane.head } });
+  }
+  // Wait until the *receiver* CodeMirror owns/layouts its independently read
+  // document. A different viewport may clamp pixel offsets, but the selected
+  // text positions are always exact to the verified document fingerprint.
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  for (let index = 0; index < panes.length; index++) {
+    const view = panes[index];
+    if (view.destroyed) throw new Error("Receiving editor was closed.");
+    const pane = snapshot.panes[index];
+    view.scrollDOM.scrollTop = pane.top;
+    view.scrollDOM.scrollLeft = pane.left;
+    view.requestMeasure();
+  }
+  if (snapshot.focus === "find") find.focusRestored();
+  else if (snapshot.focus === "pane0") panes[0]?.focus();
+  else if (snapshot.focus === "pane1") panes[1]?.focus();
+  return true;
 }
 
 function ownEditorLifecycle(props, host, views, find) {
@@ -412,6 +476,10 @@ export function CodeFile(props) {
     lifecycle.attach();
     void applyShiki(view, props.path);
     find.rebuild();
+    props.onPresentationReady?.({
+      capture: () => captureCodePresentation(views, find),
+      restore: value => restoreCodePresentation(views, find, value),
+    });
     window.addEventListener(THEME_EVENT, recolor);
   });
 
@@ -437,6 +505,7 @@ export function CodeFile(props) {
   });
 
   onCleanup(() => {
+    props.onPresentationReady?.(null);
     window.removeEventListener(THEME_EVENT, recolor);
     const retired = view;
     view = null;
@@ -504,6 +573,10 @@ export function CodeDiff(props) {
   onMount(() => {
     mounted = true;
     rerender();
+    props.onPresentationReady?.({
+      capture: () => captureCodePresentation(views, find),
+      restore: value => restoreCodePresentation(views, find, value),
+    });
     window.addEventListener(THEME_EVENT, recolor);
   });
   createEffect(() => {
@@ -511,6 +584,7 @@ export function CodeDiff(props) {
     rerender();
   });
   onCleanup(() => {
+    props.onPresentationReady?.(null);
     window.removeEventListener(THEME_EVENT, recolor);
     currentReview = null;
     const retired = merge;

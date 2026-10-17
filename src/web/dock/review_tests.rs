@@ -225,3 +225,49 @@ async fn review_dock_rejects_evicted_immutable_snapshot_without_reopening_invent
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(receiver["window_proof"].as_str().is_some());
 }
+
+#[tokio::test]
+async fn retained_review_presentation_preserves_two_bounded_panes_without_content_in_ticket() {
+    let (router, state, calls, root) = surface_app();
+    let cookie = paired(&router).await;
+    init_review_fixture(&root.0);
+    let origin = dock_window(&router, &cookie).await;
+    let receiver = dock_window(&router, &cookie).await;
+    let scope = origin["scope_id"].as_str().unwrap();
+    let review = retained_review(&router, &cookie, &origin, scope).await;
+    let id = review["id"].as_str().unwrap();
+    let meta = serde_json::json!({
+        "version":1,"fingerprint":"b".repeat(64),"query":"alpha",
+        "selected":0,"focus":"pane1",
+        "panes":[
+            {"anchor":0,"head":3,"from":0,"top":200,"left":8},
+            {"anchor":7,"head":12,"from":4,"top":340,"left":18},
+        ],
+    });
+    let mut prepared_request = review_prepare_body(&origin, scope, id);
+    prepared_request["presentation"] = meta.clone();
+    let (status, prepared) = request_dock(
+        &router, Some(&cookie), "prepare-review", prepared_request,
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    let ticket = prepared["ticket"].as_str().unwrap();
+    let (status, description) = request_dock(
+        &router, Some(&cookie), "inspect", credentials(&receiver,ticket),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(description["presentation"], meta);
+    assert_eq!(description["review_id"], id);
+    assert!(!description.to_string().contains("synthetic retained change alpha"));
+    let mut malformed = review_prepare_body(&origin, scope, id);
+    let mut one_pane = meta.clone();
+    one_pane["panes"] = serde_json::json!([{"anchor":0,"head":0,"from":0,"top":0,"left":0}]);
+    malformed["presentation"] = one_pane;
+    assert_eq!(request_dock(&router, Some(&cookie), "prepare-review", malformed).await.0,
+        StatusCode::BAD_REQUEST);
+    assert_eq!(request_dock(&router, Some(&cookie), "accept",
+        credentials(&receiver,ticket)).await.0, StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&cookie), "release",
+        credentials(&origin,ticket)).await.0, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(lock(&state.0.session.persistence).is_none());
+}

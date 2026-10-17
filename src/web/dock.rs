@@ -5,6 +5,7 @@ use super::*;
 use aw_surfaces::{Command, ViewRequest};
 use axum::extract::rejection::JsonRejection;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 const MAX_WINDOWS: usize = 24;
@@ -31,6 +32,7 @@ struct Ticket {
     scope_id: String,
     owner_epoch: String,
     resource: Resource,
+    presentation: Option<Presentation>,
     deadline: Instant,
     phase: Phase,
 }
@@ -55,6 +57,64 @@ impl Resource {
                 serde_json::json!({"kind":"review","review_id":review_id})
             }
         }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Presentation {
+    version: u8,
+    fingerprint: String,
+    query: String,
+    selected: i32,
+    focus: PresentationFocus,
+    panes: Vec<PresentationPane>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PresentationFocus {
+    None,
+    Find,
+    Pane0,
+    Pane1,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PresentationPane {
+    anchor: u32,
+    head: u32,
+    from: u32,
+    top: u32,
+    left: u32,
+}
+impl Presentation {
+    fn valid_for(&self, resource: &Resource) -> bool {
+        const MAX_OFFSET: u32 = 4 * 1024 * 1024;
+        self.version == 1
+            && self.fingerprint.len() == 64
+            && self
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && self.query.len() <= 1024
+            && self.query.encode_utf16().count() <= 512
+            && !self.query.chars().any(char::is_control)
+            && (-1..=4095).contains(&self.selected)
+            && self.panes.len()
+                == if matches!(resource, Resource::File { .. }) {
+                    1
+                } else {
+                    2
+                }
+            && !(matches!(resource, Resource::File { .. })
+                && matches!(self.focus, PresentationFocus::Pane1))
+            && self.panes.iter().all(|pane| {
+                pane.anchor <= MAX_OFFSET
+                    && pane.head <= MAX_OFFSET
+                    && pane.from <= MAX_OFFSET
+                    && pane.top <= 32 * 1024 * 1024
+                    && pane.left <= MAX_OFFSET
+            })
     }
 }
 
@@ -120,6 +180,8 @@ pub(super) struct Prepare {
     scope_id: String,
     document_id: String,
     path: String,
+    #[serde(default)]
+    presentation: Option<Presentation>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +193,8 @@ pub(super) struct PrepareReview {
     scope_id: String,
     document_id: String,
     review_id: String,
+    #[serde(default)]
+    presentation: Option<Presentation>,
 }
 
 #[derive(Deserialize)]
@@ -219,6 +283,7 @@ async fn reauthorize_view(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
     let source = ticket.source_id.clone();
     let scope = ticket.scope_id.clone();
     let resource = ticket.resource.clone();
+    let presentation = ticket.presentation.clone();
     let owner = app.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -239,6 +304,29 @@ async fn reauthorize_view(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
                 || auth_alive(&owner),
             )
             .map_err(|_| ApiError(StatusCode::FORBIDDEN, "original view no longer authorized"))?;
+        // A source that changed after the sender captured its editor must
+        // not release that view merely because the File is still readable.
+        // The comparison is on the authenticated *owner* read, not a browser
+        // label or the receiver's unsupervised assertion.
+        if let (Resource::File { .. }, Some(expected)) = (&resource, &presentation) {
+            let text = projected["result"]["text"].as_str().ok_or(ApiError(
+                StatusCode::CONFLICT,
+                "original File snapshot changed",
+            ))?;
+            let mut bytes = Vec::with_capacity(5 + text.len());
+            bytes.extend_from_slice(b"file\0");
+            bytes.extend_from_slice(text.as_bytes());
+            let actual = hash(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if actual != expected.fingerprint {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "original File content changed",
+                ));
+            }
+        }
         if let Resource::Review { review_id } = &resource {
             if projected["result"]["kind"] != "review"
                 || projected["result"]["id"].as_str() != Some(review_id.as_str())
@@ -323,6 +411,7 @@ struct PrepareOrigin {
     source_id: String,
     scope_id: String,
     document_id: String,
+    presentation: Option<Presentation>,
 }
 pub(super) async fn prepare(
     State(app): State<AppState>,
@@ -338,6 +427,7 @@ pub(super) async fn prepare(
             source_id: request.source_id,
             scope_id: request.scope_id,
             document_id: request.document_id,
+            presentation: request.presentation,
         },
         Resource::File { path: request.path },
     )
@@ -357,6 +447,7 @@ pub(super) async fn prepare_review(
             source_id: request.source_id,
             scope_id: request.scope_id,
             document_id: request.document_id,
+            presentation: request.presentation,
         },
         Resource::Review {
             review_id: request.review_id,
@@ -384,6 +475,7 @@ async fn prepare_bound(
         source_id,
         scope_id,
         document_id,
+        presentation,
     } = origin;
     if !valid_token(&window_id)
         || !bounded_id(&scope_id)
@@ -394,6 +486,9 @@ async fn prepare_bound(
             Resource::File { path } => !guarded_file_path(path),
             Resource::Review { review_id } => !bounded_id(review_id),
         }
+        || presentation
+            .as_ref()
+            .is_some_and(|state| !state.valid_for(&resource))
     {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
@@ -414,6 +509,7 @@ async fn prepare_bound(
         scope_id,
         owner_epoch,
         resource,
+        presentation,
         deadline: Instant::now() + TICKET_TTL,
         phase: Phase::Prepared,
     };
@@ -492,6 +588,9 @@ pub(super) async fn inspect(
         .expect("resource descriptor is an object")
     {
         descriptor[key] = value.clone();
+    }
+    if let Some(presentation) = &ticket.presentation {
+        descriptor["presentation"] = serde_json::json!(presentation);
     }
     Ok(Json(descriptor).into_response())
 }
