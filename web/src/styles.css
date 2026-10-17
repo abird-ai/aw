@@ -1029,7 +1029,8 @@ body.resizing-sidebar {
   min-width: 0;
   overflow: hidden;
 }
-.code-diff .cm-editor { height: 100%; }
+/* MergeView forces auto !important; keep each editor within its bounded pane. */
+.code-diff .cm-mergeViewEditor > .cm-editor { height: 100% !important; }
 .code-diff .cm-merge-a,
 .code-diff .cm-merge-b { min-width: 0; }
 .code-diff .cm-changedLine {
