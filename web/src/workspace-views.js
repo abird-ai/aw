@@ -357,6 +357,22 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
         && document.value.target.scope_id === entry.value.scope_id && document.origin?.inventory_id === origin.inventory_id && document.origin?.item_id === origin.item_id);
       return existing?.value.id || openDocument(entry, "review", { source_id: source.source_id, scope_id: entry.value.scope_id, ...origin }, Object.freeze({ ...origin }));
     },
+    openRetainedReview(containerId, raw) {
+      // The handoff registry has already revalidated this exact immutable
+      // source/scope/Review ID. This method does NOT install a new Git scope
+      // or worktree grant in the navigator, nor reopen a stale inventory.
+      const entry = container(containerId); ready();
+      if (entry.value.kind !== "git" || !raw || Object.keys(raw).length !== 3
+        || raw.source_id !== source.source_id || !id(raw.scope_id)
+        || !id(raw.review_id)) throw new Error("Retained Review requires a verified exact source and scope.");
+      const found = [...documents.values()].find(doc => doc.value.containerId === containerId
+        && doc.value.kind === "review" && doc.value.target.source_id === raw.source_id
+        && doc.value.target.scope_id === raw.scope_id
+        && doc.value.target.review_id === raw.review_id);
+      return found?.value.id || openDocument(entry, "review", {
+        source_id: raw.source_id, scope_id: raw.scope_id, review_id: raw.review_id,
+      });
+    },
     async selectWorktree(containerId, origin) {
       const entry = container(containerId); origin = gitOrigin(origin);
       if (entry.value.kind !== "git") throw new Error("Worktree selection needs a Git navigator.");

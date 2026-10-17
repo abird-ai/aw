@@ -1,17 +1,19 @@
-// File-only cross-window handoff. The server ticket is correlation, not a File
-// capability; the receiver independently authenticates, reads and renders the
-// retained root File before accepting. No plaintext or grants go through messages.
+// Read-only File/immutable Git Review cross-window handoff. The server ticket
+// is correlation, not a capability. Receiver independently authenticates and
+// reads the exact retained source before accepting. No plaintext or grants
+// cross browser windows in a message or ticket.
 const ticketSyntax = /^[a-f0-9]{64}$/u;
+const opaqueIdSyntax = /^[A-Za-z0-9_-]{1,128}$/u;
 const MAX_WAIT_MS = 90_000;
 
-export function takeFileDockTicket(location, history) {
+export function takeDocumentDockTicket(location, history) {
   if (!location?.hash?.startsWith("#aw-dock=")) return null;
   const ticket = location.hash.slice("#aw-dock=".length);
   history.replaceState(null, "", location.pathname + location.search);
   return ticketSyntax.test(ticket) ? ticket : null;
 }
 
-export function createFileDocking({
+export function createDocumentDocking({
   api, views, currentOwner, select, close, popup,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   timeoutMs = MAX_WAIT_MS, onProgress = () => {}, isRendered = () => true,
@@ -21,12 +23,13 @@ export function createFileDocking({
   },
 }) {
   if ([api, currentOwner, select, close, popup, sleep, onProgress, isRendered, navigate]
-    .some(callback => typeof callback !== "function")) throw new Error("File docking needs original-browser callbacks.");
+    .some(callback => typeof callback !== "function")) throw new Error("Read-only document docking needs original-browser callbacks.");
   let disposed = false;
   const ownerMatches = expected => {
     const now = currentOwner();
     return !disposed && now?.source_id === expected.source_id
-      && now?.scope_id === expected.scope_id && now?.owner_epoch === expected.owner_epoch;
+      && now?.owner_epoch === expected.owner_epoch
+      && (expected.kind === "review" || now?.scope_id === expected.scope_id);
   };
   const envelope = (window, ticket) => ({
     window_id: window.window_id, window_proof: window.window_proof, ticket,
@@ -38,19 +41,26 @@ export function createFileDocking({
   async function send(documentId) {
     const document = views.getDocument(documentId);
     const source = currentOwner();
-    if (disposed || !document || document.kind !== "file" || !document.data || document.unavailable
-      || document.pending || !document.target || !ownerMatches({
-        ...source, source_id: document.target.source_id, scope_id: document.target.scope_id,
-      })) throw new Error("Only a currently authorized, loaded File can move to another window.");
+    const kind = document?.kind;
+    const target = document?.target;
+    const exactResource = kind === "file" ? target?.path : target?.review_id;
+    if (disposed || !["file", "review"].includes(kind) || !document.data || document.unavailable
+      || document.pending || !target || typeof exactResource !== "string"
+      || (kind === "review" && (!opaqueIdSyntax.test(exactResource)
+        || document.data.kind !== "review" || document.data.id !== exactResource))
+      || !ownerMatches({
+        ...source, kind, source_id: target.source_id, scope_id: target.scope_id,
+      })) throw new Error("Only a currently authorized, loaded File or immutable Review can move to another window.");
     const initial = document;
     const expected = { ...source };
     const originalContainer = initial.containerId;
-    const originalPath = initial.target.path;
+    const originalResource = exactResource;
     const sameDocument = () => {
       const active = views.getDocument(documentId);
       return ownerMatches(expected) && active
         && active.containerId === originalContainer && active.target === initial.target
-        && active.kind === "file" && !active.unavailable && active.data;
+        && active.kind === kind && !active.unavailable && active.data
+        && (kind !== "review" || active.data.id === originalResource);
     };
     const nextWindow = popup(); // Must execute during the direct user click.
     if (!nextWindow) throw new Error("The browser blocked the new window. Allow pop-ups for the local owner.");
@@ -62,10 +72,11 @@ export function createFileDocking({
         || origin.scope_id !== expected.scope_id || origin.owner_epoch !== expected.owner_epoch) {
         throw new Error("Source changed before handoff preparation.");
       }
-      const prepared = await api("/api/dock/prepare", {
+      const prepared = await api(kind === "file" ? "/api/dock/prepare" : "/api/dock/prepare-review", {
         window_id: origin.window_id, window_proof: origin.window_proof,
         owner_epoch: expected.owner_epoch, source_id: expected.source_id,
-        scope_id: expected.scope_id, document_id: documentId, path: originalPath,
+        scope_id: target.scope_id, document_id: documentId,
+        ...(kind === "file" ? { path: originalResource } : { review_id: originalResource }),
       });
       ticket = prepared.ticket;
       if (!ticketSyntax.test(ticket)) throw new Error("Invalid owner handoff identity.");
@@ -92,7 +103,7 @@ export function createFileDocking({
         if (result.state !== "prepared") break;
         await sleep(250);
       }
-      throw new Error("Handoff not accepted; the original File remains open.");
+      throw new Error("Handoff not accepted; the original read-only document remains open.");
     } catch (error) {
       if (!released && origin && ticket) {
         // Cancellation only rolls back Prepared. Unknown Accept/Release stays
@@ -107,29 +118,42 @@ export function createFileDocking({
   }
 
   async function receive(ticket) {
-    if (disposed || !ticketSyntax.test(ticket)) throw new Error("Invalid File docking invitation.");
+    if (disposed || !ticketSyntax.test(ticket)) throw new Error("Invalid read-only document docking invitation.");
     const receiver = await api("/api/dock/register", {});
     const body = envelope(receiver, ticket);
     let containerId, documentId, acceptanceAttempted = false;
     try {
       const description = await api("/api/dock/inspect", body);
-      if (description.kind !== "file"
+      const kind = description.kind;
+      const resourceKey = kind === "file" ? "path" : "review_id";
+      if (!["file", "review"].includes(kind)
         || !ownerMatches(description)
         || description.source_id !== receiver.source_id
         || description.owner_epoch !== receiver.owner_epoch
-        || description.scope_id !== receiver.scope_id
-        || typeof description.path !== "string") {
-        throw new Error("The original File scope is unavailable in this window.");
+        || !opaqueIdSyntax.test(description.scope_id)
+        || (kind === "file" && description.scope_id !== receiver.scope_id)
+        || (kind === "review" && !opaqueIdSyntax.test(description.review_id))
+        || typeof description[resourceKey] !== "string") {
+        throw new Error("The original File or Review scope is unavailable in this window.");
       }
-      containerId = views.openContainer("files", description.scope_id);
-      documentId = views.openFile(containerId, description.path);
-      select(containerId, documentId);
+      // A Review's original retained Git scope can differ from the default
+      // navigator. Do not install it as a general worktree or Files grant.
+      containerId = views.openContainer(kind === "file" ? "files" : "git");
+      documentId = kind === "file"
+        ? views.openFile(containerId, description.path)
+        : views.openRetainedReview(containerId, {
+            source_id: description.source_id,
+            scope_id: description.scope_id,
+            review_id: description.review_id,
+          });
+      select(containerId, documentId, kind);
       const until = Date.now() + Math.min(Math.max(timeoutMs, 1000), MAX_WAIT_MS);
       while (Date.now() < until && ownerMatches(description)) {
         const item = views.getDocument(documentId);
         if (!item || item.target.source_id !== description.source_id
           || item.target.scope_id !== description.scope_id
-          || item.target.path !== description.path || item.unavailable || item.error) break;
+          || item.target[resourceKey] !== description[resourceKey]
+          || item.unavailable || item.error) break;
         // The new browser performs its own authorized read and renders the
         // result before asking the owner to accept the transfer.
         if (!item.pending && item.data && isRendered(documentId)) {
@@ -144,7 +168,7 @@ export function createFileDocking({
         }
         await sleep(120);
       }
-      throw new Error("Receiving File failed authorization or timed out; origin retains its view.");
+      throw new Error("Receiving read-only document failed authorization or timed out; origin retains its view.");
     } catch (error) {
       // A *known* authorization/expiry/conflict denial scrubs plaintext
       // immediately, even after a successful earlier File read. Only a lost

@@ -1,4 +1,4 @@
-//! Ephemeral, owner-mediated File-view handoff between separately mounted browser
+//! Ephemeral, owner-mediated read-only File/Review handoff between browser
 //! windows. A ticket is correlation only: every receiver read is authorized by
 //! the original SurfaceHost, and no plaintext, grants or execution owner move.
 use super::*;
@@ -30,10 +30,34 @@ struct Ticket {
     source_id: String,
     scope_id: String,
     owner_epoch: String,
-    path: String,
+    resource: Resource,
     deadline: Instant,
     phase: Phase,
 }
+#[derive(Clone)]
+enum Resource {
+    File { path: String },
+    Review { review_id: String },
+}
+impl Resource {
+    fn request(&self) -> ViewRequest {
+        match self {
+            Self::File { path } => ViewRequest::File { path: path.clone() },
+            Self::Review { review_id } => ViewRequest::Review {
+                review_id: review_id.clone(),
+            },
+        }
+    }
+    fn descriptor(&self) -> serde_json::Value {
+        match self {
+            Self::File { path } => serde_json::json!({"kind":"file", "path":path}),
+            Self::Review { review_id } => {
+                serde_json::json!({"kind":"review","review_id":review_id})
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 enum Phase {
     Prepared,
@@ -99,6 +123,18 @@ pub(super) struct Prepare {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct PrepareReview {
+    window_id: String,
+    window_proof: String,
+    owner_epoch: String,
+    source_id: String,
+    scope_id: String,
+    document_id: String,
+    review_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Envelope {
     window_id: String,
     window_proof: String,
@@ -136,9 +172,15 @@ fn guarded_file_path(value: &str) -> bool {
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
-fn current(app: &AppState, source: &str, scope: &str, epoch: &str) -> ApiResult<()> {
+fn current(
+    app: &AppState,
+    source: &str,
+    scope: &str,
+    epoch: &str,
+    root_only: bool,
+) -> ApiResult<()> {
     let (active, root, actual_epoch) = enabled(app)?;
-    if source != active || scope != root || epoch != actual_epoch {
+    if source != active || epoch != actual_epoch || (root_only && scope != root) {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "docking owner/source changed",
@@ -147,14 +189,16 @@ fn current(app: &AppState, source: &str, scope: &str, epoch: &str) -> ApiResult<
     Ok(())
 }
 
-/// Check the *actual* retained Files read through the existing bounded resource
-/// executor. Never return those bytes in a ticket/inspect/accept response.
-async fn reauthorize_file(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
+/// Check the original, retained read through the bounded SurfaceHost worker.
+/// A Review must be reauthorized by exact source, Git scope and immutable ID;
+/// no inventory selection, browser path or worktree grant is synthesized.
+async fn reauthorize_view(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
     current(
         app,
         &ticket.source_id,
         &ticket.scope_id,
         &ticket.owner_epoch,
+        matches!(ticket.resource, Resource::File { .. }),
     )?;
     let host = app
         .0
@@ -174,7 +218,7 @@ async fn reauthorize_file(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
     let actor = app.0.session.actor.as_str().to_owned();
     let source = ticket.source_id.clone();
     let scope = ticket.scope_id.clone();
-    let path = ticket.path.clone();
+    let resource = ticket.resource.clone();
     let owner = app.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -184,16 +228,27 @@ async fn reauthorize_file(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
                 "browser authorization expired",
             ));
         }
-        host.execute_if(
-            &actor,
-            Command::View {
-                source_id: source,
-                scope_id: scope,
-                request: ViewRequest::File { path },
-            },
-            || auth_alive(&owner),
-        )
-        .map_err(|_| ApiError(StatusCode::FORBIDDEN, "original File no longer authorized"))?;
+        let projected = host
+            .execute_if(
+                &actor,
+                Command::View {
+                    source_id: source,
+                    scope_id: scope,
+                    request: resource.request(),
+                },
+                || auth_alive(&owner),
+            )
+            .map_err(|_| ApiError(StatusCode::FORBIDDEN, "original view no longer authorized"))?;
+        if let Resource::Review { review_id } = &resource {
+            if projected["result"]["kind"] != "review"
+                || projected["result"]["id"].as_str() != Some(review_id.as_str())
+            {
+                return Err(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "retained review identity changed",
+                ));
+            }
+        }
         if !auth_alive(&owner) {
             return Err(ApiError(
                 StatusCode::UNAUTHORIZED,
@@ -214,6 +269,7 @@ async fn reauthorize_file(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
         &ticket.source_id,
         &ticket.scope_id,
         &ticket.owner_epoch,
+        matches!(ticket.resource, Resource::File { .. }),
     )
 }
 
@@ -260,59 +316,108 @@ pub(super) async fn register(
     .into_response())
 }
 
+struct PrepareOrigin {
+    window_id: String,
+    window_proof: String,
+    owner_epoch: String,
+    source_id: String,
+    scope_id: String,
+    document_id: String,
+}
 pub(super) async fn prepare(
     State(app): State<AppState>,
     payload: std::result::Result<Json<Prepare>, JsonRejection>,
 ) -> ApiResult<Response> {
     let request = body(payload)?;
-    if !valid_token(&request.window_id)
-        || !guarded_file_path(&request.path)
-        || request.document_id.len() > 128
-        || !request.document_id.starts_with("workspace-document-")
-        || !request
-            .document_id
+    prepare_bound(
+        &app,
+        PrepareOrigin {
+            window_id: request.window_id,
+            window_proof: request.window_proof,
+            owner_epoch: request.owner_epoch,
+            source_id: request.source_id,
+            scope_id: request.scope_id,
+            document_id: request.document_id,
+        },
+        Resource::File { path: request.path },
+    )
+    .await
+}
+pub(super) async fn prepare_review(
+    State(app): State<AppState>,
+    payload: std::result::Result<Json<PrepareReview>, JsonRejection>,
+) -> ApiResult<Response> {
+    let request = body(payload)?;
+    prepare_bound(
+        &app,
+        PrepareOrigin {
+            window_id: request.window_id,
+            window_proof: request.window_proof,
+            owner_epoch: request.owner_epoch,
+            source_id: request.source_id,
+            scope_id: request.scope_id,
+            document_id: request.document_id,
+        },
+        Resource::Review {
+            review_id: request.review_id,
+        },
+    )
+    .await
+}
+
+fn bounded_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+async fn prepare_bound(
+    app: &AppState,
+    origin: PrepareOrigin,
+    resource: Resource,
+) -> ApiResult<Response> {
+    let PrepareOrigin {
+        window_id,
+        window_proof,
+        owner_epoch,
+        source_id,
+        scope_id,
+        document_id,
+    } = origin;
+    if !valid_token(&window_id)
+        || !bounded_id(&scope_id)
+        || !bounded_id(&source_id)
+        || !document_id.starts_with("workspace-document-")
+        || !bounded_id(&document_id)
+        || match &resource {
+            Resource::File { path } => !guarded_file_path(path),
+            Resource::Review { review_id } => !bounded_id(review_id),
+        }
     {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "invalid docking File descriptor",
+            "invalid docking document descriptor",
         ));
     }
-    let (_, root, _) = enabled(&app)?;
-    current(
-        &app,
-        &request.source_id,
-        &request.scope_id,
-        &request.owner_epoch,
-    )?;
-    if request.scope_id != root {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "Files require the original launch scope",
-        ));
-    }
+    let root_only = matches!(resource, Resource::File { .. });
+    current(app, &source_id, &scope_id, &owner_epoch, root_only)?;
     {
         let mut registry = lock(&app.0.dock);
         registry.prune();
-        registry.window(
-            &request.window_id,
-            &request.window_proof,
-            &request.source_id,
-            &request.owner_epoch,
-        )?;
+        registry.window(&window_id, &window_proof, &source_id, &owner_epoch)?;
     }
     let ticket_data = Ticket {
-        origin_id: request.window_id,
-        document_id: request.document_id,
-        source_id: request.source_id,
-        scope_id: request.scope_id,
-        owner_epoch: request.owner_epoch,
-        path: request.path,
+        origin_id: window_id,
+        document_id,
+        source_id,
+        scope_id,
+        owner_epoch,
+        resource,
         deadline: Instant::now() + TICKET_TTL,
         phase: Phase::Prepared,
     };
-    reauthorize_file(&app, &ticket_data).await?;
+    reauthorize_view(app, &ticket_data).await?;
     let ticket = random_token().map_err(|_| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -323,7 +428,7 @@ pub(super) async fn prepare(
     registry.prune();
     registry.window(
         &ticket_data.origin_id,
-        &request.window_proof,
+        &window_proof,
         &ticket_data.source_id,
         &ticket_data.owner_epoch,
     )?;
@@ -335,8 +440,7 @@ pub(super) async fn prepare(
     }
     registry.tickets.insert(ticket.clone(), ticket_data);
     Ok(Json(serde_json::json!({
-        "ticket": ticket, "state":"prepared",
-        "expires_in_ms":TICKET_TTL.as_millis(),
+        "ticket":ticket, "state":"prepared", "expires_in_ms":TICKET_TTL.as_millis()
     }))
     .into_response())
 }
@@ -375,15 +479,21 @@ pub(super) async fn inspect(
     if !matches!(ticket.phase, Phase::Prepared) {
         return Err(ApiError(StatusCode::CONFLICT, "handoff already accepted"));
     }
-    reauthorize_file(&app, &ticket).await?;
+    reauthorize_view(&app, &ticket).await?;
     // No file contents or owner credential. The receiver must issue its own
     // authenticated read and display before attempting accept.
-    Ok(Json(serde_json::json!({
-        "kind":"file", "source_id":ticket.source_id,
+    let mut descriptor = serde_json::json!({
+        "source_id":ticket.source_id,
         "scope_id":ticket.scope_id, "owner_epoch":ticket.owner_epoch,
-        "path":ticket.path,
-    }))
-    .into_response())
+    });
+    let resource = ticket.resource.descriptor();
+    for (key, value) in resource
+        .as_object()
+        .expect("resource descriptor is an object")
+    {
+        descriptor[key] = value.clone();
+    }
+    Ok(Json(descriptor).into_response())
 }
 
 pub(super) async fn accept(
@@ -395,7 +505,7 @@ pub(super) async fn accept(
     if !matches!(ticket.phase, Phase::Prepared) {
         return Err(ApiError(StatusCode::CONFLICT, "handoff already accepted"));
     }
-    reauthorize_file(&app, &ticket).await?;
+    reauthorize_view(&app, &ticket).await?;
     let mut registry = lock(&app.0.dock);
     registry.prune();
     registry.window(
@@ -489,7 +599,7 @@ pub(super) async fn release(
     let ticket = retrieve(&app, &request, true)?;
     // An earlier accepted read is not a perpetual File grant. Recheck
     // current browser auth and physically pinned source before release.
-    reauthorize_file(&app, &ticket).await?;
+    reauthorize_view(&app, &ticket).await?;
     let mut registry = lock(&app.0.dock);
     registry.prune();
     registry.window(

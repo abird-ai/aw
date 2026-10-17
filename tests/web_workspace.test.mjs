@@ -1,7 +1,7 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import {initialLayout,reduceLayout,validateLayout,groupRects,changeRows,sessionTarget,sessionMetrics,KINDS} from '../web/workspace-model.js';
 import { createWorkspaceViews, checkedWorkspaceSequence, WORKSPACE_VIEW_LIMITS } from '../web/src/workspace-views.js';
-import { createFileDocking, takeFileDockTicket } from '../web/src/file-docking.js';
+import { createDocumentDocking, takeDocumentDockTicket } from '../web/src/document-docking.js';
 const open=(s,kind,resource)=>reduceLayout(s,{type:'open',target:{kind,title:kind,resource}});
 test('one conversation without network dependencies',()=>{const s=initialLayout();assert.equal(Object.keys(s.views).length,1);assert.equal(s.views.v1.kind,'conversation');});
 for(const kind of KINDS)test(`group accepts ${kind}`,()=>{const s=open(initialLayout(),kind,kind);validateLayout(s);assert(Object.values(s.views).some(v=>v.kind===kind));});
@@ -546,7 +546,7 @@ function dockFixture() {
     closeContainer: () => notifications.push('closed-container'),
   };
   const popup = { closed: false, close() { this.closed = true; }, opener: {}, location: { replace() {} } };
-  const make = overrides => createFileDocking({
+  const make = overrides => createDocumentDocking({
     api, views, currentOwner: () => owner, select: (...args) => notifications.push(['select', ...args]),
     close: id => { notifications.push(['release-document', id]); if (document?.id === id) document = null; },
     popup: () => popup, navigate: (p, ticket) => { assert.equal(p, popup); assert.equal(ticket, dockTicket); notifications.push('navigated'); },
@@ -561,11 +561,11 @@ function dockFixture() {
 
 test('docking ticket is removed from fragment before disclosure and never treated as a grant', () => {
   const changes = [], history = { replaceState: (...args) => changes.push(args) };
-  assert.equal(takeFileDockTicket({ hash: '#aw-dock=' + dockTicket, pathname: '/', search: '' }, history), dockTicket);
+  assert.equal(takeDocumentDockTicket({ hash: '#aw-dock=' + dockTicket, pathname: '/', search: '' }, history), dockTicket);
   assert.deepEqual(changes, [[null, '', '/']]);
-  assert.equal(takeFileDockTicket({ hash: '#aw-dock=broken', pathname: '/app', search: '?v=1' }, history), null);
+  assert.equal(takeDocumentDockTicket({ hash: '#aw-dock=broken', pathname: '/app', search: '?v=1' }, history), null);
   assert.deepEqual(changes.at(-1), [null, '', '/app?v=1']);
-  assert.equal(takeFileDockTicket({ hash: '#unrelated' }, history), null);
+  assert.equal(takeDocumentDockTicket({ hash: '#unrelated' }, history), null);
   assert.equal(changes.length, 2);
 });
 

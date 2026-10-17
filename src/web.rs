@@ -1111,6 +1111,7 @@ fn application_scoped(
     let router = router
         .route("/api/dock/register", post(dock::register))
         .route("/api/dock/prepare", post(dock::prepare))
+        .route("/api/dock/prepare-review", post(dock::prepare_review))
         .route("/api/dock/inspect", post(dock::inspect))
         .route("/api/dock/accept", post(dock::accept))
         .route("/api/dock/decline", post(dock::decline))
@@ -3206,6 +3207,7 @@ mod tests {
     mod docking {
         use super::*;
         include!("web/dock/tests.rs");
+        include!("web/dock/review_tests.rs");
     }
     #[cfg(feature = "oidc")]
     mod publication_http_measure {
