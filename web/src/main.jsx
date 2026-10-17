@@ -3,6 +3,8 @@ import { render } from "solid-js/web";
 import { api, workspaceAction } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
 import { Icon } from "./icons.jsx";
+import { AgentViewPanel } from "./agent-view-panel.jsx";
+import { createAgentViews } from "./agent-views.js";
 import { applyThemePreference, finishBoot } from "./theme.js";
 
 const CodeFile = lazy(() =>
@@ -257,7 +259,7 @@ function CommandBar(props) {
             key: "tab:" + tab.id,
             label: tab.title,
             meta: "Window · " + (tab.path || "Agent"),
-            icon: tab.kind === "chat" ? "chat" : tab.kind === "review" ? "git" : "file",
+            icon: tab.kind === "chat" || tab.kind === "agent-view" ? "chat" : tab.kind === "review" ? "git" : "file",
             target: tab.id === "chat" ? "chat" : "tab",
             run: () => props.activateTab(tab.id),
           });
@@ -522,6 +524,7 @@ function SessionNavigator(props) {
                     && (props.snapshot?.saved?.branch_id === branch.id
                       || props.snapshot?.saved?.branch_name === branch.name);
                   return (
+                    <div class="session-branch-actions">
                     <button
                       class={"nav-row " + (active() ? "active" : "")}
                       onClick={() => props.openSession(session.id, branch.name, Boolean(session.shared))}
@@ -533,6 +536,10 @@ function SessionNavigator(props) {
                         <span class="nav-row-detail">{branch.name}{session.shared ? " · shared" : ""}</span>
                       </span>
                     </button>
+                    <button class="mini-icon nav-readonly" type="button" disabled={!props.canInspect || session.shared}
+                      onClick={() => props.openReadonly(session, branch)}
+                      aria-label={`Open read-only view of ${session.title || "Untitled"} · ${branch.name}`} title={session.shared ? "Read-only views of shared entries are unavailable." : "Open read-only view"}>View</button>
+                    </div>
                   );
                 }}
               </For>
@@ -568,6 +575,7 @@ function SessionNavigator(props) {
                         && (props.snapshot?.saved?.branch_id === branch.id
                           || props.snapshot?.saved?.branch_name === branch.name);
                       return (
+                        <div class="session-branch-actions">
                         <button
                           class={"nav-row branch-row " + (active() ? "active" : "")}
                           onClick={() => props.openSession(session.id, branch.name, Boolean(session.shared))}
@@ -576,6 +584,10 @@ function SessionNavigator(props) {
                           <Icon name="branch" size={12} />
                           <span class="nav-row-name">{branch.name}</span>
                         </button>
+                        <button class="mini-icon nav-readonly" type="button" disabled={!props.canInspect || session.shared}
+                          onClick={() => props.openReadonly(session, branch)}
+                          aria-label={`Open read-only view of ${session.title || "Untitled"} · ${branch.name}`} title={session.shared ? "Read-only views of shared entries are unavailable." : "Open read-only view"}>View</button>
+                        </div>
                       );
                     }}
                   </For>
@@ -1745,12 +1757,80 @@ function App() {
   );
   let resizingSidebar = false;
   let source;
+  let observationLifetime = {};
   let sharedClient = null;
   let composerTextarea = null;
   let presencePending = null;
   let presenceLastSent = 0;
+  let sessionCatalogRequest = 0;
+  let deniedCatalogRefresh = null;
   const tabTargets = new Map();
   const tabElementId = id => "workspace-tab-" + encodeURIComponent(id);
+  const [viewChange, setViewChange] = createSignal(null);
+  const [viewSource, setViewSource] = createSignal(null);
+  const agentViews = createAgentViews({
+    read: async (target, { signal }) => {
+      const lifetime = observationLifetime;
+      try { return await api("/api/agent-view", target, 15000, { signal }); }
+      catch (error) {
+        if (lifetime !== observationLifetime) throw error;
+        if (error.status === 401) expireBrowserAccess();
+        else if (error.status === 403 && deniedCatalogRefresh !== lifetime) {
+          deniedCatalogRefresh = lifetime;
+          queueMicrotask(() => {
+            if (lifetime !== observationLifetime) return;
+            void loadSessions(lifetime).finally(() => { if (deniedCatalogRefresh === lifetime) deniedCatalogRefresh = null; });
+          });
+        }
+        throw error;
+      }
+    },
+    onChange: () => {
+      setViewChange({});
+      const live = new Set(agentViews.list().map(view => view.id));
+      setTabs(current => {
+        const removed = current.filter(tab => tab.kind === "agent-view" && !live.has(tab.id));
+        for (const tab of removed) tabTargets.delete(tab.id);
+        return removed.length ? current.filter(tab => tab.kind !== "agent-view" || live.has(tab.id)) : current;
+      });
+      if (activeTab().startsWith("agent-view-") && !live.has(activeTab())) setActiveTab("chat");
+    },
+  });
+  const pinnedIds = createMemo(() => { viewChange(); return agentViews.list().map(view => view.id); });
+  const pinnedView = id => { viewChange(); return agentViews.get(id); };
+  function clearAgentViews(reason, keepCatalogRequest = false) {
+    if (!keepCatalogRequest && sessionCatalogRequest < Number.MAX_SAFE_INTEGER) sessionCatalogRequest += 1;
+    agentViews.clear(reason);
+    setViewSource(null);
+    setSessions([]);
+  }
+  function expireBrowserAccess() {
+    observationLifetime = {};
+    const expiredSource = source;
+    source = null;
+    expiredSource?.close();
+    clearAgentViews("Browser access expired.");
+    setPaired(false);
+    setOnline(false);
+    setConnection("Not paired");
+  }
+  function tabTitle(tab) {
+    if (tab.kind !== "agent-view") return tab.title;
+    const data = pinnedView(tab.id)?.snapshot;
+    return data ? `View: ${data.title || "Untitled"} · ${data.branch_name}` : tab.title;
+  }
+  function pulseAgentViews() {
+    agentViews.expire();
+    if (document.hidden) return;
+    const now = performance.now();
+    for (const view of agentViews.list().slice().sort((a, b) => a.refreshAt - b.refreshAt)) {
+      if (!view.pending && view.refreshAt <= now) void agentViews.refresh(view.id);
+    }
+  }
+  createEffect(on(() => snapshot()?.instance, (instance, previous) => {
+    if (previous && instance !== previous) clearAgentViews("Owner changed; reopen the read-only view.");
+  }));
+
 
   const choices = createMemo(() => accountChoices(snapshot()));
   const surface = createMemo(() =>
@@ -1800,9 +1880,10 @@ function App() {
     }
   });
 
-  async function detectTeam() {
+  async function detectTeam(lifetime = observationLifetime) {
     try {
       const info = await api("/api/team/me");
+      if (lifetime !== observationLifetime) return null;
       if (!info?.peer_sharing) {
         setTeamInfo(info || null);
         setCollaborators([]);
@@ -1812,12 +1893,15 @@ function App() {
       setTeamInfo(info);
       try {
         const value = await api("/api/team/collaborators");
+        if (lifetime !== observationLifetime) return null;
         setCollaborators(value.participants || []);
       } catch {
+        if (lifetime !== observationLifetime) return null;
         setCollaborators([]);
       }
       return info;
     } catch {
+      if (lifetime !== observationLifetime) return null;
       setTeamInfo(null);
       setCollaborators([]);
       setCollaboration(null);
@@ -1825,24 +1909,43 @@ function App() {
     }
   }
 
-  async function loadCollaboration() {
+  async function loadCollaboration(lifetime = observationLifetime) {
+    if (lifetime !== observationLifetime) return null;
     if (!teamInfo()?.peer_sharing || !snapshot()?.saved) {
       setCollaboration(null);
       return null;
     }
     try {
       const value = await api("/api/team/session/collaboration");
+      if (lifetime !== observationLifetime) return null;
       setCollaboration(value);
       return value;
     } catch {
+      if (lifetime !== observationLifetime) return null;
       setCollaboration(null);
       return null;
     }
   }
 
-  async function loadSessions() {
+  async function loadSessions(lifetime = observationLifetime) {
+    if (lifetime !== observationLifetime) return;
+    if (sessionCatalogRequest >= Number.MAX_SAFE_INTEGER) {
+      clearAgentViews("Session list lifetime exhausted; reload the browser.");
+      setSessions([]);
+      return;
+    }
+    const ticket = ++sessionCatalogRequest;
     try {
-      const own = ((await api("/api/sessions")).sessions || []).map(session => ({
+      const catalog = await api("/api/sessions");
+      if (lifetime !== observationLifetime || ticket !== sessionCatalogRequest || catalog.source_epoch !== snapshot()?.instance) return;
+      const nextSource = typeof catalog.store_id === "string" && catalog.store_id
+        ? { store_id: catalog.store_id, source_epoch: catalog.source_epoch } : null;
+      const currentSource = viewSource();
+      if (currentSource && (currentSource.store_id !== nextSource?.store_id || currentSource.source_epoch !== nextSource?.source_epoch)) {
+        clearAgentViews("Store changed; reopen the read-only view.", true);
+      }
+      setViewSource(nextSource);
+      const own = (catalog.sessions || []).map(session => ({
         ...session,
         shared: false,
       }));
@@ -1855,22 +1958,31 @@ function App() {
           }));
         } catch {}
       }
+      const installed = viewSource();
+      if (lifetime !== observationLifetime || ticket !== sessionCatalogRequest || catalog.source_epoch !== snapshot()?.instance
+        || installed?.store_id !== nextSource?.store_id || installed?.source_epoch !== nextSource?.source_epoch) return;
       const seen = new Set();
       setSessions([...own, ...shared].filter(session => {
         if (seen.has(session.id)) return false;
         seen.add(session.id);
         return true;
       }));
-    } catch {}
+    } catch (error) {
+      if (lifetime !== observationLifetime) return;
+      if (ticket === sessionCatalogRequest && error.status === 401) expireBrowserAccess();
+      else if (ticket === sessionCatalogRequest && error.status === 403) clearAgentViews("Session read access changed.");
+    }
   }
 
-  async function connectWorkspace() {
+  async function connectWorkspace(lifetime = observationLifetime) {
     try {
       const value = await api("/api/workspace");
+      if (lifetime !== observationLifetime) return;
       const enabled = Boolean(value?.enabled);
       setWorkspaceEnabled(enabled);
       if (!enabled && nav() !== "sessions") setNav("sessions");
     } catch {
+      if (lifetime !== observationLifetime) return;
       setWorkspaceEnabled(false);
       if (nav() !== "sessions") setNav("sessions");
     }
@@ -1930,7 +2042,7 @@ function App() {
     return sharedClient;
   }
 
-  async function loadPresence() {
+  async function loadPresence(lifetime = observationLifetime) {
     const current = sharedDraft();
     if (!current) {
       setSharedPresence([]);
@@ -1941,8 +2053,10 @@ function App() {
         draft_id: current.draft_id,
         generation: current.generation,
       });
+      if (lifetime !== observationLifetime) return;
       setSharedPresence(value.presence || []);
     } catch {
+      if (lifetime !== observationLifetime) return;
       setSharedPresence([]);
     }
   }
@@ -2030,22 +2144,34 @@ function App() {
     }
   }
 
-  function connectEvents() {
-    source?.close();
-    source = new EventSource("/api/events");
-    source.onopen = () => { setOnline(true); setConnection("Connected"); };
-    source.onerror = () => { setOnline(false); setConnection("Reconnecting…"); };
-    source.addEventListener("snapshot", event => {
+  function connectEvents(lifetime = observationLifetime) {
+    if (lifetime !== observationLifetime) return;
+    const previous = source;
+    source = null;
+    previous?.close();
+    const connection = new EventSource("/api/events");
+    source = connection;
+    const current = () => lifetime === observationLifetime && source === connection;
+    const listen = (name, callback) => connection.addEventListener(name, event => { if (current()) callback(event); });
+    connection.onopen = () => { if (current()) { setOnline(true); setConnection("Connected"); } };
+    connection.onerror = () => { if (current()) { setOnline(false); setConnection("Reconnecting…"); } };
+    listen("snapshot", event => {
       try {
         setSnapshot(current => acceptSnapshot(current, JSON.parse(event.data)));
         setPaired(true);
-        void detectTeam().then(() => Promise.allSettled([loadSessions(), loadCollaboration()]));
+        void detectTeam(lifetime).then(() => {
+          if (current()) return Promise.allSettled([loadSessions(lifetime), loadCollaboration(lifetime)]);
+        });
       } catch {
         void refresh();
       }
     });
-    source.addEventListener("changed", () => void refresh(false));
-    source.addEventListener("delta", event => {
+    listen("changed", () => void refresh(false));
+    listen("context_revoked", () => {
+      clearAgentViews("Read access changed; reopen permitted views.");
+      void refresh(false);
+    });
+    listen("delta", event => {
       try {
         const next = acceptDelta(snapshot(), Number(event.lastEventId), JSON.parse(event.data));
         if (next.resync) void refresh(false);
@@ -2054,7 +2180,7 @@ function App() {
         void refresh(false);
       }
     });
-    source.addEventListener("draft_changed", event => {
+    listen("draft_changed", event => {
       try {
         const value = JSON.parse(event.data);
         if (sharedClient?.applyRemote?.(value)) {
@@ -2064,13 +2190,14 @@ function App() {
         }
       } catch {}
     });
-    source.addEventListener("draft_presence_changed", () => {
-      if (sharedActive()) void loadPresence();
+    listen("draft_presence_changed", () => {
+      if (sharedActive()) void loadPresence(lifetime);
     });
-    source.addEventListener("draft_scope_changed", () => {
-      void Promise.allSettled([loadCollaboration(), loadSessions()]);
+    listen("draft_scope_changed", () => {
+      void Promise.allSettled([loadCollaboration(lifetime), loadSessions(lifetime)]);
       if (sharedActive()) {
         void sharedClient.refresh().catch(() => {
+          if (!current()) return;
           detachSharedDraft({
             keepText: true,
             message: "Collaboration access changed. Your local text remains private.",
@@ -2078,10 +2205,10 @@ function App() {
         });
       }
     });
-    source.addEventListener("draft_submitted", () => {
+    listen("draft_submitted", () => {
       if (sharedActive()) void sharedClient.refresh().catch(() => undefined);
     });
-    source.addEventListener("draft_settled", () => {
+    listen("draft_settled", () => {
       const saved = snapshot()?.saved;
       if (!saved) return;
       const shared = Boolean(currentSession()?.shared);
@@ -2090,10 +2217,7 @@ function App() {
         quiet: true,
       });
     });
-    source.addEventListener("auth_expired", () => {
-      setPaired(false);
-      source?.close();
-    });
+    listen("auth_expired", expireBrowserAccess);
   }
 
   async function loadPresentation() {
@@ -2104,32 +2228,44 @@ function App() {
   }
 
   async function refresh(reconnect = true) {
+    let lifetime = observationLifetime;
     try {
       const next = await api("/api/session");
+      if (lifetime !== observationLifetime) return;
       setSnapshot(current => acceptSnapshot(current, next));
       setPaired(true);
       setError("");
       setConnection("Connected");
       setOnline(true);
-      await detectTeam();
-      await Promise.allSettled([loadSessions(), connectWorkspace(), loadCollaboration()]);
-      if (reconnect) connectEvents();
+      await detectTeam(lifetime);
+      if (lifetime !== observationLifetime) return;
+      await Promise.allSettled([loadSessions(lifetime), connectWorkspace(lifetime), loadCollaboration(lifetime)]);
+      if (lifetime !== observationLifetime) return;
+      if (reconnect) connectEvents(lifetime);
     } catch (e) {
+      if (lifetime !== observationLifetime) return;
       if (e.status === 401) {
+        expireBrowserAccess();
+        lifetime = observationLifetime;
         try {
           const config = await api("/api/settings");
+          if (lifetime !== observationLifetime) return;
           if (config?.local_single_user) {
             if (config.ui) setPresentationUi(normalizedUi(config.ui));
             const next = await api("/api/session");
+            if (lifetime !== observationLifetime) return;
             setSnapshot(next);
             setPaired(true);
             setSettings(!next?.identity);
-            connectEvents();
-            await detectTeam();
-            await Promise.allSettled([loadSessions(), connectWorkspace(), loadCollaboration()]);
+            connectEvents(lifetime);
+            await detectTeam(lifetime);
+            if (lifetime !== observationLifetime) return;
+            await Promise.allSettled([loadSessions(lifetime), connectWorkspace(lifetime), loadCollaboration(lifetime)]);
             return;
           }
-        } catch {}
+        } catch {
+          if (lifetime !== observationLifetime) return;
+        }
         setPaired(false);
         setConnection("Not paired");
         setOnline(false);
@@ -2140,12 +2276,25 @@ function App() {
   }
 
   onMount(() => {
+    const pulse = setInterval(pulseAgentViews, 500);
+    const wake = () => pulseAgentViews();
+    document.addEventListener("visibilitychange", wake);
+    window.addEventListener("focus", wake);
+    onCleanup(() => {
+      clearInterval(pulse);
+      document.removeEventListener("visibilitychange", wake);
+      window.removeEventListener("focus", wake);
+    });
     void loadPresentation();
     finishBoot();
     void refresh();
   });
   onCleanup(() => {
-    source?.close();
+    observationLifetime = {};
+    const previous = source;
+    source = null;
+    previous?.close();
+    agentViews.dispose();
     clearTimeout(presencePending);
     if (sharedActive()) void publishPresence(false);
     sharedClient?.destroy?.();
@@ -2205,11 +2354,13 @@ function App() {
   function closeTab(id) {
     if (id === "chat") return;
     const current = tabs();
+    const wasActive = activeTab() === id;
     const index = current.findIndex(tab => tab.id === id);
+    if (agentViews.get(id)) agentViews.close(id);
     const next = current.filter(tab => tab.id !== id);
     setTabs(next);
     tabTargets.delete(id);
-    if (activeTab() === id) {
+    if (wasActive) {
       const replacement = next[Math.min(index, next.length - 1)] || next[0];
       setActiveTab(replacement?.id || "chat");
     }
@@ -2361,6 +2512,21 @@ function App() {
     }
   }
 
+  function openReadonly(session, branch) {
+    const source = viewSource();
+    if (!source || session.shared || !branch.id) return false;
+    try {
+      const id = agentViews.open({ ...source, session_id: session.id, branch_id: branch.id });
+      upsertTab({ id, kind: "agent-view", title: "Read-only view" });
+      setMobileNav(false);
+      void agentViews.refresh(id);
+      return true;
+    } catch (error) {
+      setError(error.message);
+      return false;
+    }
+  }
+
   async function openFile(path) {
     try {
       const file = await workspaceAction({ op: "file", path });
@@ -2445,7 +2611,7 @@ function App() {
           </nav>
           <div class="sidebar-body">
             <Show when={nav() === "sessions"}>
-              <SessionNavigator sessions={sessions()} snapshot={snapshot()} openSession={openSession} />
+              <SessionNavigator sessions={sessions()} snapshot={snapshot()} openSession={openSession} openReadonly={openReadonly} canInspect={Boolean(viewSource())} />
             </Show>
             <Show when={nav() === "git"}>
               <GitNavigator fail={setError} openReview={openReview} />
@@ -2520,13 +2686,13 @@ function App() {
                         tabIndex={activeTab() === tab.id ? 0 : -1}
                         onClick={() => setActiveTab(tab.id)}
                         onKeyDown={event => onTabKeyDown(event, tab.id)}
-                        title={tab.path || tab.title}
+                        title={tab.path || tabTitle(tab)}
                       >
-                        <Icon name={tab.kind === "chat" ? "chat" : tab.kind === "review" ? "git" : "file"} size={13} />
-                        <span>{tab.title}</span>
+                        <Icon name={tab.kind === "chat" || tab.kind === "agent-view" ? "chat" : tab.kind === "review" ? "git" : "file"} size={13} />
+                        <span>{tabTitle(tab)}</span>
                       </button>
                       <Show when={tab.id !== "chat"}>
-                        <button class="doc-tab-close" tabIndex={activeTab() === tab.id ? 0 : -1} onClick={() => closeTab(tab.id)} aria-label={"Close " + tab.title}>
+                        <button class="doc-tab-close" tabIndex={activeTab() === tab.id ? 0 : -1} onClick={() => closeTab(tab.id)} aria-label={"Close " + tabTitle(tab)}>
                           <Icon name="close" size={11} />
                         </button>
                       </Show>
@@ -2552,7 +2718,7 @@ function App() {
           </Show>
 
           <div class="workspace-document-panel" id="workspace-document-panel" role="tabpanel" aria-labelledby={tabElementId(activeTab())}>
-            <Show when={surface().kind === "chat"}>
+            <div class="current-agent-panel" hidden={surface().kind !== "chat"}>
               <div class="chat-scroll">
                 <div class="chat">
                   <ResourceHeader snapshot={snapshot()} />
@@ -2681,7 +2847,29 @@ function App() {
                   </div>
                 </form>
               </div>
-            </Show>
+            </div>
+
+            <For each={pinnedIds()}>
+              {id => {
+                const view = createMemo(() => pinnedView(id));
+                const data = createMemo(() => view()?.snapshot);
+                return (
+                  <AgentViewPanel id={id} active={activeTab() === id} snapshot={data()} pending={view()?.pending} error={view()?.error}
+                    find={view()?.find} viewport={view()?.viewport}
+                    onFind={find => agentViews.updateView(id, { find })} onViewport={viewport => agentViews.updateView(id, { viewport })}
+                    onRefresh={() => void agentViews.refresh(id)} onCheckAccess={() => Boolean(agentViews.get(id)?.snapshot)}>
+                    <For each={data()?.turns || []}>
+                      {(turn, index) => <>
+                        <For each={(data()?.context_blocks || []).filter(block => block.before_turn === index())}>{block => <ContextCard block={block} />}</For>
+                        <Message role="user" text={turn.prompt} />
+                        <Message role="assistant" text={turn.answer} outcome={turn.outcome} tools={turn.tool_records} showTools={presentationUi().show_tool_calls} showThinking={false} />
+                      </>}
+                    </For>
+                    <For each={(data()?.context_blocks || []).filter(block => block.before_turn === (data()?.turns?.length || 0))}>{block => <ContextCard block={block} />}</For>
+                  </AgentViewPanel>
+                );
+              }}
+            </For>
 
             <Show when={surface().kind === "file"}>
               <div class="surface code-surface">

@@ -1,4 +1,28 @@
-# Phase 6 browser workspace — source 0.7.0
+# Browser workspace
+
+## Read-only Agent tabs
+
+The shipping Solid shell can open an explicit **Read-only view** beside a saved
+Session branch. Selecting the branch itself still activates the current Agent
+through the existing idle, draft and reconciliation guards. A read-only tab
+never creates or activates a Session, calls a model/tool, or changes the current
+Agent, composer draft or caret.
+
+Each tab names an exact Store, owner lifetime, Session and branch. Titles are
+labels. The owner retains one SQLite Store for unsaved browsing and subsequent
+Session creation; a read does not reopen State or initialize persistence.
+Authenticated requests independently check the trusted actor's current access
+and exact branch identity. Native and browser readers share the public transcript
+projection, which removes invocation receipts and provider-private context.
+
+Tabs are memory-only, with independent Find, viewport and selection. At most
+eight tabs retain at most 4 MiB each and 8 MiB together. Refresh rechecks access
+even when the head is unchanged; denial, logout, source replacement and expiry
+clear protected content and derived state. Closed tabs reject delayed replies.
+Ordinary refresh runs every five seconds, with freshness bounded to fifteen
+seconds from request start. Browser paths and cached descriptors grant no local
+folder or execution authority. Scoped browser Files/Git containers and docking
+remain in the [workspace plan](../plans/workspace-views/TODO.md).
 
 ## Current Phase 62/63 Solid Agent parity and rich rendering
 
@@ -42,16 +66,16 @@ The rooted browser `file` action was revalidated and already returns the complet
 ## Enable only what the owner intends
 
 ```sh
-aw web -C /absolute/checkout --profile ollama --model INSTALLED_MODEL --web-workspace
+aw web -C /absolute/checkout --provider-profile ollama --model-id INSTALLED_MODEL --web-workspace
 # A second deliberate grant exposes unsandboxed owner-machine shell capability:
-aw web -C /absolute/checkout --profile llama --model SERVER_MODEL \
-  --web-workspace --allow-web-terminals
+aw web -C /absolute/checkout --provider-profile llama --model-id SERVER_MODEL \
+  --web-workspace --web-allow-terminals
 # Add a known embeddable site; no arbitrary site URL is accepted from the browser:
-aw web -C /absolute/checkout --profile llama --model SERVER_MODEL \
+aw web -C /absolute/checkout --provider-profile llama --model-id SERVER_MODEL \
   --web-workspace --web-site 'Docs=https://docs.example.org/'
 ```
 
-These commands require a compiled aw. `--web-workspace` grants human read-only file/Git views under the explicit root and Git-discovered worktrees. It does **not** grant model tools. Browser terminal startup needs the additional owner flag and an interactive confirmation. The UI is still one paired principal on numeric loopback; neither this flag nor a reverse proxy turns it into a safe remote multi-user server.
+These commands require a compiled aw. `--web-workspace` grants human read-only file/Git views under the explicit root and Git-discovered worktrees. It does **not** grant model tools. Browser terminal startup needs the additional owner flag and an interactive confirmation. The UI remains a numeric-loopback owner under its LocalWeb or paired/shared authentication boundary; neither this flag nor a reverse proxy supplies remote multi-user authentication.
 
 Historical Phase-6 behavior required explicit **Open workspace**. Current local-single-user `aw --web` mounts the workspace automatically; paired/shared modes may still use explicit capability-gated entry. No terminal or model is started by loading the shell. Surface SDK construction records trusted root/program/site capabilities but does not launch a process. Files/Git/session lists are fetched lazily by the mounted side panes and refreshed on demand; that human browsing still does not dispatch inference.
 
@@ -113,8 +137,17 @@ The same submitter account selection and SDK journal are retained. There is no b
 
 ## Validation
 
-The current frontend gate runs the pure browser model suites with Node, `npm audit`, and a production Vite/Solid build; Rust tests embed and serve the compiled `web/dist` assets and verify strict loopback/origin/CSP boundaries. The post-Phase59 checker also requires the CodeMirror plain-text fallback, document/theme/generation fencing, file-identity scroll reset, and corresponding rebuilt lazy chunk. The original post-Phase59 connector lacked Playwright and Chromium, so its proof was source/bundle/build based. The current the removed browser_solid_ux_smoke helper additionally checks the rebuilt shipping bundle in Chromium, including strict-CSP code/diff layout, document labels, tab keyboard/focus behavior, factual tool states and draft-safe new-Agent reset. It requires Python Playwright and `--chromium PATH` (or an installed Chrome/Chromium), and serves only disposable loopback API fixtures; it does not certify a live Rust owner or provider. the removed post_phase34_ui_smoke helper now checks the embedded Solid bundle/style/official Round Trip mark rather than treating the historical three-region JS as the root shell. The older Chromium fake-API and Phase-6 native surface smokes remain useful for the retained advanced surface/backend contracts. A live ChatGPT OAuth round trip still requires explicit human login and is not claimed by offline validation. [SDK](SURFACES.md) · [Web protocol](WEB-PROTOCOL.md) · [Build status](BUILD-STATUS.md).
+Run the shared product gate in [Build status](BUILD-STATUS.md), plus the
+production Solid build when changing browser source. The six Node suites cover
+pure state, lifetime and rendering rules. Rust HTTP tests exercise the actual
+owner against SQLite State, including transport boundaries, exact authority,
+privacy, revocation and no execution effects. Real-browser acceptance must use
+the shipping compiled assets and Rust owner; mocked API transport does not
+establish that result. Commands, exact commits and completed acceptance belong
+in the [plan TODO](../plans/workspace-views/TODO.md).
 
+Native Windows/macOS execution, live provider/OAuth use, signing and publication
+remain separate gates. [SDK](SURFACES.md) · [Web protocol](WEB-PROTOCOL.md).
 
 ## Phase 7 shared owner note
 

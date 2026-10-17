@@ -466,6 +466,12 @@ body.resizing-sidebar {
   display: flex;
   flex-direction: column;
 }
+.current-agent-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
 .workspace-chrome {
   flex: none;
   background: var(--chrome);
@@ -1330,3 +1336,20 @@ html.aw-theme-resolved .command-menu {
   .settings-wide { grid-column: auto; }
   .code-diff .cm-mergeViewEditors { flex-direction: column; }
 }
+
+/* Read-only branch panels retain their own DOM while another tab is selected. */
+.pinned-agent-panel { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.pinned-agent-bar .mini-icon { margin-left: auto; }
+.agent-view-find { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--border); }
+.agent-view-find input { width: min(300px, 55%); min-width: 80px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
+.agent-view-find [role=status] { min-width: 65px; color: var(--muted); font-size: 10px; }
+.agent-view-state { flex: none; padding: 5px 13px; color: var(--muted); font-size: 10px; }
+.pinned-agent-transcript { padding-bottom: 35px; }
+::highlight(aw-agent-find) { background: var(--notice-bg); color: var(--fg); }
+::highlight(aw-agent-find-current) { background: var(--selected-strong); color: var(--fg); }
+.session-branch-actions { display: flex; align-items: center; min-width: 0; }
+.session-branch-actions > .nav-row { flex: 1; min-width: 0; }
+.session-branch-actions > .mini-icon { flex: none; margin-right: 3px; }
+
+.nav-readonly { width: auto; padding: 0 5px; font-size: 9px; }
+.find-previous { transform: rotate(180deg); }

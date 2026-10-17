@@ -1898,6 +1898,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
 
     let mut store = if !using_jsonl
         && (managing
+            || (local_single_web && directory.is_some())
             || args.session.is_some()
             || args.resume
             || args.import.is_some()
@@ -2223,6 +2224,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             "web tools require --allow-web-tools; effects occur on THIS owner machine".into(),
         ));
     }
+    #[cfg(feature = "web")]
+    let local_web_store = if local_single_web { store.clone() } else { None };
     let mut persistent = None;
     if let Some(s) = store.take() {
         // Local single-user web is a configuration/control surface even before
@@ -2282,14 +2285,14 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     if settings.profile.oauth_connector.is_some() {
                         #[cfg(feature = "oidc")]
                         {
-                            let path = directory.as_deref().ok_or(Error::Denied(
+                            let owned_store = local_web_store.clone().ok_or(Error::Denied(
                                 "Sign in with ChatGPT requires durable local state",
                             ))?;
                             aw::configured_oauth_execution(
                                 &settings,
                                 &ctx,
                                 &tool_options,
-                                SessionStore::open(path)?,
+                                owned_store,
                                 false,
                             )?
                         }
@@ -2309,7 +2312,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     if profile.oauth_connector.is_some() {
                         #[cfg(feature = "oidc")]
                         {
-                            let path = directory.as_deref().ok_or(Error::Denied(
+                            let owned_store = local_web_store.clone().ok_or(Error::Denied(
                                 "Sign in with ChatGPT requires durable local state",
                             ))?;
                             aw::register_oauth_profile(
@@ -2317,7 +2320,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                                 name,
                                 profile,
                                 settings.idle_timeout,
-                                SessionStore::open(path)?,
+                                owned_store,
                             )?;
                         }
                         #[cfg(not(feature = "oidc"))]
@@ -2369,6 +2372,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     context: ctx,
                     tools: tool_options,
                     state_dir: directory,
+                    store: local_web_store,
                     title: args.title.clone(),
                     domain_selector: args.domain.clone(),
                     workspace_selector: args.workspace.clone(),

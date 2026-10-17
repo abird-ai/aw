@@ -1,4 +1,4 @@
-# Web owner protocols — source 0.10.0, Phase 9
+# Web owner protocols
 
 ## Current local-single-user web mode
 
@@ -10,7 +10,7 @@ Local UI settings include ordered status fields, inline/fullscreen preference, e
 
 Current embedded static assets additionally include `/settings.js` and `/workspace-sidebars.js`; the current local workspace shell is described in [BROWSER-WORKSPACE.md](BROWSER-WORKSPACE.md).
 
-**Rust source candidate, not compile-validated or security-audited.** The original `aw web` route contract below remains a private numeric-loopback owner with one paired principal and one active conversation projection. Durable state does not turn it into multi-user authentication, a remote account service, native attach or public hosting.
+The paired route contract below retains one authenticated principal and one active Agent. Ordinary LocalWeb uses the distinct authority described above. Read-only Agent tabs project authorized history independently; they do not add execution owners or remote multi-user authentication.
 
 **Mode distinction:** the new [team gateway](TEAM-PROTOCOL.md) authenticates a named participant before dispatching to their private instance of this API. The earlier single-owner sections below do not grant team participants Unix authority, tools or human workspace surfaces.
 
@@ -30,7 +30,8 @@ New authenticated routes:
 
 | Route | Request / result |
 |---|---|
-| GET `/api/sessions` | Bounded authorized titles/IDs/directory/updated/imported flags; no stored system prompt/fingerprint configuration. |
+| GET `/api/sessions` | Exact `store_id`, owner `source_epoch` and bounded authorized Session/branch descriptors, including before the active Agent is saved. No stored system prompt/fingerprint configuration. |
+| POST `/api/agent-view` | Exact `{store_id, source_epoch, session_id, branch_id}`; authorized public transcript with decimal-string branch revision and a 15-second freshness bound. Never activates a Session. |
 | GET `/api/branches` | Current session's branch ID/name/head/revision/active-run descriptors. |
 | GET `/api/tree` | Current permitted immutable nodes and branches; viewing never executes tools. |
 | GET `/api/usage` | Native stored invocation receipts filtered to the current actor, no fabricated money/zero for unknown usage. |
@@ -57,6 +58,29 @@ Existing snapshot fields remain (instance, sequence, revision, turns, pending, i
 
 This first owner has one active view shared by browser tabs. A tab receiving another active target while it has unsent text retains that text and disables Send until the user explicitly accepts/discards retargeting. This prevents silent accidental disclosure; it is not shared-draft multiplayer or independent tab-group cursors. Unsent editor drafts are not saved across browser close.
 
+## Read-only Agent view authority
+
+The owner retains one Store for saved and unsaved browsing, activation and later
+Session creation. Reads use the strict exact-ID branch reader and do not open a
+State directory, initialize persistence, create a SessionHandle, enter the Agent
+queue or journal an effect. Memory-only owners return an empty Store catalog.
+The owner lifetime is distinct from branch revision and is stable across active
+Agent selection; stale lifetimes and mismatched Stores are refused.
+
+Host/origin/transport authentication remains necessary. Every read separately
+checks the trusted actor's current Store/Session/branch authority and local
+execution target, including unchanged heads. The reader rejects active or
+unreconciled runs; inspectable uncertain history remains visibly marked.
+Native and browser projections remove invocation receipts and provider-private
+context. The browser endpoint has four blocking-read slots and refuses
+oversized public transcripts rather than silently truncating history.
+
+Read-only descriptors are memory-only. Closing a tab fences delayed replies;
+logout, source replacement, denied refresh and freshness expiry clear its
+protected content and derived Find/selection state. Current Agent selection and
+unsent drafts remain independent. See [browser views](BROWSER-WORKSPACE.md) and
+the [implementation checklist](../plans/workspace-views/TODO.md).
+
 ## Management and recovery semantics
 
 Reset/new creates another saved session; previous tree, native receipts and unresolved hazards stay. In `--no-state`, reset remains ephemeral but still cannot dismiss in-memory effect uncertainty. Acknowledgement requires explicit confirmation and is audit-journaled. Import review remains visible in imported provenance even after its gate is cleared.
@@ -69,7 +93,7 @@ Browser closure disconnects the view; it does not kill server-held work. Owner s
 
 All text (session titles, prompts, tool output, node descriptions) is rendered with text nodes. Exported content may still contain sensitive user/tool text: explicit export confirmation warns about it. No automatic browser key vault, endpoint proxy, HTML execution, user-supplied path, or current history secrecy guarantee against a compromised same-UID host is added.
 
-The real Rust router tests and the removed phase3_smoke helper --binary …` include persisted requests, actual owner restart/kill and no-replay cases but were not run here. the removed browser_state_offline_smoke helper exercised actual packaged DOM in Chromium with fake in-page transport only; the exact DDL was separately executed with Python SQLite. See [STATE.md](STATE.md) and [BUILD-STATUS.md](BUILD-STATUS.md).
+Run the shared product gate in [Build status](BUILD-STATUS.md). Record actual Rust-owner HTTP, SQLite, production-bundle and real-browser results against their exact commits in the plan TODO. Pure model tests and mocked transport do not establish native-owner/browser acceptance or live provider/OAuth use. See [State](STATE.md).
 
 
 ## Phase 4 integration note

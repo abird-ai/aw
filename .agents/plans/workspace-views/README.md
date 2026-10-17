@@ -178,7 +178,7 @@ Source seams: `src/workspace/git.rs`, `src/workspace/ui.rs`,
 `crates/aw-git/src/lib.rs`, `src/workspace/owner.rs` and
 `crates/aw-workspace/src/layout.rs`.
 
-## Next slice: browser read-only Agent views
+## Browser read-only Agent views
 
 Start in the shipping Solid Explorer/tab shell (`web/src/main.jsx`), whose
 active document tabs are memory-only. The separate historical browser v1
@@ -191,9 +191,11 @@ Store/Session/branch identities, never a database path or an activation action.
 Keep existing Session activation separate; browsing creates no Agent/Session,
 execution binding, model/tool call or durable effect intent.
 
-Unsaved LocalWeb currently opens State during first-prompt persistence creation.
-First retain one owner Store and reuse it for both browsing and later Session
-creation; do not call that effectful initializer or reopen State per request.
+LocalWeb retains one owner Store from startup and reuses it for browsing,
+activation, provider custody and later Session creation. Reads never call the
+effectful initializer or reopen State. Durable receipt lookup precedes creation,
+so retrying an accepted unsaved request cannot create another Session or call a
+revoked provider. Memory-only owners retain their receipt-first semantics.
 Reuse the existing route boundary's host/origin/paired-browser authentication,
 then independently check exact Store identity and trusted actor Session/branch
 policy on every read. Browser authentication supplies no Store authority.
@@ -217,7 +219,7 @@ gates. Scoped browser Files/Git and docking remain subsequent slices.
 
 Source seams: `web/src/main.jsx`, `crates/aw-surfaces/src/lib.rs`,
 `crates/aw-surfaces/src/contract.rs`, `crates/aw-store/src/lib.rs`,
-`src/workspace/branch_view.rs` and `src/web.rs` (session routes, authenticated
+`src/sessions/branch_view.rs`, its native reexport and `src/web.rs` (session routes, authenticated
 boundary and LocalWeb persistence ownership).
 
 ## References

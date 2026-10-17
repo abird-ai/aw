@@ -243,7 +243,16 @@ async fn dispatch(app: &AppState, command: Command) -> ApiResult<serde_json::Val
         .0),
         Command::Snapshot => as_value(snapshot(State(app.clone())).await?.0),
         Command::Accounts => as_value(accounts(State(app.clone())).await?.0),
-        Command::Sessions => Ok(session_list(State(app.clone())).await?.0),
+        Command::Sessions => {
+            let response = session_list(State(app.clone())).await?;
+            let bytes = axum::body::to_bytes(response.into_body(), protocol::MAX_RESPONSE_BYTES)
+                .await
+                .map_err(|_| {
+                    ApiError(StatusCode::PAYLOAD_TOO_LARGE, "session catalog too large")
+                })?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "invalid session catalog"))
+        }
         Command::Branches => Ok(branch_list(State(app.clone())).await?.0),
         Command::Tree => Ok(tree_view(State(app.clone())).await?.0),
         Command::Usage => as_value(stored_usage(State(app.clone())).await?.0),
@@ -687,6 +696,20 @@ mod tests {
         assert_eq!(result["completion"]["outcome"], "completed");
         assert!(result["turn"].is_null());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn sessions_adapter_keeps_native_catalog_shape_without_selecting_or_dispatching() {
+        let (app, calls) = setup(true, true);
+        let current = current_persistence(&app).unwrap();
+        let before = dispatch(&app, Command::Snapshot).await.unwrap();
+        let catalog = dispatch(&app, Command::Sessions).await.unwrap();
+        assert_eq!(catalog["store_id"], current.store.store_id().unwrap());
+        assert_eq!(catalog["source_epoch"], before["instance"]);
+        assert_eq!(catalog["sessions"][0]["id"], current.handle.session_id());
+        assert!(catalog["sessions"][0]["branches"].is_array());
+        let after = dispatch(&app, Command::Snapshot).await.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     async fn inspect_other_branch_does_not_select_or_dispatch() {

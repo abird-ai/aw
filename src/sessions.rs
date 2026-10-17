@@ -1,5 +1,6 @@
 //! Application-owned durable session composition. Neither view nor stored data
 //! constructs credentials, grants or provider clients. The current host does so.
+pub mod branch_view;
 use crate::{
     config::{Profile, Settings},
     context::ExecutionContext,

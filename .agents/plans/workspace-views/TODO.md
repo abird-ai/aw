@@ -73,11 +73,17 @@ Design and binding decisions: [README.md](README.md).
 
 ## Uncommitted
 
-- [ ] Add browser counterparts through existing capability APIs, with browser-specific acceptance and migration before any shared serialized layout.
+- [~] Add browser read-only Agent tabs: retained owner Store, exact-ID authorized reads, bounded independent view state and composer-free Solid panels.
+- [ ] Add scoped browser Files/Git counterparts through existing capability APIs, with browser-specific acceptance before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 
 ## Tests and verification
+
+- [ ] Browser Agent HTTP regressions against real SQLite State: exact authority/identity, unsaved owner reuse, privacy, revocation and zero execution effects.
+- [ ] Browser Agent view model regressions: delayed/closed/superseded replies, duplicate targets, bounded caches, independent state, expiry and logout — existing six-suite Node gate.
+- [ ] Shipping Solid production build and immutable native package with browser assets; full pinned product gate on the implementation commit.
+- [ ] Actual shipping browser against the Rust owner and two real SQLite branches: independent Find/scroll, unchanged active Agent/draft/caret, denied refresh clearing, stale close protection and zero execution effects.
 
 - [x] Store exact-ID/authority/revocation/active-run/history/no-effect regressions — `cargo test --workspace --locked`, pinned Nix shell on `b33a418`, passed.
 - [x] Layout migration, independent descriptors, split/move/global limits and native persistence protections — same executed workspace Cargo gate on `b33a418`, passed.

@@ -6,7 +6,6 @@ use aw_agent_core::{
     AccountDescriptor, Agent, AgentEvent, CancellationToken, Error, InvocationIdentity,
     PrincipalId, ProviderAccounts, Result, ToolRecord, Turn,
 };
-#[cfg(feature = "oidc")]
 use aw_store::SessionStore;
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
@@ -41,6 +40,7 @@ use crate::{
     sessions::{self, PersistentSession},
     LocalToolOptions,
 };
+mod agent_view;
 mod context_flow;
 #[cfg(target_os = "linux")]
 mod native;
@@ -135,6 +135,7 @@ struct AppInner {
     session: Arc<Session>,
     shutdown: CancellationToken,
     event_slots: Arc<Semaphore>,
+    branch_read_slots: Arc<Semaphore>,
     #[cfg(feature = "surfaces")]
     surfaces: Option<Arc<aw_surfaces::SurfaceHost>>,
     #[cfg(feature = "surfaces")]
@@ -162,6 +163,8 @@ pub struct LocalWebOptions {
     pub context: ExecutionContext,
     pub tools: LocalToolOptions,
     pub state_dir: Option<PathBuf>,
+    /// Existing owner Store shared with provider custody and later Session creation.
+    pub store: Option<aw_store::SessionStore>,
     pub title: Option<String>,
     pub domain_selector: Option<String>,
     pub workspace_selector: Option<String>,
@@ -228,6 +231,7 @@ struct Auth {
 struct Session {
     agent: tokio::sync::Mutex<Agent>,
     persistence: Mutex<Option<PersistentSession>>,
+    store: Option<aw_store::SessionStore>,
     admission: tokio::sync::Mutex<()>,
     accounts: ProviderAccounts,
     actor: PrincipalId,
@@ -862,6 +866,34 @@ fn application_scoped(
     persistence: Option<PersistentSession>,
     scope: ApplicationScope,
 ) -> Result<(Router, AppState)> {
+    let store = persistence.as_ref().map(|p| p.store.clone()).or_else(|| {
+        scope
+            .local_settings
+            .as_ref()
+            .and_then(|local| local.store.clone())
+    });
+    if let Some(local) = &scope.local_settings {
+        match (local.state_dir.as_deref(), store.as_ref()) {
+            (Some(configured), Some(store))
+                if store.directory() == Some(configured.canonicalize()?.as_path()) => {}
+            (Some(_), _) => {
+                return Err(Error::Denied(
+                    "local web requires its existing configured owner Store",
+                ))
+            }
+            (None, Some(store)) if store.directory().is_some() => {
+                return Err(Error::Denied("local web State is disabled"))
+            }
+            _ => {}
+        }
+        if let (Some(provided), Some(retained)) = (&local.store, &store) {
+            if provided.store_id()? != retained.store_id()? {
+                return Err(Error::Denied(
+                    "local web Store authority differs from current Session",
+                ));
+            }
+        }
+    }
     let resources = scope
         .local_settings
         .as_ref()
@@ -966,6 +998,7 @@ fn application_scoped(
             session: Arc::new(Session {
                 agent: tokio::sync::Mutex::new(agent),
                 persistence: Mutex::new(persistence),
+                store,
                 admission: tokio::sync::Mutex::new(()),
                 accounts,
                 actor,
@@ -1005,6 +1038,7 @@ fn application_scoped(
             }),
             shutdown: CancellationToken::new(),
             event_slots: Arc::new(Semaphore::new(MAX_EVENT_CLIENTS)),
+            branch_read_slots: Arc::new(Semaphore::new(4)),
             #[cfg(feature = "surfaces")]
             surfaces,
             #[cfg(feature = "surfaces")]
@@ -1053,6 +1087,7 @@ fn application_scoped(
         .route("/api/session",get(snapshot))
         .route("/api/accounts",get(self::accounts))
         .route("/api/sessions",get(session_list))
+        .route("/api/agent-view",post(agent_view::read))
         .route("/api/branches",get(branch_list))
         .route("/api/tree",get(tree_view))
         .route("/api/usage",get(stored_usage))
@@ -1502,7 +1537,7 @@ async fn settings_chatgpt_start(State(app): State<AppState>) -> ApiResult<Json<s
 
     #[cfg(feature = "oidc")]
     {
-        let (state_dir, actor, profile_name, host_id, referenced_connectors) = {
+        let (_state_dir, actor, profile_name, host_id, referenced_connectors) = {
             let mut settings = local_settings_guard(&app)?;
             let state_dir = settings.state_dir.clone().ok_or(ApiError(
                 StatusCode::BAD_REQUEST,
@@ -1551,7 +1586,7 @@ async fn settings_chatgpt_start(State(app): State<AppState>) -> ApiResult<Json<s
             }
             if previous.status == "ready" {
                 previous.cancel.cancel();
-                if let Ok(store) = SessionStore::open(&state_dir) {
+                if let Ok(store) = current_store(&app) {
                     let _ = crate::oidc_flow::chatgpt_plan_disconnect(
                         &store,
                         &actor,
@@ -1562,7 +1597,7 @@ async fn settings_chatgpt_start(State(app): State<AppState>) -> ApiResult<Json<s
             }
         }
 
-        let store = SessionStore::open(&state_dir).map_err(api_error)?;
+        let store = current_store(&app)?;
         crate::oidc_flow::chatgpt_plan_cleanup_unreferenced(&store, &actor, &referenced_connectors)
             .await
             .map_err(api_error)?;
@@ -1808,11 +1843,11 @@ async fn settings_chatgpt_cancel(
             )
         };
         if connector_exists {
-            let path = state_dir.ok_or(ApiError(
+            let _path = state_dir.ok_or(ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "ChatGPT setup lost its durable state directory",
             ))?;
-            let store = SessionStore::open(&path).map_err(api_error)?;
+            let store = current_store(&app)?;
             Some(
                 crate::oidc_flow::chatgpt_plan_disconnect(&store, &actor, &setup.connector_id)
                     .await
@@ -1883,7 +1918,7 @@ async fn settings_chatgpt_finish(
 
         let (idle_timeout, profile, store) = {
             let mut settings = local_settings_guard(&app)?;
-            let path = settings.state_dir.clone().ok_or(ApiError(
+            let _path = settings.state_dir.clone().ok_or(ApiError(
                 StatusCode::BAD_REQUEST,
                 "Sign in with ChatGPT requires durable local state",
             ))?;
@@ -1916,7 +1951,7 @@ async fn settings_chatgpt_finish(
             (
                 settings.settings.idle_timeout,
                 profile,
-                SessionStore::open(&path).map_err(api_error)?,
+                current_store(&app)?,
             )
         };
 
@@ -2038,7 +2073,7 @@ async fn settings_profile_remove(
     let removal_notice: Option<String> = None;
     #[cfg(feature = "oidc")]
     if let Some(connector_id) = oauth_connector {
-        let (state_dir, actor) = {
+        let (_state_dir, actor) = {
             let settings = local_settings_guard(&app)?;
             (
                 settings.state_dir.clone().ok_or(ApiError(
@@ -2048,7 +2083,7 @@ async fn settings_profile_remove(
                 crate::sessions::actor(&settings.context, false).map_err(api_error)?,
             )
         };
-        let store = SessionStore::open(&state_dir).map_err(api_error)?;
+        let store = current_store(&app)?;
         let remote_confirmed =
             crate::oidc_flow::chatgpt_plan_disconnect(&store, &actor, &connector_id)
                 .await
@@ -2383,8 +2418,8 @@ async fn ensure_local_persistence(
         .4
         .clone()
         .unwrap_or_else(|| prompt.trim().chars().take(100).collect::<String>());
+    let store = current_store(app)?;
     let created = store_work(move || {
-        let store = aw_store::SessionStore::open(&setup.0)?;
         let binding = sessions::binding(&setup.1, &setup.2, &setup.3)?;
         PersistentSession::create_in_workspace(
             store,
@@ -2461,7 +2496,6 @@ async fn prompt(
             StatusCode::FORBIDDEN,
             "configure and select an account/model first",
         ))?;
-    let persistence = ensure_local_persistence(&app, &account, &model, &command.prompt).await?;
     if account.len() > 128 || model.len() > 256 {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
@@ -2486,15 +2520,24 @@ async fn prompt(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    // Durable lookup precedes active-view/revision checks. A retry of an old
-    // accepted ID cannot create a fresh paid run after reset, switching or restart.
-    if let Some(p) = &persistence {
-        let p = p.clone();
+    // The retained owner Store resolves accepted IDs before Session creation,
+    // account selection or revision checks, including after an unsaved restart.
+    let receipt_key = format!("{}:{}", app.0.session.actor.as_str(), command.request_id);
+    if let Some(store) = app.0.session.store.clone() {
+        let actor = app.0.session.actor.clone();
         let request = command.request_id.clone();
         let d = digest.clone();
-        if let Some(r) = store_work(move || p.store.lookup_web(&p.actor, &request, &d)).await? {
+        if let Some(r) = store_work(move || store.lookup_web(&actor, &request, &d)).await? {
             return Ok((StatusCode::ACCEPTED, Json(r.into())));
         }
+    } else if let Some((prior, receipt)) = lock(&app.0.session.state).receipts.get(&receipt_key) {
+        if prior == &fingerprint {
+            return Ok((StatusCode::ACCEPTED, Json(receipt.clone())));
+        }
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "request ID reused for different input",
+        ));
     }
     if lock(&app.0.context_job)
         .as_ref()
@@ -2516,20 +2559,30 @@ async fn prompt(
                 "selected account/model not permitted; no fallback",
             )
         })?;
-    let receipt_key = format!("{}:{}", app.0.session.actor.as_str(), command.request_id);
+    let originally_unsaved = lock(&app.0.session.persistence).is_none()
+        && app
+            .0
+            .local_settings
+            .as_ref()
+            .is_some_and(|settings| lock(settings).state_dir.is_some());
+    if originally_unsaved {
+        // Only the admitted original unsaved target may use the new Session.
+        idle_revision(&app, command.expected_revision)?;
+        if lock(&app.0.session.state).snapshot.needs_reconciliation
+            || command.session_id.is_some()
+            || command.branch_id.is_some()
+            || command.retry_operation_id.is_some()
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "unsaved target changed; refresh",
+            ));
+        }
+    }
+    let persistence = ensure_local_persistence(&app, &account, &model, &command.prompt).await?;
+    let created_here = originally_unsaved && persistence.is_some();
     let next_revision = {
         let state = lock(&app.0.session.state);
-        if persistence.is_none() {
-            if let Some((prior, r)) = state.receipts.get(&receipt_key) {
-                if prior == &fingerprint {
-                    return Ok((StatusCode::ACCEPTED, Json(r.clone())));
-                }
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "request ID reused for different input",
-                ));
-            }
-        }
         if state.snapshot.pending.is_some()
             || state.snapshot.needs_reconciliation
             || state.snapshot.revision != command.expected_revision
@@ -2540,8 +2593,9 @@ async fn prompt(
             ));
         }
         if let Some(saved) = &state.snapshot.saved {
-            if command.session_id.as_deref() != Some(saved.session_id.as_str())
-                || command.branch_id.as_deref() != Some(saved.branch_id.as_str())
+            if !created_here
+                && (command.session_id.as_deref() != Some(saved.session_id.as_str())
+                    || command.branch_id.as_deref() != Some(saved.branch_id.as_str()))
             {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
@@ -2569,6 +2623,11 @@ async fn prompt(
         let branch = command.branch_id.clone().unwrap_or_default();
         Receipt::from(
             store_work(move || {
+                let (session, branch) = if created_here {
+                    (p.handle.session_id().to_owned(), p.handle.branch()?.id)
+                } else {
+                    (session, branch)
+                };
                 p.store.reserve_web(
                     &p.actor,
                     &request,
@@ -2722,6 +2781,12 @@ fn current_persistence(app: &AppState) -> ApiResult<PersistentSession> {
         "this owner explicitly disabled persistence",
     ))
 }
+fn current_store(app: &AppState) -> ApiResult<SessionStore> {
+    app.0.session.store.clone().ok_or(ApiError(
+        StatusCode::FORBIDDEN,
+        "this owner has no SQLite State authority",
+    ))
+}
 fn idle_revision(app: &AppState, revision: u64) -> ApiResult<()> {
     if lock(&app.0.context_job)
         .as_ref()
@@ -2797,30 +2862,49 @@ async fn change_view_with_membership(
         .agent
         .try_lock()
         .map_err(|_| ApiError(StatusCode::CONFLICT, "run still settling"))?;
-    let p = current_persistence(app)?;
+    let p = lock(&app.0.session.persistence).clone();
+    let store = current_store(app)?;
+    let actor = app.0.session.actor.clone();
+    let setup = if p.is_none() {
+        if !matches!(&change, ViewChange::Open(_, _)) {
+            return Err(ApiError(StatusCode::CONFLICT, "no saved Session selected"));
+        }
+        let settings = local_settings_guard(app)?;
+        Some((
+            settings.settings.clone(),
+            settings.context.clone(),
+            settings.tools.clone(),
+        ))
+    } else {
+        None
+    };
     let owned = app.0.owned_sessions_only;
     let (next, view, saved) = store_work(move || {
         if let ViewChange::Open(ref session, _) = change {
-            if owned
-                && !allow_explicit_member
-                && p.store.session(&p.actor, session)?.owner != p.actor
-            {
+            if owned && !allow_explicit_member && store.session(&actor, session)?.owner != actor {
                 return Err(Error::Denied(
                     "this participant can open only its own private history",
                 ));
             }
         }
-        let next = match change {
-            ViewChange::New => p.new_session("New owner conversation")?,
-            ViewChange::Open(s, b) => {
+        let next = match (p, change) {
+            (Some(p), ViewChange::New) => p.new_session("New owner conversation")?,
+            (Some(p), ViewChange::Open(s, b)) => {
                 if allow_explicit_member {
                     p.open_session_with_context_transfer(&s, &b)?
                 } else {
                     p.open_session(&s, &b)?
                 }
             }
-            ViewChange::Fork(n, at) => p.fork(&n, at.as_deref())?,
-            ViewChange::Checkpoint(s) => p.checkpoint(&s)?,
+            (Some(p), ViewChange::Fork(n, at)) => p.fork(&n, at.as_deref())?,
+            (Some(p), ViewChange::Checkpoint(s)) => p.checkpoint(&s)?,
+            (None, ViewChange::Open(s, b)) => {
+                let (settings, context, tools) =
+                    setup.ok_or(Error::Denied("local Session binding unavailable"))?;
+                let binding = sessions::binding(&settings, &context, &tools)?;
+                PersistentSession::open(store, actor, binding, &s, &b, false)?
+            }
+            _ => return Err(Error::Denied("no saved Session selected")),
         };
         let view = next.view()?;
         let saved = saved_selection(&next)?;
@@ -2903,37 +2987,8 @@ async fn acknowledge(
     };
     Ok(Json(update_projection(&app, &agent, saved, false)))
 }
-async fn session_list(State(app): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
-    let p = current_persistence(&app)?;
-    let owned = app.0.owned_sessions_only;
-    let rows = store_work(move || {
-        let mut sessions = p.store.list(&p.actor)?;
-        if owned {
-            sessions.retain(|session| session.owner == p.actor);
-        }
-        sessions
-            .into_iter()
-            .take(512)
-            .map(|session| {
-                let branches = p
-                    .store
-                    .branches(&p.actor, &session.id)?
-                    .into_iter()
-                    .take(128)
-                    .collect::<Vec<_>>();
-                Ok(serde_json::json!({
-                    "id":session.id,
-                    "title":session.title,
-                    "updated_at":session.updated_at,
-                    "imported":session.imported,
-                    "directory":session.binding.working_directory,
-                    "branches":branches
-                }))
-            })
-            .collect::<Result<Vec<_>>>()
-    })
-    .await?;
-    Ok(Json(serde_json::json!({"sessions":rows})))
+async fn session_list(State(app): State<AppState>) -> ApiResult<Response> {
+    agent_view::catalog(&app).await
 }
 async fn branch_list(State(app): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let p = current_persistence(&app)?;
@@ -3126,6 +3181,10 @@ async fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod agent_views {
+        use super::*;
+        include!("web/agent_view_tests.rs");
+    }
     use aw_agent_core::{
         AgentOptions, CompletionFuture, CompletionMeta, DeltaSink, Message, Provider,
     };
@@ -3206,6 +3265,7 @@ mod tests {
             context,
             tools,
             state_dir: None,
+            store: None,
             title: None,
             domain_selector: None,
             workspace_selector: None,
