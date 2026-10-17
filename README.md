@@ -185,17 +185,19 @@ backups cannot execute historical work.
 
 ## Contributing
 
-**We are building aw in the open with you.** We'd love your ideas, architectural
-challenges, research, and thoughtful improvements. We believe the best way to
-develop software is with human-led design and AI-led implementation. Bring a use case, reproducible failure or focused change.
+We build aw in the open and would love your ideas, architectural challenges,
+research, and focused improvements. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the best ways to take part.
 
 ## AI disclosure
 
-**Human-centric design. AI-centric implementation.** aw is built with extensive AI
-assistance for research, code, and tests. Humans lead the architecture, priorities,
-and acceptance criteria. We neither hand over direction to autonomous models nor
-claim that every generated line is manually reviewed. We rely on explicit designs,
-reproducible tests, engineering evidence, and continuous validation.
+**Human-centric design. AI-centric implementation.** aw is built with extensive
+AI assistance for research, code, tests, and documentation. We believe the best
+software comes from human-led design and AI-assisted implementation: humans own
+the architecture, priorities, and acceptance criteria, while AI helps implement,
+test, and iterate. We don't hand direction to autonomous models or claim every
+generated line is manually reviewed — correctness rests on explicit designs,
+reproducible tests, and continuous validation.
 
 ## License
 
