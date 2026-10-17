@@ -2,11 +2,10 @@ Author: GPT-6 (Codex)
 
 # Read-only Agent views and composable Files/Git
 
-Let people inspect several saved branches without changing the Agent they are
-working with. The first slice is native read-only Agent views. Stop that slice
-when two differently targeted views coexist with independent viewport and find
-state while the current Agent, draft and effect admission remain unchanged.
-Files/Git composition, browser support and docking follow as separate slices.
+Read-only Agent tabs, scoped Files and native Git containers let people inspect
+independent resources inside one Workspace without changing the current Agent.
+The native slices preserve independent view state, exact authority and one
+execution owner. Browser counterparts follow next, then docking.
 
 ## Design
 
@@ -101,7 +100,7 @@ this prevents path replacement while allowing ordinary file edits. Directory
 rename/delete is unavailable while those handles live. Windows source/target
 checks and native Windows execution are separate gates.
 
-Native layout v3 migrates consistent v1/v2 inputs only against the already
+The initial scoped Files layout v3 migrated consistent v1/v2 inputs only against the already
 authorized launch scope. Mixed/unsupported versions and malformed ownership are
 rejected before installation; root binding, no-follow/atomic publication and the
 64 KiB limit remain. SQLite v33 and JSONL v1 are unchanged. Older readers reject
@@ -112,14 +111,14 @@ Acceptance: two authorized folders containing the same relative path display
 different content with independent view state; closed/rebound scopes reject
 late read/search/highlight replies; split/move/preview/save/load retain identity,
 limits and Explorer focus while Agent/root/draft/caret and effect admission stay
-unchanged. Browser/Git container counterparts and docking remain later slices.
+unchanged. Browser counterparts and docking remain later slices.
 
 Source seams: `src/workspace/files.rs`, `src/workspace/ui/files_views.rs`,
 `src/workspace/ui/async_work.rs`, `src/workspace/persistence.rs`,
 `crates/aw-workspace/src/layout.rs`, `crates/aw-tools/src/browse.rs`,
 `crates/aw-platform-win/src/scoped_fs.rs`.
 
-## Native Git containers — implementation in progress
+## Native Git containers
 
 Reuse one flat container for navigator placement and document groups. Its
 optional Files scope and per-navigator Git context map are independent resource
@@ -178,6 +177,48 @@ changes limited to exact queued-request admission.
 Source seams: `src/workspace/git.rs`, `src/workspace/ui.rs`,
 `crates/aw-git/src/lib.rs`, `src/workspace/owner.rs` and
 `crates/aw-workspace/src/layout.rs`.
+
+## Next slice: browser read-only Agent views
+
+Start in the shipping Solid Explorer/tab shell (`web/src/main.jsx`), whose
+active document tabs are memory-only. The separate historical browser v1
+four-group reducer is not the shipping shell; do not treat its Node coverage as
+implementation of these views or share native serialized layout prematurely.
+
+Reuse the exact-ID Store branch reader and native reader authority/privacy
+policy through an authenticated read-only endpoint. A request names exact
+Store/Session/branch identities, never a database path or an activation action.
+Keep existing Session activation separate; browsing creates no Agent/Session,
+execution binding, model/tool call or durable effect intent.
+
+Unsaved LocalWeb currently opens State during first-prompt persistence creation.
+First retain one owner Store and reuse it for both browsing and later Session
+creation; do not call that effectful initializer or reopen State per request.
+Reuse the existing route boundary's host/origin/paired-browser authentication,
+then independently check exact Store identity and trusted actor Session/branch
+policy on every read. Browser authentication supplies no Store authority.
+
+Each tab owns bounded content, checked request lifetime, Find, selection and
+viewport. Revalidate permission on refresh even when the branch head is
+unchanged; close/logout/revocation clears protected content and derived caches.
+Use existing browser authentication and capability APIs, keep descriptors
+memory-only and do not grant native local-folder authority to browser paths.
+
+Stop when two real SQLite branches coexist with independent Find/scroll in the
+shipping browser; held replies cannot reopen closed tabs, revocation clears
+unchanged-head content, and current Agent/draft/caret/execution counts remain
+unchanged. Execute actual Rust-owner HTTP tests and real-browser acceptance,
+separately from mocked transport/Node tests.
+
+Parallel ownership: authenticated backend reader/HTTP tests, pure browser
+view-state module/Node tests, and Solid integration/editor lifecycle/browser
+acceptance. The coordinator reconciles shared contracts, bundle and product
+gates. Scoped browser Files/Git and docking remain subsequent slices.
+
+Source seams: `web/src/main.jsx`, `crates/aw-surfaces/src/lib.rs`,
+`crates/aw-surfaces/src/contract.rs`, `crates/aw-store/src/lib.rs`,
+`src/workspace/branch_view.rs` and `src/web.rs` (session routes, authenticated
+boundary and LocalWeb persistence ownership).
 
 ## References
 

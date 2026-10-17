@@ -41,6 +41,12 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 - [x] Independently check the Workspace-only feature boundary and Windows target/test compilation. Actual Windows execution remains open and separate from compilation.
 - [x] Exercise the immutable native package in real terminal sessions with two folder roots, explicit restart/reconnect, unchanged draft/caret, zero model/tool effects and restored terminal settings.
 
+### `b33a4183f6032a024d1b73409d2c9134ea0aab24` — scoped Git local product checkpoint
+
+- [x] Pass the pinned product gate and native Linux package/version after exact Git contexts, v4 layout migration and repository/index/terminal admission corrections; product version, SQLite schema and JSONL version remain unchanged.
+- [x] Check the Workspace-only feature boundary and Windows platform-test/Git-library target compilation; native Windows execution remains open.
+- [x] Exercise two existing private worktrees in actual terminal sessions, including exact selected-index staging, stale refusal, restart/reconnect, unchanged Agent/Files/draft and zero model/tool effect rows.
+
 ## Uncommitted
 
 - [ ] Complete release-asset execution on remaining target hosts, locally or with hosted jobs when available; Linux emulation cannot certify missing macOS/Windows/ARM hosts.
@@ -51,11 +57,11 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 
 ## Tests and verification
 
-- [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `3851dbf`, passed.
-- [x] `cargo fmt --all -- --check` — pinned Nix shell on `3851dbf`, passed.
-- [x] `cargo test --workspace --locked` — pinned Nix shell on `3851dbf`, 1,608 passed, 2 existing ignored, no failures.
-- [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `3851dbf`, 107 passed.
-- [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=3851dbffd808491916e07a3642422bd0f7b465b0#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
+- [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `b33a418`, passed.
+- [x] `cargo fmt --all -- --check` — pinned Nix shell on `b33a418`, passed.
+- [x] `cargo test --workspace --locked` — pinned Nix shell on `b33a418`, 1,638 passed, 2 existing ignored, no failures.
+- [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `b33a418`, 107 passed.
+- [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=b33a4183f6032a024d1b73409d2c9134ea0aab24#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
 - [ ] Release-asset native execution — exact assets and remaining hosts; unfinished external gate.
 - [ ] Version/release approval — explicit owner decision; unfinished external gate.
 - [ ] Identity signing/notarization — actual configured identities and execution; unfinished external gate.

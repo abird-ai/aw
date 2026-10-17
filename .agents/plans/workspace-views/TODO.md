@@ -54,44 +54,58 @@ Design and binding decisions: [README.md](README.md).
 - [x] Cover model/persistence, actual retained-root backend and real native Browser/executor/TestBackend regressions, including held stale replies and split-container routing.
 - [x] Pass the pinned product gate, Workspace feature boundary, Windows test compilation and native Linux package/version on this exact commit; actual two-root terminal and restart/reconnect acceptance passed with zero effects and restored stty. Windows runtime remains open.
 
+### `491f3665b4de7f9fce3cfb4b4a14066d80e205d2` — retained repository identities
+
+- [x] Retain physical directory identities for checkout root, worktree Git directory and common directory; validate exact Git mappings before operations and fresh index application without claiming exclusion of concurrent external writers.
+- [x] Exercise deterministic checkout/admin-directory/gitfile replacement with real Git; add Windows directory-identity tests with target compilation kept separate from actual Windows execution.
+
+### `b33a4183f6032a024d1b73409d2c9134ea0aab24` — native scoped Git containers
+
+- [x] Extend flat ownership with independent Files scope and per-navigator exact Git context bindings under existing limits; preserve dormant bindings across navigator-kind switches without retargeting another view.
+- [x] Migrate consistent native v1/v2/v3 to v4 without changing geometry or reusing IDs; preserve old Files wire fields, root/atomic/no-follow/64 KiB protections, and refuse genuinely unavailable container allocation atomically.
+- [x] Add explicit Git open/reconnect through the existing palette and executor; retain opened contexts through Host presentation changes. Saved IDs and bounded labels never grant access.
+- [x] Route delayed reviews to the originating container's remembered group without changing focus/caret; fence closed/reconnected/restored lifetimes and keep worktree selection independent per navigator.
+- [x] Retain immutable moved/open Diff snapshots against their original checkout; preserve completed Find/viewport/selection and fresh selected-index staging without changing Files/Agent roots or worktree HEADs.
+- [x] Recheck queued index admission on the serialized owner; reconnect, restore and final-reference closure revoke old admission, with no replay of uncertain external effects.
+- [x] Use exact focused Git/Diff context for explicit terminal launch and validate it on the executor before starting a shell; deny unknown, revoked or replaced context and preserve existing terminal bindings.
+- [x] Keep Files work valid inside Git-only groups and independent Files reconnect from cancelling Git requests; update live Git/Workspace/Build documentation and remove stale phase-smoke/not-compiled claims.
+- [x] Pass the exact pinned product gate, Workspace feature boundary, Windows platform/Git-library compilation and native Linux package/version; complete actual two-worktree terminal and restart/reconnect acceptance. Windows runtime remains unchecked.
+
 ## Uncommitted
 
-- [~] Compose native Git using existing repository contexts and fresh exact-review/index admission; worktree selection cannot retarget Agent/Files — backend and native UI agents.
-- [~] Extend flat ownership with independent Files and per-navigator Git bindings; migrate native v1/v2/v3 to v4, preserve geometry/IDs/limits and refuse unavailable container allocation atomically — model/persistence agent.
-- [~] Retain exact checkout contexts across Host presentation changes; explicit open/reconnect, worktree selection, label-only saved hints and final-reference revocation — backend/native agents.
-- [~] Fence origin-bound Git completions and queued owner index requests across close/rebind/restore; retain intentionally open immutable Diff contexts and existing fresh-review/HEAD checks.
-- [~] Validate retained repository directory identities and Git mappings before operations/index admission without claiming exclusion of concurrent external writers — backend/platform helper agent.
 - [ ] Add browser counterparts through existing capability APIs, with browser-specific acceptance and migration before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 
 ## Tests and verification
 
-- [x] Store exact-ID/authority/revocation/active-run/history/no-effect regressions — `cargo test --workspace --locked`, pinned Nix shell on `3851dbf`, passed.
-- [x] Layout migration, independent descriptors, split/move/global limits and native persistence protections — same executed workspace Cargo gate on `3851dbf`, passed.
-- [x] Native real-Reader/executor/TestBackend cases: two targets, independent viewport/find/selection, owner/draft/caret, duplicate identities, expiry/revocation and unavailable states — same executed workspace Cargo gate on `3851dbf`, passed.
+- [x] Store exact-ID/authority/revocation/active-run/history/no-effect regressions — `cargo test --workspace --locked`, pinned Nix shell on `b33a418`, passed.
+- [x] Layout migration, independent descriptors, split/move/global limits and native persistence protections — same executed workspace Cargo gate on `b33a418`, passed.
+- [x] Native real-Reader/executor/TestBackend cases: two targets, independent viewport/find/selection, owner/draft/caret, duplicate identities, expiry/revocation and unavailable states — same executed workspace Cargo gate on `b33a418`, passed.
 - [x] Actual native PTY — `aw workspace open local --config-file CONFIG --provider-profile fixture --state-dir STATE --workspace-directory ROOT --workspace-layout LAYOUT --tools-mode off`, synthetic private fixtures. Broad two-view/Unicode/resize/`o` acceptance passed on `1c2ec6e`; focused Searching→1 match/No matches/80 matches, exact pins, draft/caret, zero effects, quit 0 and identical stty passed with the immutable Nix executable on `3b0dbb5`.
-- [x] `cargo check --locked -p aw-cli --no-default-features --features workspace` — pinned Nix shell on `3851dbf`, passed.
-- [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `3851dbf`, passed.
-- [x] `cargo fmt --all -- --check` — pinned Nix shell on `3851dbf`, passed.
-- [x] `cargo test --workspace --locked` — pinned Nix shell on `3851dbf`, 1,608 passed, 2 existing ignored, no failures.
-- [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `3851dbf`, 107 passed.
-- [x] Changed-content committed-Find and close/restore ABA regressions, including inactive footer/focus and consumed flash selection — executed by the workspace Cargo gate on `3851dbf`, passed.
-- [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=3851dbffd808491916e07a3642422bd0f7b465b0#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
+- [x] `cargo check --locked -p aw-cli --bin aw --no-default-features --features workspace` — pinned Nix shell on `b33a418`, passed.
+- [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `b33a418`, passed.
+- [x] `cargo fmt --all -- --check` — pinned Nix shell on `b33a418`, passed.
+- [x] `cargo test --workspace --locked` — pinned Nix shell on `b33a418`, 1,638 passed, 2 existing ignored, no failures.
+- [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `b33a418`, 107 passed.
+- [x] Changed-content committed-Find and close/restore ABA regressions, including inactive footer/focus and consumed flash selection — executed by the workspace Cargo gate on `b33a418`, passed.
+- [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=b33a4183f6032a024d1b73409d2c9134ea0aab24#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
 - [ ] Further native narrow/maximize, modal-focus and child-PTY acceptance; browser/container/docking-specific checks after those slices exist — remain open beyond this checkpoint.
 
-- [x] Scoped Files layout regressions: two same-path scopes, container membership/global limits, legacy full/exhausted layouts, malformed/mixed versions and split/move/close/save/load — `cargo test --workspace --locked`, pinned Nix shell on `3851dbf`, passed.
-- [x] Actual retained-root backend regressions: distinct read/list/search results, unknown/revoked/reconnected scopes, root replacement and capability cleanup — same executed workspace Cargo gate on `3851dbf`, passed.
-- [x] Native Browser/executor/TestBackend acceptance: independent same-path content/find/viewport, invoking-container preview/Explorer focus, stale reads/search/highlights, explicit refresh/reconnect races, moved-tab labels and unchanged Agent/draft/effect admission — same executed workspace Cargo gate on `3851dbf`, passed.
+- [x] Scoped Files layout regressions: two same-path scopes, container membership/global limits, legacy full/exhausted layouts, malformed/mixed versions and split/move/close/save/load — `cargo test --workspace --locked`, pinned Nix shell on `b33a418`, passed.
+- [x] Actual retained-root backend regressions: distinct read/list/search results, unknown/revoked/reconnected scopes, root replacement and capability cleanup — same executed workspace Cargo gate on `b33a418`, passed.
+- [x] Native Browser/executor/TestBackend acceptance: independent same-path content/find/viewport, invoking-container preview/Explorer focus, stale reads/search/highlights, explicit refresh/reconnect races, moved-tab labels and unchanged Agent/draft/effect admission — same executed workspace Cargo gate on `b33a418`, passed.
 - [x] Actual scoped-Files PTY — `aw workspace open local --config-file CONFIG --provider-profile fixture --state-dir STATE --workspace-directory ROOT --workspace-layout LAYOUT --tools-mode off`, immutable Nix package on `3851dbf`, private synthetic fixtures: distinct same-path Unicode roots, independent Find/scroll, Explorer focus, exact draft/caret, save/split/load, restart with unavailable scope, explicit same-ID reconnect and 100×30→220×64 resize passed. Both app exits were 0 with identical before/after stty; sessions/runs/run_events/invocation_receipts/pipeline_runs/team_runs stayed zero.
 
-- [x] Windows scoped-directory crate and four real-filesystem tests compile — `cargo check --locked -p aw-platform-win --target x86_64-pc-windows-gnu --tests`, pinned Nix shell with Rust 1.98.1 Windows target on `3851dbf`, passed.
-- [ ] Windows scoped-directory handle tests — execute on an actual Windows host; reparse-point case requires symlink privilege or Developer Mode. Compilation does not supply this runtime result.
+- [x] Windows platform scoped-directory and DirectoryIdentity tests compile — `cargo check --locked -p aw-platform-win --target x86_64-pc-windows-gnu --tests`, full pinned Nix shell with Rust 1.98.1 Windows std on `b33a418`, passed.
+- [ ] Windows scoped-directory and DirectoryIdentity filesystem tests — execute on an actual Windows host; reparse-point case requires symlink privilege or Developer Mode. Compilation does not supply this runtime result.
 
-- [ ] Git-container layout/persistence regressions: legacy migration, independent bindings, shared limits, split/move/close and malformed ownership/versions.
-- [ ] Actual Git backend/executor regressions: distinct worktree contexts, delayed/closed/rebound replies, review expiry and selected-index-only fresh staging; stale contexts never mutate.
-- [ ] Native Git/executor/TestBackend acceptance: origin-container routing/focus, independent filters/diff state, explicit open/reconnect, save/load and unchanged Agent/Files/draft/effect admission.
-- [ ] Exact Git-container candidate: pinned product gate, Workspace-only feature boundary, native Nix package/version and real-terminal two-worktree acceptance.
+- [x] Git-container layout/persistence regressions: legacy/mixed migration, independent and dormant bindings, shared limits, split/move/close, malformed ownership/versions and atomic allocation refusal — `cargo test --workspace --locked`, pinned Nix shell on `b33a418`, passed.
+- [x] Actual Git backend/executor regressions: distinct worktrees, delayed/closed/rebound/restore replies, launch discovery replacement, retained immutable reviews, context bounds/pruning and selected-index-only fresh staging — same executed workspace Cargo gate on `b33a418`, passed.
+- [x] Native Git/executor/TestBackend acceptance: originating remembered-group/focus, independent Find/viewport, moved completed selection, explicit open/reconnect, mixed File views, unchanged Agent/draft, and queued terminal denial after replacement/revocation — same executed workspace Cargo gate on `b33a418`, passed.
+- [x] Actual scoped-Git PTY — `aw workspace open local --config-file CONFIG --provider-profile fixture --state-dir STATE --workspace-directory ROOT --workspace-layout LAYOUT --tools-mode off`, immutable Nix package on `b33a418`, private two-worktree fixture and trusted real-Git wrapper with an explicitly armed 3-second diff delay: origin routing/Explorer focus, distinct Unicode reviews with independent 120-hit Find/scroll, selected-index stage/unstage and stale refusal, unchanged Files/Agent/draft/caret/HEADs, save/load, 100×30→220×64 resize, unavailable restart contexts and exact same-ID reconnects passed. Both app exits were 0 with byte-equal before/after stty; both indexes ended clean; sessions/runs/run_events/invocation_receipts/pipeline_runs/team_runs stayed zero.
+
+- [x] Windows Git library compiles — `cargo check --locked -p aw-git --target x86_64-pc-windows-gnu --lib`, full pinned Nix shell with Rust 1.98.1 Windows std on `b33a418`, passed.
 
 ## Deferred
 
