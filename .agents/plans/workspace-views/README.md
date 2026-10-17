@@ -5,7 +5,8 @@ Author: GPT-6 (Codex)
 Read-only Agent tabs, scoped Files and native Git containers let people inspect
 independent resources inside one Workspace without changing the current Agent.
 The native slices preserve independent view state, exact authority and one
-execution owner. Browser counterparts follow next, then docking.
+execution owner. Browser read-only Agent tabs use the same strict reader; scoped
+browser Files/Git containers follow next, then docking.
 
 ## Design
 

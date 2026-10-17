@@ -71,14 +71,26 @@ Design and binding decisions: [README.md](README.md).
 - [x] Keep Files work valid inside Git-only groups and independent Files reconnect from cancelling Git requests; update live Git/Workspace/Build documentation and remove stale phase-smoke/not-compiled claims.
 - [x] Pass the exact pinned product gate, Workspace feature boundary, Windows platform/Git-library compilation and native Linux package/version; complete actual two-worktree terminal and restart/reconnect acceptance. Windows runtime remains unchecked.
 
+### `a0ffa3ec9e3fb3d3c713d8cea1a8c694543d002e` — browser read-only Agent tabs
+
+- [x] Retain one LocalWeb Store from startup for unsaved browsing, activation, provider custody and first-prompt creation; strict exact-ID reads never create or activate a Session.
+- [x] Share the native authorized privacy projection with the browser; revalidate exact Store/owner lifetime/Session/branch, membership and local target on every read, including unchanged heads.
+- [x] Add bounded memory-only views with independent Find/viewport/selection, checked request lifetimes, cancellation and expiry; scrub closed/denied pending entries before abort callbacks.
+- [x] Integrate explicit read-only branch actions and composer-free Solid panels; preserve the actual composer node, draft and caret, fence stale owner observations and clear protected labels/metadata on denied access.
+- [x] Resolve durable receipts before lazy creation or account selection; preserve memory-only deduplication and retained-Store owner-replacement retries after account revocation without another Session or inference.
+- [x] Pass the exact pinned product gate: bootstrap, formatting, 1,649 Rust tests with 2 existing ignored, and all 125 browser tests; Workspace-only check and 132 web-only library tests passed. Native Nix package/version passed.
+- [x] Actual Chrome 155 against immutable package and real Rust/SQLite owner: two branches retained independent 120-hit Find, 1,100/1,750-pixel scroll and selection; actual composer/draft/caret and owner were unchanged. Unchanged authorized refresh and a changed hidden response retained state, a held actual owner reply could not reopen its closed tab, and unchanged-head membership revocation cleared transcript/Find/selection/labels. This predates the draft-retarget follow-up below.
+
 ## Uncommitted
 
-- [~] Add browser read-only Agent tabs: retained owner Store, exact-ID authorized reads, bounded independent view state and composer-free Solid panels.
+- [~] Finish browser Agent acceptance and bind private drafts to exact owner/Session/branch; external retargeting requires an explicit choice before Send or publication.
 - [ ] Add scoped browser Files/Git counterparts through existing capability APIs, with browser-specific acceptance before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 
 ## Tests and verification
+
+- [ ] Exact follow-up product gate/package and actual Chrome draft-retarget/late-observation/closed-view/revocation acceptance; recheck zero execution effects.
 
 - [ ] Browser Agent HTTP regressions against real SQLite State: exact authority/identity, unsaved owner reuse, privacy, revocation and zero execution effects.
 - [ ] Browser Agent view model regressions: delayed/closed/superseded replies, duplicate targets, bounded caches, independent state, expiry and logout — existing six-suite Node gate.

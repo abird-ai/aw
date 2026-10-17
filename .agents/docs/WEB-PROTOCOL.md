@@ -2,7 +2,7 @@
 
 ## Current local-single-user web mode
 
-The historical paired `aw web` protocol remains relevant to paired/shared/team modes, but ordinary numeric-loopback **single-user `aw --web` now has a separate `LocalWeb` authority**. It authenticates only the verified local owner path, retains exact Host/Origin/Fetch-Metadata protections, and does not use a pairing code/cookie. It is still loopback-only and must not be proxied/wildcard-bound and treated as remote multi-user authentication.
+The historical paired `aw web` protocol remains relevant to paired/shared/team modes, but ordinary numeric-loopback **single-user `aw web` now has a separate `LocalWeb` authority**. It authenticates only the verified local owner path, retains exact Host/Origin/Fetch-Metadata protections, and does not use a pairing code/cookie. It is still loopback-only and must not be proxied/wildcard-bound and treated as remote multi-user authentication.
 
 Local web can start before inference is configured. A revoked control-plane-only placeholder account lets the application expose Settings/session metadata without becoming selectable for model execution. `GET /api/settings` plus idle-gated strict Settings mutations manage secret-free provider/profile/model metadata and the shared UI preferences; provider keys remain environment-backed. Saving Settings performs validation/registration only and never dispatches inference. The first prompt after a valid default profile/model creates the real durable Session lazily.
 
@@ -16,7 +16,7 @@ The paired route contract below retains one authenticated principal and one acti
 
 ## Owner, pairing and data scope
 
-`aw web` binds a numeric loopback address (default127.0.0.1:8787). Exact Host/Origin and cross-site Fetch Metadata boundaries, JSON mutations, bounded body, one-use 256-bit random pairing code, hashed code/cookie, short pairing TTL, bounded attempts, HttpOnly SameSite=Strict host cookie, private embedded no-store/CSP assets are retained. Cookie/code are memory-only and never included in the database or snapshots. Fresh owner/restart needs a new pairing code; durable conversation can be selected via `--session BROWSER_SESSION_ID`.
+`aw web` binds a numeric loopback address (default127.0.0.1:8787). Exact Host/Origin and cross-site Fetch Metadata boundaries, JSON mutations, bounded body, one-use 256-bit random pairing code, hashed code/cookie, short pairing TTL, bounded attempts, HttpOnly SameSite=Strict host cookie, private embedded no-store/CSP assets are retained. Cookie/code are memory-only and never included in the database or snapshots. Fresh owner/restart needs a new pairing code; durable conversation can be selected via `--session-id BROWSER_SESSION_ID`.
 
 This development HTTP loopback cookie lacks Secure; browsers do not isolate cookies by port. Local malicious software/same-host services remain a trust risk. Do not proxy/wildcard-bind this owner and call it safe remote multi-user access. Authenticated actor is `browser:paired`, not the Unix launcher; CLI-owned sessions require explicit native SDK membership and are not silently exposed.
 
@@ -46,7 +46,7 @@ Persistent prompt body:
 {"request_id":"client-chosen-id","expected_revision":4,"session_id":"s_…","branch_id":"b_…","prompt":"Continue","account_id":"allowed-account","model":"allowed-model"}
 ```
 
-Account/model are optional only together (defaultownerselection); session/branch are required exactly when persisted. Unknown fields are rejected. `--no-state` retains the memory protocol without saved IDs. Accepted response: `202 {run_id, revision, state}` where state is accepted, settled or interrupted. IDs are scoped to authenticated actor and exact fingerprint. Existing receipts are looked up before active-view revision checks so a retry cannot cause a new paid call after reset/restart. Requests that omitted account/model bind the resolved defaults; changed defaults can produce an explicit fingerprint conflict rather than a new execution. They are not globally valid outside the owning store.
+Account/model are optional only together (defaultownerselection); session/branch are required exactly when persisted. Unknown fields are rejected. `--state-memory-only` retains the memory protocol without saved IDs. Accepted response: `202 {run_id, revision, state}` where state is accepted, settled or interrupted. IDs are scoped to authenticated actor and exact fingerprint. Existing receipts are looked up before active-view revision checks so a retry cannot cause a new paid call after reset/restart. Requests that omitted account/model bind the resolved defaults; changed defaults can produce an explicit fingerprint conflict rather than a new execution. They are not globally valid outside the owning store.
 
 New prompt receipt is durable before202, then `journal.begin` links exact native run before inference. Its final native settlement updates the same receipt transactionally. Preflight-rejected receipts settle without a native call. Restart recovers unfinished receipts conservatively; no auto-resubmit. A background persistence failure blocks continued prompts and requires reload/recovery. Source-level ID/hash fields are not proof of externally verified billing.
 
@@ -83,7 +83,7 @@ the [implementation checklist](../plans/workspace-views/TODO.md).
 
 ## Management and recovery semantics
 
-Reset/new creates another saved session; previous tree, native receipts and unresolved hazards stay. In `--no-state`, reset remains ephemeral but still cannot dismiss in-memory effect uncertainty. Acknowledgement requires explicit confirmation and is audit-journaled. Import review remains visible in imported provenance even after its gate is cleared.
+Reset/new creates another saved session; previous tree, native receipts and unresolved hazards stay. In `--state-memory-only`, reset remains ephemeral but still cannot dismiss in-memory effect uncertainty. Acknowledgement requires explicit confirmation and is audit-journaled. Import review remains visible in imported provenance even after its gate is cleared.
 
 A conversation fork does not copy/restore the workspace. Checkpoint changes only future context, while prior nodes remain exportable. Neither operation gives the caller another person's account or turns source text into a grant. Switching the current view does not alter running tools; mutations require idle owner plus expected view revision.
 
@@ -91,7 +91,7 @@ Browser closure disconnects the view; it does not kill server-held work. Owner s
 
 ## Output and validation limits
 
-All text (session titles, prompts, tool output, node descriptions) is rendered with text nodes. Exported content may still contain sensitive user/tool text: explicit export confirmation warns about it. No automatic browser key vault, endpoint proxy, HTML execution, user-supplied path, or current history secrecy guarantee against a compromised same-UID host is added.
+Labels use text nodes; transcripts and context cards use sanitized Markdown rendering with raw HTML disabled and inert media references. Exported content may still contain sensitive user/tool text: explicit export confirmation warns about it. No automatic browser key vault, endpoint proxy, HTML execution, user-supplied path, or current history secrecy guarantee against a compromised same-UID host is added.
 
 Run the shared product gate in [Build status](BUILD-STATUS.md). Record actual Rust-owner HTTP, SQLite, production-bundle and real-browser results against their exact commits in the plan TODO. Pure model tests and mocked transport do not establish native-owner/browser acceptance or live provider/OAuth use. See [State](STATE.md).
 
@@ -115,7 +115,7 @@ Earlier protocol sections describe the existing conversation endpoint behavior. 
 | `GET /api/workspace` | Authenticated capabilities; `{enabled:false}` when owner did not grant surfaces. |
 | `POST /api/workspace/action` | Authenticated JSON matching `aw_surfaces::Command`, tagged `op`, unknown fields rejected. Owner surface grant required. |
 
-The trusted startup flags are --web-workspace, --allow-web-terminals and repeated --web-site LABEL=HTTPS_URL. They are not browser fields. Surface commands never accept arbitrary owner root, Git arguments, program/environment, account, credential, actor or server-fetch destination.
+The trusted startup flags are --web-workspace, --web-allow-terminals and repeated --web-site LABEL=HTTPS_URL. They are not browser fields. Surface commands never accept arbitrary owner root, Git arguments, program/environment, account, credential, actor or server-fetch destination.
 
 Action operations: `capabilities`; `files`/`file` with root-relative path; `git_list` with known context and mode; `git_open` with cached item ID; `review` with review ID; `review_feedback` with row and comment; `terminals`; `terminal_start` with request ID, known context, confirmation and dimensions; `terminal_claim`/`release`; `terminal_screen`; `terminal_input`; `terminal_resize`; `terminal_stop`; `terminal_forget` for exited resources. Inspect the actual tagged enum in [contract source](../../crates/aw-surfaces/src/contract.rs) for exact required fields.
 
@@ -142,7 +142,7 @@ Current browser terminal claims are cooperative per-client control within one au
 
 ## Phase 7 shared-owner integration
 
-The new `aw serve --socket PATH` explicitly starts a Linux same-UID native owner. Add `--serve-web` to attach the existing numeric-loopback HTTP API to THAT same Agent/store. In this opt-in mode the configured actor is the verified Unix user, and the printed pairing warning states that a paired browser receives that owner role. The old `aw web` mode remains separate browser:paired identity, with no native socket or silent Unix-history sharing.
+The new `aw agent --server-socket PATH` explicitly starts a Linux same-UID native owner. Add `--web-serve` to attach the existing numeric-loopback HTTP API to THAT same Agent/store. In this opt-in mode the configured actor is the verified Unix user, and the printed pairing warning states that a paired browser receives that owner role. The historical standalone paired adapter uses `browser:paired`; ordinary `aw web` instead uses the distinct LocalWeb authority described above, with no native socket or implicit remote sharing.
 
 The existing routes and browser source are preserved. Session open/fork/new/checkpoint still change one common active projection; other views rely on revision/saved-target checks and draft retarget guards. Native `Inspect` is read-only and does not change the browser selection. Native commands do not bypass browser cookies: they enter through a separately peer-validated Unix transport and internal authority context. No HTTP header can select that native context.
 
@@ -154,11 +154,11 @@ Authentication is now rechecked after waiting for the mutation/admission locks, 
 
 ## Phase 9 / 0.10.0 — explicit named-participant gateway
 
-`aw team serve` is a new, separately selected owner mode. Prior `aw web` and Unix `serve --serve-web` roles are unchanged. Team cookies independently select `internal:<realm>:<id>` controllers with owned-only histories and explicit account/model grants. Each participant has a different active session/branch; same-user browser tabs still share that user's controller. Tools and human workspace surfaces are not granted.
+`aw team serve` is a new, separately selected owner mode. Prior `aw web` and Unix `aw agent --web-serve` roles are unchanged. Team cookies independently select `internal:<realm>:<id>` controllers with owned-only histories and explicit account/model grants. Each participant has a different active session/branch; same-user browser tabs still share that user's controller. Tools and human workspace surfaces are not granted.
 
 The existing JSON routes are reused behind the authenticated gateway; `GET /api/team/me` adds current identity metadata only. No actor/user selector, provider key, account administration, public directory or conversation-sharing API exists. Logout affects that participant; semantic host-config changes stop the whole team owner. The same-origin numeric-loopback, cookie limitations, snapshot/deduplication and immutable journal rules remain.
 
-See the exact [team protocol](TEAM-PROTOCOL.md), [identity/lifecycle contract](TEAM-IDENTITY.md) and [build boundary](BUILD-STATUS.md). Gateway Rust tests are source only here.
+See the exact [team protocol](TEAM-PROTOCOL.md), [identity/lifecycle contract](TEAM-IDENTITY.md) and [build boundary](BUILD-STATUS.md). Gateway authority tests run in the product gate; executed commits and remaining runtime gates belong in the plan TODO.
 
 ## Planned context-flow UI/API
 
@@ -179,7 +179,7 @@ Generate is an explicit confirmed account/model action that starts a tool-free S
 
 Snapshots add `context_blocks`, in projection order. Source-derived output stays buffered until final authorization/journal checks. Before snapshots/events/candidate retrieval, current dependencies are rechecked. A denied session yields403 and SSE `context_revoked`, not an old cached summary. Code may clear the browser view, but cannot erase content a client/vendor already received. A user may explicitly create a clean private session; that does not restore revoked context.
 
-No file/model tool is added by opening the picker. The browser maintains unsaved candidate changes locally and refuses to apply them until a new manual artifact is saved. Previews render inert text; no raw HTML/Markdown execution. See [exact command shapes](CONTEXT-FLOW-IMPLEMENTATION.md) and [the packaged UI](../../web/context-flow.js). Real HTTP/auth/source checks await compilation and `phase10_smoke.py`; fake-browser tests are not those tests.
+No file/model tool is added by opening the picker. The browser maintains unsaved candidate changes locally and refuses to apply them until a new manual artifact is saved. Previews render inert text; no raw HTML/Markdown execution. See [exact command shapes](CONTEXT-FLOW-IMPLEMENTATION.md) and [the packaged UI](../../web/context-flow.js). Real HTTP/auth/source checks belong in the product gate and must be recorded against their executed commit; mocked browser transport does not establish those results.
 
 ## Phase 38 — team shared-draft browser protocol
 

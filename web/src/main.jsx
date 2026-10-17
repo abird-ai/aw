@@ -13,7 +13,7 @@ const CodeFile = lazy(() =>
 const CodeDiff = lazy(() =>
   import("./code-surface.jsx").then(module => ({ default: module.CodeDiff }))
 );
-import { acceptDelta, acceptSnapshot, accountChoices, canSend, isSubmitKey, needsDraftPublicationConsent, submission } from "../model.js";
+import { acceptDelta, acceptSnapshot, accountChoices, canSend, draftTargetChanged, isSubmitKey, needsDraftPublicationConsent, submission } from "../model.js";
 import "./styles.css";
 
 const MARK = "/abird-round-trip-mark.svg";
@@ -1734,7 +1734,8 @@ function App() {
   const [connection, setConnection] = createSignal("Connecting…");
   const [online, setOnline] = createSignal(false);
   const [error, setError] = createSignal("");
-  const [prompt, setPrompt] = createSignal("");
+  const [prompt, setPromptValue] = createSignal("");
+  const [draftOrigin, setDraftOrigin] = createSignal(null);
   const [posting, setPosting] = createSignal(false);
   const [account, setAccount] = createSignal(null);
   const [sessions, setSessions] = createSignal([]);
@@ -1759,6 +1760,7 @@ function App() {
   let source;
   let observationLifetime = {};
   let sharedClient = null;
+  let sharedDraftOrigin = null;
   let composerTextarea = null;
   let presencePending = null;
   let presenceLastSent = 0;
@@ -1864,6 +1866,38 @@ function App() {
   });
   const teamSharing = createMemo(() => Boolean(teamInfo()?.peer_sharing && snapshot()?.saved));
   const sharedActive = createMemo(() => Boolean(sharedDraft() && sharedClient?.active?.()));
+  const draftRetargetRequired = createMemo(() => Boolean(snapshot()) && !sharedActive()
+    && draftTargetChanged(draftOrigin(), snapshot(), prompt()));
+
+  // Keep only a target key: an unsent draft must never retain old history.
+  function draftTarget(value = snapshot()) {
+    return value ? {
+      instance: value.instance,
+      saved: value.saved ? {
+        session_id: value.saved.session_id,
+        branch_id: value.saved.branch_id,
+      } : null,
+    } : null;
+  }
+
+  function sameDraftTarget(left, right) {
+    return left === right || Boolean(left && right && !draftTargetChanged(left, right, "draft"));
+  }
+
+  function setPrompt(value, origin = undefined) {
+    if (!value.trim()) setDraftOrigin(null);
+    else if (origin) setDraftOrigin(origin);
+    else if (!prompt().trim() || !draftOrigin()) setDraftOrigin(draftTarget());
+    return setPromptValue(value);
+  }
+
+  function useDraftHere() {
+    const current = snapshot();
+    if (!current || sharedActive() || !prompt().trim()) return;
+    setDraftOrigin(draftTarget(current));
+    setError("");
+    composerTextarea?.focus();
+  }
 
   createEffect(() => {
     const all = choices();
@@ -1992,12 +2026,14 @@ function App() {
 
   function detachSharedDraft({ keepText = true, message = "" } = {}) {
     const text = sharedClient?.currentText?.() ?? prompt();
+    const origin = sharedDraftOrigin;
     sharedClient?.destroy?.();
     sharedClient = null;
+    sharedDraftOrigin = null;
     setSharedDraft(null);
     setSharedPresence([]);
     setPublishChoice(false);
-    if (keepText) setPrompt(text);
+    if (keepText) setPrompt(text, origin);
     if (message) setError(message);
   }
 
@@ -2023,15 +2059,23 @@ function App() {
     const module = await import("./multiplayer.js");
     sharedClient = module.createSharedDraftClient({
       api,
-      onText: value => setPrompt(value),
-      onState: value => setSharedDraft(value),
+      onText: value => setPrompt(value, sharedDraftOrigin),
+      onState: value => {
+        if (sharedDraftOrigin && value.target) {
+          sharedDraftOrigin = draftTarget({ instance: sharedDraftOrigin.instance, saved: value.target });
+          if (prompt().trim()) setDraftOrigin(sharedDraftOrigin);
+        }
+        setSharedDraft(value);
+      },
       onError: error => {
         const text = sharedClient?.currentText?.() ?? prompt();
+        const origin = sharedDraftOrigin;
         sharedClient?.destroy?.();
         sharedClient = null;
+        sharedDraftOrigin = null;
         setSharedDraft(null);
         setSharedPresence([]);
-        setPrompt(text);
+        setPrompt(text, origin);
         setError(
           error?.status === 409
             ? "The shared prompt changed or was sealed. Your local edit is still here as a private draft."
@@ -2091,8 +2135,11 @@ function App() {
   }
 
   async function beginCollaboration({ publishPrivate = false } = {}) {
-    if (!teamSharing() || sharedActive()) return;
+    if (!teamSharing() || sharedActive() || draftRetargetRequired()) return;
     const privateText = prompt();
+    const origin = draftOrigin();
+    const target = draftTarget();
+    const lifetime = observationLifetime;
     if (!publishPrivate && needsDraftPublicationConsent(privateText, sharedActive())) {
       setPublishChoice(true);
       setCollabPanel(true);
@@ -2102,6 +2149,13 @@ function App() {
     try {
       const opened = await api("/api/team/draft/open", { activate_auto: true });
       const client = await ensureSharedClient();
+      const openedTarget = draftTarget({ instance: target.instance, saved: opened.target });
+      if (lifetime !== observationLifetime || prompt() !== privateText
+        || !sameDraftTarget(origin, draftOrigin()) || !sameDraftTarget(target, draftTarget())
+        || !sameDraftTarget(target, openedTarget)) {
+        throw new Error("The active Agent or draft changed. Review the draft before sharing it here.");
+      }
+      sharedDraftOrigin = openedTarget;
       client.install(opened);
       if (publishPrivate && privateText) {
         client.setText(privateText);
@@ -2414,11 +2468,12 @@ function App() {
       return showChat();
     }
     const preserveDraft = options.preserveDraft !== false;
-    if (
-      !options.quiet
-      && prompt().trim()
-      && !confirm("Open another branch and keep this unsent draft text?")
-    ) return false;
+    const original = prompt();
+    const origin = draftOrigin();
+    const target = draftTarget(current);
+    const lifetime = observationLifetime;
+    const consent = !options.quiet && Boolean(original.trim());
+    if (consent && !confirm("Open another branch and keep this unsent draft text?")) return false;
     try {
       if (sharedActive()) await leaveSharedDraft(preserveDraft);
       const path = shared ? "/api/team/session/open-shared" : "/api/session/open";
@@ -2427,7 +2482,14 @@ function App() {
         session_id: sessionId,
         branch,
       });
-      setSnapshot(next);
+      if (lifetime !== observationLifetime) return false;
+      const keepConsent = consent && prompt() === original
+        && sameDraftTarget(origin, draftOrigin())
+        && (sameDraftTarget(target, draftTarget()) || sameDraftTarget(draftTarget(next), draftTarget()));
+      const installed = setSnapshot(value => acceptSnapshot(value, next));
+      if (keepConsent && sameDraftTarget(draftTarget(next), draftTarget(installed))) {
+        setDraftOrigin(draftTarget(installed));
+      }
       setActiveTab("chat");
       setMobileNav(false);
       await Promise.allSettled([loadSessions(), loadCollaboration()]);
@@ -2441,10 +2503,14 @@ function App() {
   async function newChat() {
     const current = snapshot();
     if (!current || current.pending) return false;
-    if (prompt().trim() && !confirm("Start a new chat? Your unsent draft will be cleared.")) return false;
+    const original = prompt();
+    const origin = draftOrigin();
+    const lifetime = observationLifetime;
+    if (original.trim() && !confirm("Start a new chat? Your unsent draft will be cleared.")) return false;
     try {
       const next = await api("/api/reset", { expected_revision: current.revision });
-      setPrompt("");
+      if (lifetime !== observationLifetime) return false;
+      if (prompt() === original && draftOrigin() === origin) setPrompt("");
       setSnapshot(next);
       showChat();
       await loadSessions();
@@ -2458,7 +2524,7 @@ function App() {
   async function send(event) {
     event?.preventDefault();
     const current = snapshot();
-    if (!current) return;
+    if (!current || draftRetargetRequired()) return;
     if (currentSession()?.shared && !sharedActive()) {
       await beginCollaboration();
       return;
@@ -2492,8 +2558,9 @@ function App() {
       } else {
         const body = submission(current, prompt(), crypto.randomUUID(), account());
         const original = prompt();
+        const origin = draftOrigin();
         await api("/api/prompts", body, 120000);
-        if (prompt() === original) setPrompt("");
+        if (prompt() === original && draftOrigin() === origin) setPrompt("");
       }
       await refresh(false);
     } catch (e) {
@@ -2778,6 +2845,12 @@ function App() {
                     close={() => setCollabPanel(false)}
                   />
                 </Show>
+                <Show when={draftRetargetRequired()}>
+                  <div class="notice" role="status">
+                    <span>The active Agent changed to {title()} · {snapshot()?.saved?.branch_name || "new chat"}. Your unsent draft is still here.</span>
+                    <button class="quiet" type="button" onClick={useDraftHere}>Use draft here</button>
+                  </div>
+                </Show>
                 <form class="composer" onSubmit={send}>
                   <textarea
                     ref={composerTextarea}
@@ -2840,7 +2913,7 @@ function App() {
                     <span class="composer-hint">Enter send · Shift+Enter newline</span>
                     <Show
                       when={snapshot()?.pending}
-                      fallback={<button class="send" type="submit" disabled={!canSend(snapshot(), posting(), prompt())}>Send ↑</button>}
+                      fallback={<button class="send" type="submit" disabled={draftRetargetRequired() || !canSend(snapshot(), posting(), prompt())}>Send ↑</button>}
                     >
                       <button class="quiet stop" type="button" onClick={cancel}>Stop</button>
                     </Show>

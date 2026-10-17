@@ -34,7 +34,7 @@ The post-Phase59 CodeMirror generation/document/theme fencing and top-left file-
 
 ## Current post-Phase37 design-adaptation contract
 
-For ordinary numeric-loopback **single-user `aw --web`**, the product root is now a compiled **SolidJS** application rather than the historical hand-written three-region shell. The design intentionally combines the density/snappiness of Pi Web with a minimal ChatGPT-like conversation surface and Abird's own visual language:
+For ordinary numeric-loopback **single-user `aw web`**, the product root is now a compiled **SolidJS** application rather than the historical hand-written three-region shell. The design intentionally combines the density/snappiness of Pi Web with a minimal ChatGPT-like conversation surface and Abird's own visual language:
 
 - a narrow left Explorer, ordered **Sessions / Files / Git**;
 - a **full command/search bar** across the top for files, sessions, open tabs and commands;
@@ -77,7 +77,7 @@ aw web -C /absolute/checkout --provider-profile llama --model-id SERVER_MODEL \
 
 These commands require a compiled aw. `--web-workspace` grants human read-only file/Git views under the explicit root and Git-discovered worktrees. It does **not** grant model tools. Browser terminal startup needs the additional owner flag and an interactive confirmation. The UI remains a numeric-loopback owner under its LocalWeb or paired/shared authentication boundary; neither this flag nor a reverse proxy supplies remote multi-user authentication.
 
-Historical Phase-6 behavior required explicit **Open workspace**. Current local-single-user `aw --web` mounts the workspace automatically; paired/shared modes may still use explicit capability-gated entry. No terminal or model is started by loading the shell. Surface SDK construction records trusted root/program/site capabilities but does not launch a process. Files/Git/session lists are fetched lazily by the mounted side panes and refreshed on demand; that human browsing still does not dispatch inference.
+Historical Phase-6 behavior required explicit **Open workspace**. Current local-single-user `aw web` mounts the workspace automatically; paired/shared modes may still use explicit capability-gated entry. No terminal or model is started by loading the shell. Surface SDK construction records trusted root/program/site capabilities but does not launch a process. Files/Git/session lists are fetched lazily by the mounted side panes and refreshed on demand; that human browsing still does not dispatch inference.
 
 ## Layout and usable content
 
@@ -151,7 +151,7 @@ remain separate gates. [SDK](SURFACES.md) · [Web protocol](WEB-PROTOCOL.md).
 
 ## Phase 7 shared owner note
 
-The same packaged browser workspace can also be launched through the explicit shared-owner/server modes described by the local-owner protocol. Their peer-validated native clients share one Agent/current execution view rather than creating a second SQLite owner. Those shared/paired modes retain their own authentication semantics; the separate ordinary local-single-user `aw --web` path uses `LocalWeb` no-pair loopback authority as described above. Provider secret values remain outside browser storage/config.
+The same packaged browser workspace can also be launched through the explicit shared-owner/server modes described by the local-owner protocol. Their peer-validated native clients share one Agent/current execution view rather than creating a second SQLite owner. Those shared/paired modes retain their own authentication semantics; the separate ordinary local-single-user `aw web` path uses `LocalWeb` no-pair loopback authority as described above. Provider secret values remain outside browser storage/config.
 
 Browser logout revokes its access and terminates its browser surface host, but leaves the shared agent/native listener running. Closing a view does not shut down the owner. There is no shared draft or independent per-tab agent introduced by a second presentation. Existing website/terminal/surface trust limits remain.
 
