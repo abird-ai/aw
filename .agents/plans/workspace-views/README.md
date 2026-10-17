@@ -62,6 +62,29 @@ view never implicitly stops an Agent or PTY.
   Mutex does not show a measured need for a second publication layer.
 - Remote views remain unavailable until their exact authority/lifetime tests pass.
 
+## Next slice: native Files containers
+
+Start with one flat container owning a Files navigator and its document group.
+Keep the current Workspace runtime and global limits. Resolve a stable ScopeId
+through existing explicitly authorized root capabilities; saved paths and scope
+IDs cannot create grants. Reuse `WorkspaceFiles` and scoped filesystem traversal.
+
+Add scope identity to File descriptors and route previews into the invoking
+container's group. Current file, search and highlight caches use relative paths
+alone; key them and every background request by scope plus relative path, with
+container/view lifetime and generation fences. Explicitly migrate saved Files to
+the already-authorized launch scope; unavailable scopes remain unavailable.
+
+Acceptance: two authorized roots containing the same relative path display
+different content with independent view state; closed/rebound scopes reject
+late read/search/highlight replies; split/move/preview/save/load retain identity,
+limits and Explorer focus while Agent/root/draft/caret and effect admission stay
+unchanged. Implementation begins after the native Agent-view checkpoint.
+
+Source seams: `src/workspace/files.rs`, `src/workspace/ui.rs`,
+`src/workspace/ui/async_work.rs`, `src/workspace/persistence.rs`,
+`crates/aw-workspace/src/layout.rs`, `crates/aw-tools/src/browse.rs`.
+
 ## References
 
 - [Live Workspace behavior](../../docs/WORKSPACE.md)

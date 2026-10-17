@@ -19,13 +19,24 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 
 - [x] Provide a pinned Nix development-shell product gate and a separate native `.#aw` build/version job; execution status is recorded only after a current run.
 
+### `9fbb8a3456b717c810c901460817ba1cc2317d59` — completed vault initialization lock lifetime
+
+- [x] Explicitly release only the vault initialization lock after complete key durability work and on error/unwind, even while a duplicate open-file description survives; actual maintenance denial remains intact.
+- [x] Deterministic duplicate-descriptor controls failed before the fix; six SecretStore tests and the original focused SDK test passed after it. The original `1c2ec6e` SDK failure used the same Conflict, but its exact fork timing was not captured. The cumulative `2809fa5` full gate passed.
+
+### `2809fa58902df4dd9a23fb5a9a8fbd5e57d43189` — local Linux product gate
+
+- [x] Align this checklist and Build status with the single product gate, without reconstructing removed phase/smoke/evidence profiles.
+- [x] Remove the new Workspace-only unused-binding warning without changing control flow.
+- [x] Execute the pinned full Cargo/Node gate and native Linux package/version checks on this exact commit; this does not supply hosted workflow or other-host certification.
+
+### `3b0dbb502005570cca30e2cd52cba60c052f3587` — reviewed local product checkpoint
+
+- [x] Pass the full pinned product gate and native Linux package/version after the Find lifecycle corrections; source version, SQLite schema and JSONL version remain unchanged.
+- [x] Independently recheck the Workspace-only feature boundary and actual native terminal behavior; retain all external release gates below.
+
 ## Uncommitted
 
-- [~] Reconcile this checklist and Build status with the current single product gate — coordinator.
-- [~] Run the current product gate on a committed candidate in the pinned development shell; do not reconstruct removed Full/phase/smoke profiles.
-- [~] Fix the confirmed vault-initialization lock lifetime with duplicated descriptors; retain actual maintenance denial. The `1c2ec6e` SDK test hit the same Conflict, but its exact fork timing was not captured — native gate-fix agent.
-- [~] Remove the new Workspace-only unused-binding warning without changing control flow — backend agent.
-- [ ] Build the exact candidate's native package and confirm its version; cross-built assets require separate native execution.
 - [ ] Complete release-asset execution on remaining target hosts, locally or with hosted jobs when available; Linux emulation cannot certify missing macOS/Windows/ARM hosts.
 - [ ] Review breaking CLI/version surfaces, agree any version change and obtain release authorization before distribution; 0.16.0 remains a proposal.
 - [ ] Decide/configure Developer ID/Authenticode signing and notarization requirements; ad-hoc signatures and checksums do not supply those identities.
@@ -34,11 +45,11 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 
 ## Tests and verification
 
-- [ ] `bash scripts/bootstrap.sh` — once per fresh checkout, pinned Nix development shell.
-- [ ] `cargo fmt --all -- --check` — candidate commit.
-- [ ] `cargo test --workspace --locked` — `1c2ec6e` failed the SDK secret-service test (170 library tests passed, 1 failed); fix and rerun with development-shell tools.
-- [ ] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — candidate commit.
-- [ ] `nix build .#aw --no-link --print-out-paths --no-update-lock-file` and built `aw --version` — exact candidate.
+- [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `3b0dbb5`, passed.
+- [x] `cargo fmt --all -- --check` — pinned Nix shell on `3b0dbb5`, passed.
+- [x] `cargo test --workspace --locked` — pinned Nix shell on `3b0dbb5`, 1,572 passed, 2 existing ignored, no failures.
+- [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `3b0dbb5`, 107 passed.
+- [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=3b0dbb502005570cca30e2cd52cba60c052f3587#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
 - [ ] Release-asset native execution — exact assets and remaining hosts; unfinished external gate.
 - [ ] Version/release approval — explicit owner decision; unfinished external gate.
 - [ ] Identity signing/notarization — actual configured identities and execution; unfinished external gate.
