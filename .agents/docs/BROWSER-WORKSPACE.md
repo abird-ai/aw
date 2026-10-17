@@ -77,7 +77,7 @@ Files/Git reads, a 4 MiB reply limit and an 8 MiB Files/Git snapshot cache bound
 work and retention. Hidden views retain editor state; closed or denied editors explicitly
 scrub it before destruction.
 
-## File-only cross-window handoff
+## Read-only File and immutable Git Review cross-window handoff
 
 The active read-only **File** toolbar now has a **Move File to a new window**
 action when the current File is loaded and its original scope is available.
@@ -101,11 +101,24 @@ view intact. A lost acknowledgment is **unknown**, not confirmation;
 an existing authorized read-only receiver view remains inspectable
 without replaying effects or silently transferring additional authority.
 
-This milestone supports **File presentation only**: Git Reviews,
-native terminal/process ownership, cross-window Find/scroll/selection
-preservation, distributed authentication and native docking are not
-implemented by this browser action. It makes no changes to SQLite,
-JSONL, workspace layout, the original Agent, or model/tool admission.
+The same **Move Review to a new window** control is available for a
+loaded, retained **immutable Git Review**. The owner rechecks its exact
+Git source, worktree scope and Review ID on prepare, inspection,
+receiver admission and original-tab release. The receiver creates a
+read-only Review document by fetching that existing immutable ID,
+not by replaying a Git inventory item, transferring diff text or
+registering the original worktree as a new Files/Git navigator grant.
+Existing linked-worktree scopes are supported by the owner, but do not
+change the receiving navigator's launch-root permission. A stale or
+evicted Review, replaced worktree directory or lost authorization
+fails without silently moving anything.
+
+This is **read-only document presentation only**: native
+terminal/process ownership, cross-window Find/scroll/selection,
+remote-device authentication, broader crash-recovery and native
+docking remain separate. These browser actions do not change SQLite,
+JSONL, workspace layout, the original Agent, Git checkout/index,
+provider credentials or model/tool admission.
 See [Workspace views](../plans/workspace-views/README.md) for the
 remaining gates and failure semantics.
 

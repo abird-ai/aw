@@ -465,7 +465,7 @@ cross-process docking transport.
   Session/run/effect counters. Chrome used a fake endpoint and tools Off;
   these are bounded browser acceptance, not native/cross-window proof.
 
-### Cross-window docking contract — File baseline delivered, other surfaces OPEN
+### Cross-window docking contract — File and immutable Review baseline delivered
 
 Signed File-only browser implementation: `7de865852df747d0c3280c96180ef5dacbc6c8f2`.
 The original authenticated Rust web owner now retains only a bounded,
@@ -498,9 +498,53 @@ regressions; actual two-page Chrome 155 / private LocalWeb where receiver
 reloads the File **after the original page closes**, 390×844 Dark geometry
 holds, and all six SQLite effect counters remain zero. The source-HEAD
 product gates and byte-identical eight-asset Vite rebuild are recorded in
-`TODO.md`. This proves a **bounded File presentation move**, not a
-native/Git Review docking implementation, remote-device authentication,
-or lossless transfer of CodeMirror Find/viewport/selection across windows.
+`TODO.md`. This proves a bounded **File presentation move**, not remote-device
+authentication, native terminal docking, or lossless transfer of CodeMirror
+Find/viewport/selection across windows.
+
+#### Immutable Git Review extension — signed `00559eb070cc07bd96956f8d6b23fe9394202ca5`
+
+The same owner registry now accepts a separate, strictly validated
+`/api/dock/prepare-review` request for an **already retained** immutable
+Review. Its shared typed resource is File(path) or Review(review_id); the
+original strict File request schema remains unchanged. A Review's source
+and **exact verified Git worktree scope** are rechecked through
+`SurfaceHost::execute_if` on preparation, receiver inspection/acceptance
+and origin release, including after an independent physical checkout
+replacement. A stale or evicted Review ID is denied; the owner never
+replays a Git inventory selection or grants a new Files root.
+
+The browser receiver opens one scoped read-only Review document via
+`openRetainedReview`, using the original `source_id/scope_id/review_id`.
+It does **not** register the linked Git scope in its navigator scope
+catalog. Its ordinary navigator remains launch-root based, while the
+Diff labels and later refresh continue to use the original immutable
+Review and its source checkout. The server ticket discloses only the
+bounded Review identifier, never diff contents, Git credentials or a
+new worktree grant. Original Agent/composer, saved State, PTYs, Git
+checkout/index, and all model/tool effect paths are unchanged.
+
+Verified after the signed source commit: 11 authenticated Owner docking
+tests (including non-root linked scopes, evictions, stale/mismatched IDs,
+root/worktree replacement, File regression and single-acceptance races),
+161 Node model tests, 132 web-only Rust, 1,285 other Rust, 201 Store
+library and 156 Store integration tests. Strict formatting/Clippy,
+Workspace-only/minimal feature builds and all eight byte-identical
+embedded frontend assets passed. Actual Chrome 155 with two distinct
+pages independently rendered and refreshed both the new Git Diff and
+existing File after closing their original pages; 390×844 Dark
+display remained within viewport, fixture HEAD/index stayed identical,
+and six SQLite execution-effect counters remained zero. Live two-page
+Chrome covered the launch-root Git Review; non-root scope was
+verified with actual HTTP and frontend model tests, not claimed as
+a separate live non-root screenshot.
+
+**Still open:** cross-window CodeMirror Find/viewport/selection placement
+and focus continuity, native second-terminal/PTY lifecycle/lease docking,
+paired/remote-browser admission and ambiguous origin/receiver crash
+acceptance. These require separate bounded work; an accepted ticket is
+not proof of continuously live receiver process. No SQL/JSONL/layout
+migration, provider permission or Git write operation is introduced.
 
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
@@ -532,8 +576,8 @@ in a browser message.
    cross-terminal/PTY attach must have its **own** explicit original Runtime
    handle and terminal restoration proof, not inferred from browser moves.
 
-The **read-only File** ticket/API and browser popup are implemented;
-Git Review and native cross-terminal docking, persistent/window-crossing
+The **read-only File and immutable Git Review** ticket/API and browser
+popup are implemented; native cross-terminal docking, persistent/window-crossing
 Find/scroll/selection metadata, broader two-browser/paired authorization
 and crash/ABA/focus acceptance remain open. No new serialized layout was
 introduced: version **0.15.0**, SQLite **33**, JSONL **1**, native saved
