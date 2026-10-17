@@ -87,7 +87,8 @@ IDs, pins, geometry and root binding. Legacy File targets bind only to the
 already-authorized launch folder; containers add no migration panes. Legacy Git navigators join existing group ownership without changing Files bindings. A required new container identity fails atomically if its allocator is exhausted. Existing Conversation tabs continue to
 follow the current Agent. Mixed/unsupported versions fail before installation;
 atomic publication, no-follow reads and the 64 KiB limit remain. SQLite v33 and
-JSONL v1 are unchanged. Browser containers and docking remain planned separately.
+JSONL v1 are unchanged. Browser containers are memory-only and described in
+[Browser workspace](BROWSER-WORKSPACE.md); docking remains planned.
 
 ## Scoped Files folders
 
@@ -201,8 +202,8 @@ Use the single pinned-shell [product gate](BUILD-STATUS.md#validate-the-current-
 Record executed commands, tested commits and unfinished acceptance in the
 [Workspace plan](../plans/workspace-views/TODO.md). Rust TestBackend assertions,
 real terminal execution, cross-target compilation and native platform execution
-remain separate results; none substitutes for another. The Files slice does not
-complete browser containers, docking or external release gates.
+remain separate results; none substitutes for another. Native checks do not
+establish browser acceptance, docking or external release gates.
 
 ## Phase 6 browser counterpart
 

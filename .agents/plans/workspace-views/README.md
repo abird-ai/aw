@@ -6,7 +6,8 @@ Read-only Agent tabs, scoped Files and native Git containers let people inspect
 independent resources inside one Workspace without changing the current Agent.
 The native slices preserve independent view state, exact authority and one
 execution owner. Browser read-only Agent tabs use the same strict reader; scoped
-browser Files/Git containers follow next, then docking.
+browser Files/Git containers use exact launch-root and verified-worktree
+capabilities. Docking remains planned.
 
 ## Design
 
@@ -37,7 +38,7 @@ before installation, retain no-follow/atomic/64 KiB protections and reject
 unsupported or mixed versions. Presentation adds no SQLite/JSONL schema change.
 Old readers must reject v2 rather than silently dropping pinned targets.
 
-Later containers use a flat stable-ID graph, one parent and one container level,
+Native containers use a flat stable-ID graph, one parent and one container level,
 with cycle/orphan checks and global 8-pane/32-tab limits. A view never embeds a
 second Workspace runtime. Moving/reparenting keeps resource identity; closing a
 view never implicitly stops an Agent or PTY.
@@ -60,6 +61,16 @@ view never implicitly stops an Agent or PTY.
   checks and view expiry independent of publication. The current native cache
   has one UI owner and workers return owned replies; its tiny optional-reader
   Mutex does not show a measured need for a second publication layer.
+- The next left-right redesign pass first measures the browser Session snapshot
+  (`src/web.rs`) and bounded multiplayer presence projection
+  (`src/web/team/multiplayer.rs`). Reuse the existing publication helper; compare
+  long-lived readers with cold registration, read-heavy and write-heavy ratios,
+  snapshot sizes and held-Arc retention. Record reader/publisher latency, CPU,
+  allocations and peak bytes; migrate only for an end-to-end improvement with
+  fresh authority, sequence and presence TTL checks preserved. Never put one
+  registered Reader behind another shared Mutex. Keep admission/receipt/State,
+  PTY/lease/queue locks and single-owner caches until measurements justify a
+  different design.
 - Remote views remain unavailable until their exact authority/lifetime tests pass.
 
 ## Scoped native Files containers
@@ -112,7 +123,7 @@ Acceptance: two authorized folders containing the same relative path display
 different content with independent view state; closed/rebound scopes reject
 late read/search/highlight replies; split/move/preview/save/load retain identity,
 limits and Explorer focus while Agent/root/draft/caret and effect admission stay
-unchanged. Browser counterparts and docking remain later slices.
+unchanged. Docking remains a later slice.
 
 Source seams: `src/workspace/files.rs`, `src/workspace/ui/files_views.rs`,
 `src/workspace/ui/async_work.rs`, `src/workspace/persistence.rs`,
@@ -167,7 +178,7 @@ Stop when two Git containers inspect the same relative path in different
 existing worktrees independently, delayed results stay with their origin,
 and explicit fresh staging changes only the selected index. Stale reviews
 cannot stage; Files bindings, Agent root, draft/caret and worktree HEADs remain
-unchanged. Browser counterparts and docking remain later slices.
+unchanged. Docking remains a later slice.
 
 Parallel ownership: model/persistence, Git backend/context retention, and native
 UI are separate implementation assignments. Agree container actions/lookups,
@@ -216,7 +227,8 @@ separately from mocked transport/Node tests.
 Parallel ownership: authenticated backend reader/HTTP tests, pure browser
 view-state module/Node tests, and Solid integration/editor lifecycle/browser
 acceptance. The coordinator reconciles shared contracts, bundle and product
-gates. Scoped browser Files/Git and docking remain subsequent slices.
+gates. Scoped browser Files/Git are described below; docking remains a
+subsequent slice.
 
 Source seams: `web/src/main.jsx`, `crates/aw-surfaces/src/lib.rs`,
 `crates/aw-surfaces/src/contract.rs`, `crates/aw-store/src/lib.rs`,

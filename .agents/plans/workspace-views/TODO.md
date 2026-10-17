@@ -98,19 +98,39 @@ Design and binding decisions: [README.md](README.md).
 - [x] Actual final bundle at 390 px with long Session/branch labels: external retarget disabled Send/Enter, ordinary Use draft here enabled the preserved draft separately from submission, and no effectful POST occurred. Additional instrumented early DOM/transport checks covered publication consent, same-target revision, matching activation SSE-before-HTTP and unrelated-target/new-text races; these do not claim live paired/shared acceptance.
 - [x] Final private fixture retained exactly two Sessions, identical branch heads/revisions and zero runs/run_events/invocation_receipts/pipeline_runs/team_runs. Chrome recorded no uncaught runtime errors; the private owner exited 0. Transient diagnostics and completed agent scratch are removed after reconciliation.
 
+### `57a6059a1d401186ffdf1ecbd4080645290a3063` — scoped browser Files/Git views
+
+- [x] Retain one launch Files capability and physical directory identity; legacy and scoped reads reject root replacement without reopening the pathname or granting another root.
+- [x] Add strict read-only source/scope envelopes and opaque origin-bound Git inventories, verified existing worktrees and immutable reviews; preserve legacy commands and exact pre/post-read authentication.
+- [x] Bound physical HTTP work and encoded responses; validate full replies before context/cache admission so oversized reads preserve older valid handles. Reject copied worktree pointers and unknown/stale source, scope and review identities.
+- [x] Add flat memory-only Files/Git containers with independent navigator state, exact document identities, eight combined containers and 32 total tabs including Agent; retain four physical reads, bounded metadata/content and explicit Refresh snapshots.
+- [x] Route late replies only to their original document without stealing focus; preserve stable Explorer rows, palette origin/focus and the current Agent/root/composer/draft/caret.
+- [x] Retain per-document File/Diff Find, selection and viewport in stable editors; scrub protected plaintext, derived editor state and DOM before retirement on close, denied scope, source replacement or logout.
+- [x] Update canonical browser/surface/protocol documentation without changing native layout v4, SQLite v33, JSONL v1 or version 0.15.0. Final corrected-product gates and immutable acceptance follow below.
+
+### `0159f0b119779f74b22d93d2ecd552306bbd7584` — bounded merged editors and final browser acceptance
+
+- [x] Constrain both merged Diff editors to their pane height; the scoped CSS correction restores actual independent scrolling at desktop and 390 px without changing other editors.
+- [x] Exact pinned product gate passed: `bash scripts/bootstrap.sh`, `cargo fmt --all -- --check`, `cargo test --workspace --locked` (1,662 passed, 2 existing ignored), and the six-suite Node command from TODO-SPEC.md (147 passed); no failures.
+- [x] Exact feature boundaries passed: `cargo test --locked -p aw-cli --no-default-features --features web --lib` (132 passed) and `cargo check --locked -p aw-cli --bin aw --no-default-features --features workspace` (only two existing dead-code warnings).
+- [x] Rebuild signed frontend source with the pinned Node/Vite toolchain and `npm --prefix web run build -- --outDir PRIVATE_TMP`; all eight artifact names and bytes match committed web/dist. Exact `nix build git+file:///home/pvl/spaces/abird/src/aw?rev=0159f0b119779f74b22d93d2ecd552306bbd7584#aw --no-link --print-out-paths --no-update-lock-file --cores 8` passed; immutable `bin/aw --version` reported aw 0.15.0, exit 0. Served JS/CSS matched committed bytes.
+- [x] Actual Chrome 155 against that immutable executable and private Rust/SQLite owner: duplicate launch-root Files and two existing Git worktrees retained distinct same-path documents, independent 160-hit Find, selection and 1,100/1,750-pixel scroll, the same EditorViews and Explorer row focus. Ordinary Agent/document switches caused zero extra workspace reads; actual composer/draft/caret and owner stayed unchanged. At 390 px both Diff sides scrolled and Find controls fit.
+- [x] Actual HTTP rejected forged mutation/root fields, wrong source/scope/review and Files reads through Git-only worktree grants. Actual physical launch-root replacement disclosed no replacement bytes and scrubbed both retained File editors, Find, DOM selection and protected labels; the original fixture root was restored immediately. A held actual file reply could not reopen its closed document, and reopening allocated a fresh lifetime.
+- [x] Actual browser limits refused a ninth container or 33rd total tab before dispatch, kept existing documents usable at capacity and reused a closed slot. Held actual discovery plus simulated source_changed required fresh explicit discovery; simulated transport 401 plus a held actual discovery and queued old SSE could not revive cleared DOM. The local fixture does not establish live paired-cookie expiry. No uncaught runtime errors occurred.
+- [x] Final fixture Git HEADs plus raw/logical indexes were byte-identical; sessions/runs/run_events/invocation_receipts/pipeline_runs/team_runs all remained zero. Targeted Chrome closed and the private owner exited 0. Transient fixture and completed agent scratch are removed after coordinator reconciliation.
+
 ## Uncommitted
 
-- [~] Add memory-only scoped browser Files/Git views through retained SurfaceHost capabilities: launch-root Files and verified existing Git worktrees first, exact source/binding identity and independent state. Another Files root requires an explicit trusted-owner grant contract. Complete actual browser acceptance before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 
 ## Tests and verification
 
-- [ ] Browser Files/Git retained capability and actual-owner HTTP regressions: exact source/scope/context, unknown/forged/stale IDs, physical root replacement and independent existing worktrees; no new model/tool/Git/terminal effects.
-- [ ] Browser container model regressions: bounded stable IDs, independent navigator/document state, physically outstanding work limits, stale close/refresh/source replies and denial cleanup — existing six-suite Node gate.
-- [ ] Shipping Solid File/Diff editor acceptance: independent Find/viewport/selection and navigator mode/query/context across switches; unchanged Agent/root/draft/caret; visible limits and stale-reply refusal.
-- [ ] Exact scoped-browser implementation product gate: bootstrap, formatting, workspace Cargo tests, existing six-suite Node tests and production frontend build.
-- [ ] Immutable native package/version and actual Chrome with duplicate launch-root Files views and two existing Git worktrees; unchanged heads/indexes/Session execution counts and clean owner shutdown. Additional Files roots remain unavailable without explicit trusted-owner grants.
+- [x] Browser Files/Git retained capability and actual-owner HTTP regressions — exact pinned `cargo test --workspace --locked` and actual immutable-owner HTTP/Chrome on `0159f0b`, passed as scoped above; no model/tool/Git/terminal effects.
+- [x] Browser container model regressions: bounded IDs/state/work, stale replies and denial cleanup — existing six-suite Node gate on exact `0159f0b`, 147 passed.
+- [x] Shipping Solid File/Diff editor acceptance — actual Chrome 155 on immutable `0159f0b`, independent navigator/Find/viewport/selection, preserved Agent/draft/caret, limits and stale-reply refusal passed as scoped above.
+- [x] Exact scoped-browser product gate — pinned bootstrap/fmt/workspace Cargo (1,662 passed, 2 existing ignored), six-suite Node (147 passed) and byte-identical eight-artifact production frontend rebuild on `0159f0b`.
+- [x] Immutable package/version and actual Chrome duplicate Files/two-worktree acceptance on `0159f0b` — passed with unchanged heads/indexes, six zero State counters and owner exit 0. Additional Files roots remain unavailable without explicit trusted-owner grants.
 
 - [x] Exact follow-up product gate/package and actual Chrome draft-retarget/late-observation/closed-view/revocation acceptance — passed on `94697a7` as recorded above, with unchanged branch heads and zero execution effects.
 
@@ -130,7 +150,7 @@ Design and binding decisions: [README.md](README.md).
 - [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `b33a418`, 107 passed.
 - [x] Changed-content committed-Find and close/restore ABA regressions, including inactive footer/focus and consumed flash selection — executed by the workspace Cargo gate on `b33a418`, passed.
 - [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=b33a4183f6032a024d1b73409d2c9134ea0aab24#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
-- [ ] Further native narrow/maximize, modal-focus and child-PTY acceptance; browser/container/docking-specific checks after those slices exist — remain open beyond this checkpoint.
+- [ ] Further native narrow/maximize, modal-focus and child-PTY acceptance, plus docking-specific checks when implemented — remain open beyond this checkpoint.
 
 - [x] Scoped Files layout regressions: two same-path scopes, container membership/global limits, legacy full/exhausted layouts, malformed/mixed versions and split/move/close/save/load — `cargo test --workspace --locked`, pinned Nix shell on `b33a418`, passed.
 - [x] Actual retained-root backend regressions: distinct read/list/search results, unknown/revoked/reconnected scopes, root replacement and capability cleanup — same executed workspace Cargo gate on `b33a418`, passed.
