@@ -3099,10 +3099,36 @@ function App() {
                 const document = createMemo(() => workspaceDocument(id));
                 const data = createMemo(() => document()?.data);
                 const checkAccess = () => Boolean(workspaceViews.getDocument(id)?.data);
+                const destinationKind = () => document()?.kind === "file" ? "files" : "git";
+                const destinations = createMemo(() => workspaceContainers().filter(
+                  container => container.kind === destinationKind() && !container.unavailable
+                ));
+                const moveDocument = event => {
+                  const origin = document()?.containerId;
+                  const target = event.currentTarget.value;
+                  try {
+                    if (!workspaceViews.moveDocument(id, target)) return;
+                    setSelectedContainers(current => ({ ...current, [destinationKind()]: target }));
+                  } catch (error) {
+                    setError(error.message);
+                    event.currentTarget.value = origin;
+                  }
+                };
                 return <div class="surface code-surface" hidden={activeTab() !== id}>
                   <div class="surface-bar" aria-label="Document source and access" title={data()?.path || ""}>
                     <span class="surface-path">{data() ? [document()?.kind === "review" ? data().root : "", dirname(data().path), data().basis].filter(Boolean).join(" · ") || "." : "Read-only document"}</span>
                     <span class="surface-badge">{document()?.kind === "review" ? "diff · " : ""}read only</span>
+                    <Show when={destinations().length > 1}>
+                      <select class="surface-move-view"
+                        aria-label={destinationKind() === "files" ? "Move document to another Files view" : "Move document to another Git view"}
+                        title="Move this read-only tab without changing its source"
+                        value={document()?.containerId || ""}
+                        onChange={moveDocument}>
+                        <For each={destinations()}>
+                          {(container, index) => <option value={container.id}>{index() + 1}. {container.label}</option>}
+                        </For>
+                      </select>
+                    </Show>
                     <button class="mini-icon" type="button" aria-label="Refresh document" title="Refresh this exact document" onClick={() => void workspaceViews.refreshDocument(id)}><Icon name="refresh" size={13} /></button>
                   </div>
                   <Show when={document()?.pending}><div class="document-state" role="status">Loading…</div></Show>

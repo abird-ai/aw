@@ -93,6 +93,77 @@ test('pending File allocation is atomic, reused in its container and independent
   assert.throws(() => { f.state.getDocument(a).target.path = 'changed'; }, TypeError);
 });
 
+test('same-window File reparenting retains exact identity, pending read and cache after origin closes', async () => {
+  const f = wsFixture(), first = f.state.openContainer('files'), second = f.state.openContainer('files');
+  const id = f.state.openFile(first, 'src/雪.rs'), read = f.calls.at(-1);
+  const original = f.state.getDocument(id).target;
+  assert.equal(f.state.moveDocument(id, first), false, 'same destination is a no-op');
+  assert.equal(f.state.moveDocument(id, second), true);
+  assert.equal(f.state.getDocument(id).containerId, second);
+  assert.equal(f.state.getDocument(id).target, original, 'no new target authority');
+  assert.equal(f.calls.length, 1, 'move never starts a second request');
+  assert.equal(f.state.closeContainer(first), true);
+  assert.equal(read.signal.aborted, false, 'origin close must not cancel a reparented view');
+  read.resolve(wsReply(read, wsFile(read, 'retained pending read')));
+  await new Promise(resolve => setImmediate(resolve));
+  const result = f.state.getDocument(id).data;
+  assert.equal(result.text, 'retained pending read');
+  assert.equal(f.state.listDocuments().length, 1);
+  assert.equal(f.state.openFile(second, 'src/雪.rs'), id, 'reparent remains canonical for that view');
+  assert.equal(f.state.getDocument(id).data, result);
+  assert.equal(f.state.closeContainer(second), true);
+  assert.equal(f.state.getDocument(id), null);
+});
+
+test('document reparenting refuses collisions, foreign kinds and closed lifetimes atomically', async () => {
+  const f = wsFixture(), a = f.state.openContainer('files'), b = f.state.openContainer('files');
+  const git = f.state.openContainer('git');
+  const first = f.state.openFile(a, 'src/a.rs'), second = f.state.openFile(b, 'src/a.rs');
+  await wsSettleFile(f, second, 'destination content');
+  const original = f.state.getDocument(first), before = f.state.listDocuments().length;
+  assert.throws(() => f.state.moveDocument(first, git), /matching view/);
+  assert.throws(() => f.state.moveDocument(first, b), /already open/);
+  assert.throws(() => f.state.moveDocument('foreign-document', b), /no longer open/);
+  assert.throws(() => f.state.moveDocument(first, 'forged-container'), /closed/);
+  assert.equal(f.state.getDocument(first), original);
+  assert.equal(f.state.listDocuments().length, before);
+  assert.equal(f.calls.length, 2, 'rejected moves cannot dispatch new reads');
+  assert.equal(f.state.closeDocument(second), true);
+  assert.equal(f.state.moveDocument(first, b), true);
+  const held = f.calls[0];
+  f.state.closeContainer(b);
+  assert.equal(held.signal.aborted, true);
+  held.resolve(wsReply(held, wsFile(held, 'late redirected disclosure')));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.getDocument(first), null);
+  assert.equal(f.state.getContainer(a).kind, 'files');
+});
+
+test('moved Git review retains original checkout even when destination navigates elsewhere', async () => {
+  const f = wsFixture(), a = f.state.openContainer('git'), b = f.state.openContainer('git');
+  const alternate = f.state.selectWorktree(b, { inventory_id: 'worktrees', item_id: 'other' }), chosen = f.calls.at(-1);
+  chosen.resolve(wsReply(chosen, { kind: 'context', context: { id: 'different-checkout', label: '/other' }, agent_unchanged: true }));
+  assert.equal(await alternate, true);
+  const id = f.state.openReview(a, { inventory_id: 'original-inventory', item_id: 'changed-file' });
+  const held = f.calls.at(-1), original = f.state.getDocument(id).target;
+  assert.equal(f.state.moveDocument(id, b), true);
+  assert.equal(f.state.getDocument(id).target, original);
+  assert.equal(f.state.getContainer(b).scope_id, 'different-checkout');
+  f.state.closeContainer(a);
+  held.resolve(wsReply(held, wsReview('immutable-from-launch')));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.getDocument(id).target.scope_id, 'launch-scope');
+  assert.equal(f.state.getDocument(id).target.review_id, 'immutable-from-launch');
+  const refreshed = f.state.refreshDocument(id), reload = f.calls.at(-1);
+  assert.equal(reload.body.scope_id, 'launch-scope');
+  assert.deepEqual(reload.body.request, { op: 'review', review_id: 'immutable-from-launch' });
+  reload.resolve(wsReply(reload, wsReview('immutable-from-launch')));
+  assert.equal(await refreshed, true);
+  assert.equal(f.state.getDocument(id).containerId, b);
+  assert.equal(f.state.getDocument(id).data.id, 'immutable-from-launch');
+  assert.equal(f.events.some(event => event.type === 'activate'), false);
+});
+
 test('combined 32 document admission counts Agent/pins and preserves a pending duplicate at capacity', async () => {
   const f = wsFixture(), owner = f.state.openContainer('files');
   f.external(31);

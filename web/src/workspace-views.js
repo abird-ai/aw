@@ -247,6 +247,38 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
     const tokens = cancelAll(entry); scrub(entry); documents.delete(documentId);
     emit(); for (const token of tokens) token.control.abort(); return true;
   }
+  function sameResource(a, b) {
+    if (a.value.kind !== b.value.kind || a.value.target.source_id !== b.value.target.source_id
+      || a.value.target.scope_id !== b.value.target.scope_id) return false;
+    if (a.value.kind === "file") return a.value.target.path === b.value.target.path;
+    // Pending Git reviews have an immutable inventory/item origin; completed
+    // reviews additionally know the exact immutable review ID.
+    const target = a.value.target, other = b.value.target;
+    return (id(target.review_id) && target.review_id === other.review_id)
+      || (a.origin && b.origin && a.origin.inventory_id === b.origin.inventory_id
+        && a.origin.item_id === b.origin.item_id);
+  }
+  function moveDocument(documentId, destinationId) {
+    ready();
+    const document = documents.get(documentId);
+    if (!document) throw new Error("Document is no longer open.");
+    const destination = container(destinationId);
+    const kind = document.value.kind === "file" ? "files" : "git";
+    if (destination.value.kind !== kind || destination.value.unavailable || document.value.unavailable) {
+      throw new Error("Destination must be an available matching view.");
+    }
+    if (document.value.target.source_id !== source.source_id || !scopes.has(document.value.target.scope_id)) {
+      throw new Error("Document source is no longer available.");
+    }
+    if (document.value.containerId === destinationId) return false;
+    if ([...documents.values()].some(other => other !== document && other.value.containerId === destinationId
+      && sameResource(document, other))) throw new Error("That document is already open in the destination view.");
+    // Retain the very same entry, immutable source/scope/Review target, pending
+    // requests and cached read snapshot. No new fetch, grant or Agent binding.
+    publish(document, { containerId: destinationId });
+    emit("move-document");
+    return true;
+  }
   function closeContainer(containerId) {
     const entry = containers.get(containerId); if (!entry) return false;
     const owned = [...documents.values()].filter(document => document.value.containerId === containerId);
@@ -337,7 +369,7 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
       } });
       return Boolean(result);
     },
-    assertCanOpenDocument, refreshDocument, closeDocument, closeContainer, clear,
+    assertCanOpenDocument, refreshDocument, closeDocument, moveDocument, closeContainer, clear,
     dispose() { disposed = true; clear(); },
   });
 }

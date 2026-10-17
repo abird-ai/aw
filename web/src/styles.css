@@ -1008,6 +1008,20 @@ body.resizing-sidebar {
   text-transform: uppercase;
   letter-spacing: .05em;
 }
+.surface-move-view {
+  flex: none;
+  min-width: 0;
+  max-width: min(165px, 38%);
+  padding: 4px 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+.surface-move-view:focus-visible { outline-offset: 1px; }
+
 .code-editor,
 .code-diff {
   flex: 1;
