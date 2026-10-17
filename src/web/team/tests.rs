@@ -19,6 +19,12 @@ use std::{
 const HOST: &str = "127.0.0.1:8787";
 const ALICE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+#[cfg(all(feature = "multiplayer", feature = "oidc"))]
+mod publication_http_measure {
+    use super::*;
+    include!("publication_http_measure.rs");
+}
 struct Fake(Arc<AtomicUsize>);
 impl Provider for Fake {
     fn stream<'a>(
@@ -51,6 +57,9 @@ fn descriptor(id: &str, actor: &PrincipalId) -> AccountDescriptor {
     }
 }
 fn setup() -> (Router, TeamState, SessionStore, Arc<AtomicUsize>) {
+    setup_at(HOST.parse().unwrap())
+}
+fn setup_at(address: SocketAddr) -> (Router, TeamState, SessionStore, Arc<AtomicUsize>) {
     let store = SessionStore::in_memory().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let roster = Roster::new(
@@ -99,13 +108,8 @@ fn setup() -> (Router, TeamState, SessionStore, Arc<AtomicUsize>) {
             persistence,
         });
     }
-    let (router, team) = application(
-        roster,
-        runtimes,
-        HOST.parse().unwrap(),
-        &[ALICE.into(), BOB.into()],
-    )
-    .unwrap();
+    let (router, team) =
+        application(roster, runtimes, address, &[ALICE.into(), BOB.into()]).unwrap();
     (router, team, store, calls)
 }
 fn req(method: &str, path: &str, body: serde_json::Value, cookie: Option<&str>) -> Request {
@@ -1169,6 +1173,361 @@ async fn presence_is_ephemeral_permission_filtered_and_never_calls_provider() {
     )
     .await;
     assert!(expired["presence"].as_array().unwrap().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "multiplayer")]
+#[tokio::test]
+async fn revoked_shared_participant_presence_is_immediately_scrubbed_in_original_session() {
+    let (router, team, _, calls) = setup();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    share_alice_with_bob(&router, &alice_cookie).await;
+    open_alice_for_bob(&router, &team, &bob_cookie).await;
+    let opened = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/open",
+            serde_json::json!({"activate_auto":false}),
+            Some(&bob_cookie),
+        )
+        .await,
+    )
+    .await;
+    let target = serde_json::json!({
+        "draft_id":opened["draft_id"], "generation":opened["generation"]
+    });
+    let posted = send(
+        &router,
+        "POST",
+        "/api/team/draft/presence",
+        serde_json::json!({
+            "draft_id":opened["draft_id"],"generation":opened["generation"],
+            "client_id":"bob-revoked","cursor_anchor":0,"cursor_head":0,
+            "active":true
+        }),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(posted.status(), StatusCode::OK);
+    // Both participants share the same CRDT generation. A policy revision
+    // abandons that generation; neither old cursor is valid afterward.
+    let alice_draft = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/open",
+            serde_json::json!({"activate_auto":false}),
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(alice_draft["draft_id"], opened["draft_id"]);
+    assert_eq!(alice_draft["generation"], opened["generation"]);
+    let owner_posted = send(
+        &router,
+        "POST",
+        "/api/team/draft/presence",
+        serde_json::json!({
+            "draft_id":opened["draft_id"],"generation":opened["generation"],
+            "client_id":"alice-kept","cursor_anchor":0,"cursor_head":0,
+            "active":true
+        }),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(owner_posted.status(), StatusCode::OK);
+    let before = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/presence/list",
+            target.clone(),
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(before["presence"].as_array().unwrap().len(), 2);
+
+    let revoked = send(
+        &router,
+        "POST",
+        "/api/team/session/share",
+        serde_json::json!({"participant_id":"bob","enabled":false}),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let after = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/presence/list",
+            target.clone(),
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        after["presence"].as_array().unwrap().is_empty(),
+        "an audience change abandons the generation for every participant"
+    );
+    let denied = send(
+        &router,
+        "POST",
+        "/api/team/draft/presence/list",
+        target,
+        Some(&bob_cookie),
+    )
+    .await;
+    assert!(matches!(
+        denied.status(),
+        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "multiplayer")]
+#[test]
+fn presence_invalidation_never_clears_unrelated_session_cursors() {
+    let (_, team, _, calls) = setup();
+    let alice_session = saved(&team, 0).session_id;
+    let bob_session = saved(&team, 1).session_id;
+    assert_ne!(alice_session, bob_session);
+    for (id, session) in [("alice", &alice_session), ("bob", &bob_session)] {
+        lock(&team.0.multiplayer.presence).insert(
+            (
+                format!("draft-{id}"),
+                1,
+                id.to_owned(),
+                format!("client-{id}"),
+            ),
+            multiplayer::PresenceRecord::for_test(session, id),
+        );
+    }
+    multiplayer::invalidate_presence(&team, &alice_session);
+    let state = lock(&team.0.multiplayer.presence);
+    assert_eq!(state.len(), 1);
+    assert_eq!(state.keys().next().unwrap().2, "bob");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "multiplayer")]
+#[tokio::test]
+async fn held_authorized_presence_post_cannot_resurrect_a_revoked_cursor() {
+    let (router, team, _, calls) = setup();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    share_alice_with_bob(&router, &alice_cookie).await;
+    open_alice_for_bob(&router, &team, &bob_cookie).await;
+    let draft = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/open",
+            serde_json::json!({"activate_auto":false}),
+            Some(&bob_cookie),
+        )
+        .await,
+    )
+    .await;
+    let draft_ref = serde_json::json!({
+        "draft_id":draft["draft_id"],"generation":draft["generation"]
+    });
+    let reached = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    *lock(&team.0.multiplayer.held_presence_post) = Some(multiplayer::HeldPresencePost {
+        client_id: "bob-held".into(),
+        reached: reached.clone(),
+        release: release.clone(),
+    });
+    let held_router = router.clone();
+    let held_cookie = bob_cookie.clone();
+    let held_draft = draft.clone();
+    let held = tokio::spawn(async move {
+        send(
+            &held_router,
+            "POST",
+            "/api/team/draft/presence",
+            serde_json::json!({
+                "draft_id":held_draft["draft_id"],
+                "generation":held_draft["generation"],
+                "client_id":"bob-held","cursor_anchor":0,"cursor_head":0,
+                "active":true
+            }),
+            Some(&held_cookie),
+        )
+        .await
+    });
+    // This is an actual handler request held *after* Store access/grant
+    // revalidation and before the final in-memory cursor admission.
+    let _reached = tokio::time::timeout(Duration::from_secs(5), reached.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let revoked = send(
+        &router,
+        "POST",
+        "/api/team/session/share",
+        serde_json::json!({"participant_id":"bob","enabled":false}),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    release.add_permits(1);
+    let completed = tokio::time::timeout(Duration::from_secs(5), held)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::CONFLICT);
+    let remaining = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/presence/list",
+            draft_ref,
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert!(remaining["presence"].as_array().unwrap().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "multiplayer")]
+#[tokio::test]
+async fn changing_draft_mode_retires_old_presence_without_model_effects() {
+    let (router, team, _, calls) = setup();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    share_alice_with_bob(&router, &alice_cookie).await;
+    open_alice_for_bob(&router, &team, &bob_cookie).await;
+    let draft = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/open",
+            serde_json::json!({"activate_auto":false}),
+            Some(&bob_cookie),
+        )
+        .await,
+    )
+    .await;
+    let present = send(
+        &router,
+        "POST",
+        "/api/team/draft/presence",
+        serde_json::json!({
+            "draft_id":draft["draft_id"],"generation":draft["generation"],
+            "client_id":"bob-before-mode","cursor_anchor":0,"cursor_head":0,
+            "active":true
+        }),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(present.status(), StatusCode::OK);
+    assert_eq!(lock(&team.0.multiplayer.presence).len(), 1);
+
+    let switched = send(
+        &router,
+        "POST",
+        "/api/team/session/mode",
+        serde_json::json!({"mode":"off"}),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(switched.status(), StatusCode::OK);
+    assert!(lock(&team.0.multiplayer.presence).is_empty());
+    let old_generation = send(
+        &router,
+        "POST",
+        "/api/team/draft/presence",
+        serde_json::json!({
+            "draft_id":draft["draft_id"],"generation":draft["generation"],
+            "client_id":"alice-after-off","cursor_anchor":0,"cursor_head":0,
+            "active":true
+        }),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(old_generation.status(), StatusCode::CONFLICT);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "multiplayer")]
+#[tokio::test]
+async fn audience_regrant_rotates_generation_and_clears_prior_presence() {
+    let (router, team, _, calls) = setup();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    share_alice_with_bob(&router, &alice_cookie).await;
+    open_alice_for_bob(&router, &team, &bob_cookie).await;
+    let draft = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/open",
+            serde_json::json!({"activate_auto":false}),
+            Some(&bob_cookie),
+        )
+        .await,
+    )
+    .await;
+    let payload = serde_json::json!({
+        "draft_id":draft["draft_id"],"generation":draft["generation"],
+        "client_id":"bob-old-generation","cursor_anchor":0,"cursor_head":0,
+        "active":true
+    });
+    let posted = send(
+        &router,
+        "POST",
+        "/api/team/draft/presence",
+        payload.clone(),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(posted.status(), StatusCode::OK);
+    assert_eq!(lock(&team.0.multiplayer.presence).len(), 1);
+    // An accepted re-grant advances the audience revision even when the
+    // participant retains read access. It abandons the old CRDT generation.
+    let regrant = send(
+        &router,
+        "POST",
+        "/api/team/session/share",
+        serde_json::json!({"participant_id":"bob","enabled":true}),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(regrant.status(), StatusCode::OK);
+    assert!(lock(&team.0.multiplayer.presence).is_empty());
+
+    let old_reply = send(
+        &router,
+        "POST",
+        "/api/team/draft/presence",
+        payload,
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(old_reply.status(), StatusCode::CONFLICT);
+    let list = data(
+        send(
+            &router,
+            "POST",
+            "/api/team/draft/presence/list",
+            serde_json::json!({"draft_id":draft["draft_id"],"generation":draft["generation"]}),
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert!(list["presence"].as_array().unwrap().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 

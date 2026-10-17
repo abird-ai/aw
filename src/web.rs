@@ -3185,6 +3185,11 @@ mod tests {
         use super::*;
         include!("web/agent_view_tests.rs");
     }
+    #[cfg(feature = "oidc")]
+    mod publication_http_measure {
+        use super::*;
+        include!("web/publication_http_measure.rs");
+    }
     use aw_agent_core::{
         AgentOptions, CompletionFuture, CompletionMeta, DeltaSink, Message, Provider,
     };

@@ -1,7 +1,10 @@
 use super::*;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 
 const MAX_COLLAB_BODY: usize = aw_collab::MAX_UPDATE_BYTES * 2 + 16 * 1024;
 const PRESENCE_TTL: Duration = Duration::from_secs(30);
@@ -11,15 +14,43 @@ const MAX_PRESENCE_PER_PARTICIPANT: usize = 8;
 #[derive(Default)]
 pub(super) struct State {
     pub(super) presence: Mutex<BTreeMap<(String, u64, String, String), PresenceRecord>>,
+    /// Admission lifetime for optimistic presence writes. Share/mode changes
+    /// advance this under the same presence lock used for publication.
+    presence_epoch: AtomicU64,
+    #[cfg(test)]
+    pub(super) held_presence_post: Mutex<Option<HeldPresencePost>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct HeldPresencePost {
+    pub(super) client_id: String,
+    pub(super) reached: Arc<tokio::sync::Semaphore>,
+    pub(super) release: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
 pub(super) struct PresenceRecord {
+    session_id: String,
     participant_id: String,
     display_name: String,
     cursor_anchor: u32,
     cursor_head: u32,
     pub(super) updated_at: Instant,
+}
+
+#[cfg(test)]
+impl PresenceRecord {
+    pub(super) fn for_test(session_id: &str, participant: &str) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            participant_id: participant.to_owned(),
+            display_name: participant.to_owned(),
+            cursor_anchor: 0,
+            cursor_head: 0,
+            updated_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -230,6 +261,56 @@ fn cleanup_presence(state: &mut BTreeMap<(String, u64, String, String), Presence
     state.retain(|_, value| now.duration_since(value.updated_at) <= PRESENCE_TTL);
 }
 
+/// Every successful mode or audience revision abandons the old shared-draft
+/// generation. Withdraw *all* cursors of that Session before responding, even
+/// if the same participant retains a grant. Older in-flight POSTs carry the
+/// previous epoch and cannot republish that generation.
+pub(super) fn invalidate_presence(team: &TeamState, session_id: &str) {
+    let mut presence = lock(&team.0.multiplayer.presence);
+    let _ = team.0.multiplayer.presence_epoch.fetch_update(
+        AtomicOrdering::AcqRel,
+        AtomicOrdering::Acquire,
+        |epoch| epoch.checked_add(1),
+    );
+    // Exhaustion permanently disarms writes; it cannot revive an old epoch.
+    presence.retain(|_, value| value.session_id != session_id);
+}
+
+/// Test-only synthetic audience at the hard capacity limit. Production callers
+/// cannot bypass the per-participant and total-record admission checks.
+#[cfg(all(test, feature = "oidc"))]
+pub(super) fn seed_bounded_presence_for_http_measurement(
+    state: &mut BTreeMap<(String, u64, String, String), PresenceRecord>,
+    draft: &str,
+    generation: u64,
+    session_id: &str,
+    count: usize,
+) {
+    assert!(count <= MAX_PRESENCE_RECORDS);
+    state.clear();
+    for index in 0..count {
+        let (participant, client) = if index == 0 {
+            ("bob".to_owned(), "bob-tab".to_owned())
+        } else {
+            (
+                format!("synthetic-member-{index}"),
+                format!("synthetic-client-{index}"),
+            )
+        };
+        state.insert(
+            (draft.to_owned(), generation, participant.clone(), client),
+            PresenceRecord {
+                session_id: session_id.to_owned(),
+                participant_id: participant,
+                display_name: "synthetic, not a real participant".to_owned(),
+                cursor_anchor: 0,
+                cursor_head: 0,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+}
+
 fn validate_client_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -361,6 +442,9 @@ pub(super) async fn route(
                     .set_draft_mode(&actor, &session_id, command.mode)
             })
             .await?;
+            // Mode transitions retire all old cursor proposals; readers only
+            // reappear after a fresh authorized POST on the new policy.
+            invalidate_presence(team, &policy.session_id);
             broadcast(
                 team,
                 &policy.session_id,
@@ -381,6 +465,7 @@ pub(super) async fn route(
             let target = entry_for_participant(team, &command.participant_id)?.clone();
             let persistence = current(entry)?;
             let session_id = persistence.handle.session_id().to_owned();
+            let invalidation_session_id = session_id.clone();
             let owner = persistence.actor.clone();
             let target_actor = target.app.0.session.actor.clone();
             let enabled = command.enabled;
@@ -412,6 +497,9 @@ pub(super) async fn route(
                 Ok((policy, grant))
             })
             .await?;
+            // set_draft_grant rotates the audience revision and abandons its
+            // active CRDT generation even if the textual grant remains similar.
+            invalidate_presence(team, &invalidation_session_id);
             broadcast(
                 team,
                 current(entry)?.handle.session_id(),
@@ -687,6 +775,11 @@ pub(super) async fn route(
         }
         "/api/team/draft/presence" => {
             let command: PresenceCommand = body_json(request).await?;
+            let admission_epoch = team
+                .0
+                .multiplayer
+                .presence_epoch
+                .load(AtomicOrdering::Acquire);
             if !validate_client_id(&command.client_id) {
                 return Err(ApiError(
                     StatusCode::BAD_REQUEST,
@@ -712,6 +805,31 @@ pub(super) async fn route(
                 Ok(snapshot)
             })
             .await?;
+            // Test-only deterministic held completion: the Store grant has
+            // already been checked, but the new presence has not been admitted.
+            // Exercise a concurrent real revoke before that final admission.
+            #[cfg(test)]
+            {
+                let hold = lock(&team.0.multiplayer.held_presence_post)
+                    .as_ref()
+                    .filter(|hold| hold.client_id == command.client_id)
+                    .cloned();
+                if let Some(hold) = hold {
+                    hold.reached.add_permits(1);
+                    let _permit = hold.release.acquire_owned().await.map_err(|_| {
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "presence test gate closed",
+                        )
+                    })?;
+                }
+            }
+            if snapshot.state != aw_collab::DraftState::Active {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "shared draft generation is no longer active",
+                ));
+            }
             let utf16_len = snapshot.text.encode_utf16().count();
             if command.cursor_anchor as usize > utf16_len
                 || command.cursor_head as usize > utf16_len
@@ -723,6 +841,19 @@ pub(super) async fn route(
             }
             {
                 let mut presence = lock(&team.0.multiplayer.presence);
+                if admission_epoch == u64::MAX
+                    || admission_epoch
+                        != team
+                            .0
+                            .multiplayer
+                            .presence_epoch
+                            .load(AtomicOrdering::Acquire)
+                {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        "presence authority changed; refresh",
+                    ));
+                }
                 cleanup_presence(&mut presence);
                 let key = (
                     presence_draft_id.clone(),
@@ -747,6 +878,7 @@ pub(super) async fn route(
                     presence.insert(
                         key,
                         PresenceRecord {
+                            session_id: snapshot.target.session_id.clone(),
                             participant_id: entry.user.id.clone(),
                             display_name: entry.user.display_name.clone(),
                             cursor_anchor: command.cursor_anchor,
@@ -793,6 +925,11 @@ pub(super) async fn route(
                     StatusCode::FORBIDDEN,
                     "presence read permission required",
                 ));
+            }
+            // Old generations remain inspectable as history but have no live
+            // presence, even for their original owner.
+            if grant.0.state != aw_collab::DraftState::Active {
+                return Ok(Json(serde_json::json!({"presence":[]})).into_response());
             }
             let mut presence = lock(&team.0.multiplayer.presence);
             cleanup_presence(&mut presence);
