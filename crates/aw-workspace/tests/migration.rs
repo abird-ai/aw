@@ -36,10 +36,12 @@ fn v1_migration_keeps_geometry_and_binds_files_to_authorized_launch_scope() {
     let legacy: Workspace = serde_json::from_value(expected.clone()).unwrap();
     assert!(legacy.validate().is_err());
     let migrated = legacy.migrate(&ScopeId::launch()).unwrap();
-    expected["version"] = json!(3);
-    expected["containers"] = json!({});
-    expected["next_container_id"] = json!(1);
+    expected["version"] = json!(4);
+    expected["containers"] =
+        json!({"1":{"git_contexts":{"1":"launch"},"navigators":[1],"groups":[2]}});
+    expected["next_container_id"] = json!(2);
     expected["scope_labels"] = json!({});
+    expected["git_labels"] = json!({});
     expected["tabs"]["6"]["target"]["scope_id"] = json!("launch");
     assert_eq!(serde_json::to_value(&migrated).unwrap(), expected);
     assert_eq!(migrated.tabs[&3].target, Target::Conversation);
@@ -56,15 +58,15 @@ fn v1_migration_keeps_geometry_and_binds_files_to_authorized_launch_scope() {
 }
 
 #[test]
-fn v3_is_stable_and_unsupported_versions_never_migrate() {
+fn v4_is_stable_and_unsupported_versions_never_migrate() {
     let current = Workspace::default();
-    assert_eq!(current.version, 3);
-    assert_eq!(Workspace::conversation_only().version, 3);
+    assert_eq!(current.version, 4);
+    assert_eq!(Workspace::conversation_only().version, 4);
     assert_eq!(
         current.clone().migrate(&ScopeId::launch()).unwrap(),
         current
     );
-    for version in [0, 4, u32::MAX] {
+    for version in [0, 5, u32::MAX] {
         let mut unsupported = current.clone();
         unsupported.version = version;
         assert!(unsupported.clone().migrate(&ScopeId::launch()).is_err());

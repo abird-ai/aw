@@ -48,7 +48,7 @@ pub fn load(path: &Path, root: &Path, launch_scope: &ScopeId) -> Result<Option<W
     if saved.root != root
         || !matches!(
             (saved.version, saved.workspace.version),
-            (1, 1) | (2, 2) | (Workspace::VERSION, Workspace::VERSION)
+            (1, 1) | (2, 2) | (3, 3) | (Workspace::VERSION, Workspace::VERSION)
         )
     {
         return Err(Error::Denied(
@@ -154,7 +154,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn consistent_v1_migrates_in_memory_and_saves_only_as_v3() {
+    fn consistent_v1_migrates_in_memory_and_saves_only_as_v4() {
         use aw_workspace::{Action, Side, Target};
         let d = directory();
         let f = d.join("view.json");
@@ -200,7 +200,17 @@ mod tests {
     fn mixed_unsupported_versions_and_save_downgrades_are_rejected() {
         let d = directory();
         let f = d.join("view.json");
-        for (outer, inner) in [(1, 2), (2, 1), (0, 0), (4, 4), (1, 3), (3, 2), (2, 3)] {
+        for (outer, inner) in [
+            (1, 2),
+            (2, 1),
+            (0, 0),
+            (5, 5),
+            (1, 3),
+            (3, 2),
+            (2, 3),
+            (3, 4),
+            (4, 3),
+        ] {
             let mut workspace = Workspace::default();
             workspace.version = inner;
             let bytes = write_saved(&f, &d, outer, workspace);
@@ -243,7 +253,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn v3_exact_agent_view_descriptor_roundtrips() {
+    fn v4_exact_agent_view_descriptor_roundtrips() {
         let d = directory();
         let f = d.join("view.json");
         let mut workspace = Workspace::default();
@@ -318,7 +328,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn v3_two_scope_descriptors_roundtrip_without_rebinding_unknown_scopes() {
+    fn v4_two_scope_descriptors_roundtrip_without_rebinding_unknown_scopes() {
         use aw_workspace::{Action, Side, Target};
         let d = directory();
         let f = d.join("view.json");
@@ -359,7 +369,121 @@ mod tests {
         assert!(restored
             .containers
             .values()
-            .any(|container| container.scope_id == ScopeId("unavailable-scope-b".into())));
+            .any(|container| container.files_scope == Some(ScopeId("unavailable-scope-b".into()))));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consistent_v3_joins_legacy_git_to_files_without_rewriting_saved_geometry() {
+        use aw_workspace::{Action, GitContextId, Navigator, Side};
+        let d = directory();
+        let f = d.join("view.json");
+        let mut legacy = Workspace::default();
+        legacy
+            .apply(Action::SetNavigator {
+                pane: 1,
+                kind: Navigator::Files,
+            })
+            .unwrap();
+        legacy
+            .apply(Action::AddNavigator {
+                beside: 1,
+                side: Side::Below,
+                kind: Navigator::Sessions,
+            })
+            .unwrap();
+        let git = legacy.focused;
+        legacy.panes.insert(
+            git,
+            aw_workspace::Pane::Navigator {
+                kind: Navigator::Git,
+            },
+        );
+        legacy.version = 3;
+        legacy.next_id = u64::MAX;
+        legacy.next_container_id = u64::MAX;
+        let expected_root = legacy.root.clone();
+        let original = write_saved(&f, &d, 3, legacy);
+        let restored = load(&f, &d, &ScopeId::launch()).unwrap().unwrap();
+        assert_eq!(restored.version, 4);
+        assert_eq!(restored.root, expected_root);
+        assert_eq!(restored.next_id, u64::MAX);
+        assert_eq!(restored.next_container_id, u64::MAX);
+        assert_eq!(restored.containers.len(), 1);
+        assert_eq!(restored.git_context_for(git), Some(&GitContextId::launch()));
+        assert_eq!(restored.files_scope_for(1), Some(&ScopeId::launch()));
+        assert_eq!(std::fs::read(&f).unwrap(), original);
+        save(&f, &d, &restored).unwrap();
+        let saved: Saved = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert_eq!(saved.version, 4);
+        assert_eq!(saved.workspace, restored);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v4_exact_git_contexts_and_display_labels_roundtrip_without_paths_becoming_grants() {
+        use aw_workspace::{Action, GitContextId, Side, Target};
+        let d = directory();
+        let f = d.join("view.json");
+        let mut workspace = Workspace::default();
+        for name in ["checkout-a", "unknown-checkout-b"] {
+            let context_id = GitContextId(name.into());
+            workspace
+                .apply(Action::AddGit {
+                    beside: 2,
+                    side: Side::Below,
+                    context_id: context_id.clone(),
+                })
+                .unwrap();
+            let group = workspace.container_group_for(workspace.focused).unwrap();
+            workspace
+                .apply(Action::SetGitLabel {
+                    context_id,
+                    label: format!("/display-only/{name}"),
+                })
+                .unwrap();
+            workspace
+                .apply(Action::Open {
+                    group,
+                    target: Target::Diff {
+                        review: format!("review_{}", name.replace('-', "_")),
+                    },
+                    pinned: true,
+                })
+                .unwrap();
+        }
+        save(&f, &d, &workspace).unwrap();
+        let restored = load(&f, &d, &ScopeId::launch()).unwrap().unwrap();
+        assert_eq!(restored, workspace);
+        assert_eq!(
+            restored.git_labels[&GitContextId("unknown-checkout-b".into())],
+            "/display-only/unknown-checkout-b"
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_v3_migration_refuses_atomically_and_keeps_the_original_file() {
+        let d = directory();
+        let f = d.join("view.json");
+        let current = Workspace::default();
+        let mut legacy = current.clone();
+        legacy.version = 3;
+        legacy.panes.insert(
+            1,
+            aw_workspace::Pane::Navigator {
+                kind: aw_workspace::Navigator::Git,
+            },
+        );
+        legacy.next_container_id = u64::MAX;
+        let original = write_saved(&f, &d, 3, legacy);
+        let error = load(&f, &d, &ScopeId::launch()).unwrap_err();
+        assert!(error.to_string().contains("container ID exhaustion"));
+        assert_eq!(std::fs::read(&f).unwrap(), original);
+        assert_eq!(current, Workspace::default());
         std::fs::remove_dir_all(d).unwrap();
     }
 

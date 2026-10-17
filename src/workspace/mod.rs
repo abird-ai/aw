@@ -4,7 +4,7 @@ mod agent_view;
 mod background;
 mod branch_view;
 pub(super) mod files;
-mod git;
+pub(super) mod git;
 mod owner;
 mod palette;
 mod persistence;
@@ -44,6 +44,10 @@ pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Res
         None => files::Scopes::new(host.tools.root.clone())?,
     };
     let root = file_scopes.launch_root().to_owned();
+    let git_contexts = host
+        .workspace_git_contexts
+        .take()
+        .unwrap_or_else(|| git::Contexts::new(root.clone()));
     let layout_file = host.workspace_layout_file.clone();
     let saved_layout_in_memory = host.workspace_state.take();
     let should_load_layout = saved_layout_in_memory.is_none() && layout_file.is_some();
@@ -77,6 +81,7 @@ pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Res
         ui_config,
         background,
         file_scopes,
+        git_contexts,
     )
     .map(|mut ui| {
         ui.attach_terminals(terminals, shell);
@@ -117,6 +122,7 @@ pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Res
             }
             host.workspace_state = Some(ui.layout);
             host.workspace_file_scopes = Some(ui.file_scopes);
+            host.workspace_git_contexts = Some(ui.git.contexts);
             Ok(Returned {
                 host,
                 draft: ui.draft.text().to_owned(),

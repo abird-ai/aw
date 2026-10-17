@@ -89,7 +89,7 @@ impl Ui {
         let container = self
             .layout
             .group_for(tab)
-            .and_then(|group| self.layout.files_container_for(group));
+            .and_then(|group| self.layout.container_for(group));
         let token = match self.file_token(&key.scope_id, container) {
             Ok(token) => token,
             Err(error) => {
@@ -658,7 +658,8 @@ impl Ui {
                 match result {
                     Ok(Some(layout)) => {
                         self.reset_file_lifetime();
-                        self.files_last_group.clear();
+                        self.reset_git_lifetime();
+                        self.container_last_group.clear();
                         self.layout = layout;
                         self.layout_generation = self.layout_generation.wrapping_add(1);
                         self.terminal_return = None;
@@ -693,7 +694,8 @@ impl Ui {
                             return;
                         }
                         self.reset_file_lifetime();
-                        self.files_last_group.clear();
+                        self.reset_git_lifetime();
+                        self.container_last_group.clear();
                         self.layout = layout;
                         self.layout_generation = self.layout_generation.wrapping_add(1);
                         self.terminal_return = None;

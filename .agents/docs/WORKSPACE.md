@@ -82,9 +82,9 @@ without creating a Session. Browsing and later activation reuse one Host-owned
 Store and its exclusive owner.lock. Remote and JSONL read-only pins remain
 unavailable in this slice; there is no fallback to a different authority/backend.
 
-Native saved layout v3 migrates consistent v1/v2 layouts in memory, retaining
+Native saved layout v4 migrates consistent v1/v2/v3 layouts in memory, retaining
 IDs, pins, geometry and root binding. Legacy File targets bind only to the
-already-authorized launch folder; containers add no migration panes. Existing Conversation tabs continue to
+already-authorized launch folder; containers add no migration panes. Legacy Git navigators join existing group ownership without changing Files bindings. A required new container identity fails atomically if its allocator is exhausted. Existing Conversation tabs continue to
 follow the current Agent. Mixed/unsupported versions fail before installation;
 atomic publication, no-follow reads and the 64 KiB limit remain. SQLite v33 and
 JSONL v1 are unchanged. Browser containers and docking remain planned separately.
@@ -121,6 +121,26 @@ view closes. Existing pane/tab/navigator limits remain.
 On Windows, scoped directory handles prevent folder/ancestor rename or deletion
 while retained; ordinary file edits remain possible. Windows-target compilation
 and actual Windows execution are separate verification gates.
+
+## Scoped Git repositories
+
+Choose **Open Git repository…** (`git-open PATH`) to add a Git navigator and
+its document group. Preview stays with the originating container and preserves
+Explorer focus even if another pane becomes focused while Git is working.
+Containers can share navigator placement while retaining independent Files and
+per-navigator Git bindings. Choosing an existing worktree changes only that Git
+navigator; another Git navigator, Files and the Agent keep their roots.
+
+Host retains opened contexts across presentation changes. After restarting,
+saved external contexts remain unavailable until the focused Git navigator uses
+**Reconnect Git repository…** (`git-reconnect PATH`). Saved IDs and captions do
+not grant access or reconstruct cached patches.
+
+A moved or still-open Diff keeps its exact original reviewed checkout. Explicit
+stage/unstage applies only that fresh snapshot's index, through the existing
+serialized owner. Reconnect, final-reference closure and layout restore reject
+stale queued admission. External writers remain independent; unknown outcomes
+require inspection, with no automatic retry. [Git details](GIT.md).
 
 ## Services and scope
 

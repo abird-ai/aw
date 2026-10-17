@@ -190,6 +190,9 @@ impl Ui {
                 self.set_navigator(Navigator::Sessions);
                 self.owner(worker, Command::Refresh, false);
             }
+            "git-open" | "git-reconnect" => {
+                accepted = self.authorize_git(rest, verb == "git-reconnect");
+            }
             "git" => {
                 self.set_navigator(Navigator::Git);
                 let p = self.layout.focused;
@@ -725,28 +728,18 @@ impl Ui {
                     self.notice = "Terminal service not attached".into();
                     return Some(false);
                 };
-                let focused_repo = if matches!(
-                    self.layout.panes.get(&self.layout.focused),
-                    Some(Pane::Navigator {
-                        kind: Navigator::Git
-                    })
-                ) {
-                    self.git
-                        .panes
-                        .get(&self.layout.focused)
-                        .and_then(|n| n.repo.as_ref())
-                        .map(|r| r.root().to_owned())
-                } else {
-                    None
+                let root = match self.terminal_git_root() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        self.notice = error;
+                        return Some(false);
+                    }
                 };
-                let root = focused_repo
-                    .or_else(|| self.git.selected_root.clone())
-                    .unwrap_or_else(|| self.root.clone());
                 let shell = self.shell.clone();
                 let owner = self.snapshot.actor.clone();
                 self.notice = format!(
                     "Launching trusted shell at {} — agent binding unchanged",
-                    root.display()
+                    root.path.display()
                 );
                 self.terminal_pending = true;
                 let out = self.background_tx.clone();
@@ -754,7 +747,7 @@ impl Ui {
                 if let Err(error) = self.background.try_submit_with_panic(
                     "terminal",
                     move || {
-                        let result = pool.launch(root, shell, owner).map_err(|e| e.to_string());
+                        let result = root.launch(pool, shell, owner);
                         let _ = out.blocking_send(UiBackgroundResult::Terminal(result));
                     },
                     move || {
@@ -863,23 +856,19 @@ impl Ui {
             }
             "stage" | "unstage" => {
                 if let Some(id) = self.review_id() {
-                    if let Some((repo, review)) = self.git.reviews.get(&id).cloned() {
-                        accepted = self.owner(
-                            worker,
-                            Command::GitIndex {
-                                repo,
-                                review,
-                                action: if verb == "stage" {
-                                    aw_git::IndexAction::Stage
-                                } else {
-                                    aw_git::IndexAction::Unstage
-                                },
-                            },
-                            false,
-                        );
+                    let action = if verb == "stage" {
+                        aw_git::IndexAction::Stage
                     } else {
-                        self.notice = "Review expired; reopen current diff".into();
-                        accepted = false;
+                        aw_git::IndexAction::Unstage
+                    };
+                    match self.git.index_request(&id, action) {
+                        Ok(request) => {
+                            accepted = self.owner(worker, Command::GitIndex(request), false)
+                        }
+                        Err(error) => {
+                            self.notice = error;
+                            accepted = false;
+                        }
                     }
                 } else {
                     self.notice =

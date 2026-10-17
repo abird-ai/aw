@@ -3160,6 +3160,8 @@ struct Host {
     workspace_terminals: Option<workspace::terminals::Pool>,
     #[cfg(feature = "workspace")]
     workspace_file_scopes: Option<workspace::files::Scopes>,
+    #[cfg(feature = "workspace")]
+    workspace_git_contexts: Option<workspace::git::Contexts>,
 }
 impl Host {
     /// Build a fresh Runtime/Actor Envelope from the *verified* current
@@ -3565,6 +3567,8 @@ impl Host {
             workspace_terminals: None,
             #[cfg(feature = "workspace")]
             workspace_file_scopes: None,
+            #[cfg(feature = "workspace")]
+            workspace_git_contexts: None,
         }
     }
 

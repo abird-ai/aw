@@ -483,6 +483,18 @@ pub const WORKSPACE_COMMANDS: &[WorkspaceCommand] = &[
         shortcut: "",
     },
     WorkspaceCommand {
+        command: "git-open ",
+        label: "Open Git repository…",
+        description: "browse another repository without changing the Agent or Files folder",
+        shortcut: "",
+    },
+    WorkspaceCommand {
+        command: "git-reconnect ",
+        label: "Reconnect Git repository…",
+        description: "reconnect the selected Git repository without changing the Agent",
+        shortcut: "",
+    },
+    WorkspaceCommand {
         command: "git changes",
         label: "Show Git Changes",
         description: "focus Git → Changes",

@@ -75,7 +75,7 @@ impl Ui {
             Job::Read { tab, path, .. } => {
                 self.layout.tabs.get(tab).is_some_and(|tab| matches!(&tab.target,
                     Target::File { scope_id, path: current } if scope_id == token.access.scope_id() && current == path))
-                    && self.layout.group_for(*tab).and_then(|group| self.layout.files_container_for(group)) == token.container
+                    && self.layout.group_for(*tab).and_then(|group| self.layout.container_for(group)) == token.container
             }
             Job::Search { pane: None, .. } => self.palette.is_some()
                 && &self.palette_file_scope == token.access.scope_id()
@@ -106,7 +106,7 @@ impl Ui {
                 let container = self
                     .layout
                     .group_for(*tab)
-                    .and_then(|group| self.layout.files_container_for(group));
+                    .and_then(|group| self.layout.container_for(group));
                 bindings.insert(*tab, (scope_id.clone(), container, Some(path.clone())));
             }
         }
@@ -150,7 +150,7 @@ impl Ui {
             self.layout
                 .containers
                 .values()
-                .map(|container| container.scope_id.clone()),
+                .filter_map(|container| container.files_scope.clone()),
         );
         self.file_scopes.retain(&retained);
         for scope in &retained {

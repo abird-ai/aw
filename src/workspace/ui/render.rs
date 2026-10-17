@@ -1220,6 +1220,19 @@ impl Ui {
                     ..inner
                 };
                 if kind == Navigator::Git {
+                    if rows.height > 0 {
+                        let label = self
+                            .layout
+                            .git_context_for(id)
+                            .map(|context| self.git_context_label(context))
+                            .unwrap_or_else(|| "unavailable repository".into());
+                        frame.render_widget(
+                            Paragraph::new(label).style(Style::default().fg(palette.muted)),
+                            Rect { height: 1, ..rows },
+                        );
+                        rows.y += 1;
+                        rows.height = rows.height.saturating_sub(1);
+                    }
                     let (mode, display, info, items, selected) = {
                         let nav = self.git.panes.entry(id).or_default();
                         let info = if nav.pending.is_some() {

@@ -25,6 +25,7 @@ fn legacy(workspace: &Workspace, version: u32) -> Value {
     value.as_object_mut().unwrap().remove("containers");
     value.as_object_mut().unwrap().remove("next_container_id");
     value.as_object_mut().unwrap().remove("scope_labels");
+    value.as_object_mut().unwrap().remove("git_labels");
     for tab in value["tabs"].as_object_mut().unwrap().values_mut() {
         if tab["target"]["kind"] == "file" {
             tab["target"].as_object_mut().unwrap().remove("scope_id");
@@ -222,9 +223,22 @@ fn switching_or_closing_navigators_preserves_document_tabs_and_container_lifetim
         })
         .unwrap();
     assert_eq!(workspace.files_container_for(1), Some(container));
-    assert_eq!(workspace.containers[&container].navigators, vec![1]);
+    assert_eq!(
+        workspace.containers[&container].navigators,
+        vec![navigator, 1]
+    );
+    assert_eq!(
+        workspace.git_context_for(navigator),
+        Some(&GitContextId::launch())
+    );
+    assert_eq!(
+        workspace.containers[&container].files_scope,
+        Some(scope("root-a"))
+    );
     assert_eq!(workspace.tabs, tabs);
     workspace.apply(Action::ClosePane(1)).unwrap();
+    assert_eq!(workspace.container_for(navigator), Some(container));
+    workspace.apply(Action::ClosePane(navigator)).unwrap();
     assert!(workspace.containers.is_empty());
     assert!(workspace.panes.contains_key(&group));
     assert_eq!(workspace.tabs, tabs);
@@ -363,7 +377,7 @@ fn malformed_membership_and_new_authority_fields_are_rejected() {
             4 => entry.navigators.push(group),
             5 => entry.groups.clear(),
             6 => entry.navigators.clear(),
-            _ => entry.scope_id = ScopeId::default(),
+            _ => entry.files_scope = Some(ScopeId::default()),
         }
         assert!(invalid.validate().is_err(), "mutation {mutation}");
     }
@@ -464,8 +478,8 @@ fn legacy_full_layout_with_two_files_navigators_preserves_geometry_ids_focus_and
             2
         );
         assert_eq!(
-            migrated.containers.values().next().unwrap().scope_id,
-            scope("authorized-launch")
+            migrated.containers.values().next().unwrap().files_scope,
+            Some(scope("authorized-launch"))
         );
     }
 }

@@ -1,6 +1,6 @@
-# Git and review SDK — Phase 5 / 0.6.0
+# Git and review SDK
 
-**Authored Rust source; not compiled here.** `aw-git` is an independent blocking Rust library, not an agent tool, Git daemon or security sandbox. Use it from a host worker, never the render/input task.
+`aw-git` is the blocking Git library used by native human review views and the browser adapter. Native views use the existing bounded Workspace executor; explicit index actions pass through the serialized Agent owner. Use the library from a host worker, never the render/input task. It supplies no model tool, Git daemon or subprocess sandbox.
 
 ## Public model
 
@@ -54,17 +54,68 @@ The native UI keeps at most eight snapshots, each with at most32 comments of8192
 
 The raw patch is capped at2 MiB; display rows cap at4096. Escaped/truncated display never changes bytes used for index application. Binary/combined conflict data has an explicit read-only or bounded presentation, not false source-line annotations.
 
-## Scope and restoration
+## Scoped native Git containers
 
-Each Git navigator can retain its own checkout/subview/filter, independent of Files/Sessions and another Git pane. Selecting another worktree updates that human review view and the default new-terminal root. It does **not** rebind the existing agent or its file browser. That distinction prevents existing operations from writing into a different checkout. Multi-root agent/session switching remains a subsequent integration.
+Choose **Open Git repository…** in the existing Workspace palette, or use
+`git-open PATH`, to open a Git navigator and document group. The same relative
+path in two checkouts has distinct exact review identity. Preview stays with
+the invoking container's remembered document group and preserves Explorer
+focus; changing focus while Git works cannot redirect its eventual preview.
 
-Saved layouts contain only opaque Diff IDs. Reopening an unavailable snapshot shows a refresh requirement; it never reconstructs/stages a patch from an untrusted serialized title. Human Git reads are not provider context by default.
+Containers own placement. Their Files scope and each Git navigator's exact
+checkout context are separate bindings. Existing navigators can share a
+container/group without coupling their resource roots. Selecting an existing
+verified worktree changes only that Git navigator's context; branch Enter is
+read-only comparison. Files and the current Agent retain their bindings.
+
+An explicit terminal launch uses the focused Git navigator or exact Diff
+repository, otherwise the original human launch context. An unavailable focused
+Git/Diff context refuses launch; it never borrows another container's root.
+The background launch job revalidates the captured Git binding before starting
+the shell. Existing terminals retain their own bindings.
+
+Opaque context IDs and bounded saved labels are requests, never root grants.
+Host retains opened contexts across Agent/Workspace presentation switches;
+launch discovery stays lazy and uses the original human launch directory.
+After process restart an external context is unavailable until the user focuses
+its Git navigator and chooses **Reconnect Git repository…**, or
+`git-reconnect PATH`. A saved Diff ID never reconstructs a patch or index action.
+
+A moved or still-open Diff retains its original Repository/Review/context even
+if its navigator selects another worktree or closes. Explicit stage/unstage
+still targets that exact visible snapshot's index and requires fresh review and
+HEAD validation. Reconnect, final-reference closure and layout restore invalidate
+queued index admission. The owner checks that admission immediately before the
+existing index operation; a mutation already admitted into Git is not silently
+cancelled or replayed. External commands can race, so uncertain results still
+require inspection and an explicit new action.
+
+Retained physical directory identities and fresh Git mapping checks detect
+replacement of a context's root, worktree Git directory or common directory.
+These checks do not exclude concurrent external filesystem/Git writers. Human
+Git reads and cached comments do not become provider context automatically;
+`send-review` still requires the canonical current Agent root.
+
+Native saved layout v4 migrates consistent v1/v2/v3 inputs while preserving
+geometry, pane/tab identities and Files bindings. Legacy Git navigators join
+existing group ownership where possible. If a genuinely new container ID is
+required and its allocator is exhausted, migration fails atomically and leaves
+the current layout and saved file intact. Old readers reject v4; SQLite v33 and
+JSONL v1 are unchanged. Browser containers and docking remain separate work.
 
 ## Tests and primary references
 
-[Rust repository tests](../../crates/aw-git/tests/repository.rs) and [wire vectors](../../crates/aw-git/fixtures/wire.json) are authored for the actual library. Python wire tests independently execute real Git argv and patch behavior; they passed here but do not compile/call aw-git. Host Phase5 smoke exercises the real native renderer and service only after building aw.
+The [actual Rust repository tests](../../crates/aw-git/tests/repository.rs) run
+real Git subprocesses against private fixtures. The shared product gate is the
+locked workspace Cargo suite and six web suites in the [checklist
+specification](../plans/TODO-SPEC.md). The [workspace plan
+TODO](../plans/workspace-views/TODO.md) records exact tested commits, native
+package/terminal checks and any open platform gates. A source or cross-target
+compile check does not supply an unexecuted runtime result.
 
-Official Git status/worktree documentation and upstream API references are recorded in [SOURCES](SOURCES.md). Those references establish protocol descriptions, not that our adapter has been compiled, benchmarked or audited.
+Official Git status/worktree documentation and upstream API references are
+recorded in [SOURCES](SOURCES.md); protocol references do not certify execution
+or audit the adapter.
 
 ## Phase 6 web integration
 

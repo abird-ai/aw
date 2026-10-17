@@ -119,21 +119,49 @@ Source seams: `src/workspace/files.rs`, `src/workspace/ui/files_views.rs`,
 `crates/aw-workspace/src/layout.rs`, `crates/aw-tools/src/browse.rs`,
 `crates/aw-platform-win/src/scoped_fs.rs`.
 
-## Next slice: native Git containers
+## Native Git containers — implementation in progress
 
-Reuse the same flat ownership model for Git navigators and document groups,
-with an explicit Files or Git binding. Preserve stable IDs, global limits,
-split/move/close rules and the invoking container's remembered document group.
-Reuse existing Repository contexts, worktree membership checks and exact
-ReviewID identity; a branch comparison or worktree selection never retargets
-an Agent or Files capability.
+Reuse one flat container for navigator placement and document groups. Its
+optional Files scope and per-navigator Git context map are independent resource
+bindings. Mixed containers preserve old shared document groups and navigator
+kind switching; explicit folder/repository opens normally create a single-kind
+container. Preserve stable IDs, global limits, split/move/close rules and the
+invoking container's remembered document group.
 
-Carry origin container, navigator, repository and checked request lifetime
-through every Git completion. A delayed review opens only in that container's
-current document group and preserves Explorer focus. Closing, restoring or
-replacing the binding rejects stale replies. Keep fresh exact-review/HEAD
-validation and existing owner-serialized index admission before staging;
-review feedback still requires the canonical current Agent root.
+A Git context ID names an exact authorized checkout binding. A verified worktree
+selection mints a new context and changes only the invoking navigator's map
+entry. Another navigator, Files scope and the Agent remain unchanged. A moved
+or still-open Diff retains its exact original Repository/Review/context;
+`Target::Diff { review }` stays opaque. Saved IDs and bounded display labels
+supply no grants. External contexts require explicit reconnect after restart;
+launch discovery stays lazy and uses the original retained human launch root.
+
+`git-open PATH` / Open Git repository… and `git-reconnect PATH` / Reconnect Git
+repository… use the existing palette and bounded executor. Reconnect targets
+the focused Git navigator. Carry origin container, navigator, exact binding and
+checked request lifetime through every completion. A delayed review opens only
+in that container's current remembered document group and preserves Explorer
+focus. Closing, restoring or replacing its request binding rejects late replies.
+
+Keep fresh exact-review/HEAD checks and the existing serialized owner before
+index application. An owned index request rechecks its binding at owner
+admission; reconnect, final-reference closure and restore invalidate queued
+admission. An explicitly retained Diff may still stage its original checkout
+when its snapshot is fresh. An already admitted external mutation is not
+silently cancelled or replayed. Feedback still requires the canonical current
+Agent root. Repository identity checks detect deterministic root/git-dir/common
+directory replacement. Explicit Git-derived terminal launches revalidate their
+captured binding on the executor before starting a shell. These checks do not
+lock out concurrent external Git/filesystem writers or create a subprocess
+sandbox.
+
+Native layout v4 preserves the old Files wire fields and migrates consistent
+v1/v2/v3 inputs. Legacy Git navigators join an existing document group owner
+without changing Files bindings, geometry or pane IDs. Unowned groups need a
+new container identity; if that allocator is exhausted, migration returns an
+explicit limit error atomically, retaining the current layout and saved file.
+Never reuse old IDs or add a special legacy routing mode. SQLite v33 and JSONL
+v1 are unchanged; old binaries reject the new native layout version.
 
 Stop when two Git containers inspect the same relative path in different
 existing worktrees independently, delayed results stay with their origin,
@@ -144,8 +172,8 @@ unchanged. Browser counterparts and docking remain later slices.
 Parallel ownership: model/persistence, Git backend/context retention, and native
 UI are separate implementation assignments. Agree container actions/lookups,
 opaque Git context ID, binding epoch and completion identity before editing.
-The coordinator owns shared plans and API reconciliation; retain existing
-owner/index logic unless a concrete defect warrants a separate patch.
+The coordinator owns shared plans and API reconciliation; keep owner/index
+changes limited to exact queued-request admission.
 
 Source seams: `src/workspace/git.rs`, `src/workspace/ui.rs`,
 `crates/aw-git/src/lib.rs`, `src/workspace/owner.rs` and

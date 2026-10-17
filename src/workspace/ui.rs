@@ -24,8 +24,8 @@ use aw::{Error, Result};
 use aw_tools::browse::{Entry, EntryKind};
 use aw_ui_extension::Slot;
 use aw_workspace::{
-    Action, Axis, Editor, Id, Navigator, Pane, Rect as ModelRect, ScopeId, Side, Target, Workspace,
-    MAX_SCOPE_LABEL_BYTES,
+    Action, Axis, Editor, GitContextId, Id, Navigator, Pane, Rect as ModelRect, ScopeId, Side,
+    Target, Workspace, MAX_SCOPE_LABEL_BYTES,
 };
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -57,6 +57,7 @@ mod agent_views;
 mod async_work;
 mod commands;
 mod files_views;
+mod git_views;
 mod interaction;
 mod render;
 
@@ -702,7 +703,10 @@ pub struct Ui {
     file_find_dirty: BTreeSet<Id>,
     layout_pending: bool,
     layout_generation: u64,
-    git: git::Views,
+    pub(super) git: git::Views,
+    git_epoch: u64,
+    git_bindings: Vec<(Id, Id, GitContextId)>,
+    git_tab_bindings: BTreeMap<Id, (String, Option<Id>)>,
     terminal_pool: Option<terminals::Pool>,
     shell: PathBuf,
     terminal_pending: bool,
@@ -732,7 +736,7 @@ pub struct Ui {
     horizontal: BTreeMap<Id, u16>,
     line_counts: BTreeMap<Id, usize>,
     last_group: Id,
-    files_last_group: BTreeMap<Id, Id>,
+    container_last_group: BTreeMap<Id, Id>,
     input: bool,
     palette: Option<palette::State>,
     composer: ComposerInteraction,
@@ -775,6 +779,7 @@ impl Ui {
     ) -> Result<Self> {
         let background = BackgroundExecutor::new()?;
         let scopes = Scopes::new(root.clone())?;
+        let contexts = git::Contexts::new(root.clone());
         Self::new_with_background(
             layout,
             draft,
@@ -784,6 +789,7 @@ impl Ui {
             ui_config,
             background,
             scopes,
+            contexts,
         )
     }
 
@@ -796,6 +802,7 @@ impl Ui {
         ui_config: aw::config::UiConfig,
         background: BackgroundExecutor,
         file_scopes: Scopes,
+        git_contexts: git::Contexts,
     ) -> Result<Self> {
         layout
             .validate()
@@ -826,7 +833,10 @@ impl Ui {
             layout,
             draft: editor,
             layout_file,
-            git: git::Views::new(root.clone(), background.clone()),
+            git: git::Views::new_with_contexts(git_contexts, background.clone()),
+            git_epoch: 1,
+            git_bindings: Vec::new(),
+            git_tab_bindings: BTreeMap::new(),
             terminal_pool: None,
             shell: PathBuf::from("/bin/bash"),
             terminal_pending: false,
@@ -865,7 +875,7 @@ impl Ui {
             horizontal: BTreeMap::new(),
             line_counts: BTreeMap::new(),
             last_group,
-            files_last_group: BTreeMap::new(),
+            container_last_group: BTreeMap::new(),
             input,
             palette: None,
             composer: ComposerInteraction::default(),
@@ -949,12 +959,7 @@ impl Ui {
     }
 
     fn focus_explorer(&mut self) {
-        let owned_navigator = self
-            .layout
-            .files_container_for(self.layout.focused)
-            .and_then(|id| self.layout.files_container(id))
-            .and_then(|container| container.navigators.first())
-            .copied();
+        let owned_navigator = self.owned_navigator();
         if let Some(pane) = owned_navigator.or_else(|| {
             self.layout
                 .ordered_panes()
@@ -1570,9 +1575,9 @@ impl Ui {
         self.reconcile_file_views();
         self.reconcile_agent_views();
         let groups = self.layout.groups();
-        self.files_last_group.retain(|container, group| {
+        self.container_last_group.retain(|container, group| {
             self.layout
-                .files_container(*container)
+                .container(*container)
                 .is_some_and(|owner| owner.groups.contains(group))
         });
         if matches!(
@@ -1580,8 +1585,9 @@ impl Ui {
             Some(Pane::Group { .. })
         ) {
             self.last_group = self.layout.focused;
-            if let Some(container) = self.layout.files_container_for(self.layout.focused) {
-                self.files_last_group.insert(container, self.layout.focused);
+            if let Some(container) = self.layout.container_for(self.layout.focused) {
+                self.container_last_group
+                    .insert(container, self.layout.focused);
             }
         } else if !groups.contains(&self.last_group) {
             self.last_group = groups[0];
@@ -1618,6 +1624,7 @@ impl Ui {
         self.git
             .panes
             .retain(|id, _| self.layout.panes.contains_key(id));
+        self.reconcile_git_views();
         self.terminal_scroll
             .retain(|id, _| self.layout.tabs.contains_key(id));
         if self.terminal_return.is_some_and(|(pane, tab)| {
@@ -1637,10 +1644,10 @@ impl Ui {
     }
 
     fn group(&self) -> Id {
-        if let Some(container_id) = self.layout.files_container_for(self.layout.focused) {
-            if let Some(container) = self.layout.files_container(container_id) {
+        if let Some(container_id) = self.layout.container_for(self.layout.focused) {
+            if let Some(container) = self.layout.container(container_id) {
                 if let Some(group) = self
-                    .files_last_group
+                    .container_last_group
                     .get(&container_id)
                     .filter(|group| container.groups.contains(group))
                 {
@@ -1884,10 +1891,12 @@ impl Ui {
         ) {
             Some(self.layout.focused)
         } else {
-            self.layout
-                .panes
-                .iter()
-                .find_map(|(id, p)| matches!(p, Pane::Navigator { .. }).then_some(*id))
+            self.owned_navigator().or_else(|| {
+                self.layout
+                    .panes
+                    .iter()
+                    .find_map(|(id, p)| matches!(p, Pane::Navigator { .. }).then_some(*id))
+            })
         };
         if let Some(pane) = pane {
             let leaving_files = matches!(
@@ -2245,7 +2254,7 @@ pub async fn event_loop(
                 }
                 dirty=true;},
             Some(reply)=browser.replies.recv()=>{ui.response(reply);dirty=true;},
-            Some(reply)=ui.git.next()=>{if let Some(review)=ui.git.response(reply){ui.schedule_diff_highlight(&review);ui.apply(Action::Open{group:ui.group(),target:Target::Diff{review},pinned:false});ui.input=false;}dirty=true;},
+            Some(reply)=ui.git.next()=>{ui.git_response(reply);dirty=true;},
             _=async{if let Some(w)=&mut terminal_watch{let _=w.changed().await;}else{std::future::pending::<()>().await;}}=>{dirty=true;},
             Some(result)=ui.background_rx.recv()=>{
                 ui.apply_background_result(result);

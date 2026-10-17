@@ -56,8 +56,11 @@ Design and binding decisions: [README.md](README.md).
 
 ## Uncommitted
 
-- [ ] Compose native Git using existing repository contexts and fresh exact-review/index admission; worktree selection cannot retarget Agent/Files.
-- [ ] Extend the delivered flat Files ownership model to Git and later container kinds; preserve one parent/level, stable IDs, orphan validation and global 8-pane/32-tab limits.
+- [~] Compose native Git using existing repository contexts and fresh exact-review/index admission; worktree selection cannot retarget Agent/Files — backend and native UI agents.
+- [~] Extend flat ownership with independent Files and per-navigator Git bindings; migrate native v1/v2/v3 to v4, preserve geometry/IDs/limits and refuse unavailable container allocation atomically — model/persistence agent.
+- [~] Retain exact checkout contexts across Host presentation changes; explicit open/reconnect, worktree selection, label-only saved hints and final-reference revocation — backend/native agents.
+- [~] Fence origin-bound Git completions and queued owner index requests across close/rebind/restore; retain intentionally open immutable Diff contexts and existing fresh-review/HEAD checks.
+- [~] Validate retained repository directory identities and Git mappings before operations/index admission without claiming exclusion of concurrent external writers — backend/platform helper agent.
 - [ ] Add browser counterparts through existing capability APIs, with browser-specific acceptance and migration before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
@@ -84,6 +87,11 @@ Design and binding decisions: [README.md](README.md).
 
 - [x] Windows scoped-directory crate and four real-filesystem tests compile — `cargo check --locked -p aw-platform-win --target x86_64-pc-windows-gnu --tests`, pinned Nix shell with Rust 1.98.1 Windows target on `3851dbf`, passed.
 - [ ] Windows scoped-directory handle tests — execute on an actual Windows host; reparse-point case requires symlink privilege or Developer Mode. Compilation does not supply this runtime result.
+
+- [ ] Git-container layout/persistence regressions: legacy migration, independent bindings, shared limits, split/move/close and malformed ownership/versions.
+- [ ] Actual Git backend/executor regressions: distinct worktree contexts, delayed/closed/rebound replies, review expiry and selected-index-only fresh staging; stale contexts never mutate.
+- [ ] Native Git/executor/TestBackend acceptance: origin-container routing/focus, independent filters/diff state, explicit open/reconnect, save/load and unchanged Agent/Files/draft/effect admission.
+- [ ] Exact Git-container candidate: pinned product gate, Workspace-only feature boundary, native Nix package/version and real-terminal two-worktree acceptance.
 
 ## Deferred
 

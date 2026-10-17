@@ -7,6 +7,7 @@ pub const MAX_PANES: usize = 8;
 pub const MAX_TABS: usize = 32;
 pub const MAX_DEPTH: usize = 12;
 pub const MAX_SCOPE_LABEL_BYTES: usize = 1024;
+pub const MAX_GIT_LABEL_BYTES: usize = MAX_SCOPE_LABEL_BYTES;
 pub const MAX_SCOPE_LABELS: usize = MAX_TABS + MAX_PANES;
 
 fn initial_container_id() -> Id {
@@ -19,6 +20,21 @@ fn initial_container_id() -> Id {
 #[serde(transparent)]
 pub struct ScopeId(pub String);
 impl ScopeId {
+    pub fn launch() -> Self {
+        Self("launch".into())
+    }
+
+    pub fn is_valid(&self) -> bool {
+        valid_opaque_id(&self.0)
+    }
+}
+
+/// An exact human Git checkout binding. The host supplies authority separately;
+/// selecting a different worktree uses another identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GitContextId(pub String);
+impl GitContextId {
     pub fn launch() -> Self {
         Self("launch".into())
     }
@@ -129,8 +145,11 @@ pub struct Tab {
 /// container or a second Workspace runtime. Scope resolution belongs to the host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FilesContainer {
-    pub scope_id: ScopeId,
+pub struct Container {
+    #[serde(default, rename = "scope_id", skip_serializing_if = "Option::is_none")]
+    pub files_scope: Option<ScopeId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub git_contexts: BTreeMap<Id, GitContextId>,
     pub navigators: Vec<Id>,
     pub groups: Vec<Id>,
 }
@@ -142,12 +161,14 @@ pub struct Workspace {
     pub panes: BTreeMap<Id, Pane>,
     pub tabs: BTreeMap<Id, Tab>,
     #[serde(default)]
-    pub containers: BTreeMap<Id, FilesContainer>,
+    pub containers: BTreeMap<Id, Container>,
     #[serde(default = "initial_container_id")]
     pub next_container_id: Id,
     /// Human display hints only; never paths used to resolve capabilities.
     #[serde(default)]
     pub scope_labels: BTreeMap<ScopeId, String>,
+    #[serde(default)]
+    pub git_labels: BTreeMap<GitContextId, String>,
     pub focused: Id,
     pub next_id: Id,
 }
@@ -179,6 +200,24 @@ pub enum Action {
     },
     SetScopeLabel {
         scope_id: ScopeId,
+        label: String,
+    },
+    AddGit {
+        beside: Id,
+        side: Side,
+        context_id: GitContextId,
+    },
+    BindGit {
+        navigator: Id,
+        group: Id,
+        context_id: GitContextId,
+    },
+    SetGitContext {
+        navigator: Id,
+        context_id: GitContextId,
+    },
+    SetGitLabel {
+        context_id: GitContextId,
         label: String,
     },
     SplitGroup {
@@ -292,13 +331,14 @@ impl Default for Workspace {
             containers: BTreeMap::new(),
             next_container_id: initial_container_id(),
             scope_labels: BTreeMap::new(),
+            git_labels: BTreeMap::new(),
             focused: 2,
             next_id: 5,
         }
     }
 }
 impl Workspace {
-    pub const VERSION: u32 = 3;
+    pub const VERSION: u32 = 4;
 
     /// Upgrade only supported presentation schemas, resolving old File
     /// descriptors against the caller's already-authorized launch scope. No
@@ -320,6 +360,7 @@ impl Workspace {
                 if !self.containers.is_empty()
                     || self.next_container_id != initial_container_id()
                     || !self.scope_labels.is_empty()
+                    || !self.git_labels.is_empty()
                     || self.tabs.values().any(|tab| {
                         matches!(&tab.target, Target::File { scope_id, .. } if !scope_id.0.is_empty())
                     })
@@ -333,6 +374,29 @@ impl Workspace {
                 }
                 self.migrate_files_container(launch_scope)?;
                 self.version = Self::VERSION;
+                self.validate_graph(true)?;
+                self.migrate_git_containers()?;
+            }
+            3 => {
+                if !self.git_labels.is_empty()
+                    || self.containers.values().any(|container| {
+                        !container.git_contexts.is_empty()
+                            || container.files_scope.is_none()
+                            || container.navigators.iter().any(|navigator| {
+                                !matches!(
+                                    self.panes.get(navigator),
+                                    Some(Pane::Navigator {
+                                        kind: Navigator::Files
+                                    })
+                                )
+                            })
+                    })
+                {
+                    return Err(LayoutError::Invalid("v4 binding in v3 layout"));
+                }
+                self.version = Self::VERSION;
+                self.validate_graph(true)?;
+                self.migrate_git_containers()?;
             }
             Self::VERSION => {}
             _ => return Err(LayoutError::Invalid("unsupported schema")),
@@ -375,12 +439,40 @@ impl Workspace {
         let id = self.container_id()?;
         self.containers.insert(
             id,
-            FilesContainer {
-                scope_id: launch_scope.clone(),
+            Container {
+                files_scope: Some(launch_scope.clone()),
+                git_contexts: BTreeMap::new(),
                 navigators,
                 groups,
             },
         );
+        Ok(())
+    }
+
+    fn migrate_git_containers(&mut self) -> Result<()> {
+        let navigators = self
+            .ordered_panes()
+            .into_iter()
+            .filter(|pane| {
+                matches!(
+                    self.panes.get(pane),
+                    Some(Pane::Navigator {
+                        kind: Navigator::Git
+                    })
+                )
+            })
+            .collect::<Vec<_>>();
+        for navigator in navigators {
+            let mut group = self.nearest_group(navigator).ok_or(LayoutError::Missing)?;
+            // If allocation is exhausted, an existing owner is sufficient for
+            // legacy routing and does not change any Files binding or geometry.
+            if self.container_for(group).is_none() && self.next_container_id == Id::MAX {
+                if let Some(owned) = self.nearest_owned_group(navigator) {
+                    group = owned;
+                }
+            }
+            self.bind_git(navigator, group, GitContextId::launch())?;
+        }
         Ok(())
     }
 
@@ -409,12 +501,17 @@ impl Workspace {
             containers: BTreeMap::new(),
             next_container_id: initial_container_id(),
             scope_labels: BTreeMap::new(),
+            git_labels: BTreeMap::new(),
             focused: 1,
             next_id: 3,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_graph(false)
+    }
+
+    fn validate_graph(&self, allow_unbound_git: bool) -> Result<()> {
         if self.version != Self::VERSION {
             return Err(LayoutError::Invalid("unsupported schema"));
         }
@@ -428,7 +525,7 @@ impl Workspace {
         {
             return Err(LayoutError::Limit("pane/tab count"));
         }
-        if self.scope_labels.len() > MAX_SCOPE_LABELS {
+        if self.scope_labels.len() > MAX_SCOPE_LABELS || self.git_labels.len() > MAX_SCOPE_LABELS {
             return Err(LayoutError::Limit("scope label count"));
         }
         if self.scope_labels.iter().any(|(scope_id, label)| {
@@ -439,6 +536,15 @@ impl Workspace {
                 || label.chars().any(char::is_control)
         }) {
             return Err(LayoutError::Invalid("scope display label"));
+        }
+        if self.git_labels.iter().any(|(context_id, label)| {
+            !context_id.is_valid()
+                || !self.references_git(context_id)
+                || label.is_empty()
+                || label.len() > MAX_SCOPE_LABEL_BYTES
+                || label.chars().any(char::is_control)
+        }) {
+            return Err(LayoutError::Invalid("Git display label"));
         }
         let mut leaves = BTreeSet::new();
         validate_node(&self.root, 0, &mut leaves)?;
@@ -516,33 +622,53 @@ impl Workspace {
             }
         }
         let mut owned = BTreeSet::new();
-        let mut file_navigators = BTreeSet::new();
+        let mut navigators = BTreeSet::new();
         for (&id, container) in &self.containers {
             // Containers have a separate monotonic ID namespace, independent
             // of pane/tab allocation and their current child membership.
             if id == 0 || id >= self.next_container_id {
                 return Err(LayoutError::Invalid("container identity"));
             }
-            if !container.scope_id.is_valid()
+            if container
+                .files_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.is_valid())
+                || container
+                    .git_contexts
+                    .values()
+                    .any(|context| !context.is_valid())
+                || (container.files_scope.is_none() && container.git_contexts.is_empty())
+                || container
+                    .git_contexts
+                    .keys()
+                    .any(|pane| !container.navigators.contains(pane))
                 || container.navigators.is_empty()
                 || container.groups.is_empty()
                 || container.navigators.len() > MAX_PANES
                 || container.groups.len() > MAX_PANES
             {
-                return Err(LayoutError::Invalid("files container"));
+                return Err(LayoutError::Invalid("container binding"));
             }
             for navigator in &container.navigators {
                 if !owned.insert(*navigator)
-                    || !matches!(
-                        self.panes.get(navigator),
-                        Some(Pane::Navigator {
-                            kind: Navigator::Files
-                        })
-                    )
+                    || !matches!(self.panes.get(navigator), Some(Pane::Navigator { .. }))
                 {
                     return Err(LayoutError::Invalid("container navigator ownership"));
                 }
-                file_navigators.insert(*navigator);
+                match self.panes.get(navigator) {
+                    Some(Pane::Navigator {
+                        kind: Navigator::Files,
+                    }) if container.files_scope.is_none() => {
+                        return Err(LayoutError::Invalid("Files navigator binding"));
+                    }
+                    Some(Pane::Navigator {
+                        kind: Navigator::Git,
+                    }) if !container.git_contexts.contains_key(navigator) => {
+                        return Err(LayoutError::Invalid("Git navigator binding"));
+                    }
+                    _ => {}
+                }
+                navigators.insert(*navigator);
             }
             for group in &container.groups {
                 if !owned.insert(*group)
@@ -558,9 +684,17 @@ impl Workspace {
                 Pane::Navigator {
                     kind: Navigator::Files
                 }
-            ) && !file_navigators.contains(id)
+            ) && !navigators.contains(id)
+                || (!allow_unbound_git
+                    && matches!(
+                        pane,
+                        Pane::Navigator {
+                            kind: Navigator::Git
+                        }
+                    )
+                    && !navigators.contains(id))
         }) {
-            return Err(LayoutError::Invalid("unowned Files navigator"));
+            return Err(LayoutError::Invalid("unowned scoped navigator"));
         }
         Ok(())
     }
@@ -593,36 +727,89 @@ impl Workspace {
             .filter(|id| matches!(self.panes.get(id), Some(Pane::Group { .. })))
             .collect()
     }
-    pub fn files_container_for(&self, pane: Id) -> Option<Id> {
+    pub fn container_for(&self, pane: Id) -> Option<Id> {
         self.containers.iter().find_map(|(&id, container)| {
             (container.navigators.contains(&pane) || container.groups.contains(&pane)).then_some(id)
         })
     }
-    pub fn files_container(&self, id: Id) -> Option<&FilesContainer> {
+    pub fn container(&self, id: Id) -> Option<&Container> {
         self.containers.get(&id)
     }
-    pub fn files_scope_for(&self, pane: Id) -> Option<&ScopeId> {
-        self.files_container(self.files_container_for(pane)?)
-            .map(|container| &container.scope_id)
-    }
-    fn references_scope(&self, scope_id: &ScopeId) -> bool {
-        self.containers
-            .values()
-            .any(|container| &container.scope_id == scope_id)
-            || self.tabs.values().any(|tab| {
-                matches!(&tab.target, Target::File { scope_id: current, .. } if current == scope_id)
-            })
-    }
-    pub fn files_group_for(&self, pane: Id) -> Option<Id> {
-        let container = self.files_container(self.files_container_for(pane)?)?;
+    pub fn container_group_for(&self, pane: Id) -> Option<Id> {
+        let container = self.container(self.container_for(pane)?)?;
         if container.groups.contains(&pane) {
             Some(pane)
         } else {
             container.groups.first().copied()
         }
     }
+    pub fn files_container_for(&self, pane: Id) -> Option<Id> {
+        if !matches!(
+            self.panes.get(&pane),
+            Some(Pane::Navigator {
+                kind: Navigator::Files
+            }) | Some(Pane::Group { .. })
+        ) {
+            return None;
+        }
+        let id = self.container_for(pane)?;
+        self.containers[&id].files_scope.as_ref().map(|_| id)
+    }
+    pub fn files_container(&self, id: Id) -> Option<&Container> {
+        self.container(id)
+            .filter(|container| container.files_scope.is_some())
+    }
+    pub fn files_scope_for(&self, pane: Id) -> Option<&ScopeId> {
+        self.files_container(self.files_container_for(pane)?)?
+            .files_scope
+            .as_ref()
+    }
+    pub fn git_context_for(&self, navigator: Id) -> Option<&GitContextId> {
+        if !matches!(
+            self.panes.get(&navigator),
+            Some(Pane::Navigator {
+                kind: Navigator::Git
+            })
+        ) {
+            return None;
+        }
+        self.container(self.container_for(navigator)?)?
+            .git_contexts
+            .get(&navigator)
+    }
+    fn references_scope(&self, scope_id: &ScopeId) -> bool {
+        self.containers.values().any(|container| container.files_scope.as_ref() == Some(scope_id))
+            || self.tabs.values().any(|tab| {
+                matches!(&tab.target, Target::File { scope_id: current, .. } if current == scope_id)
+            })
+    }
+    fn references_git(&self, context_id: &GitContextId) -> bool {
+        self.containers.values().any(|container| {
+            container
+                .git_contexts
+                .values()
+                .any(|current| current == context_id)
+        })
+    }
+    pub fn files_group_for(&self, pane: Id) -> Option<Id> {
+        self.files_container_for(pane)?;
+        self.container_group_for(pane)
+    }
     fn nearest_group(&self, pane: Id) -> Option<Id> {
         self.nearest_group_for_scope(pane, None)
+    }
+    fn nearest_owned_group(&self, pane: Id) -> Option<Id> {
+        let ordered = self.ordered_panes();
+        let position = ordered.iter().position(|id| *id == pane)?;
+        ordered
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| {
+                matches!(self.panes.get(id), Some(Pane::Group { .. }))
+                    && self.container_for(**id).is_some()
+            })
+            .min_by_key(|(index, _)| index.abs_diff(position))
+            .map(|(_, id)| *id)
     }
     fn nearest_group_for_scope(&self, pane: Id, scope: Option<&ScopeId>) -> Option<Id> {
         let ordered = self.ordered_panes();
@@ -636,27 +823,25 @@ impl Workspace {
                 if scope.is_some_and(|scope| owner.is_some_and(|owner| owner != scope)) {
                     return None;
                 }
-                // A generic launch navigator joins an existing matching Files
-                // container before claiming an unowned group. Another scope's
-                // nearer group must not obstruct or retarget it.
-                let unowned = scope.is_some() && owner.is_none();
-                Some(((unowned, index.abs_diff(position)), *id))
+                Some((
+                    (scope.is_some() && owner.is_none(), index.abs_diff(position)),
+                    *id,
+                ))
             })
             .min_by_key(|(key, _)| *key)
             .map(|(_, id)| id)
     }
-
-    fn detach_files_navigator(&mut self, navigator: Id) {
-        if let Some(id) = self.files_container_for(navigator) {
+    fn detach_navigator(&mut self, navigator: Id) {
+        if let Some(id) = self.container_for(navigator) {
             if let Some(container) = self.containers.get_mut(&id) {
                 container.navigators.retain(|pane| *pane != navigator);
+                container.git_contexts.remove(&navigator);
                 if container.navigators.is_empty() {
                     self.containers.remove(&id);
                 }
             }
         }
     }
-
     fn bind_files(&mut self, navigator: Id, group: Id, scope_id: ScopeId) -> Result<()> {
         if !scope_id.is_valid() {
             return Err(LayoutError::Invalid("file scope ID"));
@@ -666,36 +851,57 @@ impl Workspace {
         {
             return Err(LayoutError::Missing);
         }
-        let group_owner = self.files_container_for(group);
-        if group_owner.is_some_and(|id| self.containers[&id].scope_id != scope_id) {
+        let group_owner = self.container_for(group);
+        if group_owner.is_some_and(|id| {
+            self.containers[&id]
+                .files_scope
+                .as_ref()
+                .is_some_and(|current| current != &scope_id)
+        }) {
             return Err(LayoutError::Invalid(
                 "document group belongs to another scope",
             ));
         }
-        let navigator_owner = self.files_container_for(navigator);
-        let owner = group_owner
-            .or_else(|| navigator_owner.filter(|id| self.containers[id].scope_id == scope_id));
+        let navigator_owner = self.container_for(navigator);
+        let prior_git = navigator_owner
+            .and_then(|id| self.containers[&id].git_contexts.get(&navigator).cloned());
+        let owner = group_owner.or_else(|| {
+            navigator_owner.filter(|id| {
+                self.containers[id]
+                    .files_scope
+                    .as_ref()
+                    .is_none_or(|current| current == &scope_id)
+            })
+        });
         if navigator_owner != owner {
-            self.detach_files_navigator(navigator);
+            self.detach_navigator(navigator);
         }
-        if let Some(id) = owner {
-            let container = self.containers.get_mut(&id).ok_or(LayoutError::Missing)?;
-            if !container.navigators.contains(&navigator) {
-                container.navigators.push(navigator);
+        let id = match owner {
+            Some(id) => id,
+            None => {
+                let id = self.container_id()?;
+                self.containers.insert(
+                    id,
+                    Container {
+                        files_scope: None,
+                        git_contexts: BTreeMap::new(),
+                        navigators: vec![],
+                        groups: vec![],
+                    },
+                );
+                id
             }
-            if !container.groups.contains(&group) {
-                container.groups.push(group);
-            }
-        } else {
-            let id = self.container_id()?;
-            self.containers.insert(
-                id,
-                FilesContainer {
-                    scope_id,
-                    navigators: vec![navigator],
-                    groups: vec![group],
-                },
-            );
+        };
+        let container = self.containers.get_mut(&id).ok_or(LayoutError::Missing)?;
+        container.files_scope = Some(scope_id);
+        if !container.navigators.contains(&navigator) {
+            container.navigators.push(navigator);
+        }
+        if !container.groups.contains(&group) {
+            container.groups.push(group);
+        }
+        if let Some(context) = prior_git {
+            container.git_contexts.insert(navigator, context);
         }
         self.panes.insert(
             navigator,
@@ -704,6 +910,79 @@ impl Workspace {
             },
         );
         Ok(())
+    }
+    fn bind_git(&mut self, navigator: Id, group: Id, context_id: GitContextId) -> Result<()> {
+        if !context_id.is_valid() {
+            return Err(LayoutError::Invalid("Git context ID"));
+        }
+        if !matches!(self.panes.get(&navigator), Some(Pane::Navigator { .. }))
+            || !matches!(self.panes.get(&group), Some(Pane::Group { .. }))
+        {
+            return Err(LayoutError::Missing);
+        }
+        let navigator_owner = self.container_for(navigator);
+        let owner = self.container_for(group).or(navigator_owner);
+        if navigator_owner != owner {
+            self.detach_navigator(navigator);
+        }
+        let id = match owner {
+            Some(id) => id,
+            None => {
+                let id = self.container_id()?;
+                self.containers.insert(
+                    id,
+                    Container {
+                        files_scope: None,
+                        git_contexts: BTreeMap::new(),
+                        navigators: vec![],
+                        groups: vec![],
+                    },
+                );
+                id
+            }
+        };
+        let container = self.containers.get_mut(&id).ok_or(LayoutError::Missing)?;
+        if !container.navigators.contains(&navigator) {
+            container.navigators.push(navigator);
+        }
+        if !container.groups.contains(&group) {
+            container.groups.push(group);
+        }
+        container.git_contexts.insert(navigator, context_id);
+        self.panes.insert(
+            navigator,
+            Pane::Navigator {
+                kind: Navigator::Git,
+            },
+        );
+        Ok(())
+    }
+    fn add_scoped_panes(&mut self, beside: Id, side: Side, kind: Navigator) -> Result<(Id, Id)> {
+        if !self.panes.contains_key(&beside) {
+            return Err(LayoutError::Missing);
+        }
+        let navigator = self.id()?;
+        let group = self.id()?;
+        self.panes.insert(navigator, Pane::Navigator { kind });
+        self.panes.insert(
+            group,
+            Pane::Group {
+                tabs: vec![],
+                active: None,
+            },
+        );
+        split_at(
+            &mut self.root,
+            beside,
+            Node::Split {
+                axis: Axis::Columns,
+                ratio: 2250,
+                first: Box::new(Node::Pane { id: navigator }),
+                second: Box::new(Node::Pane { id: group }),
+            },
+            side,
+        )?;
+        Ok((navigator, group))
     }
     pub fn ordered_panes(&self) -> Vec<Id> {
         let mut out = Vec::new();
@@ -744,16 +1023,32 @@ impl Workspace {
                 if !matches!(self.panes.get(&pane), Some(Pane::Navigator { .. })) {
                     return Err(LayoutError::Missing);
                 }
-                if kind == Navigator::Files {
-                    if self.files_container_for(pane).is_none() {
+                match kind {
+                    Navigator::Files => {
+                        let scope = self
+                            .container_for(pane)
+                            .and_then(|id| self.containers[&id].files_scope.clone())
+                            .unwrap_or_else(ScopeId::launch);
                         let group = self
-                            .nearest_group_for_scope(pane, Some(&ScopeId::launch()))
+                            .container_group_for(pane)
+                            .or_else(|| self.nearest_group_for_scope(pane, Some(&scope)))
                             .ok_or(LayoutError::Missing)?;
-                        self.bind_files(pane, group, ScopeId::launch())?;
+                        self.bind_files(pane, group, scope)?;
                     }
-                } else {
-                    self.detach_files_navigator(pane);
-                    self.panes.insert(pane, Pane::Navigator { kind });
+                    Navigator::Git => {
+                        let context = self
+                            .container_for(pane)
+                            .and_then(|id| self.containers[&id].git_contexts.get(&pane).cloned())
+                            .unwrap_or_else(GitContextId::launch);
+                        let group = self
+                            .container_group_for(pane)
+                            .or_else(|| self.nearest_group(pane))
+                            .ok_or(LayoutError::Missing)?;
+                        self.bind_git(pane, group, context)?;
+                    }
+                    Navigator::Sessions => {
+                        self.panes.insert(pane, Pane::Navigator { kind });
+                    }
                 }
             }
             Action::AddNavigator { beside, side, kind } => {
@@ -769,6 +1064,10 @@ impl Workspace {
                         .ok_or(LayoutError::Missing)?;
                     self.bind_files(id, group, ScopeId::launch())?;
                 }
+                if kind == Navigator::Git {
+                    let group = self.nearest_group(id).ok_or(LayoutError::Missing)?;
+                    self.bind_git(id, group, GitContextId::launch())?;
+                }
                 self.focused = id;
             }
             Action::AddFiles {
@@ -776,37 +1075,50 @@ impl Workspace {
                 side,
                 scope_id,
             } => {
-                if !self.panes.contains_key(&beside) {
-                    return Err(LayoutError::Missing);
-                }
-                let navigator = self.id()?;
-                let group = self.id()?;
-                self.panes.insert(
-                    navigator,
-                    Pane::Navigator {
-                        kind: Navigator::Files,
-                    },
-                );
-                self.panes.insert(
-                    group,
-                    Pane::Group {
-                        tabs: vec![],
-                        active: None,
-                    },
-                );
-                split_at(
-                    &mut self.root,
-                    beside,
-                    Node::Split {
-                        axis: Axis::Columns,
-                        ratio: 2250,
-                        first: Box::new(Node::Pane { id: navigator }),
-                        second: Box::new(Node::Pane { id: group }),
-                    },
-                    side,
-                )?;
+                let (navigator, group) = self.add_scoped_panes(beside, side, Navigator::Files)?;
                 self.bind_files(navigator, group, scope_id)?;
                 self.focused = navigator;
+            }
+            Action::AddGit {
+                beside,
+                side,
+                context_id,
+            } => {
+                let (navigator, group) = self.add_scoped_panes(beside, side, Navigator::Git)?;
+                self.bind_git(navigator, group, context_id)?;
+                self.focused = navigator;
+            }
+            Action::BindGit {
+                navigator,
+                group,
+                context_id,
+            } => {
+                self.bind_git(navigator, group, context_id)?;
+            }
+            Action::SetGitContext {
+                navigator,
+                context_id,
+            } => {
+                if !matches!(
+                    self.panes.get(&navigator),
+                    Some(Pane::Navigator {
+                        kind: Navigator::Git
+                    })
+                ) {
+                    return Err(LayoutError::Missing);
+                }
+                let owner = self.container_for(navigator).ok_or(LayoutError::Missing)?;
+                self.containers
+                    .get_mut(&owner)
+                    .ok_or(LayoutError::Missing)?
+                    .git_contexts
+                    .insert(navigator, context_id);
+            }
+            Action::SetGitLabel { context_id, label } => {
+                if !self.references_git(&context_id) {
+                    return Err(LayoutError::Missing);
+                }
+                self.git_labels.insert(context_id, label);
             }
             Action::BindFiles {
                 navigator,
@@ -833,7 +1145,7 @@ impl Workspace {
                         active: None,
                     },
                 );
-                if let Some(owner) = self.files_container_for(pane) {
+                if let Some(owner) = self.container_for(pane) {
                     self.containers
                         .get_mut(&owner)
                         .ok_or(LayoutError::Missing)?
@@ -953,7 +1265,7 @@ impl Workspace {
                     for tab in tabs {
                         self.tabs.remove(&tab);
                     }
-                    if let Some(owner) = self.files_container_for(id) {
+                    if let Some(owner) = self.container_for(id) {
                         let container = self
                             .containers
                             .get_mut(&owner)
@@ -970,7 +1282,7 @@ impl Workspace {
                         }
                     }
                 } else {
-                    self.detach_files_navigator(id);
+                    self.detach_navigator(id);
                 }
                 self.root =
                     remove_pane(&self.root, id).ok_or(LayoutError::Invalid("empty layout"))?;
@@ -1014,6 +1326,14 @@ impl Workspace {
             .collect::<BTreeSet<_>>();
         self.scope_labels
             .retain(|scope, _| referenced.contains(scope));
+        let referenced = self
+            .git_labels
+            .keys()
+            .filter(|context| self.references_git(context))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.git_labels
+            .retain(|context, _| referenced.contains(context));
         Ok(())
     }
     pub fn geometry(&self, area: Rect, maximize: bool) -> Result<Geometry> {

@@ -220,11 +220,7 @@ pub enum Command {
     GenerateTitle,
     PersistUiWake,
     Acknowledge(String),
-    GitIndex {
-        repo: aw_git::Repository,
-        review: aw_git::Review,
-        action: aw_git::IndexAction,
-    },
+    GitIndex(super::git::IndexRequest),
     Stop,
 }
 pub struct Worker {
@@ -1008,17 +1004,13 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
                 s.status = "Explicit inspection acknowledged; no rollback or expanded grants".into()
             });
         }
-        Command::GitIndex {
-            repo,
-            review,
-            action,
-        } => {
+        Command::GitIndex(request) => {
             if view.snapshot().needs_inspection {
                 return Err(Error::Denied(
                     "inspect/acknowledge earlier uncertain tool effects before index mutation",
                 ));
             }
-            repo.apply_index(&review, action).map_err(|e| {
+            let (review, action) = request.apply().map_err(|e| {
                 Error::Config(format!(
                     "Git index action: {e}. Refresh and inspect; no automatic retry."
                 ))

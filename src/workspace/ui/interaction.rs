@@ -1364,7 +1364,7 @@ impl Ui {
             return;
         }
         self.palette_file_scope = self.current_file_scope();
-        self.palette_file_container = self.layout.files_container_for(self.layout.focused);
+        self.palette_file_container = self.layout.container_for(self.layout.focused);
         self.palette = Some(palette::State::default());
         self.palette_file_query.clear();
         self.palette_file_results.clear();
