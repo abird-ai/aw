@@ -828,6 +828,20 @@ body.resizing-sidebar {
   background: linear-gradient(to bottom, transparent, var(--page) 28%);
   pointer-events: none;
 }
+/* The dock passes empty-space clicks through; notices remain interactive. */
+.composer-dock > .notice {
+  position: relative;
+  top: auto;
+  left: auto;
+  transform: none;
+  width: min(880px, calc(100% - 2px));
+  margin: 0 auto 7px;
+  pointer-events: auto;
+}
+.composer-dock > .notice span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .collab-panel {
   pointer-events: auto;
   width: min(880px, calc(100% - 2px));
