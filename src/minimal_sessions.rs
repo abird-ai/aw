@@ -41,19 +41,7 @@ pub fn default_directory() -> Result<PathBuf> {
         })?)
         .join(".local/state")
     };
-    Ok(aw_user_root(&root))
-}
-
-/// Prefer `abird/aw`; keep a legacy `<base>/aw` tree while it exists and the
-/// new one does not, so existing state is not orphaned.
-fn aw_user_root(base: &Path) -> PathBuf {
-    let fresh = base.join("abird/aw");
-    let legacy = base.join("aw");
-    if !fresh.is_dir() && legacy.is_dir() {
-        legacy
-    } else {
-        fresh
-    }
+    Ok(root.join("abird/aw"))
 }
 
 impl Sessions {

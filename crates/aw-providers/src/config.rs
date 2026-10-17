@@ -651,29 +651,14 @@ pub fn builtins() -> BTreeMap<String, Profile> {
     ])
 }
 
-/// Prefer the `abird/aw` namespace, but keep a legacy `<base>/aw` tree while it
-/// exists and the new one does not, so an existing install's config/auth/state
-/// is not orphaned. Every caller resolves through this, never by spelling the
-/// path itself.
-pub(crate) fn aw_user_root(base: &Path) -> PathBuf {
-    let fresh = base.join("abird/aw");
-    let legacy = base.join("aw");
-    if !fresh.is_dir() && legacy.is_dir() {
-        legacy
-    } else {
-        fresh
-    }
-}
-
 pub fn default_config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         let path = PathBuf::from(path);
         if path.is_absolute() {
-            return Some(aw_user_root(&path).join("config.toml"));
+            return Some(path.join("abird/aw/config.toml"));
         }
     }
-    std::env::var_os("HOME")
-        .map(|p| aw_user_root(&PathBuf::from(p).join(".config")).join("config.toml"))
+    std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config/abird/aw/config.toml"))
 }
 
 /// Never auto-load a repository-local config. It could select a new endpoint.
@@ -2194,18 +2179,5 @@ mod aw_p6_8c_optional_notices_tests {
         clear.ui.show_event_notices = false;
         assert!(save_changes(Some(&path), &final_cfg, &clear).is_ok());
         assert!(!load(Some(&path)).unwrap().ui.show_event_notices);
-    }
-
-    #[test]
-    fn aw_user_root_prefers_abird_and_keeps_a_legacy_tree() {
-        let base = std::env::temp_dir().join(format!("aw-user-root-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        assert_eq!(aw_user_root(&base), base.join("abird/aw"));
-        std::fs::create_dir_all(base.join("aw")).unwrap();
-        assert_eq!(aw_user_root(&base), base.join("aw"));
-        std::fs::create_dir_all(base.join("abird/aw")).unwrap();
-        assert_eq!(aw_user_root(&base), base.join("abird/aw"));
-        std::fs::remove_dir_all(&base).unwrap();
     }
 }
