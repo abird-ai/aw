@@ -239,6 +239,14 @@ provider_accounts {
 
 Raw shared credentials live in `SecretStore`: OS keyring, encrypted local secret file with separately protected key, KMS/HSM/envelope-encrypted service or hosted secret manager depending on deployment.
 
+Local encrypted-vault first-use initialization holds the stable exclusive
+mutation fence through master-key read/create and file/directory fsync. Its
+owned guard explicitly unlocks when that scope finishes, including error and
+unwind exits, so an inherited or duplicated descriptor cannot extend the
+completed initialization. This does not release another owner's maintenance
+lock. Cached vault handles still acquire the shared mutation fence for every
+write/delete; actual exclusive maintenance continues to reject those mutations.
+
 Database backup without the SecretStore produces **credential unavailable**, never fallback to another key. Rotation advances an opaque secret version; historical invocation provenance retains the nonsecret provider-account/version identity.
 
 ### Personal credentials

@@ -22,7 +22,9 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 ## Uncommitted
 
 - [~] Reconcile this checklist and Build status with the current single product gate — coordinator.
-- [ ] Run the current product gate on a committed candidate in the pinned development shell; do not reconstruct removed Full/phase/smoke profiles.
+- [~] Run the current product gate on a committed candidate in the pinned development shell; do not reconstruct removed Full/phase/smoke profiles.
+- [~] Fix the confirmed vault-initialization lock lifetime with duplicated descriptors; retain actual maintenance denial. The `1c2ec6e` SDK test hit the same Conflict, but its exact fork timing was not captured — native gate-fix agent.
+- [~] Remove the new Workspace-only unused-binding warning without changing control flow — backend agent.
 - [ ] Build the exact candidate's native package and confirm its version; cross-built assets require separate native execution.
 - [ ] Complete release-asset execution on remaining target hosts, locally or with hosted jobs when available; Linux emulation cannot certify missing macOS/Windows/ARM hosts.
 - [ ] Review breaking CLI/version surfaces, agree any version change and obtain release authorization before distribution; 0.16.0 remains a proposal.
@@ -34,7 +36,7 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 
 - [ ] `bash scripts/bootstrap.sh` — once per fresh checkout, pinned Nix development shell.
 - [ ] `cargo fmt --all -- --check` — candidate commit.
-- [ ] `cargo test --workspace --locked` — candidate commit, with shell/repository test tools supplied by the development shell.
+- [ ] `cargo test --workspace --locked` — `1c2ec6e` failed the SDK secret-service test (170 library tests passed, 1 failed); fix and rerun with development-shell tools.
 - [ ] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — candidate commit.
 - [ ] `nix build .#aw --no-link --print-out-paths --no-update-lock-file` and built `aw --version` — exact candidate.
 - [ ] Release-asset native execution — exact assets and remaining hosts; unfinished external gate.

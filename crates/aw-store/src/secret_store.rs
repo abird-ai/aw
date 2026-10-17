@@ -28,6 +28,40 @@ pub(crate) fn open_vault_mutation_file(state_dir: &Path) -> Result<File> {
     aw_platform::open_private_rw_create(&secret_root.join(MUTATION_FENCE_FILE)).map_err(Error::Io)
 }
 
+// First-use key initialization owns this exclusive lock only until its
+// complete master-key read/create and durability work has finished.
+struct VaultInitialization {
+    file: Option<File>,
+}
+impl VaultInitialization {
+    fn acquire(state_dir: &Path) -> Result<Self> {
+        let file = open_vault_mutation_file(state_dir)?;
+        FileExt::try_lock_exclusive(&file).map_err(|_| {
+            Error::Conflict("SecretStore key initialization fenced by owner maintenance")
+        })?;
+        Ok(Self { file: Some(file) })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if let Some(file) = &self.file {
+            // flock belongs to the open-file description: merely closing our
+            // fd leaves an inherited/duplicated fd holding initialization EX.
+            FileExt::unlock(file).map_err(Error::Io)?;
+        }
+        self.file.take();
+        Ok(())
+    }
+}
+impl Drop for VaultInitialization {
+    fn drop(&mut self) {
+        // Initialization alone owns this guard. Release on error/unwind too;
+        // never touch a separate owner's maintenance or mutation lock.
+        if let Some(file) = &self.file {
+            let _ = FileExt::unlock(file);
+        }
+    }
+}
+
 fn try_vault_writer(state_dir: &Path) -> Result<File> {
     let file = open_vault_mutation_file(state_dir)?;
     FileExt::try_lock_shared(&file).map_err(|_| {
@@ -118,11 +152,8 @@ impl LocalSecretStore {
                 // unrelated master can appear inside a backup/restore cut.
                 // Exclusive rather than shared also serializes simultaneous
                 // empty-vault initializations from direct handles.
-                let file = open_vault_mutation_file(state_dir)?;
-                FileExt::try_lock_exclusive(&file).map_err(|_| {
-                    Error::Conflict("SecretStore key initialization fenced by owner maintenance")
-                })?;
-                match read_private_file(&master_path, MASTER_KEY_LEN) {
+                let initialization = VaultInitialization::acquire(state_dir)?;
+                let master = match read_private_file(&master_path, MASTER_KEY_LEN) {
                     Ok(bytes) => bytes
                         .try_into()
                         .map_err(|_| Error::Storage("SecretStore master key has invalid length"))?,
@@ -135,7 +166,9 @@ impl LocalSecretStore {
                         create_master_key(&master_path)?
                     }
                     Err(error) => return Err(error),
-                }
+                };
+                initialization.finish()?;
+                master
             }
             Err(error) => return Err(error),
         });
@@ -452,6 +485,74 @@ mod tests {
         std::fs::remove_file(root.join("secrets/master.key")).unwrap();
         assert!(LocalSecretStore::open(&root).is_err());
         assert!(!root.join("secrets/master.key").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_initialization_finishes_before_an_inherited_descriptor_closes() {
+        let root = std::env::temp_dir().join(format!(
+            "aw-vault-init-{:016x}",
+            u64::from_ne_bytes(random_bytes().unwrap())
+        ));
+        aw_platform::ensure_private_dir(&root.join("secrets/items")).unwrap();
+        let initialization = VaultInitialization::acquire(&root).unwrap();
+        // try_clone shares the exact open-file description that fork inherits.
+        // Retaining it makes the inherited-lock failure deterministic without
+        // a child process, sleep, retry or test-thread serialization.
+        let inherited = initialization.file.as_ref().unwrap().try_clone().unwrap();
+        let master_path = root.join("secrets/master.key");
+        let expected = create_master_key(&master_path).unwrap();
+        assert_eq!(
+            read_private_file(&master_path, MASTER_KEY_LEN).unwrap(),
+            expected
+        );
+        let vault = LocalSecretStore::open(&root).unwrap();
+        let reference = provider_secret_ref("fixture", "initialization", 1).unwrap();
+        assert!(
+            matches!(vault.put(&reference, b"fixture-secret"), Err(Error::Conflict(message)) if message == "SecretStore mutation fenced by original owner maintenance")
+        );
+        initialization.finish().unwrap();
+        vault.put(&reference, b"fixture-secret").unwrap();
+        assert_eq!(vault.get(&reference).unwrap().as_slice(), b"fixture-secret");
+        // Releasing our completed initialization must not release a genuinely
+        // different maintenance owner's exclusive fence on the same inode.
+        let store = SessionStore::open(&root).unwrap();
+        let maintenance = store
+            .acquire_local_maintenance_lease("backup", std::time::Duration::from_secs(60))
+            .unwrap();
+        assert!(
+            matches!(vault.put(&reference, b"fixture-secret"), Err(Error::Conflict(message)) if message == "SecretStore mutation fenced by original owner maintenance")
+        );
+        store.release_local_maintenance_lease(&maintenance).unwrap();
+        vault.put(&reference, b"fixture-secret").unwrap();
+        drop(inherited);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_initialization_unwind_releases_its_own_inherited_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "aw-vault-init-unwind-{:016x}",
+            u64::from_ne_bytes(random_bytes().unwrap())
+        ));
+        aw_platform::ensure_private_dir(&root.join("secrets/items")).unwrap();
+        let initialization = VaultInitialization::acquire(&root).unwrap();
+        let inherited = initialization.file.as_ref().unwrap().try_clone().unwrap();
+        create_master_key(&root.join("secrets/master.key")).unwrap();
+        let vault = LocalSecretStore::open(&root).unwrap();
+        let reference = provider_secret_ref("fixture", "unwind", 1).unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _initialization = initialization;
+                panic!("fixture leaves the completed initialization scope");
+            }))
+            .is_err()
+        );
+        vault.put(&reference, b"fixture-secret").unwrap();
+        drop(inherited);
         std::fs::remove_dir_all(root).unwrap();
     }
 
