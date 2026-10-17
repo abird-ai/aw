@@ -133,6 +133,31 @@ Action operations: `capabilities`; `files`/`file` with root-relative path; `git_
 
 Unknown command/extra fields are 400; missing grant 403; stale handles/lease/sequence 409; bounded-capacity overflow 413; busy worker pool 429; unavailable service 503. Authentication failure remains 401. A response/queued-input receipt is not evidence of completed OS side effects. Model prompt deduplication remains the existing durable store protocol; surface launch/input receipts last only while this owner lives.
 
+Scoped browser reads use an additive strict wrapper:
+
+```json
+{"op":"view","source_id":"OWNER_SOURCE","scope_id":"OPAQUE_SCOPE","request":{"op":"file","path":"src/main.rs"}}
+```
+
+`GET /api/workspace` retains its `{enabled, instance, capabilities}` shape;
+`capabilities.source_id` and `capabilities.view_root` identify the exact
+SurfaceHost lifetime and granted launch scope. A scoped reply is exactly
+`{source_id, scope_id, result}`. The nested read-only request supports `files`,
+`file_search`, `file`, `git_list` (mode), `git_open` (inventory_id and item_id)
+and `review` (review_id); it cannot wrap terminal, feedback or mutation commands.
+Git inventory and Review identity remain bound to the originating scope.
+Selecting a verified existing worktree yields a new Git-only scope, leaving
+Files and the Agent unchanged. The legacy `root` alias is not a scoped grant.
+
+Scoped failures preserve status and `error`, with stable `code` plus bounded
+request `source_id`/`scope_id` when valid. `source_changed` clears that source's
+browser views; `scope_denied` clears the confirmed invalid scope; `read_denied`
+clears only the failed resource. `refresh_required` identifies expired/stale
+inventory or Review handles. Browser code never installs a grant from error
+metadata. Exact root/repository binding is rechecked on every read, including
+refresh; retained File/Diff snapshots do not inherit the separate Agent-reader
+membership expiry rule.
+
 Four admitted blocking workers share one resource operation queue. Authority is rechecked after queue acquisition and data rechecked before disclosure. Logout/expiry shuts the surface host and requests terminal termination; a previously admitted operation can still have completed effects. No raw PTY WebSocket or viewer-supplied filesystem service is added.
 
 When enabled, CSP adds exact configured `frame-src` origins and permits dynamically computed style attributes; `script-src` and `connect-src` stay same-origin, and top-level framing stays denied. Embedded page sandbox/Permissions Policy/no-referrer rules are in [BROWSER-WORKSPACE](BROWSER-WORKSPACE.md). No arbitrary CORS override, query-token URL, forwarded provider key or browser localStorage credential store is introduced.

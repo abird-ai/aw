@@ -28,8 +28,42 @@ even when the head is unchanged; denial, logout, source replacement and expiry
 clear protected content and derived state. Closed tabs reject delayed replies.
 Ordinary refresh runs every five seconds, with freshness bounded to fifteen
 seconds from request start. Browser paths and cached descriptors grant no local
-folder or execution authority. Scoped browser Files/Git containers and docking
-remain in the [workspace plan](../plans/workspace-views/TODO.md).
+folder or execution authority. Files/Git containers are described below; docking
+remains in the [workspace plan](../plans/workspace-views/TODO.md).
+
+## Independent Files/Git views
+
+Files and Git keep the same Explorer categories. Their view selector and
+**New Files view** / **New Git view** controls open independent navigators;
+**Close view and its documents** closes only that container's browser state.
+There are at most eight Files/Git containers and 32 total document tabs,
+including the permanent Agent and its read-only tabs. Limits fail visibly and
+preserve already-open views. These views are memory-only; shared layout and
+docking remain later work.
+
+Files stays under the explicitly granted startup directory. Git navigators may
+independently select existing verified worktrees through opaque inventory
+handles. Selecting a Git worktree changes that navigator only; it gives no
+Files-root grant and does not retarget another view or the Agent. Browser paths
+and display labels cannot open another server folder.
+
+Each navigator retains its own tree/list, query, expansion and Git mode/context.
+Each File/Diff document retains its own Find, viewport and selection when
+switching tabs. The exact read is an explicit snapshot; **Refresh document**
+revalidates that same binding. An unchanged refresh retains the editor state.
+A delayed open fills only its original pending tab and cannot steal later focus.
+Diffs stay with their original immutable Review after another worktree is
+selected. Read-only documents never gain a composer.
+
+The owner retains the original Files capability and directory identity rather
+than reopening its pathname. Every scoped read carries exact source and scope
+IDs, with independent inventory IDs for Git opens. Closed views reject delayed
+replies; logout and source replacement clear all protected view state. Confirmed
+scope denial clears its documents, navigator data and derived editor state;
+one unreadable file affects only that resource. Four physically outstanding
+Files/Git reads, a 4 MiB reply limit and an 8 MiB Files/Git snapshot cache bound
+work and retention. Hidden views retain editor state; closed or denied editors explicitly
+scrub it before destruction.
 
 ## Current Phase 62/63 Solid Agent parity and rich rendering
 
@@ -37,7 +71,7 @@ The active root remains the compiled SolidJS application. Phase 62 carries the s
 
 Phase 63 keeps Markdown rendering safe while adding tables, nested/task lists and strikethrough. Markdown image syntax is deliberately rendered as an **inert media reference** with an explicit user-clickable safe link rather than an `<img>` element, so rendering never auto-fetches remote media. Raw HTML remains disabled and unsafe destinations remain literal/non-clickable.
 
-The post-Phase59 CodeMirror generation/document/theme fencing and top-left file-switch reset remain authoritative underneath these additions.
+The post-Phase59 CodeMirror generation/document/theme fencing remains authoritative. A newly opened file starts at the top left; switching existing scoped views preserves their independent editor state.
 
 ## Current post-Phase37 design-adaptation contract
 

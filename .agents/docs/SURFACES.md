@@ -1,12 +1,12 @@
 # Workspace surface SDK — Phase 6
 
-**Public Rust source API, pre-1.0 and not compile-validated here.** `aw-surfaces` is a separate library composing the existing read-only file, Git-review and PTY services. It contains no HTTP server, browser renderer, credential transport, model routing or SQLite store. It transitively uses shared tool/core types; it is not claimed to have zero Tokio transitive dependencies. The headless agent and pure layout crates do not depend on it.
+**Public Rust source API, pre-1.0.** `aw-surfaces` is a separate library composing the existing read-only file, Git-review and PTY services. It contains no HTTP server, browser renderer, credential transport, model routing or SQLite store. It transitively uses shared tool/core types; it is not claimed to have zero Tokio transitive dependencies. The headless agent and pure layout crates do not depend on it.
 
 ## Embed in another Rust host
 
 ```toml
 [dependencies]
-aw-surfaces = { path = "../aw/crates/aw-surfaces", version = "=0.7.0" }
+aw-surfaces = { path = "../aw/crates/aw-surfaces", version = "=0.15.0" }
 ```
 
 ```rust,no_run
@@ -38,6 +38,30 @@ Replace all example paths and authenticate the caller in the embedding host. Con
 
 `Site::new` validates a conservative registered HTTPS descriptor. It is not a generic browser or network gateway. `input_bytes` encodes a complete typed text/key/paste message using the native terminal contract; it does not execute it. The browser HTTP layer is in `src/web/workspace.rs`, not this library.
 
+## Exact browser read scopes
+
+Capabilities add a random owner-lifetime `source_id` and an opaque `view_root`
+for the granted launch directory. The existing `root` descriptor and legacy
+commands remain compatible. Files operations reuse one retained root and check
+its physical identity before and after reads; replacing its pathname grants no
+access to the replacement directory.
+
+`Command::View { source_id, scope_id, request }` accepts only `ViewRequest`
+Files/list/search, Git inventory/open and immutable Review reads. The result is
+`{source_id, scope_id, result}`. A Git inventory returns its own `inventory_id`;
+open requires that exact inventory and item under the originating scope.
+Verified worktree selection returns another immutable Git-only scope. It never
+grants Files access, rewrites an old scope by pathname or starts a terminal.
+Retained Repository bindings and listed worktree directory identities reject
+replacement before disclosure. Inventories and reviews expire under the existing
+bounded caches; expired handles require an explicit navigator refresh.
+
+The HTTP adapter distinguishes a changed source, invalid scope and an individual
+read denial through typed error codes. Browser views clear all state for a
+changed source, the affected scope for a confirmed binding denial, and only the
+failed resource for a read denial. Cached File/Diff bytes are explicit snapshots;
+refresh revalidates the original binding.
+
 ## Resource lifetime
 
 The host retains known checkout contexts, cached reviews, native Terminal resources, transient control leases and launch receipts. A tab/view is not one of those resources. Moving/hiding/reopening views does not launch/terminate a process. `shutdown` revokes the surface host and requests termination of all retained terminals. Dropping it has the same cleanup intent; escaped processes are outside a promise of perfect containment.
@@ -60,8 +84,7 @@ The HTTP adapter adds same-origin/cookie checks, body limits, four bounded worke
 cargo run --locked -p aw-surfaces-example
 cargo run --locked -p aw-surfaces-example -- /absolute/checkout
 cargo test --locked -p aw-surfaces
-cargo test --locked -p aw-cli --no-default-features --features web
-python3 the removed check_sdk_boundary helper
+cargo test --locked -p aw-cli --no-default-features --features web --lib
 ```
 
-Rust tests and those commands are authored, not executed here. The `Source` status in [BUILD-STATUS](BUILD-STATUS.md) must not be mistaken for a published stable crate/ABI or a security audit. [Browser behavior](BROWSER-WORKSPACE.md) · [Same Agent SDK](SDK.md) · [HTTP boundary](WEB-PROTOCOL.md).
+Executed checks and remaining platform/runtime gates are recorded in the [workspace checklist](../plans/workspace-views/TODO.md). A source package and local test pass do not imply a published stable crate/ABI or a security audit. [Browser behavior](BROWSER-WORKSPACE.md) · [Same Agent SDK](SDK.md) · [HTTP boundary](WEB-PROTOCOL.md).

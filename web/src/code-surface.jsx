@@ -1,6 +1,6 @@
-import { createEffect, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { Compartment, EditorState, StateEffect, StateField } from "@codemirror/state";
-import { Decoration, EditorView, lineNumbers } from "@codemirror/view";
+import { Decoration, EditorView, drawSelection, lineNumbers } from "@codemirror/view";
 import { MergeView } from "@codemirror/merge";
 import { createHighlighterCore } from "@shikijs/core";
 import { createJavaScriptRegexEngine } from "@shikijs/engine-javascript";
@@ -37,6 +37,17 @@ const shikiField = StateField.define({
     for (const effect of transaction.effects) {
       if (effect.is(setShiki)) value = effect.value;
     }
+    return value;
+  },
+  provide: field => EditorView.decorations.from(field),
+});
+
+const setFind = StateEffect.define();
+const findField = StateField.define({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    value = value.map(transaction.changes);
+    for (const effect of transaction.effects) if (effect.is(setFind)) value = effect.value;
     return value;
   },
   provide: field => EditorView.decorations.from(field),
@@ -151,30 +162,35 @@ function syntaxClass(token) {
   return name;
 }
 
-async function applyShiki(view, path) {
-  const generation = (highlightGeneration.get(view) || 0) + 1;
+function applyShiki(view, path) {
+  const previous = highlightGeneration.get(view);
+  if (previous) previous.path = "";
+  const generation = { path: path || "" };
   highlightGeneration.set(view, generation);
-  const code = view.state.doc.toString();
+  return highlightView(view, generation);
+}
+
+async function highlightView(view, generation) {
   const theme = effectiveTheme();
 
   // Plain text is the fail-safe presentation while async syntax work is pending.
   // Never leave decorations from another file/theme attached to the current doc.
   if (!view.destroyed) view.dispatch({ effects: setShiki.of(Decoration.none) });
-  if (!code || code.length > 2 * 1024 * 1024) return;
+  if (!view.state.doc.length || view.state.doc.length > 2 * 1024 * 1024) return;
 
   try {
     const instance = await highlighter;
     if (
       view.destroyed ||
-      highlightGeneration.get(view) !== generation ||
-      view.state.doc.toString() !== code
+      highlightGeneration.get(view) !== generation
     ) return;
     if (effectiveTheme() !== theme) {
-      void applyShiki(view, path);
+      void applyShiki(view, generation.path);
       return;
     }
+    const code = view.state.doc.toString();
     const result = instance.codeToTokens(code, {
-      lang: languageFor(path),
+      lang: languageFor(generation.path),
       theme: theme === "dark" ? "github-dark-default" : "github-light-default",
     });
     const ranges = [];
@@ -203,6 +219,16 @@ async function applyShiki(view, path) {
   }
 }
 
+function scrubEditor(view) {
+  if (!view || view.destroyed) return;
+  const generation = highlightGeneration.get(view);
+  if (generation) generation.path = "";
+  highlightGeneration.delete(view);
+  // A pending highlighter may still hold this view after destroy. Replace its
+  // immutable state first so retired editors retain no source or selection.
+  view.setState(EditorState.create());
+}
+
 function labelAttributes(label) {
   return EditorView.contentAttributes.of({
     "aria-label": label,
@@ -219,7 +245,144 @@ function extensions(label, labelCompartment) {
     labelCompartment ? labelCompartment.of(labelAttributes(label)) : labelAttributes(label),
     editorTheme,
     shikiField,
+    findField,
+    drawSelection(),
   ];
+}
+
+function clearOwnedSelection(host) {
+  const selection = window.getSelection();
+  if (selection && (host?.contains(selection.anchorNode) || host?.contains(selection.focusNode))) {
+    selection.removeAllRanges();
+  }
+}
+
+function createCodeFind(views) {
+  const [query, setQuery] = createSignal("");
+  const [matches, setMatches] = createSignal([]);
+  const [selected, setSelected] = createSignal(-1);
+  const [limited, setLimited] = createSignal(false);
+  let input;
+
+  function paint(reveal = false) {
+    const all = matches();
+    for (const view of views()) {
+      if (view.destroyed) continue;
+      const ranges = all.flatMap((match, index) => match.view === view
+        ? [Decoration.mark({ class: index === selected() ? "code-find-current" : "code-find-match" }).range(match.from, match.to)] : []);
+      view.dispatch({ effects: setFind.of(Decoration.set(ranges, true)) });
+    }
+    const match = all[selected()];
+    if (reveal && match && !match.view.destroyed) match.view.dispatch({
+      selection: { anchor: match.from, head: match.to },
+      effects: EditorView.scrollIntoView(match.from, { y: "center" }),
+    });
+  }
+
+  function rebuild(reveal = false) {
+    const found = [];
+    const value = query();
+    let capped = false;
+    if (value) {
+      const expression = new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "giu");
+      search: for (const view of views()) {
+        if (view.destroyed) continue;
+        const text = view.state.doc.toString();
+        expression.lastIndex = 0;
+        for (let match; (match = expression.exec(text));) {
+          if (found.length === 4096) { capped = true; break search; }
+          found.push({ view, from: match.index, to: match.index + match[0].length });
+        }
+      }
+    }
+    setMatches(found);
+    setLimited(capped);
+    setSelected(found.length ? Math.min(Math.max(0, selected()), found.length - 1) : -1);
+    paint(reveal);
+  }
+
+  function change(value) {
+    setQuery(value.slice(0, 512));
+    setSelected(0);
+    rebuild(true);
+  }
+  function step(direction) {
+    const length = matches().length;
+    if (!length) return;
+    setSelected((selected() + direction + length) % length);
+    paint(true);
+  }
+  function clear() {
+    setQuery("");
+    setMatches([]);
+    setSelected(-1);
+    setLimited(false);
+    paint();
+  }
+  function focus() { input?.focus(); input?.select(); }
+  function Toolbar() {
+    return <div class="code-find" role="search" aria-label="Find in this document">
+      <input ref={input} aria-label="Find in this document" placeholder="Find in this document" maxlength="512" value={query()}
+        onInput={event => change(event.currentTarget.value)} onKeyDown={event => {
+          if (event.isComposing) return;
+          if (event.key === "Enter") { event.preventDefault(); step(event.shiftKey ? -1 : 1); }
+          else if (event.key === "Escape") { event.preventDefault(); clear(); }
+        }} />
+      <span class="code-find-count" role="status">{query() ? (matches().length ? `${selected() + 1} of ${matches().length}${limited() ? "+" : ""}` : "No matches") : ""}</span>
+      <button class="mini-icon" type="button" aria-label="Previous match" disabled={!matches().length} onClick={() => step(-1)}>↑</button>
+      <button class="mini-icon" type="button" aria-label="Next match" disabled={!matches().length} onClick={() => step(1)}>↓</button>
+      <button class="mini-icon" type="button" aria-label="Clear Find" disabled={!query()} onClick={clear}>×</button>
+    </div>;
+  }
+  return { Toolbar, rebuild, clear, focus };
+}
+
+function ownEditorLifecycle(props, host, views, find) {
+  const scroll = new Map();
+  function attach() {
+    const current = new Set(views());
+    for (const [view, saved] of scroll) if (!current.has(view)) {
+      view.scrollDOM.removeEventListener("scroll", saved.listener);
+      scroll.delete(view);
+    }
+    for (const view of current) if (!scroll.has(view)) {
+      const saved = { top: view.scrollDOM.scrollTop, left: view.scrollDOM.scrollLeft };
+      saved.listener = () => {
+        if (props.active !== false) { saved.top = view.scrollDOM.scrollTop; saved.left = view.scrollDOM.scrollLeft; }
+      };
+      scroll.set(view, saved);
+      view.scrollDOM.addEventListener("scroll", saved.listener, { passive: true });
+    }
+  }
+  const keydown = event => {
+    if (event.defaultPrevented || event.isComposing || event.altKey || props.active === false
+      || !((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f")
+      || [...document.querySelectorAll("dialog[open], [role=dialog]")]
+        .some(dialog => !dialog.closest("[hidden]") && dialog.getClientRects().length)) return;
+    event.preventDefault();
+    find.focus();
+  };
+  onMount(() => window.addEventListener("keydown", keydown));
+  createEffect(() => {
+    if (props.active === false) clearOwnedSelection(host());
+    else queueMicrotask(() => {
+      if (props.active === false) return;
+      attach();
+      for (const [view, saved] of scroll) if (!view.destroyed) {
+        view.scrollDOM.scrollTop = saved.top;
+        view.scrollDOM.scrollLeft = saved.left;
+        view.requestMeasure();
+      }
+    });
+  });
+  onCleanup(() => {
+    window.removeEventListener("keydown", keydown);
+    clearOwnedSelection(host());
+    find.clear();
+    for (const [view, saved] of scroll) view.scrollDOM.removeEventListener("scroll", saved.listener);
+    scroll.clear();
+  });
+  return { attach };
 }
 
 export function CodeFile(props) {
@@ -228,6 +391,9 @@ export function CodeFile(props) {
   let mounted = false;
   let currentPath = "";
   const labelCompartment = new Compartment();
+  const views = () => view ? [view] : [];
+  const find = createCodeFind(views);
+  const lifecycle = ownEditorLifecycle(props, () => host, views, find);
 
   const recolor = () => {
     if (view) void applyShiki(view, props.path || "");
@@ -243,7 +409,9 @@ export function CodeFile(props) {
       }),
       parent: host,
     });
+    lifecycle.attach();
     void applyShiki(view, props.path);
+    find.rebuild();
     window.addEventListener(THEME_EVENT, recolor);
   });
 
@@ -265,19 +433,35 @@ export function CodeFile(props) {
       view.scrollDOM.scrollLeft = 0;
     }
     void applyShiki(view, path);
+    if (textChanged || fileChanged) find.rebuild();
   });
 
   onCleanup(() => {
     window.removeEventListener(THEME_EVENT, recolor);
-    view?.destroy();
+    const retired = view;
+    view = null;
+    scrubEditor(retired);
+    retired?.destroy();
   });
-  return <div class="code-editor" ref={host} />;
+  return <div class="code-document">
+    <find.Toolbar />
+    <div class="code-editor" ref={host} onCopy={event => {
+      if (props.active === false || props.onCheckAccess?.() === false) {
+        event.preventDefault();
+        clearOwnedSelection(host);
+      }
+    }} />
+  </div>;
 }
 
 export function CodeDiff(props) {
   let host;
   let merge;
   let mounted = false;
+  let currentReview;
+  const views = () => merge ? [merge.a, merge.b] : [];
+  const find = createCodeFind(views);
+  const lifecycle = ownEditorLifecycle(props, () => host, views, find);
 
   const recolor = () => {
     if (!merge) return;
@@ -288,6 +472,10 @@ export function CodeDiff(props) {
 
   const rerender = () => {
     if (!mounted || !host) return;
+    if (merge && currentReview === props.review) return;
+    currentReview = props.review;
+    clearOwnedSelection(host);
+    if (merge) { scrubEditor(merge.a); scrubEditor(merge.b); }
     merge?.destroy();
     host.replaceChildren();
     const pair = reviewToDocuments(props.review);
@@ -307,8 +495,10 @@ export function CodeDiff(props) {
       gutter: true,
       collapseUnchanged: { margin: 3, minSize: 7 },
     });
+    lifecycle.attach();
     void applyShiki(merge.a, path);
     void applyShiki(merge.b, path);
+    find.rebuild();
   };
 
   onMount(() => {
@@ -322,10 +512,21 @@ export function CodeDiff(props) {
   });
   onCleanup(() => {
     window.removeEventListener(THEME_EVENT, recolor);
-    merge?.destroy();
+    currentReview = null;
+    const retired = merge;
+    merge = null;
+    if (retired) { scrubEditor(retired.a); scrubEditor(retired.b); retired.destroy(); }
   });
 
-  return <div class="code-diff" ref={host} />;
+  return <div class="code-document">
+    <find.Toolbar />
+    <div class="code-diff" ref={host} onCopy={event => {
+      if (props.active === false || props.onCheckAccess?.() === false) {
+        event.preventDefault();
+        clearOwnedSelection(host);
+      }
+    }} />
+  </div>;
 }
 
 function reviewToDocuments(review = {}) {

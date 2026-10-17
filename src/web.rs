@@ -4192,7 +4192,9 @@ mod tests {
         .unwrap();
         let options = WorkspaceOptions {
             root: root.0.clone(),
-            git: std::path::PathBuf::from("/usr/bin/git"),
+            git: std::env::var_os("AW_GIT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/usr/bin/git")),
             bash: std::path::PathBuf::from("/bin/bash"),
             actor: "not-a-browser-supplied-actor".into(),
             allow_terminals: false,
@@ -4204,6 +4206,382 @@ mod tests {
             application_with_workspace(agent, None, Some(options), HOST.parse().unwrap(), CODE)
                 .unwrap();
         (r, s, calls, root)
+    }
+    #[cfg(feature = "surfaces")]
+    mod scoped_surfaces {
+        use super::*;
+
+        async fn reply(
+            router: &Router,
+            cookie: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = router
+                .clone()
+                .oneshot(request("POST", "/api/workspace/action", body, Some(cookie)))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 5 * 1024 * 1024)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        async fn capabilities(router: &Router, cookie: &str) -> (StatusCode, serde_json::Value) {
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    "/api/workspace",
+                    serde_json::Value::Null,
+                    Some(cookie),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        fn view(
+            caps: &serde_json::Value,
+            scope: &str,
+            request: serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!({"op":"view","source_id":caps["source_id"],"scope_id":scope,"request":request})
+        }
+        fn git(root: &std::path::Path, args: &[&str]) -> String {
+            let program = std::env::var_os("AW_GIT").expect("pinned shell provides AW_GIT");
+            let output = std::process::Command::new(program)
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().into()
+        }
+
+        #[tokio::test]
+        async fn exact_source_scope_and_resource_errors_leave_authorized_files_usable() {
+            let (router, state, calls, _root) = surface_app();
+            let cookie = paired(&router).await;
+            let before = serde_json::to_value(&lock(&state.0.session.state).snapshot).unwrap();
+            let (status, catalog) = capabilities(&router, &cookie).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(catalog["instance"], before["instance"]);
+            let caps = &catalog["capabilities"];
+            let scope = caps["view_root"]["id"].as_str().unwrap();
+            assert_ne!(scope, "root");
+            let _held_agent = state.0.session.agent.lock().await;
+            let (status, file) = reply(
+                &router,
+                &cookie,
+                view(
+                    caps,
+                    scope,
+                    serde_json::json!({"op":"file","path":"sample.rs"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(file["source_id"], caps["source_id"]);
+            assert_eq!(file["scope_id"], scope);
+            assert_eq!(file["result"]["context"], scope);
+            assert_eq!(file["result"]["text"], "<script>not HTML</script>\n");
+            let mut stale = view(
+                caps,
+                scope,
+                serde_json::json!({"op":"file","path":"sample.rs"}),
+            );
+            stale["source_id"] = "prior_owner".into();
+            let (status, error) = reply(&router, &cookie, stale).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error["code"], "source_changed");
+            let (status, error) = reply(
+                &router,
+                &cookie,
+                view(caps, "root", serde_json::json!({"op":"files"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error["code"], "scope_denied");
+            let (status, error) = reply(
+                &router,
+                &cookie,
+                view(
+                    caps,
+                    scope,
+                    serde_json::json!({"op":"file","path":"../outside"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error["code"], "read_denied");
+            assert_eq!(
+                reply(
+                    &router,
+                    &cookie,
+                    view(
+                        caps,
+                        scope,
+                        serde_json::json!({"op":"file","path":"sample.rs"})
+                    )
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            for request in [
+                serde_json::json!({"op":"file","path":"sample.rs","root":"/other"}),
+                serde_json::json!({"op":"terminal_start","request_id":"x","confirmed":true,"rows":24,"cols":80}),
+                serde_json::json!({"op":"git_list","mode":"changes","context":"root"}),
+            ] {
+                assert_eq!(
+                    reply(&router, &cookie, view(caps, scope, request)).await.0,
+                    StatusCode::BAD_REQUEST
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&lock(&state.0.session.state).snapshot).unwrap(),
+                before
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn legacy_and_scoped_http_reads_refuse_replacement_root_bytes() {
+            let (router, _state, calls, root) = surface_app();
+            let cookie = paired(&router).await;
+            let (_, catalog) = capabilities(&router, &cookie).await;
+            let caps = &catalog["capabilities"];
+            let scope = caps["view_root"]["id"].as_str().unwrap();
+            let retired = SurfaceFixture(root.0.with_extension("retired"));
+            std::fs::rename(&root.0, &retired.0).unwrap();
+            std::fs::create_dir(&root.0).unwrap();
+            std::fs::write(root.0.join("sample.rs"), "REPLACEMENT").unwrap();
+            for body in [
+                serde_json::json!({"op":"file","path":"sample.rs"}),
+                serde_json::json!({"op":"files"}),
+                serde_json::json!({"op":"file_search","query":"sample"}),
+                view(
+                    caps,
+                    scope,
+                    serde_json::json!({"op":"file","path":"sample.rs"}),
+                ),
+            ] {
+                let modern = body["op"] == "view";
+                let (status, error) = reply(&router, &cookie, body).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(!error.to_string().contains("REPLACEMENT"));
+                if modern {
+                    assert_eq!(error["code"], "scope_denied");
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn bounded_workers_and_revoked_queued_transport_admit_no_read() {
+            let (router, state, calls, _root) = surface_app();
+            let cookie = paired(&router).await;
+            let (_, catalog) = capabilities(&router, &cookie).await;
+            let caps = &catalog["capabilities"];
+            let scope = caps["view_root"]["id"].as_str().unwrap();
+            let body = view(
+                caps,
+                scope,
+                serde_json::json!({"op":"file","path":"sample.rs"}),
+            );
+            let permits = (0..4)
+                .map(|_| state.0.surface_slots.clone().try_acquire_owned().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reply(&router, &cookie, body.clone()).await.0,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            drop(permits);
+            let host = state.0.surfaces.clone().unwrap();
+            let actor = state.0.session.actor.as_str().to_owned();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                host.execute_if(&actor, aw_surfaces::Command::Capabilities, || {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().unwrap();
+                    true
+                })
+            });
+            entered_rx.await.unwrap();
+            let queued_router = router.clone();
+            let queued_cookie = cookie.clone();
+            let queued =
+                tokio::spawn(async move { reply(&queued_router, &queued_cookie, body).await });
+            while state.0.surface_slots.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+            lock(&state.0.auth).cookie_hash = None;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap().unwrap();
+            assert_eq!(queued.await.unwrap().0, StatusCode::UNAUTHORIZED);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn closed_surface_source_cannot_redisclose_capabilities() {
+            let (router, state, calls, _root) = surface_app();
+            let cookie = paired(&router).await;
+            let (_, catalog) = capabilities(&router, &cookie).await;
+            let caps = &catalog["capabilities"];
+            let scope = caps["view_root"]["id"].as_str().unwrap();
+            state.0.surfaces.as_ref().unwrap().shutdown();
+            let (status, error) = reply(
+                &router,
+                &cookie,
+                view(caps, scope, serde_json::json!({"op":"files"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error["code"], "source_changed");
+            let (status, catalog) = capabilities(&router, &cookie).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(catalog.get("capabilities").is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn actual_http_worktrees_keep_samepath_reviews_and_indexes_independent() {
+            let (router, state, calls, root) = surface_app();
+            let cookie = paired(&router).await;
+            git(&root.0, &["init", "-b", "main"]);
+            git(&root.0, &["config", "user.name", "Fixture"]);
+            git(
+                &root.0,
+                &["config", "user.email", "fixture@example.invalid"],
+            );
+            git(&root.0, &["add", "sample.rs"]);
+            git(&root.0, &["commit", "-m", "fixture"]);
+            let other = SurfaceFixture(root.0.with_extension("linked"));
+            git(
+                &root.0,
+                &["worktree", "add", "-b", "other", other.0.to_str().unwrap()],
+            );
+            std::fs::write(root.0.join("sample.rs"), "only-A α\n").unwrap();
+            std::fs::write(other.0.join("sample.rs"), "only-B 界\n").unwrap();
+            let before = serde_json::to_value(&lock(&state.0.session.state).snapshot).unwrap();
+            let index_a = git(
+                &root.0,
+                &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+            );
+            let index_b = git(
+                &other.0,
+                &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+            );
+            let indexes = (
+                std::fs::read(&index_a).unwrap(),
+                std::fs::read(&index_b).unwrap(),
+            );
+            let heads = (
+                git(&root.0, &["rev-parse", "HEAD"]),
+                git(&other.0, &["rev-parse", "HEAD"]),
+            );
+            let (_, catalog) = capabilities(&router, &cookie).await;
+            let caps = &catalog["capabilities"];
+            let scope = caps["view_root"]["id"].as_str().unwrap();
+            let (status, inventory) = reply(
+                &router,
+                &cookie,
+                view(
+                    caps,
+                    scope,
+                    serde_json::json!({"op":"git_list","mode":"worktrees"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let inventory = &inventory["result"];
+            let item = inventory["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["path"].as_str() == other.0.to_str())
+                .unwrap();
+            let(status,opened)=reply(&router,&cookie,view(caps,scope,serde_json::json!({"op":"git_open","inventory_id":inventory["inventory_id"],"item_id":item["id"]}))).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(opened["scope_id"], scope);
+            let other_scope = opened["result"]["context"]["id"].as_str().unwrap();
+            let mut reviews = Vec::new();
+            for current in [scope, other_scope] {
+                let (status, changes) = reply(
+                    &router,
+                    &cookie,
+                    view(
+                        caps,
+                        current,
+                        serde_json::json!({"op":"git_list","mode":"changes"}),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                let changes = &changes["result"];
+                let(status,review)=reply(&router,&cookie,view(caps,current,serde_json::json!({"op":"git_open","inventory_id":changes["inventory_id"],"item_id":changes["items"][0]["id"]}))).await;
+                assert_eq!(status, StatusCode::OK);
+                reviews.push(review["result"].clone());
+            }
+            assert!(reviews[0].to_string().contains("only-A"));
+            assert!(!reviews[0].to_string().contains("only-B"));
+            assert!(reviews[1].to_string().contains("only-B"));
+            assert!(!reviews[1].to_string().contains("only-A"));
+            let (status, error) = reply(
+                &router,
+                &cookie,
+                view(
+                    caps,
+                    other_scope,
+                    serde_json::json!({"op":"file","path":"sample.rs"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error["code"], "read_denied");
+            assert_eq!(
+                reply(
+                    &router,
+                    &cookie,
+                    view(
+                        caps,
+                        scope,
+                        serde_json::json!({"op":"file","path":"sample.rs"})
+                    )
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            assert_eq!(
+                serde_json::to_value(&lock(&state.0.session.state).snapshot).unwrap(),
+                before
+            );
+            assert_eq!(
+                indexes,
+                (
+                    std::fs::read(index_a).unwrap(),
+                    std::fs::read(index_b).unwrap()
+                )
+            );
+            assert_eq!(
+                heads,
+                (
+                    git(&root.0, &["rev-parse", "HEAD"]),
+                    git(&other.0, &["rev-parse", "HEAD"])
+                )
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
     #[cfg(feature = "surfaces")]
     #[tokio::test]

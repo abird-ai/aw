@@ -100,11 +100,17 @@ Design and binding decisions: [README.md](README.md).
 
 ## Uncommitted
 
-- [ ] Add memory-only scoped browser Files/Git views through retained SurfaceHost capabilities: launch-root Files and verified existing Git worktrees first, exact source/binding identity and independent state. Another Files root requires an explicit trusted-owner grant contract. Complete actual browser acceptance before any shared serialized layout.
+- [~] Add memory-only scoped browser Files/Git views through retained SurfaceHost capabilities: launch-root Files and verified existing Git worktrees first, exact source/binding identity and independent state. Another Files root requires an explicit trusted-owner grant contract. Complete actual browser acceptance before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 
 ## Tests and verification
+
+- [ ] Browser Files/Git retained capability and actual-owner HTTP regressions: exact source/scope/context, unknown/forged/stale IDs, physical root replacement and independent existing worktrees; no new model/tool/Git/terminal effects.
+- [ ] Browser container model regressions: bounded stable IDs, independent navigator/document state, physically outstanding work limits, stale close/refresh/source replies and denial cleanup — existing six-suite Node gate.
+- [ ] Shipping Solid File/Diff editor acceptance: independent Find/viewport/selection and navigator mode/query/context across switches; unchanged Agent/root/draft/caret; visible limits and stale-reply refusal.
+- [ ] Exact scoped-browser implementation product gate: bootstrap, formatting, workspace Cargo tests, existing six-suite Node tests and production frontend build.
+- [ ] Immutable native package/version and actual Chrome with duplicate launch-root Files views and two existing Git worktrees; unchanged heads/indexes/Session execution counts and clean owner shutdown. Additional Files roots remain unavailable without explicit trusted-owner grants.
 
 - [x] Exact follow-up product gate/package and actual Chrome draft-retarget/late-observation/closed-view/revocation acceptance — passed on `94697a7` as recorded above, with unchanged branch heads and zero execution effects.
 

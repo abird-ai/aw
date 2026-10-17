@@ -223,6 +223,48 @@ Source seams: `web/src/main.jsx`, `crates/aw-surfaces/src/lib.rs`,
 `src/sessions/branch_view.rs`, its native reexport and `src/web.rs` (session routes, authenticated
 boundary and LocalWeb persistence ownership).
 
+## Scoped browser Files/Git containers
+
+Use the shipping Solid Explorer and document strip, with memory-only flat
+containers. Files and Git keep the existing category buttons; each category
+selects an independent navigator through a view selector and explicit New/Close
+view controls. Retain at most eight containers and 32 total document tabs,
+including the permanent current Agent and its bounded read-only pins. Closing
+a browser view releases only that view's state, never another browser's owner
+resources. Docking and shared serialized layouts follow separately.
+
+Retain the owner's explicitly granted launch `WorkspaceFiles` and physical
+directory binding once. Files reads remain under that launch capability.
+Git may select verified existing worktrees through opaque inventory handles;
+that grants no Files capability to the selected path. Another Files root needs
+an explicit trusted-owner grant contract. Browser paths, labels, native scope
+IDs and cached descriptors never grant server-folder access.
+
+Add a strict read-only scoped wrapper to the existing workspace action API.
+Requests and replies carry the SurfaceHost lifetime and immutable scope ID;
+Git opens additionally name the exact originating inventory and item. Context
+IDs never retarget an old binding by pathname. Keep existing SDK limits,
+retained-root and Repository identity checks, serialized resource admission,
+four bounded HTTP workers and pre/post-operation authentication. Legacy action
+clients remain compatible; scoped requests cannot wrap terminal or mutation
+commands. No SQL/JSONL/version change is needed.
+
+Each navigator retains tree/query/mode/context independently. File identity
+includes owner source, Files scope and relative path; a Diff retains its exact
+original scope and immutable Review. Stable document IDs distinguish separate
+views of the same resource. Reads allocate their destination before awaiting;
+late replies never select another tab or populate a closed/rebound view.
+Preserve per-view editor Find/viewport/selection and clear plaintext and derived
+editor state on denied scope, source replacement or logout. File/Diff content
+is an explicit read snapshot; refresh revalidates its binding. This does not
+inherit the Agent reader's separate fifteen-second membership freshness rule.
+
+Acceptance: duplicate launch-root Files views and two existing Git worktrees
+retain independent navigator/editor state. Forged scopes, physical binding
+replacement and held close/refresh/source replies fail without redirecting a
+read. The same Agent/root/draft/caret, Git heads/indexes and execution counts
+remain unchanged in actual Rust HTTP and immutable-package Chrome acceptance.
+
 ## References
 
 - [Live Workspace behavior](../../docs/WORKSPACE.md)

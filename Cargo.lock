@@ -646,6 +646,7 @@ name = "aw-surfaces"
 version = "0.15.0"
 dependencies = [
  "aw-git",
+ "aw-platform",
  "aw-terminal",
  "aw-tools",
  "getrandom 0.3.4",

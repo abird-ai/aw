@@ -1,10 +1,11 @@
-import { createEffect, createMemo, createSignal, For, lazy, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, lazy, on, onCleanup, onMount, Show, untrack } from "solid-js";
 import { render } from "solid-js/web";
 import { api, workspaceAction } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
 import { Icon } from "./icons.jsx";
 import { AgentViewPanel } from "./agent-view-panel.jsx";
 import { createAgentViews } from "./agent-views.js";
+import { createWorkspaceViews } from "./workspace-views.js";
 import { applyThemePreference, finishBoot } from "./theme.js";
 
 const CodeFile = lazy(() =>
@@ -206,7 +207,9 @@ function CommandBar(props) {
   let launcher;
   let invokingFocus;
   let timer;
-  let request = 0;
+  let request = {};
+  let searchAbort;
+  let fileSearchContainer = null;
 
   const parsed = createMemo(() => {
     const value = query().trimStart();
@@ -228,19 +231,25 @@ function CommandBar(props) {
   createEffect(() => {
     const { category, body } = parsed();
     const value = body.trim();
+    props.workspaceToken;
     clearTimeout(timer);
-    const token = ++request;
+    searchAbort?.abort();
+    const token = request = {};
     if (!open() || !props.workspaceEnabled || value.length < 2 || (category && category !== "@")) {
       setFiles({ state: "idle", entries: [] });
       return;
     }
+    try { fileSearchContainer ||= untrack(() => props.fileSearchContainer()); }
+    catch (error) { setFiles({ state: "error", entries: [], error: error.message }); return; }
+    searchAbort = new AbortController();
+    const signal = searchAbort.signal;
     setFiles({ state: "loading", entries: [] });
     timer = setTimeout(async () => {
       try {
-        const result = await workspaceAction({ op: "file_search", query: value, limit: 40 });
+        const result = await props.searchFiles(fileSearchContainer, value, { signal });
         if (token === request) setFiles({ state: "ready", entries: result.entries || [] });
-      } catch {
-        if (token === request) setFiles({ state: "error", entries: [] });
+      } catch (error) {
+        if (token === request) setFiles({ state: "error", entries: [], error: error.message });
       }
     }, 120);
   });
@@ -289,12 +298,12 @@ function CommandBar(props) {
       for (const file of files().entries) {
         if (file.kind === "file") {
           result.push({
-            key: "file:" + file.path,
+            key: "file:" + file.containerId + ":" + file.path,
             label: basename(file.path),
             meta: "File · " + (dirname(file.path) || "."),
             icon: "file",
             target: "tab",
-            run: () => props.openFile(file.path),
+            run: () => props.openFile(file.containerId, file.path),
           });
         }
       }
@@ -328,7 +337,7 @@ function CommandBar(props) {
     if (category === "@" && !props.workspaceEnabled) return "File browsing is unavailable for this owner.";
     if (!category || category === "@") {
       if (files().state === "loading") return "Searching files…";
-      if (files().state === "error") return "File search unavailable. Change the query to try again.";
+      if (files().state === "error") return files().error || "File search unavailable. Change the query to try again.";
       if (category === "@" && body.trim().length < 2) return "Type at least two characters to search files.";
     }
     return items().length ? "" : "No matches";
@@ -342,13 +351,15 @@ function CommandBar(props) {
       invokingFocus.selection = [element.selectionStart, element.selectionEnd, element.selectionDirection];
     }
     setQuery("");
+    fileSearchContainer = null;
     setSelectedKey(null);
     setOpen(true);
   }
 
   function close() {
     clearTimeout(timer);
-    ++request;
+    request = {};
+    searchAbort?.abort();
     dialog?.close();
     setOpen(false);
     const { element, selection } = invokingFocus || {};
@@ -408,7 +419,8 @@ function CommandBar(props) {
   onMount(() => window.addEventListener("keydown", globalKey));
   onCleanup(() => {
     clearTimeout(timer);
-    request++;
+    request = {};
+    searchAbort?.abort();
     window.removeEventListener("keydown", globalKey);
   });
 
@@ -604,67 +616,57 @@ function SessionNavigator(props) {
   );
 }
 
+function sameEntries(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every(key => left[key] === right[key]);
+}
+
 function FilesNavigator(props) {
-  const [nodes, setNodes] = createSignal(new Map());
-  const [expanded, setExpanded] = createSignal(new Set([""]));
-  const [loading, setLoading] = createSignal(new Set());
-  const [view, setView] = createSignal("tree");
-  const [query, setQuery] = createSignal("");
-  const [searchResults, setSearchResults] = createSignal([]);
-  const [searching, setSearching] = createSignal(false);
+  const listings = createMemo(() => props.state?.listings || {}, undefined, { equals: sameEntries });
+  const nodes = createMemo(() => new Map(Object.entries(listings()).map(([path, result]) => [path, result.entries || []])));
+  const expandedPaths = createMemo(() => props.state?.navigator.expanded || [""], undefined, { equals: sameEntries });
+  const expanded = createMemo(() => new Set(expandedPaths()));
+  const search = createMemo(() => props.state?.search);
+  const view = createMemo(() => props.state?.navigator.view || "tree");
+  const query = createMemo(() => props.state?.navigator.query || "");
+  const searching = () => Boolean(query().trim() && props.state?.pending);
+  const [appliedQuery, setAppliedQuery] = createSignal("");
   let timer;
-  let request = 0;
+  let request = {};
+
+  function patch(value) {
+    try { props.controller.patchNavigator(props.id, value); }
+    catch (error) { props.fail(error.message); }
+  }
+  const setView = value => patch({ view: value });
+  const setQuery = value => patch({ query: value });
+  const setExpanded = value => patch({ expanded: [...value] });
 
   async function load(path = "", force = false) {
-    if ((!force && nodes().has(path)) || loading().has(path)) return;
-    const active = new Set(loading());
-    active.add(path);
-    setLoading(active);
-    try {
-      const result = await workspaceAction({ op: "files", path });
-      const next = new Map(nodes());
-      next.set(path, result.entries || []);
-      setNodes(next);
-    } catch (error) {
-      props.fail(error.message);
-    } finally {
-      const active = new Set(loading());
-      active.delete(path);
-      setLoading(active);
-    }
+    if (!force && nodes().has(path)) return;
+    await props.controller.loadNavigator(props.id, { op: "files", path });
   }
 
   onMount(() => load(""));
-  onCleanup(() => clearTimeout(timer));
+  onCleanup(() => { request = {}; clearTimeout(timer); });
 
   createEffect(() => {
     const value = query().trim();
     clearTimeout(timer);
-    if (!value) {
-      setSearchResults([]);
-      setSearching(false);
-      return;
-    }
-    const token = ++request;
-    setSearching(true);
+    const token = request = {};
+    setAppliedQuery("");
+    if (!value) return;
     timer = setTimeout(async () => {
-      try {
-        const result = await workspaceAction({ op: "file_search", query: value, limit: 120 });
-        if (token === request) setSearchResults(result.entries || []);
-      } catch (error) {
-        if (token === request) {
-          setSearchResults([]);
-          props.fail(error.message);
-        }
-      } finally {
-        if (token === request) setSearching(false);
-      }
+      const accepted = await props.controller.loadNavigator(props.id, { op: "file_search", query: value, limit: 120 });
+      if (accepted && token === request) setAppliedQuery(value);
     }, 120);
   });
 
   async function toggle(entry) {
     if (entry.kind !== "directory") {
-      if (entry.kind === "file") props.openFile(entry.path);
+      if (entry.kind === "file") props.openFile(props.id, entry.path);
       return;
     }
     if (view() === "list" || query()) {
@@ -674,11 +676,12 @@ function FilesNavigator(props) {
     const next = new Set(expanded());
     if (next.has(entry.path)) {
       next.delete(entry.path);
+      setExpanded(next);
     } else {
       next.add(entry.path);
+      setExpanded(next);
       await load(entry.path);
     }
-    setExpanded(next);
   }
 
   function treeRows(path = "", depth = 0, out = []) {
@@ -694,7 +697,8 @@ function FilesNavigator(props) {
 
   const visible = createMemo(() => {
     if (query().trim()) {
-      return searchResults().map(entry => ({ entry, depth: 0, search: true }));
+      return (appliedQuery() === query().trim() ? search()?.entries || [] : [])
+        .map(entry => ({ entry, depth: 0, search: true }));
     }
     if (view() === "tree") return treeRows("", 0, []);
     const seen = new Set();
@@ -712,11 +716,18 @@ function FilesNavigator(props) {
     });
     return rows;
   });
+  const visibleByPath = createMemo(() => new Map(visible().map(row => [row.entry.path, row])));
 
   async function refreshFiles() {
-    setNodes(new Map());
-    setExpanded(new Set([""]));
-    await load("", true);
+    const originalQuery = query().trim();
+    const accepted = await props.controller.refreshNavigator(props.id);
+    if (accepted && originalQuery && query().trim() === originalQuery) setAppliedQuery(originalQuery);
+    if (!originalQuery && !query().trim()) {
+      for (const path of expanded()) {
+        if (!props.state || props.state.unavailable) break;
+        if (path) await load(path, true);
+      }
+    }
   }
 
   return (
@@ -729,21 +740,24 @@ function FilesNavigator(props) {
         </button>
       </div>
       <div class="navigator-caption">
-        <span>Files</span>
+        <span title={props.state?.label}>Files · {props.state?.label || "Unavailable"}</span>
         <Show when={searching()}><span class="navigator-status">searching…</span></Show>
       </div>
+      <Show when={props.state?.error}><div class="navigator-empty" role="status">{props.state.error}</div></Show>
       <div class="tree-list">
-        <For each={visible()}>
-          {row => {
-            const directory = () => row.entry.kind === "directory";
-            const open = () => directory() && expanded().has(row.entry.path);
-            const selected = () => props.activePath === row.entry.path;
+        <For each={visible().map(row => row.entry.path)}>
+          {path => {
+            const row = () => visibleByPath().get(path);
+            const entry = () => row()?.entry || { kind: "unavailable", path: "", name: "" };
+            const directory = () => entry().kind === "directory";
+            const open = () => directory() && expanded().has(path);
+            const selected = () => props.activePath === path;
             return (
               <button
                 class={"nav-row file-row " + (selected() ? "active" : "") + (directory() ? " directory" : "")}
-                style={{ "--depth": String(row.depth) }}
-                onClick={() => toggle(row.entry)}
-                title={row.entry.path}
+                style={{ "--depth": String(row()?.depth || 0) }}
+                onClick={() => toggle(entry())}
+                title={entry().path}
               >
                 <span class="tree-indent" />
                 <span class="chevron">
@@ -753,9 +767,9 @@ function FilesNavigator(props) {
                 </span>
                 <Icon name={directory() ? "folder" : "file"} size={13} />
                 <span class="nav-row-main">
-                  <span class="nav-row-name">{row.search || view() === "list" ? basename(row.entry.path) : row.entry.name}</span>
-                  <Show when={row.search || view() === "list"}>
-                    <span class="nav-row-detail">{dirname(row.entry.path)}</span>
+                  <span class="nav-row-name">{row()?.search || view() === "list" ? basename(entry().path) : entry().name}</span>
+                  <Show when={row()?.search || view() === "list"}>
+                    <span class="nav-row-detail">{dirname(entry().path)}</span>
                   </Show>
                 </span>
               </button>
@@ -771,35 +785,31 @@ function FilesNavigator(props) {
 }
 
 function GitNavigator(props) {
-  const [mode, setMode] = createSignal("changes");
-  const [context, setContext] = createSignal("root");
-  const [inventory, setInventory] = createSignal({ items: [] });
-  const [collapsed, setCollapsed] = createSignal(new Set());
-  const [view, setView] = createSignal("tree");
-  const [query, setQuery] = createSignal("");
-  const [loading, setLoading] = createSignal(false);
-  let request = 0;
-
-  async function load(nextMode = mode(), nextContext = context()) {
-    const token = ++request;
-    setLoading(true);
-    try {
-      const data = await workspaceAction({ op: "git_list", context: nextContext, mode: nextMode });
-      if (token === request) setInventory(data);
-    } catch (error) {
-      if (token === request) {
-        props.fail(error.message);
-        setInventory({ items: [] });
-      }
-    } finally {
-      if (token === request) setLoading(false);
-    }
+  const mode = createMemo(() => props.state?.navigator.mode || "changes");
+  const context = createMemo(() => props.state?.scope_id || "");
+  const emptyInventory = { items: [] };
+  const inventory = createMemo(() => props.state?.inventory || emptyInventory);
+  const collapsedPaths = createMemo(() => props.state?.navigator.collapsed || [], undefined, { equals: sameEntries });
+  const collapsed = createMemo(() => new Set(collapsedPaths()));
+  const view = createMemo(() => props.state?.navigator.view || "tree");
+  const query = createMemo(() => props.state?.navigator.query || "");
+  const loading = () => Boolean(props.state?.pending);
+  const unavailable = createMemo(() => Boolean(props.state?.unavailable));
+  function patch(value) {
+    try { props.controller.patchNavigator(props.id, value); }
+    catch (error) { props.fail(error.message); }
   }
+  const setMode = value => patch({ mode: value });
+  const setView = value => patch({ view: value });
+  const setQuery = value => patch({ query: value });
+  const setCollapsed = value => patch({ collapsed: [...value] });
+
+  const load = (nextMode = mode()) => props.controller.loadNavigator(props.id, { op: "git_list", mode: nextMode });
 
   createEffect(() => {
     const nextMode = mode();
-    const nextContext = context();
-    void load(nextMode, nextContext);
+    context();
+    if (!untrack(unavailable)) void load(nextMode);
   });
 
   const items = createMemo(() => {
@@ -828,15 +838,12 @@ function GitNavigator(props) {
       .map(([name, rows]) => ({ name, rows }));
   });
 
-  async function open(item) {
+  function open(item) {
     try {
-      const result = await workspaceAction({ op: "git_open", item_id: item.id });
-      if (result.kind === "context") {
-        setContext(result.context.id);
-        setMode("changes");
-      } else if (result.kind === "review") {
-        props.openReview(result);
-      }
+      patch({ selected: item.id });
+      const target = { inventory_id: inventory().inventory_id, item_id: item.id };
+      if (mode() === "worktrees") void props.controller.selectWorktree(props.id, target);
+      else props.openReview(props.id, target);
     } catch (error) {
       props.fail(error.message);
     }
@@ -920,17 +927,21 @@ function GitNavigator(props) {
       </div>
       <div class="navigator-toolbar git-toolbar">
         <NavigatorSearch value={query()} onInput={setQuery} placeholder={"Search " + mode()} />
-        <button class="mini-icon" onClick={() => load()} title="Refresh Git" aria-label="Refresh Git">
+        <button class="mini-icon" onClick={() => void props.controller.refreshNavigator(props.id)} title="Refresh Git" aria-label="Refresh Git">
           <Icon name="refresh" size={13} />
         </button>
       </div>
       <div class="navigator-caption git-context">
-        <span class="branch-pill"><Icon name="branch" size={11} />{inventory().branch || context()}</span>
+        <span class="branch-pill" title={props.state?.label}><Icon name="branch" size={11} />{inventory().branch || props.state?.label || "Unavailable"}</span>
         <Show when={loading()}><span class="navigator-status">refreshing…</span></Show>
       </div>
+      <Show when={props.state?.error}><div class="navigator-empty" role="status">{props.state.error}</div></Show>
       <div class="tree-list">
         <For each={groups()}>
-          {group => (
+          {group => {
+            const rows = createMemo(() => changeTreeRows(group));
+            const byKey = createMemo(() => new Map(rows().map(row => [row.kind === "folder" ? row.key : row.item.id, row])));
+            return (
             <>
               <Show when={group.name}>
                 <button class="git-group" onClick={() => fold(group.name)}>
@@ -945,7 +956,7 @@ function GitNavigator(props) {
                   fallback={
                     <For each={group.rows}>
                       {item => (
-                        <button class="nav-row git-row" onClick={() => open(item)} title={item.path || item.key}>
+                        <button class={"nav-row git-row " + (props.state?.navigator.selected === item.id ? "active" : "")} onClick={() => open(item)} title={item.path || item.key}>
                           <span class={"git-status status-" + (String(item.status || "").replace(/[^a-z0-9_-]+/gi, "_").toLowerCase() || "none")}>{item.status || "·"}</span>
                           <Icon name={mode() === "branches" ? "branch" : mode() === "worktrees" ? "folder" : "file"} size={13} />
                           <span class="nav-row-main">
@@ -959,41 +970,43 @@ function GitNavigator(props) {
                     </For>
                   }
                 >
-                  <For each={changeTreeRows(group)}>
-                    {row => (
+                  <For each={rows().map(row => row.kind === "folder" ? row.key : row.item.id)}>
+                    {key => {
+                      const row = () => byKey().get(key);
+                      return (
                       <Show
-                        when={row.kind === "folder"}
+                        when={row()?.kind === "folder"}
                         fallback={
                           <button
-                            class="nav-row git-row git-tree-item"
-                            style={{ "--git-depth": String(row.depth) }}
-                            onClick={() => open(row.item)}
-                            title={row.item?.path || row.item?.key}
+                            class={"nav-row git-row git-tree-item " + (props.state?.navigator.selected === key ? "active" : "")}
+                            style={{ "--git-depth": String(row()?.depth || 0) }}
+                            onClick={() => { if (row()?.item) open(row().item); }}
+                            title={row()?.item?.path || row()?.item?.key}
                           >
-                            <span class={"git-status status-" + (String(row.item?.status || "").replace(/[^a-z0-9_-]+/gi, "_").toLowerCase() || "none")}>{row.item?.status || "·"}</span>
+                            <span class={"git-status status-" + (String(row()?.item?.status || "").replace(/[^a-z0-9_-]+/gi, "_").toLowerCase() || "none")}>{row()?.item?.status || "·"}</span>
                             <Icon name="file" size={13} />
-                            <span class="nav-row-name">{basename(row.item?.path || row.item?.label || "")}</span>
+                            <span class="nav-row-name">{basename(row()?.item?.path || row()?.item?.label || "")}</span>
                           </button>
                         }
                       >
                         <button
                           class="nav-row git-row git-tree-folder"
-                          style={{ "--git-depth": String(row.depth) }}
-                          onClick={() => fold(row.key)}
-                          title={row.path}
+                          style={{ "--git-depth": String(row()?.depth || 0) }}
+                          onClick={() => fold(key)}
+                          title={row()?.path}
                         >
                           <span class="git-status" />
-                          <Icon name={collapsed().has(row.key) ? "chevronRight" : "chevronDown"} size={11} />
+                          <Icon name={collapsed().has(key) ? "chevronRight" : "chevronDown"} size={11} />
                           <Icon name="folder" size={13} />
-                          <span class="nav-row-name">{row.name}</span>
+                          <span class="nav-row-name">{row()?.name}</span>
                         </button>
                       </Show>
-                    )}
+                    ); }}
                   </For>
                 </Show>
               </Show>
             </>
-          )}
+          ); }}
         </For>
       </div>
       <Show when={!items().length && !loading()}>
@@ -1759,6 +1772,7 @@ function App() {
   let resizingSidebar = false;
   let source;
   let observationLifetime = {};
+  let workspaceDiscoveryLifetime = {};
   let sharedClient = null;
   let sharedDraftOrigin = null;
   let composerTextarea = null;
@@ -1770,6 +1784,52 @@ function App() {
   const tabElementId = id => "workspace-tab-" + encodeURIComponent(id);
   const [viewChange, setViewChange] = createSignal(null);
   const [viewSource, setViewSource] = createSignal(null);
+  const [workspaceChange, setWorkspaceChange] = createSignal(null);
+  const [workspaceSource, setWorkspaceSource] = createSignal(null);
+  const [workspaceToken, setWorkspaceToken] = createSignal({});
+  const [selectedContainers, setSelectedContainers] = createSignal({ files: null, git: null });
+  const workspaceViews = createWorkspaceViews({
+    request: async (body, { signal }) => {
+      const lifetime = observationLifetime;
+      try { return await workspaceAction(body, { signal }); }
+      catch (error) {
+        if (lifetime === observationLifetime && error.status === 401) expireBrowserAccess();
+        throw error;
+      }
+    },
+    externalDocumentCount: () => tabs().filter(tab => tab.kind !== "file" && tab.kind !== "review").length,
+    onChange: event => untrack(() => {
+      setWorkspaceChange({});
+      const documents = workspaceViews.listDocuments();
+      const live = new Set(documents.map(document => document.id));
+      setTabs(current => {
+        const kept = current.filter(tab => (tab.kind !== "file" && tab.kind !== "review") || live.has(tab.id));
+        for (const tab of current) if (!kept.includes(tab)) tabTargets.delete(tab.id);
+        const present = new Set(kept.map(tab => tab.id));
+        return [...kept, ...documents.filter(document => !present.has(document.id))
+          .map(document => ({ id: document.id, kind: document.kind, title: document.kind === "file" ? "File" : "Diff" }))];
+      });
+      if (activeTab().startsWith("workspace-document-") && !live.has(activeTab())) setActiveTab("chat");
+      const containers = workspaceViews.listContainers();
+      setSelectedContainers(current => Object.fromEntries(["files", "git"].map(kind => [kind,
+        containers.some(container => container.id === current[kind] && container.kind === kind)
+          ? current[kind] : containers.find(container => container.kind === kind)?.id || null])));
+      if (["clear", "source", "scope-denied", "refresh", "close-container"].includes(event.type)) setWorkspaceToken({});
+      if (event.type === "clear") {
+        workspaceDiscoveryLifetime = {};
+        setWorkspaceSource(null);
+      }
+    }),
+  });
+  const workspaceContainers = createMemo(() => { workspaceChange(); return workspaceViews.listContainers(); });
+  const workspaceDocumentIds = createMemo(() => { workspaceChange(); return workspaceViews.listDocuments().map(document => document.id); });
+  const workspaceDocument = id => { workspaceChange(); return workspaceViews.getDocument(id); };
+  const workspaceContainer = id => { workspaceChange(); return workspaceViews.getContainer(id); };
+  function clearWorkspaceViews() {
+    workspaceViews.clear();
+    setWorkspaceSource(null);
+    setWorkspaceEnabled(false);
+  }
   const agentViews = createAgentViews({
     read: async (target, { signal }) => {
       const lifetime = observationLifetime;
@@ -1812,14 +1872,29 @@ function App() {
     source = null;
     expiredSource?.close();
     clearAgentViews("Browser access expired.");
+    clearWorkspaceViews();
     setPaired(false);
     setOnline(false);
     setConnection("Not paired");
   }
   function tabTitle(tab) {
+    if (tab.kind === "file" || tab.kind === "review") {
+      const document = workspaceDocument(tab.id);
+      return document?.data ? (tab.kind === "review" ? "Diff: " : "") + basename(document.data.path || "file") : tab.title;
+    }
     if (tab.kind !== "agent-view") return tab.title;
     const data = pinnedView(tab.id)?.snapshot;
     return data ? `View: ${data.title || "Untitled"} · ${data.branch_name}` : tab.title;
+  }
+  function tabDescription(tab) {
+    if (tab.kind !== "file" && tab.kind !== "review") return tabTitle(tab);
+    const document = workspaceDocument(tab.id);
+    if (!document?.data) return tabTitle(tab);
+    const owner = workspaceContainer(document.containerId);
+    const peers = workspaceContainers().filter(container => container.kind === owner?.kind);
+    const position = peers.findIndex(container => container.id === document.containerId) + 1;
+    return [tabTitle(tab), document.data.root || owner?.label, document.data.path, document.data.basis,
+      owner ? `${owner.kind === "files" ? "Files" : "Git"} view ${position}` : ""].filter(Boolean).join(" · ");
   }
   function pulseAgentViews() {
     agentViews.expire();
@@ -1830,7 +1905,10 @@ function App() {
     }
   }
   createEffect(on(() => snapshot()?.instance, (instance, previous) => {
-    if (previous && instance !== previous) clearAgentViews("Owner changed; reopen the read-only view.");
+    if (previous && instance !== previous) {
+      clearAgentViews("Owner changed; reopen the read-only view.");
+      clearWorkspaceViews();
+    }
   }));
 
 
@@ -1838,7 +1916,10 @@ function App() {
   const surface = createMemo(() =>
     tabs().find(tab => tab.id === activeTab()) || tabs()[0] || { id: "chat", kind: "chat", title: "Agent" }
   );
-  const activeFilePath = createMemo(() => surface().kind === "file" ? surface().file?.path : null);
+  const activeFilePath = containerId => {
+    const document = workspaceDocument(activeTab());
+    return document?.kind === "file" && document.containerId === containerId && document.data ? document.data.path : null;
+  };
   createEffect(() => {
     const id = activeTab();
     void tabs();
@@ -2009,16 +2090,24 @@ function App() {
   }
 
   async function connectWorkspace(lifetime = observationLifetime) {
+    const owner = snapshot()?.instance;
+    const discovery = workspaceDiscoveryLifetime;
     try {
       const value = await api("/api/workspace");
-      if (lifetime !== observationLifetime) return;
+      if (lifetime !== observationLifetime || discovery !== workspaceDiscoveryLifetime || owner !== snapshot()?.instance) return;
       const enabled = Boolean(value?.enabled);
+      if (enabled) {
+        if (value.instance !== owner) return;
+        workspaceViews.setSource(value.capabilities);
+        setWorkspaceSource({ source_id: value.capabilities.source_id, view_root: value.capabilities.view_root });
+      } else clearWorkspaceViews();
       setWorkspaceEnabled(enabled);
       if (!enabled && nav() !== "sessions") setNav("sessions");
-    } catch {
-      if (lifetime !== observationLifetime) return;
-      setWorkspaceEnabled(false);
-      if (nav() !== "sessions") setNav("sessions");
+    } catch (error) {
+      if (lifetime !== observationLifetime || discovery !== workspaceDiscoveryLifetime || owner !== snapshot()?.instance) return;
+      if (error.status === 401) expireBrowserAccess();
+      else if (error.status === 403) clearWorkspaceViews();
+      if (!workspaceEnabled() && nav() !== "sessions") setNav("sessions");
     }
   }
 
@@ -2223,6 +2312,7 @@ function App() {
     listen("changed", () => void refresh(false));
     listen("context_revoked", () => {
       clearAgentViews("Read access changed; reopen permitted views.");
+      clearWorkspaceViews();
       void refresh(false);
     });
     listen("delta", event => {
@@ -2349,6 +2439,7 @@ function App() {
     source = null;
     previous?.close();
     agentViews.dispose();
+    workspaceViews.dispose();
     clearTimeout(presencePending);
     if (sharedActive()) void publishPresence(false);
     sharedClient?.destroy?.();
@@ -2372,8 +2463,43 @@ function App() {
       return false;
     }
     setNav(kind);
+    if (kind !== "sessions" && !selectedContainers()[kind]) {
+      try { ensureWorkspaceContainer(kind); }
+      catch (error) { setError(error.message); }
+    }
     setMobileNav(false);
     return true;
+  }
+
+  function ensureWorkspaceContainer(kind) {
+    const current = selectedContainers()[kind];
+    if (current && workspaceViews.getContainer(current)) return current;
+    const id = workspaceViews.openContainer(kind);
+    setSelectedContainers(value => ({ ...value, [kind]: id }));
+    return id;
+  }
+
+  async function newWorkspaceContainer(kind) {
+    const lifetime = observationLifetime;
+    const owner = snapshot()?.instance;
+    try {
+      if (!workspaceSource()) await connectWorkspace();
+      if (lifetime !== observationLifetime || owner !== snapshot()?.instance) return false;
+      const id = workspaceViews.openContainer(kind);
+      setSelectedContainers(value => ({ ...value, [kind]: id }));
+      return id;
+    } catch (error) { setError(error.message); return false; }
+  }
+
+  function closeWorkspaceContainer(kind) {
+    const id = selectedContainers()[kind];
+    if (id) workspaceViews.closeContainer(id);
+  }
+
+  async function searchWorkspaceFiles(id, query, { signal }) {
+    if (workspaceViews.getContainer(id)?.kind !== "files") throw new Error("The Files view closed. Reopen the palette to choose another view.");
+    const result = await workspaceViews.searchFiles(id, query, 40, { signal });
+    return { entries: (result?.entries || []).map(entry => ({ ...entry, containerId: id })) };
   }
 
   function showChat() {
@@ -2389,7 +2515,7 @@ function App() {
       else if (target === "settings") document.querySelector('.modal[role="dialog"] button')?.focus();
       else if (target === "nav") {
         if (window.matchMedia("(max-width: 820px)").matches) setMobileNav(true);
-        document.querySelector('.navigator input, .navigator button')?.focus();
+        document.querySelector('.scoped-navigator:not([hidden]) .navigator input, .scoped-navigator:not([hidden]) .navigator button')?.focus();
       }
     });
   }
@@ -2411,6 +2537,7 @@ function App() {
     const wasActive = activeTab() === id;
     const index = current.findIndex(tab => tab.id === id);
     if (agentViews.get(id)) agentViews.close(id);
+    if (workspaceViews.getDocument(id)) workspaceViews.closeDocument(id);
     const next = current.filter(tab => tab.id !== id);
     setTabs(next);
     tabTargets.delete(id);
@@ -2583,6 +2710,7 @@ function App() {
     const source = viewSource();
     if (!source || session.shared || !branch.id) return false;
     try {
+      workspaceViews.assertCanOpenDocument();
       const id = agentViews.open({ ...source, session_id: session.id, branch_id: branch.id });
       upsertTab({ id, kind: "agent-view", title: "Read-only view" });
       setMobileNav(false);
@@ -2594,16 +2722,10 @@ function App() {
     }
   }
 
-  async function openFile(path) {
+  function openFile(containerId, path) {
     try {
-      const file = await workspaceAction({ op: "file", path });
-      upsertTab({
-        id: "file:" + path,
-        kind: "file",
-        title: basename(path),
-        path,
-        file,
-      });
+      const id = workspaceViews.openFile(containerId, path);
+      setActiveTab(id);
       setMobileNav(false);
       return true;
     } catch (e) {
@@ -2612,16 +2734,13 @@ function App() {
     }
   }
 
-  function openReview(review) {
-    const name = basename(review.path || "file");
-    upsertTab({
-      id: "review:" + review.id,
-      kind: "review",
-      title: "Diff: " + name,
-      path: review.path || "",
-      review,
-    });
-    setMobileNav(false);
+  function openReview(containerId, origin) {
+    try {
+      const id = workspaceViews.openReview(containerId, origin);
+      setActiveTab(id);
+      setMobileNav(false);
+      return true;
+    } catch (error) { setError(error.message); return false; }
   }
 
   const title = createMemo(() => snapshot()?.saved?.title || "New Agent");
@@ -2677,15 +2796,42 @@ function App() {
             </For>
           </nav>
           <div class="sidebar-body">
-            <Show when={nav() === "sessions"}>
+            <div class="scoped-navigator" hidden={nav() !== "sessions"}>
               <SessionNavigator sessions={sessions()} snapshot={snapshot()} openSession={openSession} openReadonly={openReadonly} canInspect={Boolean(viewSource())} />
+            </div>
+            <Show when={nav() !== "sessions"}>
+              <div class="navigator-views">
+                <select aria-label={nav() === "files" ? "Files views" : "Git views"} value={selectedContainers()[nav()] || ""}
+                  disabled={!workspaceContainers().some(container => container.kind === nav())}
+                  onChange={event => {
+                    const id = event.currentTarget.value;
+                    if (workspaceViews.getContainer(id)?.kind === nav()) setSelectedContainers(value => ({ ...value, [nav()]: id }));
+                  }}>
+                  <Show when={!workspaceContainers().some(container => container.kind === nav())}><option value="">No open views</option></Show>
+                  <For each={workspaceContainers().filter(container => container.kind === nav())}>
+                    {(container, index) => <option value={container.id}>{index() + 1}. {container.label}</option>}
+                  </For>
+                </select>
+                <button class="mini-icon" type="button" aria-label={nav() === "files" ? "New Files view" : "New Git view"}
+                  title="Open another independent view" onClick={() => void newWorkspaceContainer(nav())}><Icon name="plus" size={13} /></button>
+                <button class="mini-icon" type="button" aria-label={nav() === "files" ? "Close Files view and its documents" : "Close Git view and its documents"}
+                  title="Close this view and its documents" disabled={!selectedContainers()[nav()]} onClick={() => closeWorkspaceContainer(nav())}><Icon name="close" size={13} /></button>
+              </div>
+              <Show when={!selectedContainers()[nav()]}>
+                <div class="navigator-empty">Open a {nav() === "files" ? "Files" : "Git"} view to browse independently.</div>
+              </Show>
             </Show>
-            <Show when={nav() === "git"}>
-              <GitNavigator fail={setError} openReview={openReview} />
-            </Show>
-            <Show when={nav() === "files"}>
-              <FilesNavigator fail={setError} openFile={openFile} activePath={activeFilePath()} />
-            </Show>
+            <For each={workspaceContainers().map(container => container.id)}>
+              {id => {
+                const kind = workspaceViews.getContainer(id).kind;
+                const state = createMemo(() => workspaceContainer(id));
+                return <div class="scoped-navigator" hidden={nav() !== kind || selectedContainers()[kind] !== id}>
+                  <Show when={kind === "files"} fallback={<GitNavigator id={id} state={state()} controller={workspaceViews} fail={setError} openReview={openReview} />}>
+                    <FilesNavigator id={id} state={state()} controller={workspaceViews} fail={setError} openFile={openFile} activePath={activeFilePath(id)} />
+                  </Show>
+                </div>;
+              }}
+            </For>
           </div>
           <div class="sidebar-footer">
             <button class="quiet settings-link" onClick={() => setSettings(true)}>
@@ -2719,7 +2865,7 @@ function App() {
               <CommandBar
                 workspaceEnabled={workspaceEnabled()}
                 sessions={sessions()}
-                tabs={tabs()}
+                tabs={tabs().map(tab => ({ ...tab, title: tabTitle(tab), path: tabDescription(tab) }))}
                 agent={{ title: agentTabTitle() }}
                 newChat={newChat}
                 chat={showChat}
@@ -2728,6 +2874,9 @@ function App() {
                 activateTab={setActiveTab}
                 openSession={openSession}
                 openFile={openFile}
+                searchFiles={searchWorkspaceFiles}
+                fileSearchContainer={() => ensureWorkspaceContainer("files")}
+                workspaceToken={workspaceToken()}
                 focusSurface={focusPaletteSurface}
               />
               <span class="connection" title={connection()}>
@@ -2749,11 +2898,12 @@ function App() {
                         class="doc-tab-target"
                         role="tab"
                         aria-selected={activeTab() === tab.id}
+                        aria-label={tabDescription(tab)}
                         aria-controls="workspace-document-panel"
                         tabIndex={activeTab() === tab.id ? 0 : -1}
                         onClick={() => setActiveTab(tab.id)}
                         onKeyDown={event => onTabKeyDown(event, tab.id)}
-                        title={tab.path || tabTitle(tab)}
+                        title={tabDescription(tab)}
                       >
                         <Icon name={tab.kind === "chat" || tab.kind === "agent-view" ? "chat" : tab.kind === "review" ? "git" : "file"} size={13} />
                         <span>{tabTitle(tab)}</span>
@@ -2944,25 +3094,27 @@ function App() {
               }}
             </For>
 
-            <Show when={surface().kind === "file"}>
-              <div class="surface code-surface">
-                <div class="surface-bar" aria-label="File source and access" title={surface().file.path}>
-                  <span class="surface-path">{dirname(surface().file.path) || "."}</span>
-                  <span class="surface-badge">read only</span>
-                </div>
-                <CodeFile text={surface().file.text} path={surface().file.path} />
-              </div>
-            </Show>
-
-            <Show when={surface().kind === "review"}>
-              <div class="surface code-surface">
-                <div class="surface-bar" aria-label="Diff source and scope" title={surface().review.path}>
-                  <span class="surface-path">{[surface().review.root, dirname(surface().review.path), surface().review.basis].filter(Boolean).join(" · ") || "."}</span>
-                  <span class="surface-badge">diff · read only</span>
-                </div>
-                <CodeDiff review={surface().review} />
-              </div>
-            </Show>
+            <For each={workspaceDocumentIds()}>
+              {id => {
+                const document = createMemo(() => workspaceDocument(id));
+                const data = createMemo(() => document()?.data);
+                const checkAccess = () => Boolean(workspaceViews.getDocument(id)?.data);
+                return <div class="surface code-surface" hidden={activeTab() !== id}>
+                  <div class="surface-bar" aria-label="Document source and access" title={data()?.path || ""}>
+                    <span class="surface-path">{data() ? [document()?.kind === "review" ? data().root : "", dirname(data().path), data().basis].filter(Boolean).join(" · ") || "." : "Read-only document"}</span>
+                    <span class="surface-badge">{document()?.kind === "review" ? "diff · " : ""}read only</span>
+                    <button class="mini-icon" type="button" aria-label="Refresh document" title="Refresh this exact document" onClick={() => void workspaceViews.refreshDocument(id)}><Icon name="refresh" size={13} /></button>
+                  </div>
+                  <Show when={document()?.pending}><div class="document-state" role="status">Loading…</div></Show>
+                  <Show when={document()?.error}><div class="document-state" role="status">{document().error}</div></Show>
+                  <Show when={data()} fallback={<div class="navigator-empty">{document()?.pending ? "" : "This document is unavailable. Refresh to try again."}</div>}>
+                    <Show when={document()?.kind === "file"} fallback={<CodeDiff review={data()} active={activeTab() === id} onCheckAccess={checkAccess} />}>
+                      <CodeFile text={data()?.text || ""} path={data()?.path || ""} active={activeTab() === id} onCheckAccess={checkAccess} />
+                    </Show>
+                  </Show>
+                </div>;
+              }}
+            </For>
           </div>
         </main>
       </div>

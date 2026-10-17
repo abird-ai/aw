@@ -8,6 +8,7 @@ license = "MIT"
 description = "Explicit host-owned workspace surfaces, independent of HTTP and UI"
 
 [dependencies]
+aw-platform = { version = "=0.15.0", path = "../aw-platform" }
 aw-git = { version = "=0.15.0", path = "../aw-git" }
 aw-terminal = { version = "=0.15.0", path = "../aw-terminal" }
 aw-tools = { version = "=0.15.0", path = "../aw-tools" }

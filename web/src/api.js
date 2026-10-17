@@ -21,6 +21,9 @@ export async function api(path, body, timeout = 15000, { signal } = {}) {
     if (!response.ok) {
       const error = new Error(typeof data.error === "string" ? data.error : "Request failed.");
       error.status = response.status;
+      for (const field of ["code", "source_id", "scope_id"]) {
+        if (typeof data[field] === "string") error[field] = data[field];
+      }
       throw error;
     }
     return data;
@@ -30,4 +33,4 @@ export async function api(path, body, timeout = 15000, { signal } = {}) {
   }
 }
 
-export const workspaceAction = body => api("/api/workspace/action", body);
+export const workspaceAction = (body, options) => api("/api/workspace/action", body, 15000, options);

@@ -100,10 +100,44 @@ fn default_file_search_limit() -> usize {
     80
 }
 
+/// Exact read-only workspace operation. Scope/source are supplied only by the
+/// outer View command; nested commands cannot launch a process or mutate Git.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ViewRequest {
+    Files {
+        #[serde(default)]
+        path: String,
+    },
+    FileSearch {
+        query: String,
+        #[serde(default = "default_file_search_limit")]
+        limit: usize,
+    },
+    File {
+        path: String,
+    },
+    GitList {
+        mode: GitMode,
+    },
+    GitOpen {
+        inventory_id: String,
+        item_id: String,
+    },
+    Review {
+        review_id: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Capabilities,
+    View {
+        source_id: String,
+        scope_id: String,
+        request: ViewRequest,
+    },
     Files {
         #[serde(default)]
         path: String,

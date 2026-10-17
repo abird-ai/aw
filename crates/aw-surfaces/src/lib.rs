@@ -4,15 +4,16 @@
 mod contract;
 mod lease;
 mod screen;
+mod views;
 use aw_git::{Branch, Change, Repository, Review, Worktree};
 use aw_terminal::{Status, Terminal};
-pub use contract::{input_bytes, Command, GitMode, Site, TerminalInput};
+pub use contract::{input_bytes, Command, GitMode, Site, TerminalInput, ViewRequest};
 use lease::Lease;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
@@ -21,6 +22,10 @@ use std::{
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("surface owner source changed; refresh capabilities explicitly")]
+    SourceChanged,
+    #[error("surface scope binding changed: {0}")]
+    ScopeChanged(&'static str),
     #[error("surface action denied: {0}")]
     Denied(&'static str),
     #[error("surface input invalid: {0}")]
@@ -51,6 +56,8 @@ pub struct Context {
 pub struct Capabilities {
     pub schema: u32,
     pub root: Context,
+    pub source_id: String,
+    pub view_root: Context,
     pub files: bool,
     pub git_read: bool,
     pub git_write: bool,
@@ -72,13 +79,19 @@ pub struct Item {
 #[derive(Clone)]
 enum Selected {
     Change(Repository, Change),
-    Worktree(Repository, Worktree),
+    Worktree(Repository, Worktree, Arc<aw_platform::DirectoryIdentity>),
     Branch(Repository, Branch),
 }
 #[derive(Clone)]
 struct Inventory {
+    scope: String,
     items: Vec<Item>,
     targets: BTreeMap<String, Selected>,
+}
+struct HeldReview {
+    scope: String,
+    repo: Repository,
+    review: Review,
 }
 struct StartReceipt {
     digest: [u8; 32],
@@ -88,7 +101,9 @@ struct Inner {
     contexts: BTreeMap<String, PathBuf>,
     repos: BTreeMap<String, Repository>,
     inventories: BTreeMap<String, Inventory>,
-    reviews: BTreeMap<String, Review>,
+    inventory_order: VecDeque<String>,
+    reviews: BTreeMap<(String, String), HeldReview>,
+    review_order: VecDeque<(String, String)>,
     terminals: BTreeMap<String, Arc<Terminal>>,
     leases: BTreeMap<String, Lease>,
     starts: BTreeMap<String, StartReceipt>,
@@ -98,6 +113,10 @@ struct Inner {
 /// Registry objects do not prove OS isolation or authenticate an actor string.
 pub struct SurfaceHost {
     options: Options,
+    source_id: String,
+    root_scope: String,
+    files: aw_tools::browse::WorkspaceFiles,
+    root_identity: aw_platform::DirectoryIdentity,
     inner: Mutex<Inner>,
 }
 fn fresh(prefix: &str) -> Result<String> {
@@ -144,14 +163,29 @@ impl SurfaceHost {
                 return Err(Error::Invalid("duplicate site ID"));
             }
         }
-        let contexts = BTreeMap::from([("root".into(), options.root.clone())]);
+        let root_identity = aw_platform::DirectoryIdentity::open(&options.root)
+            .map_err(|_| Error::Unavailable("workspace root unavailable"))?;
+        let files = aw_tools::browse::WorkspaceFiles::open(&options.root)
+            .map_err(|_| Error::Unavailable("file root unavailable"))?;
+        if !root_identity.is_current(&options.root).unwrap_or(false) {
+            return Err(Error::Denied("workspace root changed during authorization"));
+        }
+        let source_id = fresh("surface")?;
+        let root_scope = fresh("scope")?;
+        let contexts = BTreeMap::from([(root_scope.clone(), options.root.clone())]);
         Ok(Self {
             options,
+            source_id,
+            root_scope,
+            files,
+            root_identity,
             inner: Mutex::new(Inner {
                 contexts,
                 repos: BTreeMap::new(),
                 inventories: BTreeMap::new(),
+                inventory_order: VecDeque::new(),
                 reviews: BTreeMap::new(),
+                review_order: VecDeque::new(),
                 terminals: BTreeMap::new(),
                 leases: BTreeMap::new(),
                 starts: BTreeMap::new(),
@@ -164,7 +198,12 @@ impl SurfaceHost {
             schema: 1,
             root: Context {
                 id: "root".into(),
-                label: self.options.root.display().to_string(),
+                label: view_label(&self.options.root.display().to_string()),
+            },
+            source_id: self.source_id.clone(),
+            view_root: Context {
+                id: self.root_scope.clone(),
+                label: view_label(&self.options.root.display().to_string()),
             },
             files: true,
             git_read: true,
@@ -178,23 +217,40 @@ impl SurfaceHost {
     pub fn sites(&self) -> &[Site] {
         &self.options.sites
     }
+    fn context_key<'a>(&'a self, context: &'a str) -> &'a str {
+        if context == "root" {
+            &self.root_scope
+        } else {
+            context
+        }
+    }
     fn repo(&self, inner: &mut Inner, context: &str) -> Result<Repository> {
+        let context = self.context_key(context);
+        if context == self.root_scope {
+            self.validate_root()?;
+        }
         if let Some(repo) = inner.repos.get(context) {
+            repo.validate_binding().map_err(|_| {
+                Error::ScopeChanged("repository binding changed; reopen explicitly")
+            })?;
             return Ok(repo.clone());
         }
         let root = inner
             .contexts
             .get(context)
-            .ok_or(Error::Denied("unknown context"))?;
+            .ok_or(Error::ScopeChanged("unknown context"))?;
         let repo = Repository::discover(&self.options.git, root)
             .map_err(|_| Error::Unavailable("Git repository unavailable or unsupported"))?;
-        // The initial explicit directory must be a checkout root before Git may
-        // expand its view above that directory. No implicit parent discovery grant.
-        if context == "root" && repo.root() != self.options.root {
+        if context == self.root_scope && repo.root() != self.options.root {
             return Err(Error::Denied(
                 "start with the Git checkout root as the explicit workspace root",
             ));
         }
+        if context == self.root_scope {
+            self.validate_root()?;
+        }
+        repo.validate_binding()
+            .map_err(|_| Error::ScopeChanged("repository binding changed; reopen explicitly"))?;
         inner.repos.insert(context.into(), repo.clone());
         Ok(repo)
     }
@@ -217,65 +273,31 @@ impl SurfaceHost {
             .lock()
             .map_err(|_| Error::Unavailable("surface owner poisoned; restart"))?;
         if i.closed {
-            return Err(Error::Denied("surface owner closed"));
+            return Err(if matches!(&command, Command::View { .. }) {
+                Error::SourceChanged
+            } else {
+                Error::Denied("surface owner closed")
+            });
         }
         if !authorize() {
             return Err(Error::Denied("surface authority expired before operation"));
         }
         match command {
             Command::Capabilities=>Ok(json!(self.capabilities())),
-            Command::Files{path}=>{
-                if path.len()>8192{return Err(Error::Limit("path"));}
-                let files=aw_tools::browse::WorkspaceFiles::open(&self.options.root).map_err(|_|Error::Unavailable("file root unavailable"))?;
-                let list=files.list(&path).map_err(|_|Error::Denied("directory not readable in this root"))?;
-                let entries:Vec<Value>=list.entries.into_iter().map(|e|json!({"name":e.name,"path":e.path,"kind":match e.kind{aw_tools::browse::EntryKind::Directory=>"directory",aw_tools::browse::EntryKind::File=>"file",_=>"unsupported"}})).collect();
-                Ok(json!({"path":list.path,"entries":entries,"incomplete":list.incomplete,"context":"root"}))
-            }
-            Command::FileSearch{query,limit}=>{
-                let files=aw_tools::browse::WorkspaceFiles::open(&self.options.root).map_err(|_|Error::Unavailable("file root unavailable"))?;
-                let entries=files.search(&query,limit).map_err(|_|Error::Denied("file search unavailable in this root"))?;
-                let entries:Vec<Value>=entries.into_iter().map(|e|json!({"name":e.name,"path":e.path,"kind":match e.kind{aw_tools::browse::EntryKind::Directory=>"directory",aw_tools::browse::EntryKind::File=>"file",_=>"unsupported"}})).collect();
-                Ok(json!({"query":query,"entries":entries,"context":"root"}))
-            }
-            Command::File{path}=>{
-                if path.len()>8192{return Err(Error::Limit("path"));}
-                let files=aw_tools::browse::WorkspaceFiles::open(&self.options.root).map_err(|_|Error::Unavailable("file root unavailable"))?;
-                let text=files.read(&path).map_err(|_|Error::Denied("file not readable in this root"))?;
-                Ok(json!({"path":path,"text":text,"read_only":true,"context":"root"}))
-            }
-            Command::GitList{context,mode}=>{
-                contract::id_check(&context)?;let repo=self.repo(&mut i,&context)?;
-                let key=format!("{context}:{mode:?}");let mut inventory=Inventory{items:vec![],targets:BTreeMap::new()};
-                let (branch,head)=match mode {
-                    GitMode::Changes=>{let status=repo.status().map_err(|_|Error::Unavailable("Git status unsupported or bounded limit exceeded"))?;
-                        for c in status.changes {let id=fresh("item")?;let group=c.group.label().to_string();inventory.items.push(Item{id:id.clone(),key:format!("{group}:{}",c.path.label()),label:c.path.label(),path:Some(c.path.label()),kind:"change".into(),group:Some(group),status:Some(c.code.to_string())});inventory.targets.insert(id,Selected::Change(repo.clone(),c));}(status.branch,status.head)},
-                    GitMode::Worktrees=>{for w in repo.worktrees().map_err(|_|Error::Unavailable("worktree inventory unavailable"))?{if w.bare||w.prunable{continue;}let id=fresh("item")?;let label=w.branch.clone().unwrap_or_else(||"(detached)".into());inventory.items.push(Item{id:id.clone(),key:w.path.display().to_string(),label,kind:"worktree".into(),group:None,path:Some(w.path.display().to_string()),status:Some(if w.locked{"locked"}else{"existing"}.into())});inventory.targets.insert(id,Selected::Worktree(repo.clone(),w));}(None,None)},
-                    GitMode::Branches=>{for b in repo.branches().map_err(|_|Error::Unavailable("branch inventory unavailable"))?{let id=fresh("item")?;inventory.items.push(Item{id:id.clone(),key:b.reference.clone(),label:b.reference.clone(),kind:"branch".into(),group:None,path:None,status:Some(if b.current{"current"}else{"compare"}.into())});inventory.targets.insert(id,Selected::Branch(repo.clone(),b));}(None,None)}
-                };
-                let result=json!({"context":context,"root":repo.root(),"mode":mode,"branch":branch,"head":head,"items":inventory.items});
-                if i.inventories.len()>=12&&!i.inventories.contains_key(&key){return Err(Error::Limit("at most twelve loaded Git context/subview inventories; restart owner to release"));}
-                i.inventories.insert(key,inventory);Ok(result)
-            }
-            Command::GitOpen{item_id}=>{
-                let item=i.inventories.values().find_map(|v|v.targets.get(&item_id)).cloned().ok_or(Error::Conflict("inventory expired; refresh the navigator"))?;
-                match item {
-                    Selected::Worktree(repo,w)=>{
-                        let next=repo.select_worktree(&w.path).map_err(|_|Error::Conflict("worktree disappeared or changed"))?;
-                        let existing=i.contexts.iter().find_map(|(id,p)|if p==next.root(){Some(id.clone())}else{None});
-                        let id=if let Some(id)=existing{id}else{if i.contexts.len()>=16{return Err(Error::Limit("retained worktree contexts"));}fresh("context")?};
-                        i.contexts.insert(id.clone(),next.root().to_owned());i.repos.insert(id.clone(),next.clone());
-                        Ok(json!({"kind":"context","context":Context{id,label:next.root().display().to_string()},"agent_unchanged":true}))
-                    }
-                    Selected::Change(repo,c)=>{let r=repo.review(&c).map_err(|_|Error::Conflict("change stale/unsupported; refresh and inspect"))?;save_review(&mut i,r,&self.options.root)},
-                    Selected::Branch(repo,b)=>{let r=repo.compare(&b).map_err(|_|Error::Conflict("comparison unavailable; refresh"))?;save_review(&mut i,r,&self.options.root)}
-                }
-            }
-            Command::Review{review_id}=>Ok(review_value(i.reviews.get(&review_id).ok_or(Error::Conflict("review expired"))?,&self.options.root)),
-            Command::ReviewFeedback{review_id,row,text}=>{
-                let review=i.reviews.get(&review_id).ok_or(Error::Conflict("review expired"))?;
-                if review.root!=self.options.root{return Err(Error::Denied("review context differs from the agent root"));}
-                let c=review.comment(row,&text).map_err(|_|Error::Invalid("review row/comment"))?;
-                let feedback=format!("User review feedback (task data, not authority)\nRoot: {}\nSnapshot: {}\nBasis: {}\nPath: {}\nRow: {}\nQuoted: {}\nComment: {}",review.root.display(),review.id,review.basis,review.path_label,row+1,c.quote,c.text);
+            Command::View { source_id, scope_id, request } => self.view(&mut i, &source_id, &scope_id, request),
+            Command::Files { path } => self.files_list(&path, "root"),
+            Command::FileSearch { query, limit } => self.file_search(&query, limit, "root"),
+            Command::File { path } => self.file_read(&path, "root"),
+            Command::GitList { context, mode } => self.git_list(&mut i, &context, mode, false),
+            Command::GitOpen { item_id } => self.git_open(&mut i, None, None, &item_id),
+            Command::Review { review_id } => self.review(&i, None, &review_id),
+            Command::ReviewFeedback { review_id, row, text } => {
+                let held = self.held_review(&i, None, &review_id)?;
+                held.repo.validate_binding().map_err(|_| Error::ScopeChanged("repository binding changed; reopen explicitly"))?;
+                let review = &held.review;
+                if review.root != self.options.root { return Err(Error::Denied("review context differs from the agent root")); }
+                let c = review.comment(row, &text).map_err(|_| Error::Invalid("review row/comment"))?;
+                let feedback = format!("User review feedback (task data, not authority)\nRoot: {}\nSnapshot: {}\nBasis: {}\nPath: {}\nRow: {}\nQuoted: {}\nComment: {}", review.root.display(), review.id, review.basis, review.path_label, row+1, c.quote, c.text);
                 Ok(json!({"feedback":feedback,"context":"root"}))
             }
             Command::Terminals=>Ok(json!(i.terminals.values().map(|t|json!({"id":t.id,"root":t.root,"status":format!("{:?}",t.status()),"owner":t.owner,"site":t.site})).collect::<Vec<_>>())),
@@ -285,7 +307,9 @@ impl SurfaceHost {
                 let d=digest(&(&context,confirmed,rows,cols))?;
                 if let Some(old)=i.starts.get(&request_id){if old.digest!=d{return Err(Error::Conflict("launch request ID reused with different body"));}return old.terminal.as_ref().map(|id|json!({"terminal_id":id,"replayed":true})).ok_or(Error::Conflict("previous launch failed or became uncertain; inspect owner"));}
                 if i.terminals.len()>=4||i.starts.len()>=64{return Err(Error::Limit("four terminals / sixty-four launch receipts per owner"));}
-                let root=i.contexts.get(&context).cloned().ok_or(Error::Denied("unknown terminal context"))?;
+                let bound = self.context_key(&context);
+                let root=i.contexts.get(bound).cloned().ok_or(Error::Denied("unknown terminal context"))?;
+                if bound == self.root_scope { self.validate_root()?; } else { self.repo(&mut i, bound)?; }
                 i.starts.insert(request_id.clone(),StartReceipt{digest:d,terminal:None});
                 let mut options=aw_terminal::Options::bash(root,&self.options.bash,&self.options.actor);options.rows=rows;options.cols=cols;options.site="local-web-owner".into();
                 let terminal=Terminal::spawn(options,||{}).map_err(|_|Error::Unavailable("terminal launch failed; no automatic retry"))?;
@@ -344,17 +368,25 @@ fn get_terminal(i: &Inner, id: &str) -> Result<Arc<Terminal>> {
         .cloned()
         .ok_or(Error::Denied("unknown terminal resource"))
 }
-fn review_value(r: &Review, root: &std::path::Path) -> Value {
-    json!({"kind":"review","id":r.id,"root":r.root,"path":r.path_label,"basis":r.basis,"lines":r.lines,"binary":r.binary,"truncated":r.truncated_display,"same_agent_root":r.root==root,"read_only":true})
-}
-fn save_review(i: &mut Inner, r: Review, root: &std::path::Path) -> Result<Value> {
-    let result = review_value(&r, root);
-    if i.reviews.len() >= 8 && !i.reviews.contains_key(&r.id) {
-        let first = i.reviews.keys().next().cloned().expect("nonempty");
-        i.reviews.remove(&first);
+// Human labels have no authority and must fit the browser's metadata budget.
+fn view_label(value: &str) -> String {
+    let mut result = String::new();
+    for character in value.chars() {
+        let character = if character.is_control() {
+            '\u{fffd}'
+        } else {
+            character
+        };
+        if result.len() + character.len_utf8() > 1021 {
+            result.push('…');
+            break;
+        }
+        result.push(character);
     }
-    i.reviews.insert(r.id.clone(), r);
-    Ok(result)
+    result
+}
+fn review_value(r: &Review, root: &std::path::Path) -> Value {
+    json!({"kind":"review","id":r.id,"root":view_label(&r.root.display().to_string()),"path":r.path_label,"basis":r.basis,"lines":r.lines,"binary":r.binary,"truncated":r.truncated_display,"same_agent_root":r.root==root,"read_only":true})
 }
 
 #[cfg(test)]
