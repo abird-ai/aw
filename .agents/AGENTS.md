@@ -1,7 +1,9 @@
 # aw working instructions
 
 Start with the plan index, then the selected plan's `TODO.md`.
-The checklist rules are in TODO-SPEC.md.
+The checklist rules — plan layout, the optional `README.md` details with
+`Author:`/`Co-authors:`, the commit-grouped `TODO.md`, and the `## Tests and
+verification` section — are in TODO-SPEC.md.
 Read the relevant live documentation under `.agents/docs/` and actual source
 before changing behavior. Git, source and executed tests outrank dated prose.
 There is no requirement to reconstruct or read old comprehensive handoffs.
