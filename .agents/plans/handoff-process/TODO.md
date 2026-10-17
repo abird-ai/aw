@@ -1,5 +1,7 @@
 # Simple TODO handoff process
 
+Status: active
+
 Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
 Implemented at `9e01369`; later results retain their own command/commit scope.
 
@@ -21,4 +23,12 @@ Implemented at `9e01369`; later results retain their own command/commit scope.
 
 ## Uncommitted
 
-None.
+- [~] Produce the user-requested comprehensive onboarding handoff in `.agents/docs/HANDOFF.md`: initial design, retained historical steps/specs/decisions, current source/contracts, exact verification limits, pending work and a next-agent prompt.
+- [ ] Cross-check all non-reserved live docs and retained dated plan records against the handoff coverage map; preserve originals and current TODO authority.
+- [ ] Independently review completeness, relative links, Git references, safety instructions and the final clean checkpoint; reconcile completed agent scratch.
+
+## Tests and verification
+
+- [ ] Handoff coverage includes every retained non-reserved live doc and top-level historical plan, plus each current plan/checklist.
+- [ ] Local links/source paths and in-repository checkpoint references resolve; historical unavailable references are explicitly identified.
+- [ ] Independent review confirms no new release/provider/restored-State authority or unexecuted runtime pass is implied.

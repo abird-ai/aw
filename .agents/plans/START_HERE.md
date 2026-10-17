@@ -8,6 +8,12 @@
 4. Execute relevant tests. Record concise results and known implementation
    commits in the plan, then mark its index line done when nothing remains.
 
+For the user-requested project-wide context, read the
+[comprehensive handoff](../docs/HANDOFF.md). It explains the original design,
+retained phase/specification history, current source contracts and pending work,
+and contains a prompt for the next coordinating agent. The plan TODOs remain the
+progress authority; the handoff is an onboarding snapshot, not an evidence archive.
+
 The accepted historical checkpoint is
 `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`. Use Git history for older detail;
 there is no mandatory master reread, generated handoff or evidence archive.

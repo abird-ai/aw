@@ -10,4 +10,4 @@ reconcile completion through the coordinator. Git retains older detail.
 - [ ] [Remaining native/browser UX convergence](ux-convergence/TODO.md)
 - [ ] [Optional embedded targets and independent certification](embedded-platforms/TODO.md)
 - [ ] [Restored-State authority](restored-state-authority/TODO.md)
-- [x] [Simple TODO handoff process](handoff-process/TODO.md) — Done
+- [~] [Simple TODO handoff process and comprehensive onboarding](handoff-process/TODO.md)
