@@ -38,42 +38,52 @@ Design and binding decisions: [README.md](README.md).
 - [x] Allocate checked UI-lifetime Find request IDs so close/restore of a tab cannot accept another lifetime's actual reply; keep cancellation/source/generation admission intact.
 - [x] Two actual-executor regressions failed before the fix and passed afterward; nearest native suite passed 153 tests with one existing ignored benchmark. Final exact-commit gate, feature boundary, native package/version and real PTY acceptance passed below.
 
+### `6b96f010995ffa49414486ae63234a90ec9102e6` — retained Windows directory bindings
+
+- [x] Pin canonical root, ancestor and per-operation descendant directories with opened metadata handles that deny delete sharing; preserve leaf no-follow/hardlink, bounded read, cancellation and edit-CAS rules.
+- [x] Compile four real-filesystem Windows regression tests on cumulative Files candidate `3851dbf`. Native Windows execution remains unchecked; Windows ancestor/directory rename or deletion is blocked while the corresponding handles live.
+
+### `3851dbffd808491916e07a3642422bd0f7b465b0` — native scoped Files containers
+
+- [x] Compose Files navigators and document groups in flat, stable-ID ownership under the existing pane/tab limits; retain invoking-container preview policy and Explorer focus, including split-group routing.
+- [x] Bind File identity and all derived caches to exact scope/path; retain explicitly opened root capabilities and human launch roots across Agent presentation changes. Saved IDs and labels grant no access.
+- [x] Add explicit folder open/reconnect through the existing palette and bounded executor; reconnect moved File tabs by their own scope, prune unused capabilities and preserve bounded display-only folder labels.
+- [x] Migrate consistent native v1/v2 layouts to v3 without adding panes or changing geometry, focus, legacy IDs or exhausted allocators; reject malformed/mixed versions and preserve root binding, atomic/no-follow and 64 KiB protections.
+- [x] Fence read/list/search/highlight/find work by capability binding, exact resource/owner and checked lifetime across close/rebind/restore. Preserve ordinary moved-view state; clear revoked content and reissue pending refresh/palette queries correctly.
+- [x] Admit review feedback against the lossless canonical current Agent root independently of human Files roots; retain owner serialization and exact review/index admission.
+- [x] Cover model/persistence, actual retained-root backend and real native Browser/executor/TestBackend regressions, including held stale replies and split-container routing.
+- [x] Pass the pinned product gate, Workspace feature boundary, Windows test compilation and native Linux package/version on this exact commit; actual two-root terminal and restart/reconnect acceptance passed with zero effects and restored stty. Windows runtime remains open.
+
 ## Uncommitted
 
-- [~] Compose native Files as a rooted navigator and scoped document group; preserve separate File/Diff preview policy and Explorer focus — layout, capability and native agents.
-- [~] Add exact scope/path file identity, retained root capabilities, explicit folder open/reconnect and in-memory root binding across Agent presentation changes.
-- [~] Migrate v1/v2 layouts to flat v3 Files ownership without extra panes, changed geometry or saved-root grants.
-- [~] Fence file/list/search/highlight/find work and caches across close/rebind/restore; prune unused external capabilities.
-- [~] Pin Windows scoped root/ancestor/descendant directory handles so path replacement cannot redirect retained scopes; preserve leaf/CAS/cancellation policy.
-- [~] Preserve bounded display-only saved folder labels and reconnect moved File tabs through their exact scope; labels never authorize roots.
-- [~] Admit review feedback against a lossless canonical current Agent-root projection independently of human Files roots.
 - [ ] Compose native Git using existing repository contexts and fresh exact-review/index admission; worktree selection cannot retarget Agent/Files.
-- [ ] Add a flat stable-ID container graph with one parent, cycle/orphan validation and one container level, within global 8-pane/32-tab limits.
+- [ ] Extend the delivered flat Files ownership model to Git and later container kinds; preserve one parent/level, stable IDs, orphan validation and global 8-pane/32-tab limits.
 - [ ] Add browser counterparts through existing capability APIs, with browser-specific acceptance and migration before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 
 ## Tests and verification
 
-- [x] Store exact-ID/authority/revocation/active-run/history/no-effect regressions — `cargo test --workspace --locked`, pinned Nix shell on `3b0dbb5`, passed.
-- [x] Layout migration, independent descriptors, split/move/global limits and native persistence protections — same executed workspace Cargo gate on `3b0dbb5`, passed.
-- [x] Native real-Reader/executor/TestBackend cases: two targets, independent viewport/find/selection, owner/draft/caret, duplicate identities, expiry/revocation and unavailable states — same executed workspace Cargo gate on `3b0dbb5`, passed.
+- [x] Store exact-ID/authority/revocation/active-run/history/no-effect regressions — `cargo test --workspace --locked`, pinned Nix shell on `3851dbf`, passed.
+- [x] Layout migration, independent descriptors, split/move/global limits and native persistence protections — same executed workspace Cargo gate on `3851dbf`, passed.
+- [x] Native real-Reader/executor/TestBackend cases: two targets, independent viewport/find/selection, owner/draft/caret, duplicate identities, expiry/revocation and unavailable states — same executed workspace Cargo gate on `3851dbf`, passed.
 - [x] Actual native PTY — `aw workspace open local --config-file CONFIG --provider-profile fixture --state-dir STATE --workspace-directory ROOT --workspace-layout LAYOUT --tools-mode off`, synthetic private fixtures. Broad two-view/Unicode/resize/`o` acceptance passed on `1c2ec6e`; focused Searching→1 match/No matches/80 matches, exact pins, draft/caret, zero effects, quit 0 and identical stty passed with the immutable Nix executable on `3b0dbb5`.
-- [x] `cargo check --locked -p aw-cli --no-default-features --features workspace` — pinned Nix shell on `3b0dbb5`, passed; the new unused binding warning is gone.
-- [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `3b0dbb5`, passed.
-- [x] `cargo fmt --all -- --check` — pinned Nix shell on `3b0dbb5`, passed.
-- [x] `cargo test --workspace --locked` — pinned Nix shell on `3b0dbb5`, 1,572 passed, 2 existing ignored, no failures.
-- [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `3b0dbb5`, 107 passed.
-- [x] Changed-content committed-Find and close/restore ABA regressions, including inactive footer/focus and consumed flash selection — executed by the workspace Cargo gate on `3b0dbb5`, passed.
-- [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=3b0dbb502005570cca30e2cd52cba60c052f3587#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
+- [x] `cargo check --locked -p aw-cli --no-default-features --features workspace` — pinned Nix shell on `3851dbf`, passed.
+- [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `3851dbf`, passed.
+- [x] `cargo fmt --all -- --check` — pinned Nix shell on `3851dbf`, passed.
+- [x] `cargo test --workspace --locked` — pinned Nix shell on `3851dbf`, 1,608 passed, 2 existing ignored, no failures.
+- [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `3851dbf`, 107 passed.
+- [x] Changed-content committed-Find and close/restore ABA regressions, including inactive footer/focus and consumed flash selection — executed by the workspace Cargo gate on `3851dbf`, passed.
+- [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=3851dbffd808491916e07a3642422bd0f7b465b0#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
 - [ ] Further native narrow/maximize, modal-focus and child-PTY acceptance; browser/container/docking-specific checks after those slices exist — remain open beyond this checkpoint.
 
-- [ ] Scoped Files layout regressions: two same-path scopes, container membership/global limits, legacy full/exhausted layouts, malformed/mixed versions and split/move/close/save/load.
-- [ ] Actual retained-root backend regressions: distinct read/list/search results, unknown/revoked/reconnected scopes, root replacement and capability cleanup.
-- [ ] Native Browser/executor/TestBackend acceptance: independent same-path content/find/viewport, invoking-container preview/Explorer focus, stale reads/search/highlights and unchanged Agent/draft/effect admission.
-- [ ] Current scoped-Files candidate: pinned bootstrap/fmt, locked workspace Cargo and six web suites; Workspace feature boundary, exact native package/version and real-terminal two-root acceptance.
+- [x] Scoped Files layout regressions: two same-path scopes, container membership/global limits, legacy full/exhausted layouts, malformed/mixed versions and split/move/close/save/load — `cargo test --workspace --locked`, pinned Nix shell on `3851dbf`, passed.
+- [x] Actual retained-root backend regressions: distinct read/list/search results, unknown/revoked/reconnected scopes, root replacement and capability cleanup — same executed workspace Cargo gate on `3851dbf`, passed.
+- [x] Native Browser/executor/TestBackend acceptance: independent same-path content/find/viewport, invoking-container preview/Explorer focus, stale reads/search/highlights, explicit refresh/reconnect races, moved-tab labels and unchanged Agent/draft/effect admission — same executed workspace Cargo gate on `3851dbf`, passed.
+- [x] Actual scoped-Files PTY — `aw workspace open local --config-file CONFIG --provider-profile fixture --state-dir STATE --workspace-directory ROOT --workspace-layout LAYOUT --tools-mode off`, immutable Nix package on `3851dbf`, private synthetic fixtures: distinct same-path Unicode roots, independent Find/scroll, Explorer focus, exact draft/caret, save/split/load, restart with unavailable scope, explicit same-ID reconnect and 100×30→220×64 resize passed. Both app exits were 0 with identical before/after stty; sessions/runs/run_events/invocation_receipts/pipeline_runs/team_runs stayed zero.
 
-- [ ] Windows scoped-directory handle tests: cross-target compilation and real Windows execution are separate results; native runtime remains open without an actual host.
+- [x] Windows scoped-directory crate and four real-filesystem tests compile — `cargo check --locked -p aw-platform-win --target x86_64-pc-windows-gnu --tests`, pinned Nix shell with Rust 1.98.1 Windows target on `3851dbf`, passed.
+- [ ] Windows scoped-directory handle tests — execute on an actual Windows host; reparse-point case requires symlink privilege or Developer Mode. Compilation does not supply this runtime result.
 
 ## Deferred
 

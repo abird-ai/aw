@@ -119,6 +119,38 @@ Source seams: `src/workspace/files.rs`, `src/workspace/ui/files_views.rs`,
 `crates/aw-workspace/src/layout.rs`, `crates/aw-tools/src/browse.rs`,
 `crates/aw-platform-win/src/scoped_fs.rs`.
 
+## Next slice: native Git containers
+
+Reuse the same flat ownership model for Git navigators and document groups,
+with an explicit Files or Git binding. Preserve stable IDs, global limits,
+split/move/close rules and the invoking container's remembered document group.
+Reuse existing Repository contexts, worktree membership checks and exact
+ReviewID identity; a branch comparison or worktree selection never retargets
+an Agent or Files capability.
+
+Carry origin container, navigator, repository and checked request lifetime
+through every Git completion. A delayed review opens only in that container's
+current document group and preserves Explorer focus. Closing, restoring or
+replacing the binding rejects stale replies. Keep fresh exact-review/HEAD
+validation and existing owner-serialized index admission before staging;
+review feedback still requires the canonical current Agent root.
+
+Stop when two Git containers inspect the same relative path in different
+existing worktrees independently, delayed results stay with their origin,
+and explicit fresh staging changes only the selected index. Stale reviews
+cannot stage; Files bindings, Agent root, draft/caret and worktree HEADs remain
+unchanged. Browser counterparts and docking remain later slices.
+
+Parallel ownership: model/persistence, Git backend/context retention, and native
+UI are separate implementation assignments. Agree container actions/lookups,
+opaque Git context ID, binding epoch and completion identity before editing.
+The coordinator owns shared plans and API reconciliation; retain existing
+owner/index logic unless a concrete defect warrants a separate patch.
+
+Source seams: `src/workspace/git.rs`, `src/workspace/ui.rs`,
+`crates/aw-git/src/lib.rs`, `src/workspace/owner.rs` and
+`crates/aw-workspace/src/layout.rs`.
+
 ## References
 
 - [Live Workspace behavior](../../docs/WORKSPACE.md)
