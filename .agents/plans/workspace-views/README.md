@@ -498,9 +498,10 @@ regressions; actual two-page Chrome 155 / private LocalWeb where receiver
 reloads the File **after the original page closes**, 390×844 Dark geometry
 holds, and all six SQLite effect counters remain zero. The source-HEAD
 product gates and byte-identical eight-asset Vite rebuild are recorded in
-`TODO.md`. This proves a bounded **File presentation move**, not remote-device
-authentication, native terminal docking, or lossless transfer of CodeMirror
-Find/viewport/selection across windows.
+`TODO.md`. At the original File-only checkpoint this proved a bounded
+**File presentation move**; the later `41e66c4` checkpoint below adds
+bounded CodeMirror continuity. Remote-device authentication and native
+terminal docking remain separate.
 
 #### Immutable Git Review extension — signed `00559eb070cc07bd96956f8d6b23fe9394202ca5`
 
@@ -539,12 +540,59 @@ Chrome covered the launch-root Git Review; non-root scope was
 verified with actual HTTP and frontend model tests, not claimed as
 a separate live non-root screenshot.
 
-**Still open:** cross-window CodeMirror Find/viewport/selection placement
-and focus continuity, native second-terminal/PTY lifecycle/lease docking,
-paired/remote-browser admission and ambiguous origin/receiver crash
-acceptance. These require separate bounded work; an accepted ticket is
-not proof of continuously live receiver process. No SQL/JSONL/layout
-migration, provider permission or Git write operation is introduced.
+#### Bounded CodeMirror presentation continuity — signed `41e66c4ae115c48b450166fc5feec7c57c1fcec1`
+
+The read-only File and immutable Review handoff now includes an **optional,
+strictly validated version-1 presentation** in the same short-lived,
+owner-held ticket: SHA-256 fingerprint, Find query (maximum 512 UTF-16
+units/1024 UTF-8 bytes), selected match, up to two panes' selection and
+viewport offsets, and an explicit Find/editor/none focus hint. No
+document plaintext, DOM object, serialized editor, provider secret,
+Git write capability, PTY or active Agent is carried in this metadata.
+A Find query is user-entered text, so it is transported only within
+the existing authenticated ticket, never in the URL fragment, console,
+persisted layout, browser storage or a cross-window message.
+
+The origin captures the active read-only CodeMirror presentation during
+the direct popout gesture (or keyboard activation), with bounded gesture
+lifetime and cancellation cleanup. The receiver authenticates and performs
+its **own** exact File/Review read, verifies the SHA-256 checksum locally,
+mounts CodeMirror, restores Find/selection/viewport/focus, and only then
+acknowledges admission. For Files, the Rust owner independently verifies
+the original authorized content fingerprint at prepare, inspect,
+accept and release; changed content prevents the origin from releasing.
+For Reviews, immutable retained Review ID and exact Git scope remain
+authoritative, with independent receiver content comparison and existing
+owner reauthorization. A checksum is a consistency guard, **not** an
+access grant or replacement for resource identity.
+
+A read-only CodeMirror editor is now keyboard focusable without becoming
+editable. When a new viewport differs, pixel scroll may clamp; the
+Review's paired panes may synchronize their vertical offsets. Exact
+selection/text positions are checked against the independently loaded
+document before restoration. An unavailable/different owner, stale
+document or failed browser restore does not authorize a new window
+to acquire execution ownership.
+
+**Evidence:** On the exact signed source HEAD, 14 authenticated docking
+tests, 166 Node tests (nine suites), 132 web-only Rust tests, 1,288 other
+Rust tests, 201 Store library tests and 156 Store integration tests all
+passed. Formatting, strict Clippy, Workspace-only/minimal feature builds
+and a byte-identical rebuild of all eight browser assets passed in the
+pinned Nix shell. Four real Chrome 155 two-page transfers (File/Review ×
+Find/editor focus) passed at 390×844 Dark, including query/current match,
+selection, focus, viewport, origin-close/receiver-refresh and zero JS/
+execution effects with unchanged synthetic Git HEAD/index. These were
+private synthetic fixtures, not live personal data or paid requests.
+The complete Rust test coverage was executed as **split packages**, not
+claimed as one uninterrupted monolithic Cargo command.
+
+**Still open:** broader multi-window crash/restart, same-ID ABA,
+paired/remote-browser authorization, ambiguous ACK and full lifecycle
+acceptance; native second-terminal/PTY control and restoration.
+An accepted ticket cannot prove the receiver process is continuously
+live. No SQL/JSONL/native-layout migration, provider permission or Git
+write operation is introduced.
 
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
@@ -576,12 +624,13 @@ in a browser message.
    cross-terminal/PTY attach must have its **own** explicit original Runtime
    handle and terminal restoration proof, not inferred from browser moves.
 
-The **read-only File and immutable Git Review** ticket/API and browser
-popup are implemented; native cross-terminal docking, persistent/window-crossing
-Find/scroll/selection metadata, broader two-browser/paired authorization
-and crash/ABA/focus acceptance remain open. No new serialized layout was
-introduced: version **0.15.0**, SQLite **33**, JSONL **1**, native saved
-layout **v4**, and all authority/failure boundaries remain unchanged.
+The **read-only File and immutable Git Review** ticket/API, browser popup
+and bounded Find/scroll/selection/focus continuity are implemented.
+Native cross-terminal docking, persistent reopening after browser restart,
+broader paired-browser admission and crash/ABA/UNKNOWN acceptance are open.
+No serialized layout migration was introduced: version **0.15.0**, SQLite
+**33**, JSONL **1**, native saved layout **v4**, and all original runtime
+and resource authority boundaries remain unchanged.
 
 ## References
 

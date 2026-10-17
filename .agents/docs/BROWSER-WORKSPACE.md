@@ -113,12 +113,26 @@ change the receiving navigator's launch-root permission. A stale or
 evicted Review, replaced worktree directory or lost authorization
 fails without silently moving anything.
 
-This is **read-only document presentation only**: native
-terminal/process ownership, cross-window Find/scroll/selection,
-remote-device authentication, broader crash-recovery and native
-docking remain separate. These browser actions do not change SQLite,
-JSONL, workspace layout, the original Agent, Git checkout/index,
-provider credentials or model/tool admission.
+Read-only Files and Git Reviews now also preserve **bounded
+cross-window editor presentation**. The sender captures its Find query,
+selected match, per-pane CodeMirror selection/viewport and keyboard focus
+intent. The short-lived authenticated handoff carries this metadata and
+a SHA-256 content fingerprint, **not** the document snapshot, DOM, browser
+credential or root capability. The receiver independently loads the exact
+authorized document, checks the fingerprint and restores Find/selection/
+scroll/focus before accepting; the original File content is also checked
+by the Rust owner before release. Changed/denied content keeps the source
+view open. Read-only CodeMirror content can receive keyboard focus but
+remains non-editable. Scroll is clamped when the receiving layout differs,
+and the two Git Diff panes may synchronize their offsets. Find queries
+may contain private user-entered text, so they remain inside the existing
+authenticated handoff, not in the URL fragment, browser storage or logs.
+
+These are **read-only presentation actions only**: native terminal/process
+ownership, broader crash/restart and ABA cases, remote/paired-browser
+authentication, and native PTY docking remain separate. No SQLite, JSONL
+or native-layout migration, original Agent retargeting, Git write, provider
+credential or model/tool admission is introduced.
 See [Workspace views](../plans/workspace-views/README.md) for the
 remaining gates and failure semantics.
 
