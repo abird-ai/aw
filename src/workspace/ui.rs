@@ -581,6 +581,7 @@ enum UiBackgroundResult {
         query: String,
         matches: Vec<usize>,
         choosing: bool,
+        error: Option<&'static str>,
     },
 }
 

@@ -126,6 +126,10 @@ impl Ui {
             },
         );
         if query.is_empty() {
+            self.find_cancel.remove(&tab);
+            if choosing {
+                self.notice = Self::find_notice(0);
+            }
             return true;
         }
         let agent_lines =
@@ -233,6 +237,7 @@ impl Ui {
                         query,
                         matches,
                         choosing,
+                        error: None,
                     });
                 }
             },
@@ -242,14 +247,26 @@ impl Ui {
                     generation,
                     query: panic_query,
                     matches: Vec::new(),
-                    choosing: false,
+                    choosing,
+                    error: Some("Find failed; try the search again"),
                 });
             },
         ) {
             self.notice = error.to_string();
             self.find_cancel.remove(&tab);
+        } else if choosing {
+            self.notice = "Searching…".into();
         }
         true
+    }
+
+    pub(super) fn find_notice(count: usize) -> String {
+        if count == 0 {
+            "No matches".into()
+        } else {
+            let label = if count == 1 { "match" } else { "matches" };
+            format!("{count} {label} · press a flash label or n/N")
+        }
     }
 
     pub(super) fn update_find(&mut self, tab: Id, query: String, choosing: bool) {
@@ -283,6 +300,9 @@ impl Ui {
         );
         if let Some(row) = matches.get(selected) {
             self.jump_to_row(tab, *row);
+        }
+        if choosing {
+            self.notice = Self::find_notice(matches.len());
         }
     }
 
@@ -343,12 +363,6 @@ impl Ui {
                     }
                     SearchTarget::Main { tab } => {
                         self.update_find(tab, query, true);
-                        let count = self.find.get(&tab).map_or(0, |state| state.matches.len());
-                        self.notice = if count == 0 {
-                            "No matches".into()
-                        } else {
-                            format!("{count} matches · press a flash label or n/N")
-                        };
                     }
                 }
                 true
@@ -1740,5 +1754,95 @@ impl Ui {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_async_find_reports_only_its_validated_completion() {
+        fn commit(ui: &mut Ui, tab: Id, query: &str) {
+            let mut editor = Editor::default();
+            editor.set(query).unwrap();
+            ui.search = Some(SearchState {
+                editor,
+                target: SearchTarget::Main { tab },
+                original: String::new(),
+            });
+            assert!(ui.search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert_eq!(ui.notice, "Searching…");
+        }
+
+        fn complete(ui: &mut Ui, tab: Id) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ui.find_cancel.contains_key(&tab) && Instant::now() < deadline {
+                while let Ok(result) = ui.background_rx.try_recv() {
+                    ui.apply_background_result(result);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!ui.find_cancel.contains_key(&tab));
+        }
+
+        let mut ui = super::super::render_tests::model();
+        let path = "src/find-status.txt".to_owned();
+        ui.open(Target::File { path: path.clone() });
+        let tab = ui.layout.active(ui.group()).unwrap().id;
+        ui.file_lines
+            .insert(path, Arc::new(vec!["before".into(), "needle".into()]));
+        commit(&mut ui, tab, "needle");
+        let generation = ui.find_generation[&tab];
+        complete(&mut ui, tab);
+        assert_eq!(ui.find[&tab].matches, vec![3]);
+        assert_eq!(ui.notice, "1 match · press a flash label or n/N");
+
+        // Even a same-generation duplicate cannot overwrite a completed search.
+        ui.apply_background_result(UiBackgroundResult::Find {
+            tab,
+            generation,
+            query: "needle".into(),
+            matches: vec![],
+            choosing: true,
+            error: Some("stale failure"),
+        });
+        assert_eq!(ui.notice, "1 match · press a flash label or n/N");
+        commit(&mut ui, tab, "absent");
+        ui.apply_background_result(UiBackgroundResult::Find {
+            tab,
+            generation,
+            query: "needle".into(),
+            matches: vec![99],
+            choosing: true,
+            error: None,
+        });
+        assert_eq!(ui.notice, "Searching…");
+        assert_eq!(ui.find[&tab].query, "absent");
+        complete(&mut ui, tab);
+        assert!(ui.find[&tab].matches.is_empty());
+        assert_eq!(ui.notice, "No matches");
+
+        // The executor's panic completion is a failure, never a zero-match claim.
+        commit(&mut ui, tab, "needle");
+        ui.apply_background_result(UiBackgroundResult::Find {
+            tab,
+            generation: ui.find_generation[&tab],
+            query: "needle".into(),
+            matches: vec![],
+            choosing: true,
+            error: Some("Find failed; try the search again"),
+        });
+        assert_eq!(ui.notice, "Find failed; try the search again");
+        assert!(!ui.find_cancel.contains_key(&tab));
+        assert!(ui.find[&tab].matches.is_empty());
+
+        commit(&mut ui, tab, "needle");
+        ui.open(Target::Help);
+        complete(&mut ui, tab);
+        assert!(
+            ui.notice.is_empty(),
+            "an inactive tab cannot publish a count"
+        );
     }
 }

@@ -3748,7 +3748,7 @@ impl Host {
                 .block_on(aw_extensions::attach(&mut agent, &self.extensions))?;
         }
         if !self.has_persistence() {
-            if let Some(path) = &self.state_dir {
+            if let Some(_state_path) = &self.state_dir {
                 let binding = sessions::binding(&self.settings, &self.context, &self.tools)?;
                 let title = self
                     .title
@@ -3791,7 +3791,7 @@ impl Host {
                         {
                             let store = match self.jsonl_store.take() {
                                 Some(store) => store,
-                                None => sessions::jsonl_store(path)?,
+                                None => sessions::jsonl_store(_state_path)?,
                             };
                             let persistent = JsonlPersistentSession::create(
                                 store.clone(),

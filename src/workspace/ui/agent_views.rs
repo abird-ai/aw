@@ -1094,6 +1094,7 @@ mod tests {
             query: "ALPHA".into(),
             matches: vec![2],
             choosing: true,
+            error: None,
         });
         assert!(
             ui.find[&tab].matches.is_empty(),

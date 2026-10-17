@@ -610,6 +610,7 @@ impl Ui {
                 query,
                 matches,
                 choosing,
+                error,
             } => {
                 if self
                     .find_cancel
@@ -623,6 +624,18 @@ impl Ui {
                     || self.find_generation.get(&tab).copied() != Some(generation)
                 {
                     return;
+                }
+                self.find_cancel.remove(&tab);
+                if choosing {
+                    let active = self.layout.active(self.layout.focused).map(|tab| tab.id);
+                    if active == Some(tab) {
+                        self.notice =
+                            error.map_or_else(|| Self::find_notice(matches.len()), str::to_owned);
+                    } else if self.notice == "Searching…"
+                        && active.is_none_or(|active| !self.find_cancel.contains_key(&active))
+                    {
+                        self.notice.clear();
+                    }
                 }
                 let selected = self
                     .find

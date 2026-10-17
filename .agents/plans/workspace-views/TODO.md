@@ -25,6 +25,7 @@ Design and binding decisions: [README.md](README.md).
 - [~] Fence reads by tab, exact resource and generation; close discards owned work and stale replies — native agent.
 - [~] Revalidate authorization independently of head changes; clear denied/revoked/removed content and derived view state — backend and native agents.
 - [ ] Exercise two differently targeted views together without changing Agent identity, draft/caret or provider/tool/Queue intents — coordinator.
+- [~] Report async Find as Searching until its validated result; preserve stale-result fences and report failures truthfully — backend agent.
 - [ ] Reconcile implementation, current documentation and actual test results; review the combined diff — coordinator.
 - [ ] Compose native Files as a rooted navigator and scoped document group; preserve separate File/Diff preview policy and Explorer focus.
 - [ ] Compose native Git using existing repository contexts and fresh exact-review/index admission; worktree selection cannot retarget Agent/Files.
