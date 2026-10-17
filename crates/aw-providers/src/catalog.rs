@@ -409,7 +409,7 @@ pub fn default_cache_dir() -> Result<PathBuf> {
         ))?)
         .join(".cache")
     };
-    Ok(base.join("aw/model-catalog"))
+    Ok(crate::config::aw_user_root(&base).join("model-catalog"))
 }
 fn profile_key(profile: &Profile) -> String {
     let mut h = Sha256::new();
