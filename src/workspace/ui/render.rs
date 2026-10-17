@@ -239,6 +239,7 @@ impl Ui {
     }
 
     pub(in crate::workspace) fn schedule_visible_background_work(&mut self) {
+        self.schedule_agent_views();
         let Some(tab) = self.layout.active(self.layout.focused).cloned() else {
             return;
         };
@@ -350,6 +351,7 @@ impl Ui {
     pub(super) fn content_lines(&self, target: &Target, width: u16) -> Vec<String> {
         let text=match target{
             Target::Conversation => return self.conversation_lines(width),
+            Target::AgentView { .. } => return vec!["Read-only view; use its exact tab projection".into()],
             Target::ContextFlow=>if self.snapshot.context_output.is_empty(){"Use context-action {JSON} in the palette. Start with {\"op\":\"sources\"} or {\"op\":\"target\"}. Prepare/generate/preview/apply are separate. See .agents/docs/CONTEXT-FLOW-IMPLEMENTATION.md. No context action is inferred from navigation.".into()}else{self.snapshot.context_output.clone()},
             Target::SessionTree=>if self.snapshot.tree.is_empty(){"No tree loaded. Use /tree or the command palette. Only safe completed boundaries can fork.\nThe session tree is not a Git tree; inspecting it never executes recorded tools.".into()}else{self.snapshot.tree.clone()},
             Target::Activity=>{
@@ -403,6 +405,9 @@ impl Ui {
         target: &Target,
         width: u16,
     ) -> Arc<Vec<String>> {
+        if matches!(target, Target::AgentView { .. }) {
+            return self.agent_view_plain(id);
+        }
         let revision = match target {
             Target::File { .. } => self.file_revision,
             Target::Diff { .. } => self.git.revision,
@@ -450,6 +455,21 @@ impl Ui {
                 .as_deref()
                 .map(|title| format!("Agent: {title}"))
                 .unwrap_or_else(|| "Agent".into()),
+            Target::AgentView {
+                store_id,
+                session_id,
+                branch_id,
+            } => self
+                .agent_views
+                .values()
+                .find(|view| {
+                    view.target.store_id == *store_id
+                        && view.target.session_id == *session_id
+                        && view.target.branch_id == *branch_id
+                })
+                .and_then(|view| view.cache.as_ref())
+                .map(|cache| format!("View: {}", cache.title))
+                .unwrap_or_else(|| format!("View: {session_id} · {branch_id}")),
             Target::SessionTree => "Session tree".into(),
             Target::ContextFlow => "Context".into(),
             Target::Activity => "Activity".into(),
@@ -483,6 +503,7 @@ impl Ui {
     pub(super) fn tab_color(target: &Target) -> Color {
         match target {
             Target::Conversation => Color::LightGreen,
+            Target::AgentView { .. } => Color::LightBlue,
             Target::Activity => Color::LightCyan,
             Target::SessionTree => Color::LightBlue,
             Target::ContextFlow => Color::LightMagenta,
@@ -698,6 +719,15 @@ impl Ui {
 
     pub(super) fn selection_text(&self) -> Option<String> {
         let selection = self.text_selection.as_ref()?;
+        if self
+            .layout
+            .tabs
+            .get(&selection.tab)
+            .is_some_and(|tab| matches!(tab.target, Target::AgentView { .. }))
+            && !self.agent_view_fresh(selection.tab)
+        {
+            return None;
+        }
         let view = self.selectable_views.get(&selection.tab)?;
         let (first, last) = if selection.anchor <= selection.current {
             (selection.anchor, selection.current)
@@ -752,6 +782,7 @@ impl Ui {
             .text_selection
             .as_ref()
             .filter(|selection| selection.tab == tab)
+            .or_else(|| self.saved_selections.get(&tab))
         else {
             return;
         };
@@ -1922,6 +1953,14 @@ impl Ui {
                             .take(visible_height)
                             .collect::<Vec<_>>()
                     }),
+                    Target::AgentView { .. } => Some(
+                        self.agent_view_lines(tab.id)
+                            .iter()
+                            .skip(start)
+                            .take(visible_height)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    ),
                     Target::File { path } => {
                         Some(self.file_view_slice(path, start, visible_height))
                     }
@@ -1935,7 +1974,11 @@ impl Ui {
                         .into_iter()
                         .enumerate()
                         .map(|(offset, mut line)| {
-                            if !matches!(tab.target, Target::Conversation) && !padding.is_empty() {
+                            if !matches!(
+                                tab.target,
+                                Target::Conversation | Target::AgentView { .. }
+                            ) && !padding.is_empty()
+                            {
                                 line.spans.insert(0, Span::raw(padding.clone()));
                             }
                             self.decorate_find_line(tab.id, start + offset, line)

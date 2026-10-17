@@ -170,7 +170,7 @@ fn push_list_row(
         session
             .branches
             .iter()
-            .find(|branch| branch.name == input.active_branch)
+            .find(|branch| branch.id == input.active_branch)
     } else {
         session
             .branches
@@ -183,7 +183,7 @@ fn push_list_row(
             label: session.title.clone(),
             target: Target::Branch {
                 session: session.id.clone(),
-                branch: branch.name.clone(),
+                branch: branch.id.clone(),
             },
         });
     }
@@ -240,8 +240,12 @@ fn push_branch_tree(
                 if !matches {
                     continue;
                 }
-                let connector = if index + 1 == branches.len() { "`-" } else { "|-" };
-                let active = self.active_session && self.active_branch == branch.name;
+                let connector = if index + 1 == branches.len() {
+                    "`-"
+                } else {
+                    "|-"
+                };
+                let active = self.active_session && self.active_branch == branch.id;
                 self.out.push(Row {
                     label: format!(
                         "  {}{connector} {}{}",
@@ -251,7 +255,7 @@ fn push_branch_tree(
                     ),
                     target: Target::Branch {
                         session: self.session_id.to_owned(),
-                        branch: branch.name.clone(),
+                        branch: branch.id.clone(),
                     },
                 });
                 self.walk(&branch.name, depth + 1);
@@ -278,7 +282,7 @@ fn push_branch_tree(
                 label: format!("  ?- {}", branch.name),
                 target: Target::Branch {
                     session: session.id.clone(),
-                    branch: branch.name.clone(),
+                    branch: branch.id.clone(),
                 },
             });
         }
@@ -440,7 +444,7 @@ fn push_subagents(
                     label: format!(
                         "{}   `- {}{}",
                         "  ".repeat(depth),
-                        if child_active && input.active_branch == branch.name {
+                        if child_active && input.active_branch == branch.id {
                             "* "
                         } else {
                             ""
@@ -449,7 +453,7 @@ fn push_subagents(
                     ),
                     target: Target::Branch {
                         session: child.id.clone(),
-                        branch: branch.name.clone(),
+                        branch: branch.id.clone(),
                     },
                 });
             }
@@ -482,6 +486,7 @@ mod tests {
             updated_at: 0,
             turn_count: 1,
             branches: vec![SavedBranch {
+                id: "main".into(),
                 name: "main".into(),
                 parent: None,
             }],
@@ -511,9 +516,9 @@ mod tests {
             collapsed: &collapsed,
             include_unsaved: false,
         });
-        assert!(visible.iter().any(|row| {
-            matches!(&row.target, Target::Root { session } if session == "child")
-        }));
+        assert!(visible
+            .iter()
+            .any(|row| { matches!(&row.target, Target::Root { session } if session == "child") }));
         assert!(!visible.iter().any(|row| row.label.contains("parent")));
     }
 
@@ -521,6 +526,7 @@ mod tests {
     fn list_branch_query_targets_the_matching_branch() {
         let mut value = session("work", false);
         value.branches.push(SavedBranch {
+            id: "feature-x".into(),
             name: "feature-x".into(),
             parent: Some("main".into()),
         });

@@ -48,9 +48,45 @@ See [accepted history](../plans/accepted-history/TODO.md).
 
 ## Layout and surfaces
 
-Files/Git/Sessions remain the only navigator kinds. The current default orders them **Sessions / Files / Git**, uses a 22.5% Explorer split, and keeps Agent + Activity in the initial content group. Files and Sessions both expose Tree/List projection; Session tree mode nests every durable branch/fork beneath its Session, while Files loads directories lazily as the user expands them. Git exposes Changes/Worktrees/Branches and Tree/List projection for changes; change groups such as Staged/Unstaged/Untracked/Conflicts can be folded independently. Opening an existing worktree changes only that Git pane's human review context. Every content group still accepts Conversation, SessionTree, Activity, File, Diff, Terminal, Settings and Help. `aw-workspace::Target` stores bounded opaque IDs for review/terminal references, not an executable command, provider key, root grant or live process. File and Diff each have a separate compatible unpinned preview slot; neither can replace a terminal/conversation/pinned view.
+Files/Git/Sessions remain the only navigator kinds. The current default orders them **Sessions / Files / Git**, uses a 22.5% Explorer split, and keeps Agent + Activity in the initial content group. Files and Sessions both expose Tree/List projection; Session tree mode nests every durable branch/fork beneath its Session, while Files loads directories lazily as the user expands them. Git exposes Changes/Worktrees/Branches and Tree/List projection for changes; change groups such as Staged/Unstaged/Untracked/Conflicts can be folded independently. Opening an existing worktree changes only that Git pane's human review context. Every content group accepts Conversation, read-only AgentView, SessionTree, Activity, File, Diff, Terminal, Settings and Help. `aw-workspace::Target` stores bounded opaque IDs for review/terminal references, not an executable command, provider key, root grant or live process. File and Diff each have a separate compatible unpinned preview slot; neither can replace a terminal/conversation/pinned view.
 
 Moving a tab preserves its ID/resource. Hiding/closing terminal tabs does not terminate the process. Layout load restores structure, but unknown old resource IDs are unavailable; it never silently launches a shell or stages a diff. Existing private root-bound opt-in layout save/load, eight-pane/32-tab/two-navigators-per-kind constraints and responsive focused-pane fallback remain.
+
+## Read-only Agent views
+
+In Sessions, select a saved branch and press `o`, or choose **Open read-only
+Agent view** in the Workspace palette. Enter keeps its existing activation
+behavior. A read-only tab has no composer: opening, splitting, moving or closing
+it preserves the current Agent and its draft/caret. Existing group actions let
+two differently targeted views sit side by side, with independent scroll,
+follow-end, find and selection state. Opening the same target in the same group
+selects its existing tab; another group may hold a separate view of it.
+
+A saved view pins exact Store, Session and branch IDs; titles and branch names
+are labels. It requests fresh read authorization and grants no execution. An
+exact current-Agent pin can follow its existing live projection after a fresh
+access check. Other pins use the strict Store transcript reader and respect
+active/unreconciled owner-run fences. Readable uncertain committed history stays
+labelled for inspection; viewing never acknowledges or replays it.
+
+Views show a bounded recent transcript, with explicit markers when older or
+oversized content is omitted. Complete immutable records remain available through
+Session history/export. Background reads use the bounded UI executor, independently
+of the Agent command queue. Requests carry view/resource identities and unique
+request IDs; closing or retargeting discards replies. Refresh rechecks authority
+even when the branch head is unchanged. Denied, removed, expired or mismatched
+Store content cannot remain available through render, find or copy caches.
+
+Unsaved current Agents can browse an existing configured local SQLite State
+without creating a Session. Browsing and later activation reuse one Host-owned
+Store and its exclusive owner.lock. Remote and JSONL read-only pins remain
+unavailable in this slice; there is no fallback to a different authority/backend.
+
+Native saved layout v2 migrates consistent v1 layouts in memory, retaining tab
+IDs, pins, geometry and root binding. Existing Conversation tabs continue to
+follow the current Agent. Mixed/unsupported versions fail before installation;
+atomic publication, no-follow reads and the 64 KiB limit remain. SQLite v33 and
+JSONL v1 are unchanged. Browser containers and docking remain planned separately.
 
 ## Services and scope
 

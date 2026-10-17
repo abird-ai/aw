@@ -72,13 +72,26 @@ pub enum Pane {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Target {
+    /// Follow the current Agent without selecting or activating a durable Session.
     Conversation,
+    /// An exact read-only view descriptor. The host must authorize every read.
+    AgentView {
+        store_id: String,
+        session_id: String,
+        branch_id: String,
+    },
     SessionTree,
     ContextFlow,
     Activity,
-    File { path: String },
-    Diff { review: String },
-    Terminal { terminal: String },
+    File {
+        path: String,
+    },
+    Diff {
+        review: String,
+    },
+    Terminal {
+        terminal: String,
+    },
     Settings,
     Help,
 }
@@ -179,7 +192,7 @@ pub struct Geometry {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: Self::VERSION,
             root: Node::Split {
                 axis: Axis::Columns,
                 ratio: 2250,
@@ -225,12 +238,35 @@ impl Default for Workspace {
     }
 }
 impl Workspace {
+    pub const VERSION: u32 = 2;
+
+    /// Upgrade only the supported legacy presentation schema, then validate the
+    /// complete graph before installation. A v1 layout cannot contain v2 targets.
+    pub fn migrate(mut self) -> Result<Self> {
+        match self.version {
+            1 => {
+                if self
+                    .tabs
+                    .values()
+                    .any(|tab| matches!(tab.target, Target::AgentView { .. }))
+                {
+                    return Err(LayoutError::Invalid("v2 target in v1 layout"));
+                }
+                self.version = Self::VERSION;
+            }
+            Self::VERSION => {}
+            _ => return Err(LayoutError::Invalid("unsupported schema")),
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Minimal fullscreen preset: one conversation tab, no explorer pane until
     /// the user explicitly opens Files/Git/Sessions. Saved layouts are never
     /// rewritten to this shape.
     pub fn conversation_only() -> Self {
         Self {
-            version: 1,
+            version: Self::VERSION,
             root: Node::Pane { id: 1 },
             panes: BTreeMap::from([(
                 1,
@@ -253,7 +289,7 @@ impl Workspace {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1 {
+        if self.version != Self::VERSION {
             return Err(LayoutError::Invalid("unsupported schema"));
         }
         if self.panes.is_empty() || self.panes.len() > MAX_PANES || self.tabs.len() > MAX_TABS {
@@ -309,6 +345,16 @@ impl Workspace {
                 return Err(LayoutError::Invalid("tab identity"));
             }
             match &tab.target {
+                Target::AgentView {
+                    store_id,
+                    session_id,
+                    branch_id,
+                } if !valid_opaque_id(store_id)
+                    || !valid_opaque_id(session_id)
+                    || !valid_opaque_id(branch_id) =>
+                {
+                    return Err(LayoutError::Invalid("agent view ID"))
+                }
                 Target::File { path } if !valid_relative(path) => {
                     return Err(LayoutError::Invalid("file path"))
                 }
@@ -822,4 +868,8 @@ fn valid_resource_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_opaque_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
 }

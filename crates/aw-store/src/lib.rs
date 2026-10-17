@@ -1691,6 +1691,18 @@ impl SessionStore {
         context::authorize_tree(&c, session, actor)?;
         nodes_in(&c, session)
     }
+    /// Read one exact durable branch under the current read policy. The owned
+    /// projection carries no journal/cursor and never activates an Agent.
+    pub fn read_branch_view(
+        &self,
+        actor: &PrincipalId,
+        session_id: &str,
+        branch_id: &str,
+    ) -> Result<SessionView> {
+        let c = self.connection()?;
+        read_branch_view_in(&c, actor, session_id, branch_id, true)
+    }
+
     pub fn activate(
         &self,
         actor: &PrincipalId,
@@ -1698,26 +1710,16 @@ impl SessionStore {
         branch: &str,
     ) -> Result<(SessionView, SessionHandle)> {
         let c = self.connection()?;
-        authorize(&c, session, actor, false)?;
-        let s = session_in(&c, session)?;
-        let b = branch_in(&c, session, branch)?;
-        context::authorize_node(&c, session, &b.head, actor)?;
-        if b.active_run.is_some() {
-            return Err(Error::Conflict(
-                "branch has an active or unreconciled owner run",
-            ));
-        }
-        let history = history_in(&c, &s, &b)?;
-        Conversation::from_history(s.binding.system_prompt.clone(), &history)?;
-        let handle = SessionHandle::new(self.clone(), actor.clone(), s.id.clone(), b.clone());
-        Ok((
-            SessionView {
-                session: s,
-                branch: b,
-                history,
-            },
-            handle,
-        ))
+        // Activation keeps its historical ID-or-name selector. Pinned readers
+        // use exact IDs and never receive this effect-capable handle.
+        let view = read_branch_view_in(&c, actor, session, branch, false)?;
+        let handle = SessionHandle::new(
+            self.clone(),
+            actor.clone(),
+            view.session.id.clone(),
+            view.branch.clone(),
+        );
+        Ok((view, handle))
     }
     pub fn fork(
         &self,
@@ -3345,6 +3347,34 @@ pub(crate) fn nodes_in(c: &Connection, session: &str) -> Result<Vec<Node>> {
         .collect::<rusqlite::Result<Vec<_>>>())?;
     ids.iter().map(|n| node_in(c, session, n)).collect()
 }
+fn read_branch_view_in(
+    c: &Connection,
+    actor: &PrincipalId,
+    session: &str,
+    branch: &str,
+    exact_branch_id: bool,
+) -> Result<SessionView> {
+    authorize(c, session, actor, false)?;
+    let s = session_in(c, session)?;
+    let b = branch_in(c, session, branch)?;
+    if exact_branch_id && b.id != branch {
+        return Err(Error::Denied("pinned view requires an exact branch ID"));
+    }
+    context::authorize_node(c, session, &b.head, actor)?;
+    if b.active_run.is_some() {
+        return Err(Error::Conflict(
+            "branch has an active or unreconciled owner run",
+        ));
+    }
+    let history = history_in(c, &s, &b)?;
+    Conversation::from_history(s.binding.system_prompt.clone(), &history)?;
+    Ok(SessionView {
+        session: s,
+        branch: b,
+        history,
+    })
+}
+
 pub(crate) fn history_in(c: &Connection, s: &SessionInfo, b: &BranchInfo) -> Result<HistoryState> {
     context::projected_history(c, s, b)
 }
@@ -3390,6 +3420,216 @@ mod session_view_regressions {
             profile_hint: "fixture".into(),
             model_hint: "m".into(),
             destination_fingerprint: "0".repeat(64),
+        }
+    }
+
+    fn read_fixture() -> (SessionStore, PrincipalId, SessionInfo, BranchInfo) {
+        let store = SessionStore::in_memory().unwrap();
+        let actor = PrincipalId::new("view-owner").unwrap();
+        let (session, branch) = store.create(&actor, "same title", binding()).unwrap();
+        (store, actor, session, branch)
+    }
+
+    #[test]
+    fn branch_view_requires_exact_scoped_ids_and_keeps_activation_name_compatibility() {
+        let (store, actor, session, branch) = read_fixture();
+        let (other, other_branch) = store.create(&actor, "same title", binding()).unwrap();
+        let fork = store
+            .fork(&actor, &session.id, "review", &session.root_node)
+            .unwrap();
+        assert_eq!(
+            store
+                .read_branch_view(&actor, &session.id, &branch.id)
+                .unwrap()
+                .branch
+                .id,
+            branch.id
+        );
+        assert_eq!(
+            store
+                .read_branch_view(&actor, &session.id, &fork.id)
+                .unwrap()
+                .branch
+                .id,
+            fork.id
+        );
+        assert!(store.read_branch_view(&actor, &session.id, "main").is_err());
+        assert!(store
+            .read_branch_view(&actor, &session.id, "review")
+            .is_err());
+        assert!(store
+            .read_branch_view(&actor, &session.id, &other_branch.id)
+            .is_err());
+        assert!(store
+            .read_branch_view(&actor, &other.id, &branch.id)
+            .is_err());
+        assert_eq!(
+            store
+                .activate(&actor, &session.id, "main")
+                .unwrap()
+                .0
+                .branch
+                .id,
+            branch.id
+        );
+    }
+
+    #[test]
+    fn branch_view_rechecks_read_membership_and_never_creates_effect_intent() {
+        let (store, owner, session, branch) = read_fixture();
+        let member = PrincipalId::new("view-member").unwrap();
+        assert!(store
+            .read_branch_view(&member, &session.id, &branch.id)
+            .is_err());
+        store
+            .grant(&owner, &session.id, &member, Some(false))
+            .unwrap();
+        let counts = || {
+            let c = store.connection().unwrap();
+            [
+                "sessions",
+                "branches",
+                "nodes",
+                "runs",
+                "invocation_receipts",
+                "commit_log",
+            ]
+            .iter()
+            .map(|table| {
+                c.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+        };
+        let before = counts();
+        for _ in 0..3 {
+            let view = store
+                .read_branch_view(&member, &session.id, &branch.id)
+                .unwrap();
+            assert_eq!(view.session.id, session.id);
+            assert_eq!(view.branch.revision, branch.revision);
+            assert!(view.history.turns.is_empty());
+        }
+        assert_eq!(counts(), before);
+        store.grant(&owner, &session.id, &member, None).unwrap();
+        assert!(store
+            .read_branch_view(&member, &session.id, &branch.id)
+            .is_err());
+    }
+
+    #[test]
+    fn branch_view_preserves_active_run_fence_and_inspectable_unreconciled_history() {
+        let (store, actor, session, branch) = read_fixture();
+        {
+            let c = store.connection().unwrap();
+            c.execute(
+                "UPDATE branches SET active_run='unreconciled-owner-run' WHERE id=?1",
+                [&branch.id],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.read_branch_view(&actor, &session.id, &branch.id),
+            Err(Error::Conflict(_))
+        ));
+        assert!(store.branches(&actor, &session.id).unwrap()[0]
+            .active_run
+            .is_some());
+        {
+            let c = store.connection().unwrap();
+            c.execute(
+                "UPDATE branches SET active_run=NULL WHERE id=?1",
+                [&branch.id],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE sessions SET import_review_needed=1 WHERE id=?1",
+                [&session.id],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .read_branch_view(&actor, &session.id, &branch.id)
+                .unwrap()
+                .history
+                .needs_reconciliation
+        );
+        assert!(
+            store
+                .activate(&actor, &session.id, &branch.id)
+                .unwrap()
+                .0
+                .history
+                .needs_reconciliation
+        );
+    }
+
+    #[test]
+    fn branch_view_does_not_reinstate_suspended_identity() {
+        let (store, actor, session, branch) = read_fixture();
+        let user = store.current_user(&actor).unwrap();
+        {
+            let c = store.connection().unwrap();
+            c.execute(
+                "UPDATE users SET status='suspended' WHERE user_id=?1",
+                [&user.user_id],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.read_branch_view(&actor, &session.id, &branch.id),
+            Err(Error::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn branch_view_keeps_restored_history_validation() {
+        for oversized in [false, true] {
+            let (store, actor, session, branch) = read_fixture();
+            let turn = aw_agent_core::Turn {
+                id: 1,
+                prompt: "prompt".into(),
+                answer: if oversized {
+                    "x".repeat(aw_agent_core::limits::MAX_OUTPUT_BYTES + 1)
+                } else {
+                    "answer".into()
+                },
+                model: "fixture".into(),
+                profile: if oversized {
+                    "fixture".into()
+                } else {
+                    String::new()
+                },
+                outcome: aw_agent_core::Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: None,
+                tool_records: vec![],
+                invocations: vec![],
+                context_messages: vec![],
+                needs_reconciliation: false,
+            };
+            {
+                let c = store.connection().unwrap();
+                c.execute("INSERT INTO nodes(id,session_id,parent_id,kind,actor,payload,created_at) VALUES('view-prompt',?1,?2,'prompt',?3,'{}',1)",
+                    params![session.id, session.root_node, actor.as_str()]).unwrap();
+                c.execute("INSERT INTO nodes(id,session_id,parent_id,kind,actor,payload,created_at) VALUES('view-turn',?1,'view-prompt','turn',?2,?3,1)",
+                    params![session.id, actor.as_str(), json(&turn).unwrap()]).unwrap();
+                c.execute(
+                    "UPDATE branches SET head='view-turn',revision=revision+1 WHERE id=?1",
+                    [&branch.id],
+                )
+                .unwrap();
+                c.execute("UPDATE sessions SET next_turn=2 WHERE id=?1", [&session.id])
+                    .unwrap();
+            }
+            assert!(store
+                .read_branch_view(&actor, &session.id, &branch.id)
+                .is_err());
+            assert!(store.activate(&actor, &session.id, &branch.id).is_err());
         }
     }
 

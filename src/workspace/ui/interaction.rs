@@ -100,7 +100,10 @@ impl Ui {
         query: String,
         choosing: bool,
     ) -> bool {
-        if !matches!(target, Target::File { .. } | Target::Diff { .. }) {
+        if !matches!(
+            target,
+            Target::File { .. } | Target::Diff { .. } | Target::AgentView { .. }
+        ) {
             return false;
         }
         if let Some(cancel) = self.find_cancel.remove(&tab) {
@@ -125,6 +128,8 @@ impl Ui {
         if query.is_empty() {
             return true;
         }
+        let agent_lines =
+            matches!(target, Target::AgentView { .. }).then(|| self.agent_view_plain(tab));
         let lowered = query.to_lowercase();
         let file_lines = match &target {
             Target::File { path } => self.file_lines.get(path).cloned(),
@@ -153,7 +158,16 @@ impl Ui {
             "find",
             move || {
                 let mut matches = Vec::new();
-                if let (Some(path), Some(lines)) = (file_path, file_lines) {
+                if let Some(lines) = agent_lines {
+                    for (index, line) in lines.iter().enumerate() {
+                        if cancel.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if line.to_lowercase().contains(&lowered) {
+                            matches.push(index);
+                        }
+                    }
+                } else if let (Some(path), Some(lines)) = (file_path, file_lines) {
                     let header = Self::file_context(&path).to_lowercase();
                     if header.contains(&lowered) {
                         matches.push(0);
@@ -609,7 +623,9 @@ impl Ui {
                     if self.selection_moved {
                         let _ = self.copy_selection();
                     } else {
-                        self.text_selection = None;
+                        if let Some(selection) = self.text_selection.take() {
+                            self.saved_selections.remove(&selection.tab);
+                        }
                     }
                     return;
                 }
@@ -668,13 +684,17 @@ impl Ui {
             if self.palette.is_some() {
                 return;
             }
-            self.text_selection = None;
+            if let Some(selection) = self.text_selection.take() {
+                self.saved_selections.remove(&selection.tab);
+            }
             self.selection_dragging = false;
             self.selection_moved = false;
             return;
         };
         if self.palette.is_none() && !matches!(hit, Hit::TextView { .. }) {
-            self.text_selection = None;
+            if let Some(selection) = self.text_selection.take() {
+                self.saved_selections.insert(selection.tab, selection);
+            }
             self.selection_dragging = false;
             self.selection_moved = false;
         }
@@ -1204,6 +1224,9 @@ impl Ui {
                 KeyCode::Down | KeyCode::Char('j') => {
                     let n = self.nav.entry((pane, kind)).or_default();
                     n.selected = n.selected.saturating_add(1);
+                }
+                KeyCode::Char('o') if kind == Navigator::Sessions => {
+                    self.open_selected_agent_view()
                 }
                 KeyCode::Delete if kind == Navigator::Sessions => {
                     let archived = self

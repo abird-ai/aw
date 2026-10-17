@@ -162,6 +162,7 @@ impl Ui {
                     accepted = self.owner(worker, Command::Title(rest.into()), false);
                 }
             }
+            "open-agent-view" => self.open_selected_agent_view(),
             "keymap" => self.open(Target::Help),
             "context" => self.open(Target::ContextFlow),
             "context-action" => match serde_json::from_str::<aw::context_flow::Command>(rest) {
@@ -579,7 +580,7 @@ impl Ui {
             }
             PaletteTarget::Session { session, branch } => {
                 self.snapshot.session.as_deref() == Some(session.as_str())
-                    && self.snapshot.branch == *branch
+                    && self.snapshot.branch_id.as_deref() == Some(branch.as_str())
             }
             PaletteTarget::Command(command) | PaletteTarget::Slash(command) => {
                 let raw = command.split_whitespace().next().unwrap_or("");
@@ -587,6 +588,7 @@ impl Ui {
                 matches!(
                     verb,
                     "conversation"
+                        | "open-agent-view"
                         | "settings"
                         | "status"
                         | "theme"

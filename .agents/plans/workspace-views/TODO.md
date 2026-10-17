@@ -1,29 +1,50 @@
-# Read-only Agent views and composable Files/Git
+# TODO — Read-only Agent views and composable Files/Git
 
-Accepted/provenance checkpoint: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
+Status: active
+Provenance: 5a8e90ae5000fdf5edeaea3fb90be21fec086de6
+Accepted checkpoint: 47ee8a03abecbb3aee84a49c0a590096d76ed1a7
 
-Design only; no independent viewer/container implementation is claimed. Preserve [Domain authority](../../docs/DOMAIN-MODEL.md), [Workspace behavior](../../docs/WORKSPACE.md) and the existing Agent/SurfaceHost owners.
+Design and binding decisions: [README.md](README.md).
 
-## Completed
+## Committed
 
-- [x] Chosen first slice: native read-only pinned Agent views, before compound Files/Git containers, Solid counterparts or docking.
-- [x] Existing stable tab IDs, bounded layout, shared transcript renderer and generation-fenced background executor provide the implementation seams.
+### `47ee8a03abecbb3aee84a49c0a590096d76ed1a7` — accepted design checkpoint
+
+- [x] Choose native read-only pinned Agent views before Files/Git containers, browser counterparts and docking.
+- [x] Reuse stable tab IDs, bounded layout, the transcript renderer and existing Agent/SurfaceHost owners.
 
 ## Uncommitted
 
-- [ ] Retain exact durable Session and branch IDs in navigation; distinguish view ID, scoped resource key and container ID from title/name/pane position. Do not create a durable Session merely to display an unsaved Agent.
-- [ ] Extend the existing strict `read_branch_view` seam as a bounded host-authorized read adapter, reusing current store policy without returning an effect-capable SessionHandle, activating a Session or bypassing active/unreconciled-run fences. Display unavailable/live/snapshot states factually.
-- [ ] Keep one current Agent/composer. Explicit Open view creates read-only presentation; explicit activation still uses the existing busy/recovery/draft checks and saved binding. Failed activation retains the old owner and draft.
-- [ ] Give each view independent scroll/follow/find/selection/focus state; matching current-owner views may observe its live projection. Revalidate access and invalidate revoked/removed cached content; snapshots are never grants.
-- [ ] Fence every asynchronous result by owning view/container, exact scope/resource and generation. Close cancels owned work; late results cannot reopen, replace a newer preview or steal focus.
-- [ ] Migrate view-layout data explicitly: read v1 as Follow current Agent, retain IDs/pins/geometry/human scope, validate before install, preserve atomic/no-follow/64KiB protections, reject unsupported downgrade. Do not bump SQLite/JSONL for presentation.
-- [ ] Stop the first slice when two differently targeted read-only views coexist with independent viewport/find state and no current-Agent/draft change or provider/tool/Queue intent.
-- [ ] Then compose native Files: one rooted navigator plus scoped document group; separate pinned File/Diff preview policy and ordinary Explorer focus from explicit palette navigation. Same paths in different scopes cannot alias.
-- [ ] Then compose native Git: reuse repository contexts, exact reviews and fresh index admission. Selecting a worktree cannot retarget Agent/Files; review→file requires authorized path mapping.
-- [ ] Use a flat stable-ID graph with one parent, cycle/orphan validation and one container level; count all placements against existing global 8-pane/32-tab limits. Do not embed another Workspace or owner runtime inside a tab.
-- [ ] Add Solid counterparts through current capability APIs; do not promise unsupported browser resources or publish a shared serialized layout before both adapters/migration exist.
-- [ ] Dock/breakout last: reparent the same descriptor/state with explicit cross-window ownership, close-origin and focus/lifetime transfer. Closing a view never implicitly stops an Agent/PTY; moving never starts/clones resources.
-- [ ] Restore exact surviving focus/draft/caret on modal cancel; fallback only to its owned parent/empty state. Preserve palette/history/child-PTY keys and IME protections.
-- [ ] Prove denied/revoked/same-title branches, stale replies, owner busy/UNKNOWN, duplicate views, narrow/Unicode/resize/maximize and actual PTY restoration, without new provider calls. Test actual native/browser cuts separately.
-- [ ] Bound retained history/cache bytes across views. Prefer left-right publication where measured read-heavy ownership fits; retain existing projection/admission/receipt/resource locks where it does not. Benchmark the actual workload before another migration. Register readers once and release guards before callbacks/render/I/O/await.
-- [ ] Remote views remain unavailable until authorized machine/member/revision/expiry/offline tests exist; no local fallback, root inference from saved paths or implicit execution retargeting.
+- [~] Extract a strict `SessionStore::read_branch_view` reader from activation; keep handle creation in activation and exact branch IDs in pinned reads — backend agent.
+- [~] Capture a private host reader without creating an Agent/Session or using the execution queue — backend agent.
+- [~] Reuse one Host-owned SQLite Store for unsaved browsing and later activation/first prompt; preserve exclusive owner.lock and avoid reopening/recovery per view — backend agent.
+- [~] Retain exact Store, Session and branch identities in owner/navigation projections; titles remain labels — backend and native agents.
+- [~] Add bounded `AgentView` descriptors and explicit v1→v2 layout migration; preserve IDs, pins, geometry, root binding, atomic/no-follow and 64 KiB protections — layout agent.
+- [~] Add explicit Open read-only view while retaining Enter activation and one current Agent/composer — native agent.
+- [~] Keep per-view scroll/follow/find/selection/focus and bounded transcript/render caches — native agent.
+- [~] Fence reads by tab, exact resource and generation; close discards owned work and stale replies — native agent.
+- [~] Revalidate authorization independently of head changes; clear denied/revoked/removed content and derived view state — backend and native agents.
+- [ ] Exercise two differently targeted views together without changing Agent identity, draft/caret or provider/tool/Queue intents — coordinator.
+- [ ] Reconcile implementation, current documentation and actual test results; review the combined diff — coordinator.
+- [ ] Compose native Files as a rooted navigator and scoped document group; preserve separate File/Diff preview policy and Explorer focus.
+- [ ] Compose native Git using existing repository contexts and fresh exact-review/index admission; worktree selection cannot retarget Agent/Files.
+- [ ] Add a flat stable-ID container graph with one parent, cycle/orphan validation and one container level, within global 8-pane/32-tab limits.
+- [ ] Add browser counterparts through existing capability APIs, with browser-specific acceptance and migration before any shared serialized layout.
+- [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
+- [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
+
+## Tests and verification
+
+- [ ] Store reader tests: exact IDs, read-only/denied/revoked authority, active-run fences, readable unresolved history, malformed/oversized history and no execution effects.
+- [ ] Layout tests: v1 migration, rejected mixed/unsupported versions, independent descriptors, split/move and existing global limits — `cargo test --locked -p aw-workspace` plus native persistence tests.
+- [ ] Native tests: two targets, independent viewport/find/selection, unchanged owner/draft/caret, same-title identities, duplicate views and unavailable states.
+- [ ] Async tests: close/supersede/revocation cannot resurrect content, steal focus or accept another view's reply.
+- [ ] Native rendering/input checks: narrow/Unicode/resize/maximize, modal focus restoration and child-PTY key ownership; distinguish TestBackend checks from actual PTY execution.
+- [ ] `cargo fmt --all -- --check` — pinned Nix development shell, on the candidate commit.
+- [ ] `cargo test --workspace --locked` — pinned Nix development shell, on the candidate commit.
+- [ ] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — on the candidate commit.
+- [ ] Browser/container/docking acceptance — only after those later slices exist; the first native slice does not close this plan.
+
+## Deferred
+
+- [ ] Remote views — remain unavailable until exact machine/member/revision/expiry/offline tests exist; no local fallback or execution retargeting.

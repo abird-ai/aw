@@ -52,6 +52,7 @@ use std::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod agent_views;
 mod async_work;
 mod commands;
 mod interaction;
@@ -552,6 +553,7 @@ struct ConversationPending {
 }
 
 enum UiBackgroundResult {
+    AgentView(agent_views::Reply),
     Terminal(std::result::Result<String, String>),
     InitialLayout {
         base_generation: u64,
@@ -638,6 +640,10 @@ pub struct Ui {
     rendered: BTreeMap<Id, Rendered>,
     file_revision: u64,
     snapshot: Snapshot,
+    branch_reader: Option<super::branch_view::Reader>,
+    agent_views: BTreeMap<Id, agent_views::View>,
+    agent_view_generation: u64,
+    saved_selections: BTreeMap<Id, TextSelection>,
     nav: BTreeMap<(Id, Navigator), NavState>,
     files: BTreeMap<String, String>,
     file_lines: BTreeMap<String, Arc<Vec<String>>>,
@@ -756,6 +762,10 @@ impl Ui {
             rendered: BTreeMap::new(),
             file_revision: 0,
             snapshot,
+            branch_reader: None,
+            agent_views: BTreeMap::new(),
+            agent_view_generation: 0,
+            saved_selections: BTreeMap::new(),
             nav: BTreeMap::new(),
             files: BTreeMap::new(),
             file_lines: BTreeMap::new(),
@@ -1284,7 +1294,7 @@ impl Ui {
                             shortcut: String::new(),
                             target: PaletteTarget::Session {
                                 session: session.id.clone(),
-                                branch: branch.name.clone(),
+                                branch: branch.id.clone(),
                             },
                             score,
                         });
@@ -1325,7 +1335,7 @@ impl Ui {
                 let label = self.session_title(&session_id);
                 let description = format!("{state} · {session_id}");
                 let branch = if self.snapshot.session.as_ref() == Some(&session_id) {
-                    Some(self.snapshot.branch.clone())
+                    self.snapshot.branch_id.clone()
                 } else {
                     self.snapshot
                         .sessions
@@ -1338,7 +1348,7 @@ impl Ui {
                                 .find(|branch| branch.name == "main")
                                 .or_else(|| session.branches.first())
                         })
-                        .map(|branch| branch.name.clone())
+                        .map(|branch| branch.id.clone())
                 };
                 if let (Some(score), Some(branch)) = (
                     palette_resource_score(PaletteCategory::Agents, &label, &description, query),
@@ -1384,6 +1394,11 @@ impl Ui {
                     Target::Terminal { .. } => "Open terminal tab".into(),
                     Target::Settings => "Fullscreen settings".into(),
                     Target::Help => "Keyboard shortcuts and help".into(),
+                    Target::AgentView {
+                        session_id,
+                        branch_id,
+                        ..
+                    } => format!("Read only · {session_id} · {branch_id}"),
                 };
                 if let Some(score) =
                     palette_resource_score(PaletteCategory::Windows, &label, &description, query)
@@ -1453,6 +1468,7 @@ impl Ui {
     }
 
     fn reconcile_layout_state(&mut self) {
+        self.reconcile_agent_views();
         let groups = self.layout.groups();
         if matches!(
             self.layout.panes.get(&self.layout.focused),
@@ -1665,7 +1681,9 @@ impl Ui {
     }
 
     fn focus_current_agent(&mut self, session: &str, branch: &str) -> bool {
-        if self.snapshot.session.as_deref() != Some(session) || self.snapshot.branch != branch {
+        if self.snapshot.session.as_deref() != Some(session)
+            || self.snapshot.branch_id.as_deref() != Some(branch)
+        {
             return false;
         }
         let existing = self.layout.tabs.values().find_map(|tab| {
@@ -1912,7 +1930,7 @@ impl Ui {
             sessions: &self.snapshot.sessions,
             subagents: &self.snapshot.subagents,
             active_session: self.snapshot.session.as_deref(),
-            active_branch: &self.snapshot.branch,
+            active_branch: self.snapshot.branch_id.as_deref().unwrap_or(""),
             scope: state.session_scope,
             list: state.display == NavDisplay::List,
             query: &state.filter,
@@ -2037,6 +2055,9 @@ pub async fn event_loop(
     browser: &mut Browser,
     initial: Option<String>,
 ) -> Result<(Ui, Exit)> {
+    ui.branch_reader = worker.branch_reader();
+    let mut view_refresh = tokio::time::interval(Duration::from_millis(250));
+    view_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut input = EventStream::new();
     let mut watch = worker.projection.subscribe();
     let mut dirty = true;
@@ -2092,12 +2113,13 @@ pub async fn event_loop(
                 .any(|item| matches!(item.state.as_str(), "admitted" | "running"));
         let animation_deadline = last_animation + Duration::from_millis(260);
         tokio::select! {
+            _=view_refresh.tick(),if ui.layout.tabs.values().any(|tab|matches!(tab.target,Target::AgentView{..}))=>{ui.branch_reader=worker.branch_reader();ui.schedule_agent_views();dirty=true;},
             event=input.next()=>{match event{Some(Ok(Event::Key(key)))=>ui.key(key,worker,browser),Some(Ok(Event::Paste(text)))=>{
                 if let Some(p)=&mut ui.palette{if let Err(e)=p.paste(&text){ui.notice=e.to_string();}else{let query=p.text().to_owned();ui.sync_palette_file_search(browser,&query);}}
                 else if ui.terminal_paste(&text){}
                 else if ui.input&&matches!(ui.layout.active(ui.layout.focused).map(|t|&t.target),Some(Target::Conversation)){if let Err(e)=ui.draft.insert(&text){ui.notice=e.to_string();}else{ui.composer.reset_after_external_edit();}}
             },Some(Ok(Event::Mouse(mouse)))=>ui.mouse(mouse,worker,browser),Some(Ok(Event::Resize(..)))=>{ui.can_submit=false;},Some(Ok(_))=>{},Some(Err(e))=>return Err(e.into()),None=>return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,"terminal event stream closed")))}dirty=true;},
-            changed=watch.changed()=>{if changed.is_err(){return Err(Error::Storage("workspace owner disconnected"));}ui.snapshot=worker.projection.snapshot();
+            changed=watch.changed()=>{if changed.is_err(){return Err(Error::Storage("workspace owner disconnected"));}ui.snapshot=worker.projection.snapshot();ui.expire_agent_views();
                 if ui.snapshot.rejected_revision!=ui.recovery_seen{
                     ui.recovery_seen=ui.snapshot.rejected_revision;
                     if ui.draft.is_empty(){let _=ui.draft.set(ui.snapshot.rejected_prompt.clone());ui.composer.reset_after_external_edit();ui.notice="Preflight failed; rejected input returned to your composer. No automatic retry.".into();}
@@ -2272,6 +2294,8 @@ mod tests {
                 busy: false,
                 state_pending: false,
                 fatal: false,
+                store_id: None,
+                branch_id: None,
                 session: None,
                 session_title: None,
                 branch: "main".into(),
@@ -2417,6 +2441,8 @@ mod render_tests {
             busy: false,
             state_pending: false,
             fatal: false,
+            store_id: None,
+            branch_id: None,
             session: None,
             session_title: None,
             branch: "main".into(),
@@ -2451,7 +2477,7 @@ mod render_tests {
             session_tps: None,
         }
     }
-    fn model() -> Ui {
+    pub(super) fn model() -> Ui {
         Ui::new(
             Workspace::default(),
             "draft remains local".into(),
@@ -2506,7 +2532,7 @@ mod render_tests {
         );
     }
 
-    fn turn_with_trace(
+    pub(super) fn turn_with_trace(
         prompt: &str,
         answer: &str,
         outcome: aw::conversation::Outcome,
@@ -3061,6 +3087,7 @@ mod render_tests {
         state.display = NavDisplay::List;
         ui.snapshot.session = Some("running-session".into());
         ui.snapshot.branch = "main".into();
+        ui.snapshot.branch_id = Some("main".into());
         ui.snapshot.busy = true;
         ui.snapshot.turn_started = Some(Instant::now() - Duration::from_secs(2));
         ui.snapshot.sessions = vec![
@@ -3073,6 +3100,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 17,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -3086,6 +3114,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 4,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -3551,6 +3580,7 @@ mod render_tests {
             updated_at: 0,
             turn_count: 0,
             branches: vec![crate::workspace::owner::SavedBranch {
+                id: "work".into(),
                 name: "work".into(),
                 parent: None,
             }],
@@ -3631,11 +3661,13 @@ mod render_tests {
             updated_at: 0,
             turn_count: 0,
             branches: vec![crate::workspace::owner::SavedBranch {
+                id: "work".into(),
                 name: "work".into(),
                 parent: None,
             }],
         }];
         ui.snapshot.branch = "work".into();
+        ui.snapshot.branch_id = Some("work".into());
         ui.open_palette();
         ui.palette.as_mut().unwrap().set("&Bird").unwrap();
         let before = ui.palette_choices();
@@ -3699,6 +3731,7 @@ mod render_tests {
         ui.snapshot.busy = true;
         ui.snapshot.session = Some("current".into());
         ui.snapshot.branch = "work".into();
+        ui.snapshot.branch_id = Some("work".into());
         let item = |target| PaletteItem {
             category: PaletteCategory::Actions,
             label: String::new(),
@@ -4460,10 +4493,12 @@ mod render_tests {
                 turn_count: 0,
                 branches: vec![
                     crate::workspace::owner::SavedBranch {
+                        id: "main".into(),
                         name: "main".into(),
                         parent: None,
                     },
                     crate::workspace::owner::SavedBranch {
+                        id: "feature".into(),
                         name: "feature".into(),
                         parent: Some("main".into()),
                     },
@@ -4478,6 +4513,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 0,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -4534,6 +4570,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 1,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -4547,6 +4584,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 1,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -4598,10 +4636,12 @@ mod render_tests {
             turn_count: 2,
             branches: vec![
                 crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 },
                 crate::workspace::owner::SavedBranch {
+                    id: "feature-x".into(),
                     name: "feature-x".into(),
                     parent: Some("main".into()),
                 },
@@ -4635,6 +4675,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 1,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -4677,6 +4718,7 @@ mod render_tests {
             updated_at: 0,
             turn_count: 1,
             branches: vec![crate::workspace::owner::SavedBranch {
+                id: "main".into(),
                 name: "main".into(),
                 parent: None,
             }],
@@ -4706,6 +4748,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 0,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -4719,6 +4762,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 0,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -4732,6 +4776,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 0,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "main".into(),
                     name: "main".into(),
                     parent: None,
                 }],
@@ -5215,6 +5260,7 @@ mod render_tests {
         assert!(ui.palette_items("&").is_empty());
         ui.snapshot.session = Some("root-agent".into());
         ui.snapshot.branch = "work".into();
+        ui.snapshot.branch_id = Some("work".into());
         ui.snapshot.subagents = vec![crate::workspace::owner::SavedSubagent {
             parent_session: "root-agent".into(),
             child_session: "child-agent".into(),
@@ -5232,6 +5278,7 @@ mod render_tests {
             updated_at: 0,
             turn_count: 2,
             branches: vec![crate::workspace::owner::SavedBranch {
+                id: "review".into(),
                 name: "review".into(),
                 parent: None,
             }],
@@ -5270,6 +5317,7 @@ mod render_tests {
         let mut ui = model();
         ui.snapshot.session = Some("root-agent".into());
         ui.snapshot.branch = "work".into();
+        ui.snapshot.branch_id = Some("work".into());
         ui.snapshot.busy = true;
         ui.draft.set("keep this draft").unwrap();
         ui.recovery = "rejected input".into();
@@ -5522,6 +5570,7 @@ mod render_tests {
                 updated_at: 0,
                 turn_count: 0,
                 branches: vec![crate::workspace::owner::SavedBranch {
+                    id: "feature-x".into(),
                     name: "feature-x".into(),
                     parent: None,
                 }],

@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 #[derive(Clone, Debug)]
 pub struct SavedBranch {
+    pub id: String,
     pub name: String,
     pub parent: Option<String>,
 }
@@ -54,7 +55,9 @@ pub struct Snapshot {
     pub busy: bool,
     pub state_pending: bool,
     pub fatal: bool,
+    pub store_id: Option<String>,
     pub session: Option<String>,
+    pub branch_id: Option<String>,
     pub session_title: Option<String>,
     pub branch: String,
     pub model: String,
@@ -96,7 +99,9 @@ impl Snapshot {
             busy: false,
             state_pending: false,
             fatal: false,
+            store_id: None,
             session: None,
+            branch_id: None,
             session_title: None,
             branch: "main".into(),
             model: host
@@ -156,6 +161,7 @@ pub struct Projection {
     pub data: Arc<Mutex<Snapshot>>,
     tick: watch::Sender<u64>,
     cancel: Arc<Mutex<Option<CancellationToken>>>,
+    branch_reader: Arc<Mutex<Option<super::branch_view::Reader>>>,
 }
 impl Projection {
     pub fn snapshot(&self) -> Snapshot {
@@ -243,6 +249,11 @@ fn apply_pending_ui(
 
 impl Worker {
     pub fn start(host: Host) -> Result<Self> {
+        let branch_reader = host
+            .persistent
+            .as_ref()
+            .map(|p| super::branch_view::Reader::new(p.store.clone(), p.actor.clone()))
+            .transpose()?;
         // Move the settled Host including its existing runtime. Dropping the
         // runtime here would invalidate pooled provider I/O; mode changes must
         // not replace the agent, store or its idle runtime resources.
@@ -252,13 +263,14 @@ impl Worker {
             data: Arc::new(Mutex::new(Snapshot::new(&host))),
             tick,
             cancel: Arc::new(Mutex::new(None)),
+            branch_reader: Arc::new(Mutex::new(branch_reader)),
         };
         let view = projection.clone();
         let pending_ui = Arc::new(Mutex::new(None));
         let owner_pending_ui = pending_ui.clone();
         let worker=thread::Builder::new().name("aw-workspace-owner".into()).spawn(move||{
             let mut host=host;
-            refresh(&host,&view,false);
+            refresh(&mut host,&view,false);
             while let Ok(command)=rx.recv(){
                 if matches!(command,Command::Stop){
                     apply_pending_ui(&mut host, &view, &owner_pending_ui);
@@ -277,7 +289,7 @@ impl Worker {
                         view.change(|s|{s.busy=false;s.state_pending=false;});break;}
                 }
                 apply_pending_ui(&mut host, &view, &owner_pending_ui);
-                view.set_cancel(None);refresh(&host,&view,false);view.change(|s|{s.busy=false;s.state_pending=false;s.turn_started=None;});
+                view.set_cancel(None);refresh(&mut host,&view,false);view.change(|s|{s.busy=false;s.state_pending=false;s.turn_started=None;});
             }
             view.set_cancel(None);host
         })?;
@@ -303,6 +315,14 @@ impl Worker {
                 "workspace owner unavailable for UI persistence",
             )),
         }
+    }
+
+    pub(super) fn branch_reader(&self) -> Option<super::branch_view::Reader> {
+        self.projection
+            .branch_reader
+            .lock()
+            .ok()
+            .and_then(|reader| reader.clone())
     }
 
     pub fn send(&self, command: Command) -> Result<()> {
@@ -351,8 +371,15 @@ impl Drop for Worker {
 fn saved_workspace_sessions(
     store: &aw_store::SessionStore,
     actor: &aw_agent_core::PrincipalId,
-) -> Result<(Vec<SavedSession>, Vec<SavedSubagent>)> {
-    let visible = store.list(actor)?.into_iter().map(|session| (session, false));
+) -> Result<(
+    Vec<SavedSession>,
+    Vec<SavedSubagent>,
+    super::branch_view::Reader,
+)> {
+    let visible = store
+        .list(actor)?
+        .into_iter()
+        .map(|session| (session, false));
     let archived = store
         .list_archived(actor)?
         .into_iter()
@@ -366,6 +393,7 @@ fn saved_workspace_sessions(
                 .into_iter()
                 .take(128)
                 .map(|branch| SavedBranch {
+                    id: branch.id,
                     name: branch.name,
                     parent: branch.parent_name,
                 })
@@ -398,11 +426,32 @@ fn saved_workspace_sessions(
             depth: item.depth.unwrap_or(1),
         })
         .collect();
-    Ok((sessions, subagents))
+    let reader = super::branch_view::Reader::new(store.clone(), actor.clone())?;
+    Ok((sessions, subagents, reader))
 }
 
-fn refresh(host: &Host, view: &Projection, with_sessions: bool) {
+fn refresh(host: &mut Host, view: &Projection, with_sessions: bool) {
     let current = host.persistent.as_ref().map(|p| p.view());
+    let source: Result<Option<(aw_store::SessionStore, aw_agent_core::PrincipalId)>> = (|| {
+        if host.store_backend != crate::resources_cli::SessionStoreBackendArg::Sqlite {
+            return Ok(None);
+        }
+        if host.persistent.is_none() && host.sqlite_store.is_none() {
+            let Some(path) = host.state_dir.as_ref() else {
+                return Ok(None);
+            };
+            // Do not initialize missing State merely to browse a saved view.
+            if !path.join("sessions.sqlite3").try_exists()? {
+                return Ok(None);
+            }
+        }
+        let store = host.sqlite_store()?;
+        let actor = match &host.persistent {
+            Some(saved) => saved.actor.clone(),
+            None => aw::sessions::actor(&host.context, false)?,
+        };
+        Ok(Some((store, actor)))
+    })();
     let current_budget = match (&host.persistent, &current) {
         (Some(persistent), Some(Ok(current))) => persistent
             .store
@@ -421,24 +470,44 @@ fn refresh(host: &Host, view: &Projection, with_sessions: bool) {
         _ => None,
     };
     let mut session_projection = None;
-    if with_sessions {
-        let result = if let Some(p) = &host.persistent {
-            saved_workspace_sessions(&p.store, &p.actor)
-        } else if let Some(path) = &host.state_dir {
-            (|| {
-                let store = aw_store::SessionStore::open(path)?;
-                let actor = aw::sessions::actor(&host.context, false)?;
-                saved_workspace_sessions(&store, &actor)
-            })()
-        } else {
-            Ok((vec![], vec![]))
-        };
-        match result {
-            Ok(value) => session_projection = Some(value),
-            Err(e) => view.change(|s| s.status = e.to_string()),
+    let reader = match source {
+        Ok(Some((store, actor))) => {
+            if with_sessions {
+                match saved_workspace_sessions(&store, &actor) {
+                    Ok((sessions, subagents, reader)) => {
+                        session_projection = Some((sessions, subagents));
+                        Some(reader)
+                    }
+                    Err(error) => {
+                        session_projection = Some((vec![], vec![]));
+                        view.change(|snapshot| snapshot.status = error.to_string());
+                        None
+                    }
+                }
+            } else {
+                super::branch_view::Reader::new(store, actor).ok()
+            }
         }
+        Ok(None) => {
+            if with_sessions {
+                session_projection = Some((vec![], vec![]));
+            }
+            None
+        }
+        Err(error) => {
+            if with_sessions {
+                session_projection = Some((vec![], vec![]));
+            }
+            view.change(|snapshot| snapshot.status = error.to_string());
+            None
+        }
+    };
+    let store_id = reader.as_ref().map(|reader| reader.store_id().to_owned());
+    if let Ok(mut published) = view.branch_reader.lock() {
+        *published = reader;
     }
     view.change(|s| {
+        s.store_id = store_id;
         s.model = host
             .settings
             .profile
@@ -462,6 +531,7 @@ fn refresh(host: &Host, view: &Projection, with_sessions: bool) {
         }
         if let Some(Ok(v)) = &current {
             s.session = Some(v.session.id.clone());
+            s.branch_id = Some(v.branch.id.clone());
             s.session_title = Some(v.session.title.clone());
             s.branch = v.branch.name.clone();
             if host.agent.is_none() {
@@ -471,6 +541,7 @@ fn refresh(host: &Host, view: &Projection, with_sessions: bool) {
             }
         }
         if let Some(Err(e)) = &current {
+            s.branch_id = None;
             s.status = e.to_string();
             s.turns = Arc::new(vec![]);
             s.context_blocks.clear();
@@ -479,13 +550,16 @@ fn refresh(host: &Host, view: &Projection, with_sessions: bool) {
             s.live.clear();
         }
         if host.persistent.is_none() {
+            s.branch_id = None;
             s.session = None;
             s.session_title = None;
             s.branch = "memory / main".into();
         }
-        if s.event_rail.as_ref().is_some_and(|rail|
-            rail.session()!=s.session.as_deref().unwrap_or("memory")) {
-            s.event_rail=None;
+        if s.event_rail
+            .as_ref()
+            .is_some_and(|rail| rail.session() != s.session.as_deref().unwrap_or("memory"))
+        {
+            s.event_rail = None;
         }
         s.delegation_budget = current_budget.clone();
         s.loaded_resources = host.loaded_resources.with_context_blocks(&s.context_blocks);
@@ -495,6 +569,7 @@ fn refresh(host: &Host, view: &Projection, with_sessions: bool) {
         }
     });
 }
+
 fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
     match command {
         Command::Prompt(prompt) => {
@@ -796,11 +871,7 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
                     .store
                     .set_sessions_archived(&persistent.actor, &sessions, archived)?;
             } else {
-                let state_dir = host
-                    .state_dir
-                    .as_deref()
-                    .ok_or(Error::Denied("state disabled"))?;
-                let store = aw_store::SessionStore::open(state_dir)?;
+                let store = host.sqlite_store()?;
                 let actor = aw::sessions::actor(&host.context, false)?;
                 store.set_sessions_archived(&actor, &sessions, archived)?;
             }
@@ -821,11 +892,7 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
             let p = if let Some(current) = &host.persistent {
                 current.open_saved_session(&session, &branch)?
             } else {
-                let store = aw_store::SessionStore::open(
-                    host.state_dir
-                        .as_deref()
-                        .ok_or(Error::Denied("state disabled"))?,
-                )?;
+                let store = host.sqlite_store()?;
                 aw::sessions::PersistentSession::open_saved(
                     store,
                     aw::sessions::actor(&host.context, false)?,
@@ -965,3 +1032,187 @@ fn execute(host: &mut Host, view: &Projection, command: Command) -> Result<()> {
 
 #[cfg(test)]
 mod publication_benchmarks;
+
+#[cfg(test)]
+mod branch_reader_tests {
+    use super::*;
+    use crate::{config, resources_cli::SessionStoreBackendArg};
+    use aw::context::ExecutionContext;
+    use std::{path::Path, time::Duration};
+
+    fn host(root: &Path, backend: SessionStoreBackendArg) -> Host {
+        let mut profile = config::builtins().remove("llama").unwrap();
+        profile.model = Some("fixture".into());
+        profile.models = vec!["fixture".into()];
+        Host::new(
+            config::Settings {
+                profile_name: "llama".into(),
+                profile,
+                system_prompt: String::new(),
+                request_timeout: Duration::from_secs(2),
+                idle_timeout: Duration::from_secs(2),
+                max_output_bytes: 1024,
+            },
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+            ExecutionContext::capture(root).unwrap(),
+            aw::LocalToolOptions::new(root, aw::ToolMode::Off),
+            false,
+            aw::ToolMode::Off,
+            32,
+            4,
+            64,
+            1,
+            3600,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            4,
+            None,
+            None,
+            None,
+            Some(root.join("state")),
+            backend,
+            None,
+            #[cfg(feature = "jsonl")]
+            None,
+            #[cfg(feature = "jsonl")]
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn seed(root: &Path) -> (String, String, String) {
+        let mut host = host(root, SessionStoreBackendArg::Sqlite);
+        let store = host.sqlite_store().unwrap();
+        let actor = aw::sessions::actor(&host.context, false).unwrap();
+        let binding = aw::sessions::binding(&host.settings, &host.context, &host.tools).unwrap();
+        let (session, branch) = store.create(&actor, "Saved fixture", binding).unwrap();
+        (store.store_id().unwrap(), session.id, branch.id)
+    }
+
+    fn projection(host: &Host) -> Projection {
+        let (tick, _) = watch::channel(0);
+        Projection {
+            data: Arc::new(Mutex::new(Snapshot::new(host))),
+            tick,
+            cancel: Arc::new(Mutex::new(None)),
+            branch_reader: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn unsaved_browse_then_resume_and_new_reuse_one_owner_store() {
+        let root = crate::test_support::temp_dir("view-browse-resume");
+        let (store_id, session_id, branch_id) = seed(&root);
+        {
+            let mut host = host(&root, SessionStoreBackendArg::Sqlite);
+            let view = projection(&host);
+            refresh(&mut host, &view, true);
+            assert!(host.persistent.is_none() && host.agent.is_none());
+            let snapshot = view.snapshot();
+            assert_eq!(snapshot.store_id.as_deref(), Some(store_id.as_str()));
+            assert!(snapshot.session.is_none() && snapshot.branch_id.is_none());
+            assert_eq!(snapshot.sessions[0].branches[0].id, branch_id);
+            let reader = view.branch_reader.lock().unwrap().clone().unwrap();
+            let target = super::super::branch_view::Target {
+                store_id,
+                session_id: session_id.clone(),
+                branch_id: branch_id.clone(),
+            };
+            reader.read(&target).unwrap();
+            refresh(&mut host, &view, false);
+            assert!(view.branch_reader.lock().unwrap().is_some());
+            assert!(host.persistent.is_none() && host.agent.is_none());
+            host.resume_session(&session_id, &branch_id).unwrap();
+            host.ensure(false, "Existing Agent").unwrap();
+            execute(&mut host, &view, Command::New).unwrap();
+            assert_ne!(
+                host.persistent.as_ref().unwrap().handle.session_id(),
+                session_id
+            );
+            reader.read(&target).unwrap();
+            host.resume_session(&session_id, &branch_id).unwrap();
+            assert_eq!(
+                host.persistent.as_ref().unwrap().handle.session_id(),
+                session_id
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsaved_browse_then_first_ensure_creates_only_the_explicit_session() {
+        let root = crate::test_support::temp_dir("view-browse-first-prompt");
+        let (_, old_session, _) = seed(&root);
+        {
+            let mut host = host(&root, SessionStoreBackendArg::Sqlite);
+            let view = projection(&host);
+            refresh(&mut host, &view, true);
+            let actor = aw::sessions::actor(&host.context, false).unwrap();
+            assert_eq!(host.sqlite_store().unwrap().list(&actor).unwrap().len(), 1);
+            host.ensure(false, "Explicit first Agent").unwrap();
+            assert_ne!(
+                host.persistent.as_ref().unwrap().handle.session_id(),
+                old_session
+            );
+            assert_eq!(host.sqlite_store().unwrap().list(&actor).unwrap().len(), 2);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn browsing_absent_state_or_jsonl_never_initializes_or_falls_back_to_sqlite() {
+        let root = crate::test_support::temp_dir("view-no-sqlite-fallback");
+        {
+            let mut host = host(&root, SessionStoreBackendArg::Sqlite);
+            let view = projection(&host);
+            refresh(&mut host, &view, true);
+            assert!(!root.join("state").exists());
+            assert!(view.snapshot().store_id.is_none());
+            assert!(view.branch_reader.lock().unwrap().is_none());
+        }
+        seed(&root);
+        {
+            let mut host = host(&root, SessionStoreBackendArg::Jsonl);
+            let view = projection(&host);
+            refresh(&mut host, &view, true);
+            assert!(host.sqlite_store.is_none());
+            assert!(view.snapshot().sessions.is_empty());
+            assert!(view.snapshot().store_id.is_none());
+            assert!(view.branch_reader.lock().unwrap().is_none());
+            // An unused SQLite authority remains independently openable.
+            aw_store::SessionStore::open(&root.join("state")).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_configured_state_clears_publication_without_source_fallback() {
+        let root = crate::test_support::temp_dir("view-authority-change");
+        seed(&root);
+        {
+            let mut host = host(&root, SessionStoreBackendArg::Sqlite);
+            let view = projection(&host);
+            refresh(&mut host, &view, true);
+            assert!(view.branch_reader.lock().unwrap().is_some());
+            let other = root.join("other-state");
+            std::fs::create_dir(&other).unwrap();
+            host.state_dir = Some(other.clone());
+            refresh(&mut host, &view, true);
+            assert!(view.snapshot().store_id.is_none());
+            assert!(view.branch_reader.lock().unwrap().is_none());
+            assert!(!other.join("sessions.sqlite3").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

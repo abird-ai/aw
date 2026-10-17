@@ -904,6 +904,7 @@ async fn renewing_a_release_does_not_resurrect_old_derived_artifacts() {
     assert!(store.branches(bob.actor(), &s.id).is_ok());
     assert!(store.context_artifact(bob.actor(), &a.id).is_err());
     assert!(store.activate(bob.actor(), &t.id, &tb.id).is_err());
+    assert!(store.read_branch_view(bob.actor(), &t.id, &tb.id).is_err());
 }
 
 struct RevokeDuringOutput {

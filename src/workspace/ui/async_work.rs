@@ -480,6 +480,7 @@ impl Ui {
     }
     pub(super) fn apply_background_result(&mut self, result: UiBackgroundResult) {
         match result {
+            UiBackgroundResult::AgentView(reply) => self.apply_agent_view_reply(reply),
             UiBackgroundResult::Terminal(result) => {
                 self.terminal_pending = false;
                 match result {

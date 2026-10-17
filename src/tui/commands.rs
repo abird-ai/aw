@@ -405,6 +405,12 @@ impl WorkspaceCommand {
 #[cfg(feature = "workspace")]
 pub const WORKSPACE_COMMANDS: &[WorkspaceCommand] = &[
     WorkspaceCommand {
+        command: "open-agent-view",
+        label: "Open read-only Agent view",
+        description: "open the selected saved branch without changing the current Agent or draft",
+        shortcut: "o in Sessions",
+    },
+    WorkspaceCommand {
         command: "conversation",
         label: "Focus Agent",
         description: "open/focus the current agent composer",
@@ -971,6 +977,7 @@ Tab          complete selected slash command
 ↑ / ↓        slash selection; multiline cursor; otherwise history
 Ctrl+P/N     previous/next prompt history
 Ctrl+Shift+P open unified command palette, preserving the draft
+o (Sessions) open selected branch as a read-only Agent view; Enter activates
 F1           command palette; /keymap prints the full keymap
 F6/F7        toggle thinking activity / tool details during live work
 Ctrl+A/E     line start/end · Ctrl+B/F left/right

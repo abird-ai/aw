@@ -2,6 +2,7 @@
 //! neither a layout operation nor a read-only file view invokes a model.
 mod agent_view;
 mod background;
+mod branch_view;
 mod files;
 mod git;
 mod owner;

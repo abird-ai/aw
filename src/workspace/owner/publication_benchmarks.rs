@@ -8,7 +8,9 @@ fn snapshot(live_bytes: usize, sessions: usize) -> Snapshot {
         busy: true,
         state_pending: false,
         fatal: false,
+        store_id: Some("invented-store".into()),
         session: Some("invented-session".into()),
+        branch_id: Some("invented-branch".into()),
         session_title: Some("Fixture".into()),
         branch: "main".into(),
         model: "fixture".into(),
@@ -39,6 +41,7 @@ fn snapshot(live_bytes: usize, sessions: usize) -> Snapshot {
                 updated_at: 0,
                 turn_count: 0,
                 branches: vec![SavedBranch {
+                    id: format!("invented-branch-{n}"),
                     name: "main".into(),
                     parent: None,
                 }],

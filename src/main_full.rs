@@ -2090,7 +2090,9 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                         &mut file_config,
                     )?;
                     if let Some(update) = chatgpt_plan_profile_update(
-                        directory.as_deref(),
+                        SessionStore::open(directory.as_deref().ok_or(Error::Denied(
+                            "Sign in with ChatGPT requires durable local state for SecretStore custody",
+                        ))?)?,
                         &actor,
                         &file_config,
                         host_id,
@@ -2945,17 +2947,13 @@ fn run_schedule_due(args: ScheduleRunDueCliArgs) -> Result<u8> {
 
 #[cfg(feature = "pipelines")]
 fn run_pipeline_invocation(host: &mut Host, invocation: PipelineInvocation) -> Result<u8> {
-    let state = host
-        .state_dir
-        .clone()
-        .ok_or(Error::Denied("pipeline execution requires durable SQLite state"))?;
+    host.state_dir.as_deref().ok_or(Error::Denied(
+        "pipeline execution requires durable SQLite state",
+    ))?;
     if !matches!(host.store_backend, resources_cli::SessionStoreBackendArg::Sqlite) {
         return Err(Error::Denied("Phase 39 pipelines require the SQLite authority backend"));
     }
-    let mut store = match host.persistent.as_ref() {
-        Some(saved) => saved.store.clone(),
-        None => SessionStore::open(&state)?,
-    };
+    let mut store = host.sqlite_store()?;
     let actor = sessions::actor(&host.context, false)?;
     let mut run = match invocation {
         PipelineInvocation::Start { pipeline, revision, binding, request_id, input } => {
@@ -3015,7 +3013,7 @@ fn run_pipeline_invocation(host: &mut Host, invocation: PipelineInvocation) -> R
                 if host.persistent.is_none() {
                     drop(store);
                     if let Err(error) = host.ensure(false, &input) {
-                        let recovery = SessionStore::open(&state)?;
+                        let recovery = host.sqlite_store()?;
                         let _ = recovery.pipeline_fail_agent(
                             &actor,
                             &current.id,
@@ -3122,6 +3120,7 @@ struct Host {
     subagent_guardian_policy: Option<String>,
     state_dir: Option<PathBuf>,
     store_backend: resources_cli::SessionStoreBackendArg,
+    sqlite_store: Option<SessionStore>,
     persistent: Option<PersistentSession>,
     #[cfg(feature = "jsonl")]
     jsonl_store: Option<aw_store_jsonl::JsonlStore>,
@@ -3524,6 +3523,7 @@ impl Host {
             subagent_guardian_policy,
             state_dir,
             store_backend,
+            sqlite_store: persistent.as_ref().map(|saved| saved.store.clone()),
             persistent,
             #[cfg(feature = "jsonl")]
             jsonl_store,
@@ -3662,6 +3662,41 @@ impl Host {
         })
     }
 
+    /// One owner-lock lifetime for browsing and later Session activation. A
+    /// cached store never changes the configured State or supplies a fallback.
+    fn sqlite_store(&mut self) -> Result<SessionStore> {
+        let existing = self
+            .persistent
+            .as_ref()
+            .map(|saved| saved.store.clone())
+            .or_else(|| self.sqlite_store.clone());
+        if let Some(store) = existing {
+            match (store.directory(), self.state_dir.as_deref()) {
+                (Some(directory), Some(configured)) if configured.canonicalize()? == directory => {}
+                (None, None) => {}
+                _ => {
+                    return Err(Error::Denied(
+                        "SQLite State does not match the configured authority",
+                    ))
+                }
+            }
+            if let Some(cached) = &self.sqlite_store {
+                if cached.store_id()? != store.store_id()? {
+                    return Err(Error::Denied("SQLite State authority changed"));
+                }
+            }
+            self.sqlite_store = Some(store.clone());
+            return Ok(store);
+        }
+        let path = self
+            .state_dir
+            .as_deref()
+            .ok_or(Error::Denied("state disabled"))?;
+        let store = SessionStore::open(path)?;
+        self.sqlite_store = Some(store.clone());
+        Ok(store)
+    }
+
     fn ensure(&mut self, web: bool, title: &str) -> Result<()> {
         if self.agent.is_some() {
             return Ok(());
@@ -3674,14 +3709,15 @@ impl Host {
                         "personal ChatGPT-plan credentials stay with the local Unix owner",
                     ));
                 }
-                let path = self.state_dir.as_deref().ok_or(Error::Denied(
+                self.state_dir.as_deref().ok_or(Error::Denied(
                     "Sign in with ChatGPT requires durable local state for SecretStore custody",
                 ))?;
+                let store = Self::storage_step(self.sqlite_store(), "opening OAuth durable store")?;
                 aw::configured_oauth_execution(
                     &self.settings,
                     &self.context,
                     &self.tools,
-                    Self::storage_step(SessionStore::open(path), "opening OAuth durable store")?,
+                    store,
                     false,
                 )?
             }
@@ -3726,7 +3762,7 @@ impl Host {
 
                 match self.store_backend {
                     resources_cli::SessionStoreBackendArg::Sqlite => {
-                        let store = Self::storage_step(SessionStore::open(path), "opening Session store")?;
+                        let store = Self::storage_step(self.sqlite_store(), "opening Session store")?;
                         if let Some(selector) = self.workspace_selector.as_deref() {
                             let d = match self.domain_selector.as_deref() {
                                 Some(v) => Some(store.domain(agent.actor(), v)?.id),
@@ -4227,6 +4263,7 @@ impl Host {
         if let Some(agent) = &mut self.agent {
             p.apply(agent)?;
         }
+        self.sqlite_store = Some(p.store.clone());
         self.persistent = Some(p);
         Ok(())
     }
@@ -4406,11 +4443,7 @@ impl Host {
                 let persistent = if let Some(current) = &self.persistent {
                     current.open_session(id, branch)?
                 } else {
-                    let store = SessionStore::open(
-                        self.state_dir
-                            .as_deref()
-                            .ok_or(Error::Denied("state disabled"))?,
-                    )?;
+                    let store = self.sqlite_store()?;
                     PersistentSession::open(
                         store,
                         sessions::actor(&self.context, false)?,
@@ -4462,19 +4495,11 @@ impl Host {
         self.describe()
     }
 
-    fn choose_resume_session(&self) -> Result<Option<String>> {
+    fn choose_resume_session(&mut self) -> Result<Option<String>> {
         let actor = sessions::actor(&self.context, false)?;
         let choices = match self.store_backend {
             resources_cli::SessionStoreBackendArg::Sqlite => {
-                let store = if let Some(persistent) = &self.persistent {
-                    persistent.store.clone()
-                } else {
-                    SessionStore::open(
-                        self.state_dir
-                            .as_deref()
-                            .ok_or(Error::Denied("state disabled"))?,
-                    )?
-                };
+                let store = self.sqlite_store()?;
                 store
                     .list(&actor)?
                     .into_iter()
@@ -4695,15 +4720,7 @@ impl Host {
                 let actor = sessions::actor(&self.context, false)?;
                 match self.store_backend {
                     resources_cli::SessionStoreBackendArg::Sqlite => {
-                        let store = if let Some(p) = &self.persistent {
-                            p.store.clone()
-                        } else {
-                            SessionStore::open(
-                                self.state_dir
-                                    .as_deref()
-                                    .ok_or(Error::Denied("state disabled"))?,
-                            )?
-                        };
+                        let store = self.sqlite_store()?;
                         print_json(&store.list(&actor)?)?;
                     }
                     resources_cli::SessionStoreBackendArg::Jsonl => {
@@ -5310,16 +5327,12 @@ fn ensure_chatgpt_host_id(
 
 #[cfg(feature = "oidc")]
 fn chatgpt_plan_profile_update(
-    state_dir: Option<&Path>,
+    store: SessionStore,
     actor: &aw::PrincipalId,
     file_config: &config::FileConfig,
     host_id: String,
     profile_name: String,
 ) -> Result<Option<config::ProfileUpdate>> {
-    let path = state_dir.ok_or(Error::Denied(
-        "Sign in with ChatGPT requires durable local state for SecretStore custody",
-    ))?;
-    let store = SessionStore::open(path)?;
     let referenced = file_config
         .profiles
         .values()
@@ -5418,7 +5431,7 @@ fn configure_provider_interactively(
                     &mut host.file_config,
                 )?;
                 if let Some(update) = chatgpt_plan_profile_update(
-                    host.state_dir.as_deref(),
+                    host.sqlite_store()?,
                     &actor,
                     &host.file_config,
                     host_id,
