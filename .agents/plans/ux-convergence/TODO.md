@@ -12,7 +12,7 @@ Continue only authorized bounded slices after current validation. This is additi
 
 ## Uncommitted
 
-- [ ] Inventory remaining gaps from actual shipping views; keep accepted behavior/capability differences and mark unavailable resources honestly rather than inventing parity.
+- [~] Inventory remaining gaps from actual shipping views: source-backed inventory and executed 90-frame native gallery now documented in [README.md](README.md); still require actual browser Light/Dark/screenshots and full native focus/caret/split matrix before calling the cross-surface inventory fully accepted (65×20 maximize/restore smoke now passed).
 - [ ] Apply shared semantic roles across native/browser with System/Light/Dark and 16/256/truecolor fallback: readable primary/secondary text, independent focus/selection and factual status words/icons, not color alone.
 - [ ] Complete restrained chrome where gaps remain: borderless primary surfaces, one sidebar boundary, necessary split separators, single-row compact filled active tabs, quiet inactive tabs/overflow and one context-bearing title.
 - [ ] Preserve user prompt emphasis, unboxed assistant prose and one compact tool block: success green, failure/denial/interruption red, running/UNKNOWN neutral or attention; unsettled outcomes must never appear successful/free.

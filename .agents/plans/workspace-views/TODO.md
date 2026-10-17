@@ -122,7 +122,7 @@ Design and binding decisions: [README.md](README.md).
 ## Uncommitted
 
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
-- [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
+- [~] Evaluate left-right publication only at measured read-heavy shared ownership seams. A reproducible 90-case release-mode synthetic Session/presence matrix with held historical snapshots is now in `crates/aw-agent-core/examples/publication_measure.rs`; see README screening/disposition. Read-heavy cases improve but 4:1 write-heavy cases regress substantially, and end-to-end HTTP/grant/TTL/SSE gains have **not** been measured. Production Mutex ownership remains unchanged; the final redesign gate is open.
 
 ## Tests and verification
 
@@ -150,7 +150,7 @@ Design and binding decisions: [README.md](README.md).
 - [x] `node --test tests/web_model.test.mjs tests/web_workspace.test.mjs tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs tests/web_agent_parity.test.mjs tests/web_rich_markdown.test.mjs` — pinned Nix shell on `b33a418`, 107 passed.
 - [x] Changed-content committed-Find and close/restore ABA regressions, including inactive footer/focus and consumed flash selection — executed by the workspace Cargo gate on `b33a418`, passed.
 - [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=b33a4183f6032a024d1b73409d2c9134ea0aab24#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
-- [ ] Further native narrow/maximize, modal-focus and child-PTY acceptance, plus docking-specific checks when implemented — remain open beyond this checkpoint.
+- [~] Further native narrow/maximize, modal-focus and child-PTY acceptance, plus docking-specific checks when implemented — **partially exercised**, not closed: on the starting `a20a4bd` tree, 90 native TestBackend gallery renders passed; isolated real PTY F1/resize/explicit quit and child-shell Ctrl+C/quit-all both exited 0 with restored termios and six zero State counters. A live 65×20 Ctrl+K Z maximize/restore + F1/resize/quit smoke also passed with restored termios; exact focus/caret/split matrix, live browser screenshots and docking-specific checks remain open; see README.
 
 - [x] Scoped Files layout regressions: two same-path scopes, container membership/global limits, legacy full/exhausted layouts, malformed/mixed versions and split/move/close/save/load — `cargo test --workspace --locked`, pinned Nix shell on `b33a418`, passed.
 - [x] Actual retained-root backend regressions: distinct read/list/search results, unknown/revoked/reconnected scopes, root replacement and capability cleanup — same executed workspace Cargo gate on `b33a418`, passed.

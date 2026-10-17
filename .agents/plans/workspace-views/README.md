@@ -277,6 +277,93 @@ replacement and held close/refresh/source replies fail without redirecting a
 read. The same Agent/root/draft/caret, Git heads/indexes and execution counts
 remain unchanged in actual Rust HTTP and immutable-package Chrome acceptance.
 
+## Publication screening and disposition — 2026-10-17
+
+A reproducible, source-controlled **release-mode candidate benchmark** is now
+available at `crates/aw-agent-core/examples/publication_measure.rs`:
+
+```sh
+cargo run --locked -p aw-agent-core --release --example publication_measure -- --held
+# --quick selects small Session and presence cases with 1/4 readers;
+# omit --held to compare without an owned historical snapshot.
+```
+
+It uses the existing `aw_agent_core::publication` implementation (not an
+imitated lock-free structure), a cloned `Mutex` Session read against an
+immutable Arc publication read, and the **actual** presence read shape:
+prune/filter/project rows under its Mutex rather than clone the whole map.
+The matrix covers Session payloads 32 KiB / 256 KiB / 4 MiB, presence 8 / 128
+rows, one/four/eight registered readers, and write/read ratios 1:4, 1:16,
+4:1. Output is one JSON object per case (90 cases with paired strategies),
+with wall time, reader/writer p50/p95, cold reader registration time, Linux
+process CPU *ticks*, payload-clone allocations and estimated peak live payload
+bytes. Held-old-snapshot cases check reclamation when consumers retain Arc
+ownership across publication.
+
+Medians from **three complete optimized 90-case runs** in the pinned
+2026-10-17 Nix developer shell, expressed as **Mutex wall time →
+publication wall time** for the same isolated work:
+
+| Workload, eight readers | 1:16 write/read | 4:1 write/read |
+| --- | --- | --- |
+| 256 KiB Session | 3.58 → 0.36 ms (9.8× faster) | 3.76 → 10.28 ms (2.7× slower) |
+| 4 MiB Session | 26.78 → 5.47 ms (4.9× faster) | 28.96 → 117.56 ms (4.1× slower) |
+| 8-row presence | 3.73 → 0.75 ms (5.0× faster) | 5.24 → 14.67 ms (2.8× slower) |
+| 128-row presence | 38.58 → 7.18 ms (5.4× faster) | 42.48 → 230.36 ms (5.4× slower) |
+
+This is **microbenchmark screening, not a production improvement claim**:
+the Session payload is representative bytes rather than real `Snapshot`
+JSON; real `/api/session` separately waits for exact authorized Store
+recovery hints and current account visibility, and SSE subscribes before
+its high-water snapshot. The hot `Session::delta` path appends per-token
+while holding the existing mutable State mutex; replacing it with full
+per-token immutable payload cloning is potentially quadratic in growing
+answer length. Presence list has fresh Store authorization and mandatory
+30-second TTL semantics; every publication must keep grants, expiry,
+bounds and request lifetimes independent of the cache. There is no valid
+single shared Reader behind a Mutex. Timings are short, sensitive to host
+scheduling and do not include JSON encoding, transport, hardware counters
+or a realistic service arrival distribution. The estimated allocation
+count/peak records payload clones only, not the complete allocator heap;
+CPU tick resolution is too coarse for the shortest scenarios.
+
+**Decision: do not migrate either production Mutex yet.** Read-heavy
+throughput improvements can be substantial, but the 4:1 loss, additional
+retained payloads and current per-delta mutation lifecycle mean no
+measured end-to-end performance win has been established. Retain one
+durable `SessionState` authority and the bounded presence Mutex; avoid
+a second truth/cache and new synchronization invariants. Next:
+instrument the existing authenticated HTTP/SSE and authorized presence
+handlers with *synthetic* private Store fixtures to determine realistic
+write/read ratio, JSON/TTL/grant cost and p95 latency before considering
+a narrowly synchronized read projection. Do not infer permission from a
+previously published snapshot.
+
+### Native acceptance added during the same screening
+
+- The real shipping `Ui::draw` 90-frame TestBackend gallery passed on the
+  starting HEAD with the pinned Nix developer environment: Dark/Light/System,
+  80×24/100×30/120×40/160×45/200×60 and six scenes including split,
+  palette, tabs overflow and stale terminal. The fixtures guarantee zero
+  provider/PTY attachment; they are **not** real-terminal proof.
+- A separate real PTY drove an existing immutable `aw 0.15.0` binary with a
+  temporary fake `openai` endpoint at `127.0.0.1:9`, explicit `--tools-mode
+  off`, synthetic private State/root/layout and isolated HOME/XDG dirs.
+  Native startup, F1 palette, 80×24 → 120×30 resize, `quit-discard` clean
+  exit code 0, byte-equal termios and alternate-screen restoration passed.
+- A second isolated real PTY exercised explicit `terminal-start`, a live
+  child shell receiving its own Ctrl+C, then `quit-all` with child
+  termination. The owner exited 0 and restored terminal modes and alternate
+  screen; all six SQLite Session/run/effect counters were zero. This was
+  **not** a test of remote agents, paid providers, Windows, compositor or
+  actual user data.
+- A third real PTY drove 80×24 → **65×20**, Ctrl+K Z maximize and restore
+  (both redrew, Sessions header repainted on restore), F1 modal close/reopen,
+  then 120×30 resize and explicit clean quit; it exited 0 with restored
+  terminal state and six zero State counters. Real split/modal-focus detail,
+  broader terminal capability combinations and docking are still open;
+  do not close the combined item from these bounded smoke tests.
+
 ## References
 
 - [Live Workspace behavior](../../docs/WORKSPACE.md)
