@@ -50,10 +50,9 @@ data. Isolated worktrees must exclude the reserved subtree before checkout.
 The coordinator owns reconciliation, commits, pushes and deletion decisions
 unless explicitly delegated.
 
-Preserve signed history and historical tags. Do not push, publish, create tags
-or make persistent live-state changes without user authorization. Do not commit
-credentials, runtime databases, transcripts, real grants, caches or build
-outputs. Review exact owned paths before an atomic, expected-parent commit.
+Preserve signed history and historical tags. Do not commit credentials,
+runtime databases, transcripts, real grants, caches or build outputs. Review
+exact owned paths before an atomic, expected-parent commit.
 
 ## Repository and history layout
 
@@ -96,3 +95,12 @@ outputs. Review exact owned paths before an atomic, expected-parent commit.
   parked. Do not invent Phase69 or claim complete v1.5/agentc/security parity.
   Read the affected live protocol before changing storage, retry, networking,
   device, team or disclosure behavior.
+
+## Git safety
+
+Commits are signed; never disable signing. Never push, force-push, tag,
+publish, deploy, or run destructive operations — history rewrite, `reset
+--hard`, branch deletion, or touching another agent's staged or uncommitted
+work — without explicit user confirmation for that action. Confirm each such
+action on its own: a request to "commit" or "apply" is not authorization to
+push.
