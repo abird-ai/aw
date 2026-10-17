@@ -81,21 +81,37 @@ Design and binding decisions: [README.md](README.md).
 - [x] Pass the exact pinned product gate: bootstrap, formatting, 1,649 Rust tests with 2 existing ignored, and all 125 browser tests; Workspace-only check and 132 web-only library tests passed. Native Nix package/version passed.
 - [x] Actual Chrome 155 against immutable package and real Rust/SQLite owner: two branches retained independent 120-hit Find, 1,100/1,750-pixel scroll and selection; actual composer/draft/caret and owner were unchanged. Unchanged authorized refresh and a changed hidden response retained state, a held actual owner reply could not reopen its closed tab, and unchanged-head membership revocation cleared transcript/Find/selection/labels. This predates the draft-retarget follow-up below.
 
+### `68629d8ddcdba4bb502ef21ea04d5bae006f5fdd` — explicit browser draft targets
+
+- [x] Bind private unsent text to minimal owner/Session/branch identity; external retargeting preserves draft/caret and blocks Send and publication until explicit Use draft here, which does not submit.
+- [x] Consume confirmed local branch-open consent only for unchanged text/origin and its exact canonical target, including matching SSE-before-HTTP; quiet updates and unrelated targets grant no consent.
+- [x] Fence late navigation/reset UI replies by browser lifetime, preserve text rebound during accepted-send waits, and keep shared-draft exact target/protocol semantics.
+- [x] Rebuild the production Solid bundle and correct canonical CLI/current LocalWeb documentation without changing runtime protocols or State schemas. Exact pinned bootstrap/format/workspace Cargo and six-suite Node gate passed: 1,649 Rust tests, 2 existing ignored, 125 Node tests; immutable Nix package/version passed. The notice clickability correction follows below.
+
+### `94697a7899ae52eb11167519c9abc05ee3517756` — reachable draft consent and final browser acceptance
+
+- [x] Keep the consent notice in composer flow with pointer events restored and long labels wrapped; ordinary Use draft here remains reachable at 390 px. Global error notices retain their placement.
+- [x] Pass the exact pinned bootstrap/format/workspace Cargo and six-suite Node gate: 1,649 Rust tests, 2 existing ignored, 125 Node tests, no failures. Rebuild the production Solid bundle into a private directory and match all eight committed artifacts byte-for-byte.
+- [x] Build the exact immutable Nix package and run `bin/aw --version`: aw 0.15.0, exit 0. Served JS/CSS matched committed bytes.
+- [x] Actual Chrome 155 against that immutable binary and a private Rust/SQLite owner: two branches retained independent 120-hit Find, scroll and selection; composer node/draft/caret and active owner stayed unchanged. Unchanged authorized refresh kept selected DOM; a changed hidden response retained Find/viewport; a held real owner reply could not reopen a closed tab, and reopening allocated a fresh lifetime.
+- [x] Actual unchanged-head membership revocation cleared protected transcript, Find, selection and labels and refreshed the catalog. A held real snapshot and queued old SSE could not revive cleared owner DOM after a simulated transport 401; the LocalWeb fixture has no paired-cookie expiry.
+- [x] Actual final bundle at 390 px with long Session/branch labels: external retarget disabled Send/Enter, ordinary Use draft here enabled the preserved draft separately from submission, and no effectful POST occurred. Additional instrumented early DOM/transport checks covered publication consent, same-target revision, matching activation SSE-before-HTTP and unrelated-target/new-text races; these do not claim live paired/shared acceptance.
+- [x] Final private fixture retained exactly two Sessions, identical branch heads/revisions and zero runs/run_events/invocation_receipts/pipeline_runs/team_runs. Chrome recorded no uncaught runtime errors; the private owner exited 0. Transient diagnostics and completed agent scratch are removed after reconciliation.
+
 ## Uncommitted
 
-- [~] Finish browser Agent acceptance and bind private drafts to exact owner/Session/branch; external retargeting requires an explicit choice before Send or publication.
-- [ ] Add scoped browser Files/Git counterparts through existing capability APIs, with browser-specific acceptance before any shared serialized layout.
+- [ ] Add memory-only scoped browser Files/Git views through retained SurfaceHost capabilities: launch-root Files and verified existing Git worktrees first, exact source/binding identity and independent state. Another Files root requires an explicit trusted-owner grant contract. Complete actual browser acceptance before any shared serialized layout.
 - [ ] Add docking last with explicit cross-window ownership, reparenting, origin close and focus/lifetime transfer; moving never starts/clones resources.
 - [ ] Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 
 ## Tests and verification
 
-- [ ] Exact follow-up product gate/package and actual Chrome draft-retarget/late-observation/closed-view/revocation acceptance; recheck zero execution effects.
+- [x] Exact follow-up product gate/package and actual Chrome draft-retarget/late-observation/closed-view/revocation acceptance — passed on `94697a7` as recorded above, with unchanged branch heads and zero execution effects.
 
-- [ ] Browser Agent HTTP regressions against real SQLite State: exact authority/identity, unsaved owner reuse, privacy, revocation and zero execution effects.
-- [ ] Browser Agent view model regressions: delayed/closed/superseded replies, duplicate targets, bounded caches, independent state, expiry and logout — existing six-suite Node gate.
-- [ ] Shipping Solid production build and immutable native package with browser assets; full pinned product gate on the implementation commit.
-- [ ] Actual shipping browser against the Rust owner and two real SQLite branches: independent Find/scroll, unchanged active Agent/draft/caret, denied refresh clearing, stale close protection and zero execution effects.
+- [x] Browser Agent HTTP regressions against real SQLite State: exact authority/identity, unsaved owner reuse, privacy, revocation and zero execution effects — `cargo test --workspace --locked`, exact pinned `94697a7`, passed.
+- [x] Browser Agent view model regressions: delayed/closed/superseded replies, duplicate targets, bounded caches, independent state, expiry and logout — existing six-suite Node command from TODO-SPEC.md, exact pinned `94697a7`, 125 passed.
+- [x] Shipping Solid production build — `npm --prefix web run build -- --outDir PRIVATE_TMP`, exact pinned `94697a7`, all eight artifacts matched committed bytes. `nix build git+file:///home/pvl/spaces/abird/src/aw?rev=94697a7899ae52eb11167519c9abc05ee3517756#aw --no-link --print-out-paths --no-update-lock-file --cores 8` and full pinned product gate passed.
+- [x] Actual shipping browser against the Rust owner and two real SQLite branches: independent Find/scroll, unchanged active Agent/draft/caret, denied refresh clearing, stale close protection and zero execution effects — Chrome 155 on immutable `94697a7`, passed as scoped above.
 
 - [x] Store exact-ID/authority/revocation/active-run/history/no-effect regressions — `cargo test --workspace --locked`, pinned Nix shell on `b33a418`, passed.
 - [x] Layout migration, independent descriptors, split/move/global limits and native persistence protections — same executed workspace Cargo gate on `b33a418`, passed.

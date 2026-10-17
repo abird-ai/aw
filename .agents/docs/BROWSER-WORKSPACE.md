@@ -8,6 +8,13 @@ through the existing idle, draft and reconciliation guards. A read-only tab
 never creates or activates a Session, calls a model/tool, or changes the current
 Agent, composer draft or caret.
 
+Private unsent drafts remain bound to their owner, Session and branch. An
+external target change preserves text and caret while blocking Send and private
+draft publication. **Use draft here** explicitly binds the draft to the current
+target without sending or publishing it. A confirmed local branch-open already
+supplies that consent for unchanged text and the exact target; clearing the
+text resets the binding. Read-only tab selection never retargets the draft.
+
 Each tab names an exact Store, owner lifetime, Session and branch. Titles are
 labels. The owner retains one SQLite Store for unsaved browsing and subsequent
 Session creation; a read does not reopen State or initialize persistence.
@@ -75,7 +82,7 @@ aw web -C /absolute/checkout --provider-profile llama --model-id SERVER_MODEL \
   --web-workspace --web-site 'Docs=https://docs.example.org/'
 ```
 
-These commands require a compiled aw. `--web-workspace` grants human read-only file/Git views under the explicit root and Git-discovered worktrees. It does **not** grant model tools. Browser terminal startup needs the additional owner flag and an interactive confirmation. The UI remains a numeric-loopback owner under its LocalWeb or paired/shared authentication boundary; neither this flag nor a reverse proxy supplies remote multi-user authentication.
+These commands require a compiled aw. `--web-workspace` grants human Files reads under the explicit startup root and Git views of that checkout and its verified existing worktrees. It does **not** grant model tools. Browser terminal startup needs the additional owner flag and an interactive confirmation. The UI remains a numeric-loopback owner under its LocalWeb or paired/shared authentication boundary; neither this flag nor a reverse proxy supplies remote multi-user authentication.
 
 Historical Phase-6 behavior required explicit **Open workspace**. Current local-single-user `aw web` mounts the workspace automatically; paired/shared modes may still use explicit capability-gated entry. No terminal or model is started by loading the shell. Surface SDK construction records trusted root/program/site capabilities but does not launch a process. Files/Git/session lists are fetched lazily by the mounted side panes and refreshed on demand; that human browsing still does not dispatch inference.
 
@@ -87,13 +94,13 @@ The older browser-local v1 reducer still models up to four content groups and 24
 
 ## Human file/Git reads
 
-Files uses the current owner root, bounded read-only directory and UTF-8 file services. Navigating or reading does not advertise a model tool or inject source into model context. Symlink/traversal/hardlink restrictions are inherited from the Linux file implementation; this remains a trusted same-OS-user application, not a tenant sandbox.
+Files uses the explicit owner startup root, bounded read-only directory and UTF-8 file services. Navigating or reading does not advertise a model tool or inject source into model context. Symlink/traversal/hardlink restrictions are inherited from the Linux file implementation; this remains a trusted same-OS-user application, not a tenant sandbox.
 
 Git has exclusive **Changes / Worktrees / Branches** subviews and **List / Tree** changed-file projection. The browser sends opaque inventory handles for open operations, not arbitrary Git commands, shell arguments or filesystem roots. Staged/unstaged records of the same path keep different identities. Worktree selection changes human Git scope and the initial directory of a newly created terminal only. It does not move the agent, its Files root, tools, provider or account.
 
 The web adapter is **read-only for Git** in this slice. The native Phase 5 whole-file index update commands remain available, but are not exposed through the new HTTP action schema. Branch opening compares an object; it does not checkout. No browser fetch/push/commit/checkout/worktree creation/deletion occurs.
 
-A diff is a cached exact review snapshot, not a live working-file promise. Clicking a diff row can add a labelled comment to the **unsent** composer if it belongs to the agent root and the conversation target did not change during the request. The user submits explicitly. Cross-root feedback is blocked. Review caches cap at eight; inventories and source bytes retain the Git SDK's bounds. Expired handles require refresh and inspection.
+A diff is a cached exact review snapshot, not a live working-file promise. The current Solid CodeMirror surface displays it read-only. The retained historical workspace module and API provide row comments that append labelled feedback to the **unsent** composer, with conversation-target checks and cross-root feedback blocked. The user submits explicitly. Review caches cap at eight; inventories and source bytes retain the Git SDK's bounds. Expired handles require refresh and inspection.
 
 ## Terminal behavior and limits
 
