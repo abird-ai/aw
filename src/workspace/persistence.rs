@@ -1,7 +1,7 @@
 //! Opt-in per-user view persistence. Never restores credentials or execution.
 //! Platform-specific safe file publication/no-follow reads live in aw-platform.
 use aw::{Error, Result};
-use aw_workspace::Workspace;
+use aw_workspace::{ScopeId, Workspace};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ struct Saved {
 
 const LIMIT: usize = 64 * 1024;
 
-pub fn load(path: &Path, root: &Path) -> Result<Option<Workspace>> {
+pub fn load(path: &Path, root: &Path, launch_scope: &ScopeId) -> Result<Option<Workspace>> {
     if !path.try_exists()? {
         return Ok(None);
     }
@@ -48,7 +48,7 @@ pub fn load(path: &Path, root: &Path) -> Result<Option<Workspace>> {
     if saved.root != root
         || !matches!(
             (saved.version, saved.workspace.version),
-            (1, 1) | (Workspace::VERSION, Workspace::VERSION)
+            (1, 1) | (2, 2) | (Workspace::VERSION, Workspace::VERSION)
         )
     {
         return Err(Error::Denied(
@@ -57,7 +57,7 @@ pub fn load(path: &Path, root: &Path) -> Result<Option<Workspace>> {
     }
     let workspace = saved
         .workspace
-        .migrate()
+        .migrate(launch_scope)
         .map_err(|e| Error::Config(e.to_string()))?;
     Ok(Some(workspace))
 }
@@ -119,7 +119,9 @@ mod tests {
 
     #[test]
     fn missing_is_not_corruption() {
-        assert!(load(&path(), Path::new("/tmp")).unwrap().is_none());
+        assert!(load(&path(), Path::new("/tmp"), &ScopeId::launch())
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(unix)]
@@ -131,8 +133,11 @@ mod tests {
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
         let f = d.join("view.json");
         save(&f, &d, &Workspace::default()).unwrap();
-        assert_eq!(load(&f, &d).unwrap(), Some(Workspace::default()));
-        assert!(load(&f, Path::new("/different")).is_err());
+        assert_eq!(
+            load(&f, &d, &ScopeId::launch()).unwrap(),
+            Some(Workspace::default())
+        );
+        assert!(load(&f, Path::new("/different"), &ScopeId::launch()).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -143,13 +148,13 @@ mod tests {
         std::fs::create_dir(&d).unwrap();
         std::fs::write(d.join("actual"), b"{}").unwrap();
         std::os::unix::fs::symlink("actual", d.join("alias")).unwrap();
-        assert!(load(&d.join("alias"), &d).is_err());
+        assert!(load(&d.join("alias"), &d, &ScopeId::launch()).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn consistent_v1_migrates_in_memory_and_saves_only_as_v2() {
+    fn consistent_v1_migrates_in_memory_and_saves_only_as_v3() {
         use aw_workspace::{Action, Side, Target};
         let d = directory();
         let f = d.join("view.json");
@@ -165,6 +170,7 @@ mod tests {
             .apply(Action::Open {
                 group,
                 target: Target::File {
+                    scope_id: ScopeId::launch(),
                     path: "src/lib.rs".into(),
                 },
                 pinned: true,
@@ -173,13 +179,18 @@ mod tests {
         expected.apply(Action::MoveTab { tab: 3, group }).unwrap();
         let mut legacy = expected.clone();
         legacy.version = 1;
+        for tab in legacy.tabs.values_mut() {
+            if let aw_workspace::Target::File { scope_id, .. } = &mut tab.target {
+                *scope_id = ScopeId::default();
+            }
+        }
         let original = write_saved(&f, &d, 1, legacy);
-        let loaded = load(&f, &d).unwrap().unwrap();
+        let loaded = load(&f, &d, &ScopeId::launch()).unwrap().unwrap();
         assert_eq!(loaded, expected);
         assert_eq!(std::fs::read(&f).unwrap(), original);
         save(&f, &d, &loaded).unwrap();
         let saved: Saved = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
-        assert_eq!(saved.version, 2);
+        assert_eq!(saved.version, Workspace::VERSION);
         assert_eq!(saved.workspace, expected);
         std::fs::remove_dir_all(d).unwrap();
     }
@@ -189,11 +200,14 @@ mod tests {
     fn mixed_unsupported_versions_and_save_downgrades_are_rejected() {
         let d = directory();
         let f = d.join("view.json");
-        for (outer, inner) in [(1, 2), (2, 1), (0, 0), (3, 3), (1, 3), (3, 2)] {
+        for (outer, inner) in [(1, 2), (2, 1), (0, 0), (4, 4), (1, 3), (3, 2), (2, 3)] {
             let mut workspace = Workspace::default();
             workspace.version = inner;
             let bytes = write_saved(&f, &d, outer, workspace);
-            assert!(load(&f, &d).is_err(), "versions {outer}/{inner}");
+            assert!(
+                load(&f, &d, &ScopeId::launch()).is_err(),
+                "versions {outer}/{inner}"
+            );
             assert_eq!(std::fs::read(&f).unwrap(), bytes);
         }
         save(&f, &d, &Workspace::default()).unwrap();
@@ -218,18 +232,18 @@ mod tests {
             branch_id: "branch".into(),
         };
         write_saved(&f, &d, 1, legacy);
-        assert!(load(&f, &d).is_err());
+        assert!(load(&f, &d, &ScopeId::launch()).is_err());
         let mut invalid = Workspace::default();
         invalid.version = 1;
         invalid.focused = 999;
         write_saved(&f, &d, 1, invalid);
-        assert!(load(&f, &d).is_err());
+        assert!(load(&f, &d, &ScopeId::launch()).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn v2_exact_agent_view_descriptor_roundtrips() {
+    fn v3_exact_agent_view_descriptor_roundtrips() {
         let d = directory();
         let f = d.join("view.json");
         let mut workspace = Workspace::default();
@@ -239,7 +253,113 @@ mod tests {
             branch_id: "branch/.. exact".into(),
         };
         save(&f, &d, &workspace).unwrap();
-        assert_eq!(load(&f, &d).unwrap(), Some(workspace));
+        assert_eq!(load(&f, &d, &ScopeId::launch()).unwrap(), Some(workspace));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_and_v2_files_bind_only_to_explicit_launch_scope_without_rewriting_disk() {
+        use aw_workspace::{Action, Navigator, Side, Target};
+        let d = directory();
+        let f = d.join("view.json");
+        let authorized = ScopeId("authorized-launch".into());
+        let mut current = Workspace::default();
+        current
+            .apply(Action::SetNavigator {
+                pane: 1,
+                kind: Navigator::Files,
+            })
+            .unwrap();
+        current
+            .apply(Action::AddNavigator {
+                beside: 1,
+                side: Side::Below,
+                kind: Navigator::Files,
+            })
+            .unwrap();
+        current
+            .apply(Action::Open {
+                group: 2,
+                target: Target::File {
+                    scope_id: ScopeId::launch(),
+                    path: "src/lib.rs".into(),
+                },
+                pinned: true,
+            })
+            .unwrap();
+        for version in [1, 2] {
+            let mut legacy = current.clone();
+            legacy.version = version;
+            legacy.containers.clear();
+            legacy.next_container_id = 1;
+            for tab in legacy.tabs.values_mut() {
+                if let Target::File { scope_id, .. } = &mut tab.target {
+                    *scope_id = ScopeId::default();
+                }
+            }
+            let expected = legacy.clone().migrate(&authorized).unwrap();
+            let original = write_saved(&f, &d, version, legacy);
+            let restored = load(&f, &d, &authorized).unwrap().unwrap();
+            assert_eq!(restored, expected);
+            assert_eq!(restored.root, current.root);
+            assert_eq!(restored.panes, current.panes);
+            assert_eq!(restored.containers.len(), 1);
+            assert_eq!(restored.files_scope_for(1), Some(&authorized));
+            assert_eq!(std::fs::read(&f).unwrap(), original);
+            assert!(load(&f, Path::new("/different"), &authorized).is_err());
+            save(&f, &d, &restored).unwrap();
+            let saved: Saved = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+            assert_eq!(saved.version, Workspace::VERSION);
+            assert_eq!(saved.workspace, expected);
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_two_scope_descriptors_roundtrip_without_rebinding_unknown_scopes() {
+        use aw_workspace::{Action, Side, Target};
+        let d = directory();
+        let f = d.join("view.json");
+        let mut workspace = Workspace::default();
+        for name in ["scope-a", "unavailable-scope-b"] {
+            let scope_id = ScopeId(name.into());
+            workspace
+                .apply(Action::AddFiles {
+                    beside: 2,
+                    side: Side::Below,
+                    scope_id: scope_id.clone(),
+                })
+                .unwrap();
+            let group = workspace.files_group_for(workspace.focused).unwrap();
+            workspace
+                .apply(Action::SetScopeLabel {
+                    scope_id: scope_id.clone(),
+                    label: format!("/display-only/{name}"),
+                })
+                .unwrap();
+            workspace
+                .apply(Action::Open {
+                    group,
+                    target: Target::File {
+                        scope_id,
+                        path: "src/lib.rs".into(),
+                    },
+                    pinned: true,
+                })
+                .unwrap();
+        }
+        save(&f, &d, &workspace).unwrap();
+        let restored = load(&f, &d, &ScopeId::launch()).unwrap().unwrap();
+        assert_eq!(restored, workspace);
+        // Loading presentation metadata neither authorizes these identities nor
+        // rewrites them to the launch capability. The host resolves them later.
+        assert_eq!(restored.containers.len(), 2);
+        assert!(restored
+            .containers
+            .values()
+            .any(|container| container.scope_id == ScopeId("unavailable-scope-b".into())));
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -249,14 +369,14 @@ mod tests {
         let d = directory();
         let f = d.join("view.json");
         let expected = Workspace::default();
-        let mut bytes = write_saved(&f, &d, 2, expected.clone());
+        let mut bytes = write_saved(&f, &d, Workspace::VERSION, expected.clone());
         bytes.resize(LIMIT, b' ');
         std::fs::write(&f, &bytes).unwrap();
-        assert_eq!(load(&f, &d).unwrap(), Some(expected));
+        assert_eq!(load(&f, &d, &ScopeId::launch()).unwrap(), Some(expected));
         bytes.push(b' ');
         std::fs::write(&f, bytes).unwrap();
         assert!(matches!(
-            load(&f, &d),
+            load(&f, &d, &ScopeId::launch()),
             Err(Error::Limit("layout exceeds 64 KiB"))
         ));
         std::fs::remove_dir_all(d).unwrap();
@@ -275,6 +395,7 @@ mod tests {
                 .apply(aw_workspace::Action::Open {
                     group: 1,
                     target: aw_workspace::Target::File {
+                        scope_id: ScopeId::launch(),
                         path: format!("{n:02}{}", "a".repeat(4094)),
                     },
                     pinned: true,
@@ -296,7 +417,10 @@ mod tests {
         let f = d.join("view.json");
         save(&f, &d, &Workspace::default()).unwrap();
         std::fs::hard_link(&f, d.join("alias.json")).unwrap();
-        assert!(matches!(load(&f, &d), Err(Error::Denied(_))));
+        assert!(matches!(
+            load(&f, &d, &ScopeId::launch()),
+            Err(Error::Denied(_))
+        ));
         std::fs::remove_dir_all(d).unwrap();
     }
 

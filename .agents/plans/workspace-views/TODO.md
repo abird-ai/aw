@@ -40,7 +40,13 @@ Design and binding decisions: [README.md](README.md).
 
 ## Uncommitted
 
-- [ ] Compose native Files as a rooted navigator and scoped document group; preserve separate File/Diff preview policy and Explorer focus.
+- [~] Compose native Files as a rooted navigator and scoped document group; preserve separate File/Diff preview policy and Explorer focus — layout, capability and native agents.
+- [~] Add exact scope/path file identity, retained root capabilities, explicit folder open/reconnect and in-memory root binding across Agent presentation changes.
+- [~] Migrate v1/v2 layouts to flat v3 Files ownership without extra panes, changed geometry or saved-root grants.
+- [~] Fence file/list/search/highlight/find work and caches across close/rebind/restore; prune unused external capabilities.
+- [~] Pin Windows scoped root/ancestor/descendant directory handles so path replacement cannot redirect retained scopes; preserve leaf/CAS/cancellation policy.
+- [~] Preserve bounded display-only saved folder labels and reconnect moved File tabs through their exact scope; labels never authorize roots.
+- [~] Admit review feedback against a lossless canonical current Agent-root projection independently of human Files roots.
 - [ ] Compose native Git using existing repository contexts and fresh exact-review/index admission; worktree selection cannot retarget Agent/Files.
 - [ ] Add a flat stable-ID container graph with one parent, cycle/orphan validation and one container level, within global 8-pane/32-tab limits.
 - [ ] Add browser counterparts through existing capability APIs, with browser-specific acceptance and migration before any shared serialized layout.
@@ -61,6 +67,13 @@ Design and binding decisions: [README.md](README.md).
 - [x] Changed-content committed-Find and close/restore ABA regressions, including inactive footer/focus and consumed flash selection — executed by the workspace Cargo gate on `3b0dbb5`, passed.
 - [x] `nix build 'git+file:///home/pvl/spaces/abird/src/aw?rev=3b0dbb502005570cca30e2cd52cba60c052f3587#aw' --no-link --print-out-paths --no-update-lock-file` — passed; built native `bin/aw --version` exited 0 with `aw 0.15.0`.
 - [ ] Further native narrow/maximize, modal-focus and child-PTY acceptance; browser/container/docking-specific checks after those slices exist — remain open beyond this checkpoint.
+
+- [ ] Scoped Files layout regressions: two same-path scopes, container membership/global limits, legacy full/exhausted layouts, malformed/mixed versions and split/move/close/save/load.
+- [ ] Actual retained-root backend regressions: distinct read/list/search results, unknown/revoked/reconnected scopes, root replacement and capability cleanup.
+- [ ] Native Browser/executor/TestBackend acceptance: independent same-path content/find/viewport, invoking-container preview/Explorer focus, stale reads/search/highlights and unchanged Agent/draft/effect admission.
+- [ ] Current scoped-Files candidate: pinned bootstrap/fmt, locked workspace Cargo and six web suites; Workspace feature boundary, exact native package/version and real-terminal two-root acceptance.
+
+- [ ] Windows scoped-directory handle tests: cross-target compilation and real Windows execution are separate results; native runtime remains open without an actual host.
 
 ## Deferred
 

@@ -3158,6 +3158,8 @@ struct Host {
     workspace_layout_file: Option<PathBuf>,
     #[cfg(feature = "workspace")]
     workspace_terminals: Option<workspace::terminals::Pool>,
+    #[cfg(feature = "workspace")]
+    workspace_file_scopes: Option<workspace::files::Scopes>,
 }
 impl Host {
     /// Build a fresh Runtime/Actor Envelope from the *verified* current
@@ -3561,6 +3563,8 @@ impl Host {
             workspace_layout_file: None,
             #[cfg(feature = "workspace")]
             workspace_terminals: None,
+            #[cfg(feature = "workspace")]
+            workspace_file_scopes: None,
         }
     }
 

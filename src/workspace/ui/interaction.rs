@@ -74,9 +74,9 @@ impl Ui {
         let Some(target) = self.layout.tabs.get(&tab).map(|tab| tab.target.clone()) else {
             return Vec::new();
         };
-        if let Target::File { path } = &target {
+        if let Target::File { scope_id, path } = &target {
             return self
-                .file_view_lines(path)
+                .file_view_lines(&FileKey::new(scope_id.clone(), path.clone()))
                 .into_iter()
                 .map(|line| {
                     line.spans
@@ -153,11 +153,20 @@ impl Ui {
             matches!(target, Target::AgentView { .. }).then(|| self.agent_view_plain(tab));
         let lowered = query.to_lowercase();
         let file_lines = match &target {
-            Target::File { path } => self.file_lines.get(path).cloned(),
+            Target::File { scope_id, path } => self
+                .file_lines
+                .get(&FileKey::new(scope_id.clone(), path.clone()))
+                .cloned(),
             _ => None,
         };
         let file_path = match &target {
-            Target::File { path } => Some(path.clone()),
+            Target::File { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        let file_context = match &target {
+            Target::File { scope_id, path } => {
+                Some(self.file_key_context(&FileKey::new(scope_id.clone(), path.clone())))
+            }
             _ => None,
         };
         let diff = match &target {
@@ -188,8 +197,8 @@ impl Ui {
                             matches.push(index);
                         }
                     }
-                } else if let (Some(path), Some(lines)) = (file_path, file_lines) {
-                    let header = Self::file_context(&path).to_lowercase();
+                } else if let (Some(_path), Some(lines)) = (file_path, file_lines) {
+                    let header = file_context.unwrap_or_default().to_lowercase();
                     if header.contains(&lowered) {
                         matches.push(0);
                     }
@@ -1354,6 +1363,8 @@ impl Ui {
         if self.palette.is_some() {
             return;
         }
+        self.palette_file_scope = self.current_file_scope();
+        self.palette_file_container = self.layout.files_container_for(self.layout.focused);
         self.palette = Some(palette::State::default());
         self.palette_file_query.clear();
         self.palette_file_results.clear();
@@ -1811,10 +1822,15 @@ mod tests {
 
         let mut ui = super::super::render_tests::model();
         let path = "src/find-status.txt".to_owned();
-        ui.open(Target::File { path: path.clone() });
+        ui.open(Target::File {
+            scope_id: ScopeId::launch(),
+            path: path.clone(),
+        });
         let tab = ui.layout.active(ui.group()).unwrap().id;
-        ui.file_lines
-            .insert(path, Arc::new(vec!["before".into(), "needle".into()]));
+        ui.file_lines.insert(
+            path.into(),
+            Arc::new(vec!["before".into(), "needle".into()]),
+        );
         commit(&mut ui, tab, "needle");
         let generation = ui.find_generation[&tab];
         complete(&mut ui, tab);

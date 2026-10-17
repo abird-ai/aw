@@ -31,7 +31,7 @@ views discard replies. Access must be revalidated even when a branch head has
 not changed; denial invalidates cached content and derived selection/find state.
 Only an exact current-owner identity can use its authorized live projection.
 
-Native layout v2 explicitly migrates consistent v1 layouts: existing Conversation
+The initial Agent-view layout v2 explicitly migrated consistent v1 layouts: existing Conversation
 means Follow current. Preserve geometry, IDs, pins and root binding, validate
 before installation, retain no-follow/atomic/64 KiB protections and reject
 unsupported or mixed versions. Presentation adds no SQLite/JSONL schema change.
@@ -62,28 +62,62 @@ view never implicitly stops an Agent or PTY.
   Mutex does not show a measured need for a second publication layer.
 - Remote views remain unavailable until their exact authority/lifetime tests pass.
 
-## Next slice: native Files containers
+## Scoped native Files containers
 
-Start with one flat container owning a Files navigator and its document group.
-Keep the current Workspace runtime and global limits. Resolve a stable ScopeId
-through existing explicitly authorized root capabilities; saved paths and scope
-IDs cannot create grants. Reuse `WorkspaceFiles` and scoped filesystem traversal.
+A flat container owns Files navigator views and document groups within the
+existing Workspace runtime, eight-pane/32-tab limits and navigator limits.
+Splitting a document group preserves membership; moving a File tab preserves its
+exact scope/path target. Closing a navigator detaches its groups rather than
+closing unrelated Agent views. Legacy navigators share one launch container;
+migration adds no panes and preserves geometry, IDs, focus and exhausted pane
+allocators. Containers have their own checked ID allocator.
 
-Add scope identity to File descriptors and route previews into the invoking
-container's group. Current file, search and highlight caches use relative paths
-alone; key them and every background request by scope plus relative path, with
-container/view lifetime and generation fences. Explicitly migrate saved Files to
-the already-authorized launch scope; unavailable scopes remain unavailable.
+`ScopeId` identifies a requested human Files binding. The UI resolves it only
+through an explicitly opened retained `WorkspaceFiles` capability. Saved IDs,
+paths and bounded display labels create no grants. Additional folders open on
+the existing bounded executor; saved external folders remain unavailable after
+restart until the user explicitly reconnects them. A moved File tab can reconnect
+its own scope even after its original navigator closed. A launch reconnect must
+retain the original canonical launch root.
 
-Acceptance: two authorized roots containing the same relative path display
+The UI owns the capability registry; Host retains it across Agent/Workspace
+presentation transitions. Human Files/Git roots therefore stay independent of
+an Agent resumed in another directory. Same-root review disclosure uses the
+owner's lossless canonical current Agent-root projection, never a display label.
+Unused external capabilities are revoked after their last container/File view
+reference disappears; a failed layout addition releases its new capability.
+
+File caches and all read/list/search/highlight work use scope plus relative
+path, exact capability binding and view/container lifetime. A conservative
+checked UI Files-work epoch invalidates pending work on ownership changes and
+explicit restore/reconnect; focus, scrolling and geometry remain local. Completed
+viewport/find state survives ordinary moves. Reconnect discards old plaintext,
+render/find/selection state before replacement content can appear. Preview goes
+to the invoking container's document group and preserves Explorer focus.
+
+On Unix the existing root descriptor pins filesystem traversal. Windows scoped
+roots must pin directories and ancestors with handles that deny delete sharing;
+this prevents path replacement while allowing ordinary file edits. Directory
+rename/delete is unavailable while those handles live. Windows source/target
+checks and native Windows execution are separate gates.
+
+Native layout v3 migrates consistent v1/v2 inputs only against the already
+authorized launch scope. Mixed/unsupported versions and malformed ownership are
+rejected before installation; root binding, no-follow/atomic publication and the
+64 KiB limit remain. SQLite v33 and JSONL v1 are unchanged. Older readers reject
+v3; returning to an older binary requires an explicitly selected compatible
+layout or starting without saved layout.
+
+Acceptance: two authorized folders containing the same relative path display
 different content with independent view state; closed/rebound scopes reject
 late read/search/highlight replies; split/move/preview/save/load retain identity,
 limits and Explorer focus while Agent/root/draft/caret and effect admission stay
-unchanged. Implementation begins after the native Agent-view checkpoint.
+unchanged. Browser/Git container counterparts and docking remain later slices.
 
-Source seams: `src/workspace/files.rs`, `src/workspace/ui.rs`,
+Source seams: `src/workspace/files.rs`, `src/workspace/ui/files_views.rs`,
 `src/workspace/ui/async_work.rs`, `src/workspace/persistence.rs`,
-`crates/aw-workspace/src/layout.rs`, `crates/aw-tools/src/browse.rs`.
+`crates/aw-workspace/src/layout.rs`, `crates/aw-tools/src/browse.rs`,
+`crates/aw-platform-win/src/scoped_fs.rs`.
 
 ## References
 

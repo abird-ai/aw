@@ -16,23 +16,10 @@ mod ux_v15_native {
             None,
             None,
         )]);
-        ui.files.insert(
-            "src/fixture.rs".into(),
-            "// Invented, read-only visual fixture\nfn main() {\n    println!(\"界 · café\");\n}\n"
-                .into(),
-        );
-        ui.file_lines.insert(
-            "src/fixture.rs".into(),
-            Arc::new(
-                ui.files["src/fixture.rs"]
-                    .lines()
-                    .map(str::to_owned)
-                    .collect(),
-            ),
-        );
         match scene {
             "agent" => {}
             "file" => ui.open(Target::File {
+                scope_id: ScopeId::launch(),
                 path: "src/fixture.rs".into(),
             }),
             "palette" => ui.open_palette(),
@@ -40,7 +27,10 @@ mod ux_v15_native {
                 ui.open(Target::Help);
                 ui.open(Target::Settings);
                 for path in ["src/fixture.rs", "crates/very-long-unicode-界/file.rs"] {
-                    ui.open(Target::File { path: path.into() });
+                    ui.open(Target::File {
+                        scope_id: ScopeId::launch(),
+                        path: path.into(),
+                    });
                 }
             }
             "split" => {
@@ -49,6 +39,7 @@ mod ux_v15_native {
                     side: Side::Right,
                 });
                 ui.open(Target::File {
+                    scope_id: ScopeId::launch(),
                     path: "src/fixture.rs".into(),
                 });
             }
@@ -57,6 +48,20 @@ mod ux_v15_native {
             }),
             _ => panic!("unknown visual fixture"),
         }
+        ui.files.insert(
+            "src/fixture.rs".into(),
+            "// Invented, read-only visual fixture\nfn main() {\n    println!(\"界 · café\");\n}\n"
+                .into(),
+        );
+        ui.file_lines.insert(
+            "src/fixture.rs".into(),
+            Arc::new(
+                ui.files[&FileKey::from("src/fixture.rs")]
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        );
         ui
     }
 

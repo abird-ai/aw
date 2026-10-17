@@ -3,7 +3,7 @@
 mod agent_view;
 mod background;
 mod branch_view;
-mod files;
+pub(super) mod files;
 mod git;
 mod owner;
 mod palette;
@@ -37,7 +37,13 @@ pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Res
             "aw workspace open requires a real terminal; use --output-print for redirected output".into(),
         ));
     }
-    let root = host.tools.root.canonicalize()?;
+    // Human Files roots remain the capabilities originally opened for this
+    // presentation owner, even if Resume selected an Agent bound elsewhere.
+    let file_scopes = match host.workspace_file_scopes.take() {
+        Some(scopes) => scopes,
+        None => files::Scopes::new(host.tools.root.clone())?,
+    };
+    let root = file_scopes.launch_root().to_owned();
     let layout_file = host.workspace_layout_file.clone();
     let saved_layout_in_memory = host.workspace_state.take();
     let should_load_layout = saved_layout_in_memory.is_none() && layout_file.is_some();
@@ -46,7 +52,7 @@ pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Res
         .validate()
         .map_err(|e| Error::Config(e.to_string()))?;
     let background = background::Executor::new()?;
-    let mut browser = files::Browser::new(root.clone(), background.clone())?;
+    let mut browser = files::Browser::new(background.clone());
     let terminals = host
         .workspace_terminals
         .get_or_insert_with(terminals::Pool::new)
@@ -70,6 +76,7 @@ pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Res
         worker.projection.snapshot(),
         ui_config,
         background,
+        file_scopes,
     )
     .map(|mut ui| {
         ui.attach_terminals(terminals, shell);
@@ -109,6 +116,7 @@ pub(super) fn run(mut host: Host, initial: Option<String>, draft: String) -> Res
                 }
             }
             host.workspace_state = Some(ui.layout);
+            host.workspace_file_scopes = Some(ui.file_scopes);
             Ok(Returned {
                 host,
                 draft: ui.draft.text().to_owned(),

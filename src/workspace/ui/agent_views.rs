@@ -1306,6 +1306,7 @@ mod tests {
         // A different exact target cannot replace an existing view at the global limit.
         while ui.layout.tabs.len() < 32 {
             ui.open(Target::File {
+                scope_id: ScopeId::launch(),
                 path: format!("fixture-{}.txt", ui.layout.tabs.len()),
             });
         }

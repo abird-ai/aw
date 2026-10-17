@@ -354,6 +354,8 @@ impl Ui {
                     accepted = false;
                 }
             }
+            "files-open" => accepted = self.authorize_files(browser, rest, false),
+            "files-reconnect" => accepted = self.authorize_files(browser, rest, true),
             "file" => {
                 if rest.is_empty() {
                     self.notice = "file RELATIVE_PATH".into();
@@ -382,15 +384,11 @@ impl Ui {
                         .or_default()
                         .directory
                         .clone();
-                    self.list_files(browser, pane, path);
-                } else if let Some(Target::File { path }) =
+                    self.refresh_files_navigator(browser, pane, path);
+                } else if let Some(Target::File { scope_id, path }) =
                     self.layout.active(pane).map(|t| t.target.clone())
                 {
-                    self.files.remove(&path);
-                    self.file_lines.remove(&path);
-                    self.file_highlights.remove(&path);
-                    self.file_revision = self.file_revision.wrapping_add(1);
-                    self.read_file(browser, path);
+                    self.refresh_file(browser, FileKey::new(scope_id, path));
                 } else {
                     self.owner(worker, Command::Refresh, false);
                 }
@@ -493,7 +491,7 @@ impl Ui {
                                 .map(|_| None)
                                 .map_err(|e| e.to_string())
                         } else {
-                            persistence::load(&path, &root)
+                            persistence::load(&path, &root, &ScopeId::launch())
                                 .and_then(|layout| {
                                     layout.map(Some).ok_or_else(|| {
                                         Error::Config("No saved layout exists".into())
@@ -597,6 +595,8 @@ impl Ui {
                         | "activity"
                         | "tree"
                         | "files"
+                        | "files-open"
+                        | "files-reconnect"
                         | "sessions"
                         | "git"
                         | "split"
@@ -648,10 +648,10 @@ impl Ui {
             PaletteTarget::Slash(command) => {
                 let _ = self.command(command.trim_end(), worker, browser);
             }
-            PaletteTarget::File(path) => {
+            PaletteTarget::File(key) => {
                 let group = self.group();
-                self.read_file(browser, path.clone());
-                self.focus_palette_file(group, &path);
+                self.read_file_key(browser, key.clone());
+                self.focus_palette_file(group, &key);
             }
             PaletteTarget::Session { session, branch } => {
                 if !self.focus_current_agent(&session, &branch)
@@ -668,6 +668,38 @@ impl Ui {
                 );
             }
             PaletteTarget::Terminal(terminal) => self.open(Target::Terminal { terminal }),
+        }
+    }
+
+    pub(super) fn send_review_feedback(&mut self) -> bool {
+        let Some(id) = self.review_id() else {
+            self.notice = "Focus a diff before sending review feedback".into();
+            return false;
+        };
+        let Some(agent_root) = self.snapshot.agent_root.as_deref() else {
+            self.notice = "Current Agent root unavailable; feedback remains local.".into();
+            return false;
+        };
+        match self.git.feedback(&id, agent_root) {
+            Ok(text) => {
+                let addition = if self.draft.is_empty() {
+                    text
+                } else {
+                    format!("\n\n{text}")
+                };
+                if let Err(error) = self.draft.insert(&addition) {
+                    self.notice = error.to_string();
+                    return false;
+                }
+                self.open(Target::Conversation);
+                self.notice =
+                    "Feedback inserted into unsent composer. Inspect and Send explicitly.".into();
+                true
+            }
+            Err(error) => {
+                self.notice = error;
+                false
+            }
         }
     }
 
@@ -877,32 +909,7 @@ impl Ui {
                     accepted = false;
                 }
             }
-            "send-review" => {
-                if let Some(id) = self.review_id() {
-                    match self.git.feedback(&id, &self.root) {
-                        Ok(text) => {
-                            let addition = if self.draft.is_empty() {
-                                text
-                            } else {
-                                format!("\n\n{text}")
-                            };
-                            if let Err(e) = self.draft.insert(&addition) {
-                                self.notice = e.to_string();
-                            } else {
-                                self.open(Target::Conversation);
-                                self.notice="Feedback inserted into unsent composer. Inspect and Send explicitly.".into();
-                            }
-                        }
-                        Err(e) => {
-                            self.notice = e;
-                            accepted = false;
-                        }
-                    }
-                } else {
-                    self.notice = "Focus a diff before sending review feedback".into();
-                    accepted = false;
-                }
-            }
+            "send-review" => accepted = self.send_review_feedback(),
             "reviewed" => {
                 if let Some(id) = self.review_id() {
                     if !self.git.reviewed.remove(&id) {

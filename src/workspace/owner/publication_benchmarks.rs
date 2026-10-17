@@ -19,6 +19,7 @@ fn snapshot(live_bytes: usize, sessions: usize) -> Snapshot {
         effort: "normal".into(),
         actor: "fixture".into(),
         root: "/invented".into(),
+        agent_root: Some("/invented".into()),
         tools: "none".into(),
         needs_inspection: false,
         turns: Arc::new(Vec::new()),

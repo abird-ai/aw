@@ -6,6 +6,27 @@ pub type Result<T> = std::result::Result<T, LayoutError>;
 pub const MAX_PANES: usize = 8;
 pub const MAX_TABS: usize = 32;
 pub const MAX_DEPTH: usize = 12;
+pub const MAX_SCOPE_LABEL_BYTES: usize = 1024;
+pub const MAX_SCOPE_LABELS: usize = MAX_TABS + MAX_PANES;
+
+fn initial_container_id() -> Id {
+    1
+}
+
+/// A presentation resource identity, never a filesystem path or a grant.
+/// Empty values exist only while decoding the supported legacy schemas.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScopeId(pub String);
+impl ScopeId {
+    pub fn launch() -> Self {
+        Self("launch".into())
+    }
+
+    pub fn is_valid(&self) -> bool {
+        valid_opaque_id(&self.0)
+    }
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LayoutError {
@@ -84,6 +105,8 @@ pub enum Target {
     ContextFlow,
     Activity,
     File {
+        #[serde(default)]
+        scope_id: ScopeId,
         path: String,
     },
     Diff {
@@ -102,6 +125,15 @@ pub struct Tab {
     pub target: Target,
     pub pinned: bool,
 }
+/// Flat presentation ownership. All children are existing panes, never another
+/// container or a second Workspace runtime. Scope resolution belongs to the host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesContainer {
+    pub scope_id: ScopeId,
+    pub navigators: Vec<Id>,
+    pub groups: Vec<Id>,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
@@ -109,6 +141,13 @@ pub struct Workspace {
     pub root: Node,
     pub panes: BTreeMap<Id, Pane>,
     pub tabs: BTreeMap<Id, Tab>,
+    #[serde(default)]
+    pub containers: BTreeMap<Id, FilesContainer>,
+    #[serde(default = "initial_container_id")]
+    pub next_container_id: Id,
+    /// Human display hints only; never paths used to resolve capabilities.
+    #[serde(default)]
+    pub scope_labels: BTreeMap<ScopeId, String>,
     pub focused: Id,
     pub next_id: Id,
 }
@@ -123,6 +162,24 @@ pub enum Action {
         beside: Id,
         side: Side,
         kind: Navigator,
+    },
+    /// Create a scoped navigator and its document group without changing any
+    /// Agent, tool root or existing resource descriptor.
+    AddFiles {
+        beside: Id,
+        side: Side,
+        scope_id: ScopeId,
+    },
+    /// Associate an existing navigator and document group with an already
+    /// resolved scope. The descriptor itself grants no root access.
+    BindFiles {
+        navigator: Id,
+        group: Id,
+        scope_id: ScopeId,
+    },
+    SetScopeLabel {
+        scope_id: ScopeId,
+        label: String,
     },
     SplitGroup {
         pane: Id,
@@ -232,26 +289,49 @@ impl Default for Workspace {
                     },
                 ),
             ]),
+            containers: BTreeMap::new(),
+            next_container_id: initial_container_id(),
+            scope_labels: BTreeMap::new(),
             focused: 2,
             next_id: 5,
         }
     }
 }
 impl Workspace {
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 
-    /// Upgrade only the supported legacy presentation schema, then validate the
-    /// complete graph before installation. A v1 layout cannot contain v2 targets.
-    pub fn migrate(mut self) -> Result<Self> {
+    /// Upgrade only supported presentation schemas, resolving old File
+    /// descriptors against the caller's already-authorized launch scope. No
+    /// serialized root or scope descriptor can create authority.
+    pub fn migrate(mut self, launch_scope: &ScopeId) -> Result<Self> {
+        if !launch_scope.is_valid() {
+            return Err(LayoutError::Invalid("launch scope ID"));
+        }
         match self.version {
-            1 => {
-                if self
-                    .tabs
-                    .values()
-                    .any(|tab| matches!(tab.target, Target::AgentView { .. }))
+            1 | 2 => {
+                if self.version == 1
+                    && self
+                        .tabs
+                        .values()
+                        .any(|tab| matches!(tab.target, Target::AgentView { .. }))
                 {
                     return Err(LayoutError::Invalid("v2 target in v1 layout"));
                 }
+                if !self.containers.is_empty()
+                    || self.next_container_id != initial_container_id()
+                    || !self.scope_labels.is_empty()
+                    || self.tabs.values().any(|tab| {
+                        matches!(&tab.target, Target::File { scope_id, .. } if !scope_id.0.is_empty())
+                    })
+                {
+                    return Err(LayoutError::Invalid("v3 descriptor in legacy layout"));
+                }
+                for tab in self.tabs.values_mut() {
+                    if let Target::File { scope_id, .. } = &mut tab.target {
+                        *scope_id = launch_scope.clone();
+                    }
+                }
+                self.migrate_files_container(launch_scope)?;
                 self.version = Self::VERSION;
             }
             Self::VERSION => {}
@@ -259,6 +339,49 @@ impl Workspace {
         }
         self.validate()?;
         Ok(self)
+    }
+
+    fn migrate_files_container(&mut self, launch_scope: &ScopeId) -> Result<()> {
+        // Check recursion before traversing legacy geometry. Migration does not
+        // allocate pane/tab IDs or consume next_id, even at ID exhaustion.
+        validate_node(&self.root, 0, &mut BTreeSet::new())?;
+        let navigators = self
+            .ordered_panes()
+            .into_iter()
+            .filter(|id| {
+                matches!(
+                    self.panes.get(id),
+                    Some(Pane::Navigator {
+                        kind: Navigator::Files
+                    })
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(&first) = navigators.first() else {
+            return Ok(());
+        };
+        let mut groups = self
+            .groups()
+            .into_iter()
+            .filter(|group| {
+                matches!(self.panes.get(group), Some(Pane::Group { tabs, .. })
+                    if tabs.iter().any(|tab| self.tabs.get(tab).is_some_and(|tab|
+                        matches!(tab.target, Target::File { .. }))))
+            })
+            .collect::<Vec<_>>();
+        if groups.is_empty() {
+            groups.push(self.nearest_group(first).ok_or(LayoutError::Missing)?);
+        }
+        let id = self.container_id()?;
+        self.containers.insert(
+            id,
+            FilesContainer {
+                scope_id: launch_scope.clone(),
+                navigators,
+                groups,
+            },
+        );
+        Ok(())
     }
 
     /// Minimal fullscreen preset: one conversation tab, no explorer pane until
@@ -283,6 +406,9 @@ impl Workspace {
                     pinned: true,
                 },
             )]),
+            containers: BTreeMap::new(),
+            next_container_id: initial_container_id(),
+            scope_labels: BTreeMap::new(),
             focused: 1,
             next_id: 3,
         }
@@ -292,8 +418,27 @@ impl Workspace {
         if self.version != Self::VERSION {
             return Err(LayoutError::Invalid("unsupported schema"));
         }
-        if self.panes.is_empty() || self.panes.len() > MAX_PANES || self.tabs.len() > MAX_TABS {
+        if self.next_container_id == 0 {
+            return Err(LayoutError::Invalid("container identity"));
+        }
+        if self.panes.is_empty()
+            || self.panes.len() > MAX_PANES
+            || self.tabs.len() > MAX_TABS
+            || self.containers.len() > MAX_PANES
+        {
             return Err(LayoutError::Limit("pane/tab count"));
+        }
+        if self.scope_labels.len() > MAX_SCOPE_LABELS {
+            return Err(LayoutError::Limit("scope label count"));
+        }
+        if self.scope_labels.iter().any(|(scope_id, label)| {
+            !scope_id.is_valid()
+                || !self.references_scope(scope_id)
+                || label.is_empty()
+                || label.len() > MAX_SCOPE_LABEL_BYTES
+                || label.chars().any(char::is_control)
+        }) {
+            return Err(LayoutError::Invalid("scope display label"));
         }
         let mut leaves = BTreeSet::new();
         validate_node(&self.root, 0, &mut leaves)?;
@@ -355,7 +500,10 @@ impl Workspace {
                 {
                     return Err(LayoutError::Invalid("agent view ID"))
                 }
-                Target::File { path } if !valid_relative(path) => {
+                Target::File { scope_id, .. } if !scope_id.is_valid() => {
+                    return Err(LayoutError::Invalid("file scope ID"))
+                }
+                Target::File { path, .. } if !valid_relative(path) => {
                     return Err(LayoutError::Invalid("file path"))
                 }
                 Target::Diff { review } if !valid_resource_id(review) => {
@@ -366,6 +514,53 @@ impl Workspace {
                 }
                 _ => {}
             }
+        }
+        let mut owned = BTreeSet::new();
+        let mut file_navigators = BTreeSet::new();
+        for (&id, container) in &self.containers {
+            // Containers have a separate monotonic ID namespace, independent
+            // of pane/tab allocation and their current child membership.
+            if id == 0 || id >= self.next_container_id {
+                return Err(LayoutError::Invalid("container identity"));
+            }
+            if !container.scope_id.is_valid()
+                || container.navigators.is_empty()
+                || container.groups.is_empty()
+                || container.navigators.len() > MAX_PANES
+                || container.groups.len() > MAX_PANES
+            {
+                return Err(LayoutError::Invalid("files container"));
+            }
+            for navigator in &container.navigators {
+                if !owned.insert(*navigator)
+                    || !matches!(
+                        self.panes.get(navigator),
+                        Some(Pane::Navigator {
+                            kind: Navigator::Files
+                        })
+                    )
+                {
+                    return Err(LayoutError::Invalid("container navigator ownership"));
+                }
+                file_navigators.insert(*navigator);
+            }
+            for group in &container.groups {
+                if !owned.insert(*group)
+                    || !matches!(self.panes.get(group), Some(Pane::Group { .. }))
+                {
+                    return Err(LayoutError::Invalid("container group ownership"));
+                }
+            }
+        }
+        if self.panes.iter().any(|(id, pane)| {
+            matches!(
+                pane,
+                Pane::Navigator {
+                    kind: Navigator::Files
+                }
+            ) && !file_navigators.contains(id)
+        }) {
+            return Err(LayoutError::Invalid("unowned Files navigator"));
         }
         Ok(())
     }
@@ -385,11 +580,130 @@ impl Workspace {
             .ok_or(LayoutError::Limit("ID exhaustion"))?;
         Ok(id)
     }
+    fn container_id(&mut self) -> Result<Id> {
+        let id = self.next_container_id;
+        self.next_container_id = id
+            .checked_add(1)
+            .ok_or(LayoutError::Limit("container ID exhaustion"))?;
+        Ok(id)
+    }
     pub fn groups(&self) -> Vec<Id> {
         self.ordered_panes()
             .into_iter()
             .filter(|id| matches!(self.panes.get(id), Some(Pane::Group { .. })))
             .collect()
+    }
+    pub fn files_container_for(&self, pane: Id) -> Option<Id> {
+        self.containers.iter().find_map(|(&id, container)| {
+            (container.navigators.contains(&pane) || container.groups.contains(&pane)).then_some(id)
+        })
+    }
+    pub fn files_container(&self, id: Id) -> Option<&FilesContainer> {
+        self.containers.get(&id)
+    }
+    pub fn files_scope_for(&self, pane: Id) -> Option<&ScopeId> {
+        self.files_container(self.files_container_for(pane)?)
+            .map(|container| &container.scope_id)
+    }
+    fn references_scope(&self, scope_id: &ScopeId) -> bool {
+        self.containers
+            .values()
+            .any(|container| &container.scope_id == scope_id)
+            || self.tabs.values().any(|tab| {
+                matches!(&tab.target, Target::File { scope_id: current, .. } if current == scope_id)
+            })
+    }
+    pub fn files_group_for(&self, pane: Id) -> Option<Id> {
+        let container = self.files_container(self.files_container_for(pane)?)?;
+        if container.groups.contains(&pane) {
+            Some(pane)
+        } else {
+            container.groups.first().copied()
+        }
+    }
+    fn nearest_group(&self, pane: Id) -> Option<Id> {
+        self.nearest_group_for_scope(pane, None)
+    }
+    fn nearest_group_for_scope(&self, pane: Id, scope: Option<&ScopeId>) -> Option<Id> {
+        let ordered = self.ordered_panes();
+        let position = ordered.iter().position(|id| *id == pane)?;
+        ordered
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| matches!(self.panes.get(id), Some(Pane::Group { .. })))
+            .filter_map(|(index, id)| {
+                let owner = self.files_scope_for(*id);
+                if scope.is_some_and(|scope| owner.is_some_and(|owner| owner != scope)) {
+                    return None;
+                }
+                // A generic launch navigator joins an existing matching Files
+                // container before claiming an unowned group. Another scope's
+                // nearer group must not obstruct or retarget it.
+                let unowned = scope.is_some() && owner.is_none();
+                Some(((unowned, index.abs_diff(position)), *id))
+            })
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, id)| id)
+    }
+
+    fn detach_files_navigator(&mut self, navigator: Id) {
+        if let Some(id) = self.files_container_for(navigator) {
+            if let Some(container) = self.containers.get_mut(&id) {
+                container.navigators.retain(|pane| *pane != navigator);
+                if container.navigators.is_empty() {
+                    self.containers.remove(&id);
+                }
+            }
+        }
+    }
+
+    fn bind_files(&mut self, navigator: Id, group: Id, scope_id: ScopeId) -> Result<()> {
+        if !scope_id.is_valid() {
+            return Err(LayoutError::Invalid("file scope ID"));
+        }
+        if !matches!(self.panes.get(&navigator), Some(Pane::Navigator { .. }))
+            || !matches!(self.panes.get(&group), Some(Pane::Group { .. }))
+        {
+            return Err(LayoutError::Missing);
+        }
+        let group_owner = self.files_container_for(group);
+        if group_owner.is_some_and(|id| self.containers[&id].scope_id != scope_id) {
+            return Err(LayoutError::Invalid(
+                "document group belongs to another scope",
+            ));
+        }
+        let navigator_owner = self.files_container_for(navigator);
+        let owner = group_owner
+            .or_else(|| navigator_owner.filter(|id| self.containers[id].scope_id == scope_id));
+        if navigator_owner != owner {
+            self.detach_files_navigator(navigator);
+        }
+        if let Some(id) = owner {
+            let container = self.containers.get_mut(&id).ok_or(LayoutError::Missing)?;
+            if !container.navigators.contains(&navigator) {
+                container.navigators.push(navigator);
+            }
+            if !container.groups.contains(&group) {
+                container.groups.push(group);
+            }
+        } else {
+            let id = self.container_id()?;
+            self.containers.insert(
+                id,
+                FilesContainer {
+                    scope_id,
+                    navigators: vec![navigator],
+                    groups: vec![group],
+                },
+            );
+        }
+        self.panes.insert(
+            navigator,
+            Pane::Navigator {
+                kind: Navigator::Files,
+            },
+        );
+        Ok(())
     }
     pub fn ordered_panes(&self) -> Vec<Id> {
         let mut out = Vec::new();
@@ -426,10 +740,22 @@ impl Workspace {
                 }
                 self.focused = id;
             }
-            Action::SetNavigator { pane, kind } => match self.panes.get_mut(&pane) {
-                Some(Pane::Navigator { kind: k }) => *k = kind,
-                _ => return Err(LayoutError::Missing),
-            },
+            Action::SetNavigator { pane, kind } => {
+                if !matches!(self.panes.get(&pane), Some(Pane::Navigator { .. })) {
+                    return Err(LayoutError::Missing);
+                }
+                if kind == Navigator::Files {
+                    if self.files_container_for(pane).is_none() {
+                        let group = self
+                            .nearest_group_for_scope(pane, Some(&ScopeId::launch()))
+                            .ok_or(LayoutError::Missing)?;
+                        self.bind_files(pane, group, ScopeId::launch())?;
+                    }
+                } else {
+                    self.detach_files_navigator(pane);
+                    self.panes.insert(pane, Pane::Navigator { kind });
+                }
+            }
             Action::AddNavigator { beside, side, kind } => {
                 if !self.panes.contains_key(&beside) {
                     return Err(LayoutError::Missing);
@@ -437,7 +763,63 @@ impl Workspace {
                 let id = self.id()?;
                 self.panes.insert(id, Pane::Navigator { kind });
                 split_at(&mut self.root, beside, Node::Pane { id }, side)?;
+                if kind == Navigator::Files {
+                    let group = self
+                        .nearest_group_for_scope(id, Some(&ScopeId::launch()))
+                        .ok_or(LayoutError::Missing)?;
+                    self.bind_files(id, group, ScopeId::launch())?;
+                }
                 self.focused = id;
+            }
+            Action::AddFiles {
+                beside,
+                side,
+                scope_id,
+            } => {
+                if !self.panes.contains_key(&beside) {
+                    return Err(LayoutError::Missing);
+                }
+                let navigator = self.id()?;
+                let group = self.id()?;
+                self.panes.insert(
+                    navigator,
+                    Pane::Navigator {
+                        kind: Navigator::Files,
+                    },
+                );
+                self.panes.insert(
+                    group,
+                    Pane::Group {
+                        tabs: vec![],
+                        active: None,
+                    },
+                );
+                split_at(
+                    &mut self.root,
+                    beside,
+                    Node::Split {
+                        axis: Axis::Columns,
+                        ratio: 2250,
+                        first: Box::new(Node::Pane { id: navigator }),
+                        second: Box::new(Node::Pane { id: group }),
+                    },
+                    side,
+                )?;
+                self.bind_files(navigator, group, scope_id)?;
+                self.focused = navigator;
+            }
+            Action::BindFiles {
+                navigator,
+                group,
+                scope_id,
+            } => {
+                self.bind_files(navigator, group, scope_id)?;
+            }
+            Action::SetScopeLabel { scope_id, label } => {
+                if !self.references_scope(&scope_id) {
+                    return Err(LayoutError::Missing);
+                }
+                self.scope_labels.insert(scope_id, label);
             }
             Action::SplitGroup { pane, side } => {
                 if !matches!(self.panes.get(&pane), Some(Pane::Group { .. })) {
@@ -451,6 +833,13 @@ impl Workspace {
                         active: None,
                     },
                 );
+                if let Some(owner) = self.files_container_for(pane) {
+                    self.containers
+                        .get_mut(&owner)
+                        .ok_or(LayoutError::Missing)?
+                        .groups
+                        .push(id);
+                }
                 split_at(&mut self.root, pane, Node::Pane { id }, side)?;
                 self.focused = id;
             }
@@ -564,11 +953,29 @@ impl Workspace {
                     for tab in tabs {
                         self.tabs.remove(&tab);
                     }
+                    if let Some(owner) = self.files_container_for(id) {
+                        let container = self
+                            .containers
+                            .get_mut(&owner)
+                            .ok_or(LayoutError::Missing)?;
+                        container.groups.retain(|group| *group != id);
+                        if container.groups.is_empty() {
+                            let navigators = container.navigators.clone();
+                            for navigator in navigators {
+                                self.root = remove_pane(&self.root, navigator)
+                                    .ok_or(LayoutError::Invalid("empty layout"))?;
+                                self.panes.remove(&navigator);
+                            }
+                            self.containers.remove(&owner);
+                        }
+                    }
+                } else {
+                    self.detach_files_navigator(id);
                 }
                 self.root =
                     remove_pane(&self.root, id).ok_or(LayoutError::Invalid("empty layout"))?;
                 self.panes.remove(&id);
-                if self.focused == id {
+                if !self.panes.contains_key(&self.focused) {
                     self.focused = self.groups()[0];
                 }
             }
@@ -599,6 +1006,14 @@ impl Workspace {
                 }
             }
         }
+        let referenced = self
+            .scope_labels
+            .keys()
+            .filter(|scope| self.references_scope(scope))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.scope_labels
+            .retain(|scope, _| referenced.contains(scope));
         Ok(())
     }
     pub fn geometry(&self, area: Rect, maximize: bool) -> Result<Geometry> {

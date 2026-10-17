@@ -5,6 +5,7 @@ use aw::{AgentEvent, CancellationToken, Error, Result};
 use aw_agent_core::Turn;
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     thread,
 };
@@ -66,6 +67,9 @@ pub struct Snapshot {
     pub effort: String,
     pub actor: String,
     pub root: String,
+    /// Lossless current Agent binding for same-root disclosure admission.
+    /// `root` above is display text; Files retain their own launch capability.
+    pub agent_root: Option<PathBuf>,
     pub tools: String,
     pub needs_inspection: bool,
     pub turns: Arc<Vec<Turn>>,
@@ -124,6 +128,7 @@ impl Snapshot {
                     .map_or("unknown".into(), |n| n.to_string())
             ),
             root: host.tools.root.display().to_string(),
+            agent_root: host.tools.root.canonicalize().ok(),
             tools: host.tools.mode.to_string(),
             needs_inspection: false,
             turns: Arc::new(vec![]),
@@ -506,6 +511,7 @@ fn refresh(host: &mut Host, view: &Projection, with_sessions: bool) {
     if let Ok(mut published) = view.branch_reader.lock() {
         *published = reader;
     }
+    let agent_root = host.tools.root.canonicalize().ok();
     view.change(|s| {
         s.store_id = store_id;
         s.model = host
@@ -522,6 +528,7 @@ fn refresh(host: &mut Host, view: &Projection, with_sessions: bool) {
             .reasoning_effort
             .map_or_else(String::new, |effort| effort.label().into());
         s.root = host.tools.root.display().to_string();
+        s.agent_root = agent_root;
         s.tools = host.tools.mode.to_string();
         s.session_tps = host.session_performance.average_output_tps();
         if let Some(a) = &host.agent {
@@ -1108,6 +1115,63 @@ mod branch_reader_tests {
             cancel: Arc::new(Mutex::new(None)),
             branch_reader: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_root_projection_preserves_lossless_binding_across_refresh() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let root = crate::test_support::temp_dir("view-agent-root-projection");
+        let original = root.join(OsString::from_vec(b"original-\x80".to_vec()));
+        let resumed = root.join(OsString::from_vec(b"resumed-\x81".to_vec()));
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&resumed).unwrap();
+        {
+            let mut host = host(&original, SessionStoreBackendArg::Sqlite);
+            let view = projection(&host);
+            let initial = view.snapshot();
+            assert_eq!(initial.agent_root, Some(original.canonicalize().unwrap()));
+            assert_ne!(initial.agent_root, Some(PathBuf::from(&initial.root)));
+            host.tools.root = resumed.clone();
+            refresh(&mut host, &view, false);
+            let refreshed = view.snapshot();
+            assert_eq!(refreshed.agent_root, Some(resumed.canonicalize().unwrap()));
+            assert_ne!(refreshed.agent_root, Some(PathBuf::from(&refreshed.root)));
+            assert!(!original.join("state").exists());
+            assert!(!resumed.join("state").exists());
+            assert!(host.agent.is_none() && host.persistent.is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_root_projection_resolves_aliases_and_denies_missing_roots() {
+        let root = crate::test_support::temp_dir("view-agent-root-alias");
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        {
+            let mut host = host(&root, SessionStoreBackendArg::Sqlite);
+            let view = projection(&host);
+            host.tools.root = PathBuf::from(".");
+            refresh(&mut host, &view, false);
+            assert_eq!(
+                view.snapshot().agent_root,
+                Some(std::env::current_dir().unwrap().canonicalize().unwrap())
+            );
+            host.tools.root = alias;
+            refresh(&mut host, &view, false);
+            assert_eq!(
+                view.snapshot().agent_root,
+                Some(root.canonicalize().unwrap())
+            );
+            host.tools.root = root.join("missing");
+            refresh(&mut host, &view, false);
+            assert!(view.snapshot().agent_root.is_none());
+            assert!(!root.join("state").exists());
+            assert!(host.agent.is_none() && host.persistent.is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

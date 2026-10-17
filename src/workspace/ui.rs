@@ -1,6 +1,6 @@
 use super::{
     background::Executor as BackgroundExecutor,
-    files::{Browser, Content, Request},
+    files::{Access, Browser, Content, Request, Scopes},
     git,
     owner::{Command, Snapshot, Worker},
     palette::{self, Category as PaletteCategory},
@@ -24,7 +24,8 @@ use aw::{Error, Result};
 use aw_tools::browse::{Entry, EntryKind};
 use aw_ui_extension::Slot;
 use aw_workspace::{
-    Action, Axis, Editor, Id, Navigator, Pane, Rect as ModelRect, Side, Target, Workspace,
+    Action, Axis, Editor, Id, Navigator, Pane, Rect as ModelRect, ScopeId, Side, Target, Workspace,
+    MAX_SCOPE_LABEL_BYTES,
 };
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -55,6 +56,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 mod agent_views;
 mod async_work;
 mod commands;
+mod files_views;
 mod interaction;
 mod render;
 
@@ -180,7 +182,7 @@ struct HitRegion {
 enum PaletteTarget {
     Command(String),
     Slash(String),
-    File(String),
+    File(FileKey),
     Session { session: String, branch: String },
     Window { group: Id, tab: Id },
     Terminal(String),
@@ -491,25 +493,84 @@ struct Rendered {
     revision: u64,
     lines: Arc<Vec<String>>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FileKey {
+    scope_id: ScopeId,
+    path: String,
+}
+
+impl FileKey {
+    fn new(scope_id: ScopeId, path: String) -> Self {
+        Self { scope_id, path }
+    }
+    fn target(&self) -> Target {
+        Target::File {
+            scope_id: self.scope_id.clone(),
+            path: self.path.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<String> for FileKey {
+    fn from(path: String) -> Self {
+        Self::new(ScopeId::launch(), path)
+    }
+}
+#[cfg(test)]
+impl From<&str> for FileKey {
+    fn from(path: &str) -> Self {
+        Self::from(path.to_owned())
+    }
+}
+
+#[derive(Clone)]
+struct FileToken {
+    access: Access,
+    epoch: u64,
+    container: Option<Id>,
+}
+
 #[derive(Clone)]
 enum Job {
     List {
         pane: Id,
         path: String,
+        token: FileToken,
     },
     Read {
+        tab: Id,
         path: String,
+        token: FileToken,
     },
     Search {
         pane: Option<Id>,
         query: String,
         cancel: Arc<AtomicBool>,
+        token: FileToken,
     },
+    Authorize {
+        beside: Id,
+        reconnect: Option<ScopeId>,
+        origin_tab: Option<Id>,
+        epoch: u64,
+    },
+}
+
+impl Job {
+    fn token(&self) -> Option<&FileToken> {
+        match self {
+            Self::List { token, .. } | Self::Read { token, .. } | Self::Search { token, .. } => {
+                Some(token)
+            }
+            Self::Authorize { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum HighlightTarget {
-    File(String),
+    File(FileKey),
     Diff(String),
 }
 
@@ -633,6 +694,12 @@ pub struct Ui {
     pub draft: Editor,
     pub layout_file: Option<PathBuf>,
     pub root: PathBuf,
+    pub file_scopes: Scopes,
+    file_epoch: u64,
+    file_bindings: BTreeMap<Id, (ScopeId, Option<Id>, Option<String>)>,
+    palette_file_scope: ScopeId,
+    palette_file_container: Option<Id>,
+    file_find_dirty: BTreeSet<Id>,
     layout_pending: bool,
     layout_generation: u64,
     git: git::Views,
@@ -648,9 +715,9 @@ pub struct Ui {
     agent_view_generation: u64,
     saved_selections: BTreeMap<Id, TextSelection>,
     nav: BTreeMap<(Id, Navigator), NavState>,
-    files: BTreeMap<String, String>,
-    file_lines: BTreeMap<String, Arc<Vec<String>>>,
-    file_highlights: BTreeMap<String, HighlightCache>,
+    files: BTreeMap<FileKey, String>,
+    file_lines: BTreeMap<FileKey, Arc<Vec<String>>>,
+    file_highlights: BTreeMap<FileKey, HighlightCache>,
     diff_highlights: BTreeMap<String, HighlightCache>,
     highlight_generation: u64,
     conversation_generation: u64,
@@ -665,6 +732,7 @@ pub struct Ui {
     horizontal: BTreeMap<Id, u16>,
     line_counts: BTreeMap<Id, usize>,
     last_group: Id,
+    files_last_group: BTreeMap<Id, Id>,
     input: bool,
     palette: Option<palette::State>,
     composer: ComposerInteraction,
@@ -706,6 +774,7 @@ impl Ui {
         ui_config: aw::config::UiConfig,
     ) -> Result<Self> {
         let background = BackgroundExecutor::new()?;
+        let scopes = Scopes::new(root.clone())?;
         Self::new_with_background(
             layout,
             draft,
@@ -714,6 +783,7 @@ impl Ui {
             snapshot,
             ui_config,
             background,
+            scopes,
         )
     }
 
@@ -725,6 +795,7 @@ impl Ui {
         snapshot: Snapshot,
         ui_config: aw::config::UiConfig,
         background: BackgroundExecutor,
+        file_scopes: Scopes,
     ) -> Result<Self> {
         layout
             .validate()
@@ -751,7 +822,7 @@ impl Ui {
             _ => ExplorerPlacement::Hidden,
         };
         let (background_tx, background_rx) = tokio::sync::mpsc::channel(64);
-        Ok(Self {
+        let mut ui = Self {
             layout,
             draft: editor,
             layout_file,
@@ -761,6 +832,12 @@ impl Ui {
             terminal_pending: false,
             terminal_scroll: BTreeMap::new(),
             root,
+            file_scopes,
+            file_epoch: 1,
+            file_bindings: BTreeMap::new(),
+            palette_file_scope: ScopeId::launch(),
+            palette_file_container: None,
+            file_find_dirty: BTreeSet::new(),
             layout_pending: false,
             layout_generation: 0,
             rendered: BTreeMap::new(),
@@ -788,6 +865,7 @@ impl Ui {
             horizontal: BTreeMap::new(),
             line_counts: BTreeMap::new(),
             last_group,
+            files_last_group: BTreeMap::new(),
             input,
             palette: None,
             composer: ComposerInteraction::default(),
@@ -817,7 +895,9 @@ impl Ui {
             text_selection: None,
             selection_dragging: false,
             selection_moved: false,
-        })
+        };
+        ui.reconcile_layout_state();
+        Ok(ui)
     }
     pub fn attach_terminals(&mut self, pool: terminals::Pool, shell: PathBuf) {
         self.terminal_pool = Some(pool);
@@ -832,13 +912,15 @@ impl Ui {
             return;
         };
         let root = self.root.clone();
+        let launch_scope = ScopeId::launch();
         let base_generation = self.layout_generation;
         let out = self.background_tx.clone();
         let panic_out = out.clone();
         match self.background.try_submit_with_panic(
             "layout",
             move || {
-                let result = persistence::load(&path, &root).map_err(|e| e.to_string());
+                let result =
+                    persistence::load(&path, &root, &launch_scope).map_err(|e| e.to_string());
                 let _ = out.blocking_send(UiBackgroundResult::InitialLayout {
                     base_generation,
                     result,
@@ -867,12 +949,18 @@ impl Ui {
     }
 
     fn focus_explorer(&mut self) {
-        if let Some(pane) = self
+        let owned_navigator = self
             .layout
-            .ordered_panes()
-            .into_iter()
-            .find(|id| matches!(self.layout.panes.get(id), Some(Pane::Navigator { .. })))
-        {
+            .files_container_for(self.layout.focused)
+            .and_then(|id| self.layout.files_container(id))
+            .and_then(|container| container.navigators.first())
+            .copied();
+        if let Some(pane) = owned_navigator.or_else(|| {
+            self.layout
+                .ordered_panes()
+                .into_iter()
+                .find(|id| matches!(self.layout.panes.get(id), Some(Pane::Navigator { .. })))
+        }) {
             self.apply(Action::Focus(pane));
             self.input = false;
         } else {
@@ -886,11 +974,7 @@ impl Ui {
     }
 
     fn focus_main(&mut self) {
-        let group = if self.layout.groups().contains(&self.last_group) {
-            self.last_group
-        } else {
-            self.layout.groups()[0]
-        };
+        let group = self.group();
         self.apply(Action::Focus(group));
         self.input = matches!(
             self.layout.active(group).map(|tab| &tab.target),
@@ -1232,44 +1316,52 @@ impl Ui {
         }
 
         if include(PaletteCategory::Files) {
-            let mut files = BTreeMap::<String, String>::new();
-            for ((_, kind), state) in &self.nav {
+            let mut files = BTreeMap::<FileKey, String>::new();
+            for ((pane, kind), state) in &self.nav {
                 if *kind != Navigator::Files {
                     continue;
                 }
+                let Some(scope) = self.layout.files_scope_for(*pane) else {
+                    continue;
+                };
                 for entries in state.directories.values() {
                     for entry in entries {
                         if entry.kind == EntryKind::File {
                             files
-                                .entry(entry.path.clone())
+                                .entry(FileKey::new(scope.clone(), entry.path.clone()))
                                 .or_insert_with(|| entry.name.clone());
                         }
                     }
                 }
             }
-            for path in self.files.keys() {
+            for key in self.files.keys() {
                 files
-                    .entry(path.clone())
-                    .or_insert_with(|| path.rsplit('/').next().unwrap_or(path).to_owned());
+                    .entry(key.clone())
+                    .or_insert_with(|| key.path.rsplit('/').next().unwrap_or(&key.path).to_owned());
             }
             for entry in &self.palette_file_results {
                 if entry.kind == EntryKind::File {
                     files
-                        .entry(entry.path.clone())
+                        .entry(FileKey::new(
+                            self.palette_file_scope.clone(),
+                            entry.path.clone(),
+                        ))
                         .or_insert_with(|| entry.name.clone());
                 }
             }
             let file_limit = if query.is_empty() { 8 } else { 24 };
             let mut file_items = files
                 .into_iter()
-                .filter_map(|(path, name)| {
-                    palette_resource_score(PaletteCategory::Files, &name, &path, query).map(
+                .filter_map(|(key, name)| {
+                    let description =
+                        format!("{} · {}", key.path, self.file_scope_label(&key.scope_id));
+                    palette_resource_score(PaletteCategory::Files, &name, &description, query).map(
                         |score| PaletteItem {
                             category: PaletteCategory::Files,
                             label: name,
-                            description: path.clone(),
+                            description,
                             shortcut: String::new(),
-                            target: PaletteTarget::File(path),
+                            target: PaletteTarget::File(key),
                             score,
                         },
                     )
@@ -1389,7 +1481,9 @@ impl Ui {
                     Target::SessionTree => "Durable session tree".into(),
                     Target::ContextFlow => "Context and provenance".into(),
                     Target::Activity => "Agent activity".into(),
-                    Target::File { path } => format!("File · {path}"),
+                    Target::File { scope_id, path } => {
+                        format!("File · {path} · {}", self.file_scope_label(scope_id))
+                    }
                     Target::Diff { review } => self
                         .git
                         .reviews
@@ -1473,13 +1567,22 @@ impl Ui {
     }
 
     fn reconcile_layout_state(&mut self) {
+        self.reconcile_file_views();
         self.reconcile_agent_views();
         let groups = self.layout.groups();
+        self.files_last_group.retain(|container, group| {
+            self.layout
+                .files_container(*container)
+                .is_some_and(|owner| owner.groups.contains(group))
+        });
         if matches!(
             self.layout.panes.get(&self.layout.focused),
             Some(Pane::Group { .. })
         ) {
             self.last_group = self.layout.focused;
+            if let Some(container) = self.layout.files_container_for(self.layout.focused) {
+                self.files_last_group.insert(container, self.layout.focused);
+            }
         } else if !groups.contains(&self.last_group) {
             self.last_group = groups[0];
         }
@@ -1491,20 +1594,6 @@ impl Ui {
             .retain(|id, _| self.layout.tabs.contains_key(id));
         self.rendered
             .retain(|id, _| self.layout.tabs.contains_key(id));
-        self.jobs.retain(|_, job| {
-            if let Job::Search {
-                pane: Some(pane),
-                cancel,
-                ..
-            } = job
-            {
-                if !self.layout.panes.contains_key(pane) {
-                    cancel.store(true, Ordering::Release);
-                    return false;
-                }
-            }
-            true
-        });
         self.find.retain(|id, _| self.layout.tabs.contains_key(id));
         self.find_generation
             .retain(|id, _| self.layout.tabs.contains_key(id));
@@ -1548,6 +1637,20 @@ impl Ui {
     }
 
     fn group(&self) -> Id {
+        if let Some(container_id) = self.layout.files_container_for(self.layout.focused) {
+            if let Some(container) = self.layout.files_container(container_id) {
+                if let Some(group) = self
+                    .files_last_group
+                    .get(&container_id)
+                    .filter(|group| container.groups.contains(group))
+                {
+                    return *group;
+                }
+                if let Some(group) = container.groups.first() {
+                    return *group;
+                }
+            }
+        }
         if self.layout.groups().contains(&self.last_group) {
             self.last_group
         } else {
@@ -1649,26 +1752,36 @@ impl Ui {
         }
     }
 
-    fn open_file_preview(&mut self, path: String) {
+    fn open_file_preview_key(&mut self, key: FileKey) -> Option<Id> {
         let focused = self.layout.focused;
         let group = self.group();
         self.apply(Action::Open {
             group,
-            target: Target::File { path },
+            target: key.target(),
             pinned: false,
         });
-        // Opening a human preview must not unexpectedly move keyboard focus out
-        // of the Explorer. The preview becomes active in its content group, but
-        // the user's current navigator remains focused until they explicitly
-        // move there.
+        let tab = self
+            .layout
+            .active(group)
+            .filter(|tab| tab.target == key.target())
+            .map(|tab| tab.id);
         if self.layout.panes.contains_key(&focused) {
             self.apply(Action::Focus(focused));
         }
         self.input = false;
+        tab
     }
 
-    fn focus_palette_file(&mut self, group: Id, path: &str) {
-        if matches!(self.layout.active(group).map(|tab|&tab.target),Some(Target::File {path:active}) if active==path)
+    #[cfg(test)]
+    fn open_file_preview(&mut self, path: String) {
+        self.open_file_preview_key(FileKey::new(self.current_file_scope(), path));
+    }
+
+    fn focus_palette_file(&mut self, group: Id, key: &FileKey) {
+        if self
+            .layout
+            .active(group)
+            .is_some_and(|tab| tab.target == key.target())
         {
             self.apply(Action::Focus(group));
             self.input = false;
@@ -2310,6 +2423,7 @@ mod tests {
                 effort: String::new(),
                 actor: "unix:fixture".into(),
                 root: "/tmp".into(),
+                agent_root: Some(PathBuf::from("/tmp")),
                 tools: "off".into(),
                 needs_inspection: false,
                 turns: Arc::new(vec![]),
@@ -2440,7 +2554,7 @@ mod render_tests {
     use ratatui::backend::TestBackend;
     use std::collections::VecDeque;
     include!("ui/ux_visual_tests.rs");
-    fn projection() -> Snapshot {
+    pub(super) fn projection() -> Snapshot {
         Snapshot {
             generation: 0,
             busy: false,
@@ -2457,6 +2571,7 @@ mod render_tests {
             effort: String::new(),
             actor: "unix:fixture".into(),
             root: "/tmp".into(),
+            agent_root: Some(PathBuf::from("/tmp")),
             tools: "off".into(),
             needs_inspection: false,
             turns: Arc::new(vec![]),
@@ -2861,7 +2976,7 @@ mod render_tests {
         assert_eq!(ui.layout.focused, explorer);
         assert!(matches!(
             ui.layout.active(group).map(|tab| &tab.target),
-            Some(Target::File { path }) if path == "src/lib.rs"
+            Some(Target::File { path, .. }) if path == "src/lib.rs"
         ));
     }
 
@@ -3396,6 +3511,7 @@ mod render_tests {
         let mut ui = model();
         ui.files.insert("a.txt".into(), "source".into());
         let target = Target::File {
+            scope_id: ScopeId::launch(),
             path: "a.txt".into(),
         };
         let first = ui.rendered_lines(9, &target, 80);
@@ -3531,13 +3647,14 @@ mod render_tests {
         let lines = (0..8192)
             .map(|index| format!("pub fn bird_{index}() {{}}"))
             .collect::<Vec<_>>();
-        ui.file_lines.insert(path.clone(), Arc::new(lines.clone()));
-        ui.files.insert(path.clone(), lines.join("\n"));
-        let slice = ui.file_view_slice(&path, 7000, 31);
+        ui.file_lines
+            .insert(path.clone().into(), Arc::new(lines.clone()));
+        ui.files.insert(path.clone().into(), lines.join("\n"));
+        let slice = ui.file_view_slice(&path.clone().into(), 7000, 31);
         assert_eq!(slice.len(), 31);
         assert!(line_plain_text(&slice[0]).contains("bird_6998"));
         assert!(line_plain_text(slice.last().unwrap()).contains("bird_7028"));
-        assert_eq!(ui.file_line_count(&path), 8194);
+        assert_eq!(ui.file_line_count(&path.clone().into()), 8194);
     }
 
     #[test]
@@ -3556,16 +3673,16 @@ mod render_tests {
                     "ordinary Explorer preview preserves focus"
                 );
             }
-            ui.focus_palette_file(group, "unopened.txt");
+            ui.focus_palette_file(group, &"unopened.txt".into());
             assert_eq!(
                 ui.layout.focused,
                 if from_explorer { explorer } else { group }
             );
-            ui.focus_palette_file(group, "chosen.txt");
+            ui.focus_palette_file(group, &"chosen.txt".into());
             assert_eq!(ui.layout.focused, group);
             assert!(!ui.input);
             assert!(
-                matches!(ui.layout.active(group).map(|tab|&tab.target),Some(Target::File {path}) if path=="chosen.txt")
+                matches!(ui.layout.active(group).map(|tab|&tab.target),Some(Target::File {path,..}) if path=="chosen.txt")
             );
             assert_eq!(ui.draft, editor);
             assert!(Arc::ptr_eq(&ui.snapshot.turns, &turns));
@@ -3796,6 +3913,7 @@ mod render_tests {
         ui.jobs.insert(
             40,
             Job::Search {
+                token: ui.file_token(&ScopeId::launch(), None).unwrap(),
                 pane: None,
                 query: "old".into(),
                 cancel: cancel.clone(),
@@ -3845,6 +3963,7 @@ mod render_tests {
         ui.jobs.insert(
             41,
             Job::Search {
+                token: ui.file_token(&ScopeId::launch(), None).unwrap(),
                 pane: None,
                 query: "pending".into(),
                 cancel: cancel.clone(),
@@ -3855,6 +3974,7 @@ mod render_tests {
         let invoking = ui.palette.take().unwrap();
         ui.finish_palette_dispatch(invoking, false);
         ui.response(crate::workspace::files::Response {
+            access: ui.file_scopes.access(&ScopeId::launch()),
             ticket: 41,
             result: Ok(Content::Search {
                 query: "pending".into(),
@@ -3881,6 +4001,7 @@ mod render_tests {
         ui.jobs.insert(
             41,
             Job::Search {
+                token: ui.file_token(&ScopeId::launch(), None).unwrap(),
                 pane: None,
                 query: "old".into(),
                 cancel: first_cancel.clone(),
@@ -3897,6 +4018,7 @@ mod render_tests {
         ui.jobs.insert(
             42,
             Job::Search {
+                token: ui.file_token(&ScopeId::launch(), None).unwrap(),
                 pane: Some(pane),
                 query: "older".into(),
                 cancel: second_cancel.clone(),
@@ -3917,13 +4039,17 @@ mod render_tests {
         let mut ui = model();
         let group = ui.group();
         let path = "src/find.rs".to_owned();
-        ui.open(Target::File { path: path.clone() });
+        ui.open(Target::File {
+            scope_id: ScopeId::launch(),
+            path: path.clone(),
+        });
         let tab = ui.layout.active(group).unwrap().id;
         let lines = (0..8192)
             .map(|index| format!("fn bird_{index}() {{}}"))
             .collect::<Vec<_>>();
-        ui.file_lines.insert(path.clone(), Arc::new(lines.clone()));
-        ui.files.insert(path, lines.join("\n"));
+        ui.file_lines
+            .insert(path.clone().into(), Arc::new(lines.clone()));
+        ui.files.insert(path.into(), lines.join("\n"));
 
         let started = Instant::now();
         ui.update_find(tab, "bird_7000".into(), false);
@@ -3979,6 +4105,7 @@ mod render_tests {
         let mut ui = model();
         let group = ui.group();
         ui.open(Target::File {
+            scope_id: ScopeId::launch(),
             path: "src/slow.rs".into(),
         });
         let tab = ui.layout.active(group).unwrap().id;
@@ -4109,19 +4236,22 @@ mod render_tests {
     fn theme_rehighlight_is_deferred_and_replaces_cache_with_plain_fallback_first() {
         let mut ui = model();
         let path = "src/lib.rs".to_owned();
-        ui.files.insert(path.clone(), "pub fn bird() {}".into());
-        ui.file_lines
-            .insert(path.clone(), Arc::new(vec!["pub fn bird() {}".into()]));
+        ui.files
+            .insert(path.clone().into(), "pub fn bird() {}".into());
+        ui.file_lines.insert(
+            path.clone().into(),
+            Arc::new(vec!["pub fn bird() {}".into()]),
+        );
         ui.ui_config.theme = aw::config::ThemeMode::Dark;
-        ui.schedule_file_highlight(&path);
-        let first_generation = ui.file_highlights[&path].generation;
+        ui.schedule_file_highlight(&path.clone().into());
+        let first_generation = ui.file_highlights[&path.clone().into()].generation;
         ui.ui_config.theme = aw::config::ThemeMode::Light;
         ui.refresh_file_highlights_for_theme();
-        let cache = &ui.file_highlights[&path];
+        let cache = &ui.file_highlights[&path.clone().into()];
         assert!(cache.generation > first_generation);
         assert_eq!(cache.theme, aw::config::ThemeMode::Light);
         assert!(cache.lines.iter().all(Option::is_none));
-        let plain = ui.file_view_slice(&path, 2, 1);
+        let plain = ui.file_view_slice(&path.clone().into(), 2, 1);
         assert_eq!(line_plain_text(&plain[0]), "pub fn bird() {}");
     }
 
@@ -4199,12 +4329,12 @@ mod render_tests {
         let mut ui = model();
         let path = "src/lib.rs".to_owned();
         let text = "pub fn bird() -> usize { 1 }".to_owned();
-        ui.files.insert(path.clone(), text.clone());
+        ui.files.insert(path.clone().into(), text.clone());
         ui.file_lines
-            .insert(path.clone(), Arc::new(vec![text.clone()]));
+            .insert(path.clone().into(), Arc::new(vec![text.clone()]));
         let generation = 7;
         ui.file_highlights.insert(
-            path.clone(),
+            path.clone().into(),
             HighlightCache {
                 generation,
                 theme: ui.ui_config.theme,
@@ -4213,7 +4343,7 @@ mod render_tests {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         );
-        let plain = ui.file_view_lines(&path);
+        let plain = ui.file_view_lines(&path.clone().into());
         assert_eq!(plain[2].spans.len(), 1);
         assert_eq!(line_plain_text(&plain[2]), text);
 
@@ -4225,13 +4355,13 @@ mod render_tests {
             ),
         ]);
         ui.apply_background_result(UiBackgroundResult::Highlight {
-            target: HighlightTarget::File(path.clone()),
+            target: HighlightTarget::File(path.clone().into()),
             generation,
             start: 0,
             lines: vec![highlighted],
             done: false,
         });
-        let styled = ui.file_view_lines(&path);
+        let styled = ui.file_view_lines(&path.clone().into());
         assert!(styled[2].spans.len() >= 2);
         assert_eq!(line_plain_text(&styled[2]), text);
     }
@@ -4240,9 +4370,9 @@ mod render_tests {
     fn stale_or_wrong_theme_highlight_chunks_cannot_replace_current_cache() {
         let mut ui = model();
         let path = "src/lib.rs".to_owned();
-        ui.files.insert(path.clone(), "fn bird() {}".into());
+        ui.files.insert(path.clone().into(), "fn bird() {}".into());
         ui.file_highlights.insert(
-            path.clone(),
+            path.clone().into(),
             HighlightCache {
                 generation: 22,
                 theme: ui.ui_config.theme,
@@ -4252,13 +4382,13 @@ mod render_tests {
             },
         );
         ui.apply_background_result(UiBackgroundResult::Highlight {
-            target: HighlightTarget::File(path.clone()),
+            target: HighlightTarget::File(path.clone().into()),
             generation: 21,
             start: 0,
             lines: vec![Line::styled("stale", Style::default().fg(Color::Red))],
             done: false,
         });
-        assert!(ui.file_highlights[&path].lines[0].is_none());
+        assert!(ui.file_highlights[&path.clone().into()].lines[0].is_none());
 
         let old_theme = ui.ui_config.theme;
         ui.ui_config.theme = match old_theme {
@@ -4266,23 +4396,23 @@ mod render_tests {
             _ => aw::config::ThemeMode::Light,
         };
         ui.apply_background_result(UiBackgroundResult::Highlight {
-            target: HighlightTarget::File(path.clone()),
+            target: HighlightTarget::File(path.clone().into()),
             generation: 22,
             start: 0,
             lines: vec![Line::styled("wrong-theme", Style::default().fg(Color::Red))],
             done: false,
         });
-        assert!(ui.file_highlights[&path].lines[0].is_none());
+        assert!(ui.file_highlights[&path.clone().into()].lines[0].is_none());
     }
 
     #[test]
     fn replacing_highlight_generation_cancels_previous_worker_token() {
         let mut ui = model();
         let path = "src/lib.rs".to_owned();
-        ui.files.insert(path.clone(), "fn bird() {}".into());
+        ui.files.insert(path.clone().into(), "fn bird() {}".into());
         let old_cancel = Arc::new(AtomicBool::new(false));
         ui.file_highlights.insert(
-            path.clone(),
+            path.clone().into(),
             HighlightCache {
                 generation: 1,
                 theme: ui.ui_config.theme,
@@ -4292,7 +4422,7 @@ mod render_tests {
             },
         );
         ui.file_highlights.insert(
-            path,
+            path.into(),
             HighlightCache {
                 generation: 2,
                 theme: ui.ui_config.theme,
@@ -4336,16 +4466,16 @@ mod render_tests {
         let mut ui = model();
         let path = "src/overscroll.rs".to_owned();
         let source = (0..20).map(|i| format!("line-{i}")).collect::<Vec<_>>();
-        ui.files.insert(path.clone(), source.join("\n"));
-        ui.file_lines.insert(path.clone(), Arc::new(source));
-        let total = ui.file_line_count(&path);
+        ui.files.insert(path.clone().into(), source.join("\n"));
+        ui.file_lines.insert(path.clone().into(), Arc::new(source));
+        let total = ui.file_line_count(&path.clone().into());
         let mut viewport = Viewport::default();
         viewport.configure(total, 8, true);
         viewport.end();
         viewport.scroll(4);
         assert!(viewport.offset() > total.saturating_sub(8));
         assert_eq!(viewport.source_scrollbar_offset(), total.saturating_sub(8));
-        let slice = ui.file_view_slice(&path, viewport.offset(), 8);
+        let slice = ui.file_view_slice(&path.clone().into(), viewport.offset(), 8);
         assert!(
             slice.len() < 8,
             "overscroll tail must remain renderer blank space"
@@ -4442,12 +4572,16 @@ mod render_tests {
         ui.jobs.insert(
             91,
             Job::Search {
+                token: ui
+                    .file_token(&ScopeId::launch(), ui.layout.files_container_for(explorer))
+                    .unwrap(),
                 pane: Some(explorer),
                 query: "needle".into(),
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         );
         ui.response(crate::workspace::files::Response {
+            access: ui.file_scopes.access(&ScopeId::launch()),
             ticket: 91,
             result: Ok(Content::Search {
                 query: "needle".into(),
@@ -5201,6 +5335,7 @@ mod render_tests {
         ui.open(Target::Help);
         ui.open(Target::Settings);
         ui.open(Target::File {
+            scope_id: ScopeId::launch(),
             path: "a/very/long/path/that/forces/the/tab/strip/to/fold.rs".into(),
         });
         let group = ui.group();
@@ -5227,6 +5362,7 @@ mod render_tests {
         let mut ui = model();
         let group = ui.group();
         ui.open(Target::File {
+            scope_id: ScopeId::launch(),
             path: "src/lib.rs".into(),
         });
         let tab = ui.layout.active(group).unwrap().id;
@@ -5234,6 +5370,10 @@ mod render_tests {
         scroll.configure(200, 10, false);
         scroll.scroll(37);
         ui.scroll.insert(tab, scroll);
+        ui.files.insert(
+            "src/lib.rs".into(),
+            (0..200).map(|row| format!("line {row}\n")).collect(),
+        );
         ui.file_lines.insert(
             "src/lib.rs".into(),
             Arc::new((0..200).map(|row| format!("line {row}")).collect()),
@@ -5332,6 +5472,7 @@ mod render_tests {
             side: Side::Right,
         });
         ui.open(Target::File {
+            scope_id: ScopeId::launch(),
             path: "src/lib.rs".into(),
         });
         let layout = ui.layout.clone();
@@ -5446,6 +5587,7 @@ mod render_tests {
         ui.jobs.insert(
             98,
             Job::Search {
+                token: ui.file_token(&ScopeId::launch(), None).unwrap(),
                 pane: Some(pane),
                 query: "obsolete".into(),
                 cancel: cancel.clone(),
@@ -5468,6 +5610,7 @@ mod render_tests {
         ui.jobs.insert(
             99,
             Job::Search {
+                token: ui.file_token(&ScopeId::launch(), None).unwrap(),
                 pane: Some(pane),
                 query: "obsolete".into(),
                 cancel: cancel.clone(),
@@ -5522,17 +5665,20 @@ mod render_tests {
     #[test]
     fn palette_file_search_reply_becomes_a_typed_file_result() {
         let mut ui = model();
+        ui.open_palette();
         ui.palette_file_query = "needle".into();
         ui.palette_file_pending = Some(7);
         ui.jobs.insert(
             7,
             Job::Search {
+                token: ui.file_token(&ScopeId::launch(), None).unwrap(),
                 pane: None,
                 query: "needle".into(),
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         );
         ui.response(crate::workspace::files::Response {
+            access: ui.file_scopes.access(&ScopeId::launch()),
             ticket: 7,
             result: Ok(Content::Search {
                 query: "needle".into(),
@@ -5546,13 +5692,14 @@ mod render_tests {
         assert!(ui.palette_file_pending.is_none());
         assert!(ui.palette_items("needle").iter().any(|item| {
             item.category == PaletteCategory::Files
-                && matches!(&item.target, PaletteTarget::File(path) if path == "src/needle.rs")
+                && matches!(&item.target, PaletteTarget::File(key) if key.path == "src/needle.rs")
         }));
     }
 
     #[test]
     fn command_palette_searches_runtime_files_sessions_and_windows() {
         let mut ui = model();
+        ui.set_navigator(Navigator::Files);
 
         let mut files = NavState::default();
         files.directories.insert(
@@ -5591,7 +5738,7 @@ mod render_tests {
 
         assert!(ui.palette_items("main.rs").iter().any(|item| {
             item.category == PaletteCategory::Files
-                && matches!(&item.target, PaletteTarget::File(path) if path == "src/main.rs")
+                && matches!(&item.target, PaletteTarget::File(key) if key.path == "src/main.rs")
         }));
         assert!(ui.palette_items("feature-x").iter().any(|item| {
             item.category == PaletteCategory::Sessions

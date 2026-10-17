@@ -148,7 +148,10 @@ fn files_reuse_only_unpinned_file_preview() {
     for path in ["src/a.rs", "src/b.rs"] {
         w.apply(Action::Open {
             group: 2,
-            target: Target::File { path: path.into() },
+            target: Target::File {
+                scope_id: ScopeId::launch(),
+                path: path.into(),
+            },
             pinned: false,
         })
         .unwrap();
@@ -162,13 +165,19 @@ fn pin_protects_file_preview() {
     let mut w = Workspace::default();
     w.apply(Action::Open {
         group: 2,
-        target: Target::File { path: "a".into() },
+        target: Target::File {
+            scope_id: ScopeId::launch(),
+            path: "a".into(),
+        },
         pinned: true,
     })
     .unwrap();
     w.apply(Action::Open {
         group: 2,
-        target: Target::File { path: "b".into() },
+        target: Target::File {
+            scope_id: ScopeId::launch(),
+            path: "b".into(),
+        },
         pinned: false,
     })
     .unwrap();
@@ -362,6 +371,7 @@ fn new_group_can_show_any_existing_target() {
         Target::SessionTree,
         Target::Help,
         Target::File {
+            scope_id: ScopeId::launch(),
             path: "readme".into(),
         },
     ] {
@@ -472,6 +482,7 @@ fn file_and_diff_have_separate_preview_slots() {
         w.apply(Action::Open {
             group: 2,
             target: Target::File {
+                scope_id: ScopeId::launch(),
                 path: format!("f{n}"),
             },
             pinned: false,

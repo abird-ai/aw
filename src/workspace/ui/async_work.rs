@@ -13,30 +13,43 @@ impl Ui {
             .ok_or(Error::Limit("preview ID exhausted"))?;
         let request = match &job {
             Job::List { path, .. } => Request::List(path.clone()),
-            Job::Read { path } => Request::Read(path.clone()),
+            Job::Read { path, .. } => Request::Read(path.clone()),
             Job::Search { query, cancel, .. } => Request::Search {
                 query: query.clone(),
                 limit: 80,
                 cancel: cancel.clone(),
             },
+            Job::Authorize { .. } => {
+                return Err(Error::Config(
+                    "root authorization requires explicit Files action".into(),
+                ))
+            }
         };
-        browser.request(self.ticket, request)?;
+        let token = job.token().expect("file request token");
+        browser.request(self.ticket, &token.access, request)?;
         self.jobs.insert(self.ticket, job);
         Ok(self.ticket)
     }
+
     pub(super) fn list_files(&mut self, browser: &Browser, pane: Id, path: String) {
-        if self
-            .jobs
-            .values()
-            .any(|job| matches!(job, Job::List { pane: p, path: q } if *p == pane && *q == path))
-        {
+        let Some(scope) = self.layout.files_scope_for(pane).cloned() else {
             return;
-        }
+        };
+        let container = self.layout.files_container_for(pane);
+        let token = match self.file_token(&scope, container) {
+            Ok(token) => token,
+            Err(error) => {
+                self.notice = error.to_string();
+                return;
+            }
+        };
+        if self.jobs.values().any(|job| matches!(job, Job::List { pane: p, path: q, token: current } if *p == pane && *q == path && current.access.same_binding(&token.access))) { return; }
         match self.file_request(
             browser,
             Job::List {
                 pane,
                 path: path.clone(),
+                token,
             },
         ) {
             Ok(ticket) => {
@@ -46,32 +59,53 @@ impl Ui {
                     n.directory = path;
                     n.entries.clear();
                     n.loaded = false;
+                } else if path.is_empty() {
+                    n.loaded = false;
                 } else {
-                    if path.is_empty() {
-                        n.loaded = false;
-                    } else {
-                        n.expanded.insert(path);
-                    }
+                    n.expanded.insert(path);
                 }
             }
-            Err(e) => self.notice = e.to_string(),
+            Err(error) => self.notice = error.to_string(),
         }
     }
+
     pub(super) fn read_file(&mut self, browser: &Browser, path: String) {
-        if !aw_workspace::valid_relative(&path) {
-            self.notice = "Use a clean relative file path under this workspace root.".into();
+        self.read_file_key(browser, FileKey::new(self.current_file_scope(), path));
+    }
+
+    pub(super) fn read_file_key(&mut self, browser: &Browser, key: FileKey) {
+        if !aw_workspace::valid_relative(&key.path) {
+            self.notice = "Use a clean relative file path under this Files root.".into();
             return;
         }
-        self.open_file_preview(path.clone());
-        if !self.files.contains_key(&path)
-            && !self
-                .jobs
-                .values()
-                .any(|j| matches!(j,Job::Read{path:p} if *p==path))
-        {
-            if let Err(e) = self.file_request(browser, Job::Read { path }) {
-                self.notice = e.to_string();
+        let Some(tab) = self.open_file_preview_key(key.clone()) else {
+            return;
+        };
+        self.request_file_view(browser, tab, key);
+    }
+
+    fn request_file_view(&mut self, browser: &Browser, tab: Id, key: FileKey) {
+        if self.files.contains_key(&key) || self.jobs.values().any(|job| matches!(job, Job::Read { path, token, .. } if path == &key.path && token.access.scope_id() == &key.scope_id)) { return; }
+        let container = self
+            .layout
+            .group_for(tab)
+            .and_then(|group| self.layout.files_container_for(group));
+        let token = match self.file_token(&key.scope_id, container) {
+            Ok(token) => token,
+            Err(error) => {
+                self.notice = error.to_string();
+                return;
             }
+        };
+        if let Err(error) = self.file_request(
+            browser,
+            Job::Read {
+                tab,
+                path: key.path,
+                token,
+            },
+        ) {
+            self.notice = error.to_string();
         }
     }
 
@@ -111,9 +145,8 @@ impl Ui {
             self.palette_file_results.clear();
             return;
         }
-        if self.palette_file_query == query
-            && (self.palette_file_pending.is_some() || !self.palette_file_results.is_empty())
-        {
+        // This includes completed empty results; paint must not resubmit a miss.
+        if self.palette_file_query == query {
             return;
         }
         self.cancel_file_searches(None);
@@ -124,9 +157,17 @@ impl Ui {
         ) {
             return;
         }
+        let token = match self.file_token(&self.palette_file_scope, self.palette_file_container) {
+            Ok(token) => token,
+            Err(error) => {
+                self.notice = error.to_string();
+                return;
+            }
+        };
         match self.file_request(
             browser,
             Job::Search {
+                token,
                 pane: None,
                 query: query.to_owned(),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -177,9 +218,20 @@ impl Ui {
         }) {
             return;
         }
+        let Some(scope) = self.layout.files_scope_for(pane).cloned() else {
+            return;
+        };
+        let token = match self.file_token(&scope, self.layout.files_container_for(pane)) {
+            Ok(token) => token,
+            Err(error) => {
+                self.notice = error.to_string();
+                return;
+            }
+        };
         match self.file_request(
             browser,
             Job::Search {
+                token,
                 pane: Some(pane),
                 query: query.to_owned(),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -195,19 +247,24 @@ impl Ui {
         }
     }
 
-    pub(super) fn next_highlight_generation(&mut self) -> u64 {
-        self.highlight_generation = self.highlight_generation.wrapping_add(1).max(1);
-        self.highlight_generation
+    pub(super) fn next_highlight_generation(&mut self) -> Option<u64> {
+        self.highlight_generation = self.highlight_generation.checked_add(1)?;
+        Some(self.highlight_generation)
     }
 
-    pub(super) fn schedule_file_highlight(&mut self, path: &str) {
-        let Some(text) = self.files.get(path).cloned() else { return };
-        let generation = self.next_highlight_generation();
+    pub(super) fn schedule_file_highlight(&mut self, key: &FileKey) {
+        let Some(text) = self.files.get(key).cloned() else {
+            return;
+        };
+        let Some(generation) = self.next_highlight_generation() else {
+            self.notice = "Syntax request IDs exhausted.".into();
+            return;
+        };
         let theme = self.ui_config.theme;
         let total = text.split('\n').take(8192).count();
         let cancel = Arc::new(AtomicBool::new(false));
         self.file_highlights.insert(
-            path.to_owned(),
+            key.clone(),
             HighlightCache {
                 generation,
                 theme,
@@ -216,56 +273,61 @@ impl Ui {
                 cancel: cancel.clone(),
             },
         );
-        let target = HighlightTarget::File(path.to_owned());
-        let path = path.to_owned();
+        let target = HighlightTarget::File(key.clone());
+        let key = key.clone();
+        let path = key.path.clone();
         let path_for_job = path.clone();
         let out = self.background_tx.clone();
         let panic_out = out.clone();
         let panic_target = target.clone();
-        if let Err(error) = self.background.try_submit_with_panic("syntax", move || {
-            let target_for_chunks = target.clone();
-            let mut final_lines = Vec::with_capacity(total);
-            let _ = crate::tui::syntax::highlight_path_progressive(
-                &path_for_job,
-                &text,
-                theme,
-                128,
-                |start, lines| {
-                    if cancel.load(Ordering::Acquire) {
-                        return false;
-                    }
-                    final_lines.extend(lines.iter().cloned());
-                    try_send_ui_progress(
-                        &out,
-                        UiBackgroundResult::Highlight {
-                            target: target_for_chunks.clone(),
-                            generation,
-                            start,
-                            lines,
-                            done: false,
-                        },
-                    )
-                },
-            );
-            if !cancel.load(Ordering::Acquire) {
-                let _ = out.blocking_send(UiBackgroundResult::Highlight {
-                    target,
+        if let Err(error) = self.background.try_submit_with_panic(
+            "syntax",
+            move || {
+                let target_for_chunks = target.clone();
+                let mut final_lines = Vec::with_capacity(total);
+                let _ = crate::tui::syntax::highlight_path_progressive(
+                    &path_for_job,
+                    &text,
+                    theme,
+                    128,
+                    |start, lines| {
+                        if cancel.load(Ordering::Acquire) {
+                            return false;
+                        }
+                        final_lines.extend(lines.iter().cloned());
+                        try_send_ui_progress(
+                            &out,
+                            UiBackgroundResult::Highlight {
+                                target: target_for_chunks.clone(),
+                                generation,
+                                start,
+                                lines,
+                                done: false,
+                            },
+                        )
+                    },
+                );
+                if !cancel.load(Ordering::Acquire) {
+                    let _ = out.blocking_send(UiBackgroundResult::Highlight {
+                        target,
+                        generation,
+                        start: 0,
+                        lines: final_lines,
+                        done: true,
+                    });
+                }
+            },
+            move || {
+                let _ = panic_out.blocking_send(UiBackgroundResult::Highlight {
+                    target: panic_target,
                     generation,
                     start: 0,
-                    lines: final_lines,
+                    lines: Vec::new(),
                     done: true,
                 });
-            }
-        }, move || {
-            let _ = panic_out.blocking_send(UiBackgroundResult::Highlight {
-                target: panic_target,
-                generation,
-                start: 0,
-                lines: Vec::new(),
-                done: true,
-            });
-        }) {
-            if let Some(cache) = self.file_highlights.get_mut(&path) {
+            },
+        ) {
+            if let Some(cache) = self.file_highlights.get_mut(&key) {
                 cache.complete = true;
             }
             self.notice = error.to_string();
@@ -275,8 +337,13 @@ impl Ui {
     pub(super) fn schedule_diff_highlight(&mut self, review_id: &str) {
         self.diff_highlights
             .retain(|id, _| self.git.reviews.contains_key(id));
-        let Some((_, review)) = self.git.reviews.get(review_id).cloned() else { return };
-        let generation = self.next_highlight_generation();
+        let Some((_, review)) = self.git.reviews.get(review_id).cloned() else {
+            return;
+        };
+        let Some(generation) = self.next_highlight_generation() else {
+            self.notice = "Syntax request IDs exhausted.".into();
+            return;
+        };
         let theme = self.ui_config.theme;
         let cancel = Arc::new(AtomicBool::new(false));
         self.diff_highlights.insert(
@@ -293,49 +360,53 @@ impl Ui {
         let out = self.background_tx.clone();
         let panic_out = out.clone();
         let panic_target = target.clone();
-        if let Err(error) = self.background.try_submit_with_panic("syntax", move || {
-            let target_for_chunks = target.clone();
-            let mut final_lines = Vec::with_capacity(review.lines.len());
-            let _ = syntax::highlight_diff_progressive(
-                &review.path_label,
-                &review.lines,
-                theme,
-                128,
-                |start, lines| {
-                    if cancel.load(Ordering::Acquire) {
-                        return false;
-                    }
-                    final_lines.extend(lines.iter().cloned());
-                    try_send_ui_progress(
-                        &out,
-                        UiBackgroundResult::Highlight {
-                            target: target_for_chunks.clone(),
-                            generation,
-                            start,
-                            lines,
-                            done: false,
-                        },
-                    )
-                },
-            );
-            if !cancel.load(Ordering::Acquire) {
-                let _ = out.blocking_send(UiBackgroundResult::Highlight {
-                    target,
+        if let Err(error) = self.background.try_submit_with_panic(
+            "syntax",
+            move || {
+                let target_for_chunks = target.clone();
+                let mut final_lines = Vec::with_capacity(review.lines.len());
+                let _ = syntax::highlight_diff_progressive(
+                    &review.path_label,
+                    &review.lines,
+                    theme,
+                    128,
+                    |start, lines| {
+                        if cancel.load(Ordering::Acquire) {
+                            return false;
+                        }
+                        final_lines.extend(lines.iter().cloned());
+                        try_send_ui_progress(
+                            &out,
+                            UiBackgroundResult::Highlight {
+                                target: target_for_chunks.clone(),
+                                generation,
+                                start,
+                                lines,
+                                done: false,
+                            },
+                        )
+                    },
+                );
+                if !cancel.load(Ordering::Acquire) {
+                    let _ = out.blocking_send(UiBackgroundResult::Highlight {
+                        target,
+                        generation,
+                        start: 0,
+                        lines: final_lines,
+                        done: true,
+                    });
+                }
+            },
+            move || {
+                let _ = panic_out.blocking_send(UiBackgroundResult::Highlight {
+                    target: panic_target,
                     generation,
                     start: 0,
-                    lines: final_lines,
+                    lines: Vec::new(),
                     done: true,
                 });
-            }
-        }, move || {
-            let _ = panic_out.blocking_send(UiBackgroundResult::Highlight {
-                target: panic_target,
-                generation,
-                start: 0,
-                lines: Vec::new(),
-                done: true,
-            });
-        }) {
+            },
+        ) {
             if let Some(cache) = self.diff_highlights.get_mut(review_id) {
                 cache.complete = true;
             }
@@ -359,17 +430,104 @@ impl Ui {
         let Some(job) = self.jobs.remove(&response.ticket) else {
             return;
         };
-        match job {
-            Job::List { pane, path } => {
-                if !self.layout.panes.contains_key(&pane) {
+        if let Job::Authorize {
+            beside,
+            reconnect,
+            origin_tab,
+            epoch,
+        } = job
+        {
+            if epoch != self.file_epoch
+                || !self.layout.panes.contains_key(&beside)
+                || response.access.is_some()
+            {
+                return;
+            }
+            let grant = match response.result {
+                Ok(Content::Authorized(grant)) => grant,
+                Err(error) => {
+                    self.notice = error;
                     return;
                 }
+                _ => {
+                    self.notice = "Invalid Files root authorization reply".into();
+                    return;
+                }
+            };
+            if let Some(scope) = reconnect {
+                if self.reconnect_file_scope(beside).as_ref() != Some(&scope)
+                    || origin_tab.is_some_and(|tab| {
+                        self.layout
+                            .active(beside)
+                            .is_none_or(|active| active.id != tab)
+                    })
+                {
+                    return;
+                }
+                match self.file_scopes.rebind(&scope, grant) {
+                    Ok(()) => {
+                        self.reset_file_lifetime();
+                        self.files.retain(|key, _| key.scope_id != scope);
+                        self.file_lines.retain(|key, _| key.scope_id != scope);
+                        let navigators = self
+                            .layout
+                            .panes
+                            .keys()
+                            .filter(|pane| self.layout.files_scope_for(**pane) == Some(&scope))
+                            .copied()
+                            .collect::<Vec<_>>();
+                        for pane in navigators {
+                            self.nav.remove(&(pane, Navigator::Files));
+                        }
+                        self.reconcile_layout_state();
+                        self.notice = "Files folder reconnected; Agent unchanged.".into();
+                    }
+                    Err(error) => self.notice = error.to_string(),
+                }
+            } else {
+                match self.file_scopes.install(grant) {
+                    Ok(scope) => {
+                        let focused = self.layout.focused;
+                        let input = self.input;
+                        match self.layout.apply(Action::AddFiles {
+                            beside,
+                            side: Side::Right,
+                            scope_id: scope.clone(),
+                        }) {
+                            Ok(()) => {
+                                self.layout_generation = self.layout_generation.wrapping_add(1);
+                                self.reconcile_layout_state();
+                                if focused != beside && self.layout.panes.contains_key(&focused) {
+                                    self.apply(Action::Focus(focused));
+                                    self.input = input;
+                                } else {
+                                    self.input = false;
+                                }
+                                self.notice =
+                                    "Read-only Files folder opened; Agent unchanged.".into();
+                            }
+                            Err(error) => {
+                                self.file_scopes.close(&scope);
+                                self.notice = error.to_string();
+                            }
+                        }
+                    }
+                    Err(error) => self.notice = error.to_string(),
+                }
+            }
+            return;
+        }
+        if !self.file_reply_current(&job, response.access.as_ref()) {
+            return;
+        }
+        match job {
+            Job::List { pane, path, .. } => {
                 let n = self.nav.entry((pane, Navigator::Files)).or_default();
                 if n.pending == Some(response.ticket) {
                     n.pending = None;
                 }
                 match response.result {
-                    Ok(Content::Directory(list)) => {
+                    Ok(Content::Directory(list)) if list.path == path => {
                         n.loaded = true;
                         n.incomplete |= list.incomplete;
                         if n.display == NavDisplay::Tree {
@@ -380,66 +538,64 @@ impl Ui {
                             n.selected = 0;
                         }
                     }
-                    Err(e) => {
+                    Err(error) => {
                         if n.display == NavDisplay::List && n.directory == path {
                             n.entries.clear();
                         } else {
                             n.expanded.remove(&path);
                         }
-                        self.notice = e;
+                        self.notice = error;
                     }
-                    _ => {
-                        self.notice = "Invalid directory preview reply".into();
-                    }
+                    _ => self.notice = "Invalid directory preview reply".into(),
                 }
             }
-            Job::Read { path } => {
+            Job::Read { path, token, .. } => {
+                let key = FileKey::new(token.access.scope_id().clone(), path.clone());
                 let text = match response.result {
                     Ok(Content::File {
                         path: resolved,
                         text,
                     }) if resolved == path => text,
-                    Err(e) => format!("[file unavailable]\n{e}"),
+                    Err(error) => format!("[file unavailable]\n{error}"),
                     _ => "[unexpected preview response]".into(),
                 };
-                // Bound cache independently from on-disk/source limits. Explicit
-                // reopen/refresh reloads an evicted view, never an agent call.
                 while self.files.len() >= 8 {
-                    if let Some(key) = self.files.keys().find(|k| **k != path).cloned() {
-                        self.files.remove(&key);
-                        self.file_lines.remove(&key);
-                        self.file_highlights.remove(&key);
+                    if let Some(evicted) = self.files.keys().find(|other| **other != key).cloned() {
+                        self.files.remove(&evicted);
+                        self.file_lines.remove(&evicted);
+                        self.file_highlights.remove(&evicted);
                     } else {
                         break;
                     }
                 }
-                self.file_highlights.remove(&path);
-                let lines = Arc::new(
-                    text.lines()
-                        .take(8192)
-                        .map(aw_workspace::editor::display)
-                        .collect::<Vec<_>>(),
+                self.file_highlights.remove(&key);
+                self.file_lines.insert(
+                    key.clone(),
+                    Arc::new(
+                        text.lines()
+                            .take(8192)
+                            .map(aw_workspace::editor::display)
+                            .collect(),
+                    ),
                 );
-                self.file_lines.insert(path.clone(), lines);
-                self.files.insert(path.clone(), text);
+                self.files.insert(key.clone(), text);
                 self.file_revision = self.file_revision.wrapping_add(1);
-                self.schedule_file_highlight(&path);
+                self.schedule_file_highlight(&key);
+                self.refresh_file_find(&key);
             }
             Job::Search { pane, query, .. } => match pane {
                 None => {
-                    if self.palette_file_pending == Some(response.ticket) {
-                        self.palette_file_pending = None;
-                    }
-                    if query != self.palette_file_query {
+                    if self.palette_file_pending != Some(response.ticket)
+                        || query != self.palette_file_query
+                    {
                         return;
                     }
+                    self.palette_file_pending = None;
                     match response.result {
                         Ok(Content::Search {
                             query: resolved,
                             entries,
-                        }) if resolved == query => {
-                            self.palette_file_results = entries;
-                        }
+                        }) if resolved == query => self.palette_file_results = entries,
                         Err(error) => {
                             self.palette_file_results.clear();
                             self.notice = error;
@@ -452,19 +608,18 @@ impl Ui {
                 }
                 Some(pane) => {
                     let state = self.nav.entry((pane, Navigator::Files)).or_default();
-                    if state.search_pending == Some(response.ticket) {
-                        state.search_pending = None;
-                    }
-                    if state.filter.trim() != query || state.search_query != query {
+                    if state.search_pending != Some(response.ticket)
+                        || state.filter.trim() != query
+                        || state.search_query != query
+                    {
                         return;
                     }
+                    state.search_pending = None;
                     match response.result {
                         Ok(Content::Search {
                             query: resolved,
                             entries,
-                        }) if resolved == query => {
-                            state.search_results = entries;
-                        }
+                        }) if resolved == query => state.search_results = entries,
                         Err(error) => {
                             state.search_results.clear();
                             self.notice = error;
@@ -476,6 +631,7 @@ impl Ui {
                     }
                 }
             },
+            Job::Authorize { .. } => unreachable!(),
         }
     }
     pub(super) fn apply_background_result(&mut self, result: UiBackgroundResult) {
@@ -501,17 +657,23 @@ impl Ui {
                 }
                 match result {
                     Ok(Some(layout)) => {
+                        self.reset_file_lifetime();
+                        self.files_last_group.clear();
                         self.layout = layout;
                         self.layout_generation = self.layout_generation.wrapping_add(1);
                         self.terminal_return = None;
                         self.reconcile_layout_state();
                         if !matches!(
-                            self.layout.active(self.layout.focused).map(|tab| &tab.target),
+                            self.layout
+                                .active(self.layout.focused)
+                                .map(|tab| &tab.target),
                             Some(Target::Conversation)
                         ) {
                             self.input = false;
                         }
-                        self.notice = "Saved layout restored asynchronously; Agent/session state unchanged".into();
+                        self.notice =
+                            "Saved layout restored asynchronously; Agent/session state unchanged"
+                                .into();
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -530,12 +692,16 @@ impl Ui {
                             self.notice = "Loaded layout ignored because the workspace changed while the load was running".into();
                             return;
                         }
+                        self.reset_file_lifetime();
+                        self.files_last_group.clear();
                         self.layout = layout;
                         self.layout_generation = self.layout_generation.wrapping_add(1);
                         self.terminal_return = None;
                         self.reconcile_layout_state();
                         if !matches!(
-                            self.layout.active(self.layout.focused).map(|tab| &tab.target),
+                            self.layout
+                                .active(self.layout.focused)
+                                .map(|tab| &tab.target),
                             Some(Target::Conversation)
                         ) {
                             self.input = false;
@@ -543,7 +709,8 @@ impl Ui {
                         self.notice = "Layout loaded; active session and drafts unchanged".into();
                     }
                     Ok(None) => {
-                        self.notice = "Layout saved; no account secrets, transcript or draft stored".into();
+                        self.notice =
+                            "Layout saved; no account secrets, transcript or draft stored".into();
                     }
                     Err(error) => self.notice = error,
                 }
@@ -584,7 +751,9 @@ impl Ui {
                 key,
                 result,
             } => {
-                let Some(pending) = self.conversation_pending.as_ref() else { return };
+                let Some(pending) = self.conversation_pending.as_ref() else {
+                    return;
+                };
                 if pending.generation != generation || !pending.key.matches(&key) {
                     return;
                 }
@@ -638,10 +807,9 @@ impl Ui {
                         self.notice.clear();
                     }
                 }
-                let selected = self
-                    .find
-                    .get(&tab)
-                    .map_or(0, |state| state.selected.min(matches.len().saturating_sub(1)));
+                let selected = self.find.get(&tab).map_or(0, |state| {
+                    state.selected.min(matches.len().saturating_sub(1))
+                });
                 self.find.insert(
                     tab,
                     FindState {
@@ -660,22 +828,38 @@ impl Ui {
     }
 
     pub(super) fn visible_files(&mut self, browser: &Browser) {
+        if let Some(palette) = &self.palette {
+            let query = palette.text().to_owned();
+            self.sync_palette_file_search(browser, &query);
+        }
+
         if let Some(Pane::Navigator {
             kind: Navigator::Git,
         }) = self.layout.panes.get(&self.layout.focused)
         {
             self.git.ensure(self.layout.focused);
         }
-        let active = self.layout.active(self.group()).map(|t| t.target.clone());
-        if let Some(Target::File { path }) = active {
-            if !self.files.contains_key(&path)
-                && !self
-                    .jobs
-                    .values()
-                    .any(|j| matches!(j,Job::Read{path:p} if *p==path))
-            {
-                if let Err(e) = self.file_request(browser, Job::Read { path }) {
-                    self.notice = e.to_string();
+        let files = self
+            .layout
+            .groups()
+            .into_iter()
+            .filter_map(|group| {
+                self.layout.active(group).and_then(|tab| match &tab.target {
+                    Target::File { scope_id, path } => {
+                        Some((tab.id, FileKey::new(scope_id.clone(), path.clone())))
+                    }
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        for (tab, key) in files {
+            self.request_file_view(browser, tab, key.clone());
+            if self.files.contains_key(&key) {
+                if !self.file_highlights.contains_key(&key) {
+                    self.schedule_file_highlight(&key);
+                }
+                if self.file_find_dirty.remove(&tab) {
+                    self.refresh_file_find(&key);
                 }
             }
         }

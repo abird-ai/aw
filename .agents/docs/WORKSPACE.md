@@ -82,11 +82,45 @@ without creating a Session. Browsing and later activation reuse one Host-owned
 Store and its exclusive owner.lock. Remote and JSONL read-only pins remain
 unavailable in this slice; there is no fallback to a different authority/backend.
 
-Native saved layout v2 migrates consistent v1 layouts in memory, retaining tab
-IDs, pins, geometry and root binding. Existing Conversation tabs continue to
+Native saved layout v3 migrates consistent v1/v2 layouts in memory, retaining
+IDs, pins, geometry and root binding. Legacy File targets bind only to the
+already-authorized launch folder; containers add no migration panes. Existing Conversation tabs continue to
 follow the current Agent. Mixed/unsupported versions fail before installation;
 atomic publication, no-follow reads and the 64 KiB limit remain. SQLite v33 and
 JSONL v1 are unchanged. Browser containers and docking remain planned separately.
+
+## Scoped Files folders
+
+Choose **Open Files folder…** in the Workspace palette, or enter
+`files-open PATH`, to browse another local folder. It opens a Files navigator
+and its document group in the same Workspace. A file preview stays with the
+invoking folder's group and preserves Explorer focus. File and Diff preview
+slots remain separate; moving or splitting a file view preserves its exact
+folder and relative path, viewport and Find state.
+
+Folders have independent identities, so two `src/lib.rs` tabs from different
+folders show their own content and search results. Folder captions put the name
+first and retain the full location. Opening or reconnecting a Files folder never
+changes the current Agent, its draft/caret, execution directory or tool grants.
+Human folders also survive switching to Agent and back, even if an Agent was
+resumed in a different directory.
+
+After restarting, saved additional folders show their saved caption as
+unavailable until explicitly reconnected. Focus that Files navigator or a file
+tab and choose **Reconnect Files folder…** (`files-reconnect PATH`). A moved file
+tab reconnects its own folder. Saved captions and paths never open folders or
+grant access. The original launch binding can reconnect only to its original
+folder.
+
+Reads, filtering and highlighting use retained filesystem capabilities and the
+existing bounded background executor. Closing, restoring or reconnecting rejects
+old replies; reconnect clears old content and derived selection/Find state.
+Unused additional capabilities are released after their last container or file
+view closes. Existing pane/tab/navigator limits remain.
+
+On Windows, scoped directory handles prevent folder/ancestor rename or deletion
+while retained; ordinary file edits remain possible. Windows-target compilation
+and actual Windows execution are separate verification gates.
 
 ## Services and scope
 
@@ -139,11 +173,16 @@ Input/paint never run blocking Git or PTY launch. Git stdout/stderr/row count/ti
 
 Returning inline keeps the same settled Agent/Host and retained PTYs. Quit actions are context-sensitive: ordinary `quit` appears only when no unsent/recovery text or live terminals need confirmation; `quit-discard` confirms unsent text, `quit-terminals` confirms terminal termination, and `quit-all` is shown only when both confirmations are required. A host/raw-mode cleanup guard restores the physical terminal on ordinary returns/errors; abrupt process death cannot be repaired by Drop. Disowned child processes may require external inspection.
 
-Git comments/markers and terminal histories are memory-only. The current SQLite schema is v32. Phase 38 introduced v21 shared-prompt draft state, Phase 39 added bounded pipeline state at v22, the unnumbered post-Phase-39 repair restored legacy coordination shape at v23, Phase 40 added separate routing/affinity receipts at v24, Phase 41 adds bounded child-Session relations at v25, Phase 42 adds isolated child execution bindings at v26, Phase 43 adds durable root delegation envelopes/budget accounting at v27, Phase 44 adds bounded recursive lineage at v28, Phase 45 adds governed child-routing receipts at v29, and Phase 46 adds bounded team-template/run/join receipts at v30, Phase 49 adds planner operation/task/join receipts at v31, and Phase 50 adds guardian review/approval/release receipts at v32; none of these makes workspace layout/Git/PTY state model context. Manual index/PTY activity is not part of the native model-tool durable journal. The post-Phase37 design adaptation adds a local SecretStore-backed **Sign in with ChatGPT** provider path through OpenAI Responses; it does not make OAuth credentials part of workspace layout state and does not turn the Chat Completions adapter into a subscription adapter. Broader shared workspace geometry/files/PTY control, current-directory shell integration and remote personal-inference expansion remain separate concerns.
+Git comments/markers and terminal histories are memory-only. The current SQLite schema is v33. Phase 38 introduced v21 shared-prompt draft state, Phase 39 added bounded pipeline state at v22, the unnumbered post-Phase-39 repair restored legacy coordination shape at v23, Phase 40 added separate routing/affinity receipts at v24, Phase 41 adds bounded child-Session relations at v25, Phase 42 adds isolated child execution bindings at v26, Phase 43 adds durable root delegation envelopes/budget accounting at v27, Phase 44 adds bounded recursive lineage at v28, Phase 45 adds governed child-routing receipts at v29, and Phase 46 adds bounded team-template/run/join receipts at v30, Phase 49 adds planner operation/task/join receipts at v31, and Phase 50 adds guardian review/approval/release receipts at v32; none of these makes workspace layout/Git/PTY state model context. Manual index/PTY activity is not part of the native model-tool durable journal. The post-Phase37 design adaptation adds a local SecretStore-backed **Sign in with ChatGPT** provider path through OpenAI Responses; it does not make OAuth credentials part of workspace layout state and does not turn the Chat Completions adapter into a subscription adapter. Broader shared workspace geometry/files/PTY control, current-directory shell integration and remote personal-inference expansion remain separate concerns.
 
 ## Validation
 
-Run `cargo test --workspace --locked`: the actual SDK consumers, Cargo dependency checks, Ratatui TestBackend tests, real Git/PTY library tests and `cargo test --release -p aw-cli` must pass. The modern inline path additionally has `cargo test -p aw-cli`, which drives the real Ratatui inline composer in a PTY, answers terminal cursor-position queries, verifies Ctrl+C clears only the draft without terminal-wide erase sequences, exercises transient slash/settings UI, and exits through `/quit` without contacting a provider. Python Git/PTY probes are independently executed lower-level checks; no screenshot or generated image is evidence the Rust interface works. [Build status](BUILD-STATUS.md).
+Use the single pinned-shell [product gate](BUILD-STATUS.md#validate-the-current-candidate).
+Record executed commands, tested commits and unfinished acceptance in the
+[Workspace plan](../plans/workspace-views/TODO.md). Rust TestBackend assertions,
+real terminal execution, cross-target compilation and native platform execution
+remain separate results; none substitutes for another. The Files slice does not
+complete browser containers, docking or external release gates.
 
 ## Phase 6 browser counterpart
 

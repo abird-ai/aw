@@ -1,4 +1,4 @@
-use aw_workspace::{Action, Rect, Side, Target, Workspace, MAX_PANES, MAX_TABS};
+use aw_workspace::{Action, Rect, ScopeId, Side, Target, Workspace, MAX_PANES, MAX_TABS};
 use serde_json::{json, Value};
 
 fn agent_view(store: &str, session: &str, branch: &str) -> Target {
@@ -31,12 +31,16 @@ fn legacy_layout() -> Value {
 }
 
 #[test]
-fn v1_migration_changes_only_version_and_keeps_follow_current() {
+fn v1_migration_keeps_geometry_and_binds_files_to_authorized_launch_scope() {
     let mut expected = legacy_layout();
     let legacy: Workspace = serde_json::from_value(expected.clone()).unwrap();
     assert!(legacy.validate().is_err());
-    let migrated = legacy.migrate().unwrap();
-    expected["version"] = json!(2);
+    let migrated = legacy.migrate(&ScopeId::launch()).unwrap();
+    expected["version"] = json!(3);
+    expected["containers"] = json!({});
+    expected["next_container_id"] = json!(1);
+    expected["scope_labels"] = json!({});
+    expected["tabs"]["6"]["target"]["scope_id"] = json!("launch");
     assert_eq!(serde_json::to_value(&migrated).unwrap(), expected);
     assert_eq!(migrated.tabs[&3].target, Target::Conversation);
     migrated
@@ -52,15 +56,18 @@ fn v1_migration_changes_only_version_and_keeps_follow_current() {
 }
 
 #[test]
-fn v2_is_stable_and_unsupported_versions_never_migrate() {
+fn v3_is_stable_and_unsupported_versions_never_migrate() {
     let current = Workspace::default();
-    assert_eq!(current.version, 2);
-    assert_eq!(Workspace::conversation_only().version, 2);
-    assert_eq!(current.clone().migrate().unwrap(), current);
-    for version in [0, 3, u32::MAX] {
+    assert_eq!(current.version, 3);
+    assert_eq!(Workspace::conversation_only().version, 3);
+    assert_eq!(
+        current.clone().migrate(&ScopeId::launch()).unwrap(),
+        current
+    );
+    for version in [0, 4, u32::MAX] {
         let mut unsupported = current.clone();
         unsupported.version = version;
-        assert!(unsupported.clone().migrate().is_err());
+        assert!(unsupported.clone().migrate(&ScopeId::launch()).is_err());
         assert!(unsupported.apply(Action::Focus(current.focused)).is_err());
     }
 }
@@ -76,7 +83,7 @@ fn legacy_new_targets_and_invalid_graphs_are_rejected() {
     invalid_path["tabs"]["6"]["target"]["path"] = json!("../secret");
     for value in [new_target, invalid_focus, invalid_path] {
         let legacy: Workspace = serde_json::from_value(value).unwrap();
-        assert!(legacy.migrate().is_err());
+        assert!(legacy.migrate(&ScopeId::launch()).is_err());
     }
 }
 

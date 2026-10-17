@@ -471,6 +471,18 @@ pub const WORKSPACE_COMMANDS: &[WorkspaceCommand] = &[
         shortcut: "Ctrl+Shift+E / Alt+E → Alt+2",
     },
     WorkspaceCommand {
+        command: "files-open ",
+        label: "Open Files folder…",
+        description: "browse another local folder read only without changing the Agent",
+        shortcut: "",
+    },
+    WorkspaceCommand {
+        command: "files-reconnect ",
+        label: "Reconnect Files folder…",
+        description: "reconnect the selected Files folder without changing the Agent",
+        shortcut: "",
+    },
+    WorkspaceCommand {
         command: "git changes",
         label: "Show Git Changes",
         description: "focus Git → Changes",

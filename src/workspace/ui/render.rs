@@ -19,6 +19,14 @@ impl Ui {
         )
     }
 
+    pub(super) fn file_key_context(&self, key: &FileKey) -> String {
+        format!(
+            "{} · {}",
+            self.file_scope_label(&key.scope_id),
+            Self::file_context(&key.path)
+        )
+    }
+
     pub(super) fn diff_context(path: &str, basis: &str, reviewed: bool) -> String {
         let directory = path
             .rsplit_once('/')
@@ -30,24 +38,27 @@ impl Ui {
         )
     }
 
-    pub(super) fn file_line_count(&self, path: &str) -> usize {
-        2 + self.file_lines.get(path).map_or(1, |lines| lines.len())
+    pub(super) fn file_line_count(&self, key: &FileKey) -> usize {
+        2 + self.file_lines.get(key).map_or(1, |lines| lines.len())
     }
 
     pub(super) fn file_view_slice(
         &self,
-        path: &str,
+        key: &FileKey,
         start: usize,
         height: usize,
     ) -> Vec<Line<'static>> {
         let palette = crate::tui::theme::palette_for(&self.ui_config);
-        let count = self.file_line_count(path);
+        let count = self.file_line_count(key);
         let end = start.saturating_add(height).min(count);
-        let highlighted = self.file_highlights.get(path);
-        let source = self.file_lines.get(path);
+        let highlighted = self.file_highlights.get(key);
+        let source = self.file_lines.get(key);
         (start..end)
             .map(|row| match row {
-                0 => Line::styled(Self::file_context(path), Style::default().fg(palette.muted)),
+                0 => Line::styled(
+                    self.file_key_context(key),
+                    Style::default().fg(palette.muted),
+                ),
                 1 => Line::default(),
                 source_row => {
                     let index = source_row - 2;
@@ -63,7 +74,11 @@ impl Ui {
                             Line::raw(if source.is_some() {
                                 String::new()
                             } else {
-                                "Loading explicit local file preview…".into()
+                                if self.file_scopes.access(&key.scope_id).is_some() {
+                                    "Loading explicit local file preview…".into()
+                                } else {
+                                    "Folder unavailable. Choose Reconnect Files folder….".into()
+                                }
                             })
                         })
                 }
@@ -71,8 +86,8 @@ impl Ui {
             .collect()
     }
 
-    pub(super) fn file_view_lines(&self, path: &str) -> Vec<Line<'static>> {
-        self.file_view_slice(path, 0, self.file_line_count(path))
+    pub(super) fn file_view_lines(&self, key: &FileKey) -> Vec<Line<'static>> {
+        self.file_view_slice(key, 0, self.file_line_count(key))
     }
 
     pub(super) fn diff_line_count(&self, review_id: &str) -> usize {
@@ -370,8 +385,8 @@ impl Ui {
                 if rows.is_empty(){"No live activity yet. This view observes native events; it does not create a run.".into()}
                 else{rows.join("\n")}
             },
-            Target::File{path}=>format!("File: {} — read only; not model context\n\n{}",path,self.files.get(path).map(String::as_str).unwrap_or("Loading explicit local file preview…")),
-            Target::Help=>format!("{}\n{}\nExplicit human browsing root: {}",WORKSPACE_KEYMAP,HELP,self.snapshot.root),
+            Target::File{scope_id,path}=>format!("File: {} — read only; not model context\n\n{}",path,self.files.get(&FileKey::new(scope_id.clone(),path.clone())).map(String::as_str).unwrap_or("Loading explicit local file preview…")),
+            Target::Help=>format!("{}\n{}\nExplicit human browsing root: {}",WORKSPACE_KEYMAP,HELP,self.root.display()),
             Target::Diff{review}=>match self.git.reviews.get(review){Some((_,r))=>{let mut text=format!("{} · {} · {}{}\nSnapshot {}\n",r.root.display(),r.path_label,r.basis,if self.git.reviewed.contains(review){" [REVIEWED]"}else{""},r.id);for (i,line) in r.lines.iter().enumerate(){text.push_str(&format!("{:>4} {:>6} {:>6} {}\n",i+1,line.old.map(|n|n.to_string()).unwrap_or_default(),line.new.map(|n|n.to_string()).unwrap_or_default(),line.text));}if let Some(comments)=self.git.comments.get(review){for c in comments{text.push_str(&format!("\nCOMMENT row {}: {}\n",c.row+1,c.text));}}
                 if r.truncated_display{text.push_str("[display bounded; raw review patch retained separately]\n");}text},None=>"Review no longer cached. Reopen from Git; no stale patch is applied automatically.".into()},
             Target::Terminal{..}=>"Terminal renderer unavailable; use terminal-start for an explicit new process".into(),
@@ -473,7 +488,7 @@ impl Ui {
             Target::SessionTree => "Session tree".into(),
             Target::ContextFlow => "Context".into(),
             Target::Activity => "Activity".into(),
-            Target::File { path } => path.rsplit('/').next().unwrap_or(path).to_owned(),
+            Target::File { path, .. } => path.rsplit('/').next().unwrap_or(path).to_owned(),
             Target::Diff { review } => {
                 let path = self
                     .git
@@ -1400,10 +1415,15 @@ impl Ui {
                         width: 2.min(rows.width),
                         height: 1,
                     };
+                    let root = self
+                        .layout
+                        .files_scope_for(id)
+                        .map(|scope| self.file_scope_label(scope))
+                        .unwrap_or_else(|| "unavailable folder".into());
                     let cwd = if directory.is_empty() {
-                        self.snapshot.root.clone()
+                        root
                     } else {
-                        format!("{}/{}", self.snapshot.root.trim_end_matches('/'), directory)
+                        format!("{}/{}", root.trim_end_matches('/'), directory)
                     };
                     frame.render_widget(
                         Paragraph::new(cwd).style(Style::default().fg(palette.muted)),
@@ -1924,7 +1944,9 @@ impl Ui {
                 };
                 let count = match &tab.target {
                     Target::Conversation => conversation_content.as_ref().map_or(0, Vec::len),
-                    Target::File { path } => self.file_line_count(path),
+                    Target::File { scope_id, path } => {
+                        self.file_line_count(&FileKey::new(scope_id.clone(), path.clone()))
+                    }
                     Target::Diff { review } => self.diff_line_count(review),
                     _ => plain_lines.as_ref().map_or(0, |lines| lines.len()),
                 };
@@ -1961,9 +1983,11 @@ impl Ui {
                             .cloned()
                             .collect::<Vec<_>>(),
                     ),
-                    Target::File { path } => {
-                        Some(self.file_view_slice(path, start, visible_height))
-                    }
+                    Target::File { scope_id, path } => Some(self.file_view_slice(
+                        &FileKey::new(scope_id.clone(), path.clone()),
+                        start,
+                        visible_height,
+                    )),
                     Target::Diff { review } => {
                         Some(self.diff_view_slice(review, start, visible_height))
                     }
