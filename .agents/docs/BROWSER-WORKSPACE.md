@@ -39,7 +39,7 @@ Files and Git keep the same Explorer categories. Their view selector and
 There are at most eight Files/Git containers and 32 total document tabs,
 including the permanent Agent and its read-only tabs. Limits fail visibly and
 preserve already-open views. These views are memory-only; shared layout and
-docking remain later work.
+**cross-window** docking remain later work.
 
 Files stays under the explicitly granted startup directory. Git navigators may
 independently select existing verified worktrees through opaque inventory
@@ -54,6 +54,18 @@ revalidates that same binding. An unchanged refresh retains the editor state.
 A delayed open fills only its original pending tab and cannot steal later focus.
 Diffs stay with their original immutable Review after another worktree is
 selected. Read-only documents never gain a composer.
+
+When two or more compatible Files/Git views are open, the active File/Diff
+source bar offers a compact **Move document to another view** selector. This
+is *same-window* reparenting: the existing tab/document ID, original
+source/scope, immutable Review, CodeMirror Find/scroll/selection, current
+Agent/composer, and any exact in-flight read are retained. It starts no new
+read or capability, and it refuses a mismatched navigator, a missing/denied
+view or a duplicate of the same resource already in the destination. Closing
+the origin no longer closes a moved tab; closing its destination retires
+the tab and fences late replies. With only one compatible view the selector
+is hidden to keep the source bar quiet. This does **not** move resources
+between browser windows/processes or give browser labels/pathnames authority.
 
 The owner retains the original Files capability and directory identity rather
 than reopening its pathname. Every scoped read carries exact source and scope

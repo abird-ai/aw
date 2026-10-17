@@ -9,10 +9,9 @@ Continue only authorized bounded slices after current validation. This is additi
 - [x] Shipping browser/native shell and palette/focus slices use existing state/execution owners; strict browser CSP and accessible file/editor semantics remain.
 - [x] Actual palette grammar is `>` Actions, `!` Windows, `@` Files, `#` Sessions, `$` Terminals, `/` Commands and `&` Agents. Empty-query Enter is unarmed; selected identity survives async insertion and invalidation stays inert.
 - [x] F1/Ctrl+Shift+P, existing browser Ctrl/Cmd+K, exact draft/caret cancel, busy admission and original child-PTY/history key ownership are preserved.
+- [x] Source-backed shipping native/browser UX **inventory** recorded in [README.md](README.md): 90 real Ratatui TestBackend frames (Dark/Light/System), isolated native child-shell/resize/maximize restoration checks, and four actual Chrome 155 initial-Agent screenshots (1440×900 and 390×844, Light/Dark) with no document overflow, missing composer or uncaught runtime exceptions. Exact current browser Files/Git/modal and contrast/keyboard parity remain **separate open checks**, not inferred from initial-shell screenshots.
 
 ## Uncommitted
-
-- [~] Inventory remaining gaps from actual shipping views: source-backed inventory and executed 90-frame native gallery now documented in [README.md](README.md); still require actual browser Light/Dark/screenshots and full native focus/caret/split matrix before calling the cross-surface inventory fully accepted (65×20 maximize/restore smoke now passed).
 - [ ] Apply shared semantic roles across native/browser with System/Light/Dark and 16/256/truecolor fallback: readable primary/secondary text, independent focus/selection and factual status words/icons, not color alone.
 - [ ] Complete restrained chrome where gaps remain: borderless primary surfaces, one sidebar boundary, necessary split separators, single-row compact filled active tabs, quiet inactive tabs/overflow and one context-bearing title.
 - [ ] Preserve user prompt emphasis, unboxed assistant prose and one compact tool block: success green, failure/denial/interruption red, running/UNKNOWN neutral or attention; unsettled outcomes must never appear successful/free.

@@ -332,12 +332,75 @@ throughput improvements can be substantial, but the 4:1 loss, additional
 retained payloads and current per-delta mutation lifecycle mean no
 measured end-to-end performance win has been established. Retain one
 durable `SessionState` authority and the bounded presence Mutex; avoid
-a second truth/cache and new synchronization invariants. Next:
-instrument the existing authenticated HTTP/SSE and authorized presence
-handlers with *synthetic* private Store fixtures to determine realistic
-write/read ratio, JSON/TTL/grant cost and p95 latency before considering
-a narrowly synchronized read projection. Do not infer permission from a
-previously published snapshot.
+a second truth/cache and new synchronization invariants. The authenticated
+HTTP/SSE and presence measurements below strengthen this decision; a future
+candidate must demonstrate an *end-to-end* improvement with fresh authority,
+sequence, TTL and exact effect admission preserved. A previously published
+snapshot never supplies permission.
+
+### Authenticated HTTP and real presence — signed source `2c0742506bb9e2620c4152585021262c3c7345b5`
+
+Opt-in benchmark tests on the actual shipping Axum routes, not a replacement
+left-right implementation:
+
+```sh
+cargo test --locked -p aw-cli --lib shipping_session_http_sse_publication_measurement -- --ignored --nocapture
+cargo test --locked -p aw-cli --lib shipping_presence_http_publication_measurement -- --ignored --nocapture
+```
+
+Each test creates its own numeric-loopback listener and *synthetic* owner,
+with real HTTP framing/JSON, pairing-cookie authentication, unchanged
+same-origin/Host policy, bounded concurrency and current permission checks.
+The Session test exercises initial SSE high-water snapshots and repeated
+`/api/session` reads alongside synthetic **in-memory** per-delta writes; its
+4 MiB payload is a stress input, not a claim that normal output is that size.
+The presence test uses the real invite-only team router, SQLite-backed draft
+grant/epoch validation, the maximum 128-row memory cap, 30-second TTL, fresh
+authorization and actual cursor POST/list endpoints. Fake pending display
+and synthetic presence rows cannot call a paid provider, use tools, activate
+a Session or grant a file or cross-machine capability.
+
+Three completed runs in the pinned shell, medians of **eight-reader, 1:16
+write/read read-p95** (one worker per authenticated HTTP client):
+
+| Actual handler, current Mutex | Median read-p95 | Additional measured boundary |
+| --- | ---: | --- |
+| Session JSON, 32 KiB pending | 7.76 ms | initial SSE 2.12 ms |
+| Session JSON, 256 KiB pending | 43.18 ms | initial SSE 12.22 ms |
+| Session JSON, 4 MiB pending | 1,027.42 ms | initial SSE 374.13 ms |
+| Presence list, 8 rows | 6.94 ms | actual Store grant + TTL + JSON |
+| Presence list, 128 rows | 19.18 ms | same Store/grant path, full cap |
+
+For 128-row presence with eight readers and **4:1 writes/read**, measured
+read-p95 was **19.01 ms** and total sampled wall time was **694.35 ms**:
+writes still matter. Real read latencies include serialization, IPC/Store
+work, scheduler and loopback transport; CPU ticks, allocation/retention and
+cold-registration detail remain in the earlier isolated benchmark. These
+are synthetic offered loads with limited concurrent client connections,
+not observed field traffic, production p95 SLOs, or a direct HTTP comparison
+against a migrated implementation.
+
+**Conclusion:** The measurable publication microbenchmark wins under
+read-heavy contention do not justify cloning the growing full Session
+snapshot for each delta, or introducing a second presence authority with
+extra allocation/TTL/grant synchronization. Keep both original locks.
+Revisit only if production-like request/refresh frequency and a bounded
+candidate read projection show a repeatable end-to-end win **and** fresh
+authorization and source epochs are rechecked at admission.
+
+The review also uncovered and fixed a privacy/correctness regression.
+The Store's `set_draft_mode` and `set_draft_grant` **each abandon** the
+prior live draft generation after an audience/policy revision. The original
+presence cache was allowed to retain old participant/cursor rows until
+the 30-second TTL. The new scoped cleanup removes every cursor for the
+affected Session on successful policy/audience change, without touching a
+different Session. A checked cache admission epoch rejects an in-flight
+POST that completed Store authorization before revocation but arrives at
+the map afterwards. Both publish and list now refuse to present an
+abandoned draft as live presence; a successful re-grant cannot resurrect
+the previous generation. Focused tests cover revoke, re-grant, mode Off,
+old-generation POST/list, an actual held authorized POST and cross-Session
+isolation. Existing presence POSTs now return an explicit `409` for an abandoned or stale generation; route names, JSONL/SQLite versions, active owner and model effects are unchanged.
 
 ### Native acceptance added during the same screening
 
@@ -363,6 +426,82 @@ previously published snapshot.
   terminal state and six zero State counters. Real split/modal-focus detail,
   broader terminal capability combinations and docking are still open;
   do not close the combined item from these bounded smoke tests.
+
+## Docking — bounded same-window reparenting
+
+First implemented slice: signed source `e06ffa7007997310bac2c5e5c14938fde92dc320`.
+It is an actual user-facing **same-browser-window** resource move, not a
+cross-process docking transport.
+
+- `web/src/workspace-views.js` changes only `document.containerId` under
+  the existing `createWorkspaceViews` owner. The document's exact
+  `source_id/scope_id`, File path or immutable Git Review ID and retained
+  original inventory/item, DOM identity, cached read snapshot and in-flight
+  tokens stay unchanged. No fetch, grant, new Document ID or new execution
+  path is created by the move.
+- A destination must be an existing, currently available navigator of the
+  matching kind (Files→Files or Diff→Git). An existing document of the same
+  exact resource at the destination is an explicit conflict; the controller
+  never silently merges or closes either view. Git documents may move to
+  another Git navigator inspecting a *different* worktree, but still refresh
+  through their original immutable Review and original checkout scope.
+- Container closure now follows the document's current owning container.
+  Moving before a pending read finishes retains that read when the original
+  container closes. Closing the destination cancels/scrubs its children and
+  rejects late replies. An unavailable or replaced source cannot be revived
+  by moving a display descriptor.
+- The shipping Solid File/Diff source bar offers a compact, accessible
+  destination selector **only when at least two compatible views exist**.
+  Changing the owner updates the matching Explorer selector but preserves
+  active document focus, unsent composer and CodeMirror instance. It adds
+  no duplicate global toolbar/header; 390 px and theme rules are retained.
+- Three shipping-controller Node regressions cover pending reparenting,
+  duplicate/mismatched/closed denial, and a Git Diff moved across dissimilar
+  checkout contexts. Actual Chrome 155 via DevTools Protocol exercised
+  two private Files containers at **390×844 Dark**, a real rooted File,
+  move, original container closure and selector disappearance: CodeMirror
+  instance, draft/caret, original read count and 390 px document width
+  were preserved; zero uncaught JS exceptions and six zero SQLite
+  Session/run/effect counters. Chrome used a fake endpoint and tools Off;
+  these are bounded browser acceptance, not native/cross-window proof.
+
+### Cross-window docking prerequisites — OPEN
+
+A second browser/native window has a **different presentation lifetime**;
+a string ID, URL, browser message or persisted layout may only request a view,
+never grant Store/File/Git/Session/PTY or model ownership. Do not use
+`window.open` + `postMessage` as a substitute for authority transfer.
+Do not send source contents, credentials, old Tool receipts, or PTY handles
+in a browser message.
+
+1. Define an owner-approved, single-use **Prepared → Accepted → Released**
+   handoff with source-window lifetime, destination-window identity,
+   bounded expiry, exact Store/source epoch, original resource and distinct
+   logical view identity. Receiver must authenticate to the same owner and
+   independently reauthorize the source/scope before exposing content. A
+   handoff token is a correlation key, not a root/tool/provider grant.
+2. Keep the original view visible/owned until a trusted receiver acceptance
+   is committed. An old origin that closes early cannot revoke another
+   participant's legitimate view or silently authorize an unconfirmed move;
+   ambiguity remains inspect-only or asks the human to reopen. No replay
+   of active effects or implicit Agent activation is ever allowed.
+3. Transfer bounded presentation metadata (Find/viewport/selection/tab
+   placement), **not** serialized plaintext snapshots or a second
+   cache/Provider/PTY owner. Across processes the receiver creates a fresh
+   local renderer only after read authorization; source removes its old
+   logical view only on an accepted handoff. Closing either window cancels
+   its own pending work, never an unrelated source.
+4. Measure and verify simultaneous moves, same-ID ABA, lost/delayed/duplicate
+   ACKs, wrong/missing/revoked owner, source-epoch replacement, stale
+   branch/Review/scope, origin/receiver crash, re-open and limits. Native
+   cross-terminal/PTY attach must have its **own** explicit original Runtime
+   handle and terminal restoration proof, not inferred from browser moves.
+
+Cross-window backend ticket/API, browser shell/popup controls, native
+cross-terminal docking, new serialized layout versions and multi-window
+visual acceptance remain unimplemented. Version **0.15.0**, SQLite **33**,
+JSONL **1**, native saved layout **v4** and all retained authority/failure
+boundaries remain unchanged.
 
 ## References
 

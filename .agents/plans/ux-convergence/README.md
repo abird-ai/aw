@@ -62,14 +62,31 @@ inventory. User data, provider/private traces and restored State are excluded.
   header repainted), F1 modal close/reopen and 120×30, exited 0 with equal
   terminal settings and six zero State counters. A third smoke exercised an
   actual child shell, shell-owned Ctrl+C and explicit quit-all, also exiting
-  0 with terminal restoration and zero State counters. This has **not** exercised
-  a child shell, model provider, Windows, browser screenshots or production
-  user data. A first attempt using Ctrl+C alone did **not** quit because
+  0 with terminal restoration and zero State counters. This has **not**
+  exercised a model provider, Windows or production user data. A first
+  attempt using Ctrl+C alone did **not** quit because
   Workspace reserves that chord for Agent cancel/draft clearing; it restored
   modes after catchable fixture termination. This is an expected behavior,
   not evidence of successful graceful exit.
-- Prior browser 390 px/Chrome findings remain accepted in
-  `../workspace-views/TODO.md`; they were **not re-run** in this inventory.
+- Real Chrome 155 shipping Solid UI captures used its DevTools Protocol on
+  an isolated fake-provider LocalWeb owner. The four explicit viewports were
+  1440×900 Light/Dark and 390×844 Light/Dark. Each `data-effective-theme`
+  matched the requested scheme; the shell and composer were present, document
+  and viewport widths were equal (no horizontal overflow), the composer was
+  visible and zero uncaught JavaScript exceptions were observed. These are
+  transient private screenshots, not shipped proof artifacts. The initial
+  390 px Agent header/resource labels/composer remain coherent. This is **not**
+  actual Files/Git/diff/modal/denial-browser parity or a WCAG contrast audit.
+- The earlier Chrome 155 Files/Git/browser owner acceptance in
+  `../workspace-views/TODO.md` remains separately scoped. Muted labels and
+  resource details still require a targeted accessibility/keyboard audit.
+- The subsequent bounded same-window docking substrate passed actual Chrome
+  155 at **390×844 Dark** with two Files views: the move selector fit the
+  viewport, the exact same CodeMirror editor and draft/caret survived moving,
+  no new workspace read was issued, closing the source kept the moved tab,
+  and the private State had zero run/effect counters. Cross-window handoff,
+  full File/Diff contrast testing and native second-terminal ownership are
+  not implied. See [Workspace views](../workspace-views/README.md).
 
 Keep visual/design work downstream of stable resource identity and current
 ownership. The next change should fix a *measured* user-facing gap with a narrow
