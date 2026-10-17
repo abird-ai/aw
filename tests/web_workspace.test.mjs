@@ -1,6 +1,7 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import {initialLayout,reduceLayout,validateLayout,groupRects,changeRows,sessionTarget,sessionMetrics,KINDS} from '../web/workspace-model.js';
 import { createWorkspaceViews, checkedWorkspaceSequence, WORKSPACE_VIEW_LIMITS } from '../web/src/workspace-views.js';
+import { createFileDocking, takeFileDockTicket } from '../web/src/file-docking.js';
 const open=(s,kind,resource)=>reduceLayout(s,{type:'open',target:{kind,title:kind,resource}});
 test('one conversation without network dependencies',()=>{const s=initialLayout();assert.equal(Object.keys(s.views).length,1);assert.equal(s.views.v1.kind,'conversation');});
 for(const kind of KINDS)test(`group accepts ${kind}`,()=>{const s=open(initialLayout(),kind,kind);validateLayout(s);assert(Object.values(s.views).some(v=>v.kind===kind));});
@@ -511,4 +512,139 @@ test('identity grammar matches backend while readable unsupported Unix colon lab
   ] }));
   assert.equal(await listing, true);
   assert.equal(f.state.getContainer(owner).listings[''].entries[1].kind, 'unsupported');
+});
+
+const dockTicket = 'a'.repeat(64);
+function dockFixture() {
+  const calls = [], notifications = [], owner = { source_id: 'source-dock', scope_id: 'scope-dock', owner_epoch: 'owner-epoch' };
+  const target = { source_id: owner.source_id, scope_id: owner.scope_id, path: 'src/hello.rs' };
+  let document = { id: 'workspace-document-37', kind: 'file', containerId: 'container-one', target, data: { path: target.path, text: 'PRIVATE_FILE_CONTENT' }, pending: false, unavailable: false, error: '' };
+  let registered = 0, statusCalls = 0, accepted = false, released = false;
+  const window = { window_id: 'b'.repeat(64), window_proof: 'c'.repeat(64), ...owner };
+  const receiver = { ...window, window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64) };
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('register')) return (++registered === 1 ? window : receiver);
+    if (path.endsWith('prepare')) return { ticket: dockTicket, state: 'prepared' };
+    if (path.endsWith('status')) return { state: ++statusCalls === 1 ? 'prepared' : 'accepted', document_id: document?.id };
+    if (path.endsWith('release')) { released = true; return { state: 'released', document_id: document?.id }; }
+    if (path.endsWith('cancel')) return { state: 'cancelled' };
+    if (path.endsWith('decline')) return { state: 'declined' };
+    if (path.endsWith('inspect')) return { kind: 'file', ...owner, path: target.path };
+    if (path.endsWith('accept')) { accepted = true; return { state: 'accepted' }; }
+    throw Error('unknown mock API');
+  };
+  const views = {
+    getDocument: id => document?.id === id ? document : null,
+    openContainer: () => 'destination',
+    openFile: (id, path) => {
+      assert.equal(id, 'destination'); assert.equal(path, target.path);
+      document = { id: 'receiver-file', containerId: 'destination', kind: 'file', target, data: null, pending: true, error: '', unavailable: false };
+      return document.id;
+    },
+    closeDocument: id => { if (document?.id === id) document = null; notifications.push('closed-file'); },
+    closeContainer: () => notifications.push('closed-container'),
+  };
+  const popup = { closed: false, close() { this.closed = true; }, opener: {}, location: { replace() {} } };
+  const make = overrides => createFileDocking({
+    api, views, currentOwner: () => owner, select: (...args) => notifications.push(['select', ...args]),
+    close: id => { notifications.push(['release-document', id]); if (document?.id === id) document = null; },
+    popup: () => popup, navigate: (p, ticket) => { assert.equal(p, popup); assert.equal(ticket, dockTicket); notifications.push('navigated'); },
+    sleep: async () => {}, onProgress: (id, active) => notifications.push(['progress', id, active]),
+    ...overrides,
+  });
+  return { api, calls, owner, target, window, receiver, views, popup, make, notifications,
+    get document() { return document; }, setDocument: value => { document = value; },
+    get accepted() { return accepted; }, get released() { return released; },
+  };
+}
+
+test('docking ticket is removed from fragment before disclosure and never treated as a grant', () => {
+  const changes = [], history = { replaceState: (...args) => changes.push(args) };
+  assert.equal(takeFileDockTicket({ hash: '#aw-dock=' + dockTicket, pathname: '/', search: '' }, history), dockTicket);
+  assert.deepEqual(changes, [[null, '', '/']]);
+  assert.equal(takeFileDockTicket({ hash: '#aw-dock=broken', pathname: '/app', search: '?v=1' }, history), null);
+  assert.deepEqual(changes.at(-1), [null, '', '/app?v=1']);
+  assert.equal(takeFileDockTicket({ hash: '#unrelated' }, history), null);
+  assert.equal(changes.length, 2);
+});
+
+test('owner-approved File handoff releases only after distinct receiver acceptance', async () => {
+  const f = dockFixture();
+  const result = await f.make().send('workspace-document-37');
+  assert.equal(result, true);
+  assert.equal(f.released, true);
+  assert.equal(f.document, null);
+  assert.deepEqual(f.notifications.slice(0, 2), [['progress', 'workspace-document-37', true], 'navigated']);
+  assert.deepEqual(f.notifications.slice(-2), [['release-document', 'workspace-document-37'], ['progress', 'workspace-document-37', false]]);
+  assert.deepEqual(f.calls.map(call => call.path), [
+    '/api/dock/register', '/api/dock/prepare', '/api/dock/status', '/api/dock/status', '/api/dock/release',
+  ]);
+  const prepared = f.calls.find(call => call.path.endsWith('prepare')).body;
+  assert.deepEqual(Object.keys(prepared).sort(), ['document_id', 'owner_epoch', 'path', 'scope_id', 'source_id', 'window_id', 'window_proof']);
+  assert.equal(prepared.path, 'src/hello.rs');
+  assert.ok(f.calls.every(call => !JSON.stringify(call).includes('PRIVATE_FILE_CONTENT')));
+});
+
+test('cancelled or blocked File popout keeps original view and cannot create authority', async () => {
+  const f = dockFixture();
+  await assert.rejects(f.make({ popup: () => null }).send('workspace-document-37'), /blocked/);
+  assert.equal(f.calls.length, 0);
+  const cancelled = f.make({ navigate: () => { f.popup.closed = true; } });
+  await assert.rejects(cancelled.send('workspace-document-37'), /not accepted/);
+  assert.equal(f.document.id, 'workspace-document-37');
+  assert.equal(f.calls.at(-1).path, '/api/dock/cancel');
+  assert.equal(f.released, false);
+});
+
+test('receiver rereads the original capability before acceptance without receiving plaintext in ticket', async () => {
+  const f = dockFixture();
+  // The receiver registered in its own window, independently of origin.
+  const file = f.make({
+    isRendered: () => Boolean(f.document?.data),
+    sleep: async () => { if (f.document?.pending) f.setDocument({ ...f.document, pending: false, data: { path: f.target.path, text: 'AUTHORIZED_RECEIVER_BYTES' } }); },
+  });
+  const result = await file.receive(dockTicket);
+  assert.deepEqual(result, { containerId: 'destination', documentId: 'receiver-file' });
+  assert.equal(f.accepted, true);
+  assert.equal(f.document.data.text, 'AUTHORIZED_RECEIVER_BYTES');
+  assert.deepEqual(f.calls.map(call => call.path), ['/api/dock/register', '/api/dock/inspect', '/api/dock/accept']);
+  assert.equal(f.notifications.filter(event => event === 'closed-file').length, 0);
+});
+
+test('denied receiver and uncertain acceptance cannot be converted into a successful transfer', async () => {
+  const denied = dockFixture();
+  const receiver = denied.make({ sleep: async () => denied.setDocument({ ...denied.document, pending: false, error: 'scope_denied' }) });
+  await assert.rejects(receiver.receive(dockTicket), /failed authorization/);
+  assert.ok(denied.notifications.includes('closed-file'));
+  assert.ok(denied.notifications.includes('closed-container'));
+  assert.equal(denied.calls.some(call => call.path.endsWith('accept')), false);
+  assert.equal(denied.calls.filter(call => call.path.endsWith('decline')).length, 1,
+    'receiver reports a known failed read to original owner');
+  const unknown = dockFixture();
+  const uncertain = unknown.make({
+    api: async (path, body) => path.endsWith('accept') ? Promise.reject(Error('response lost')) : unknown.api(path, body),
+    isRendered: () => Boolean(unknown.document?.data),
+    sleep: async () => unknown.setDocument({ ...unknown.document, pending: false, data: { text: 'fresh' } }),
+  });
+  await assert.rejects(uncertain.receive(dockTicket), /response lost/);
+  assert.equal(unknown.document?.id, 'receiver-file', 'unknown commit retains exact already-authorized view for inspection');
+  assert.equal(unknown.notifications.includes('closed-container'), false);
+  assert.equal(unknown.calls.some(call => call.path.endsWith('decline')), false,
+    'unknown acceptance cannot be falsely downgraded to a confirmed rejection');
+  const revoked = dockFixture();
+  const knownDenied = revoked.make({
+    api: async (path, body) => path.endsWith('accept')
+      ? Promise.reject(Object.assign(Error('grant revoked'), { status: 403 }))
+      : revoked.api(path, body),
+    isRendered: () => Boolean(revoked.document?.data),
+    sleep: async () => revoked.setDocument({ ...revoked.document, pending: false, data: { text: 'old' } }),
+  });
+  await assert.rejects(knownDenied.receive(dockTicket), /grant revoked/);
+  assert.equal(revoked.document, null, 'confirmed denial must scrub the old authorized snapshot');
+  assert.equal(revoked.notifications.includes('closed-container'), true);
+  assert.equal(revoked.calls.some(call => call.path.endsWith('decline')), true);
+  const wrongOwner = dockFixture();
+  await assert.rejects(wrongOwner.make({ currentOwner: () => ({ ...wrongOwner.owner, owner_epoch: 'replaced' }) }).receive(dockTicket), /unavailable/);
+  assert.equal(wrongOwner.notifications.length, 0);
 });

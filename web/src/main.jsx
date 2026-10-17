@@ -6,6 +6,7 @@ import { Icon } from "./icons.jsx";
 import { AgentViewPanel } from "./agent-view-panel.jsx";
 import { createAgentViews } from "./agent-views.js";
 import { createWorkspaceViews } from "./workspace-views.js";
+import { createFileDocking, takeFileDockTicket } from "./file-docking.js";
 import { applyThemePreference, finishBoot } from "./theme.js";
 
 const CodeFile = lazy(() =>
@@ -1761,6 +1762,7 @@ function App() {
   const [publishChoice, setPublishChoice] = createSignal(false);
   const [nav, setNav] = createSignal("sessions");
   const [mobileNav, setMobileNav] = createSignal(false);
+  const [dockingFile, setDockingFile] = createSignal(null);
   const [settings, setSettings] = createSignal(false);
   const [presentationUi, setPresentationUi] = createSignal(normalizedUi({}));
   const [workspaceEnabled, setWorkspaceEnabled] = createSignal(false);
@@ -1770,6 +1772,9 @@ function App() {
     Math.min(520, Math.max(220, Number(localStorage.getItem("aw.sidebar.width")) || 286)),
   );
   let resizingSidebar = false;
+  // The correlation fragment is removed from history before any API request.
+  // It is held only in this renderer's memory, never browser storage.
+  let pendingDockTicket = takeFileDockTicket(window.location, window.history);
   let source;
   let observationLifetime = {};
   let workspaceDiscoveryLifetime = {};
@@ -1829,6 +1834,38 @@ function App() {
     workspaceViews.clear();
     setWorkspaceSource(null);
     setWorkspaceEnabled(false);
+  }
+  const fileDocking = createFileDocking({
+    api, views: workspaceViews,
+    currentOwner: () => {
+      const scope = workspaceSource(), owner = snapshot();
+      return scope && owner ? {
+        source_id: scope.source_id, scope_id: scope.view_root.id,
+        owner_epoch: owner.instance,
+      } : null;
+    },
+    select: (containerId, documentId) => {
+      setSelectedContainers(current => ({ ...current, files: containerId }));
+      setNav("files");
+      setActiveTab(documentId);
+      setMobileNav(false);
+    },
+    close: documentId => closeTab(documentId),
+    popup: () => window.open("about:blank", "_blank"),
+    onProgress: (documentId, active) => setDockingFile(active ? documentId : null),
+    isRendered: documentId => activeTab() === documentId
+      && Boolean(document.querySelector('.surface.code-surface:not([hidden]) .cm-editor')),
+  });
+  async function receivePendingFileDock() {
+    if (!pendingDockTicket || !paired()) return;
+    const ticket = pendingDockTicket;
+    pendingDockTicket = null;
+    if (!workspaceEnabled() || !workspaceSource()) {
+      setError("The original Files owner is unavailable here. No view was transferred.");
+      return;
+    }
+    try { await fileDocking.receive(ticket); }
+    catch (error) { setError(error.message); }
   }
   const agentViews = createAgentViews({
     read: async (target, { signal }) => {
@@ -2431,9 +2468,10 @@ function App() {
     });
     void loadPresentation();
     finishBoot();
-    void refresh();
+    void refresh().then(() => void receivePendingFileDock());
   });
   onCleanup(() => {
+    fileDocking.dispose();
     observationLifetime = {};
     const previous = source;
     source = null;
@@ -2452,6 +2490,7 @@ function App() {
       await api("/api/pair", { code: pairCode().trim() });
       setPairCode("");
       await refresh();
+      await receivePendingFileDock();
     } catch (e) {
       setError(e.message);
     }
@@ -3128,6 +3167,15 @@ function App() {
                           {(container, index) => <option value={container.id}>{index() + 1}. {container.label}</option>}
                         </For>
                       </select>
+                    </Show>
+                    <Show when={document()?.kind === "file" && data() && !document()?.pending && !document()?.unavailable && workspaceEnabled()}>
+                      <button class="mini-icon" type="button"
+                        aria-label="Move File to a new window"
+                        title="Move this read-only File into another authenticated browser window"
+                        disabled={Boolean(dockingFile())}
+                        onClick={() => void fileDocking.send(id).catch(error => setError(error.message))}>
+                        <Icon name="popout" size={13} />
+                      </button>
                     </Show>
                     <button class="mini-icon" type="button" aria-label="Refresh document" title="Refresh this exact document" onClick={() => void workspaceViews.refreshDocument(id)}><Icon name="refresh" size={13} /></button>
                   </div>

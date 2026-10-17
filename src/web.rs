@@ -42,6 +42,8 @@ use crate::{
 };
 mod agent_view;
 mod context_flow;
+#[cfg(feature = "surfaces")]
+mod dock;
 #[cfg(target_os = "linux")]
 mod native;
 #[cfg(all(feature = "team", target_os = "linux"))]
@@ -145,6 +147,8 @@ struct AppInner {
     context_recipients: Mutex<BTreeMap<String, String>>,
     local_settings: Option<Mutex<LocalSettingsState>>,
     chatgpt_setup: Mutex<Option<ChatGptSetupState>>,
+    #[cfg(feature = "surfaces")]
+    dock: Mutex<dock::Registry>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ResourceSummary {
@@ -1048,6 +1052,8 @@ fn application_scoped(
             context_recipients: Mutex::new(BTreeMap::new()),
             local_settings: local_settings.map(|value| Mutex::new(value.into())),
             chatgpt_setup: Mutex::new(None),
+            #[cfg(feature = "surfaces")]
+            dock: Mutex::new(dock::Registry::default()),
         }),
         authority,
     );
@@ -1100,9 +1106,20 @@ fn application_scoped(
         .route("/api/prompts",post(prompt))
         .route("/api/cancel",post(cancel))
         .route("/api/reset",post(reset))
-        .route("/api/logout",post(logout))
+        .route("/api/logout",post(logout));
+    #[cfg(feature = "surfaces")]
+    let router = router
+        .route("/api/dock/register", post(dock::register))
+        .route("/api/dock/prepare", post(dock::prepare))
+        .route("/api/dock/inspect", post(dock::inspect))
+        .route("/api/dock/accept", post(dock::accept))
+        .route("/api/dock/decline", post(dock::decline))
+        .route("/api/dock/status", post(dock::status))
+        .route("/api/dock/release", post(dock::release))
+        .route("/api/dock/cancel", post(dock::cancel));
+    let router = router
         .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
-        .layer(middleware::from_fn_with_state(state.clone(),boundary))
+        .layer(middleware::from_fn_with_state(state.clone(), boundary))
         .with_state(state.clone());
     Ok((router, state))
 }
@@ -3184,6 +3201,11 @@ mod tests {
     mod agent_views {
         use super::*;
         include!("web/agent_view_tests.rs");
+    }
+    #[cfg(feature = "surfaces")]
+    mod docking {
+        use super::*;
+        include!("web/dock/tests.rs");
     }
     #[cfg(feature = "oidc")]
     mod publication_http_measure {
