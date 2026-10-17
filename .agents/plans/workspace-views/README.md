@@ -465,7 +465,42 @@ cross-process docking transport.
   Session/run/effect counters. Chrome used a fake endpoint and tools Off;
   these are bounded browser acceptance, not native/cross-window proof.
 
-### Cross-window docking prerequisites — OPEN
+### Cross-window docking contract — File baseline delivered, other surfaces OPEN
+
+Signed File-only browser implementation: `7de865852df747d0c3280c96180ef5dacbc6c8f2`.
+The original authenticated Rust web owner now retains only a bounded,
+**ephemeral presentation correlation** in `src/web/dock.rs` (24 windows,
+24 tickets, 180-second window expiry and 90-second File ticket). A sender
+creates a fresh cryptographic window proof and File request; a second browser
+window separately registers, inspects the ticket and **independently** reads
+the exact retained File via the existing scoped `SurfaceHost` before
+acknowledging its own renderer. The origin closes its File tab **only after**
+the owner verifies acceptance and authorizes Release. The ticket and browser
+fragment contain no document bytes, provider state, tool receipt, root grant,
+or execution authority; the receiver erases its fragment before disclosure.
+
+The owner checks same-origin/browser auth and the exact Session instance,
+source, scope, and original physical root on preparation, inspection,
+acceptance and final release. It checks receiver identity, competing
+acceptances, cancellation, expiry, a known receiver decline and late
+stale/duplicate requests; acceptance is not replayed. The root/contents
+are revalidated before an origin tab may be released. An accepted receiver
+window whose **registration** expired is not considered live, but a
+time-bounded registration is *not* a guarantee its OS/browser process
+remains open at every instant; crash ambiguity must stay explicit. An
+unknown acceptance response retains an authorized read-only receiver
+for inspection without claiming success; confirmed denial scrubs it.
+The native Agent, unsent draft, PTY, Git state, SQLite/JSONL and all effects
+remain unaffected.
+
+Evidence: seven authenticated owner-route tests; 155 browser-model
+regressions; actual two-page Chrome 155 / private LocalWeb where receiver
+reloads the File **after the original page closes**, 390×844 Dark geometry
+holds, and all six SQLite effect counters remain zero. The source-HEAD
+product gates and byte-identical eight-asset Vite rebuild are recorded in
+`TODO.md`. This proves a **bounded File presentation move**, not a
+native/Git Review docking implementation, remote-device authentication,
+or lossless transfer of CodeMirror Find/viewport/selection across windows.
 
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
@@ -497,11 +532,12 @@ in a browser message.
    cross-terminal/PTY attach must have its **own** explicit original Runtime
    handle and terminal restoration proof, not inferred from browser moves.
 
-Cross-window backend ticket/API, browser shell/popup controls, native
-cross-terminal docking, new serialized layout versions and multi-window
-visual acceptance remain unimplemented. Version **0.15.0**, SQLite **33**,
-JSONL **1**, native saved layout **v4** and all retained authority/failure
-boundaries remain unchanged.
+The **read-only File** ticket/API and browser popup are implemented;
+Git Review and native cross-terminal docking, persistent/window-crossing
+Find/scroll/selection metadata, broader two-browser/paired authorization
+and crash/ABA/focus acceptance remain open. No new serialized layout was
+introduced: version **0.15.0**, SQLite **33**, JSONL **1**, native saved
+layout **v4**, and all authority/failure boundaries remain unchanged.
 
 ## References
 

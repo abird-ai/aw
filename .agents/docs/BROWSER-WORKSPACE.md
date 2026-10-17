@@ -77,6 +77,38 @@ Files/Git reads, a 4 MiB reply limit and an 8 MiB Files/Git snapshot cache bound
 work and retention. Hidden views retain editor state; closed or denied editors explicitly
 scrub it before destruction.
 
+## File-only cross-window handoff
+
+The active read-only **File** toolbar now has a **Move File to a new window**
+action when the current File is loaded and its original scope is available.
+It opens a separate browser page under the **same** human-owned AW HTTP
+origin. The original File tab and its unsent Agent draft remain unchanged
+until that receiver independently authenticates, reloads the retained File
+through the scoped workspace read API, renders it and acknowledges the
+short-lived handoff. Only then can the original owner approve release
+of the sender's File tab. The receiver may continue read-only browsing and
+refreshing after the original browser page closes.
+
+The owner-side handoff is memory-only, with a 90-second ticket, a separately
+registered receiving window and 24-window/24-ticket ceilings. The URL
+fragment is removed immediately when the receiver starts. It carries
+**only a correlation ticket**—never File contents, a root capability,
+provider credentials, PTY leases or saved Sessions. The owner revalidates
+actual paired/local browser authorization, exact source/scope/instance,
+original physical File access and a single receiver before allowing
+release. Denial/timeout/explicit receiver decline leaves the original
+view intact. A lost acknowledgment is **unknown**, not confirmation;
+an existing authorized read-only receiver view remains inspectable
+without replaying effects or silently transferring additional authority.
+
+This milestone supports **File presentation only**: Git Reviews,
+native terminal/process ownership, cross-window Find/scroll/selection
+preservation, distributed authentication and native docking are not
+implemented by this browser action. It makes no changes to SQLite,
+JSONL, workspace layout, the original Agent, or model/tool admission.
+See [Workspace views](../plans/workspace-views/README.md) for the
+remaining gates and failure semantics.
+
 ## Current Phase 62/63 Solid Agent parity and rich rendering
 
 The active root remains the compiled SolidJS application. Phase 62 carries the server-authored loaded `[Context]` / `[Skills]` resource projection and typed status/session information into the Solid Agent surface without letting browser state invent provider/tool/filesystem authority. Browser-only projection metadata is never copied into prompt submission.
