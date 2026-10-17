@@ -109,11 +109,26 @@ impl Ui {
         if let Some(cancel) = self.find_cancel.remove(&tab) {
             cancel.store(true, Ordering::Release);
         }
-        let generation = {
-            let current = self.find_generation.entry(tab).or_insert(0);
-            *current = current.wrapping_add(1).max(1);
-            *current
+        let active = self
+            .layout
+            .active(self.layout.focused)
+            .is_some_and(|active| active.id == tab);
+        let Some(generation) = self.find_request_generation.checked_add(1) else {
+            self.find_generation.remove(&tab);
+            self.find.insert(
+                tab,
+                FindState {
+                    query,
+                    ..FindState::default()
+                },
+            );
+            if active {
+                self.notice = "Find request IDs exhausted; restart the workspace.".into();
+            }
+            return true;
         };
+        self.find_request_generation = generation;
+        self.find_generation.insert(tab, generation);
         let cancel = Arc::new(AtomicBool::new(false));
         self.find_cancel.insert(tab, cancel.clone());
         self.find.insert(
@@ -123,11 +138,13 @@ impl Ui {
                 matches: Vec::new(),
                 selected: 0,
                 choosing: false,
+                committed: choosing,
             },
         );
         if query.is_empty() {
             self.find_cancel.remove(&tab);
-            if choosing {
+            self.find_generation.remove(&tab);
+            if choosing && active {
                 self.notice = Self::find_notice(0);
             }
             return true;
@@ -252,9 +269,12 @@ impl Ui {
                 });
             },
         ) {
-            self.notice = error.to_string();
+            if active {
+                self.notice = error.to_string();
+            }
             self.find_cancel.remove(&tab);
-        } else if choosing {
+            self.find_generation.remove(&tab);
+        } else if choosing && active {
             self.notice = "Searching…".into();
         }
         true
@@ -296,6 +316,7 @@ impl Ui {
                 matches: matches.clone(),
                 selected,
                 choosing: choosing && !matches.is_empty(),
+                committed: choosing,
             },
         );
         if let Some(row) = matches.get(selected) {
@@ -396,6 +417,7 @@ impl Ui {
             state.selected - 1
         };
         state.choosing = false;
+        state.committed = false;
         let row = state.matches.get(state.selected).copied();
         let _ = state;
         if let Some(row) = row {
@@ -423,6 +445,7 @@ impl Ui {
         };
         state.selected = index;
         state.choosing = false;
+        state.committed = false;
         self.jump_to_row(tab, row);
         true
     }

@@ -121,6 +121,8 @@ struct FindState {
     matches: Vec<usize>,
     selected: usize,
     choosing: bool,
+    // Enter's intent survives pending/missing results until a jump consumes it.
+    committed: bool,
 }
 
 #[derive(Default)]
@@ -674,6 +676,7 @@ pub struct Ui {
     search: Option<SearchState>,
     find: BTreeMap<Id, FindState>,
     find_generation: BTreeMap<Id, u64>,
+    find_request_generation: u64,
     find_cancel: BTreeMap<Id, Arc<AtomicBool>>,
     last_tab_click: Option<(Id, Id, Instant)>,
     exit: Option<Exit>,
@@ -796,6 +799,7 @@ impl Ui {
             search: None,
             find: BTreeMap::new(),
             find_generation: BTreeMap::new(),
+            find_request_generation: 0,
             find_cancel: BTreeMap::new(),
             last_tab_click: None,
             exit: None,
@@ -5409,6 +5413,7 @@ mod render_tests {
                 matches: vec![1],
                 selected: 0,
                 choosing: false,
+                committed: false,
             },
         );
         ui.find_generation.insert(tab, 7);

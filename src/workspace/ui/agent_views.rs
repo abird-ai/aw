@@ -276,11 +276,11 @@ impl Ui {
         if let Some(cancel) = self.find_cancel.remove(&tab) {
             cancel.store(true, Ordering::Release);
         }
-        let generation = self.find_generation.entry(tab).or_default();
-        *generation = generation.wrapping_add(1);
+        self.find_generation.remove(&tab);
         if let Some(find) = self.find.get_mut(&tab) {
             find.matches.clear();
             find.selected = 0;
+            find.choosing = false;
         }
         self.saved_selections.remove(&tab);
         if self
@@ -590,8 +590,9 @@ impl Ui {
                         .filter(|find| !find.query.is_empty())
                     {
                         let query = find.query.clone();
+                        let committed = find.committed;
                         let target = self.layout.tabs[&reply.tab].target.clone();
-                        self.schedule_find(reply.tab, target, query, false);
+                        self.schedule_find(reply.tab, target, query, committed);
                     }
                 }
             }
@@ -776,6 +777,154 @@ mod tests {
     }
 
     #[test]
+    fn readonly_agent_view_refresh_preserves_committed_find_until_consumed() {
+        fn finish_find(ui: &mut Ui, tab: Id) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ui.find_cancel.contains_key(&tab) && Instant::now() < deadline {
+                if let Ok(reply) = ui.background_rx.try_recv() {
+                    ui.apply_background_result(reply);
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            assert!(!ui.find_cancel.contains_key(&tab));
+        }
+
+        let (mut ui, _, _, _, a, _) = fixture();
+        let target = resource(&a).unwrap();
+        ui.snapshot.session = Some(target.session_id);
+        ui.snapshot.branch_id = Some(target.branch_id);
+        ui.snapshot.live = "ALPHA initial".into();
+        ui.open(a);
+        let tab = ui.layout.active(ui.layout.focused).unwrap().id;
+        let view_group = ui.layout.focused;
+        ui.apply(Action::SplitGroup {
+            pane: view_group,
+            side: Side::Right,
+        });
+        ui.open(Target::Help);
+        let other_group = ui.layout.focused;
+        ui.apply(Action::Focus(view_group));
+        draw(&mut ui);
+        ui.schedule_agent_views();
+        replies(&mut ui, 1);
+        draw(&mut ui);
+
+        // A genuine changed, authorized live frame can already be waiting when
+        // Enter commits Find. Deliver that frame before either Find completion.
+        ui.snapshot.live = "ALPHA changed".into();
+        ui.snapshot.generation += 1;
+        ui.schedule_agent_views();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frame = loop {
+            if let Ok(UiBackgroundResult::AgentView(reply)) = ui.background_rx.try_recv() {
+                break reply;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        ui.update_find(tab, "ALPHA".into(), true);
+        assert_eq!(ui.notice, "Searching…");
+        let cancelled = ui.find_cancel[&tab].clone();
+        let stale_generation = ui.find_generation[&tab];
+        ui.apply_agent_view_reply(frame);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_ne!(ui.find_generation[&tab], stale_generation);
+        finish_find(&mut ui, tab);
+        assert_eq!(ui.find[&tab].matches.len(), 1);
+        assert_eq!(ui.notice, "1 match · press a flash label or n/N");
+        assert!(ui.find[&tab].choosing);
+
+        // A committed miss retains its intent too: later live content may add
+        // a match, even though there was no active flash selection beforehand.
+        ui.update_find(tab, "GAMMA".into(), true);
+        finish_find(&mut ui, tab);
+        assert_eq!(ui.notice, "No matches");
+        assert!(!ui.find[&tab].choosing);
+        draw(&mut ui);
+        ui.apply(Action::Focus(other_group));
+        ui.notice = "Other pane retains its status".into();
+        ui.snapshot.live = "GAMMA newly arrived".into();
+        ui.snapshot.generation += 1;
+        ui.schedule_agent_views();
+        replies(&mut ui, 1);
+        assert_eq!(ui.notice, "Other pane retains its status");
+        finish_find(&mut ui, tab);
+        assert_eq!(ui.find[&tab].matches.len(), 1);
+        assert_eq!(ui.layout.focused, other_group);
+        assert_eq!(ui.notice, "Other pane retains its status");
+        assert!(ui.find[&tab].choosing);
+        ui.apply(Action::Focus(view_group));
+
+        // Once n/N or a flash label consumes that mode, another live refresh
+        // keeps the query but must not capture the user's ordinary keys again.
+        assert!(ui.cycle_find(true));
+        draw(&mut ui);
+        ui.snapshot.live = "GAMMA another refresh".into();
+        ui.snapshot.generation += 1;
+        ui.schedule_agent_views();
+        replies(&mut ui, 1);
+        finish_find(&mut ui, tab);
+        assert_eq!(ui.find[&tab].matches.len(), 1);
+        assert!(!ui.find[&tab].choosing);
+    }
+
+    #[test]
+    fn readonly_agent_view_restored_tab_rejects_find_from_previous_lifetime() {
+        let (mut ui, _, _, _, a, b) = fixture();
+        ui.open(a);
+        let tab = ui.layout.active(ui.layout.focused).unwrap().id;
+        let saved = ui.layout.clone();
+        draw(&mut ui);
+        ui.schedule_agent_views();
+        replies(&mut ui, 1);
+        draw(&mut ui);
+        ui.update_find(tab, "ALPHA".into(), true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let old = loop {
+            if let Ok(reply @ UiBackgroundResult::Find { .. }) = ui.background_rx.try_recv() {
+                break reply;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(&old, UiBackgroundResult::Find { matches, .. } if !matches.is_empty()));
+
+        ui.apply(Action::CloseTab {
+            group: ui.layout.group_for(tab).unwrap(),
+            tab,
+        });
+        ui.layout = saved;
+        ui.layout.tabs.get_mut(&tab).unwrap().target = b;
+        ui.reconcile_layout_state();
+        draw(&mut ui);
+        ui.schedule_agent_views();
+        replies(&mut ui, 1);
+        draw(&mut ui);
+        ui.update_find(tab, "ALPHA".into(), true);
+        ui.apply_background_result(old);
+        assert!(
+            ui.find[&tab].matches.is_empty(),
+            "old resource's match rows stay inert"
+        );
+        assert!(
+            ui.find_cancel.contains_key(&tab),
+            "old lifetime cannot settle the replacement search"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ui.find_cancel.contains_key(&tab) && Instant::now() < deadline {
+            if let Ok(reply) = ui.background_rx.try_recv() {
+                ui.apply_background_result(reply);
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(!ui.find_cancel.contains_key(&tab));
+        assert!(ui.find[&tab].matches.is_empty());
+        assert_eq!(ui.notice, "No matches");
+    }
+
+    #[test]
     fn readonly_agent_views_two_real_targets_keep_owner_draft_and_independent_state() {
         let (mut ui, store, owner, _, a, b) = fixture();
         let draft = (ui.draft.text().to_owned(), ui.draft.cursor());
@@ -866,6 +1015,7 @@ mod tests {
                 matches: vec![1],
                 selected: 0,
                 choosing: false,
+                committed: false,
             },
         );
         ui.saved_selections.insert(
@@ -1072,6 +1222,7 @@ mod tests {
                 matches: vec![1],
                 selected: 0,
                 choosing: false,
+                committed: false,
             },
         );
         let cancel = Arc::new(AtomicBool::new(false));

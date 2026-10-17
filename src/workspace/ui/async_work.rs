@@ -626,6 +626,7 @@ impl Ui {
                     return;
                 }
                 self.find_cancel.remove(&tab);
+                self.find_generation.remove(&tab);
                 if choosing {
                     let active = self.layout.active(self.layout.focused).map(|tab| tab.id);
                     if active == Some(tab) {
@@ -648,6 +649,7 @@ impl Ui {
                         matches: matches.clone(),
                         selected,
                         choosing: choosing && !matches.is_empty(),
+                        committed: choosing,
                     },
                 );
                 if let Some(row) = matches.get(selected).copied() {
