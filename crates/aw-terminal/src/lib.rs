@@ -397,3 +397,31 @@ pub(crate) fn changed(shared: &Shared, f: impl FnOnce(&mut State)) {
     }
     (shared.notify)();
 }
+
+#[cfg(test)]
+mod handoff_checkpoint_tests {
+    #[test]
+    fn formatted_screen_replays_visible_cells_but_not_alternate_screen_ownership() {
+        let mut origin = vt100::Parser::new(8, 40, 100);
+        origin.process(b"\x1b[1;31mcolored text\x1b[0m\x1b[?2004h");
+        let formatted = origin.screen().state_formatted();
+        let mut receiver = vt100::Parser::new(8, 40, 100);
+        receiver.process(&formatted);
+        assert_eq!(receiver.screen().contents(), origin.screen().contents());
+        assert_eq!(
+            receiver.screen().bracketed_paste(),
+            origin.screen().bracketed_paste()
+        );
+
+        // state_formatted() is a *visible display* reconstruction, not a
+        // guaranteed parser checkpoint. The inactive screen, scrollback and
+        // any partially received escape sequence need a separate transfer
+        // design before migrating an arbitrary running application.
+        origin.process(b"\x1b[?1049h\x1b[1;32malternate app\x1b[0m");
+        assert!(origin.screen().alternate_screen());
+        let mut fresh = vt100::Parser::new(8, 40, 100);
+        fresh.process(&origin.screen().state_formatted());
+        assert_eq!(fresh.screen().contents(), origin.screen().contents());
+        assert!(!fresh.screen().alternate_screen());
+    }
+}

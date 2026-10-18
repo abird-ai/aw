@@ -15,5 +15,8 @@ local-ipc = ["dep:tokio"]
 tokio = { version = "=1.48.0", features = ["net"], optional = true }
 libc = "=0.2.177"
 
+[dev-dependencies]
+portable-pty = "=0.9.0"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

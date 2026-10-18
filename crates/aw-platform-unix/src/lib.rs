@@ -13,6 +13,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(target_os = "linux")]
+pub mod fd_transfer;
 pub mod scoped_fs;
 
 pub const FAMILY: &str = "unix";

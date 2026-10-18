@@ -504,6 +504,7 @@ name = "aw-platform-unix"
 version = "0.15.0"
 dependencies = [
  "libc",
+ "portable-pty",
  "tokio",
 ]
 
