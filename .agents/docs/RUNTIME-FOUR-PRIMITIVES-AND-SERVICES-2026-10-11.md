@@ -4,7 +4,7 @@
 
 **Grounded implementation baseline:** aw `crates/aw-agent-kernel`, `crates/aw-agent-core`, `crates/aw-tools`, `crates/aw-mcp`, `crates/aw-extensions`, `crates/aw-terminal`, `crates/aw-ui-extension`, `aw-store`, `aw-store-jsonl` and their feature cuts at Git `6b3a426` (the handoff HEAD; inspect live Git before work). Source `0.15.0`; SQLite schema `v33`; E1–E5 already separately proven in their defined scopes; E6 parked. No tool defaults change, remote/browser privilege broadening, new release, push, tag or existing-source edit is authorized merely by this plan.
 
-**Reference inputs:** Agentc P6 `.agents/AGENTS.md`, `P6-HANDOFF.md`, `P6-RUNTIME.md` (R-D1…R-D31, `2.1), `P6-PRIMITIVES.md`, `P6-SURFACE.md`, `P6-API.md`, `P6-EXTENDING.md`, P6-ACTORS/SIGNALS/HOOKS/TRUST/SUBAGENTS/DECIDERS/INTEGRATION/SETTINGS/STATUS/VOICE; actual agentc headers, C actor and job loop, event and extension code were inspected separately. Agentc is a **design reference**: no external executable conformance, binary invocation, source port, imported C ABI, or automatic future synchronization.
+**Reference inputs:** Agentc P6 `AGENTS.md`, `P6-HANDOFF.md`, `P6-RUNTIME.md` (R-D1…R-D31, `2.1), `P6-PRIMITIVES.md`, `P6-SURFACE.md`, `P6-API.md`, `P6-EXTENDING.md`, P6-ACTORS/SIGNALS/HOOKS/TRUST/SUBAGENTS/DECIDERS/INTEGRATION/SETTINGS/STATUS/VOICE; actual agentc headers, C actor and job loop, event and extension code were inspected separately. Agentc is a **design reference**: no external executable conformance, binary invocation, source port, imported C ABI, or automatic future synchronization.
 
 ---
 

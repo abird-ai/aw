@@ -2,7 +2,7 @@
 
 1. Read [TODO.md](TODO.md) and the selected plan's checklist.
 2. Confirm the live Git checkpoint and ownership with the coordinator. Read
-   [working instructions](../AGENTS.md), relevant live docs and affected source.
+   [working instructions](../../AGENTS.md), relevant live docs and affected source.
 3. Keep parallel scratch work in `.agents/runs/<plan>-<session-agent>/TODO.md`.
    Each agent writes its own checklist; the coordinator reconciles the plan.
 4. Execute relevant tests. Record concise results and known implementation

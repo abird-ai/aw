@@ -35,7 +35,7 @@ Navigation: [Start and ownership](#1-start-here-establish-current-context-and-ow
 ## 1. Start here: establish current context and ownership
 
 1. Read [the plan index](../plans/TODO.md), the selected plan's `TODO.md`,
-   [TODO-SPEC.md](../plans/TODO-SPEC.md), and [working instructions](../AGENTS.md).
+   [TODO-SPEC.md](../plans/TODO-SPEC.md), and [working instructions](../../AGENTS.md).
    Then read this handoff and that plan's optional `README.md`.
 2. Confirm the actual branch, HEAD and owned worktree state. The paths in examples
    assume `/home/pvl/spaces/abird/src/aw`; adapt only the checkout location.
@@ -1047,7 +1047,7 @@ These are reconciliation points for this handoff, not fresh code-review findings
 | First post58 pass uses owner-wide session.hidden/restored audit state. | Later command/fresh-review hardening uses stable-viewer local per-user archive and one atomic bounded batch; legacy owner visibility is compatibility read state only, not current deletion/security authority. |
 | Phase67 original schedule claims have no post-crash recovery/cadence refinement. | Post68 uses durable process incarnation fencing, exact existing-run linkage, reserved request IDs and at most one catch-up; pause/resume does not create burst backfill. |
 | Phase68 installer validates by executing downloaded candidate. | Post68 installers verify release VERSION/exact checksum sidecar without pre-install execution. Publisher-side native audit intentionally executes under scrubbed environment. Neither supplies identity signing. |
-| Retained GIT-WORKFLOW archive-era snippets broadly show commit/tag/bundle steps. | Current [working instructions](../AGENTS.md) require exact owned-path review, signed expected-parent commit and explicit separate authority for tag/push/publish/destruction; archival examples grant no permission. |
+| Retained GIT-WORKFLOW archive-era snippets broadly show commit/tag/bundle steps. | Current [working instructions](../../AGENTS.md) require exact owned-path review, signed expected-parent commit and explicit separate authority for tag/push/publish/destruction; archival examples grant no permission. |
 | Historical browser docs show four-group workbench/site/terminal/context modules as though they were the main frontend. | Active compiled Solid root and its newly implemented exact views are the product surface; retained modules and backend APIs do not prove all advanced UI is migrated. Browser Git mutation, shared docking and full PTY/site parity remain distinct unclaimed slices. |
 | Old deferrals say schedules/autonomy or any richer browser behavior is wholly absent. | Phase67/post68 govern interval task occurrences and later Solid/read-only/container slices implement bounded behavior. No automatic broad event/cron/webhook scope, child-to-child disclosure, arbitrary topology/placement, automatic merge/import, monetary budget or richer account-reauth promise follows. Keep genuinely requested remaining work in current plans instead of transcribing old deferred lists as authoritative TODOs. |
 
@@ -1525,7 +1525,7 @@ Coverage at preparation: **193 documents/instruction files**, including this han
 
 | Document | Context and decision content | Pending/status interpretation |
 | --- | --- | --- |
-| [AGENTS.md](../AGENTS.md) | Binding working instructions, reserved subtree ownership, exact authority/version/cfg boundaries and signed expected-parent Git safety. | Read first; no implicit publication/live effect/restoration authority, no reserved subtree inspection. |
+| [AGENTS.md](../../AGENTS.md) | Binding working instructions, reserved subtree ownership, exact authority/version/cfg boundaries and signed expected-parent Git safety. | Read first; no implicit publication/live effect/restoration authority, no reserved subtree inspection. |
 | [plans/DOCUMENT-INDEX.md](../plans/DOCUMENT-INDEX.md) | Document entry point to canonical index and start guide. | Complete retained-corpus coverage is linked from the comprehensive handoff; no removed archive required. |
 | [plans/README.md](../plans/README.md) | Planning entry points: canonical TODO index/start guide and live .agents/docs. | Current pointer; detailed original history mapped in this handoff and retained files. |
 | [plans/ROADMAP.md](../plans/ROADMAP.md) | Roadmap entry point to canonical TODO index/start guide. | Current task state is in plan checklists, not a duplicate roadmap ledger. |
@@ -1740,7 +1740,7 @@ Coverage at preparation: **193 documents/instruction files**, including this han
 Continue work in /home/pvl/spaces/abird/src/aw.
 
 First read .agents/plans/TODO.md, .agents/plans/workspace-views/TODO.md,
-.agents/plans/TODO-SPEC.md and .agents/AGENTS.md. Then read
+.agents/plans/TODO-SPEC.md and AGENTS.md. Then read
 .agents/docs/HANDOFF.md in full and the affected live specifications/source.
 Confirm current HEAD and owned worktree state; the handoff's starting source
 checkpoint is 04bb9e000ce0d7406972bf564bb9a0c744fe9698, not a demand to reset.

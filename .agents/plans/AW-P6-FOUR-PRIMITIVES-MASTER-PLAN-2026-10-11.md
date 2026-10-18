@@ -475,7 +475,7 @@ These are mandatory **future executable test classes**; none are claimed execute
 
 **Reference read order for future implementer** (agentc is reference only):
 1. aw `.agents/plans/START_HERE.md`, `CURRENT-AW-DECISIONS-AND-PENDING-2026-10-11.md`, current comprehensive Oct11 handoff *in full* where required, these three new docs, then live affected sources.
-2. Agentc @dotlink-l5 `.agents/AGENTS.md`; `plans/P6-HANDOFF.md`; `plans/P6-RUNTIME.md` with R-D1…31/`2.1; `P6-PRIMITIVES.md`, `P6-SURFACE.md`, `P6-API.md`, `P6-EXTENDING.md`, then `P6-ACTORS/SIGNALS/HOOKS/TRUST/SUBAGENTS/DECIDERS/INTEGRATION/SETTINGS/STATUS/VOICE.md`. Review design contracts `.agents/design/00..50` and C source if verifying precise inspiration. **Never** depend on executing agentc or changing its dirty tree.
+2. Agentc @dotlink-l5 `AGENTS.md`; `plans/P6-HANDOFF.md`; `plans/P6-RUNTIME.md` with R-D1…31/`2.1; `P6-PRIMITIVES.md`, `P6-SURFACE.md`, `P6-API.md`, `P6-EXTENDING.md`, then `P6-ACTORS/SIGNALS/HOOKS/TRUST/SUBAGENTS/DECIDERS/INTEGRATION/SETTINGS/STATUS/VOICE.md`. Review design contracts `.agents/design/00..50` and C source if verifying precise inspiration. **Never** depend on executing agentc or changing its dirty tree.
 3. For aw implementation `git status --short --branch`; `git rev-parse HEAD`; `git worktree list`; `git log --oneline --decorate -20`, with current source/tests outranking old prose.
 4. Read `aw-agent-kernel`, `aw-agent-core`, `aw-tools`, `aw-terminal`, `aw-extensions`, `aw-mcp`, `aw-ui-extension`, `aw-store[-jsonl]`, `src/tui` and CLI based on wave; do not guess an absent method.
 
