@@ -70,6 +70,23 @@ pub fn configure_child_group(command: &mut Command) {
     command.process_group(0);
 }
 
+/// Launch an explicit, foreground-independent local owner in a new OS
+/// session. The caller must close inherited stdio, bound its lifetime, and
+/// supply a private rendezvous; this never implicitly starts a service.
+pub fn spawn_detached_session(command: &mut Command) -> io::Result<Child> {
+    // SAFETY: the child pre-exec callback calls only async-signal-safe
+    // setsid(2); no allocation, locks, environment mutation, or Rust unwind.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
 /// Graceful stop of the explicitly spawned per-child process group.
 /// A missing/already-exited group is harmless; a failed signal is never
 /// interpreted as proof of process termination.

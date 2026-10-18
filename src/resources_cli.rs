@@ -986,6 +986,12 @@ pub(crate) enum WorkspaceCommand {
     /// Attach a second native terminal to a human-invited, live PTY.
     #[cfg(all(feature = "workspace", unix))]
     Attach { invite: PathBuf },
+    /// Explicit, independent owner for a persistent local PTY (Unix only).
+    #[cfg(all(feature = "workspace", unix))]
+    Persistent {
+        #[command(subcommand)]
+        command: PersistentTerminalCommand,
+    },
     /// List accessible Workspaces.
     #[command(alias = "ls")]
     List {
@@ -1036,10 +1042,31 @@ pub(crate) enum WorkspaceCommand {
         store: StoreArgs,
     },
 }
+#[cfg(all(feature = "workspace", unix))]
+#[derive(Subcommand, Debug)]
+pub(crate) enum PersistentTerminalCommand {
+    /// Spawn one unsandboxed Bash in its own local PTY broker (24h idle limit).
+    Start {
+        root: PathBuf,
+        shell: PathBuf,
+    },
+    /// Terminate the explicitly owned persistent PTY, after admission.
+    Stop { invite: PathBuf },
+    /// Internal broker; never use this as a shell/Agent command.
+    #[command(hide = true)]
+    Serve {
+        root: PathBuf,
+        shell: PathBuf,
+        directory: PathBuf,
+    },
+}
+
 pub(crate) fn workspace(command: WorkspaceCommand) -> Result<u8> {
     match command {
         #[cfg(all(feature = "workspace", unix))]
         WorkspaceCommand::Attach { .. } => return Err(Error::Denied("native PTY attach must be dispatched by root CLI")),
+        #[cfg(all(feature = "workspace", unix))]
+        WorkspaceCommand::Persistent { .. } => return Err(Error::Denied("persistent PTY requires direct native CLI dispatch")),
         WorkspaceCommand::Open { .. } => {
             return Err(Error::Config(
                 "workspace open must be dispatched by the root CLI".into(),

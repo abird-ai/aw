@@ -1541,6 +1541,18 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::Workspace { command } => match command {
             #[cfg(all(feature = "workspace", unix))]
             Some(resources_cli::WorkspaceCommand::Attach { invite }) => workspace::native_dock::attach(&invite),
+            #[cfg(all(feature = "workspace", unix))]
+            Some(resources_cli::WorkspaceCommand::Persistent { command }) => {
+                use resources_cli::PersistentTerminalCommand as Persistent;
+                match command {
+                    Persistent::Start { root, shell } =>
+                        workspace::native_dock::start_persistent(&root, &shell),
+                    Persistent::Stop { invite } =>
+                        workspace::native_dock::stop_persistent(&invite),
+                    Persistent::Serve { root, shell, directory } =>
+                        workspace::native_dock::serve_persistent(&root, &shell, &directory),
+                }
+            }
             Some(resources_cli::WorkspaceCommand::Open { name, args }) => {
                 let mut run = args.run.into_run(args.workspace_layout);
                 run.workspace = Some(name);
@@ -6084,6 +6096,43 @@ fn native_workspace_attach_is_a_distinct_typed_command_not_a_new_agent() {
     }
 }
 
+#[cfg(all(test, feature = "workspace", unix))]
+#[test]
+fn persistent_terminal_cli_is_typed_and_explicit() {
+    use resources_cli::PersistentTerminalCommand as Persistent;
+    let args = [
+        ["aw", "workspace", "persistent", "start", "/tmp/synthetic-root", "/bin/bash"],
+        ["aw", "workspace", "persistent", "serve", "/tmp/synthetic-root", "/bin/bash"],
+    ];
+    for input in args {
+        let mut words = input.to_vec();
+        if words[3] == "serve" { words.push("/tmp/synthetic-owner"); }
+        let parsed = cli_taxonomy::parse::<Cli>(words);
+        match parsed.command {
+            Some(TopCommand::Workspace {
+                command: Some(resources_cli::WorkspaceCommand::Persistent { command }),
+            }) => match command {
+                Persistent::Start { root, shell } if root == PathBuf::from("/tmp/synthetic-root")
+                    && shell == PathBuf::from("/bin/bash") => {}
+                Persistent::Serve { root, shell, directory }
+                    if root == PathBuf::from("/tmp/synthetic-root")
+                        && shell == PathBuf::from("/bin/bash")
+                        && directory == PathBuf::from("/tmp/synthetic-owner") => {}
+                _ => panic!("persistent owner CLI must carry explicit root/shell/endpoint"),
+            },
+            _ => panic!("persistent owner CLI must not activate an Agent"),
+        }
+    }
+    let parsed = cli_taxonomy::parse::<Cli>([
+        "aw", "workspace", "persistent", "stop", "/tmp/synthetic-owner/invite",
+    ]);
+    assert!(matches!(parsed.command, Some(TopCommand::Workspace {
+        command: Some(resources_cli::WorkspaceCommand::Persistent {
+            command: Persistent::Stop { .. },
+        }),
+    })));
+}
+
 #[cfg(test)]
 #[test]
 fn r14_full_cli_parses_and_exports_from_small_outer_stack() {
@@ -6100,10 +6149,10 @@ fn r14_full_cli_parses_and_exports_from_small_outer_stack() {
             if cfg!(feature = "full") {
                 if cfg!(target_os = "linux") {
                     assert_eq!(schema.counts.flags,1719);
-                    assert_eq!(schema.counts.command_paths,244 + usize::from(cfg!(all(feature = "workspace", unix))));
+                    assert_eq!(schema.counts.command_paths,244 + 5 * usize::from(cfg!(all(feature = "workspace", unix))));
                 } else {
                     assert_eq!(schema.counts.flags,1670);
-                    assert_eq!(schema.counts.command_paths,235 + usize::from(cfg!(all(feature = "workspace", unix))));
+                    assert_eq!(schema.counts.command_paths,235 + 5 * usize::from(cfg!(all(feature = "workspace", unix))));
                 }
             }
         })

@@ -5,6 +5,8 @@
 //! process, Pool and Agent remain the sole owners. No background daemon,
 //! shell replay, saved layout token, provider access or new PTY is created.
 //! If that owner process dies the client disconnects and fails closed.
+mod persistent;
+pub use persistent::{serve_persistent, start_persistent, stop_persistent};
 use super::{terminal_control::INVITE_TTL, terminals};
 use aw::{Error, Result};
 use aw_terminal::Snapshot;
@@ -48,6 +50,8 @@ enum Request {
     Input { bytes: Vec<u8> },
     Resize { rows: u16, cols: u16 },
     Detach,
+    /// Explicit stop only for a separately launched broker-owned PTY.
+    Stop { ticket: String },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -56,15 +60,21 @@ enum Reply {
     Frame { snapshot: Snapshot },
     /// Origin has fenced the recipient epoch and regained exclusive control.
     Detached { terminal: String },
+    Stopped { terminal: String },
     Error { message: String },
 }
 
 /// A directory created with unpredictable CSPRNG bytes, mode 0700, containing
 /// only a 0600 invitation file and the owner-bound AF_UNIX socket.
 struct Cleanup(PathBuf);
+impl Cleanup {
+    fn transfer(mut self) { self.0 = PathBuf::new(); }
+}
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        if self.0.as_os_str().is_empty() { return; }
         let _ = fs::remove_file(self.0.join("invite"));
+        let _ = fs::remove_file(self.0.join("invite-next"));
         let _ = fs::remove_file(self.0.join("socket"));
         let _ = fs::remove_dir(&self.0);
     }
@@ -112,7 +122,10 @@ fn request(reader: &mut BufReader<UnixStream>, max: usize) -> io::Result<Option<
         }
     }
 }
-fn serve(mut stream: UnixStream, pool: &terminals::Pool, invite: &Invite) -> io::Result<bool> {
+fn serve(
+    mut stream: UnixStream, pool: &terminals::Pool, invite: &Invite,
+    persistent: bool,
+) -> io::Result<bool> {
     stream.set_read_timeout(Some(Duration::from_millis(130)))?;
     stream.set_write_timeout(Some(Duration::from_millis(850)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -125,6 +138,23 @@ fn serve(mut stream: UnixStream, pool: &terminals::Pool, invite: &Invite) -> io:
             None => return Err(io::Error::new(io::ErrorKind::TimedOut, "no explicit terminal hello")),
         }
     };
+    if let Request::Stop { ticket } = &hello {
+        if !persistent || ticket.len() != 64 || !pool.has_invitation(&invite.terminal, ticket) {
+            send(&mut stream, &Reply::Error { message: "native stop not authorized".into() })?;
+            return Ok(false);
+        }
+        pool.cancel_dock(&invite.terminal)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        pool.shutdown();
+        if pool.running() {
+            send(&mut stream, &Reply::Error {
+                message: "PTY termination uncertain; inspect launched processes".into(),
+            })?;
+        } else {
+            send(&mut stream, &Reply::Stopped { terminal: invite.terminal.clone() })?;
+        }
+        return Ok(true);
+    }
     let Request::Hello { version, ticket } = hello else {
         send(&mut stream, &Reply::Error { message: "explicit terminal hello required".into() })?;
         return Ok(false);
@@ -155,6 +185,15 @@ fn serve(mut stream: UnixStream, pool: &terminals::Pool, invite: &Invite) -> io:
     let mut last_version = None;
     loop {
         if pool.is_shutting_down() || last_seen.elapsed() > HEARTBEAT_TTL { break; }
+        // A separately broker-owned PTY ends with its original child.
+        // Never silently launch a replacement shell when the child exits.
+        if persistent && pool.get(&invite.terminal).is_some_and(|terminal|
+            terminal.status() != aw_terminal::Status::Running) {
+            let _ = send(&mut stream, &Reply::Error {
+                message: "persistent PTY exited; no process replay".into(),
+            });
+            break;
+        }
         if last_frame.elapsed() >= FRAME_INTERVAL {
             let snapshot = match pool.snapshot_docked(&lease, 0) {
                 Ok(snapshot) => snapshot,
@@ -192,7 +231,7 @@ fn serve(mut stream: UnixStream, pool: &terminals::Pool, invite: &Invite) -> io:
                         }
                     }
                     Request::Detach => { detached_by_request = true; break; }
-                    Request::Hello { .. } => break, // replay is not a fresh controller
+                    Request::Hello { .. } | Request::Stop { .. } => break, // replay cannot change authority
                 }
             }
             Ok(None) => {}
@@ -274,7 +313,7 @@ pub fn invite(pool: terminals::Pool, terminal_id: &str) -> Result<PathBuf> {
                 break;
             }
             match listener.accept() {
-                Ok((client, _)) => match serve(client, &pool, &invitation) {
+                Ok((client, _)) => match serve(client, &pool, &invitation, false) {
                     Ok(true) => break, // used once; never automatically replay
                     Ok(false) => {}
                     Err(_) => {} // malformed/untrusted clients cannot transfer
@@ -462,6 +501,7 @@ pub fn attach(invitation_path: &Path) -> Result<u8> {
                             Reply::Detached { terminal: id } if id == invitation.terminal
                                 && detach_since.is_some() => { closed = true; }
                             Reply::Detached { .. } => return Err(Error::Denied("unsolicited native detach receipt")),
+                            Reply::Stopped { .. } => return Err(Error::Denied("unsolicited broker stop receipt")),
                             Reply::Error { message } => return Err(fail(message)),
                             Reply::Ready { .. } => return Err(Error::Denied("replayed native admission")),
 
@@ -589,6 +629,33 @@ mod tests {
         writer.write_all(b"1234567890\n").await.unwrap();
         assert!(read_bounded_frame(&mut reader, &mut partial, 4).await.is_err(),
             "too-large native owner frame must be rejected before allocation");
+    }
+
+    #[test]
+    fn stop_request_never_terminates_original_workspace_owned_pty() {
+        let (root, root_cleanup) = private_directory().unwrap();
+        let shell = std::env::var_os("AW_BASH").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/bash"));
+        let pool = terminals::Pool::new();
+        let terminal_id = pool.launch(root.clone(), shell, "synthetic_actor".into()).unwrap();
+        let invitation = invite(pool.clone(), &terminal_id).unwrap();
+        let descriptor = read_invite(&invitation).unwrap();
+        let mut socket = UnixStream::connect(&descriptor.socket).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let request = serde_json::to_vec(&Request::Stop {
+            ticket: descriptor.ticket.clone(),
+        }).unwrap();
+        socket.write_all(&request).unwrap();
+        socket.write_all(b"\n").unwrap();
+        let response = super::request(&mut BufReader::new(socket), 4096).unwrap().unwrap();
+        assert!(matches!(serde_json::from_slice::<Reply>(&response).unwrap(),
+            Reply::Error { .. }));
+        assert_eq!(pool.get(&terminal_id).unwrap().status(), aw_terminal::Status::Running);
+        assert!(pool.has_invitation(&terminal_id, &descriptor.ticket));
+        pool.cancel_dock(&terminal_id).unwrap();
+        pool.shutdown();
+        drop(pool);
+        drop(root_cleanup);
     }
 
     #[test]
