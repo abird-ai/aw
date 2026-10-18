@@ -1,13 +1,17 @@
-# Plans
+# Plan queue
 
-Accepted history: `47ee8a03abecbb3aee84a49c0a590096d76ed1a7`.
-Read one plan, keep agent-owned scratch checklists under `.agents/runs/`, and
-reconcile completion through the coordinator. Git retains older detail.
+## Active
 
-- [x] [Accepted source checkpoint and completed work](accepted-history/TODO.md) — Done
-- [~] [Release readiness](release-readiness/TODO.md)
-- [~] [Read-only Agent views and composable Files/Git](workspace-views/TODO.md)
-- [x] [Native/browser UX convergence](ux-convergence/TODO.md) — Done (visual/interaction scope; separate PTY/Actor authority work stays open)
-- [ ] [Optional embedded targets and independent certification](embedded-platforms/TODO.md)
-- [ ] [Restored-State authority](restored-state-authority/TODO.md)
-- [x] [Simple TODO handoff process and comprehensive onboarding](handoff-process/TODO.md) — Done
+- [~] P1 release-readiness — @pvl — [details](release-readiness/TODO.md)
+- [~] P2 workspace-views — @pvl — [details](workspace-views/TODO.md)
+
+## Icebox
+
+- [ ] embedded-platforms — [details](embedded-platforms/TODO.md)
+- [ ] restored-state-authority — [details](restored-state-authority/TODO.md)
+
+## Closed
+
+- [x] accepted-history — `47ee8a0` — 2026-10-18
+- [x] handoff-process — 2026-10-18
+- [x] ux-convergence — 2026-10-18 — visual/interaction scope
