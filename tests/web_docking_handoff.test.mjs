@@ -23,6 +23,7 @@ function fixture() {
     if (path.endsWith('inspect')) return { kind: 'review', source_id: owner.source_id,
       scope_id: linkedScope, owner_epoch: owner.owner_epoch, review_id: reviewId };
     if (path.endsWith('accept')) return { state: 'accepted' };
+    if (path.endsWith('heartbeat')) return { state: 'released' };
     if (path.endsWith('cancel')) return { state: 'cancelled' };
     if (path.endsWith('decline')) return { state: 'declined' };
     throw Error('Unexpected API operation');
@@ -85,6 +86,7 @@ test('receiving Git Review creates one exact independently loaded read-only docu
   assert.deepEqual(f.controls[0].selected, ['receiving-git', 'received-review', 'review']);
   assert.deepEqual(f.calls.map(value => value.path), [
     '/api/dock/register', '/api/dock/inspect', '/api/dock/accept',
+    '/api/dock/heartbeat',
   ]);
 });
 

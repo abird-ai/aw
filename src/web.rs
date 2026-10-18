@@ -1115,6 +1115,9 @@ fn application_scoped(
         .route("/api/dock/inspect", post(dock::inspect))
         .route("/api/dock/accept", post(dock::accept))
         .route("/api/dock/decline", post(dock::decline))
+        .route("/api/dock/confirm", post(dock::confirm))
+        .route("/api/dock/heartbeat", post(dock::heartbeat))
+        .route("/api/dock/retire", post(dock::retire))
         .route("/api/dock/status", post(dock::status))
         .route("/api/dock/release", post(dock::release))
         .route("/api/dock/cancel", post(dock::cancel));
@@ -3208,6 +3211,7 @@ mod tests {
         use super::*;
         include!("web/dock/tests.rs");
         include!("web/dock/review_tests.rs");
+        include!("web/dock/lifecycle_tests.rs");
     }
     #[cfg(feature = "oidc")]
     mod publication_http_measure {

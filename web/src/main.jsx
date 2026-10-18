@@ -1843,6 +1843,18 @@ function App() {
   }
   const documentDocking = createDocumentDocking({
     api, views: workspaceViews,
+    retireWindow: windowIdentity => {
+      // Best-effort pagehide signal; owner also requires a fresh post-accept
+      // receiver ACK, so lost unload packets never authorize origin closure.
+      try {
+        void fetch("/api/dock/retire", {
+          method: "POST", credentials: "same-origin", cache: "no-store",
+          keepalive: true,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(windowIdentity),
+        }).catch(() => {});
+      } catch {}
+    },
     capture: documentId => presentationControllers.get(documentId)?.capture() || null,
     restore: (documentId, state) => presentationControllers.get(documentId)?.restore(state) || false,
     currentOwner: () => {
@@ -2470,7 +2482,10 @@ function App() {
     const wake = () => pulseAgentViews();
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("focus", wake);
+    const retireDockOnPageHide = () => documentDocking.retire();
+    window.addEventListener("pagehide", retireDockOnPageHide);
     onCleanup(() => {
+      window.removeEventListener("pagehide", retireDockOnPageHide);
       clearInterval(pulse);
       document.removeEventListener("visibilitychange", wake);
       window.removeEventListener("focus", wake);

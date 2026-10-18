@@ -18,16 +18,24 @@ export function createDocumentDocking({
   api, views, currentOwner, select, close, popup,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   timeoutMs = MAX_WAIT_MS, onProgress = () => {}, isRendered = () => true,
+  retireWindow = () => {},
   capture = () => null, restore = async () => true,
   navigate = (window, ticket) => {
     window.opener = null;
     window.location.replace(new URL("#aw-dock=" + ticket, location.href).href);
   },
 }) {
-  if ([api, currentOwner, select, close, popup, sleep, onProgress, isRendered, capture, restore, navigate]
+  if ([api, currentOwner, select, close, popup, sleep, onProgress, isRendered, capture, restore, retireWindow, navigate]
     .some(callback => typeof callback !== "function")) throw new Error("Read-only document docking needs original-browser callbacks.");
   let disposed = false;
   let staged = null;
+  let receivingWindow = null;
+  // A pagehide message is best effort. The origin's fresh ACK requirement
+  // remains the real gate even when browsers omit unload networking.
+  function retire() {
+    if (receivingWindow) retireWindow(receivingWindow);
+    receivingWindow = null;
+  }
   // Called on the real button's pointerdown before browser focus moves away
   // from Find/the editor. Keyboard actions capture at send as a fallback.
   function stage(documentId) {
@@ -81,7 +89,7 @@ export function createDocumentDocking({
     };
     const nextWindow = popup(); // Must execute during the direct user click.
     if (!nextWindow) throw new Error("The browser blocked the new window. Allow pop-ups for the local owner.");
-    let origin, ticket, released = false, navigated = false;
+    let origin, ticket, released = false, navigated = false, requestedConfirmation = false;
     onProgress(documentId, true);
     try {
       // The browser computes the digest from already-authorized local data.
@@ -115,6 +123,17 @@ export function createDocumentDocking({
         if (!sameDocument() || nextWindow.closed) break;
         const result = await api("/api/dock/status", envelope(origin, ticket));
         if (result.document_id !== documentId) throw new Error("Handoff target changed.");
+        if (result.state === "confirming") {
+          if (!requestedConfirmation) {
+            const acknowledgement = await api("/api/dock/confirm", envelope(origin, ticket));
+            if (acknowledgement.state !== "confirming") {
+              throw new Error("The original owner rejected the confirmation request.");
+            }
+            requestedConfirmation = true;
+          }
+          await sleep(250);
+          continue;
+        }
         if (result.state === "accepted") {
           if (!sameDocument()) break;
           const outcome = await api("/api/dock/release", envelope(origin, ticket));
@@ -146,6 +165,7 @@ export function createDocumentDocking({
     if (disposed || !ticketSyntax.test(ticket)) throw new Error("Invalid read-only document docking invitation.");
     const receiver = await api("/api/dock/register", {});
     const body = envelope(receiver, ticket);
+    receivingWindow = body;
     let containerId, documentId, acceptanceAttempted = false;
     try {
       const description = await api("/api/dock/inspect", body);
@@ -206,7 +226,21 @@ export function createDocumentDocking({
             error.status = 409;
             throw error;
           }
-          return { containerId, documentId };
+          // Accept alone is not sufficient. Source initiates confirmation
+          // after seeing Accepted; receiver must respond while this document
+          // and browser lifetime are still owned by this exact renderer.
+          while (Date.now() < until && !disposed && ownerMatches(description)) {
+            const current = views.getDocument(documentId);
+            if (!current || current !== item || !isRendered(documentId)) break;
+            const state = await api("/api/dock/heartbeat", body);
+            if (state.state === "released") {
+              receivingWindow = null;
+              return { containerId, documentId };
+            }
+            if (!["confirming", "accepted"].includes(state.state)) break;
+            await sleep(250);
+          }
+          throw new Error("Handoff release was not confirmed; read-only receiver remains inspectable.");
         }
         await sleep(120);
       }
@@ -229,5 +263,8 @@ export function createDocumentDocking({
     }
   }
 
-  return Object.freeze({ stage, cancelStage, send, receive, dispose() { disposed = true; staged = null; } });
+  return Object.freeze({
+    stage, cancelStage, send, receive, retire,
+    dispose() { retire(); disposed = true; staged = null; },
+  });
 }

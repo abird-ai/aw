@@ -54,6 +54,26 @@ async fn dock_prepared(router: &Router, cookie: &str, origin: &serde_json::Value
     ticket.to_owned()
 }
 
+/// Exact post-accept two-party liveness confirmation. The origin must start
+/// a fresh confirmation epoch; an older receiver registration cannot release.
+async fn confirm_dock(
+    router: &Router, cookie: &str,
+    source: &serde_json::Value, receiver: &serde_json::Value,
+) {
+    assert_eq!(request_dock(router,Some(cookie),"status",source.clone()).await.1["state"],
+        "confirming");
+    assert_eq!(request_dock(router,Some(cookie),"release",source.clone()).await.0,
+        StatusCode::CONFLICT,"unconfirmed receiver must never release");
+    assert_eq!(request_dock(router,Some(cookie),"heartbeat",receiver.clone()).await.1["state"],
+        "confirming","a pre-challenge heartbeat is not admission");
+    assert_eq!(request_dock(router,Some(cookie),"confirm",source.clone()).await.1["state"],
+        "confirming");
+    assert_eq!(request_dock(router,Some(cookie),"heartbeat",receiver.clone()).await.1["state"],
+        "accepted");
+    assert_eq!(request_dock(router,Some(cookie),"status",source.clone()).await.1["state"],
+        "accepted");
+}
+
 #[tokio::test]
 async fn docking_needs_original_surface_owner_and_authenticated_browser() {
     let (router, _, _) = app();
@@ -133,6 +153,7 @@ async fn read_only_file_handoff_is_two_distinct_windows_and_exact_one_use() {
         request_dock(&router, Some(&cookie), "cancel", original.clone()).await.0,
         StatusCode::CONFLICT
     );
+    confirm_dock(&router,&cookie,&original,&receiving).await;
     let (status, confirmed) =
         request_dock(&router, Some(&cookie), "status", original.clone()).await;
     assert_eq!(status, StatusCode::OK);
@@ -221,6 +242,8 @@ async fn docking_expiry_cancel_wrong_owner_and_competing_receiver_are_fail_close
     assert!([accepted_a.0, accepted_b.0].iter().all(
         |status| matches!(*status, StatusCode::OK | StatusCode::CONFLICT)
     ));
+    let winner = if accepted_a.0 == StatusCode::OK { &a } else { &b };
+    confirm_dock(&router,&cookie,&original,winner).await;
     assert_eq!(
         request_dock(&router, Some(&cookie), "cancel", original.clone()).await.0,
         StatusCode::CONFLICT
@@ -319,6 +342,7 @@ async fn accepted_handoff_rechecks_file_before_original_release() {
         request_dock(&router, Some(&cookie), "accept", credentials(&receiver, &ticket)).await.0,
         StatusCode::OK
     );
+    confirm_dock(&router,&cookie,&original,&credentials(&receiver,&ticket)).await;
     let file = root.0.join("sample.rs");
     let saved = root.0.join("saved-synthetic.rs");
     std::fs::rename(&file, &saved).unwrap();
@@ -411,6 +435,8 @@ async fn declined_receiver_aborts_pending_handoff_without_erasing_other_views() 
             StatusCode::CONFLICT
         );
     }
+    confirm_dock(&router,&cookie,&credentials(&origin,&accepted),
+        &credentials(&other,&accepted)).await;
     assert_eq!(
         request_dock(&router, Some(&cookie), "release", credentials(&origin, &accepted)).await.0,
         StatusCode::OK
@@ -455,7 +481,8 @@ async fn file_presentation_is_bounded_and_rechecked_on_owner_read_and_release() 
     assert_eq!(request_dock(&router,Some(&cookie),"status",origin_env.clone()).await.1["state"],
         "prepared");
     std::fs::write(root.0.join("sample.rs"),&original).unwrap();
-    assert_eq!(request_dock(&router,Some(&cookie),"accept",receiver_env).await.0,StatusCode::OK);
+    assert_eq!(request_dock(&router,Some(&cookie),"accept",receiver_env.clone()).await.0,StatusCode::OK);
+    confirm_dock(&router,&cookie,&origin_env,&receiver_env).await;
     std::fs::write(root.0.join("sample.rs"),"changed after receiver accepted").unwrap();
     assert_eq!(request_dock(&router,Some(&cookie),"release",origin_env.clone()).await.0,
         StatusCode::CONFLICT);

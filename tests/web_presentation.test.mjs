@@ -162,6 +162,7 @@ for (const kind of ['file', 'review']) {
           accepted = true;
           return { state: 'accepted' };
         }
+        if (path.endsWith('heartbeat')) return { state: 'released' };
         throw Error('Unexpected read-only handoff route ' + path);
       },
       views: {
@@ -196,7 +197,7 @@ for (const kind of ['file', 'review']) {
     assert.equal(result.documentId, mounted.id);
     assert.equal(accepted, true);
     assert.deepEqual(restored, state);
-    assert.deepEqual(calls, ['/api/dock/register', '/api/dock/inspect', '/api/dock/accept']);
+    assert.deepEqual(calls, ['/api/dock/register', '/api/dock/inspect', '/api/dock/accept', '/api/dock/heartbeat']);
     assert.ok(!JSON.stringify(calls).includes('first\\nneedle\\nlast'));
   });
 }

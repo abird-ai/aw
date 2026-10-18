@@ -532,6 +532,7 @@ function dockFixture() {
     if (path.endsWith('decline')) return { state: 'declined' };
     if (path.endsWith('inspect')) return { kind: 'file', ...owner, path: target.path };
     if (path.endsWith('accept')) { accepted = true; return { state: 'accepted' }; }
+    if (path.endsWith('heartbeat')) return { state: 'released' };
     throw Error('unknown mock API');
   };
   const views = {
@@ -608,7 +609,7 @@ test('receiver rereads the original capability before acceptance without receivi
   assert.deepEqual(result, { containerId: 'destination', documentId: 'receiver-file' });
   assert.equal(f.accepted, true);
   assert.equal(f.document.data.text, 'AUTHORIZED_RECEIVER_BYTES');
-  assert.deepEqual(f.calls.map(call => call.path), ['/api/dock/register', '/api/dock/inspect', '/api/dock/accept']);
+  assert.deepEqual(f.calls.map(call => call.path), ['/api/dock/register', '/api/dock/inspect', '/api/dock/accept', '/api/dock/heartbeat']);
   assert.equal(f.notifications.filter(event => event === 'closed-file').length, 0);
 });
 

@@ -12,6 +12,10 @@ const MAX_WINDOWS: usize = 24;
 const MAX_TICKETS: usize = 24;
 const WINDOW_TTL: Duration = Duration::from_secs(180);
 const TICKET_TTL: Duration = Duration::from_secs(90);
+/// Liveness is a short, receiver-proven observation, never proof the browser
+/// cannot crash immediately afterwards. Origin must ask for an ACK *after*
+/// it observes acceptance, avoiding an old registration as release authority.
+const RECEIVER_ACK_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 pub(super) struct Registry {
@@ -121,7 +125,11 @@ impl Presentation {
 #[derive(Clone)]
 enum Phase {
     Prepared,
-    Accepted { receiver_id: String },
+    Accepted {
+        receiver_id: String,
+        confirmation_requested: bool,
+        acknowledged_at: Option<Instant>,
+    },
     Declined,
     Released,
 }
@@ -133,6 +141,18 @@ impl Registry {
     #[cfg(test)]
     pub(super) fn expire_window_for_test(&mut self, window: &str) {
         self.windows.get_mut(window).unwrap().deadline = Instant::now() - Duration::from_millis(1);
+    }
+    #[cfg(test)]
+    pub(super) fn stale_ack_for_test(&mut self, ticket: &str) {
+        match &mut self.tickets.get_mut(ticket).unwrap().phase {
+            Phase::Accepted {
+                acknowledged_at, ..
+            } => {
+                *acknowledged_at =
+                    Some(Instant::now() - RECEIVER_ACK_TTL - Duration::from_millis(10));
+            }
+            _ => panic!("test requires accepted receiver"),
+        }
     }
     fn prune(&mut self) {
         let now = Instant::now();
@@ -622,6 +642,8 @@ pub(super) async fn accept(
     }
     held.phase = Phase::Accepted {
         receiver_id: request.window_id,
+        confirmation_requested: false,
+        acknowledged_at: None,
     };
     Ok(Json(serde_json::json!({"state":"accepted"})).into_response())
 }
@@ -657,6 +679,141 @@ pub(super) async fn decline(
     Ok(Json(serde_json::json!({"state":"declined"})).into_response())
 }
 
+/// Source-initiated confirmation gate: the recipient must respond *after* this
+/// authenticated request. Old accept replies and mere registration cannot
+/// authorize origin closure; this is intentionally non-durable.
+pub(super) async fn confirm(
+    State(app): State<AppState>,
+    payload: std::result::Result<Json<Envelope>, JsonRejection>,
+) -> ApiResult<Response> {
+    let request = body(payload)?;
+    let ticket = retrieve(&app, &request, true)?;
+    let mut registry = lock(&app.0.dock);
+    registry.prune();
+    registry.window(
+        &request.window_id,
+        &request.window_proof,
+        &ticket.source_id,
+        &ticket.owner_epoch,
+    )?;
+    let receiver_id = match &registry
+        .tickets
+        .get(&request.ticket)
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "handoff unavailable"))?
+        .phase
+    {
+        Phase::Accepted { receiver_id, .. } => receiver_id.clone(),
+        _ => return Err(ApiError(StatusCode::CONFLICT, "receiver has not accepted")),
+    };
+    if !registry
+        .windows
+        .get(&receiver_id)
+        .is_some_and(|window| window.deadline > Instant::now())
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "receiver no longer available",
+        ));
+    }
+    let held = registry
+        .tickets
+        .get_mut(&request.ticket)
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "handoff unavailable"))?;
+    if let Phase::Accepted {
+        confirmation_requested,
+        acknowledged_at,
+        ..
+    } = &mut held.phase
+    {
+        // Repeated confirmation may not invalidate a newly received ACK:
+        // a second request is idempotent until ticket closure/expiration.
+        if !*confirmation_requested {
+            *confirmation_requested = true;
+            *acknowledged_at = None;
+        }
+    }
+    Ok(Json(serde_json::json!({"state":"confirming"})).into_response())
+}
+
+/// Only the accepted receiver's original window proof can ACK source's
+/// confirmation challenge. The server verifies exact ticket, source, owner
+/// epoch, authenticated browser, and live window on every observation.
+pub(super) async fn heartbeat(
+    State(app): State<AppState>,
+    payload: std::result::Result<Json<Envelope>, JsonRejection>,
+) -> ApiResult<Response> {
+    let request = body(payload)?;
+    let ticket = retrieve(&app, &request, false)?;
+    let mut registry = lock(&app.0.dock);
+    registry.prune();
+    registry.window(
+        &request.window_id,
+        &request.window_proof,
+        &ticket.source_id,
+        &ticket.owner_epoch,
+    )?;
+    let held = registry
+        .tickets
+        .get_mut(&request.ticket)
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "handoff unavailable"))?;
+    let state = match &mut held.phase {
+        Phase::Accepted {
+            receiver_id,
+            confirmation_requested,
+            acknowledged_at,
+        } if receiver_id == &request.window_id => {
+            if *confirmation_requested {
+                *acknowledged_at = Some(Instant::now());
+                "accepted"
+            } else {
+                "confirming"
+            }
+        }
+        Phase::Released => "released",
+        _ => return Err(ApiError(StatusCode::CONFLICT, "receiver not accepted")),
+    };
+    Ok(Json(serde_json::json!({"state":state})).into_response())
+}
+
+/// Best-effort browser tab retirement (including pagehide with keepalive).
+/// With a missed tab-close message the short ACK deadline still fails closed.
+/// Old proofs cannot revive a retired window, and retiring one receiver never
+/// retires a different Session/source/recipient.
+pub(super) async fn retire(
+    State(app): State<AppState>,
+    payload: std::result::Result<Json<Envelope>, JsonRejection>,
+) -> ApiResult<Response> {
+    let request = body(payload)?;
+    let ticket = retrieve(&app, &request, false)?;
+    let mut registry = lock(&app.0.dock);
+    registry.prune();
+    registry.window(
+        &request.window_id,
+        &request.window_proof,
+        &ticket.source_id,
+        &ticket.owner_epoch,
+    )?;
+    let held = registry
+        .tickets
+        .get_mut(&request.ticket)
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "handoff unavailable"))?;
+    match &mut held.phase {
+        Phase::Prepared => held.phase = Phase::Declined,
+        Phase::Accepted { receiver_id, .. } if receiver_id == &request.window_id => (),
+        Phase::Released => (),
+        _ => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "receiver has different owner",
+            ))
+        }
+    }
+    if let Some(window) = registry.windows.get_mut(&request.window_id) {
+        window.deadline = Instant::now();
+    }
+    Ok(Json(serde_json::json!({"state":"retired"})).into_response())
+}
+
 pub(super) async fn status(
     State(app): State<AppState>,
     payload: std::result::Result<Json<Envelope>, JsonRejection>,
@@ -665,19 +822,29 @@ pub(super) async fn status(
     let ticket = retrieve(&app, &request, true)?;
     let state = match &ticket.phase {
         Phase::Prepared => "prepared",
-        Phase::Accepted { receiver_id } if receiver_id != &ticket.origin_id => {
+        Phase::Accepted {
+            receiver_id,
+            confirmation_requested,
+            acknowledged_at,
+        } if receiver_id != &ticket.origin_id => {
             // Do not instruct the source to close for an already-expired
             // receiving presentation. This is a lease, not a claim of perfect
             // process liveness after the last successful HTTP round trip.
             let registry = lock(&app.0.dock);
-            if registry
+            if !registry
                 .windows
                 .get(receiver_id)
                 .is_some_and(|w| w.deadline > Instant::now())
             {
+                "receiver_unavailable"
+            } else if !confirmation_requested {
+                "confirming"
+            } else if acknowledged_at
+                .is_some_and(|time| Instant::now().duration_since(time) <= RECEIVER_ACK_TTL)
+            {
                 "accepted"
             } else {
-                "receiver_unavailable"
+                "confirming"
             }
         }
         Phase::Accepted { .. } => "unavailable",
@@ -713,10 +880,19 @@ pub(super) async fn release(
         .ok_or(ApiError(StatusCode::NOT_FOUND, "handoff unavailable"))?
         .phase
     {
-        Phase::Accepted { receiver_id } => registry
-            .windows
-            .get(receiver_id)
-            .is_some_and(|w| w.deadline > Instant::now()),
+        Phase::Accepted {
+            receiver_id,
+            confirmation_requested,
+            acknowledged_at,
+        } => {
+            *confirmation_requested
+                && acknowledged_at
+                    .is_some_and(|time| Instant::now().duration_since(time) <= RECEIVER_ACK_TTL)
+                && registry
+                    .windows
+                    .get(receiver_id)
+                    .is_some_and(|w| w.deadline > Instant::now())
+        }
         _ => false,
     };
     if !receiver_live {

@@ -91,6 +91,7 @@ async fn immutable_review_handoff_keeps_exact_retained_source_and_no_effects() {
         StatusCode::CONFLICT);
     assert_eq!(request_dock(&router,Some(&cookie),"accept",dest.clone()).await.1["state"],
         "accepted");
+    confirm_dock(&router,&cookie,&source,&dest).await;
     assert_eq!(request_dock(&router,Some(&cookie),"release",source.clone()).await.1["state"],
         "released");
     assert_eq!(request_dock(&router,Some(&cookie),"accept",dest).await.0,
@@ -183,6 +184,7 @@ async fn review_handoff_retains_nonroot_git_worktree_scope_without_files_grant()
         StatusCode::FORBIDDEN);
     assert_eq!(request_dock(&router,Some(&cookie),"accept",
         credentials(&receiver,ticket)).await.0,StatusCode::OK);
+    confirm_dock(&router,&cookie,&credentials(&origin,ticket),&credentials(&receiver,ticket)).await;
     // A linked checkout can be replaced after acceptance. Never release
     // the origin on an obsolete Git directory identity.
     let retired=linked.with_extension("retired-review-checkout");
@@ -266,6 +268,8 @@ async fn retained_review_presentation_preserves_two_bounded_panes_without_conten
         StatusCode::BAD_REQUEST);
     assert_eq!(request_dock(&router, Some(&cookie), "accept",
         credentials(&receiver,ticket)).await.0, StatusCode::OK);
+    confirm_dock(&router,&cookie,&credentials(&origin,ticket),
+        &credentials(&receiver,ticket)).await;
     assert_eq!(request_dock(&router, Some(&cookie), "release",
         credentials(&origin,ticket)).await.0, StatusCode::OK);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
