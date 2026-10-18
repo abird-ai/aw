@@ -128,10 +128,23 @@ and the two Git Diff panes may synchronize their offsets. Find queries
 may contain private user-entered text, so they remain inside the existing
 authenticated handoff, not in the URL fragment, browser storage or logs.
 
+After the receiving File/Review is independently loaded and rendered, its
+**Accept** response is not by itself a release receipt. The origin must
+request a fresh confirmation, and the same accepted receiver must answer
+using its original registered window proof. The owner checks that this
+post-confirmation ACK is at most three seconds old before allowing the
+source tab to close. A pagehide attempts a same-origin keepalive retirement
+to block reuse of the window identity; a missed retirement is not treated
+as liveness. Receiver browser reload cannot silently reuse the stripped
+ticket/old proof or restore an old view automatically. On missed/unknown
+confirmation, the original File/Review remains available, rather than
+claiming a completed move. This is a recent acknowledgment, **not** a
+guarantee that a browser cannot crash immediately after sending it.
+
 These are **read-only presentation actions only**: native terminal/process
-ownership, broader crash/restart and ABA cases, remote/paired-browser
-authentication, and native PTY docking remain separate. No SQLite, JSONL
-or native-layout migration, original Agent retargeting, Git write, provider
+ownership, independent paired-browser accounts, post-ACK crash/network
+partitions, and native PTY docking remain separate. No SQLite, JSONL or
+native-layout migration, original Agent retargeting, Git write, provider
 credential or model/tool admission is introduced.
 See [Workspace views](../plans/workspace-views/README.md) for the
 remaining gates and failure semantics.

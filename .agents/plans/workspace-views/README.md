@@ -594,6 +594,57 @@ An accepted ticket cannot prove the receiver process is continuously
 live. No SQL/JSONL/native-layout migration, provider permission or Git
 write operation is introduced.
 
+#### Short-lived receiver-confirmed release and tab retirement — signed `e5589196e88ada25250b97d5fca3d693f23c2415`
+
+A later lifecycle review found that a **180-second registered window** is not
+sufficient evidence the browser is still present when the original window
+releases its view. On the same short-lived, authenticated File/Review
+ticket, the recipient now first Accepts an independently read/rendered
+resource. The *origin* then initiates a fresh `Confirm` observation,
+and only that exact accepted receiver may acknowledge via
+`/api/dock/heartbeat` using its original window identity and proof.
+The Rust owner admits source Release only when this post-confirmation
+acknowledgment is **at most three seconds old**, the original window
+and receiver are still within the owner's expiry bounds, the exact
+original File/Review remains readable, and all existing grant, source,
+scope, owner-epoch and single-receiver checks still pass.
+Pre-confirmation pings and other registered windows cannot supply the
+acknowledgment. Acknowledge/confirm does **not** grant access to another
+File, Session, Git checkout, tool, PTY or provider.
+
+The receiving page also issues a *best-effort* same-origin, JSON,
+`keepalive` retirement on `pagehide`. The owner invalidates that
+window's proof and prevents further heartbeat/release; when the browser
+omits the retirement packet, missing fresh confirmation still blocks
+origin release. A receiver reload never restores the in-memory
+window proof or URL fragment and cannot automatically resurrect an old
+ticket. A lost Release response is **unknown**: the sender keeps its
+read-only original view rather than claiming success; any independently
+authorized receiving view remains inspectable, never promoted to a
+second Runtime or execution owner.
+
+**Verification:** On signed `e558919`, 20 real authenticated Axum
+docking tests and 169 Node tests cover accepted-but-unconfirmed receipt,
+wrong/fresh-window proofs, expiry and renewed proof, concurrent retire
+and Accept, original-owner restart, capacity limits, and unknown HTTP
+outcomes. Rust validation passed as 1,294 non-Store tests (four ignored),
+201 Store library tests and 156 Store integrations, with web-only 132,
+strict library Clippy, formatting, Workspace-only/minimal features, and
+an eight-asset byte-for-byte frontend rebuild. Real Chrome 155 File
+and Git Review transfers, subsequent receiver reload and early File
+popup closure passed with 390px Dark geometry, unmodified synthetic
+Git HEAD/index and zero State/run/effect counters. The browser fixture
+does not simulate a receiver crashing at every submillisecond point of
+the post-ACK/Release race.
+
+**Limits:** A three-second acknowledgment is a bounded *recent
+observation*, not a durable lease or guarantee that a browser cannot
+crash immediately afterwards. Full independent multi-profile/paired
+account handling is not supplied by the existing one-time pairing
+model. Network partitions, crashes immediately after ACK, and native
+PTY/Runtime handoff still require separate acceptance and design.
+No persistent handoff schema or authority was added.
+
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
 never grant Store/File/Git/Session/PTY or model ownership. Do not use
@@ -626,11 +677,14 @@ in a browser message.
 
 The **read-only File and immutable Git Review** ticket/API, browser popup
 and bounded Find/scroll/selection/focus continuity are implemented.
-Native cross-terminal docking, persistent reopening after browser restart,
-broader paired-browser admission and crash/ABA/UNKNOWN acceptance are open.
-No serialized layout migration was introduced: version **0.15.0**, SQLite
-**33**, JSONL **1**, native saved layout **v4**, and all original runtime
-and resource authority boundaries remain unchanged.
+Native cross-terminal docking and **automatically reopening** a transferred
+view after receiver restart are not implemented. The fresh receiver-confirmation
+gate and origin-preserving crash/reload denials are verified, but independent
+paired-account browser admission, arbitrary partitions, crash exactly after
+ACK and ambiguous transport outcomes need further acceptance. No serialized
+layout migration was introduced: version **0.15.0**, SQLite **33**, JSONL
+**1**, native saved layout **v4**, and all original runtime and resource
+authority boundaries remain unchanged.
 
 ## References
 
