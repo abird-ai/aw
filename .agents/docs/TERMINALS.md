@@ -8,7 +8,52 @@ Agent **Scrollback** uses one persistent aw presenter with a dynamically sized R
 
 Post-Phase-58 resize/exit hardening clears the old physical Scrollback scratch footprint with `Clear(FromCursorDown)` before rebuilding its Inline viewport, because Ratatui 0.30 has no public mutable Inline-height/anchor API. Owned Inline dynamically recreates its Inline viewport only when required geometry/physical size changes; after real saturation it remains bottom-anchored and can commit only settled runtime-turn overflow. Both presenters publish/retain exact physical boundaries so the shared `TerminalSession` restores the invoking shell adjacent to aw content rather than at the terminal bottom. `TerminalSession` also owns raw mode, cursor visibility, bracketed paste, alternate-screen state, signal/panic restoration and opportunistic keyboard-enhancement push/pop. On a direct known-capable terminal, Kitty-style modifier reporting may be enabled directly. Once tmux is the immediate terminal peer, only tmux's positive capability report is authoritative; inherited outer-terminal markers such as `KITTY_WINDOW_ID` or `WEZTERM_PANE` never bypass an unsupported tmux transport.
 
-**Authored Rust source, not compile-validated here.** `aw-terminal` owns a real local PTY, child process and bounded emulated screen. It is not an ANSI-coloured log view. The independent Python PTY probes validate kernel assumptions only; actual Rust/emulator/TUI fixtures still need the host build.
+**Historical Phase 5 note (superseded):** `aw-terminal` owns a real PTY,
+child process and bounded screen; it is not a coloured log view.
+Current compiled Rust/PTY host acceptance is recorded above.
+
+## Native second-terminal docking — Unix, 0.15.0
+
+Focus an existing running native PTY and invoke **`terminal-dock`** in
+the Workspace command palette. Copy the displayed command to a
+**second local terminal**:
+
+`aw workspace attach /tmp/aw-pty-<nonce>/invite`
+
+F12 detaches the second frontend. The first aw process **must remain
+alive**; this is not a background daemon or a second Agent.
+
+- **One original shell:** Same PTY, Bash/process PID, Pool, Actor, terminal
+  output parser and OS execution authority. Original view remains visible
+  but its input/paste/resize/termination are fenced while docked.
+- **One use:** 90-second invitation, 0700 private directory, 0600
+  invitation file and local Unix socket. No persistent token, root
+  capability, provider credential, browser transport, model call or saved
+  layout migration.
+- **Safe control return:** Monotonic, non-cloneable lease; queued input
+  drains before the original gains control. Only the original owner
+  acknowledges successful F12 detach. An unknown input/detach response
+  is never replayed or called successful.
+- **Failure:** Receiver crash returns to original owner. Original-owner
+  loss makes the receiver fail closed with no shell revival. On SIGKILL,
+  inert invitation/socket entries may remain in /tmp until cleanup.
+- **Bounds:** Existing four-terminal cap, VT100 2–120 × 4–300,
+  bounded input/paste and socket frames, no read of another Session,
+  File root or Git checkout through this feature.
+
+**Verified on signed `c98987a`:** Real independent Linux PTY sessions
+normal detach, same shell PID, 65×20 and 120×40 receiver resizes, Ctrl+C
+ownership, unmodified source shell during remote control, F12 and
+owner `quit-all` restoration, receiver crash and owner loss; no
+model/tool run or effect records (the shell modified only private fixtures). Native wire, lease, expiry and race tests
+passed. Full Rust, Node, formatting, scoped Clippy and minimal/Workspace
+feature checks passed as recorded in
+[Workspace plan](../plans/workspace-views/TODO.md).
+
+**Not yet supplied:** owner-independent durable PTY survival, cross-device
+or different-Actor control, Windows-native implementation or host-run
+macOS acceptance. Windows target compilation was blocked by missing
+target std/core in the connector, not demonstrated successful.
 
 ## Ownership and explicit launch
 

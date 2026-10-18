@@ -7,7 +7,7 @@ independent resources inside one Workspace without changing the current Agent.
 The native slices preserve independent view state, exact authority and one
 execution owner. Browser read-only Agent tabs use the same strict reader; scoped
 browser Files/Git containers use exact launch-root and verified-worktree
-capabilities. Read-only browser File/Review docking now includes same-owner multi-profile handoff; native PTY and distinct-Actor delegated docking remain planned.
+capabilities. Read-only browser File/Review and live-owner Unix PTY docking are implemented; owner-independent PTY survival and distinct-Actor delegation remain planned.
 
 ## Design
 
@@ -689,6 +689,63 @@ user/Actor, per-browser narrowed grants or independent revocation. Immediate
 post-ACK crashes, arbitrary partitions, persistent restored docking and
 native second-terminal/PTY authority remain open.
 
+#### Original-PTY native docking to a second Unix terminal — signed `c98987a4158ba7f71e58e5a83cab378f36a7e9be`
+
+**User flow:** Launch an explicitly trusted shell with `terminal-start`;
+focus that terminal tab and choose **terminal-dock** in the existing
+command palette. In a separate local terminal, run the displayed
+`aw workspace attach /tmp/aw-pty-<nonce>/invite`. F12 detaches. Use
+**terminal-dock-cancel** to revoke an unconsumed invitation.
+
+**Authority:** The first Workspace **keeps** the existing
+`aw-terminal::Terminal`, retained Pool, Actor and child PID. The
+second CLI starts no Agent, provider, ToolRegistry or PTY. One OS-random,
+90-second invitation (private directory 0700, file 0600) admits one
+same-Unix-owner local socket client; it is never saved in a layout or
+State. A monotonic epoch plus non-cloneable RAII lease fences input,
+paste, resize and terminal termination: the original view is read-only
+while the remote frontend is controlling. The source still displays
+cells from the original VT100 parser. On detach/crash, pending input
+must drain before returning control. F12 is successful only upon an
+explicit **original-owner receipt after release**, never just
+a successful socket write. Unknown shell effects are not replayed.
+
+**Bounds:** Original terminal limit remains four retained PTYs, 2–120
+rows, 4–300 cols and the existing input queue. Client frames are
+strictly bounded and cancellation-safe, key bursts are coalesced, and
+the remote view reserves one status row. Wrong/expired/reused tickets,
+racing receivers, forged/public/symlinked descriptors and swapped
+socket bindings are denied. Graceful close removes the invite/socket;
+a SIGKILL may leave inert temporary filesystem entries until /tmp
+cleanup. A new renderer after the source owner exits **cannot**
+resurrect that PTY, and cannot claim successful detach without its ACK.
+
+**Exact signed-HEAD validation:** `cargo test --workspace --locked
+--exclude aw-store -- --test-threads=4` passed **1,320** (4 ignored),
+Store lib **201**, Store integrations **156**, Node **174**, web-only
+Rust **139**; 4 wire and 8 Pool native focused tests passed. Format,
+strict aw-terminal/aw-cli library Clippy, binary Clippy with the six
+documented unrelated baseline lint categories excepted,
+Workspace/minimal builds and 8 byte-identical browser artifacts passed
+in pinned Nix dev shell. Full Rust coverage was split by package,
+not claimed as one uninterrupted monolithic Cargo invocation.
+
+**Real OS PTYs:** two independent terminal processes, one original
+Bash PID, original source input denied during remote lease. Receiver
+65×20→shell 19×65 and 120×40→39×120. F12 and `quit-all` restore both
+terminal modes; recipient SIGKILL leaves original process and input
+recoverable, original-owner SIGKILL makes recipient fail closed with
+nonzero exit and **no** new shell. Private synthetic config, Tools Off,
+no model/tool run/effect records (the shell modified only private fixtures).
+Native Windows target compilation was
+attempted but **blocked by absent Windows Rust std/core target**, not
+a verified Windows pass; macOS was not host-tested.
+
+**Outside this milestone:** durable owner-independent terminal service,
+remote/multi-machine PTY control, different-user Actor delegation and
+native Windows/macOS acceptance. No browser File/Review docking ticket
+grants native terminal control.
+
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
 never grant Store/File/Git/Session/PTY or model ownership. Do not use
@@ -721,10 +778,12 @@ in a browser message.
 
 The **read-only File and immutable Git Review** ticket/API, browser popup
 and bounded Find/scroll/selection/focus continuity are implemented.
-Native cross-terminal docking and **automatically reopening** after restart
-are not implemented. Fresh receiver confirmation, origin-preserving denial,
-and same-owner profile pairing are verified; distinct Actor grants, arbitrary
-partitions, crashes immediately after ACK, and ambiguous outcomes remain open.
+The browser handoff alone does not control a native PTY. The
+`c98987a` milestone above adds explicit **live-owner Unix PTY docking**;
+automatic recovery after the original owner exits remains unimplemented.
+Fresh receiver confirmation, origin-preserving denial and same-owner
+profile pairing are verified; distinct Actor grants, arbitrary partitions,
+post-ACK crashes and ambiguous browser outcomes remain open.
 No serialized
 layout migration was introduced: version **0.15.0**, SQLite **33**, JSONL
 **1**, native saved layout **v4**, and all original runtime and resource
