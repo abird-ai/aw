@@ -191,6 +191,33 @@ body.resizing-sidebar {
   gap: 7px;
   text-align: left;
 }
+.browser-pair-invite,
+.dock-link-share {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.browser-pair-invite input,
+.dock-link-share input {
+  min-width: 0;
+  width: 100%;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  background: var(--canvas);
+  font: 10px/1.4 Geist Mono, ui-monospace, monospace;
+}
+.browser-pair-invite > div { display: flex; gap: 6px; justify-content: flex-end; }
+.dock-link-share { flex: none; margin: 0 10px 7px; }
+.dock-link-share > button { justify-self: end; }
 .quiet,
 .icon-button {
   padding: 5px 8px;

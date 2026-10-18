@@ -28,6 +28,7 @@ export function Icon(props) {
     chat: <path d="M4 5h16v11H9l-5 4z"/>,
     refresh: <><path d="M20 6v5h-5"/><path d="M4 18v-5h5"/><path d="M6.1 8a7 7 0 0 1 11.5-1.9L20 11M4 13l2.4 4.9A7 7 0 0 0 17.9 16"/></>,
     popout: <><rect x="3.5" y="9" width="11.5" height="11.5" rx="1.5"/><path d="M12 4h8v8M20 4l-10 10"/></>,
+    link: <><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7l-1.2 1.2"/><path d="M14 11a5 5 0 0 0-7.1 0l-2 2a5 5 0 0 0 7.1 7l1.2-1.2"/></>,
   };
   return <svg {...common} class={props.class || ""}>{paths[props.name] || paths.file}</svg>;
 }

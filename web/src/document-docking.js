@@ -18,14 +18,15 @@ export function createDocumentDocking({
   api, views, currentOwner, select, close, popup,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   timeoutMs = MAX_WAIT_MS, onProgress = () => {}, isRendered = () => true,
-  retireWindow = () => {},
+  retireWindow = () => {}, onLinkReady = () => {},
+  makeLink = ticket => new URL("#aw-dock=" + ticket, location.href).href,
   capture = () => null, restore = async () => true,
   navigate = (window, ticket) => {
     window.opener = null;
     window.location.replace(new URL("#aw-dock=" + ticket, location.href).href);
   },
 }) {
-  if ([api, currentOwner, select, close, popup, sleep, onProgress, isRendered, capture, restore, retireWindow, navigate]
+  if ([api, currentOwner, select, close, popup, sleep, onProgress, isRendered, capture, restore, retireWindow, onLinkReady, makeLink, navigate]
     .some(callback => typeof callback !== "function")) throw new Error("Read-only document docking needs original-browser callbacks.");
   let disposed = false;
   let staged = null;
@@ -57,7 +58,7 @@ export function createDocumentDocking({
     try { window?.close?.(); } catch { /* already closed */ }
   };
 
-  async function send(documentId) {
+  async function send(documentId, { external = false } = {}) {
     const document = views.getDocument(documentId);
     const source = currentOwner();
     const kind = document?.kind;
@@ -87,8 +88,8 @@ export function createDocumentDocking({
         && active.kind === kind && !active.unavailable && active.data === initial.data
         && (kind !== "review" || active.data.id === originalResource);
     };
-    const nextWindow = popup(); // Must execute during the direct user click.
-    if (!nextWindow) throw new Error("The browser blocked the new window. Allow pop-ups for the local owner.");
+    const nextWindow = external ? null : popup(); // Only the popup path needs the direct click.
+    if (!external && !nextWindow) throw new Error("The browser blocked the new window. Allow pop-ups for the local owner.");
     let origin, ticket, released = false, navigated = false, requestedConfirmation = false;
     onProgress(documentId, true);
     try {
@@ -116,11 +117,12 @@ export function createDocumentDocking({
       if (!sameDocument()) throw new Error("Original view changed during preparation.");
       // The fragment never reaches the HTTP owner and is removed from browser
       // history by the receiver before any inspection. Not an authority token.
-      navigate(nextWindow, ticket);
+      if (external) onLinkReady(documentId, makeLink(ticket));
+      else navigate(nextWindow, ticket);
       navigated = true;
       const until = Date.now() + Math.min(Math.max(timeoutMs, 1000), MAX_WAIT_MS);
       while (Date.now() < until && !disposed) {
-        if (!sameDocument() || nextWindow.closed) break;
+        if (!sameDocument() || (nextWindow && nextWindow.closed)) break;
         const result = await api("/api/dock/status", envelope(origin, ticket));
         if (result.document_id !== documentId) throw new Error("Handoff target changed.");
         if (result.state === "confirming") {
@@ -157,6 +159,7 @@ export function createDocumentDocking({
       if (!navigated) safeClose(nextWindow);
       throw error;
     } finally {
+      if (external) onLinkReady(documentId, null);
       onProgress(documentId, false);
     }
   }

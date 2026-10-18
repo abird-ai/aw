@@ -1763,6 +1763,9 @@ function App() {
   const [nav, setNav] = createSignal("sessions");
   const [mobileNav, setMobileNav] = createSignal(false);
   const [dockingDocument, setDockingDocument] = createSignal(null);
+  const [handoffLink, setHandoffLink] = createSignal(null);
+  const [pairedBrowserMode, setPairedBrowserMode] = createSignal(false);
+  const [browserInvite, setBrowserInvite] = createSignal(null);
   const [settings, setSettings] = createSignal(false);
   const [presentationUi, setPresentationUi] = createSignal(normalizedUi({}));
   const [workspaceEnabled, setWorkspaceEnabled] = createSignal(false);
@@ -1772,6 +1775,7 @@ function App() {
     Math.min(520, Math.max(220, Number(localStorage.getItem("aw.sidebar.width")) || 286)),
   );
   let resizingSidebar = false;
+  let browserInviteExpiry;
   // The correlation fragment is removed from history before any API request.
   // It is held only in this renderer's memory, never browser storage.
   let pendingDockTicket = takeDocumentDockTicket(window.location, window.history);
@@ -1843,6 +1847,8 @@ function App() {
   }
   const documentDocking = createDocumentDocking({
     api, views: workspaceViews,
+    onLinkReady: (documentId, url) => setHandoffLink(current =>
+      url ? { documentId, url } : current?.documentId === documentId ? null : current),
     retireWindow: windowIdentity => {
       // Best-effort pagehide signal; owner also requires a fresh post-accept
       // receiver ACK, so lost unload packets never authorize origin closure.
@@ -1931,6 +1937,10 @@ function App() {
     expiredSource?.close();
     clearAgentViews("Browser access expired.");
     clearWorkspaceViews();
+    setBrowserInvite(null);
+    setHandoffLink(null);
+    setPairedBrowserMode(false);
+    clearTimeout(browserInviteExpiry);
     setPaired(false);
     setOnline(false);
     setConnection("Not paired");
@@ -2422,11 +2432,42 @@ function App() {
     listen("auth_expired", expireBrowserAccess);
   }
 
+  async function issueBrowserInvite() {
+    setError("");
+    try {
+      const result = await api("/api/browser/invite", {});
+      if (!/^[a-f0-9]{64}$/u.test(result.code) || result.role !== "same_owner_browser") {
+        throw new Error("Owner returned an invalid browser invitation.");
+      }
+      clearTimeout(browserInviteExpiry);
+      setBrowserInvite({ code: result.code });
+      const lifetime = Math.min(300, Math.max(1, Number(result.expires_in_seconds) || 1));
+      browserInviteExpiry = setTimeout(() => setBrowserInvite(current =>
+        current?.code === result.code ? null : current), lifetime * 1000);
+    } catch (error) { setError(error.message); }
+  }
+  async function cancelBrowserInvite() {
+    try {
+      const response = await api("/api/browser/invite/revoke", {});
+      if (!response.revoked) throw new Error("Owner did not confirm invitation cancellation.");
+      clearTimeout(browserInviteExpiry);
+      setBrowserInvite(null);
+    } catch (error) { setError(error.message); }
+  }
+  async function copyPrivateLink(value) {
+    try { await navigator.clipboard.writeText(value); }
+    catch { setError("Unable to copy automatically. Select the displayed value and copy it."); }
+  }
   async function loadPresentation() {
     try {
       const config = await api("/api/settings");
       if (config?.ui) setPresentationUi(normalizedUi(config.ui));
-    } catch {}
+      if (config?.local_single_user) setPairedBrowserMode(false);
+    } catch (error) {
+      // LocalWeb alone serves Settings. A paired web owner is deliberately
+      // restricted from provider Settings but can explicitly invite siblings.
+      if (error?.status === 403) setPairedBrowserMode(true);
+    }
   }
 
   async function refresh(reconnect = true) {
@@ -2495,6 +2536,7 @@ function App() {
     void refresh().then(() => void receivePendingDocumentDock());
   });
   onCleanup(() => {
+    clearTimeout(browserInviteExpiry);
     documentDocking.dispose();
     presentationControllers.clear();
     observationLifetime = {};
@@ -2513,6 +2555,7 @@ function App() {
     setError("");
     try {
       await api("/api/pair", { code: pairCode().trim() });
+      setPairedBrowserMode(true);
       setPairCode("");
       await refresh();
       await receivePendingDocumentDock();
@@ -2817,7 +2860,7 @@ function App() {
           <form class="pair-card" onSubmit={pair}>
             <Mark />
             <h1>Connect to aw</h1>
-            <p>Use the one-time pairing code from your local aw owner. Provider credentials never enter this browser.</p>
+            <p>Use the one-time code from your aw owner or an explicitly paired browser. A second browser receives the same owner's access, not a separate account.</p>
             <label class="field">
               <span>Pairing code</span>
               <input type="password" value={pairCode()} onInput={event => setPairCode(event.currentTarget.value)} autocomplete="off" />
@@ -2898,6 +2941,25 @@ function App() {
             </For>
           </div>
           <div class="sidebar-footer">
+            <Show when={pairedBrowserMode()}>
+              <button class="quiet settings-link" type="button" aria-label="Invite another browser profile"
+                onClick={() => void issueBrowserInvite()}>
+                <Icon name="link" size={14} />
+                <span>Pair another browser</span>
+              </button>
+              <Show when={browserInvite()}>
+                <div class="browser-pair-invite">
+                  <span>Grants the same owner access, including sessions and enabled tools. One use; expires within 5 minutes. Cancel stops an unused code; logging out revokes every paired browser.</span>
+                  <input type="text" aria-label="One-time second browser code" readOnly
+                    value={browserInvite().code} onFocus={event => event.currentTarget.select()} />
+                  <div>
+                    <button class="quiet" type="button" onClick={() => void copyPrivateLink(browserInvite().code)}>Copy code</button>
+                    <button class="quiet" type="button" aria-label="Cancel browser invitation"
+                      onClick={() => void cancelBrowserInvite()}>Cancel invitation</button>
+                  </div>
+                </div>
+              </Show>
+            </Show>
             <button class="quiet settings-link" onClick={() => setSettings(true)}>
               <Icon name="settings" size={14} />
               <span>Settings</span>
@@ -3207,9 +3269,29 @@ function App() {
                         onClick={() => void documentDocking.send(id).catch(error => setError(error.message))}>
                         <Icon name="popout" size={13} />
                       </button>
+                      <button class="mini-icon" type="button"
+                        aria-label={document()?.kind === "review" ? "Move Review to another paired browser" : "Move File to another paired browser"}
+                        title="Prepare a short-lived read-only link for a separately paired browser profile"
+                        disabled={Boolean(dockingDocument())}
+                        onPointerDown={() => documentDocking.stage(id)}
+                        onPointerLeave={() => documentDocking.cancelStage(id)}
+                        onPointerCancel={() => documentDocking.cancelStage(id)}
+                        onClick={() => void documentDocking.send(id, { external: true }).catch(error => setError(error.message))}>
+                        <Icon name="link" size={13} />
+                      </button>
                     </Show>
                     <button class="mini-icon" type="button" aria-label="Refresh document" title="Refresh this exact document" onClick={() => void workspaceViews.refreshDocument(id)}><Icon name="refresh" size={13} /></button>
                   </div>
+                  <Show when={handoffLink()?.documentId === id}>
+                    <div class="dock-link-share" role="status">
+                      <span>Open in another paired browser within 90 seconds. The original stays open until the receiving window confirms.</span>
+                      <input type="text" readOnly value={handoffLink().url}
+                        aria-label="Read-only docking link for another browser"
+                        onFocus={event => event.currentTarget.select()} />
+                      <button type="button" class="quiet"
+                        onClick={() => void copyPrivateLink(handoffLink().url)}>Copy link</button>
+                    </div>
+                  </Show>
                   <Show when={document()?.pending}><div class="document-state" role="status">Loading…</div></Show>
                   <Show when={document()?.error}><div class="document-state" role="status">{document().error}</div></Show>
                   <Show when={data()} fallback={<div class="navigator-empty">{document()?.pending ? "" : "This document is unavailable. Refresh to try again."}</div>}>

@@ -110,6 +110,10 @@ mod workspace {
 
 const PAIR_TTL: Duration = Duration::from_secs(300);
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+/// One human-owner authority with up to four independent browser cookie jars.
+/// Sibling cookies are *not* separate accounts; logout revokes all of them.
+const MAX_OWNER_BROWSER_SESSIONS: usize = 4;
+const MAX_BROWSER_INVITES_PER_MINUTE: usize = 4;
 const MAX_RECEIPTS: usize = 256;
 const MAX_EVENT_CLIENTS: usize = 8;
 const API_BODY_LIMIT: usize = aw_agent_core::limits::MAX_PROMPT_BYTES + 4096;
@@ -229,6 +233,11 @@ struct Auth {
     pairing_expires: Instant,
     used: bool,
     cookie_hash: Option<[u8; 32]>,
+    /// Secondary distinct HttpOnly cookies share this owner's expiry and
+    /// revocation. They do not add an Actor, provider or grant.
+    sibling_cookie_hashes: Vec<[u8; 32]>,
+    invite: Option<([u8; 32], Instant)>,
+    invite_issuances: Vec<Instant>,
     session_expires: Option<Instant>,
     failures: Vec<Instant>,
 }
@@ -996,6 +1005,9 @@ fn application_scoped(
                 pairing_expires: Instant::now() + PAIR_TTL,
                 used: false,
                 cookie_hash: None,
+                sibling_cookie_hashes: Vec::new(),
+                invite: None,
+                invite_issuances: Vec::new(),
                 session_expires: None,
                 failures: Vec::new(),
             }),
@@ -1090,6 +1102,8 @@ fn application_scoped(
         .route("/api/settings/chatgpt/finish", post(settings_chatgpt_finish))
         .route("/healthz",get(||async {Json(serde_json::json!({"service":"aw","phase":7,"version":env!("CARGO_PKG_VERSION")}))}))
         .route("/api/pair",post(pair))
+        .route("/api/browser/invite",post(browser_invite))
+        .route("/api/browser/invite/revoke",post(revoke_browser_invite))
         .route("/api/session",get(snapshot))
         .route("/api/accounts",get(self::accounts))
         .route("/api/sessions",get(session_list))
@@ -1317,10 +1331,19 @@ fn authenticated(app: &AppState, headers: &HeaderMap) -> bool {
         return false;
     }
     let auth = lock(&app.0.auth);
-    auth.session_expires.is_some_and(|t| Instant::now() < t)
-        && auth
-            .cookie_hash
-            .is_some_and(|h| bool::from(h.ct_eq(&hash(token.as_bytes()))))
+    if !auth_alive_at(&auth) {
+        return false;
+    }
+    let digest = hash(token.as_bytes());
+    let primary = auth
+        .cookie_hash
+        .is_some_and(|h| bool::from(h.ct_eq(&digest)));
+    // Bound the entire set and always compare each active sibling cookie.
+    let sibling = auth
+        .sibling_cookie_hashes
+        .iter()
+        .fold(false, |accepted, h| accepted | bool::from(h.ct_eq(&digest)));
+    primary | sibling
 }
 fn auth_alive_at(auth: &Auth) -> bool {
     auth.cookie_hash.is_some() && auth.session_expires.is_some_and(|t| Instant::now() < t)
@@ -1335,6 +1358,104 @@ fn auth_alive(app: &AppState) -> bool {
         Authority::LocalWeb => true,
     }
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyBrowserInvite {}
+
+/// Explicit user-authorized second-browser invitation. The random code is
+/// shown only to the already authenticated owner; never placed in a URL,
+/// response cookie, journal, log or saved State. It adds a same-principal
+/// browser cookie, not an Actor, Session, provider or File-root grant.
+async fn browser_invite(
+    State(app): State<AppState>,
+    payload: std::result::Result<Json<EmptyBrowserInvite>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Response> {
+    if !matches!(app.1, Authority::Browser) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "second-browser pairing requires an already paired browser owner",
+        ));
+    }
+    let Json(_) = payload.map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid browser invitation request",
+        )
+    })?;
+    let code = random_token().map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "browser invitation randomness unavailable",
+        )
+    })?;
+    let mut auth = lock(&app.0.auth);
+    let now = Instant::now();
+    auth.invite_issuances
+        .retain(|issued| now.duration_since(*issued) < Duration::from_secs(60));
+    if !auth.used || !auth_alive_at(&auth) {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "owner pairing has expired",
+        ));
+    }
+    if auth.sibling_cookie_hashes.len() + 1 >= MAX_OWNER_BROWSER_SESSIONS
+        || auth.invite_issuances.len() >= MAX_BROWSER_INVITES_PER_MINUTE
+    {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "browser pairing limit reached",
+        ));
+    }
+    let remaining = auth
+        .session_expires
+        .expect("active owner has expiry")
+        .saturating_duration_since(now);
+    let lifetime = remaining.min(PAIR_TTL);
+    if lifetime.is_zero() {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "owner pairing has expired",
+        ));
+    }
+    // Only the newest explicit invitation can be used. Rotating a code
+    // revokes the older still-unconsumed code without touching existing tabs.
+    auth.invite = Some((hash(code.as_bytes()), now + lifetime));
+    auth.invite_issuances.push(now);
+    Ok(Json(serde_json::json!({
+        "code":code,
+        "expires_in_seconds":lifetime.as_secs(),
+        "role":"same_owner_browser",
+        "max_browsers":MAX_OWNER_BROWSER_SESSIONS,
+    }))
+    .into_response())
+}
+
+/// Explicitly invalidate an unused secondary-browser invitation. Hiding a
+/// code in the UI must not leave a still-valid invisible owner access token.
+async fn revoke_browser_invite(
+    State(app): State<AppState>,
+    payload: std::result::Result<Json<EmptyBrowserInvite>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Response> {
+    if !matches!(app.1, Authority::Browser) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "browser pairing is not enabled",
+        ));
+    }
+    let Json(_) = payload.map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid invitation revocation request",
+        )
+    })?;
+    let mut auth = lock(&app.0.auth);
+    if !auth.used || !auth_alive_at(&auth) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "owner pairing expired"));
+    }
+    auth.invite = None;
+    Ok(Json(serde_json::json!({"revoked":true})).into_response())
+}
+
 async fn pair(
     State(app): State<AppState>,
     payload: std::result::Result<Json<PairCommand>, axum::extract::rejection::JsonRejection>,
@@ -1357,15 +1478,27 @@ async fn pair(
             "too many pairing attempts; wait one minute",
         ));
     }
-    if auth.used
-        || now >= auth.pairing_expires
-        || !valid_token(&command.code)
-        || !bool::from(auth.pairing_hash.ct_eq(&hash(command.code.as_bytes())))
-    {
+    // One use of the original operator-visible code. Additional browsers
+    // require a newly issued explicit invitation from an existing owner
+    // browser. They share the original expiry and global logout/revocation.
+    let digest = valid_token(&command.code).then(|| hash(command.code.as_bytes()));
+    let initial = digest.is_some_and(|candidate| {
+        !auth.used && now < auth.pairing_expires && bool::from(auth.pairing_hash.ct_eq(&candidate))
+    });
+    let invited = digest.is_some_and(|candidate| {
+        auth.used
+            && auth_alive_at(&auth)
+            && auth.sibling_cookie_hashes.len() + 1 < MAX_OWNER_BROWSER_SESSIONS
+            && auth
+                .invite
+                .as_ref()
+                .is_some_and(|(code, expires)| now < *expires && bool::from(code.ct_eq(&candidate)))
+    });
+    if !initial && !invited {
         auth.failures.push(now);
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
-            "pairing code invalid, used or expired; restart owner for a new code",
+            "pairing code invalid, used or expired; request a new explicit invitation",
         ));
     }
     let token = random_token().map_err(|_| {
@@ -1374,15 +1507,30 @@ async fn pair(
             "secure randomness unavailable",
         )
     })?;
-    auth.used = true;
-    auth.cookie_hash = Some(hash(token.as_bytes()));
-    auth.session_expires = Some(now + SESSION_TTL);
+    if initial {
+        auth.used = true;
+        auth.cookie_hash = Some(hash(token.as_bytes()));
+        auth.session_expires = Some(now + SESSION_TTL);
+    } else {
+        // The original owner-wide session lifetime is never renewed by
+        // inviting another browser profile. Logout revokes every sibling.
+        auth.invite = None;
+        auth.sibling_cookie_hashes.push(hash(token.as_bytes()));
+    }
+    let seconds_left = auth
+        .session_expires
+        .expect("paired owner has expiry")
+        .saturating_duration_since(now)
+        .as_secs()
+        .max(1);
     let cookie = format!(
-        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={seconds_left}",
         app.0.cookie_name,
-        SESSION_TTL.as_secs()
     );
-    let mut response = Json(serde_json::json!({"paired":true})).into_response();
+    let mut response = Json(serde_json::json!({
+        "paired":true, "same_owner":true, "secondary_browser":invited
+    }))
+    .into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).map_err(|_| {
@@ -1394,6 +1542,7 @@ async fn pair(
     );
     Ok(response)
 }
+
 fn local_settings_guard(
     app: &AppState,
 ) -> ApiResult<std::sync::MutexGuard<'_, LocalSettingsState>> {
@@ -3082,7 +3231,12 @@ async fn logout(State(app): State<AppState>) -> ApiResult<Response> {
         }))
         .into_response());
     }
-    lock(&app.0.auth).cookie_hash = None;
+    {
+        let mut auth = lock(&app.0.auth);
+        auth.cookie_hash = None;
+        auth.sibling_cookie_hashes.clear();
+        auth.invite = None;
+    }
     shutdown_surfaces(&app).await;
     let _ = app.0.session.events.send(WireEvent {
         sequence: 0,
@@ -3205,6 +3359,10 @@ mod tests {
     mod agent_views {
         use super::*;
         include!("web/agent_view_tests.rs");
+    }
+    mod browser_pairing {
+        use super::*;
+        include!("web/browser_invite_tests.rs");
     }
     #[cfg(feature = "surfaces")]
     mod docking {

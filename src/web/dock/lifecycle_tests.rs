@@ -200,3 +200,144 @@ async fn window_and_ticket_capacity_are_bounded_and_reclaimable() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(lock(&state.0.session.persistence).is_none());
 }
+
+
+#[cfg(feature = "surfaces")]
+#[tokio::test]
+async fn two_separately_paired_cookie_jars_can_hand_off_exact_file_under_one_owner() {
+    let (router, app, calls, _root) = surface_app();
+    let primary = paired(&router).await;
+    let secondary = super::browser_pairing::sibling_cookie(&router, &primary).await;
+    let origin = dock_window(&router, &primary).await;
+    let receiver = dock_window(&router, &secondary).await;
+    let ticket = dock_prepared(&router, &primary, &origin).await;
+    let original = credentials(&origin, &ticket);
+    let receiving = credentials(&receiver, &ticket);
+    assert_eq!(request_dock(&router, Some(&secondary), "inspect",
+        receiving.clone()).await.1["path"], "sample.rs");
+    // The registered sibling has its *own* cookie but the exact same
+    // preexisting owner actor/scope; it independently authorizes the File read.
+    let scoped = router.clone().oneshot(request(
+        "POST", "/api/workspace/action",
+        serde_json::json!({"op":"view",
+            "source_id":origin["source_id"],"scope_id":origin["scope_id"],
+            "request":{"op":"file","path":"sample.rs"}}),
+        Some(&secondary),
+    )).await.unwrap();
+    assert_eq!(scoped.status(), StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&secondary), "accept",
+        receiving.clone()).await.1["state"], "accepted");
+    assert_eq!(request_dock(&router, Some(&primary), "confirm",
+        original.clone()).await.1["state"], "confirming");
+    assert_eq!(request_dock(&router, Some(&primary), "release",
+        original.clone()).await.0, StatusCode::CONFLICT);
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat",
+        receiving.clone()).await.1["state"], "accepted");
+    assert_eq!(request_dock(&router, Some(&primary), "release",
+        original.clone()).await.1["state"], "released");
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat",
+        receiving).await.1["state"], "released");
+    assert!(lock(&app.0.session.persistence).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn separate_cookie_profiles_cannot_release_after_receiver_retirement_post_ack() {
+    let (router, app, calls, _root) = surface_app();
+    let primary = paired(&router).await;
+    let secondary = super::browser_pairing::sibling_cookie(&router, &primary).await;
+    let origin = dock_window(&router, &primary).await;
+    let receiver = dock_window(&router, &secondary).await;
+    let ticket = dock_prepared(&router, &primary, &origin).await;
+    let source = credentials(&origin, &ticket);
+    let recipient = credentials(&receiver, &ticket);
+    assert_eq!(request_dock(&router, Some(&secondary), "accept", recipient.clone()).await.0,
+        StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&primary), "confirm", source.clone()).await.0,
+        StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat", recipient.clone()).await.1["state"],
+        "accepted");
+    // Owner processes a real accepted-window retirement after fresh ACK,
+    // before the original commits release. Browser registration alone cannot
+    // revive even an ACK younger than three seconds.
+    assert_eq!(request_dock(&router, Some(&secondary), "retire", recipient.clone()).await.0,
+        StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&primary), "status", source.clone()).await.1["state"],
+        "receiver_unavailable");
+    assert_eq!(request_dock(&router, Some(&primary), "release", source.clone()).await.0,
+        StatusCode::CONFLICT);
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat", recipient).await.0,
+        StatusCode::FORBIDDEN);
+    let replacement = dock_window(&router, &secondary).await;
+    assert_ne!(replacement["window_id"], receiver["window_id"]);
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat",
+        credentials(&replacement, &ticket)).await.0, StatusCode::CONFLICT);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(lock(&app.0.session.persistence).is_none());
+}
+
+#[tokio::test]
+async fn separate_cookie_profiles_release_retire_race_is_linearized_without_double_release() {
+    let (router, app, calls, _root) = surface_app();
+    let primary = paired(&router).await;
+    let secondary = super::browser_pairing::sibling_cookie(&router, &primary).await;
+    let origin = dock_window(&router, &primary).await;
+    let receiver = dock_window(&router, &secondary).await;
+    let ticket = dock_prepared(&router, &primary, &origin).await;
+    let source = credentials(&origin, &ticket);
+    let recipient = credentials(&receiver, &ticket);
+    assert_eq!(request_dock(&router, Some(&secondary), "accept", recipient.clone()).await.0,
+        StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&primary), "confirm", source.clone()).await.0,
+        StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat", recipient.clone()).await.0,
+        StatusCode::OK);
+    let (released, retired) = tokio::join!(
+        request_dock(&router, Some(&primary), "release", source.clone()),
+        request_dock(&router, Some(&secondary), "retire", recipient.clone()),
+    );
+    assert_eq!(retired.0, StatusCode::OK);
+    assert!(matches!(released.0, StatusCode::OK | StatusCode::CONFLICT));
+    let status = request_dock(&router, Some(&primary), "status", source.clone()).await;
+    assert_eq!(status.0, StatusCode::OK);
+    if released.0 == StatusCode::OK {
+        // The receiver could still crash immediately after the release
+        // commit: this cannot be prevented by a short transport heartbeat.
+        assert_eq!(status.1["state"], "released");
+    } else {
+        assert_eq!(status.1["state"], "receiver_unavailable");
+    }
+    assert_eq!(request_dock(&router, Some(&primary), "release", source).await.0,
+        StatusCode::CONFLICT, "once committed or retired, no second release is possible");
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat", recipient).await.0,
+        StatusCode::FORBIDDEN);
+    assert!(lock(&app.0.session.persistence).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn logout_from_invited_browser_invalidates_inflight_owner_dock_receipt() {
+    let (router, app, calls, _root) = surface_app();
+    let primary = paired(&router).await;
+    let secondary = super::browser_pairing::sibling_cookie(&router, &primary).await;
+    let origin = dock_window(&router, &primary).await;
+    let receiver = dock_window(&router, &secondary).await;
+    let ticket = dock_prepared(&router, &primary, &origin).await;
+    let source = credentials(&origin, &ticket);
+    let recipient = credentials(&receiver, &ticket);
+    assert_eq!(request_dock(&router, Some(&secondary), "accept", recipient.clone()).await.0,
+        StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&primary), "confirm", source.clone()).await.0,
+        StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat", recipient.clone()).await.0,
+        StatusCode::OK);
+    let logout = router.clone().oneshot(request("POST", "/api/logout",
+        serde_json::json!({}), Some(&secondary))).await.unwrap();
+    assert_eq!(logout.status(), StatusCode::OK);
+    assert_eq!(request_dock(&router, Some(&primary), "release", source.clone()).await.0,
+        StatusCode::UNAUTHORIZED);
+    assert_eq!(request_dock(&router, Some(&secondary), "heartbeat", recipient).await.0,
+        StatusCode::UNAUTHORIZED);
+    assert!(!auth_alive(&app));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
