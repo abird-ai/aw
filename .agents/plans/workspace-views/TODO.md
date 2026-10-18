@@ -197,10 +197,24 @@ Design and binding decisions: [README.md](README.md).
 - [x] Add permanent `tests/native_persistent_pty.py` and actual **independent Linux OS PTY** acceptance on source: `reconnect` (three frontends, same Bash PID after launcher and receiver exit), `competition` (simultaneous second PTY denied), `workspace-exit` (real unrelated Workspace exits while broker remains, subsequent read/input unchanged), `shell-exit` (broker/endpoint exit with child, no shell replay) and `broker-loss` (receiver exits nonzero and restores terminal, no shell revival). Original token replay denied; proper 0700/0600, custom private TMPDIR, filtered launcher credential, explicit shutdown/cleanup and no user account/provider requests.
 - [x] Pinned Nix candidate tests: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` (**1,324 passed, four ignored**); `cargo test --locked -p aw-store --lib -- --test-threads=4` (**201 passed**); five `aw-store` integration targets (**7+29+9+23+88 = 156 passed**); web-only Rust (**139 passed**); 12 Node suites (**174 passed**). Strict aw-platform-unix and aw-cli library Clippy, scoped binary Clippy (documented four preexisting categories excluded), fmt, Workspace/minimal feature builds, `aw 0.15.0` binary and byte-identical Vite rebuild (**8/8**). Full Rust coverage was split by package, not a claimed single uninterrupted monolithic Cargo run.
 
+### `a1100a9d344c5835eb73dedc673e55570ad17219` — atomic PTY-master plus pidfd escrow (kernel-only)
+
+- [x] Extend authenticated bounded Linux `SCM_RIGHTS` with exact one/two-FD frame cardinality and paired escrow. `receive_pair` returns independently owned, close-on-exec PTY master + pidfd; malformed, extra/missing, wrong-version/proof messages close received FDs, never granting caller command rights.
+- [x] Add `pid_identity::open/exited` (Linux pidfd) and test against an actual private child. Test the **same shell PID** after source process exit, kernel identity still live, and eventual exit observation. Source refusal retains the original shell controller.
+- [x] Strict Unix platform all-targets, terminal and aw-cli library Clippy, fmt; source-candidate split Rust 1,333 non-Store + 201 Store lib + 156 integrations, Node 174, web-only 139, workspace/minimal features and byte-identical 8/8 bundle passed.
+
+### `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a` — Linux live PTY migration prerequisites (not yet product migration)
+
+- [x] Add Linux-only, bounded `SCM_RIGHTS` transfer of one FD between same-UID peers with `SO_PEERCRED`, explicit 256-bit proof, `CLOEXEC`, and failure-path FD closure. No hidden broker activation, owner change or persistent schema.
+- [x] Real independent-process `portable-pty` Bash tests verify **the same shell PID** after the original owner process exits and the recipient holds its exact master FD. A rejected offer leaves the original shell usable. Private cleanup guards and no shell/input replay; no real user shell.
+- [x] VT100 parser test confirms visible-cell reconstruction is insufficient for lossless migration: formatted output does not preserve **alternate-screen ownership**. Reader quiescence, complete parser state, child guard/pidfd, and atomic commit remain hard gates.
+- [x] Pinned source candidate: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` (**1,330 passed; 4 ignored**), Store library (**201 passed**), five Store integration targets (**156 passed**), browser Node (**174 passed**), web-only Rust (**139 passed**), strict platform/terminal/library Clippy, formatting and Workspace/minimal builds; 8/8 byte-identical browser assets. This is split-package coverage, not a claimed monolithic Cargo run.
+- [x] Full protocol constraints and next acceptance steps recorded in [Live PTY migration design](LIVE-PTY-MIGRATION.md). **Do not add `terminal-promote` or mark live migration implemented** until the complete production acceptance gate passes.
+
 ## Uncommitted
 
 - [~] **Distinct user/Actor** delegation, individually narrowed/revocable browser grants and remote-device trust remain unimplemented. Browser post-ACK crashes/partitions are inspect-only; recent ACK never proves perpetual process liveness.
-- [ ] **Migration of an already-running Workspace-owned PTY** into a detached broker remains unimplemented. Newly created, explicit broker-owned PTYs survive their *launcher/Workspace frontend*, not broker SIGKILL, machine reboot or loss of their PTY master. Remote/multi-machine control and Windows/macOS host certification remain separate future features.
+- [ ] **Live migration of an already-running Workspace-owned PTY** remains unimplemented. Kernel-atomic PTY master + pidfd transfer is a proven prerequisite, **not a completed promotion**. Finish single-reader quiescence, complete parser/scrollback/escape checkpoint, adopted child custody with `ChildGuard` disarm, and authenticated release/rollback/UNKNOWN fencing. Newly created broker-owned PTYs survive launcher/frontend exit, not broker SIGKILL or reboot. Remote/multi-machine control and Windows/macOS certification remain separate.
 
 
 ## Tests and verification
