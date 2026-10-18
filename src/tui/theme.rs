@@ -1,5 +1,6 @@
 use aw::config::ThemeMode;
 use ratatui::style::{Color, Modifier, Style};
+use std::io::IsTerminal;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
@@ -205,7 +206,7 @@ pub fn palette(mode: ThemeMode) -> Palette {
             surface: Color::Rgb(244, 245, 242),
             foreground: Color::Rgb(36, 39, 37),
             muted: Color::Rgb(105, 113, 109),
-            faint: Color::Rgb(144, 153, 147),
+            faint: Color::Rgb(102, 112, 104),
             accent: Color::Rgb(56, 104, 199),
             accent_foreground: Color::White,
             user_prompt_foreground: Color::Rgb(42, 55, 69),
@@ -231,7 +232,7 @@ pub fn palette(mode: ThemeMode) -> Palette {
             surface: Color::Rgb(31, 36, 33),
             foreground: Color::Rgb(237, 241, 238),
             muted: Color::Rgb(164, 173, 167),
-            faint: Color::Rgb(120, 131, 124),
+            faint: Color::Rgb(146, 156, 149),
             accent: Color::Rgb(110, 168, 254),
             accent_foreground: Color::Rgb(18, 24, 21),
             user_prompt_foreground: Color::Rgb(224, 234, 244),
@@ -254,6 +255,128 @@ pub fn palette(mode: ThemeMode) -> Palette {
     }
 }
 
+/// Terminal color depth is a presentation capability, not an authority
+/// claim. On a real 16/256-color TTY, approximate explicit RGB themes
+/// instead of emitting unsupported 24-bit escape sequences. TestBackend and
+/// noninteractive output retain exact RGB for reproducible visual fixtures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorDepth { Ansi16, Ansi256, TrueColor }
+
+fn terminal_depth() -> ColorDepth {
+    if let Ok(override_depth) = std::env::var("AW_UI_COLOR_DEPTH") {
+        match override_depth.as_str() {
+            "16" => return ColorDepth::Ansi16,
+            "256" => return ColorDepth::Ansi256,
+            "truecolor" => return ColorDepth::TrueColor,
+            _ => {} // Ignore unsupported values; never execute user text.
+        }
+    }
+    if !std::io::stdout().is_terminal() {
+        return ColorDepth::TrueColor;
+    }
+    let color_term = std::env::var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
+    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    if matches!(color_term.as_str(), "truecolor" | "24bit")
+        || term.contains("direct") || term.contains("truecolor") {
+        ColorDepth::TrueColor
+    } else if term.contains("256color") {
+        ColorDepth::Ansi256
+    } else {
+        ColorDepth::Ansi16
+    }
+}
+
+fn limited_color(value: Color, depth: ColorDepth) -> Color {
+    let Color::Rgb(r, g, b) = value else { return value };
+    match depth {
+        ColorDepth::TrueColor => value,
+        ColorDepth::Ansi256 => {
+            let cube = |channel: u8| -> u8 {
+                if channel < 48 { 0 } else if channel < 115 { 1 }
+                else { ((u16::from(channel) - 35) / 40).min(5) as u8 }
+            };
+            Color::Indexed(16 + 36 * cube(r) + 6 * cube(g) + cube(b))
+        }
+        ColorDepth::Ansi16 => {
+            const CANDIDATES: [(u8,u8,u8,Color);16] = [
+                (0,0,0,Color::Black), (170,0,0,Color::Red),
+                (0,170,0,Color::Green), (170,85,0,Color::Yellow),
+                (0,0,170,Color::Blue), (170,0,170,Color::Magenta),
+                (0,170,170,Color::Cyan), (170,170,170,Color::Gray),
+                (85,85,85,Color::DarkGray), (255,85,85,Color::LightRed),
+                (85,255,85,Color::LightGreen), (255,255,85,Color::LightYellow),
+                (85,85,255,Color::LightBlue), (255,85,255,Color::LightMagenta),
+                (85,255,255,Color::LightCyan), (255,255,255,Color::White),
+            ];
+            let distance = |v: (u8,u8,u8,Color)| {
+                let dr = i32::from(r) - i32::from(v.0);
+                let dg = i32::from(g) - i32::from(v.1);
+                let db = i32::from(b) - i32::from(v.2);
+                2*dr*dr + 4*dg*dg + 3*db*db
+            };
+            CANDIDATES.iter().min_by_key(|candidate| distance(**candidate))
+                .expect("fixed palette has 16 colors").3
+        }
+    }
+}
+
+impl Palette {
+    fn limited(self, depth: ColorDepth, mode: ThemeMode) -> Self {
+        if depth == ColorDepth::TrueColor || mode == ThemeMode::System {
+            return self;
+        }
+        let map = |color| limited_color(color, depth);
+        let mut projected = Self {
+            background: map(self.background),
+            #[cfg(feature = "workspace")]
+            surface: map(self.surface),
+            foreground: map(self.foreground),
+            muted: map(self.muted),
+            faint: map(self.faint),
+            accent: map(self.accent),
+            accent_foreground: map(self.accent_foreground),
+            user_prompt_foreground: map(self.user_prompt_foreground),
+            user_prompt_background: map(self.user_prompt_background),
+            #[cfg(feature = "workspace")]
+            success: map(self.success),
+            #[cfg(feature = "workspace")]
+            warning: map(self.warning),
+            #[cfg(feature = "workspace")]
+            danger: map(self.danger),
+            selection_foreground: map(self.selection_foreground),
+            selection_background: map(self.selection_background),
+            tool_foreground: map(self.tool_foreground),
+            tool_background: map(self.tool_background),
+            tool_neutral_foreground: map(self.tool_neutral_foreground),
+            tool_neutral_background: map(self.tool_neutral_background),
+            tool_error_foreground: map(self.tool_error_foreground),
+            tool_error_background: map(self.tool_error_background),
+        };
+        if depth == ColorDepth::Ansi16 {
+            // Fixed 16-color terminal palettes vary by emulator. Favor basic
+            // legible foreground/background pairs over subtle, low-contrast
+            // near-gray text shades in a limited-color environment.
+            let dark = mode == ThemeMode::Dark;
+            projected.foreground = if dark { Color::White } else { Color::Black };
+            projected.background = if dark { Color::Black } else { Color::White };
+            projected.muted = if dark { Color::Gray } else { Color::Black };
+            projected.faint = projected.muted;
+            // Never collapse success and failure into one nearest-gray ANSI
+            // code. Factual status words remain the primary distinction.
+            projected.tool_foreground = if dark { Color::LightGreen } else { Color::Green };
+            projected.tool_error_foreground = if dark { Color::LightRed } else { Color::Red };
+            projected.tool_neutral_foreground = projected.muted;
+            #[cfg(feature = "workspace")]
+            {
+                projected.success = projected.tool_foreground;
+                projected.danger = projected.tool_error_foreground;
+                projected.warning = if dark { Color::LightYellow } else { Color::Yellow };
+            }
+        }
+        projected
+    }
+}
+
 /// Apply only already parsed/validated semantic accent metadata. A project
 /// palette cannot inject terminal commands or modify status/color authority.
 pub fn palette_for(ui: &aw::config::UiConfig) -> Palette {
@@ -271,7 +394,7 @@ pub fn palette_for(ui: &aw::config::UiConfig) -> Palette {
             }
         }
     }
-    resolved
+    resolved.limited(terminal_depth(), ui.theme)
 }
 
 /// Best-effort terminal-background hint used only for syntax theme selection.
@@ -336,6 +459,40 @@ mod tests {
             !matches!(palette.user_prompt_background, Color::Rgb(_, _, _)),
             "System semantic surfaces must not guess a fixed RGB terminal background"
         );
+    }
+
+    #[test]
+    fn explicit_light_dark_and_system_have_bounded_16_256_truecolor_fallback() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let rgb = palette(mode);
+            let full = rgb.limited(ColorDepth::TrueColor, mode);
+            assert_eq!(full.foreground, rgb.foreground);
+            assert!(matches!(full.foreground, Color::Rgb(_, _, _)));
+            let indexed = rgb.limited(ColorDepth::Ansi256, mode);
+            assert!(matches!(indexed.foreground, Color::Indexed(16..=231)));
+            assert!(matches!(indexed.background, Color::Indexed(16..=231)));
+            assert_ne!(indexed.foreground, indexed.background);
+            let basic = rgb.limited(ColorDepth::Ansi16, mode);
+            assert_eq!(basic.foreground, if mode == ThemeMode::Dark {
+                Color::White
+            } else {
+                Color::Black
+            });
+            assert_eq!(basic.background, if mode == ThemeMode::Dark {
+                Color::Black
+            } else {
+                Color::White
+            });
+            assert_ne!(basic.tool_foreground, basic.tool_error_foreground);
+        }
+        let system = palette(ThemeMode::System);
+        for depth in [ColorDepth::Ansi16, ColorDepth::Ansi256, ColorDepth::TrueColor] {
+            let selected = system.limited(depth, ThemeMode::System);
+            assert_eq!(selected.foreground, Color::Reset);
+            assert_eq!(selected.background, Color::Reset);
+            assert_eq!(selected.user_prompt_background, Color::Blue);
+        }
+        assert_eq!(limited_color(Color::Reset, ColorDepth::Ansi16), Color::Reset);
     }
 
     #[test]

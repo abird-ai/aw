@@ -5,10 +5,11 @@ use aw_ui_extension::{
     Tone, UiExtension,
 };
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span as TuiSpan},
 };
 use std::sync::Arc;
+use super::theme::{palette_for, Palette};
 use unicode_width::UnicodeWidthStr;
 
 const STATUS_ID: &str = "builtin.status-line";
@@ -189,11 +190,12 @@ pub fn project(
 ) -> Vec<Line<'static>> {
     let registry = registry(ui);
     let context = context(status, performance);
+    let palette = palette_for(ui);
     registry
         .project(slot, &context)
         .unwrap_or_default()
         .into_iter()
-        .map(to_tui_line)
+        .map(|line| to_tui_line(line, palette))
         .collect()
 }
 
@@ -216,12 +218,13 @@ pub fn project_status(
         return Vec::new();
     }
     let context = context(status, None);
+    let palette = palette_for(ui);
     ui.status_lines
         .iter()
         .filter(|line| line.region == region)
         .filter_map(|line| {
-            let left = status_tui_spans(&line.items, &context);
-            let right = status_tui_spans(&line.right_items, &context);
+            let left = status_tui_spans(&line.items, &context, palette);
+            let right = status_tui_spans(&line.right_items, &context, palette);
             (!left.is_empty() || !right.is_empty()).then(|| balanced_line(left, right, width))
         })
         .collect()
@@ -291,10 +294,10 @@ fn status_spans(items: &[StatusItem], context: &Context) -> Vec<Span> {
     spans
 }
 
-fn status_tui_spans(items: &[StatusItem], context: &Context) -> Vec<TuiSpan<'static>> {
+fn status_tui_spans(items: &[StatusItem], context: &Context, palette: Palette) -> Vec<TuiSpan<'static>> {
     status_spans(items, context)
         .into_iter()
-        .map(to_tui_span)
+        .map(|span| to_tui_span(span, palette))
         .collect()
 }
 
@@ -379,8 +382,8 @@ fn waterfall(stats: &Performance, width: usize) -> Option<String> {
     Some(format!("{}{}", "·".repeat(wait), "━".repeat(width.saturating_sub(wait))))
 }
 
-fn to_tui_span(span: Span) -> TuiSpan<'static> {
-    let mut style = tone_style(span.tone);
+fn to_tui_span(span: Span, palette: Palette) -> TuiSpan<'static> {
+    let mut style = tone_style(span.tone, palette);
     if span.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -395,34 +398,60 @@ fn to_tui_span(span: Span) -> TuiSpan<'static> {
     TuiSpan::styled(safe.chars().take(512).collect::<String>(), style)
 }
 
-fn to_tui_line(line: ExtensionLine) -> Line<'static> {
-    Line::from(line.spans.into_iter().map(to_tui_span).collect::<Vec<_>>())
+fn to_tui_line(line: ExtensionLine, palette: Palette) -> Line<'static> {
+    Line::from(line.spans.into_iter().map(|span| to_tui_span(span, palette)).collect::<Vec<_>>())
 }
 
-fn tone_style(tone: Tone) -> Style {
-    let color = match tone {
-        Tone::Normal => Color::Gray,
-        Tone::Muted => Color::DarkGray,
-        Tone::Accent => Color::LightCyan,
-        Tone::Model => Color::LightYellow,
-        Tone::Profile | Tone::Provider => Color::LightBlue,
-        Tone::Effort => Color::LightMagenta,
-        Tone::Directory => Color::Green,
-        Tone::Agent | Tone::Branch => Color::Cyan,
-        Tone::Tools => Color::Gray,
-        Tone::Session => Color::Magenta,
-        Tone::State => Color::LightMagenta,
-        Tone::Performance => Color::Gray,
-        Tone::Good => Color::LightGreen,
-        Tone::Warning => Color::LightYellow,
-        Tone::Error => Color::LightRed,
+/// Extension status roles use the same semantic colors as the native
+/// Agent and Workspace, including System/Light/Dark and terminal fallback.
+fn tone_style(tone: Tone, palette: Palette) -> Style {
+    let foreground = match tone {
+        Tone::Normal | Tone::State => palette.foreground,
+        Tone::Muted | Tone::Profile | Tone::Provider | Tone::Tools | Tone::Performance =>
+            palette.muted,
+        Tone::Accent | Tone::Model | Tone::Effort | Tone::Agent | Tone::Branch
+        | Tone::Session => palette.accent,
+        Tone::Directory => palette.foreground,
+        Tone::Good => palette.tool_foreground,
+        Tone::Error => palette.tool_error_foreground,
+        Tone::Warning => {
+            #[cfg(feature = "workspace")]
+            { palette.warning }
+            #[cfg(not(feature = "workspace"))]
+            { palette.accent }
+        }
     };
-    Style::default().fg(color)
+    Style::default().fg(foreground)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_status_extensions_use_native_theme_roles_not_fixed_bright_ansi() {
+        for mode in [
+            aw::config::ThemeMode::System,
+            aw::config::ThemeMode::Light,
+            aw::config::ThemeMode::Dark,
+        ] {
+            let palette = super::palette_for(&UiConfig {
+                theme: mode,
+                ..UiConfig::default()
+            });
+            assert_eq!(tone_style(Tone::Normal, palette).fg, Some(palette.foreground));
+            assert_eq!(tone_style(Tone::Muted, palette).fg, Some(palette.muted));
+            assert_eq!(tone_style(Tone::Model, palette).fg, Some(palette.accent));
+            assert_eq!(tone_style(Tone::Good, palette).fg, Some(palette.tool_foreground));
+            assert_eq!(tone_style(Tone::Error, palette).fg, Some(palette.tool_error_foreground));
+            #[cfg(feature = "workspace")]
+            assert_eq!(tone_style(Tone::Warning, palette).fg, Some(palette.warning));
+            if mode == aw::config::ThemeMode::System {
+                assert_eq!(tone_style(Tone::Normal, palette).fg,
+                    Some(ratatui::style::Color::Reset));
+            }
+        }
+    }
 
     #[test]
     fn status_extension_owns_multiple_ordered_rows_and_slots() {

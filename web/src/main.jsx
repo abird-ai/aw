@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { api, workspaceAction } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
 import { Icon } from "./icons.jsx";
+import { toolPresentation } from "./tool-presentation.js";
 import { AgentViewPanel } from "./agent-view-panel.jsx";
 import { createAgentViews } from "./agent-views.js";
 import { createWorkspaceViews } from "./workspace-views.js";
@@ -22,16 +23,6 @@ const MARK = "/abird-round-trip-mark.svg";
 
 function Mark() {
   return <img src={MARK} alt="" aria-hidden="true" />;
-}
-
-function toolPresentation(tool) {
-  const status = String(tool?.status || "unknown").toLowerCase();
-  const failedStatus = ["failed", "denied", "interrupted"].includes(status);
-  if (failedStatus || tool?.output?.is_error === true) {
-    return { tone: "failure", symbol: "×", status: failedStatus ? status : "failed" };
-  }
-  if (status === "succeeded") return { tone: "success", symbol: "✓", status };
-  return { tone: "neutral", symbol: status === "running" ? "·" : "?", status };
 }
 
 function Message(props) {
@@ -94,10 +85,20 @@ function ResourceHeader(props) {
   ];
   const skills = () => props.snapshot?.resources?.skills || [];
   return (
-    <section class="agent-resources" aria-label="Loaded Agent resources">
-      <div class="resource-section"><strong>Context</strong><For each={context()} fallback={<span class="muted">none loaded</span>}>{item => <span>{item}</span>}</For></div>
-      <div class="resource-section"><strong>Skills</strong><For each={skills()} fallback={<span class="muted">none loaded</span>}>{item => <span>{item}</span>}</For></div>
-    </section>
+    <Show when={context().length || skills().length}>
+      <section class="agent-resources" aria-label="Loaded Agent resources">
+        <Show when={context().length}>
+          <div class="resource-section"><strong>Context</strong>
+            <For each={context()}>{item => <span>{item}</span>}</For>
+          </div>
+        </Show>
+        <Show when={skills().length}>
+          <div class="resource-section"><strong>Skills</strong>
+            <For each={skills()}>{item => <span>{item}</span>}</For>
+          </div>
+        </Show>
+      </section>
+    </Show>
   );
 }
 
@@ -1047,6 +1048,41 @@ function normalizedUi(value = {}) {
 }
 
 function Settings(props) {
+  let dialogNode;
+  let returnFocus;
+  // Settings is rendered as an aria-modal surface, so it must own focus
+  // until Close/Cancel has actually completed (including remote revocation).
+  function modalKeyDown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      void closeSettings();
+    }
+    if (event.key !== "Tab" || event.altKey || event.ctrlKey || event.metaKey) return;
+    const controls = [...dialogNode.querySelectorAll(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])'
+    )].filter(element => element.getClientRects().length && !element.closest('[hidden]'));
+    if (!controls.length) {
+      event.preventDefault();
+      dialogNode.focus();
+      return;
+    }
+    const first = controls[0], last = controls.at(-1);
+    if (event.shiftKey && (document.activeElement === first || !dialogNode.contains(document.activeElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || !dialogNode.contains(document.activeElement))) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+  onMount(() => {
+    returnFocus = document.activeElement;
+    queueMicrotask(() => dialogNode?.isConnected && dialogNode.querySelector(".modal-head button")?.focus());
+  });
+  onCleanup(() => {
+    if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+  });
   const [state, setState] = createSignal(null);
   const [selected, setSelected] = createSignal("");
   const [draft, setDraft] = createSignal({
@@ -1350,7 +1386,8 @@ function Settings(props) {
 
   return (
     <div class="scrim" onMouseDown={event => event.target === event.currentTarget && void closeSettings()}>
-      <section class="modal" role="dialog" aria-modal="true" aria-label="Settings">
+      <section class="modal" role="dialog" aria-modal="true" aria-label="Settings"
+        ref={dialogNode} tabIndex="-1" onKeyDown={modalKeyDown}>
         <header class="modal-head">
           <h2>Settings</h2>
           <button class="quiet" onClick={() => void closeSettings()}>Close</button>

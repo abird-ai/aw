@@ -18,6 +18,9 @@ mod ux_v15_native {
         )]);
         match scene {
             "agent" => {}
+            "activity" => ui.open(Target::Activity),
+            "settings" => ui.open(Target::Settings),
+            "sessions-tree" => ui.open(Target::SessionTree),
             "file" => ui.open(Target::File {
                 scope_id: ScopeId::launch(),
                 path: "src/fixture.rs".into(),
@@ -98,6 +101,9 @@ mod ux_v15_native {
         ] {
             for scene in [
                 "agent",
+                "activity",
+                "settings",
+                "sessions-tree",
                 "file",
                 "palette",
                 "tabs-overflow",
@@ -185,7 +191,7 @@ mod ux_v15_native {
                 assert!(Arc::ptr_eq(&ui.snapshot.turns, &turns));
             }
         }
-        assert_eq!(manifest.len(), 90);
+        assert_eq!(manifest.len(), 135);
         if let Some(path) = &output {
             std::fs::write(
                 path.join("manifest.json"),

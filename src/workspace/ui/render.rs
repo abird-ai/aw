@@ -164,7 +164,7 @@ impl Ui {
                     Span::styled(
                         aw_workspace::editor::display(&line.text),
                         Style::default()
-                            .fg(Color::Gray)
+                            .fg(palette.muted)
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]),
@@ -515,18 +515,15 @@ impl Ui {
         truncate_cells(&raw, 24)
     }
 
-    pub(super) fn tab_color(target: &Target) -> Color {
+    pub(super) fn tab_color(&self, target: &Target) -> Color {
+        let palette = crate::tui::theme::palette_for(&self.ui_config);
         match target {
-            Target::Conversation => Color::LightGreen,
-            Target::AgentView { .. } => Color::LightBlue,
-            Target::Activity => Color::LightCyan,
-            Target::SessionTree => Color::LightBlue,
-            Target::ContextFlow => Color::LightMagenta,
-            Target::File { .. } => Color::Rgb(134, 187, 216),
-            Target::Diff { .. } => Color::Rgb(221, 173, 96),
-            Target::Terminal { .. } => Color::LightYellow,
-            Target::Settings => Color::Rgb(199, 146, 234),
-            Target::Help => Color::Gray,
+            Target::Conversation => palette.success,
+            Target::AgentView { .. } | Target::File { .. }
+            | Target::Activity | Target::Settings => palette.accent,
+            Target::Diff { .. } | Target::Terminal { .. }
+            | Target::ContextFlow => palette.warning,
+            Target::SessionTree | Target::Help => palette.muted,
         }
     }
 
@@ -1192,7 +1189,7 @@ impl Ui {
                         (
                             index as Id,
                             (*label).to_owned(),
-                            Self::navigator_color(*candidate),
+                            self.navigator_color(*candidate),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1272,6 +1269,7 @@ impl Ui {
                             &modes,
                             mode,
                             palette.success,
+                            palette.muted,
                         );
                         for (area, candidate) in mode_hits {
                             self.hit(
@@ -1290,7 +1288,7 @@ impl Ui {
                             };
                             frame.render_widget(
                                 Paragraph::new(format!(" {}", Self::git_display_icon(display)))
-                                    .style(Style::default().fg(Color::Gray)),
+                                    .style(Style::default().fg(palette.muted)),
                                 toggle,
                             );
                             self.hit(
@@ -1341,38 +1339,41 @@ impl Ui {
                                 .map(|row| {
                                     let style = match &row.item {
                                         git::Item::Heading(key) => {
+                                            // Git state uses semantic palette roles in
+                                            // System/Light/Dark, never fixed bright ANSI
+                                            // colors that vanish on light terminals.
                                             let color = if key.contains("Conflicts") {
-                                                Color::LightRed
+                                                palette.danger
                                             } else if key.contains("Staged") {
-                                                Color::LightCyan
+                                                palette.accent
                                             } else if key.contains("Untracked") {
-                                                Color::LightGreen
+                                                palette.success
                                             } else {
-                                                Color::LightYellow
+                                                palette.warning
                                             };
                                             Style::default().fg(color).add_modifier(Modifier::BOLD)
                                         }
                                         git::Item::Folder(_) => Style::default().fg(palette.accent),
                                         git::Item::Change(change) => {
                                             let color = match change.code {
-                                                'A' | '?' => Color::LightGreen,
-                                                'D' => Color::LightRed,
-                                                'M' => Color::LightYellow,
-                                                'R' | 'C' => Color::LightCyan,
+                                                'A' | '?' => palette.success,
+                                                'D' => palette.danger,
+                                                'M' => palette.warning,
+                                                'R' | 'C' => palette.accent,
                                                 _ => palette.foreground,
                                             };
                                             Style::default().fg(color)
                                         }
                                         git::Item::Worktree(_) => {
-                                            Style::default().fg(Color::LightBlue)
+                                            Style::default().fg(palette.accent)
                                         }
                                         git::Item::Branch(branch) => {
                                             if branch.current {
                                                 Style::default()
-                                                    .fg(Color::LightGreen)
+                                                    .fg(palette.success)
                                                     .add_modifier(Modifier::BOLD)
                                             } else {
-                                                Style::default().fg(Color::LightMagenta)
+                                                Style::default().fg(palette.muted)
                                             }
                                         }
                                     };
@@ -1453,7 +1454,7 @@ impl Ui {
                     };
                     frame.render_widget(
                         Paragraph::new(format!(" {}", Self::nav_display_icon(display)))
-                            .style(Style::default().fg(Color::Gray)),
+                            .style(Style::default().fg(palette.muted)),
                         toggle,
                     );
                     self.hit(
@@ -1513,7 +1514,8 @@ impl Ui {
                         scopes_area,
                         &scopes,
                         scope,
-                        Color::LightMagenta,
+                        palette.accent,
+                        palette.muted,
                     );
                     for (area, candidate) in scope_hits {
                         self.hit(
@@ -1530,7 +1532,7 @@ impl Ui {
                                 Style::default().fg(if multi_select {
                                     palette.accent
                                 } else {
-                                    Color::Gray
+                                    palette.muted
                                 }),
                             ),
                             multi,
@@ -1544,7 +1546,7 @@ impl Ui {
                     };
                     frame.render_widget(
                         Paragraph::new(format!(" {}", Self::nav_display_icon(display)))
-                            .style(Style::default().fg(Color::Gray)),
+                            .style(Style::default().fg(palette.muted)),
                         toggle,
                     );
                     self.hit(
@@ -1711,9 +1713,9 @@ impl Ui {
                         } else {
                             Style::default()
                                 .fg(if matches!(row.item, NavigatorItem::UnsavedSession) {
-                                    Color::Gray
+                                    palette.muted
                                 } else {
-                                    Color::LightMagenta
+                                    palette.accent
                                 })
                                 .add_modifier(Modifier::BOLD)
                         };
@@ -1811,23 +1813,23 @@ impl Ui {
                                         NavigatorItem::Parent => Style::default().fg(palette.muted),
                                         NavigatorItem::File(entry) => match entry.kind {
                                             EntryKind::Directory => Style::default()
-                                                .fg(Color::Rgb(124, 166, 205))
+                                                .fg(palette.accent)
                                                 .add_modifier(Modifier::BOLD),
                                             EntryKind::File => {
                                                 Style::default().fg(palette.foreground)
                                             }
                                             EntryKind::Unsupported => {
-                                                Style::default().fg(Color::LightRed)
+                                                Style::default().fg(palette.danger)
                                             }
                                         },
                                         NavigatorItem::UnsavedSession => {
-                                            Style::default().fg(Color::Gray)
+                                            Style::default().fg(palette.muted)
                                         }
                                         NavigatorItem::SessionRoot { .. } => Style::default()
-                                            .fg(Color::LightMagenta)
+                                            .fg(palette.accent)
                                             .add_modifier(Modifier::BOLD),
                                         NavigatorItem::SessionBranch { .. } => {
-                                            Style::default().fg(Color::LightCyan)
+                                            Style::default().fg(palette.accent)
                                         }
                                     };
                                     ListItem::new(aw_workspace::editor::display(&row.label))
@@ -1879,7 +1881,7 @@ impl Ui {
                                 label.push(' ');
                                 label.push_str(TAB_DIRTY_ICON);
                             }
-                            (*tab_id, label, Self::tab_color(&tab.target))
+                            (*tab_id, label, self.tab_color(&tab.target))
                         })
                     })
                     .collect::<Vec<_>>();

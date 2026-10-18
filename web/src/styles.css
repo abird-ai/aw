@@ -11,12 +11,12 @@
   --selected-strong: #dfe8e2;
   --fg: #242725;
   --muted: #69716d;
-  --faint: #909993;
+  --faint: #667068;
   --border: #e2e7e3;
   --border-strong: #cfd8d2;
   --primary: #283d35;
   --green: #60b786;
-  --green-strong: #3c8661;
+  --green-strong: #317b53;
   --green-soft: #e7f3eb;
   --blue: #3868c7;
   --blue-soft: #edf2fb;
@@ -1300,7 +1300,7 @@ body.resizing-sidebar {
   --selected-strong: #314038;
   --fg: #edf1ee;
   --muted: #a4ada7;
-  --faint: #78837c;
+  --faint: #929c95;
   --border: #303833;
   --border-strong: #424d46;
   --primary: #dceae2;

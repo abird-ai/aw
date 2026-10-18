@@ -69,8 +69,15 @@ pub fn header_lines(header: &AgentHeader, mode: HeaderMode, ui: &aw::config::UiC
         out.push(Line::default());
     }
     const MAX_SECTION_ITEMS: usize = 8;
-    out.push(Line::styled("[Context]", p.markdown_heading_style()));
     let context = header.resources.context();
+    let skills = header.resources.skills();
+    // A minimal embedded Agent shouldn't start with two empty status cards.
+    // Never suppress loaded Context/Skills or the explicit Full header.
+    if mode != HeaderMode::Full && context.is_empty() && skills.is_empty() {
+        return out;
+    }
+    if mode == HeaderMode::Full || !context.is_empty() {
+        out.push(Line::styled("[Context]", p.markdown_heading_style()));
     if context.is_empty() { out.push(Line::styled("  none loaded", Style::default().fg(p.muted))); }
     else if context.len() <= MAX_SECTION_ITEMS { out.extend(context.iter().map(|v| Line::styled(format!("  {}", aw::presentation::safe_text(&v.label())), p.text_style()))); }
     else {
@@ -80,15 +87,18 @@ pub fn header_lines(header: &AgentHeader, mode: HeaderMode, ui: &aw::config::UiC
         out.push(Line::styled(format!("  … {omitted} earlier loaded context resource{}", if omitted == 1 { "" } else { "s" }), Style::default().fg(p.muted)));
         out.extend(context[context.len()-tail..].iter().map(|v| Line::styled(format!("  {}", aw::presentation::safe_text(&v.label())), p.text_style())));
     }
-    out.push(Line::default());
-    out.push(Line::styled("[Skills]", p.markdown_heading_style()));
-    let skills = header.resources.skills();
+        out.push(Line::default());
+    }
+    if mode == HeaderMode::Full || !skills.is_empty() {
+        out.push(Line::styled("[Skills]", p.markdown_heading_style()));
     if skills.is_empty() { out.push(Line::styled("  none loaded", Style::default().fg(p.muted))); }
     else {
         out.extend(skills.iter().take(MAX_SECTION_ITEMS).map(|v| Line::styled(format!("  {}", aw::presentation::safe_text(&v.label())), p.text_style())));
         if skills.len() > MAX_SECTION_ITEMS { out.push(Line::styled(format!("  … {} more loaded skills", skills.len()-MAX_SECTION_ITEMS), Style::default().fg(p.muted))); }
     }
-    out.push(Line::default()); out
+        out.push(Line::default());
+    }
+    out
 }
 
 pub fn prompt_lines(
@@ -123,7 +133,10 @@ pub fn turn_lines(
     if !thinking.is_zero(){lines.push(Line::styled(if ui.show_thinking{format!("Thinking {:.1}s",thinking.as_secs_f64())}else{"Thinking · hidden".into()},p.thinking_style()));lines.push(Line::default());}
     let record_for=|id:&str|turn.tool_records.iter().find(|r|r.call.id==id); let trace=turn.context_messages.iter().skip(1).collect::<Vec<_>>(); let fallback=aw::presentation::settled_answer_fallback(turn); let mut assistant=false;
     for m in trace { match m.role {
-        aw_agent_core::Role::Assistant=>{if !m.content.trim().is_empty(){assistant=true;lines.extend(render_markdown(&m.content));} for call in &m.tool_calls{let rec=record_for(&call.id);let style=p.tool_style(aw::presentation::tool_tone(rec));lines.push(Line::default());if ui.show_tool_calls{lines.extend(filled_block(vec![rec.map_or_else(||aw::presentation::safe_text(&format!("{}  {}",call.name,call.arguments)),aw::presentation::tool_title)],style,width));}else{let status=rec.map(|r|format!("{:?}",r.status).to_ascii_lowercase()).unwrap_or_else(||"running".into());lines.extend(filled_block(vec![format!("tool {} · {status} · hidden",call.name)],style,width));}}}
+        aw_agent_core::Role::Assistant=>{if !m.content.trim().is_empty(){assistant=true;lines.extend(render_markdown(&m.content));} for call in &m.tool_calls{let rec=record_for(&call.id);let style=p.tool_style(aw::presentation::tool_tone(rec));lines.push(Line::default());if ui.show_tool_calls{lines.extend(filled_block(vec![rec.map_or_else(
+    || format!("{} · unknown", aw::presentation::safe_text(&format!("{}  {}",call.name,call.arguments))),
+    |record| format!("{} · {}", aw::presentation::tool_title(record), factual_tool_status(record)),
+)],style,width));}else{let status=rec.map(factual_tool_status).unwrap_or("unknown");lines.extend(filled_block(vec![format!("tool {} · {status} · hidden",call.name)],style,width));}}}
         aw_agent_core::Role::Tool if ui.show_tool_calls=>{let rec=m.tool_call_id.as_deref().and_then(record_for);let style=p.tool_style(aw::presentation::tool_tone(rec));let safe=aw::presentation::safe_text(&m.content);let all=safe.lines().collect::<Vec<_>>();const MAX:usize=12;let mut block=Vec::new();if all.len()>MAX{block.push(format!("… ({} earlier lines omitted)",all.len()-MAX));}block.extend(all.iter().skip(all.len().saturating_sub(MAX)).map(|line|(*line).to_owned()));lines.extend(filled_block(block,style,width));}
         _=>{}
     }}
@@ -228,6 +241,21 @@ pub fn auxiliary_lines(
     lines
 }
 
+/// Text is the authoritative outcome, even in monochrome/16-color terminals.
+/// A misleading "succeeded" tool status with an error output is a failure.
+fn factual_tool_status(record: &aw_agent_core::ToolRecord) -> &'static str {
+    if record.output.as_ref().is_some_and(|output| output.is_error) {
+        return "failed";
+    }
+    match record.status {
+        aw_agent_core::ToolStatus::Running => "running",
+        aw_agent_core::ToolStatus::Succeeded => "succeeded",
+        aw_agent_core::ToolStatus::Failed => "failed",
+        aw_agent_core::ToolStatus::Denied => "denied",
+        aw_agent_core::ToolStatus::Interrupted => "interrupted",
+    }
+}
+
 pub fn live_lines(live: &LiveProjection<'_>, ui: &aw::config::UiConfig, width: usize) -> Vec<Line<'static>> {
     let p = super::theme::palette_for(ui);
     let mut lines = Vec::new();
@@ -243,10 +271,10 @@ pub fn live_lines(live: &LiveProjection<'_>, ui: &aw::config::UiConfig, width: u
         lines.push(Line::default());
         let mut block=Vec::new();
         if ui.show_tool_calls {
-            block.push(aw::presentation::tool_title(record));
+            block.push(format!("{} · {}", aw::presentation::tool_title(record), factual_tool_status(record)));
             if let Some(output)=&record.output { block.extend(aw::presentation::safe_text(&output.content).lines().take(12).map(str::to_owned)); }
         } else {
-            block.push(format!("tool {} · {} · hidden",record.call.name,format!("{:?}",record.status).to_ascii_lowercase()));
+            block.push(format!("tool {} · {} · hidden", record.call.name, factual_tool_status(record)));
         }
         lines.extend(filled_block(block,style,width));
     }
@@ -390,9 +418,89 @@ mod tests {
         resources.add_instruction_file("./AGENTS.md",42);
         let h=AgentHeader::from_resources(&resources);
         let full=plain(&header_lines(&h,HeaderMode::Full,&ui));let embedded=plain(&header_lines(&h,HeaderMode::Embedded,&ui));
-        for token in ["[Context]","system prompt · built-in · 128 B","instructions · ./AGENTS.md · 42 B","[Skills]","none loaded"]{assert!(full.contains(token));assert!(embedded.contains(token));}
+        for token in ["[Context]", "system prompt · built-in · 128 B", "instructions · ./AGENTS.md · 42 B"] {
+            assert!(full.contains(token));
+            assert!(embedded.contains(token));
+        }
+        assert!(full.contains("[Skills]") && full.contains("none loaded"));
+        assert!(!embedded.contains("[Skills]") && !embedded.contains("none loaded"));
         assert!(full.contains("F1 palette"));assert!(!full.contains("F1 help"));
         assert!(full.contains("aw v"));assert!(full.contains("/ commands"));assert!(!embedded.contains("aw v"));assert!(!embedded.contains("/ commands"));
+    }
+
+    #[test]
+    fn embedded_header_is_quiet_when_empty_and_never_hides_loaded_resources() {
+        let ui = aw::config::UiConfig::default();
+        let none = AgentHeader::default();
+        assert!(header_lines(&none, HeaderMode::Embedded, &ui).is_empty());
+        assert!(header_lines(&none, HeaderMode::Hidden, &ui).is_empty());
+        let explicit_full = plain(&header_lines(&none, HeaderMode::Full, &ui));
+        assert!(explicit_full.contains("[Context]") && explicit_full.contains("[Skills]"));
+
+        let mut resources = super::super::agent_resources::LoadedResourceSummary::default();
+        resources.add_skill("review", "./SKILL.md", 100);
+        let skills_only = plain(&header_lines(
+            &AgentHeader::from_resources(&resources), HeaderMode::Embedded, &ui,
+        ));
+        assert!(!skills_only.contains("[Context]"));
+        assert!(skills_only.contains("[Skills]"));
+        assert!(skills_only.contains("review"));
+
+        resources.add_instruction_file("./AGENTS.md", 42);
+        let both = plain(&header_lines(
+            &AgentHeader::from_resources(&resources), HeaderMode::Embedded, &ui,
+        ));
+        assert!(both.contains("[Context]") && both.contains("[Skills]"));
+        assert!(both.contains("./AGENTS.md"));
+    }
+
+    #[test]
+    fn native_tool_blocks_include_factual_status_words_in_all_color_modes() {
+        use aw_agent_core::{ToolCall, ToolEffect, ToolOutput, ToolRecord, ToolStatus};
+        let make = |name: &str, status, output| ToolRecord {
+            call: ToolCall {
+                id: name.to_owned(),
+                name: name.to_owned(),
+                arguments: serde_json::json!({}),
+            },
+            effect: ToolEffect::Process,
+            execution_site: "synthetic".into(),
+            status,
+            output,
+        };
+        let records = vec![
+            make("inflight", ToolStatus::Running, None),
+            make("finished", ToolStatus::Succeeded, None),
+            make("denied", ToolStatus::Denied, None),
+            make("interrupted", ToolStatus::Interrupted, None),
+            make("failure", ToolStatus::Failed, None),
+            make("inconsistent", ToolStatus::Succeeded, Some(ToolOutput::error("not a success"))),
+        ];
+        for mode in [
+            aw::config::ThemeMode::System,
+            aw::config::ThemeMode::Light,
+            aw::config::ThemeMode::Dark,
+        ] {
+            let ui = aw::config::UiConfig {
+                theme: mode,
+                ..aw::config::UiConfig::default()
+            };
+            let view = LiveProjection { answer: "", tools: &records };
+            let full = plain(&live_lines(&view, &ui, 80));
+            for label in [
+                "inflight · running", "finished · succeeded", "denied · denied",
+                "interrupted · interrupted", "failure · failed",
+                "inconsistent · failed",
+            ] {
+                assert!(full.contains(label), "missing factual status: {label}");
+            }
+            let mut hidden = ui.clone();
+            hidden.show_tool_calls = false;
+            let summary = plain(&live_lines(&view, &hidden, 80));
+            assert!(summary.contains("tool denied · denied · hidden"));
+            assert!(summary.contains("tool inconsistent · failed · hidden"));
+            assert!(!summary.contains("not a success"));
+        }
     }
 
     #[test]

@@ -255,6 +255,7 @@ fn draw_segmented_control<T: Copy + PartialEq>(
     items: &[(T, &str)],
     selected: T,
     selected_color: Color,
+    inactive_color: Color,
 ) -> (Vec<(Rect, T)>, u16) {
     if area.width == 0 || area.height == 0 || items.is_empty() {
         return (Vec::new(), 0);
@@ -266,7 +267,6 @@ fn draw_segmented_control<T: Copy + PartialEq>(
         .map(|(_, label)| UnicodeWidthStr::width(*label) as u16)
         .sum::<u16>()
         .saturating_add(divider_width.saturating_mul(items.len().saturating_sub(1) as u16));
-    let inactive = Color::Rgb(145, 148, 154);
     let mut hits = Vec::new();
     if needed <= area.width {
         let mut x = area.x;
@@ -287,7 +287,7 @@ fn draw_segmented_control<T: Copy + PartialEq>(
                     .fg(selected_color)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
-                Style::default().fg(inactive)
+                Style::default().fg(inactive_color)
             };
             frame.render_widget(Paragraph::new(Span::styled(*label, style)), rect);
             hits.push((rect, *value));
@@ -295,7 +295,7 @@ fn draw_segmented_control<T: Copy + PartialEq>(
             if index + 1 < items.len() && x < area.x.saturating_add(area.width) {
                 let width = divider_width.min(area.x.saturating_add(area.width).saturating_sub(x));
                 frame.render_widget(
-                    Paragraph::new(Span::styled(DIVIDER, Style::default().fg(Color::DarkGray))),
+                    Paragraph::new(Span::styled(DIVIDER, Style::default().fg(inactive_color))),
                     Rect {
                         x,
                         y: area.y,
@@ -317,7 +317,7 @@ fn draw_segmented_control<T: Copy + PartialEq>(
                 .fg(selected_color)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::default().fg(inactive)
+            Style::default().fg(inactive_color)
         };
         frame.render_widget(
             Paragraph::new(Span::styled(*label, style)),
@@ -1679,11 +1679,12 @@ impl Ui {
         }
     }
 
-    fn navigator_color(kind: Navigator) -> Color {
+    fn navigator_color(&self, kind: Navigator) -> Color {
+        let palette = crate::tui::theme::palette_for(&self.ui_config);
         match kind {
-            Navigator::Sessions => Color::LightMagenta,
-            Navigator::Files => Color::LightBlue,
-            Navigator::Git => Color::LightYellow,
+            Navigator::Sessions => palette.accent,
+            Navigator::Files => palette.success,
+            Navigator::Git => palette.warning,
         }
     }
 
@@ -3109,8 +3110,10 @@ mod render_tests {
         assert!(text.contains("[Context]"));
         assert!(text.contains("system prompt · config · 128 B"));
         assert!(text.contains("instructions · ./AGENTS.md · 42 B"));
-        assert!(text.contains("[Skills]"));
-        assert!(text.contains("none loaded"));
+        // Embedded Agent chrome hides empty optional sections, but must keep
+        // admitted instructions and built-in/loaded Context provenance.
+        assert!(!text.contains("[Skills]"));
+        assert!(!text.contains("none loaded"));
         assert!(!text.contains("aw v0.15.0"));
         assert!(!text.contains("/ commands"));
     }
@@ -5065,6 +5068,7 @@ mod render_tests {
                     &sessions,
                     SessionScope::User,
                     Color::LightMagenta,
+                    Color::Gray,
                 );
             })
             .unwrap();
@@ -5096,6 +5100,7 @@ mod render_tests {
                     &git,
                     git::Mode::Changes,
                     Color::LightGreen,
+                    Color::Gray,
                 );
             })
             .unwrap();
