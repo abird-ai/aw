@@ -1,7 +1,32 @@
-/target/
+# Git
+/worktrees/
+/.agents/runs/*
+!/.agents/runs/README.md
+
+# Nix
+result/
+result-*
+.direnv/
+
+# Common build and dep dirs
+/tmp/
+**/target/
+**/node_modules/
+**/dist/
+.venv
+
+# Misc
+crash.log
+**/__pycache__/
+/.continue/
+/.kilocode/
+/.vscode/
+/.claude/
+.codex
+.kilo/
+
+# Repo-specific
 /result
-/result-*
-/.direnv/
 /.awtar-checkout.json
 /.agents/plans/evidence/host/
 /.agents/plans/evidence/browser-host/
@@ -10,13 +35,11 @@
 /.agents/plans/evidence/cargo-home*/
 .env
 *.key
-__pycache__/
 *.pyc
 
 # Private device integration and phase packaging
 *.bundle
 *.bundle.sha256
-*.key
 device-grant*.json
 device-link*.json
 receipt-ledger*.json
@@ -28,5 +51,5 @@ team-private*.json
 /.agents/plans/evidence/ci-export/
 
 # Browser UI build cache; compiled assets are committed/embedded.
-/web/node_modules/
 /web/.vite/
+!/web/dist/
