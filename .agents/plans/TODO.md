@@ -7,7 +7,7 @@ reconcile completion through the coordinator. Git retains older detail.
 - [x] [Accepted source checkpoint and completed work](accepted-history/TODO.md) — Done
 - [~] [Release readiness](release-readiness/TODO.md)
 - [~] [Read-only Agent views and composable Files/Git](workspace-views/TODO.md)
-- [ ] [Remaining native/browser UX convergence](ux-convergence/TODO.md)
+- [x] [Native/browser UX convergence](ux-convergence/TODO.md) — Done (visual/interaction scope; separate PTY/Actor authority work stays open)
 - [ ] [Optional embedded targets and independent certification](embedded-platforms/TODO.md)
 - [ ] [Restored-State authority](restored-state-authority/TODO.md)
 - [x] [Simple TODO handoff process and comprehensive onboarding](handoff-process/TODO.md) — Done

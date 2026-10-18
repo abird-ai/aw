@@ -1,6 +1,74 @@
 Author: GPT-6
 
-# Shipping UX inventory — 2026-10-17
+# Native and browser UX convergence
+
+## Verified source completion — 18 October 2026
+
+Signed implementation: `2bd67498849d04e18c00551396ccc8fcc08dfcd4`.
+Scope: shipping **visual and interaction UX**, without new Runtime/Actor,
+ToolPolicy, provider, PTY or Store authority. The separately owned
+`.agents/plans/ux/` remained untouched.
+
+- **Native palette and status** — one semantic Light/Dark/System role map
+  across Agent, Git/Explorer/tabs/status extensions. Explicit palettes
+  degrade to 16/256 colors and preserve truecolor where available;
+  System defers to the terminal's default foreground/background.
+  Factual tool status words survive any color depth and contradictory
+  error results cannot be presented as success.
+- **Less noise, same capabilities** — embedded native and browser Agents
+  omit empty Context/Skills sections but retain actual loaded resource
+  provenance. Single-row active tabs, compact tool blocks, unboxed
+  assistant messages, quiet Explorer labels, real pane boundaries and
+  existing keyboard commands remain; no presentation action grants
+  a new Files, Git, Agent, Terminal or execution resource.
+- **Keyboard and accessibility** — browser Settings traps Tab/Shift+Tab,
+  supports Escape through the original safe close/revocation path and
+  returns focus to its invoker. Existing Command Palette and tab
+  navigation preserve their keyboard ownership and draft/caret.
+  Light/Dark tested metadata, foreground and success/danger contrast
+  achieved at least **4.5:1** on page/Explorer surfaces. This is a
+  targeted contrast audit, *not* a full WCAG conformance certificate.
+- **Native acceptance** — **135 shipping Ratatui TestBackend frames**
+  (9 scenes, 3 themes, 5 widths/heights): Agent, Activity, Settings,
+  Session Tree, File, Palette, overflowing tabs, split and unavailable
+  terminal. Real isolated PTY in 16-color mode verified 80×24→65×20→120×30,
+  global F1, maximize/restore, `quit-discard` exit 0, byte-equal termios
+  and alternate-screen release. Another live synthetic child-shell PTY
+  verified Ctrl+C stays with child shell, F1 remains reachable and
+  `quit-all` releases child and restores terminal state.
+- **Actual Chrome 155** — a private synthetic LocalWeb with desktop
+  1440×900, mobile 390×844 and narrow 320×568, both Light/Dark.
+  Sixteen verified visual/interaction scenarios include Sessions,
+  actual File/Git Diff, one context title, Settings modal focus and
+  390px geometry, Command Palette cancellation, Home/End document
+  tabs, responsive layout and Unicode draft/caret preservation.
+  Eight screenshots remained private in temporary fixtures. No
+  horizontal document overflow, uncaught JS errors, Git HEAD/index
+  modifications, Session runs or tool/effect receipts.
+- **Product gates** — **1,309 non-Store Rust tests** (4 ignored),
+  **201 Store library tests**, **156 Store integrations**, **174 Node
+  tests**, **139 web-only Rust tests**, strict library Clippy,
+  formatting, workspace/minimal feature builds, `aw 0.15.0` binary,
+  and **8/8 byte-identical built frontend assets**, all verified on
+  the signed implementation. Cargo coverage passed via split packages;
+  a monolithic `cargo test --workspace --locked` was attempted but
+  **not completed** within the connector's 112–115 second cap.
+  Binary-wide strict Clippy still has six existing non-UX warnings.
+
+**Remaining outside this scope:** native *second-terminal* docking
+(transfer of exclusive PTY Runtime control), different-user delegated
+access, adversarial post-ACK crash/partition certification, actual
+Windows/macOS runtime certification and release/deployment. The
+[Workspace views](../workspace-views/TODO.md) and
+[Release readiness](../release-readiness/TODO.md) remain open.
+Completing visual convergence does **not** complete those milestones.
+
+## Historical shipping UX inventory — 17 October 2026
+
+The paragraphs below record the **pre-convergence baseline** and
+its earlier evidence; their "remaining work" statements are
+historical and superseded, *within the present scope*, by the signed
+completion above.
 
 This is a source-backed comparison of the **shipping** native Workspace and
 Solid browser shell, not a new product, a claim of browser parity or authority
