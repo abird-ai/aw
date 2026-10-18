@@ -58,23 +58,43 @@ fn validate_peer(socket: &UnixStream) -> io::Result<()> {
 /// Does not consume the source FD; caller must await owner-approved receipt
 /// before relinquishing its original reader/process lifecycle.
 pub fn send_one(socket: &UnixStream, fd: BorrowedFd<'_>, proof: &[u8; 32]) -> io::Result<()> {
+    send_exact(socket, &[fd], proof)
+}
+
+/// Atomic master + process-identity escrow. Both descriptors are carried by
+/// one authenticated SCM_RIGHTS message, never two partially admitted sends.
+/// The recipient may *not* activate either without the owner's final receipt.
+pub fn send_pair(
+    socket: &UnixStream,
+    master: BorrowedFd<'_>,
+    pidfd: BorrowedFd<'_>,
+    proof: &[u8; 32],
+) -> io::Result<()> {
+    send_exact(socket, &[master, pidfd], proof)
+}
+
+fn send_exact(socket: &UnixStream, fds: &[BorrowedFd<'_>], proof: &[u8; 32]) -> io::Result<()> {
     validate_peer(socket)?;
+    if !matches!(fds.len(), 1 | 2) {
+        return Err(invalid("unsupported FD transfer count"));
+    }
     let mut payload = [0_u8; WIRE_LEN];
-    payload[0] = WIRE_VERSION;
+    payload[0] = WIRE_VERSION + (fds.len() as u8 - 1);
     payload[1..].copy_from_slice(proof);
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast::<c_void>(),
         iov_len: payload.len(),
     };
-    let ctrl_size = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize };
+    let bytes = (fds.len() * size_of::<RawFd>()) as u32;
+    let ctrl_size = unsafe { libc::CMSG_SPACE(bytes) as usize };
     let mut control = vec![0_usize; ctrl_size.div_ceil(size_of::<usize>())];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast::<c_void>();
     msg.msg_controllen = ctrl_size;
-    // SAFETY: aligned control allocation, valid msghdr/iovec; one raw fd
-    // copied as ancillary payload and never dereferenced as a pointer.
+    // SAFETY: aligned control allocation and valid msghdr/iovec; exactly
+    // one or two owned source FDs copied as SCM_RIGHTS, not dereferenced.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
@@ -82,12 +102,16 @@ pub fn send_one(socket: &UnixStream, fd: BorrowedFd<'_>, proof: &[u8; 32]) -> io
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
-        (libc::CMSG_DATA(cmsg) as *mut RawFd).write_unaligned(fd.as_raw_fd());
+        (*cmsg).cmsg_len = libc::CMSG_LEN(bytes) as _;
+        for (index, fd) in fds.iter().enumerate() {
+            (libc::CMSG_DATA(cmsg) as *mut RawFd)
+                .add(index)
+                .write_unaligned(fd.as_raw_fd());
+        }
     }
     loop {
-        // SAFETY: valid fd and msghdr; MSG_NOSIGNAL avoids SIGPIPE on peer
-        // departure, caller treats incomplete/unknown delivery as not ACKed.
+        // SAFETY: valid fd and msghdr. MSG_NOSIGNAL avoids SIGPIPE; a
+        // short/unknown send never constitutes authorization to release.
         let n = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
         if n < 0 {
             let error = io::Error::last_os_error();
@@ -106,7 +130,29 @@ pub fn send_one(socket: &UnixStream, fd: BorrowedFd<'_>, proof: &[u8; 32]) -> io
 /// Receive exactly one owned descriptor. On malformed messages, wrong proofs,
 /// ancillary truncation, or multiple FDs, close **every** received descriptor.
 pub fn receive_one(socket: &UnixStream, proof: &[u8; 32]) -> io::Result<OwnedFd> {
+    Ok(receive_exact(socket, proof, 1)?
+        .pop()
+        .expect("exactly one checked descriptor"))
+}
+
+/// Receive master and stable child pidfd as one kernel-atomic message.
+/// Each returned handle is close-on-exec and closes on validation failure.
+pub fn receive_pair(socket: &UnixStream, proof: &[u8; 32]) -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = receive_exact(socket, proof, 2)?;
+    let identity = fds.pop().expect("checked pidfd");
+    let master = fds.pop().expect("checked master FD");
+    Ok((master, identity))
+}
+
+fn receive_exact(
+    socket: &UnixStream,
+    proof: &[u8; 32],
+    expected: usize,
+) -> io::Result<Vec<OwnedFd>> {
     validate_peer(socket)?;
+    if !matches!(expected, 1 | 2) {
+        return Err(invalid("unsupported FD transfer count"));
+    }
     let mut payload = [0_u8; WIRE_LEN];
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast::<c_void>(),
@@ -120,7 +166,7 @@ pub fn receive_one(socket: &UnixStream, proof: &[u8; 32]) -> io::Result<OwnedFd>
     msg.msg_control = control.as_mut_ptr().cast::<c_void>();
     msg.msg_controllen = ctrl_size;
     // SAFETY: socket, iovec and ancillary storage are valid for recvmsg;
-    // MSG_CMSG_CLOEXEC protects inherited descriptors.
+    // MSG_CMSG_CLOEXEC protects both descriptors from exec inheritance.
     let n = unsafe {
         libc::recvmsg(
             socket.as_raw_fd(),
@@ -132,8 +178,8 @@ pub fn receive_one(socket: &UnixStream, proof: &[u8; 32]) -> io::Result<OwnedFd>
         return Err(io::Error::last_os_error());
     }
     let mut received = Vec::<OwnedFd>::new();
-    // SAFETY: traverse kernel-validated msghdr ancillary offsets; only
-    // construct OwnedFd for nonnegative fds returned by SCM_RIGHTS.
+    // SAFETY: traverse kernel-validated msghdr ancillary offsets. Every FD
+    // is immediately wrapped for RAII close even if checks later fail.
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
@@ -160,13 +206,13 @@ pub fn receive_one(socket: &UnixStream, proof: &[u8; 32]) -> io::Result<OwnedFd>
     }
     if n as usize != WIRE_LEN
         || msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
-        || payload[0] != WIRE_VERSION
+        || payload[0] != WIRE_VERSION + (expected as u8 - 1)
         || !constant_time_equal(&payload[1..], proof)
-        || received.len() != 1
+        || received.len() != expected
     {
-        return Err(denied()); // received descriptors closed by Drop
+        return Err(denied());
     }
-    Ok(received.pop().expect("exactly one checked descriptor"))
+    Ok(received)
 }
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
@@ -209,6 +255,47 @@ mod tests {
         // A failed admission may not close the original sender handle.
         let mut original = source;
         original.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0; 16]);
+    }
+
+    #[test]
+    fn atomic_two_fd_escrow_is_exactly_typed_and_close_on_exec() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut master = File::open("/dev/zero").unwrap();
+        let identity = File::open("/dev/null").unwrap();
+        send_pair(&sender, master.as_fd(), identity.as_fd(), &[23; 32]).unwrap();
+        let (fd_a, fd_b) = receive_pair(&receiver, &[23; 32]).unwrap();
+        for fd in [&fd_a, &fd_b] {
+            // SAFETY: the received descriptors are valid for F_GETFD.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        }
+        let mut restored = File::from(fd_a);
+        let mut bytes = [1_u8; 16];
+        restored.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0; 16]);
+        let mut marker = File::from(fd_b);
+        assert_eq!(marker.read(&mut bytes).unwrap(), 0);
+
+        // Message cardinality is encoded in the protocol version: accepting
+        // one half of a two-FD escrow must close everything and fail.
+        send_pair(&sender, master.as_fd(), identity.as_fd(), &[33; 32]).unwrap();
+        assert_eq!(
+            receive_one(&receiver, &[33; 32]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+        );
+        send_one(&sender, master.as_fd(), &[35; 32]).unwrap();
+        assert_eq!(
+            receive_pair(&receiver, &[35; 32]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+        );
+        send_pair(&sender, master.as_fd(), identity.as_fd(), &[37; 32]).unwrap();
+        assert_eq!(
+            receive_pair(&receiver, &[99; 32]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+        );
+        // No failed destination admission consumes the original handles.
+        master.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, [0; 16]);
     }
 

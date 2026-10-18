@@ -15,6 +15,8 @@ use std::{
 
 #[cfg(target_os = "linux")]
 pub mod fd_transfer;
+#[cfg(target_os = "linux")]
+pub mod pid_identity;
 pub mod scoped_fs;
 
 pub const FAMILY: &str = "unix";

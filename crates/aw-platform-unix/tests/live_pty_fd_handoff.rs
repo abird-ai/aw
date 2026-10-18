@@ -2,14 +2,18 @@
 //! Kernel proof, not an enabled Workspace PTY migration API. A live child
 //! continues with the same PID after its original process exits, provided
 //! the recipient receives the original PTY master FD before owner exit.
-use aw_platform_unix::fd_transfer::{receive_one, send_one};
+use aw_platform_unix::fd_transfer::{receive_one, receive_pair, send_one, send_pair};
+use aw_platform_unix::pid_identity;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
     fs::{self, DirBuilder, File},
     io::{Read, Write},
-    os::unix::{
-        fs::DirBuilderExt,
-        net::{UnixListener, UnixStream},
+    os::{
+        fd::AsFd,
+        unix::{
+            fs::DirBuilderExt,
+            net::{UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -123,7 +127,14 @@ fn owner_process_fixture() {
         .expect("UnixMasterPty exposes its OS FD");
     // SAFETY: pair.master owns fd for at least the duration of send_one.
     let borrow = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    send_one(&stream, borrow, &PROOF).unwrap();
+    if std::env::var_os("AW_PTY_FD_HANDOFF_PIDFD_TEST").is_some() {
+        // The kernel transfers master + stable child identity as one
+        // message. No partial receipt may activate either resource.
+        let identity = pid_identity::open(pid).unwrap();
+        send_pair(&stream, borrow, identity.as_fd(), &PROOF).unwrap();
+    } else {
+        send_one(&stream, borrow, &PROOF).unwrap();
+    }
     let mut acknowledgement = [0_u8; 1];
     stream.read_exact(&mut acknowledgement).unwrap();
     if acknowledgement == *b"N" {
@@ -147,7 +158,7 @@ fn owner_process_fixture() {
     std::process::exit(0);
 }
 
-fn probe_handoff(approve: bool) {
+fn probe_handoff(approve: bool, with_pidfd: bool) {
     let root = fixture_dir();
     let _cleanup = PrivateFixture(root.clone());
     let endpoint = root.join("owner.sock");
@@ -165,18 +176,19 @@ fn probe_handoff(approve: bool) {
         })
         .expect("absolute Bash executable in AW_BASH or PATH");
     assert!(bash.is_absolute() && bash.is_file());
-    let mut owner = OwnerGuard(
-        Command::new(exe)
-            .args(["--exact", "owner_process_fixture", "--nocapture"])
-            .env("AW_PTY_FD_HANDOFF_OWNER_TEST", "1")
-            .env("AW_PTY_FD_HANDOFF_ROOT_TEST", &root)
-            .env("AW_PTY_FD_HANDOFF_SOCKET_TEST", &endpoint)
-            .env("AW_PTY_FD_HANDOFF_BASH_TEST", bash)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut owner_command = Command::new(exe);
+    owner_command
+        .args(["--exact", "owner_process_fixture", "--nocapture"])
+        .env("AW_PTY_FD_HANDOFF_OWNER_TEST", "1")
+        .env("AW_PTY_FD_HANDOFF_ROOT_TEST", &root)
+        .env("AW_PTY_FD_HANDOFF_SOCKET_TEST", &endpoint)
+        .env("AW_PTY_FD_HANDOFF_BASH_TEST", bash)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if with_pidfd {
+        owner_command.env("AW_PTY_FD_HANDOFF_PIDFD_TEST", "1");
+    }
+    let mut owner = OwnerGuard(owner_command.spawn().unwrap());
     let until = Instant::now() + Duration::from_secs(6);
     let (mut socket, _) = loop {
         match listener.accept() {
@@ -192,7 +204,12 @@ fn probe_handoff(approve: bool) {
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let owned_master = receive_one(&socket, &PROOF).unwrap();
+    let (owned_master, stable_process) = if with_pidfd {
+        let (master, pidfd) = receive_pair(&socket, &PROOF).unwrap();
+        (master, Some(pidfd))
+    } else {
+        (receive_one(&socket, &PROOF).unwrap(), None)
+    };
     let pre = wait_for_file(&root.join("before.pid"), Duration::from_secs(3));
     socket.write_all(if approve { b"A" } else { b"N" }).unwrap();
     let exit = owner.0.wait().unwrap();
@@ -200,6 +217,12 @@ fn probe_handoff(approve: bool) {
     if approve {
         // Original owner exited completely; adopted exact kernel master
         // still controls the *same* already-running Bash.
+        if let Some(identity) = &stable_process {
+            assert!(
+                !pid_identity::exited(identity.as_fd()).unwrap(),
+                "original shell must still be alive after the source exits"
+            );
+        }
         let mut master = File::from(owned_master);
         master
             .write_all(b"printf '%s' \"$$\" > after.pid\n")
@@ -209,6 +232,16 @@ fn probe_handoff(approve: bool) {
         assert_eq!(pre, post, "FD transfer must not create another shell");
         master.write_all(b"exit\n").unwrap();
         master.flush().unwrap();
+        if let Some(identity) = &stable_process {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !pid_identity::exited(identity.as_fd()).unwrap() {
+                assert!(
+                    Instant::now() < until,
+                    "pidfd did not observe original shell exit"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
     } else {
         // Denied admission: receiver closes the FD and the old controller
         // has proved it could still issue a command after the offer.
@@ -231,10 +264,15 @@ fn probe_handoff(approve: bool) {
 
 #[test]
 fn kernel_master_fd_survives_original_process_without_restarting_bash() {
-    probe_handoff(true);
+    probe_handoff(true, false);
 }
 
 #[test]
 fn rejected_transfer_preserves_original_shell_controller() {
-    probe_handoff(false);
+    probe_handoff(false, false);
+}
+
+#[test]
+fn transferred_pidfd_tracks_exact_running_bash_after_owner_exits() {
+    probe_handoff(true, true);
 }
