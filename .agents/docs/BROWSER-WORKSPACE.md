@@ -141,9 +141,28 @@ confirmation, the original File/Review remains available, rather than
 claiming a completed move. This is a recent acknowledgment, **not** a
 guarantee that a browser cannot crash immediately after sending it.
 
-These are **read-only presentation actions only**: native terminal/process
-ownership, independent paired-browser accounts, post-ACK crash/network
-partitions, and native PTY docking remain separate. No SQLite, JSONL or
+An explicitly paired browser can now choose **Pair another browser**,
+display a one-use code valid for up to five minutes, and Copy or
+**Cancel invitation** (which revokes the unused code on the owner).
+The recipient separately pairs at the normal screen, receiving its
+own random HttpOnly SameSite=Strict cookie. Both profiles share exactly
+the **same owner principal, source/tool/account grants and expiry**, with
+at most four paired browsers. Logging out from any browser revokes all.
+
+A read-only File/Review also offers **Move to another paired browser**,
+showing a temporary correlation-only `#aw-dock=` link. The receiving
+browser removes the fragment, authenticates itself, and independently
+reads/restores the exact authorized resource before the owner confirms
+release. No pairing code, cookies, document bytes, provider secret or
+execution grant enters the URL. Two real distinct-profile Chrome 155
+File/Review runs passed, including cancelled-invite denial, separate
+cookies, global logout, unchanged Git HEAD/index and zero execution
+runs/receipts.
+
+These are **read-only presentation actions only**: *different-user
+Actor delegation*, individually narrow/revocable profile grants,
+immediate post-ACK crash/partition recovery and native PTY docking
+remain separate. No SQLite, JSONL or
 native-layout migration, original Agent retargeting, Git write, provider
 credential or model/tool admission is introduced.
 See [Workspace views](../plans/workspace-views/README.md) for the

@@ -7,7 +7,7 @@ independent resources inside one Workspace without changing the current Agent.
 The native slices preserve independent view state, exact authority and one
 execution owner. Browser read-only Agent tabs use the same strict reader; scoped
 browser Files/Git containers use exact launch-root and verified-worktree
-capabilities. Docking remains planned.
+capabilities. Read-only browser File/Review docking now includes same-owner multi-profile handoff; native PTY and distinct-Actor delegated docking remain planned.
 
 ## Design
 
@@ -639,11 +639,55 @@ the post-ACK/Release race.
 
 **Limits:** A three-second acknowledgment is a bounded *recent
 observation*, not a durable lease or guarantee that a browser cannot
-crash immediately afterwards. Full independent multi-profile/paired
-account handling is not supplied by the existing one-time pairing
-model. Network partitions, crashes immediately after ACK, and native
+crash immediately afterwards. At the older `e558919` checkpoint,
+independent browser-profile pairing was not implemented; later
+`0efea351` adds *same-owner profiles*, not distinct Actor delegation.
+Network partitions, crashes immediately after ACK, and native
 PTY/Runtime handoff still require separate acceptance and design.
 No persistent handoff schema or authority was added.
+
+#### Independent browser profiles, shared original owner — signed `0efea351cfb6f95d839ceb051e638f53a56cd28a`
+
+An already paired Browser explicitly requests a **one-use invitation**
+from `/api/browser/invite`. It lasts up to five minutes, bounded by the
+original owner's session expiry, with one pending code, four issuances/minute
+and no more than four total browser cookie jars. Reissue rotates pending
+codes; `/api/browser/invite/revoke` cancels an unused invitation. Unpaired
+and LocalWeb requests are denied. The initial startup code stays single-use.
+Each newly paired profile receives a distinct random
+`HttpOnly; SameSite=Strict` cookie hash, but it inherits exactly the
+**same owner Actor, original expiry, Store, SourceHost, account/tool/provider
+grants**. No additional principal, Files root, separate per-profile grant
+or owner lifetime is created. Logging out from any profile revokes all.
+
+In the shipping Solid UI, `Pair another browser` provides an ephemeral
+code with Copy/Cancel. `Move File/Review to another paired browser` provides
+a temporary **correlation-only** `#aw-dock=` URL, for manual copy to
+another independently paired profile. The fragment is immediately cleared;
+it carries no pairing code, cookie, plaintext document, grant or credentials.
+The receiving browser independently reads the existing scoped File or
+immutable Review and restores bounded CodeMirror presentation before
+the original owner-mediated confirm/heartbeat/release. Failed or unknown
+results preserve inspectable read-only views.
+
+**Verified on signed source:** 7 Rust pairing tests, 24 authenticated
+docking tests, 171 Node tests, web-only Rust 139, other Rust 1,305 (four
+ignored), Store 201 library and 156 integration tests, strict Clippy/fmt,
+Workspace/minimal builds and 8/8 byte-identical Vite assets. Rust coverage
+used split package commands, not a claimed monolithic workspace invocation.
+**Real Chrome 155:** two distinct profiles under a private paired owner,
+B initially unauthorized (401) and rejected a cancelled code; fresh code
+gave it a distinct HttpOnly cookie. Both File and Git Review transfers
+and receiver refresh passed after owner ACK, original unsent draft stayed,
+fragment was cleared and logout from B revoked both profiles. At 390px
+Dark no overflow/uncaught JS errors; synthetic Git HEAD/index unchanged.
+The private owner initialized one expected Session, **zero run/events,
+receipts, pipeline or team effects**. Fake provider, Tools Off.
+
+This is same-owner multi-profile access, **not** delegation to another
+user/Actor, per-browser narrowed grants or independent revocation. Immediate
+post-ACK crashes, arbitrary partitions, persistent restored docking and
+native second-terminal/PTY authority remain open.
 
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
@@ -677,11 +721,11 @@ in a browser message.
 
 The **read-only File and immutable Git Review** ticket/API, browser popup
 and bounded Find/scroll/selection/focus continuity are implemented.
-Native cross-terminal docking and **automatically reopening** a transferred
-view after receiver restart are not implemented. The fresh receiver-confirmation
-gate and origin-preserving crash/reload denials are verified, but independent
-paired-account browser admission, arbitrary partitions, crash exactly after
-ACK and ambiguous transport outcomes need further acceptance. No serialized
+Native cross-terminal docking and **automatically reopening** after restart
+are not implemented. Fresh receiver confirmation, origin-preserving denial,
+and same-owner profile pairing are verified; distinct Actor grants, arbitrary
+partitions, crashes immediately after ACK, and ambiguous outcomes remain open.
+No serialized
 layout migration was introduced: version **0.15.0**, SQLite **33**, JSONL
 **1**, native saved layout **v4**, and all original runtime and resource
 authority boundaries remain unchanged.
