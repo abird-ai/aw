@@ -12,6 +12,43 @@ Post-Phase-58 resize/exit hardening clears the old physical Scrollback scratch f
 child process and bounded screen; it is not a coloured log view.
 Current compiled Rust/PTY host acceptance is recorded above.
 
+## Persistent broker-owned terminal — Unix, 0.15.0
+
+For a new terminal that should survive closing the launching CLI or a
+Workspace frontend, explicitly run:
+
+- `aw workspace persistent start /absolute/root /absolute/path/to/bash`
+- `aw workspace attach /tmp/aw-pty-<nonce>/invite` (use the printed path;
+  it follows `TMPDIR` if configured)
+- **F12** to detach; subsequent attaches reuse the **same Bash PID**.
+- `aw workspace persistent stop /tmp/aw-pty-<nonce>/invite` after
+  detaching to terminate the shell and remove its private endpoint.
+
+This new broker owns one **separately launched** PTY. It runs detached
+from the initiating CLI in a new Unix session with null stdio and
+whitelisted HOME/PATH/locale/TMPDIR only. No provider/Agent/Store
+environment, model/tool admission or SQLite/JSONL run is created.
+Invitation tokens are one-use, 90-second, private (0700 directory,
+0600 file) and rotated after detach or receiver loss. Same-UID clients
+still require the current token; old/racing controllers fail closed.
+The owner terminates after 24 hours *idle between attachments*; an
+active session is not cut off by this timer. Child exit stops the broker,
+while lost broker ownership causes clients to exit without replay.
+
+**Verified:** signed `bd87e5d`, real Linux `tests/native_persistent_pty.py`
+scenarios `reconnect`, `competition`, `workspace-exit`, `shell-exit` and
+`broker-loss`: same original Bash PID across three frontends,
+independent Workspace exit, token rotation, no competing controller,
+credential filtering, private TMPDIR, F12/termios restoration, explicit
+shutdown and endpoint cleanup. Full split Rust, Node, web-only,
+feature-boundary, formatting and scoped Clippy gates passed; see
+[Workspace plan](../plans/workspace-views/TODO.md).
+
+**Limit:** Already-running Workspace-owned PTYs are **not transferable**
+to the new broker. They still require the original Workspace owner.
+No shell survives broker SIGKILL or OS reboot by promise, and
+remote/multi-user control and Windows/macOS host acceptance remain open.
+
 ## Native second-terminal docking — Unix, 0.15.0
 
 Focus an existing running native PTY and invoke **`terminal-dock`** in

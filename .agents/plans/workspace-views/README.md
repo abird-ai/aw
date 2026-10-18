@@ -7,7 +7,7 @@ independent resources inside one Workspace without changing the current Agent.
 The native slices preserve independent view state, exact authority and one
 execution owner. Browser read-only Agent tabs use the same strict reader; scoped
 browser Files/Git containers use exact launch-root and verified-worktree
-capabilities. Read-only browser File/Review and live-owner Unix PTY docking are implemented; owner-independent PTY survival and distinct-Actor delegation remain planned.
+capabilities. Browser File/Review and native Unix docking are implemented; a dedicated broker now also keeps *newly launched* PTYs alive after a Workspace frontend exits. Migration of older Workspace PTYs and distinct-Actor delegation remain planned.
 
 ## Design
 
@@ -741,10 +741,60 @@ Native Windows target compilation was
 attempted but **blocked by absent Windows Rust std/core target**, not
 a verified Windows pass; macOS was not host-tested.
 
-**Outside this milestone:** durable owner-independent terminal service,
-remote/multi-machine PTY control, different-user Actor delegation and
-native Windows/macOS acceptance. No browser File/Review docking ticket
-grants native terminal control.
+**Outside this historical live-owner milestone:** the newer `bd87e5d`
+dedicated broker enables owner-independent *new* shells, but live
+Workspace-owned PTYs still cannot be migrated. Remote/multi-machine PTY
+control, separate Actor delegation and Windows/macOS acceptance remain
+open; browser File/Review tickets never grant PTY control.
+
+#### Opt-in persistent Unix PTY broker — signed `bd87e5dbb1c8fc745397b9a7066ef05906c07366`
+
+A new explicit **`aw workspace persistent start ABSOLUTE_ROOT ABSOLUTE_BASH`**
+spawns a separate local PTY owner. It launches **one new shell**, not
+another Agent or tool, and exits after publishing a private invitation.
+The detached broker retains the PTY master, VT100 parser and shell PID
+when the initiating CLI or an unrelated Workspace frontend exits.
+Attach/detach with `aw workspace attach INVITE` and **F12**; the broker
+rotates the one-use 90-second invitation after each recipient departs.
+Use **`aw workspace persistent stop INVITE`** *after detaching* to
+terminate the broker-owned shell explicitly.
+
+The broker runs in its own Unix session with null stdio and an environment
+allowlist (HOME, PATH, locale, the resolved private TMPDIR). It never
+opens a Workspace SQLite/JSONL State, Agent, provider, credentials, root
+grant or tool engine. Same-UID Unix clients must possess the current
+private invitation. Owner generation/one-controller lease, queued input
+drain, bounded frames, post-detach receipt and no-replay behavior reuse
+the previous native-docking protocol. No saved layout, new serializer,
+schema migration, model usage or independent delegated user is created.
+
+The fresh AW-generated endpoint is 0700 (private directory) and the
+one-use invitation 0600. The hidden `serve` CLI refuses unrelated,
+occupied or public paths before assuming cleanup ownership. Tokens rotate
+on reconnect; stale and competing controllers are denied. A detached
+broker stops an idle PTY after **24 hours**, resetting that window on
+completed attachments; active sessions are not timed out merely because
+of broker age. Child exit cleans the owner and socket; broker loss makes
+clients fail closed without reviving shell input or recreating the PTY.
+
+**Acceptance:** `tests/native_persistent_pty.py` runs five independent
+real Linux process/PTY cases (reconnect, competing client, separate
+Workspace exit, child exit, broker loss), with the *same* Bash PID across
+three separate frontends and a successful terminal restoration. The test
+also checks expired/replayed invitations, private TMPDIR, filtered
+launcher credentials, explicit stop and endpoint cleanup. Split Rust
+tests passed **1,324 non-Store** (four ignored), **201 Store library** and
+**156 Store integrations**; **174 Node** and **139 web-only Rust**
+also passed. Formatting, strict platform/library Clippy, scoped binary
+Clippy, Workspace/minimal builds, and eight byte-identical browser assets
+passed in the pinned Nix environment (`aw 0.15.0`).
+
+**Limits:** This does **not migrate** an existing Workspace-owned
+shell: those PTYs still require their original owner to stay running.
+A broker-owned PTY survives *frontend* exit, not broker SIGKILL or reboot.
+Persistent remote/multi-machine PTY authority, separate-user grants,
+Windows/macOS terminal certification and OS-level durable restoration
+remain unimplemented.
 
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
