@@ -1,6 +1,8 @@
 //! Optional native workspace frontend. One owner thread uses the existing SDK;
 //! neither a layout operation nor a read-only file view invokes a model.
 mod agent_view;
+#[cfg(unix)]
+pub(super) mod native_dock;
 mod background;
 mod branch_view;
 pub(super) mod files;
@@ -11,6 +13,7 @@ mod persistence;
 mod session_nav;
 mod syntax;
 mod tab_strip;
+mod terminal_control;
 pub(super) mod terminals;
 mod ui;
 mod viewport;

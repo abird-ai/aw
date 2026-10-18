@@ -6,6 +6,7 @@ mod filter;
 mod input;
 pub use input::{encode_key, encode_paste, Key, Modifiers};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
@@ -30,20 +31,20 @@ pub enum Error {
     #[error("terminal request failed: {0}")]
     Backend(String),
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Running,
     Stopping,
     Exited(u32),
     Failed,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
 }
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Cell {
     pub text: String,
     pub wide: bool,
@@ -56,7 +57,7 @@ pub struct Cell {
     pub underline: bool,
     pub inverse: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Snapshot {
     pub id: String,
     pub root: PathBuf,

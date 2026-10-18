@@ -1123,11 +1123,12 @@ impl Ui {
         }
     }
     fn terminal_paste(&mut self, text: &str) -> bool {
-        if let Some(terminal) = self.terminal() {
+        if let (Some(pool), Some(terminal)) = (&self.terminal_pool, self.terminal()) {
             let result = aw_terminal::encode_paste(text, terminal.input_modes().1)
-                .and_then(|bytes| terminal.input(bytes));
-            if let Err(e) = result {
-                self.notice = e.to_string();
+                .map_err(|error| aw::Error::Config(error.to_string()))
+                .and_then(|bytes| pool.input_local(&terminal.id, bytes));
+            if let Err(error) = result {
+                self.notice = error.to_string();
             }
             return true;
         }

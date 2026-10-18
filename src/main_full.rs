@@ -1539,6 +1539,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             run_agent(run)
         }
         TopCommand::Workspace { command } => match command {
+            #[cfg(all(feature = "workspace", unix))]
+            Some(resources_cli::WorkspaceCommand::Attach { invite }) => workspace::native_dock::attach(&invite),
             Some(resources_cli::WorkspaceCommand::Open { name, args }) => {
                 let mut run = args.run.into_run(args.workspace_layout);
                 run.workspace = Some(name);
@@ -6068,6 +6070,20 @@ fn r14_original_command_tree_inventory() {
     }
 }
 
+#[cfg(all(test, feature = "workspace", unix))]
+#[test]
+fn native_workspace_attach_is_a_distinct_typed_command_not_a_new_agent() {
+    let cli = cli_taxonomy::parse::<Cli>([
+        "aw", "workspace", "attach", "/tmp/synthetic-native-owner/invite",
+    ]);
+    match cli.command {
+        Some(TopCommand::Workspace {
+            command: Some(resources_cli::WorkspaceCommand::Attach { invite }),
+        }) => assert_eq!(invite, PathBuf::from("/tmp/synthetic-native-owner/invite")),
+        _ => panic!("attaching a native PTY must not construct an Agent or Workspace owner"),
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn r14_full_cli_parses_and_exports_from_small_outer_stack() {
@@ -6084,10 +6100,10 @@ fn r14_full_cli_parses_and_exports_from_small_outer_stack() {
             if cfg!(feature = "full") {
                 if cfg!(target_os = "linux") {
                     assert_eq!(schema.counts.flags,1719);
-                    assert_eq!(schema.counts.command_paths,244);
+                    assert_eq!(schema.counts.command_paths,244 + usize::from(cfg!(all(feature = "workspace", unix))));
                 } else {
                     assert_eq!(schema.counts.flags,1670);
-                    assert_eq!(schema.counts.command_paths,235);
+                    assert_eq!(schema.counts.command_paths,235 + usize::from(cfg!(all(feature = "workspace", unix))));
                 }
             }
         })

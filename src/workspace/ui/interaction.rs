@@ -1079,8 +1079,10 @@ impl Ui {
         // input. We reserve only the explicit global workspace chords above.
         if let Some(t) = self.terminal() {
             if let Some(bytes) = terminals::key(key, t.input_modes().0) {
-                if let Err(e) = t.input(bytes) {
-                    self.notice = e.to_string();
+                if let Some(pool) = &self.terminal_pool {
+                    if let Err(error) = pool.input_local(&t.id, bytes) {
+                        self.notice = error.to_string();
+                    }
                 }
             }
             return;

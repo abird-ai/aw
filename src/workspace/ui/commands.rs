@@ -622,6 +622,8 @@ impl Ui {
                         | "terminal"
                         | "terminal-open"
                         | "terminals"
+                        | "terminal-dock"
+                        | "terminal-dock-cancel"
                         | "terminal-scroll"
                         | "terminal-live"
                         | "hunk-next"
@@ -719,6 +721,31 @@ impl Ui {
                 self.notice = "Agent cancellation requested, separate from terminal input".into();
             }
             "terminal" => self.toggle_terminal(),
+            #[cfg(unix)]
+            "terminal-dock" => {
+                let id = self.terminal().map(|terminal| terminal.id.clone());
+                match (&self.terminal_pool, id) {
+                    (Some(pool), Some(id)) => match super::super::native_dock::invite(pool.clone(), &id) {
+                        Ok(invite) => self.notice = format!(
+                            "Dock: aw workspace attach {}",
+                            invite.display()
+                        ),
+                        Err(error) => { self.notice = error.to_string(); accepted = false; }
+                    },
+                    _ => { self.notice = "Focus a running terminal before docking".into(); accepted = false; }
+                }
+            }
+            #[cfg(unix)]
+            "terminal-dock-cancel" => {
+                let id = self.terminal().map(|terminal| terminal.id.clone());
+                match (&self.terminal_pool, id) {
+                    (Some(pool), Some(id)) => match pool.cancel_dock(&id) {
+                        Ok(()) => self.notice = "Unused native PTY invitation revoked; shell remains owned here".into(),
+                        Err(error) => { self.notice = error.to_string(); accepted = false; }
+                    },
+                    _ => { self.notice = "Focus a terminal with a pending invitation".into(); accepted = false; }
+                }
+            }
             "terminal-start" => {
                 if self.terminal_pending {
                     self.notice = "Terminal launch already pending".into();
@@ -798,10 +825,15 @@ impl Ui {
                 };
             }
             "terminal-stop" => {
-                if let Some(t) = self.terminal() {
-                    t.terminate();
-                    self.notice =
-                        "PTY termination requested; inspect commands with uncertain effects".into();
+                if let (Some(pool), Some(t)) = (&self.terminal_pool, self.terminal()) {
+                    match pool.terminate_local(&t.id) {
+                        Ok(()) => self.notice =
+                            "PTY termination requested; inspect commands with uncertain effects".into(),
+                        Err(error) => {
+                            self.notice = error.to_string();
+                            accepted = false;
+                        }
+                    }
                 } else {
                     self.notice = "Focus a terminal tab".into();
                     accepted = false;

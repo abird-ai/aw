@@ -386,7 +386,7 @@ impl WorkspaceCommand {
             | "terminal-live"
             | "terminal-scroll 20"
             | "terminal-scroll -20"
-            | "terminal-forget" => context.terminal_focused,
+            | "terminal-forget" | "terminal-dock" | "terminal-dock-cancel" => context.terminal_focused,
             "stage" | "unstage" | "hunk-next" | "hunk-prev" | "reviewed" | "comment"
             | "send-review" => context.diff_focused,
             "filter" => context.navigator_focused,
@@ -522,6 +522,20 @@ pub const WORKSPACE_COMMANDS: &[WorkspaceCommand] = &[
         command: "terminals",
         label: "List Terminals",
         description: "show retained local terminal resources and status",
+        shortcut: "",
+    },
+    #[cfg(unix)]
+    WorkspaceCommand {
+        command: "terminal-dock",
+        label: "Move PTY control to another terminal…",
+        description: "one-use 90s private invitation; original owner stays running; no new shell",
+        shortcut: "",
+    },
+    #[cfg(unix)]
+    WorkspaceCommand {
+        command: "terminal-dock-cancel",
+        label: "Cancel pending PTY invitation",
+        description: "revoke an unused native terminal invitation without stopping its shell",
         shortcut: "",
     },
     WorkspaceCommand {

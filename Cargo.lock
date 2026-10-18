@@ -671,6 +671,7 @@ version = "0.15.0"
 dependencies = [
  "aw-platform",
  "portable-pty",
+ "serde",
  "thiserror 2.0.17",
  "vt100",
 ]

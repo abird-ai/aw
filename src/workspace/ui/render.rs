@@ -1003,7 +1003,7 @@ impl Ui {
             if let Some(pool) = &self.terminal_pool {
                 for (id, (_, rows, cols)) in sizes {
                     if let Some(terminal) = pool.get(&id) {
-                        let _ = terminal.resize(rows, cols);
+                        let _ = pool.resize_local(&terminal.id, rows, cols);
                     }
                 }
             }
@@ -1913,7 +1913,12 @@ impl Ui {
                             area,
                             &t,
                             *self.terminal_scroll.get(&tab.id).unwrap_or(&0),
-                            focused && self.palette.is_none(),
+                            focused && self.palette.is_none()
+                                && matches!(self.terminal_pool.as_ref()
+                                    .and_then(|pool| pool.dock_mode(&t.id)),
+                                    Some(super::super::terminal_control::Mode::Local)
+                                        | Some(super::super::terminal_control::Mode::Offered)),
+                            self.terminal_pool.as_ref().and_then(|pool| pool.dock_mode(&t.id)),
                         );
                     } else {
                         frame.render_widget(Paragraph::new("Terminal not live in this owner. Restoring a layout never launches a shell. Use terminal-start explicitly."),area);

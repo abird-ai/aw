@@ -983,6 +983,9 @@ pub(crate) enum WorkspaceCommand {
         #[command(flatten)]
         args: crate::WorkspaceOpenCliArgs,
     },
+    /// Attach a second native terminal to a human-invited, live PTY.
+    #[cfg(all(feature = "workspace", unix))]
+    Attach { invite: PathBuf },
     /// List accessible Workspaces.
     #[command(alias = "ls")]
     List {
@@ -1035,6 +1038,8 @@ pub(crate) enum WorkspaceCommand {
 }
 pub(crate) fn workspace(command: WorkspaceCommand) -> Result<u8> {
     match command {
+        #[cfg(all(feature = "workspace", unix))]
+        WorkspaceCommand::Attach { .. } => return Err(Error::Denied("native PTY attach must be dispatched by root CLI")),
         WorkspaceCommand::Open { .. } => {
             return Err(Error::Config(
                 "workspace open must be dispatched by the root CLI".into(),
