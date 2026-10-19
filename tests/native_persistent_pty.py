@@ -33,6 +33,10 @@ env={**os.environ,'HOME':str(root),'XDG_CONFIG_HOME':str(root),
      'XDG_CACHE_HOME':str(root),'TMPDIR':str(socketbase),
      'AW_FAKE_PROVIDER_SECRET':'must-not-be-inherited',
      'TERM':'xterm-256color','COLORTERM':''}
+# These independent PTYs emulate xterm, not the invoking desktop/tmux peer.
+for key in ('TMUX','TMUX_PANE','KITTY_WINDOW_ID','WEZTERM_PANE',
+            'GHOSTTY_RESOURCES_DIR','FOOT_CLIENT_PID'):
+  env.pop(key,None)
 try:
   launcher=subprocess.run([binary,'workspace','persistent','start',str(work),bash],
      cwd=str(work),env=env,capture_output=True,text=True,timeout=19,check=True)
@@ -41,7 +45,7 @@ except Exception:
   raise
 text=launcher.stdout
 import re
-match=re.search(r'aw workspace attach (/[\w\-/]+/invite)',text)
+match=re.search(r'(?m)^aw workspace attach (/[^\r\n]+/invite)$',text)
 assert match, 'missing broker invitation, got '+repr(text[:300])
 invite=pathlib.Path(match.group(1))
 def read_code():
@@ -159,7 +163,7 @@ def stale_hello(code):
   return b'error' in data or b'Error' in data
 passed=False
 try:
-  print('BROKER_STARTED',{'launcherExit':launcher.returncode,'brokerPid':broker_pid,'separateOwner':True,
+  print('BROKER_STARTED',{'launcherExit':launcher.returncode,'brokerPid':broker_pid,'separateOwner':True,'fixture':str(root),
       'privateInvite':True,'idleHours':24},flush=True)
   if mode=='workspace-exit':
     # Closing an unrelated original Workspace must not affect this separately
