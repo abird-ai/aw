@@ -1,5 +1,7 @@
 use crate::{changed, filter::Filter, Message, Shared, Status, MAX_INPUT};
 use portable_pty::{Child, MasterPty, PtySize};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::{
     io::{Read, Write},
     sync::{atomic::Ordering, mpsc, Arc},
@@ -8,6 +10,8 @@ use std::{
 
 enum ReadEvent {
     Bytes(Vec<u8>),
+    #[cfg(target_os = "linux")]
+    Paused(u64),
     Closed,
     Failed,
 }
@@ -22,13 +26,49 @@ pub(crate) fn run(
     mut writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<Message>,
     shared: Arc<Shared>,
+    #[cfg(target_os = "linux")] monitor_fd: OwnedFd,
 ) {
     let (output_tx, output_rx) = mpsc::sync_channel::<ReadEvent>(32);
+    #[cfg(target_os = "linux")]
+    let reader_state = shared.clone();
     let reader_thread = std::thread::Builder::new()
         .name("aw-terminal-reader".into())
         .spawn(move || {
             let mut buffer = [0_u8; 8192];
+            #[cfg(target_os = "linux")]
+            let mut last_paused_generation = None;
             loop {
+                #[cfg(target_os = "linux")]
+                {
+                    if reader_state.reader_pause_requested.load(Ordering::Acquire) {
+                        let generation = reader_state.reader_epoch.load(Ordering::Acquire);
+                        if last_paused_generation != Some(generation) {
+                            if output_tx.send(ReadEvent::Paused(generation)).is_err() {
+                                break;
+                            }
+                            last_paused_generation = Some(generation);
+                        }
+                        std::thread::sleep(Duration::from_millis(4));
+                        continue;
+                    }
+                    last_paused_generation = None;
+                    // The reader owns an independent CLOEXEC descriptor until
+                    // it exits, so poll never sees a recycled original FD.
+                    match aw_platform::pty_poll::readable(
+                        monitor_fd.as_raw_fd(),
+                        Duration::from_millis(16),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_) => {
+                            let _ = output_tx.send(ReadEvent::Failed);
+                            break;
+                        }
+                    }
+                    if reader_state.reader_pause_requested.load(Ordering::Acquire) {
+                        continue;
+                    }
+                }
                 match reader.read(&mut buffer) {
                     Ok(0) => {
                         let _ = output_tx.send(ReadEvent::Closed);
@@ -63,6 +103,8 @@ pub(crate) fn run(
     let mut output_closed = false;
     let mut stopping: Option<Instant> = None;
     let mut exited = false;
+    #[cfg(target_os = "linux")]
+    let mut quiesce_reply: Option<(u64, mpsc::SyncSender<crate::Result<()>>)> = None;
 
     loop {
         while let Ok(message) = rx.try_recv() {
@@ -97,6 +139,25 @@ pub(crate) fn run(
                         state.notice = "PTY resize failed; previous size retained".into()
                     }),
                 },
+                #[cfg(target_os = "linux")]
+                Message::Quiesce { epoch, reply } => {
+                    let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.quiescing
+                        && state.quiesce_epoch == epoch
+                        && state.status == Status::Running
+                        && !shared.stop.load(Ordering::Acquire)
+                    {
+                        // State lock synchronizes request acceptance and
+                        // timeout rollback: a stale request cannot repause.
+                        shared.reader_epoch.store(epoch, Ordering::Release);
+                        shared.reader_pause_requested.store(true, Ordering::Release);
+                        quiesce_reply = Some((epoch, reply));
+                    } else {
+                        let _ = reply.send(Err(crate::Error::Unavailable(
+                            "PTY quiescence request was revoked",
+                        )));
+                    }
+                }
                 Message::Stop => {
                     shared.stop.store(true, Ordering::Release);
                 }
@@ -104,6 +165,15 @@ pub(crate) fn run(
         }
 
         if shared.stop.load(Ordering::Acquire) && stopping.is_none() {
+            #[cfg(target_os = "linux")]
+            {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.quiescing = false;
+                shared
+                    .reader_pause_requested
+                    .store(false, Ordering::Release);
+                quiesce_reply.take();
+            }
             changed(&shared, |state| state.status = Status::Stopping);
             stopping = Some(Instant::now());
             if let Some(pid) = child.process_id() {
@@ -146,6 +216,31 @@ pub(crate) fn run(
         }
 
         match output_rx.recv_timeout(Duration::from_millis(50)) {
+            #[cfg(target_os = "linux")]
+            Ok(ReadEvent::Paused(epoch)) => {
+                // A delayed acknowledgment from a timed-out generation
+                // must never consume the *new* generation's reply channel.
+                if quiesce_reply
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending == epoch)
+                {
+                    if let Some((pending_epoch, reply)) = quiesce_reply.take() {
+                        let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if state.quiescing
+                            && state.quiesce_epoch == pending_epoch
+                            && state.status == Status::Running
+                            && shared.pending.load(Ordering::Acquire) == 0
+                            && !shared.stop.load(Ordering::Acquire)
+                        {
+                            let _ = reply.send(Ok(()));
+                        } else if state.quiescing && state.quiesce_epoch == pending_epoch {
+                            let _ = reply.send(Err(crate::Error::Unavailable(
+                                "PTY quiescence was not confirmed",
+                            )));
+                        }
+                    }
+                }
+            }
             Ok(ReadEvent::Bytes(bytes)) => {
                 let bytes = filter.push(&bytes);
                 let mut replies = Vec::new();

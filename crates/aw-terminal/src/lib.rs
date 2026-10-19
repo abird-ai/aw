@@ -7,6 +7,8 @@ mod input;
 pub use input::{encode_key, encode_paste, Key, Modifiers};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU64;
 use std::{
     path::PathBuf,
     sync::{
@@ -142,16 +144,29 @@ pub(crate) struct State {
     pub version: u64,
     pub status: Status,
     pub notice: String,
+    #[cfg(target_os = "linux")]
+    pub quiescing: bool,
+    #[cfg(target_os = "linux")]
+    pub quiesce_epoch: u64,
 }
 pub(crate) struct Shared {
     pub state: Mutex<State>,
     pub stop: AtomicBool,
     pub pending: AtomicUsize,
     pub notify: Notify,
+    #[cfg(target_os = "linux")]
+    pub reader_pause_requested: AtomicBool,
+    #[cfg(target_os = "linux")]
+    pub reader_epoch: AtomicU64,
 }
 pub(crate) enum Message {
     Input(Vec<u8>),
     Resize(u16, u16),
+    #[cfg(target_os = "linux")]
+    Quiesce {
+        epoch: u64,
+        reply: mpsc::SyncSender<Result<()>>,
+    },
     Stop,
 }
 /// One terminal resource. Multiple `Arc<Terminal>` views refer to the SAME PTY.
@@ -208,6 +223,12 @@ impl Terminal {
         // No BASH_ENV/ENV/LD_*/API-token/agent-socket inheritance. The shell still
         // has the user's filesystem/network authority; this is NOT a sandbox.
         // portable-pty supplies the Unix PTY / Windows ConPTY reader/writer pair.
+        #[cfg(target_os = "linux")]
+        let monitor_fd = aw_platform::pty_poll::duplicate(
+            pair.master
+                .as_raw_fd()
+                .ok_or(Error::Unavailable("native PTY descriptor missing"))?,
+        )?;
         let reader = pair.master.try_clone_reader().map_err(backend)?;
         let writer = pair.master.take_writer().map_err(backend)?;
         let shared = Arc::new(Shared {
@@ -221,18 +242,30 @@ impl Terminal {
                 version: 0,
                 status: Status::Running,
                 notice: String::new(),
+                #[cfg(target_os = "linux")]
+                quiescing: false,
+                #[cfg(target_os = "linux")]
+                quiesce_epoch: 0,
             }),
             stop: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
             notify: Arc::new(notify),
+            #[cfg(target_os = "linux")]
+            reader_pause_requested: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            reader_epoch: AtomicU64::new(0),
         });
         let child = driver::ChildGuard::new(pair.slave.spawn_command(command).map_err(backend)?);
         drop(pair.slave);
         let (tx, rx) = mpsc::sync_channel(32);
         let state = shared.clone();
+        #[cfg(target_os = "linux")]
+        let task = move || driver::run(pair.master, child, reader, writer, rx, state, monitor_fd);
+        #[cfg(not(target_os = "linux"))]
+        let task = move || driver::run(pair.master, child, reader, writer, rx, state);
         std::thread::Builder::new()
             .name("aw-terminal-pty".into())
-            .spawn(move || driver::run(pair.master, child, reader, writer, rx, state))?;
+            .spawn(task)?;
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -274,6 +307,12 @@ impl Terminal {
         if guard.status != Status::Running {
             return Err(Error::Unavailable("terminal is not running"));
         }
+        #[cfg(target_os = "linux")]
+        if guard.quiescing {
+            return Err(Error::Unavailable(
+                "PTY owner is quiescing; input not accepted",
+            ));
+        }
         let len = bytes.len();
         if len > MAX_PASTE + 32 {
             return Err(Error::Full);
@@ -293,22 +332,80 @@ impl Terminal {
     }
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         valid_size(rows, cols)?;
-        if self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .parser
-            .screen()
-            .size()
-            == (rows, cols)
-        {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.status != Status::Running {
+            return Err(Error::Unavailable("terminal is not running"));
+        }
+        #[cfg(target_os = "linux")]
+        if state.quiescing {
+            return Err(Error::Unavailable(
+                "PTY owner is quiescing; resize not accepted",
+            ));
+        }
+        if state.parser.screen().size() == (rows, cols) {
             return Ok(());
         }
         self.tx
             .try_send(Message::Resize(rows, cols))
             .map_err(|_| Error::Full)?;
         Ok(())
+    }
+
+    /// Reversible Linux single-reader cutover barrier. Deny new input/resize,
+    /// drain prior commands, then await the only PTY reader's pause receipt.
+    /// This does NOT release child custody, clone a parser or authorize any
+    /// broker to consume escrowed FDs.
+    #[cfg(target_os = "linux")]
+    pub fn quiesce(&self, timeout: Duration) -> Result<Quiesced<'_>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let epoch;
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.status != Status::Running || self.shared.stop.load(Ordering::Acquire) {
+                return Err(Error::Unavailable("terminal no longer running"));
+            }
+            if state.quiescing {
+                return Err(Error::Unavailable("PTY reader quiescence already pending"));
+            }
+            epoch = state
+                .quiesce_epoch
+                .checked_add(1)
+                .ok_or(Error::Unavailable("PTY reader generation exhausted"))?;
+            state.quiesce_epoch = epoch;
+            state.quiescing = true;
+            if self
+                .tx
+                .try_send(Message::Quiesce { epoch, reply: tx })
+                .is_err()
+            {
+                state.quiescing = false;
+                return Err(Error::Full);
+            }
+        }
+        let response = rx.recv_timeout(timeout.min(Duration::from_secs(5)));
+        match response {
+            Ok(Ok(())) => Ok(Quiesced {
+                terminal: self,
+                epoch,
+            }),
+            _ => {
+                self.release_quiescence(epoch);
+                Err(Error::Unavailable(
+                    "PTY quiescence unconfirmed; original reader resumed",
+                ))
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn release_quiescence(&self, epoch: u64) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.quiescing && state.quiesce_epoch == epoch {
+            state.quiescing = false;
+            self.shared
+                .reader_pause_requested
+                .store(false, Ordering::Release);
+        }
     }
     pub fn terminate(&self) {
         self.shared.stop.store(true, Ordering::Release);
@@ -362,6 +459,27 @@ impl Terminal {
         };
         state.parser.screen_mut().set_scrollback(0);
         result
+    }
+}
+/// Exclusive reversible source-reader pause. No ownership is transferred.
+/// RAII rollback resumes the original driver, including after an aborted
+/// handoff. A recipient has no authority simply because this guard exists.
+#[cfg(target_os = "linux")]
+#[must_use = "dropping the reader gate resumes the original owner"]
+pub struct Quiesced<'a> {
+    terminal: &'a Terminal,
+    epoch: u64,
+}
+#[cfg(target_os = "linux")]
+impl Quiesced<'_> {
+    pub fn snapshot(&self) -> Snapshot {
+        self.terminal.snapshot(0)
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for Quiesced<'_> {
+    fn drop(&mut self) {
+        self.terminal.release_quiescence(self.epoch);
     }
 }
 impl Drop for Terminal {
