@@ -65,15 +65,23 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 - [x] Execute the byte-identical installed portable asset in all 35 native cases: original-Workspace parser/`vim`/`less`/source-crash (4), adversarial migration protocol/process-loss (26), persistent broker lifecycle (5). Same shell PID/parser and exclusive I/O survive source exit within the existing Linux scope; source SIGKILL cannot restore its killed terminal.
 - [x] Add the real portable asset build/checksum/version step to CI so native-only compilation cannot hide this target failure. Local execution is verified; hosted workflow execution is unclaimed. Other hosts, live providers/billing, signing/notarization and release authorization remain open.
 
+### Source `769e9ef27f5edc88f24ae3fe6be1f8ddfe388596` — CLI and source compatibility review
+
+- [x] Compare actual Full/Minimal/Stateless offline CLI schemas and root help with accepted `47ee8a0`: no changed/removed existing flag rows or removed command paths; seven additive Linux Full command paths. Six binaries and sixteen parser/metadata controls pass with private empty HOME/XDG/cwd and no generated State/config/root files.
+- [x] Compile independent consumers against both source revisions and execute synthetic layout/capabilities readers: terminal exhaustive matches and Workspace literals require source updates; v1 layout migrates to v4 with an explicit scope, while the old reader refuses v4; capabilities remains schema 1 but current parsing requires source/scope fields absent from old output. Preserve those custody/binding checks. Record scope, commands and owner decisions in [CLI compatibility](CLI-COMPATIBILITY.md).
+
 ## Uncommitted
 
 - [ ] Complete remaining release-asset native-host execution: Linux ARM64, macOS ARM64 and Windows x86_64/ARM64, locally or with hosted jobs when available. Linux x86_64 musl fixture acceptance is recorded above; emulation cannot certify missing hosts.
-- [ ] Review breaking CLI/version surfaces, agree any version change and obtain release authorization before distribution; 0.16.0 remains a proposal.
+- [ ] Agree the version/release decision after the [completed compatibility review](CLI-COMPATIBILITY.md), including source SDK revision pinning, one-way native layout upgrade and mixed-version capabilities policy; obtain explicit release authorization before distribution. 0.16.0 remains a proposal; source stays 0.15.0.
 - [ ] Decide/configure Developer ID/Authenticode signing and notarization requirements; ad-hoc signatures and checksums do not supply those identities.
 - [ ] Run live-provider/billing compatibility checks only when separately authorized and configured.
 - [ ] Obtain an independent security review; product tests do not supply independent certification.
 
 ## Tests and verification
+
+- [x] `769e9ef` versus accepted `47ee8a0`: pinned offline/locked Full, Minimal and Stateless CLI builds and real `cli schema`/`--help`/`--version` execution — passed; all existing exported flag rows equal, reduced schemas equal, sixteen parser/metadata controls pass. Current Full reuses the verified `b3d970b` musl asset with Git-equal Rust/Cargo/web inputs; current reduced cuts use an isolated target directory. See [review](CLI-COMPATIBILITY.md) for command forms and feature/host limits.
+- [x] `769e9ef` versus `47ee8a0`: actual external Rust consumer controls — baseline exhaustive terminal match/Workspace literal compile, current consumers require source updates (E0004/E0063); current model migrates synthetic layout v1 to v4, baseline refuses v4; old capabilities payload is refused by current required source/scope fields, current payload is accepted by old type. No real user data or authority defaults used. These focused checks do not replace the full product or external release gates.
 
 - [x] `b3d970b`: pinned glibc/musl `cargo test --locked -p aw-platform-unix --all-targets` and `cargo test --locked -p aw-terminal --all-targets` (musl adds `--target x86_64-unknown-linux-musl` and static CRT) — 14 + 55 passed per libc. Explicit `unshare --user --map-auto --map-root-user -- cargo test ... --test cross_uid_fd_handoff -- --ignored --exact different_uid_is_rejected_before_descriptor_io` passed for each libc. Strict platform all-target Clippy for each, Cargo formatting and portable CI Bash syntax passed. The pinned cross-package development shell supplies the musl compiler/linker; this is actual local execution, not compile-only evidence.
 - [x] `nix build path:/tmp/aw-musl-acceptance-4lcyexci/source-fixed#dist-linux-x86_64 --no-link --print-out-paths --no-update-lock-file` on signed `b3d970b` — passed. Real sidecar/ELF/version checks, four private-prefix installer checks and 35 `AW_TEST_BINARY=PRIVATE_INSTALLED_ASSET` native scenarios passed in the pinned Nix shell. No current all-target release assembly, other-host qualification, live-provider result or complete Rust/Node suite is inferred from this focused gate.
