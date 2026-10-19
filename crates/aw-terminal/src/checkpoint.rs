@@ -21,7 +21,7 @@ pub const MAX_CHECKPOINT_WIRE_BYTES: usize = 48 * 1024 * 1024;
 const CHECKPOINT_FORMAT: u8 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-enum Event {
+pub(crate) enum Event {
     Bytes(Vec<u8>),
     Resize { rows: u16, cols: u16 },
 }
@@ -60,11 +60,11 @@ fn bounded_events<'de, D: serde::Deserializer<'de>>(
 /// Only the original driver appends; it must record successful size changes
 /// in the same order in which its parser applies them.
 pub(crate) struct Journal {
-    rows: u16,
-    cols: u16,
-    events: Vec<Event>,
-    bytes: usize,
-    complete: bool,
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) events: Vec<Event>,
+    pub(crate) bytes: usize,
+    pub(crate) complete: bool,
 }
 
 impl Journal {
@@ -158,16 +158,16 @@ impl Journal {
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     format: u8,
-    id: String,
-    root: PathBuf,
-    owner: String,
-    site: String,
-    epoch: u64,
-    rows: u16,
-    cols: u16,
+    pub(crate) id: String,
+    pub(crate) root: PathBuf,
+    pub(crate) owner: String,
+    pub(crate) site: String,
+    pub(crate) epoch: u64,
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
     #[serde(deserialize_with = "bounded_events")]
-    events: Vec<Event>,
-    bytes: usize,
+    pub(crate) events: Vec<Event>,
+    pub(crate) bytes: usize,
     pending_filter: Filter,
 }
 

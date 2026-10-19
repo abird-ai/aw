@@ -26,6 +26,26 @@ pub fn open(pid: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
 }
 
+/// Read the PID bound to this *existing* kernel pidfd in our PID namespace.
+/// Validation uses waitid first; procfs is metadata, never a PID reopen or
+/// signaling fallback. A dead/reaped identity cannot pass live admission.
+pub fn live_pid(pidfd: BorrowedFd<'_>) -> io::Result<u32> {
+    if inspect_exit(pidfd)? != ExitObservation::Running {
+        return Err(rejected());
+    }
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+    let pid = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:\t"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 1)
+        .ok_or_else(rejected)?;
+    if exited(pidfd)? {
+        return Err(rejected());
+    }
+    Ok(pid)
+}
+
 /// Nonblocking process-exit observation; does not reap a process belonging
 /// to another parent or infer exit based on /proc pathname/PID lookup.
 pub fn exited(pidfd: BorrowedFd<'_>) -> io::Result<bool> {
@@ -279,6 +299,7 @@ mod tests {
     fn ordinary_file_cannot_be_used_as_a_process_lifecycle_identity() {
         let file = std::fs::File::open("/dev/null").unwrap();
         assert!(inspect_exit(file.as_fd()).is_err());
+        assert!(live_pid(file.as_fd()).is_err());
         assert!(reap_child(file.as_fd()).is_err());
     }
 
@@ -290,6 +311,7 @@ mod tests {
             .expect("spawn private signal target");
         let identity = open(child.id()).expect("pidfd for original child");
         assert!(!exited(identity.as_fd()).unwrap());
+        assert_eq!(live_pid(identity.as_fd()).unwrap(), child.id());
         signal(identity.as_fd(), ProcessSignal::Terminate).unwrap();
         let status = child.wait().unwrap();
         assert!(
@@ -297,6 +319,7 @@ mod tests {
             "SIGTERM must terminate the private target"
         );
         assert!(exited(identity.as_fd()).unwrap());
+        assert!(live_pid(identity.as_fd()).is_err());
         let repeat = signal(identity.as_fd(), ProcessSignal::Kill);
         assert!(
             repeat.is_err(),

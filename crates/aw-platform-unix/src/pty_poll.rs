@@ -66,6 +66,35 @@ pub fn readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
     }
 }
 
+/// Validate a Linux PTY master without consuming output or changing size.
+#[cfg(target_os = "linux")]
+pub fn number(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut number: libc::c_uint = 0;
+    // SAFETY: TIOCGPTN writes one unsigned integer into valid storage.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGPTN, &mut number) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(number)
+}
+
+/// Change only the size of an already authorized Linux PTY master.
+#[cfg(target_os = "linux")]
+pub fn resize(fd: std::os::fd::BorrowedFd<'_>, rows: u16, cols: u16) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ reads one initialized winsize; caller owns the FD.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &size) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

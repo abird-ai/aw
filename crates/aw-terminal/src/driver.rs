@@ -19,15 +19,25 @@ enum ReadEvent {
 /// Portable PTY reactor. portable_pty owns the Unix PTY / Windows ConPTY
 /// distinction. A dedicated reader thread drains output even while the view is
 /// hidden; this owner thread serializes resize/input/child lifecycle.
-pub(crate) fn run(
-    master: Box<dyn MasterPty + Send>,
-    mut child: ChildGuard,
-    mut reader: Box<dyn Read + Send>,
-    mut writer: Box<dyn Write + Send>,
-    rx: mpsc::Receiver<Message>,
-    shared: Arc<Shared>,
-    #[cfg(target_os = "linux")] monitor_fd: OwnedFd,
-) {
+pub(crate) struct Backend {
+    pub master: Master,
+    pub child: Custodian,
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub filter: Filter,
+    #[cfg(target_os = "linux")]
+    pub monitor_fd: OwnedFd,
+}
+pub(crate) fn run(backend: Backend, rx: mpsc::Receiver<Message>, shared: Arc<Shared>) {
+    let Backend {
+        master,
+        mut child,
+        mut reader,
+        mut writer,
+        mut filter,
+        #[cfg(target_os = "linux")]
+        monitor_fd,
+    } = backend;
     let (output_tx, output_rx) = mpsc::sync_channel::<ReadEvent>(32);
     #[cfg(target_os = "linux")]
     let reader_state = shared.clone();
@@ -104,7 +114,6 @@ pub(crate) fn run(
     #[cfg(target_os = "linux")]
     let reader_thread = reader_thread.expect("reader spawn already checked");
 
-    let mut filter = Filter::default();
     let mut output_closed = false;
     let mut stopping: Option<Instant> = None;
     let mut exited = false;
@@ -204,6 +213,7 @@ pub(crate) fn run(
                     epoch,
                     terminal_id,
                     reply,
+                    publish,
                 } => {
                     let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                     let exclusive = state.source_release == crate::SourceRelease::Pending(epoch)
@@ -259,7 +269,17 @@ pub(crate) fn run(
                             "PTY source released; destination activation is separate".into();
                         state.version = state.version.wrapping_add(1);
                     }
-                    let _ = reply.send(Ok(crate::SourceReleaseReceipt { terminal_id, epoch }));
+                    let receipt = crate::SourceReleaseReceipt { terminal_id, epoch };
+                    // Publish only after closure/disarm. The original worker
+                    // owns publication even if its waiting caller disappears.
+                    let publication =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            publish.map_or(Ok(()), |publish| publish(&receipt))
+                        }))
+                        .unwrap_or(Err(crate::Error::Unavailable(
+                            "source publication panicked; inspect custody",
+                        )));
+                    let _ = reply.send(publication.map(|()| receipt));
                     // Observer faults must not strand the original-parent
                     // waiter or undo the already factual source release.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -293,19 +313,21 @@ pub(crate) fn run(
             }
             changed(&shared, |state| state.status = Status::Stopping);
             stopping = Some(Instant::now());
-            if let Some(pid) = child.process_id() {
-                aw_platform::kill_process_group(pid);
-            }
-            let _ = child.kill();
+            child.begin_stop();
         }
 
+        #[cfg(target_os = "linux")]
+        if !exited
+            && child.adopted()
+            && stopping.is_some_and(|started| started.elapsed() >= Duration::from_millis(500))
+        {
+            let _ = child.kill();
+        }
         if !exited {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     exited = true;
-                    changed(&shared, |state| {
-                        state.status = Status::Exited(status.exit_code())
-                    });
+                    changed(&shared, |state| state.status = status);
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -413,9 +435,7 @@ pub(crate) fn run(
     });
     shared.pending.store(0, Ordering::Release);
     if !exited {
-        if let Some(pid) = child.process_id() {
-            aw_platform::kill_process_group(pid);
-        }
+        child.begin_stop();
         let _ = child.kill();
         let _ = child.try_wait();
     }
@@ -424,25 +444,146 @@ pub(crate) fn run(
     (shared.notify)();
 }
 
-/// Launch/worker failure must not orphan a child merely because no public handle
-/// was returned. This guard is created immediately after successful spawn.
-pub(crate) struct ChildGuard {
-    inner: Option<Box<dyn Child + Send + Sync>>,
+/// One reactor for original and adopted PTYs; adoption never constructs a
+/// portable child handle or invents parentage/wait status.
+pub(crate) enum Master {
+    Original(Box<dyn MasterPty + Send>),
+    #[cfg(target_os = "linux")]
+    Adopted(OwnedFd),
 }
-
-impl ChildGuard {
-    pub fn new(inner: Box<dyn Child + Send + Sync>) -> Self {
-        Self { inner: Some(inner) }
+impl Master {
+    fn resize(&self, size: PtySize) -> std::io::Result<()> {
+        match self {
+            Self::Original(master) => master.resize(size).map_err(std::io::Error::other),
+            #[cfg(target_os = "linux")]
+            Self::Adopted(master) => {
+                use std::os::fd::AsFd;
+                aw_platform::pty_poll::resize(master.as_fd(), size.rows, size.cols)
+            }
+        }
     }
-
+    #[cfg(target_os = "linux")]
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            Self::Original(master) => master.as_raw_fd(),
+            Self::Adopted(master) => Some(master.as_raw_fd()),
+        }
+    }
+}
+pub(crate) enum Custodian {
+    Original(ChildGuard),
+    #[cfg(target_os = "linux")]
+    Adopted(OwnedFd),
+}
+impl Custodian {
+    fn process_id(&self) -> Option<u32> {
+        match self {
+            Self::Original(child) => child.process_id(),
+            #[cfg(target_os = "linux")]
+            Self::Adopted(_) => None, // never signal an adopted process group
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn adopted(&self) -> bool {
+        matches!(self, Self::Adopted(_))
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<Status>> {
+        match self {
+            Self::Original(child) => child
+                .try_wait()
+                .map(|value| value.map(|s| Status::Exited(s.exit_code()))),
+            #[cfg(target_os = "linux")]
+            Self::Adopted(pidfd) => {
+                use aw_platform::pid_identity::{inspect_exit, ChildExit, ExitObservation};
+                use std::os::fd::AsFd;
+                match inspect_exit(pidfd.as_fd())? {
+                    ExitObservation::Running => Ok(None),
+                    ExitObservation::Exited { status } => {
+                        // Observation does not grant exclusive wait ownership.
+                        // The original parent's passive waiter may share this
+                        // process in a trusted embedding. Never race its reap.
+                        // An independently launched broker is a nonparent.
+                        Ok(Some(match status {
+                            Some(ChildExit::Code(code)) => Status::Exited(u32::from(code)),
+                            Some(ChildExit::Signal { number, .. }) => Status::Signalled(number),
+                            None => Status::ExitedUnknown,
+                        }))
+                    }
+                }
+            }
+        }
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Original(child) => child.kill(),
+            #[cfg(target_os = "linux")]
+            Self::Adopted(pidfd) => {
+                use std::os::fd::AsFd;
+                aw_platform::pid_identity::signal(
+                    pidfd.as_fd(),
+                    aw_platform::pid_identity::ProcessSignal::Kill,
+                )
+            }
+        }
+    }
+    fn begin_stop(&mut self) {
+        match self {
+            Self::Original(child) => {
+                if let Some(pid) = child.process_id() {
+                    aw_platform::kill_process_group(pid);
+                }
+                let _ = child.kill();
+            }
+            #[cfg(target_os = "linux")]
+            Self::Adopted(pidfd) => {
+                use std::os::fd::AsFd;
+                let _ = aw_platform::pid_identity::signal(
+                    pidfd.as_fd(),
+                    aw_platform::pid_identity::ProcessSignal::Terminate,
+                );
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     fn into_waiter(mut self) -> ChildWaiter {
-        ChildWaiter {
-            inner: self.inner.take().expect("owned original child"),
+        match &mut self {
+            Self::Original(child) => ChildWaiter {
+                inner: child.inner.take().expect("owned original child"),
+            },
+            Self::Adopted(_) => {
+                unreachable!("adopted terminals cannot stage original-child release")
+            }
+        }
+    }
+}
+impl Drop for Custodian {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Self::Adopted(pidfd) = self {
+            use std::os::fd::AsFd;
+            // Activated custody only. Inert escrow never constructs this type.
+            if matches!(
+                aw_platform::pid_identity::inspect_exit(pidfd.as_fd()),
+                Ok(aw_platform::pid_identity::ExitObservation::Running)
+            ) {
+                let _ = aw_platform::pid_identity::signal(
+                    pidfd.as_fd(),
+                    aw_platform::pid_identity::ProcessSignal::Kill,
+                );
+            }
         }
     }
 }
 
+/// Launch failure must not orphan an original child.
+pub(crate) struct ChildGuard {
+    inner: Option<Box<dyn Child + Send + Sync>>,
+}
+impl ChildGuard {
+    pub fn new(inner: Box<dyn Child + Send + Sync>) -> Self {
+        Self { inner: Some(inner) }
+    }
+}
 #[cfg(target_os = "linux")]
 struct ChildWaiter {
     inner: Box<dyn Child + Send + Sync>,
@@ -453,21 +594,17 @@ impl ChildWaiter {
         self.inner.wait()
     }
 }
-
 impl std::ops::Deref for ChildGuard {
     type Target = dyn Child + Send + Sync;
-
     fn deref(&self) -> &Self::Target {
         self.inner.as_deref().expect("owned original child")
     }
 }
-
 impl std::ops::DerefMut for ChildGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.as_deref_mut().expect("owned original child")
     }
 }
-
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let Some(inner) = self.inner.as_mut() else {

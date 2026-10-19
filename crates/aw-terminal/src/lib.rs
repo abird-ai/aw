@@ -2,8 +2,12 @@
 //! Explicit trusted host capability; not a model tool, sandbox or remote server.
 //! Spawn on a blocking worker. Hidden views do not stop output draining.
 #[cfg(target_os = "linux")]
+mod adoption;
+#[cfg(target_os = "linux")]
 mod checkpoint;
 mod driver;
+#[cfg(target_os = "linux")]
+pub use adoption::{Adoption, EscrowIdentity};
 mod filter;
 mod input;
 #[cfg(target_os = "linux")]
@@ -48,6 +52,23 @@ pub enum Status {
     /// This source has relinquished PTY I/O and termination custody.
     #[cfg(target_os = "linux")]
     Released,
+    #[cfg(target_os = "linux")]
+    ExitedUnknown,
+    #[cfg(target_os = "linux")]
+    Signalled(i32),
+}
+
+impl Status {
+    /// True only for observed process exit, including a nonchild whose exit
+    /// code is unavailable. Failed/Released never prove child termination.
+    pub fn exited(self) -> bool {
+        match self {
+            Self::Exited(_) => true,
+            #[cfg(target_os = "linux")]
+            Self::ExitedUnknown | Self::Signalled(_) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Local source-worker facts, not broker authentication or activation authority.
@@ -163,6 +184,8 @@ impl Options {
         }
     }
 }
+#[cfg(target_os = "linux")]
+type ReleasePublisher = Box<dyn FnOnce(&SourceReleaseReceipt) -> Result<()> + Send>;
 type Notify = Arc<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct Replies {
@@ -240,6 +263,7 @@ pub(crate) enum Message {
         epoch: u64,
         terminal_id: String,
         reply: mpsc::SyncSender<Result<SourceReleaseReceipt>>,
+        publish: Option<ReleasePublisher>,
     },
     Stop,
 }
@@ -351,10 +375,16 @@ impl Terminal {
         drop(pair.slave);
         let (tx, rx) = mpsc::sync_channel(32);
         let state = shared.clone();
-        #[cfg(target_os = "linux")]
-        let task = move || driver::run(pair.master, child, reader, writer, rx, state, monitor_fd);
-        #[cfg(not(target_os = "linux"))]
-        let task = move || driver::run(pair.master, child, reader, writer, rx, state);
+        let backend = driver::Backend {
+            master: driver::Master::Original(pair.master),
+            child: driver::Custodian::Original(child),
+            reader,
+            writer,
+            filter: filter::Filter::default(),
+            #[cfg(target_os = "linux")]
+            monitor_fd,
+        };
+        let task = move || driver::run(backend, rx, state);
         std::thread::Builder::new()
             .name("aw-terminal-pty".into())
             .spawn(task)?;
@@ -731,6 +761,23 @@ impl Staged<'_, '_> {
     /// After queue admission, timeout/ACK loss is UNKNOWN: inspect
     /// Terminal::source_release, never retry or resume the old reader.
     pub fn release_source(self) -> Result<PendingSourceRelease> {
+        self.release_with_publisher(None)
+    }
+
+    /// Trusted host publication runs on the releasing worker after descriptor
+    /// closure and guard disarm, even if the caller loses its ACK. Failure is
+    /// UNKNOWN; it never restores source custody or authorizes activation.
+    pub fn release_source_and_publish(
+        self,
+        publish: impl FnOnce(&SourceReleaseReceipt) -> Result<()> + Send + 'static,
+    ) -> Result<PendingSourceRelease> {
+        self.release_with_publisher(Some(Box::new(publish)))
+    }
+
+    fn release_with_publisher(
+        self,
+        publish: Option<ReleasePublisher>,
+    ) -> Result<PendingSourceRelease> {
         if !self.transmitted {
             return Err(Error::Unavailable(
                 "PTY escrow has no confirmed kernel send",
@@ -775,6 +822,7 @@ impl Staged<'_, '_> {
                     epoch: gate.epoch,
                     terminal_id: gate.terminal.id.clone(),
                     reply,
+                    publish,
                 })
                 .is_err()
             {
@@ -783,6 +831,17 @@ impl Staged<'_, '_> {
             }
         }
         Ok(PendingSourceRelease { receipt })
+    }
+    /// Kernel identity bound to this original, still-exclusive escrow.
+    pub fn identity(&self) -> Result<EscrowIdentity> {
+        use std::os::fd::AsFd;
+        if !self.gate.still_exclusive() {
+            return Err(Error::Unavailable("escrow revoked"));
+        }
+        Ok(EscrowIdentity {
+            child_pid: aw_platform::pid_identity::live_pid(self.pidfd.as_fd())?,
+            pty_number: aw_platform::pty_poll::number(self.master.as_fd())?,
+        })
     }
     pub fn child_exited(&self) -> Result<bool> {
         use std::os::fd::AsFd;

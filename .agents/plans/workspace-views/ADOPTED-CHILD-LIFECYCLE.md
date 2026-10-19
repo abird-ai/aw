@@ -3,7 +3,7 @@ Owner: @pvl
 
 # Adopted PTY child lifecycle
 
-Status: **local source release and passive reaping tested; production custody protocol pending**.
+Status: **local source release, passive reaping and adopted reactor tested; production custody protocol pending**.
 Continuation of [live migration](LIVE-PTY-MIGRATION.md).
 
 ## Kernel contract
@@ -35,7 +35,7 @@ or PTY-reader permission. Unsupported wait APIs fail closed.
 Only a trusted original host holding the non-cloneable `Staged` capability
 can call `release_source`, after a successful kernel send. The caller must
 independently authenticate recipient readiness and commit its owner intent
-before calling. **No shipping broker/CLI calls this API.** It does not
+before calling. Broker integration is a separate checkpoint. This primitive does not
 implement authentication, signed cross-process release or broker activation.
 
 - Queue admission changes the exact source epoch from Retained to Pending.
@@ -59,6 +59,25 @@ Definite pre-admission failure leaves original custody intact. Once admitted,
 there is no automatic rollback on timeout or lost reply. A worker rejection
 before disarm may return custody to the exact original epoch; a failed
 reader join stays fenced/UNKNOWN with the armed guard's failure cleanup.
+
+## Adopted reactor — implemented
+
+- `Adoption::prepare` holds inert CLOEXEC master/pidfd escrow and replays
+  the checkpoint without I/O or signals. Validate live kernel pidfd PID and
+  PTY-master number against the original staged identity; reject mismatches.
+- Trusted host activation requires independently authenticated source release.
+  Reuse the existing reactor, filter, parser, bounded queue and snapshot API;
+  no executable argument, replacement shell or extra execution owner.
+- Retain exact terminal ID/root/owner/site. Continue the original checkpoint
+  journal and pending sanitizer state; replay never emits historical replies.
+- Adopted stop uses exact-pidfd TERM, then KILL after 500 ms. Never signal a
+  numeric PID/group. Do not steal the original parent's wait receipt; preserve
+  `ExitedUnknown` for nonchildren and factual signal status when available.
+- `Status::exited` excludes Failed/Released. Uncertain teardown cannot count
+  as successful process termination.
+- Optional source release publication runs on the original worker after
+  reader join, descriptor closure and guard disarm. ACK loss or publisher
+  panic cannot restore custody or strand the passive parent waiter.
 
 ## Required production custody transaction — pending
 
@@ -86,9 +105,8 @@ reader join stays fenced/UNKNOWN with the armed guard's failure cleanup.
    UNKNOWN until the authoritative transition is inspected. Broker loss
    must not cause automatic shell/input replay or source reactivation.
 
-Authenticated release-record ownership/publication, recipient identity and
-wrong-pidfd admission, adopted live driver, stop escalation and crash
-recovery still need implementation and real process tests. Source-side
+Authenticated production release-record ownership/publication, recipient
+identity and crash recovery still need integration and real process tests. Source-side
 passive waiting alone does not make the broker the shell's parent. No
 public promotion command.
 
@@ -120,3 +138,11 @@ public promotion command.
 
 References: Linux [waitid](https://man7.org/linux/man-pages/man2/waitid.2.html)
 and [pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
+
+- Adopted backend tests: inert drop and wrong PID/master identity preserve
+  original custody; activated reactor retains exact ID, alternate screen,
+  Unicode/input modes and live DSR replies; old reader stays retired;
+  resize, exact stop, lost publication ACK and publisher panic are covered.
+- Pinned platform + terminal all-target tests: **66 passed**. Both crates'
+  strict all-target Clippy passed. This checkpoint does not certify the
+  production broker protocol or Workspace command.

@@ -26,7 +26,7 @@ fn denied() -> io::Error {
 
 /// Unix peer identity must be validated on both sending and receiving ends.
 /// A pathname, process ID, or inherited environment variable is not authority.
-fn validate_peer(socket: &UnixStream) -> io::Result<()> {
+pub fn peer_pid(socket: &UnixStream) -> io::Result<u32> {
     let mut creds = MaybeUninit::<libc::ucred>::zeroed();
     let mut size = size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: initialized socklen_t; kernel writes ucred into valid storage.
@@ -51,7 +51,11 @@ fn validate_peer(socket: &UnixStream) -> io::Result<()> {
     if creds.uid != unsafe { libc::geteuid() } {
         return Err(denied());
     }
-    Ok(())
+    u32::try_from(creds.pid).map_err(|_| denied())
+}
+
+fn validate_peer(socket: &UnixStream) -> io::Result<()> {
+    peer_pid(socket).map(|_| ())
 }
 
 /// Send one FD with an explicit 256-bit one-use correlation proof.
