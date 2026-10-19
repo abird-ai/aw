@@ -146,3 +146,12 @@ and [pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
 - Pinned platform + terminal all-target tests: **66 passed**. Both crates'
   strict all-target Clippy passed. This checkpoint does not certify the
   production broker protocol or Workspace command.
+
+- Linux teardown now retires/joins the sole reader even if a silent descendant
+  retains the slave. Drop the output receiver before joining, so a full bounded
+  channel cannot deadlock cleanup. No adopted process-group signal is added.
+- The held-slave regression fails with the retirement block removed and passes
+  with it restored. A 3,000-line stream produced while the source reader is
+  paused drains exactly once after cutover; inactive main screen and bounded
+  scrollback remain available. Focused adopted-backend tests: **5 passed**;
+  strict terminal all-target Clippy passed.

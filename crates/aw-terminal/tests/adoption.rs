@@ -145,3 +145,177 @@ fn release_publication_survives_caller_ack_loss_and_publisher_panic() {
         drop(master);
     }
 }
+
+#[test]
+fn exact_shell_stop_retires_reader_even_if_a_descendant_holds_the_slave() {
+    let root = std::env::temp_dir().join(format!(
+        "aw-adopted-slave-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let shell: std::path::PathBuf = std::env::var_os("AW_BASH")
+        .map(Into::into)
+        .unwrap_or_else(|| "/bin/bash".into());
+    let mut options = Options::bash(&root, shell, "synthetic-slave-holder");
+    options.args = vec!["--noprofile".into(), "--norc".into(), "-c".into(), "(trap '' HUP TERM; while :; do IFS= read -r -t 60 ignored </dev/tty; done) & printf '%s' \"$!\" > holder.pid; printf READY; IFS= read -r done".into()];
+    let original = Terminal::spawn(options, || {}).unwrap();
+    until(|| contents(&original).contains("READY"));
+    let holder: u32 = std::fs::read_to_string(root.join("holder.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{holder}/cwd")).unwrap(),
+        root
+    );
+    let holder = aw_platform::pid_identity::open(holder).unwrap();
+    struct Cleanup(std::os::fd::OwnedFd, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = aw_platform::pid_identity::signal(
+                self.0.as_fd(),
+                aw_platform::pid_identity::ProcessSignal::Kill,
+            );
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let cleanup = Cleanup(holder, root);
+    let mut gate = original.quiesce(Duration::from_secs(2)).unwrap();
+    let mut stage = gate.stage().unwrap();
+    let identity = stage.identity().unwrap();
+    let checkpoint = Checkpoint::from_wire(&stage.checkpoint().to_wire().unwrap()).unwrap();
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    stage.send_once(&sender, &[23; 32]).unwrap();
+    let (master, pidfd) = aw_platform::fd_transfer::receive_pair(&receiver, &[23; 32]).unwrap();
+    let escrow = Adoption::prepare(checkpoint, master, pidfd, identity).unwrap();
+    stage
+        .release_source()
+        .unwrap()
+        .wait(Duration::from_secs(2))
+        .unwrap();
+    drop(gate);
+    drop(original);
+    let marker = std::sync::Arc::new(());
+    let released = std::sync::Arc::downgrade(&marker);
+    let adopted = escrow
+        .activate(move || {
+            let _ = &marker;
+        })
+        .unwrap();
+    adopted.terminate();
+    drop(adopted);
+    until(|| released.upgrade().is_none());
+    assert!(
+        !aw_platform::pid_identity::exited(cleanup.0.as_fd()).unwrap(),
+        "no guessed process-group kill"
+    );
+    drop(cleanup);
+}
+
+#[test]
+fn streaming_cutover_drains_once_and_preserves_main_and_scrollback() {
+    let root = std::env::temp_dir().join(format!(
+        "aw-stream-cutover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    let shell: std::path::PathBuf = std::env::var_os("AW_BASH")
+        .map(Into::into)
+        .unwrap_or_else(|| "/bin/bash".into());
+    let mut options = Options::bash(&root, shell, "synthetic-stream-cutover");
+    options.args = vec!["--noprofile".into(), "--norc".into(), "-c".into(), "printf READY; while [[ ! -f stream ]]; do sleep 0.01; done; for ((i=0;i<3000;i++)); do printf 'STREAM_%04d\\n' \"$i\"; done; printf '\\033[?1049h\\033[?2004h\\033[1;31mALT_READY_界'; IFS= read -r back; printf '\\033[?1049lRESTORED'; IFS= read -r done; exit 7".into()];
+    let original = Terminal::spawn(options, || {}).unwrap();
+    until(|| contents(&original).contains("READY"));
+    let mut gate = original.quiesce(Duration::from_secs(2)).unwrap();
+    let mut stage = gate.stage().unwrap();
+    let identity = stage.identity().unwrap();
+    let checkpoint = Checkpoint::from_wire(&stage.checkpoint().to_wire().unwrap()).unwrap();
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    stage.send_once(&sender, &[31; 32]).unwrap();
+    let (master, pidfd) = aw_platform::fd_transfer::receive_pair(&receiver, &[31; 32]).unwrap();
+    let escrow = Adoption::prepare(checkpoint, master, pidfd, identity).unwrap();
+    std::fs::write(root.join("stream"), b"start").unwrap();
+    // Force new output while the sole original reader is paused. The bounded
+    // kernel PTY buffer backpressures the producer until receiver activation.
+    thread::sleep(Duration::from_millis(60));
+    stage
+        .release_source()
+        .unwrap()
+        .wait(Duration::from_secs(2))
+        .unwrap();
+    drop(gate);
+    let retired_version = original.snapshot(0).version;
+    let adopted = escrow.activate(|| {}).unwrap();
+    until(|| contents(&adopted).contains("ALT_READY_界"));
+    let held = adopted.quiesce(Duration::from_secs(2)).unwrap();
+    let wire = held.checkpoint().unwrap().to_wire().unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    let mut bytes = Vec::new();
+    for event in data["events"].as_array().unwrap() {
+        if let Some(chunk) = event.get("Bytes") {
+            bytes.extend(
+                chunk
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b.as_u64().unwrap() as u8),
+            );
+        }
+    }
+    let text = String::from_utf8(bytes).unwrap();
+    let lines = text
+        .lines()
+        .filter_map(|line| line.find("STREAM_").map(|at| &line[at..]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        3000,
+        "no lost or duplicated output across source retirement"
+    );
+    for (i, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("STREAM_{i:04}"));
+    }
+    drop(held);
+    adopted.input(b"back\n".to_vec()).unwrap();
+    until(|| !adopted.snapshot(0).alternate_screen && contents(&adopted).contains("RESTORED"));
+    assert!(
+        contents(&adopted).contains("STREAM_2999"),
+        "inactive main buffer lost"
+    );
+    let history = adopted
+        .snapshot(100)
+        .cells
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<String>();
+    assert!(
+        history.contains("STREAM_28"),
+        "bounded main scrollback lost"
+    );
+    assert_eq!(
+        original.snapshot(0).version,
+        retired_version,
+        "old reader consumed new stream"
+    );
+    adopted.input(b"finish\n".to_vec()).unwrap();
+    until(|| adopted.status().exited());
+}

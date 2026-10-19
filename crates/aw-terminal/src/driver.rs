@@ -439,6 +439,20 @@ pub(crate) fn run(backend: Backend, rx: mpsc::Receiver<Message>, shared: Arc<Sha
         let _ = child.kill();
         let _ = child.try_wait();
     }
+    #[cfg(target_os = "linux")]
+    {
+        // Descendants may retain a silent slave after the exact shell exits.
+        // Retire the reader and unblock a full output channel before joining;
+        // otherwise its reader/monitor FDs could retain custody indefinitely.
+        shared.reader_retired.store(true, Ordering::Release);
+        drop(output_rx);
+        if reader_thread.join().is_err() {
+            changed(&shared, |state| {
+                state.status = Status::Failed;
+                state.notice = "PTY reader shutdown uncertain; inspect process effects".into();
+            });
+        }
+    }
     drop(writer);
     drop(master);
     (shared.notify)();
