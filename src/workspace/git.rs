@@ -1454,17 +1454,17 @@ mod capability_tests {
         sync(&mut views, &other, 1, &[]);
         load(&mut views, 21);
         let id = review(&mut views, 21);
-        sync(&mut views, &other, 1, &[id.clone()]);
+        sync(&mut views, &other, 1, std::slice::from_ref(&id));
         let closed = views
             .index_request(&id, aw_git::IndexAction::Stage)
             .unwrap();
         sync(&mut views, &other, 1, &[]);
         assert!(matches!(closed.apply(), Err(aw_git::Error::Stale)));
-        sync(&mut views, &other, 1, &[id.clone()]);
+        sync(&mut views, &other, 1, std::slice::from_ref(&id));
         let restored = views
             .index_request(&id, aw_git::IndexAction::Stage)
             .unwrap();
-        sync(&mut views, &other, 2, &[id.clone()]);
+        sync(&mut views, &other, 2, std::slice::from_ref(&id));
         assert!(matches!(restored.apply(), Err(aw_git::Error::Stale)));
         let rebound = views
             .index_request(&id, aw_git::IndexAction::Stage)
@@ -1477,7 +1477,7 @@ mod capability_tests {
         sync(&mut views, &other, 2, &[]);
         load(&mut views, 21);
         let current = review(&mut views, 21);
-        sync(&mut views, &other, 2, &[current.clone()]);
+        sync(&mut views, &other, 2, std::slice::from_ref(&current));
         let pending = views
             .index_request(&current, aw_git::IndexAction::Stage)
             .unwrap();

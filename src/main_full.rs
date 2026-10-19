@@ -6112,12 +6112,12 @@ fn persistent_terminal_cli_is_typed_and_explicit() {
             Some(TopCommand::Workspace {
                 command: Some(resources_cli::WorkspaceCommand::Persistent { command }),
             }) => match command {
-                Persistent::Start { root, shell } if root == PathBuf::from("/tmp/synthetic-root")
-                    && shell == PathBuf::from("/bin/bash") => {}
+                Persistent::Start { root, shell } if root == std::path::Path::new("/tmp/synthetic-root")
+                    && shell == std::path::Path::new("/bin/bash") => {}
                 Persistent::Serve { root, shell, directory }
-                    if root == PathBuf::from("/tmp/synthetic-root")
-                        && shell == PathBuf::from("/bin/bash")
-                        && directory == PathBuf::from("/tmp/synthetic-owner") => {}
+                    if root == std::path::Path::new("/tmp/synthetic-root")
+                        && shell == std::path::Path::new("/bin/bash")
+                        && directory == std::path::Path::new("/tmp/synthetic-owner") => {}
                 _ => panic!("persistent owner CLI must carry explicit root/shell/endpoint"),
             },
             _ => panic!("persistent owner CLI must not activate an Agent"),
