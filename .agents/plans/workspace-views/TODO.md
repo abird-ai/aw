@@ -226,6 +226,19 @@ Design and binding decisions: [README.md](README.md).
 - [x] Document parent/reaper responsibility and the still-required guarded release in [Adopted child lifecycle](ADOPTED-CHILD-LIFECYCLE.md). Keep original `ChildGuard` armed and all production reader/activation paths unchanged.
 - [ ] Adopted driver, commit-gated `ChildGuard` disarm, authenticated irreversible source release/one-time broker activation and crash/UNKNOWN recovery remain unimplemented. This milestone is an OS prerequisite, not production migration.
 
+### `7ced795768d1cdf07f42f5ca9af8a42aefc9695d` — guarded local source release and passive parent custody
+
+- [x] Add trusted-native `Staged::release_source` after a confirmed kernel send. Exact paused epoch, live original child and drained input are rechecked; retire/join the sole reader, close sender escrow/master/writer FDs, then disarm `ChildGuard` into a separate non-signaling `ChildWaiter` on the existing worker.
+- [x] Fence source input/resize/Stop/Drop and pause rollback once release is admitted. `PendingSourceRelease` loss/timeout stays UNKNOWN; inspect the source epoch, never retry or reactivate. Local receipt/`Status::Released` is issued only after closure/disarm; observer panic cannot kill the child or prevent passive parent reaping. Wait failures remain inspectable.
+- [x] Replace Linux's EOF-on-drop portable writer with a plain CLOEXEC master-FD writer. Restoring the old writer makes the live-shell survival regression fail; the new writer passes without injected newline/VEOF.
+- [x] Seven source-release tests and existing terminal regressions pass. A real independent source using the original `Terminal`/`ChildGuard` exits after release; receiver retains identical Bash PID, alternate screen/Unicode/bracketed-paste checkpoint and new explicit I/O. Unsent/failed escrow, pre-release Stop, lost ACK/guard drop and observer panic are covered.
+- [ ] Production authentication/signed owner transaction, recipient PID/root/Actor/epoch admission, adopted live broker driver and the complete crash/UNKNOWN matrix remain open. No shipping broker/CLI invokes the local release API; no `terminal-promote`.
+
+### `2b8d76985100ec784f96ae0284a232612cb19413` — reproducible independent native PTY fixtures
+
+- [x] Accept complete printed invitation paths, including Nix TMPDIR dots; clear inherited tmux/desktop protocol markers from synthetic xterm PTYs and print the exact private fixture path for failure inspection.
+- [x] Rebuild actual `aw 0.15.0` from product source `7ced795`; all five `tests/native_persistent_pty.py` modes pass: `reconnect`, `competition`, `workspace-exit`, `shell-exit`, `broker-loss`. Same PID across three frontends, spent-ticket denial, exclusive control, explicit stop, termios restoration and endpoint/fixture cleanup pass within their existing scope. These are existing newly launched broker regressions, not production migration acceptance.
+
 ## Uncommitted
 
 - [~] **Distinct user/Actor** delegation, individually narrowed/revocable browser grants and remote-device trust remain unimplemented. Browser post-ACK crashes/partitions are inspect-only; recent ACK never proves perpetual process liveness.
@@ -233,6 +246,12 @@ Design and binding decisions: [README.md](README.md).
 
 
 ## Tests and verification
+
+- [x] Product source `7ced795`, pinned Nix: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` — **1,365 passed, 4 ignored**, 104 targets; Store library — **201 passed**; five explicit Store integrations `composite_design`, `context_flow`, `custody_inventory`, `resources`, `store` — **7+29+9+23+88 = 156 passed**. Zero failures; split-package execution. Final non-Store run includes source parent-wait error reporting.
+- [x] Same product source: **174 Node tests** in all 12 browser suites, **139 web-only Rust tests**, strict terminal all-targets/CLI-library Clippy, formatting and minimal/Workspace feature checks passed; Workspace retains its two existing dead-code warnings. Binary build/version passed: `aw 0.15.0`.
+- [x] Focused `cargo test --locked -p aw-terminal --all-targets` — **20 unit + 17 PTY + 5 replay/staging + 7 source-release tests passed**. Actual independent source exit, retained shell PID and passive parent reaping are verified locally; authenticated production broker activation/crash recovery remain unexecuted.
+- [x] Existing native broker host gate: `AW_TEST_BINARY=.../target/debug/aw python3 tests/native_persistent_pty.py MODE` for all five modes — **5 passed**, product source `7ced795` with fixture correction `2b8d76`. Initial harness failures from dotted Nix paths/inherited TMUX markers were reproduced and fixed; failed-run brokers were stopped and exact owned fixtures cleaned. No live account/provider request or deployment.
+
 
 - [x] Exact `62f3735` product source in pinned Nix shell: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` — **1,358 passed, 4 ignored**, 103 targets; `cargo test --locked -p aw-store --lib -- --test-threads=4` — **201 passed**; five explicit Store integration targets `composite_design`, `context_flow`, `custody_inventory`, `resources`, `store` — **7+29+9+23+88 = 156 passed**. Zero failures; split-package execution, not one monolithic Cargo pass.
 - [x] Same source: all 12 browser Node suites — **174 passed**; `cargo test --locked -p aw-cli --no-default-features --features web --lib` — **139 passed**. `bash scripts/bootstrap.sh`, formatting, strict platform/terminal all-targets and CLI-library Clippy, minimal and Workspace feature checks passed (Workspace retains two existing dead-code warnings).

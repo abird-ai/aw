@@ -572,9 +572,9 @@ impl Terminal {
         result
     }
 }
-/// Exclusive reversible source-reader pause. No ownership is transferred.
-/// RAII rollback resumes the original driver, including after an aborted
-/// handoff. A recipient has no authority simply because this guard exists.
+/// Exclusive source-reader pause. Drop resumes the original driver while
+/// custody is retained; it cannot roll back an admitted source release.
+/// A recipient has no authority simply because this guard exists.
 #[cfg(target_os = "linux")]
 #[must_use = "dropping the reader gate resumes the original owner"]
 pub struct Quiesced<'a> {
@@ -642,9 +642,9 @@ impl<'owner> Quiesced<'owner> {
     }
 
     /// Prepare a single atomic PTY-master/pidfd escrow while the original
-    /// output reader is actually paused. This is NOT a migration commit:
-    /// dropping this guard still resumes the source, and every staged handle
-    /// closes unless a separate authenticated receiver takes custody.
+    /// output reader is actually paused. Staging is NOT a migration commit.
+    /// Before explicit source release, dropping this guard resumes the source.
+    /// Receiver authentication and activation remain independent requirements.
     pub fn stage<'stage>(&'stage mut self) -> Result<Staged<'stage, 'owner>> {
         if self.staged {
             return Err(Error::Unavailable(
@@ -678,9 +678,9 @@ impl<'owner> Quiesced<'owner> {
 }
 
 /// Sender-held escrow from one exact original PTY and child. The duplicated
-/// file descriptors carry no Agent/Source/Tool authority; the original
-/// driver/ChildGuard are STILL the sole active owner until an independent,
-/// owner-fenced commit protocol is introduced.
+/// file descriptors carry no Agent/Source/Tool authority. Original custody
+/// remains armed until explicit trusted source release; this type supplies
+/// neither recipient authentication nor broker activation.
 #[cfg(target_os = "linux")]
 pub struct Staged<'stage, 'owner> {
     gate: &'stage Quiesced<'owner>,
