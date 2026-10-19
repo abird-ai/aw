@@ -793,6 +793,7 @@ impl Ui {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Explicit existing UI service owners.
     pub fn new_with_background(
         layout: Workspace,
         draft: String,

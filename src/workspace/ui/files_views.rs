@@ -204,7 +204,7 @@ impl Ui {
     /// One conservative UI lifetime fences the small, bounded Files work graph.
     /// Focus, tab selection, scrolling and geometry do not replace this lifetime.
     pub(super) fn invalidate_file_work(&mut self) {
-        self.file_epoch = self.file_epoch.checked_add(1).unwrap_or(u64::MAX);
+        self.file_epoch = self.file_epoch.saturating_add(1);
         for job in self.jobs.values() {
             if let Job::Search { cancel, .. } = job {
                 cancel.store(true, Ordering::Release);

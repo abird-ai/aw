@@ -461,7 +461,7 @@ impl Ui {
             if let Err(error) = self.background.try_submit_with_panic("agent-view", move || {
                 if cancel.load(Ordering::Acquire) { return; }
                 let result = if let Some((turns, resources, pending, answer, tools, title, branch)) = live_data {
-                    reader.authorize(&target).map_err(|error| error.to_string()).and_then(|()| {
+                    reader.authorize(&target).map_err(|error| error.to_string()).map(|()| {
                         let (turns, limited) = bounded_turns(&turns);
                         let pending = aw::presentation::tail_text(&pending, 8 * 1024);
                         let answer = aw::presentation::tail_text(&answer, 16 * 1024);
@@ -477,7 +477,7 @@ impl Ui {
                             lines.extend(crate::tui::agent_chrome::live_lines(&crate::tui::agent_chrome::LiveProjection { answer, tools }, &ui, inner));
                         }
                         if tools_size > MAX_RENDER_INPUT { lines.push(Line::raw("[Live tool details bounded; inspect the current Agent for complete details.]")); }
-                        Ok(cache(format!("{title} · {branch}"), lines))
+                        cache(format!("{title} · {branch}"), lines)
                     })
                 } else {
                     reader.read(&target).map_err(|error| error.to_string()).and_then(|snapshot| render_snapshot(snapshot, &ui, width))

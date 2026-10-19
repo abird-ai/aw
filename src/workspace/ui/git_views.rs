@@ -100,7 +100,7 @@ impl Ui {
             })
             .collect::<Vec<_>>();
         if bindings != self.git_bindings {
-            self.git_epoch = self.git_epoch.checked_add(1).unwrap_or(u64::MAX);
+            self.git_epoch = self.git_epoch.saturating_add(1);
             self.git_bindings = bindings;
         }
         let reviews = self
@@ -218,7 +218,7 @@ impl Ui {
     }
 
     pub(super) fn reset_git_lifetime(&mut self) {
-        self.git_epoch = self.git_epoch.checked_add(1).unwrap_or(u64::MAX);
+        self.git_epoch = self.git_epoch.saturating_add(1);
         self.diff_highlights.clear();
         let tabs = self
             .layout

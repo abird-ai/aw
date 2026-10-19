@@ -345,16 +345,15 @@ impl Contexts {
         if self.bindings.len() >= 8 && !self.bindings.contains_key(&id) {
             return Err("At most 8 Git contexts may be open".into());
         }
-        if id == GitContextId::launch() {
-            if self.launch_identity.is_none()
+        if id == GitContextId::launch()
+            && (self.launch_identity.is_none()
                 || !self.launch_root.starts_with(grant.repo.root())
                 || self
                     .launch_repo
                     .as_ref()
-                    .is_some_and(|root| root != grant.repo.root())
-            {
-                return Err("Launch Git context can only reconnect its original repository".into());
-            }
+                    .is_some_and(|root| root != grant.repo.root()))
+        {
+            return Err("Launch Git context can only reconnect its original repository".into());
         }
         let epoch = self
             .next_epoch
