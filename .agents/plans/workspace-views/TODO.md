@@ -219,6 +219,13 @@ Design and binding decisions: [README.md](README.md).
 - [x] Pinned source candidate: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` (**1,330 passed; 4 ignored**), Store library (**201 passed**), five Store integration targets (**156 passed**), browser Node (**174 passed**), web-only Rust (**139 passed**), strict platform/terminal/library Clippy, formatting and Workspace/minimal builds; 8/8 byte-identical browser assets. This is split-package coverage, not a claimed monolithic Cargo run.
 - [x] Full protocol constraints and next acceptance steps recorded in [Live PTY migration design](LIVE-PTY-MIGRATION.md). **Do not add `terminal-promote` or mark live migration implemented** until the complete production acceptance gate passes.
 
+### `62f3735aedf07e364a98bc2453e1d7f33c83a3c3` — exact pidfd exit facts, custody still pending
+
+- [x] Separate non-consuming `inspect_exit` from explicit nonblocking `reap_child`, both using exact `waitid(P_PIDFD)`. A transferred nonchild reports kernel-observed exit with unavailable status; ECHILD alone never means exit, successful reap or code zero. No PID fallback or process-wide subreaper.
+- [x] Real synthetic children preserve exit 37 and SIGTERM, repeated inspection retains the parent's wait receipt, reap succeeds once, invalid file descriptors reject and an unrelated sibling stays live. Transferred original Bash denies receiver reap before/after source exit and retains its exact PID; eventual exit has no fabricated status.
+- [x] Document parent/reaper responsibility and the still-required guarded release in [Adopted child lifecycle](ADOPTED-CHILD-LIFECYCLE.md). Keep original `ChildGuard` armed and all production reader/activation paths unchanged.
+- [ ] Adopted driver, commit-gated `ChildGuard` disarm, authenticated irreversible source release/one-time broker activation and crash/UNKNOWN recovery remain unimplemented. This milestone is an OS prerequisite, not production migration.
+
 ## Uncommitted
 
 - [~] **Distinct user/Actor** delegation, individually narrowed/revocable browser grants and remote-device trust remain unimplemented. Browser post-ACK crashes/partitions are inspect-only; recent ACK never proves perpetual process liveness.
@@ -226,6 +233,11 @@ Design and binding decisions: [README.md](README.md).
 
 
 ## Tests and verification
+
+- [x] Exact `62f3735` product source in pinned Nix shell: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` — **1,358 passed, 4 ignored**, 103 targets; `cargo test --locked -p aw-store --lib -- --test-threads=4` — **201 passed**; five explicit Store integration targets `composite_design`, `context_flow`, `custody_inventory`, `resources`, `store` — **7+29+9+23+88 = 156 passed**. Zero failures; split-package execution, not one monolithic Cargo pass.
+- [x] Same source: all 12 browser Node suites — **174 passed**; `cargo test --locked -p aw-cli --no-default-features --features web --lib` — **139 passed**. `bash scripts/bootstrap.sh`, formatting, strict platform/terminal all-targets and CLI-library Clippy, minimal and Workspace feature checks passed (Workspace retains two existing dead-code warnings).
+- [x] Focused Linux lifecycle/FD-transfer verification on the same source — `cargo test --locked -p aw-platform-unix --all-targets`: **10 unit + 4 independent-process integration tests passed**. Terminal baseline before mutation: **20 unit + 5 replay + 17 PTY tests passed** on `4fc27e9`. Legacy-Workspace-to-broker release/exit acceptance has **not** been executed or closed.
+
 
 - [x] Exact `e06ffa7` source checkpoint in pinned Nix shell: source-product Rust gate split by package (1,274 non-Store + 201 Store lib + 156 Store integration passed), Node six-suite gate (150 passed), web-only feature (132 passed), `cargo fmt` and byte-for-byte private Vite rebuild of eight tracked browser assets. This is not a claim of a completed monolithic `cargo test --workspace --locked` command.
 - [x] Real Chrome 155 user-visible **same-window** File move with two Files navigators, 390×844 Dark, original editor/draft/caret retained, conditional control visibility, no new owner request, no JS exceptions, zero six-category SQLite effects. Cross-window/other-browser/native docking acceptance remains open.
