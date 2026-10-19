@@ -1,5 +1,24 @@
 # Live Workspace PTY → persistent broker
 
+## Current Linux custody — `9d82f1a`
+
+- **Implemented and native-tested:** `terminal-promote` moves the running
+  Workspace shell into an independent broker. The exact shell PID and full
+  bounded parser state survive original Workspace exit/SIGKILL; the broker
+  becomes the sole reader/controller after authenticated source release.
+- Source and recipient bind exact process lifetimes, terminal/root/Actor/site,
+  epoch, kernel PTY/pidfd identity and checkpoint digest. The original worker
+  signs release only after reader join, descriptor closure and ChildGuard
+  disarm. Missing proof stays UNKNOWN; no input/shell replay or source resume.
+- Real native parser/`vim`/`less`/source-crash flows and 26 adversarial process
+  cases pass. Actual different-UID rejection remains **unexecuted**: the host
+  requires a sudo password. Remote/distinct-Actor and non-Linux acceptance,
+  broker-SIGKILL/reboot execution survival remain separate.
+- Current protocol, limits and recovery: [Linux custody](NATIVE-PTY-CUSTODY.md).
+  The prerequisite record below describes its named historical revisions;
+  its earlier “unimplemented” notes are superseded for this Linux path.
+
+
 Status: **FD+pidfd escrow and reversible reader gate verified; production migration NOT implemented**
 Linux source: `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a`, `a1100a9d344c5835eb73dedc673e55570ad17219`, `635e1ec6e6763caf438999b1551932b5e37bfa81`
 Owner: @pvl (Workspace views)

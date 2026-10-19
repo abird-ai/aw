@@ -8,6 +8,24 @@ The same typed Clap Arg IDs, short flags, value parsers, environment names, stat
 
 This is a breaking source change; release/version decisions and unfinished qualification are tracked in [release readiness](../plans/release-readiness/TODO.md). Historical implementation is accepted at the [recorded Git checkpoint](../plans/accepted-history/TODO.md).
 
+
+## Native terminal custody
+
+- Linux Workspace palette `terminal-promote`: move the focused running shell
+  into an independent broker, retaining its PID/parser after Workspace exit.
+  Cancel outstanding docking offers first; use the printed, quoted attach command.
+- `aw workspace attach INVITE`: one admitted native controller; F12 detaches.
+- `aw workspace persistent stop INVITE`: explicit stop after detach; success
+  requires observed exit of the exact shell, not all escaped descendants.
+- `aw workspace persistent inspect DIRECTORY`: read-only custody record status;
+  missing proof is UNKNOWN and never causes input or shell replay.
+- `aw workspace persistent start ABSOLUTE_ROOT ABSOLUTE_BASH` continues to create
+  a new broker-owned shell. Native docking still needs its original owner.
+
+The broker creates no Agent/State/provider context. Migration is Linux trusted
+local; actual different-UID runtime rejection needs a privileged runner and
+remains unexecuted. See [native custody](../plans/workspace-views/NATIVE-PTY-CUSTODY.md).
+
 ---
 
 ## R12 — machine-readable stdout and stdio RPC

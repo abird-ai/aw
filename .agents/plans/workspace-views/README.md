@@ -796,6 +796,22 @@ Persistent remote/multi-machine PTY authority, separate-user grants,
 Windows/macOS terminal certification and OS-level durable restoration
 remain unimplemented.
 
+#### Live Linux original-PTY custody
+
+The later [native custody protocol](NATIVE-PTY-CUSTODY.md) implements deliberate
+`terminal-promote` for an already-running Workspace shell. Real original
+Workspace exit/SIGKILL, `vim`/`less`, parser state and exclusive I/O acceptance
+pass with the same Bash PID. Source release is signed only after reader join,
+FD closure and ChildGuard disarm; missing proof remains UNKNOWN. The old source
+resource may be forgotten without stopping the broker or retaining its parser.
+Read-only custody inspection and exact-pidfd stop reuse the existing native
+broker/Pool/Control architecture. No Agent, Store, ToolPolicy or active root is
+retargeted. The earlier `bd87e5d` limitation above is historical for Linux.
+
+Actual different-UID rejection remains unexecuted on this host; remote or
+separate-Actor authority, macOS/Windows and broker crash/reboot restoration
+remain separate. Current source commits and pinned gates are in [TODO](TODO.md).
+
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,
 never grant Store/File/Git/Session/PTY or model ownership. Do not use

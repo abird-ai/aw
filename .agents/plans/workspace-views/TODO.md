@@ -239,13 +239,49 @@ Design and binding decisions: [README.md](README.md).
 - [x] Accept complete printed invitation paths, including Nix TMPDIR dots; clear inherited tmux/desktop protocol markers from synthetic xterm PTYs and print the exact private fixture path for failure inspection.
 - [x] Rebuild actual `aw 0.15.0` from product source `7ced795`; all five `tests/native_persistent_pty.py` modes pass: `reconnect`, `competition`, `workspace-exit`, `shell-exit`, `broker-loss`. Same PID across three frontends, spent-ticket denial, exclusive control, explicit stop, termios restoration and endpoint/fixture cleanup pass within their existing scope. These are existing newly launched broker regressions, not production migration acceptance.
 
+### `9f1cc28f0b16b7d831d1387fb3e392806dfe91d7` — inert adopted PTY reactor
+
+- [x] Validate transferred kernel PID/master identity; retain exact original terminal/root/Actor/site and full replay/filter state. Activation reuses the existing reactor without an executable or replacement child.
+- [x] Exact-pidfd TERM/KILL, factual nonchild exit observation, original-parent passive reaping and worker-owned post-disarm publication; lost ACK/publisher panic cannot restore source custody.
+
+### `11999aaa9d0055aa5c8f89f76b1d465e6931ed53` — retire readers when descendants hold the slave
+
+- [x] Retire/join Linux readers and close monitor handles without a guessed adopted process-group kill; drop the output receiver before joining to unblock a full channel. Regression fails with the fix removed and passes restored.
+- [x] Drain 3,000 lines emitted during original-reader pause exactly once after cutover; retain inactive main screen and bounded scrollback.
+
+### `a0c64c9efc26d926c32d6fa54cad98746b9c22c0`, `c51c681f653622da3eb49c8cf6bf6d151fcc8e57` — strict native lint coverage
+
+- [x] Preserve Git authority/lifetime behavior with equivalent map/saturating/guard expressions; clean existing fixture-only lints and document the existing explicit UI dependencies. Strict CLI all-target Clippy passes.
+
+### `9d82f1a742e35ab2c0c36385c8ef31a03a73b056` — Linux original-shell custody transaction
+
+- [x] Bind private same-UID native peers to exact source/broker lifetimes, terminal/root/Actor/site, epoch, PTY/pidfd identity and checkpoint digest. Receiver holds escrow inert until the releasing worker's exact Ed25519-signed record is published after closure/disarm.
+- [x] Fence the original Control registry during migration; definite source rejection alone restores local control. Pending/Released cannot resume on timeout, old handles, Stop, lost/duplicate ACK or source death. Preserve authoritative diagnosis on later failures.
+- [x] Share the existing persistent Pool/Control/attach loop. Actual Workspace-launched shell survives original Workspace exit/SIGKILL with its exact PID/parser and exclusive input/output; enable deliberately invoked Linux `terminal-promote` only after that real acceptance.
+- [x] Read-only `workspace persistent inspect`; observed-exit stop receipt, quoted invitation commands, source projection forgetting, and passive reaping without retaining forgotten parser/history. No new Agent, Store, ToolPolicy, provider call, saved-layout authority or schema/version change.
+- [x] Real parser/`vim`/`less`/source-crash frontend flows, 26 adversarial admission/process-loss cases, five existing broker regressions and complete scoped pinned gates below pass. Different-UID runtime acceptance remains blocked, not certified.
+
+Historical pending scope before this transaction, retained verbatim and
+superseded for Linux by the checked implementation above:
+
+- [ ] **Live migration of an already-running Workspace-owned PTY** remains unimplemented. Kernel-atomic PTY master + pidfd transfer is a proven prerequisite, **not a completed promotion**. The reversible single-reader barrier is verified; complete parser/scrollback/escape checkpoint, adopted child custody with `ChildGuard` disarm, and authenticated release/rollback/UNKNOWN fencing remain open. Newly created broker-owned PTYs survive launcher/frontend exit, not broker SIGKILL or reboot. Remote/multi-machine control and Windows/macOS certification remain separate.
+
 ## Uncommitted
 
 - [~] **Distinct user/Actor** delegation, individually narrowed/revocable browser grants and remote-device trust remain unimplemented. Browser post-ACK crashes/partitions are inspect-only; recent ACK never proves perpetual process liveness.
-- [ ] **Live migration of an already-running Workspace-owned PTY** remains unimplemented. Kernel-atomic PTY master + pidfd transfer is a proven prerequisite, **not a completed promotion**. The reversible single-reader barrier is verified; complete parser/scrollback/escape checkpoint, adopted child custody with `ChildGuard` disarm, and authenticated release/rollback/UNKNOWN fencing remain open. Newly created broker-owned PTYs survive launcher/frontend exit, not broker SIGKILL or reboot. Remote/multi-machine control and Windows/macOS certification remain separate.
+- [ ] Actual different-UID native migration rejection requires a privileged runner; no host privilege change was made. Remote/distinct-Actor, macOS/Windows custody and broker-SIGKILL/reboot execution restoration remain separate unimplemented acceptance.
 
 
 ## Tests and verification
+
+- [x] Source `9d82f1a`, pinned Nix: non-Store workspace **1,374 passed, 4 existing ignored**, 105 targets; Store library **201**, five Store integrations **156** — **1,731 Rust tests passed**, split execution, not a monolithic workspace claim. Final CLI binary rerun: **383 passed, 1 existing ignored**.
+- [x] Same source: **174 Node tests** across 12 browser suites, **139 web-only Rust tests**, strict all-target Clippy for platform/terminal/CLI, formatting, minimal/Workspace feature checks and `aw 0.15.0` binary build passed. Workspace retains two existing feature-only dead-code warnings; no new feature authority or dependency version was added.
+- [x] `tests/native_live_migration.py parser|vim|less|source-crash`: **4 passed** with original Workspace shell PID/root/Actor/ID, retained parser/partial CSI/DSR, exclusive input, Ctrl+C, source-resource forget, receiver detach/termios and exact stop. Source SIGKILL does not promise source termios restoration.
+- [x] `tests/native_migration_protocol.py`: **26 passed**, including wrong binding/proof/kernel identity, absent/forged/stale release, bounded/incomplete frames, lost/duplicate ACK, receiver crashes and original source death at intent/escrow/prepared/released boundaries. Death alone never activates escrow.
+- [x] `tests/native_persistent_pty.py` reconnect/competition/workspace-exit/shell-exit/broker-loss: **5 passed**, private TMPDIR paths with spaces/quotes, same PID over three frontends, token/control fencing, explicit stop, termios and fixture/endpoint cleanup.
+- [x] Final terminal target: **55 passed** (20 unit, 17 PTY, 5 replay/staging, 7 source-release, 6 adoption). Forgotten source parser/history is freed while the same shell stays alive and its passive parent waiter still reaps it.
+- [ ] Actual different-UID process rejection — blocked: `sudo -n -u nobody` requires a password. Existing kernel SO_PEERCRED UID enforcement is retained; executed same-UID and bad-proof/peer tests are not a privileged cross-UID runtime result.
+
 
 - [x] Product source `7ced795`, pinned Nix: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` — **1,365 passed, 4 ignored**, 104 targets; Store library — **201 passed**; five explicit Store integrations `composite_design`, `context_flow`, `custody_inventory`, `resources`, `store` — **7+29+9+23+88 = 156 passed**. Zero failures; split-package execution. Final non-Store run includes source parent-wait error reporting.
 - [x] Same product source: **174 Node tests** in all 12 browser suites, **139 web-only Rust tests**, strict terminal all-targets/CLI-library Clippy, formatting and minimal/Workspace feature checks passed; Workspace retains its two existing dead-code warnings. Binary build/version passed: `aw 0.15.0`.

@@ -1,5 +1,34 @@
 # Real terminal service — Phase 5 / 0.6.0
 
+## Live migration of an original Workspace PTY — Linux, 0.15.0
+
+Focus an existing locally controlled terminal, cancel unused docking offers,
+then invoke **`terminal-promote`** in the Workspace palette. Copy the printed
+`aw workspace attach INVITE` command into another native terminal; F12 detaches.
+After successful release the original Workspace may exit: the same shell PID,
+parser, inactive/main/alternate buffers and bounded scrollback belong to the
+independent broker. The old view is a frozen source snapshot. `terminal-forget`
+removes that released source resource without stopping the independent shell.
+
+`aw workspace persistent inspect DIRECTORY` reports recorded custody without
+retrying input or activating anything. After detaching, use the printed
+`aw workspace persistent stop INVITE` to stop the exact shell. Stop success
+requires observed exit; escaped/disowned jobs can remain.
+
+**Verified on `9d82f1a`:** real original Workspace exit and post-release
+SIGKILL, real `vim`/`less`, Unicode/attributes/partial CSI, one new DSR response,
+exclusive input, Ctrl+C, F12/termios restoration, explicit stop, 3,000-line
+stream cutover and 26 admission/crash cases. SIGKILL cannot restore the killed
+source terminal; the attached recipient still restores its own terminal.
+Actual different-UID rejection remains unexecuted because the host requires
+privileged credentials. Linux trusted-local scope only; no broker crash/reboot
+restoration or remote/distinct-Actor grant is claimed.
+
+See [custody protocol](../plans/workspace-views/NATIVE-PTY-CUSTODY.md) and
+[canonical verification](../plans/workspace-views/TODO.md). The older
+persistent-broker limitation below records its pre-migration checkpoint.
+
+
 ## Current TUI integration amendment
 
 The current inline/fullscreen TUI is compile/test/PTY-smoke validated; the older “authored source only” wording below is historical. Embedded PTYs still own ordinary terminal keys. The Conversation-only **F6/F7** thinking/tool visibility toggles are intentionally handled only when a Conversation is focused and therefore are **not intercepted from a focused child terminal**. Tool-result coloring described in the current TUI is aw-owned transcript chrome, not passthrough of child/model escape sequences.
