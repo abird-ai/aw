@@ -1,0 +1,127 @@
+# Explicit dispatch only; execution is separate from release authorization.
+name: Native release assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: aw-linux-x86_64
+            package: dist-linux-x86_64
+          - asset: aw-linux-aarch64
+            package: dist-linux-aarch64
+          - asset: aw-macos-aarch64
+            package: dist-macos-aarch64
+          - asset: aw-windows-x86_64.exe
+            package: dist-windows-x86_64
+          - asset: aw-windows-aarch64.exe
+            package: dist-windows-aarch64
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .cargo
+            crates
+            examples
+            nix
+            scripts
+            src
+            tests
+            web
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build one exact asset and bind its source
+        env:
+          PACKAGE: ${{ matrix.package }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          source_dir=$(mktemp -d "$RUNNER_TEMP/aw-release-source.XXXXXX")
+          git archive --format=tar "$GITHUB_SHA" -- \
+            Cargo.toml Cargo.lock flake.nix flake.lock rust-toolchain.toml \
+            .cargo crates examples nix scripts src tests web | tar -x -C "$source_dir"
+          out=$(nix build "path:$source_dir#$PACKAGE" --no-link --print-out-paths --no-update-lock-file --max-jobs 1 --cores 2)
+          mkdir native-input
+          cp "$out/$ASSET" "$out/$ASSET.sha256" "$out/VERSION" native-input/
+          printf '%s\n' "$GITHUB_SHA" > native-input/source-revision
+
+      - name: Transfer this run's immutable input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-${{ matrix.asset }}-${{ github.run_attempt }}
+          path: native-input/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  native:
+    name: Execute ${{ matrix.asset }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: aw-linux-x86_64
+            runner: ubuntu-24.04
+            python_arch: x64
+          - asset: aw-linux-aarch64
+            runner: ubuntu-24.04-arm
+            python_arch: arm64
+          - asset: aw-macos-aarch64
+            runner: macos-15
+            python_arch: arm64
+          - asset: aw-windows-x86_64.exe
+            runner: windows-2025
+            python_arch: x64
+          - asset: aw-windows-aarch64.exe
+            runner: windows-11-arm
+            python_arch: arm64
+    steps:
+      - name: Check out the same source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: tests
+
+      - name: Set up the native Python launcher
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.15'
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Download this workflow run's exact asset
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-${{ matrix.asset }}-${{ github.run_attempt }}
+          path: native-input
+
+      - name: Verify and execute on the matching native host
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: python tests/native_release_asset.py native-input "$ASSET" --revision "$GITHUB_SHA"

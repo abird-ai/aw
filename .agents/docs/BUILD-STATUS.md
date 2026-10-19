@@ -35,6 +35,32 @@ execution result, and a local run cannot establish missing Windows/macOS hosts,
 permitted live-provider use, signing or publication. Record the exact command
 and result on the plan TODO line and leave unexecuted work open.
 
+The manual [Native release assets workflow](../../.github/workflows/native-release.yml)
+builds each existing Nix `dist-*` target in a separate Linux job, then transfers
+that run's asset/checksum/VERSION/source revision to its matching native runner.
+Actions are pinned; sparse checkouts and explicit immutable build exports
+exclude `.agents`. The
+[native asset probe](../../tests/native_release_asset.py) refuses wrong hosts,
+revisions, versions, hashes or image architectures before executing a private
+copy. It checks CLI metadata and one Unicode streaming answer from a synthetic
+loopback fixture, with tools off, memory-only State and isolated HOME/XDG/cwd.
+Minimal also refuses Workspace mode without another fixture request.
+
+The workflow is dispatch-only. Its definition and local Linux execution do not
+establish an executed hosted job. This bounded probe does not qualify native
+interactive UI/PTY behavior, platform filesystem contracts, installers, real TLS
+or providers, billing, identity signing, notarization or publication. Those
+outcomes retain their own unchecked gates. Runner labels follow the
+[GitHub runner matrix](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+On an available matching host, a private bundle contains the exact asset, its
+`.sha256`, `VERSION`, and a `source-revision` file naming the builder's full
+commit plus newline. From that same checked-out revision:
+
+```sh
+python tests/native_release_asset.py PRIVATE_BUNDLE ASSET --revision FULL_COMMIT
+```
+
 ## Completion and remaining work
 
 Keep one current checkbox per outcome in the appropriate plan TODO, linked from the [root TODO](../plans/TODO.md). After coordinator verification, record the test command/result and implementation commit; remove resolved duplicates. Temporary raw reports and logs are useful while diagnosing a run, but no historical evidence archive or byte ledger is required for an accepted checkpoint.
