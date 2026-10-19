@@ -220,6 +220,10 @@ fn reader_pause_timeout_and_repeated_guards_cannot_leave_source_fenced() {
     wait(&t, "OK=back-in-control");
     let gate = t.quiesce(Duration::from_secs(2)).unwrap();
     t.terminate();
+    assert!(
+        gate.checkpoint().is_err(),
+        "terminate while paused may not produce a transferable checkpoint"
+    );
     drop(gate);
     let deadline = Instant::now() + Duration::from_secs(4);
     while matches!(t.status(), Status::Running | Status::Stopping) && Instant::now() < deadline {
@@ -261,5 +265,169 @@ fn reader_cutover_rollback_preserves_alternate_screen_and_input_modes() {
     assert!(resumed.alternate_screen);
     assert!(resumed.bracketed_paste);
     assert_eq!(resumed.id, paused.id);
+    t.terminate();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn quiesced_raw_replay_keeps_live_original_bash_modes_and_rolls_back() {
+    let t = Terminal::spawn(
+        options(
+            "printf 'MAIN_MARK\\n\\033[?1049h\\033[?2004h\\033[1;31mALT_MARK'; \
+             read -r answer; printf '\\033[0m END=%s' \"$answer\"; sleep 2",
+        ),
+        || {},
+    )
+    .unwrap();
+    wait(&t, "ALT_MARK");
+    let paused = t
+        .quiesce(Duration::from_secs(2))
+        .expect("single original owner must pause");
+    let original = paused.snapshot();
+    assert!(original.alternate_screen);
+    assert!(original.bracketed_paste);
+    assert!(original
+        .cells
+        .iter()
+        .any(|cell| cell.fg == aw_terminal::Color::Indexed(1)));
+    let checkpoint = paused
+        .checkpoint()
+        .expect("bounded original PTY output replayable");
+    assert_eq!(checkpoint.terminal_id(), original.id);
+    assert_eq!(checkpoint.original_root(), &t.root);
+    assert_eq!(checkpoint.original_owner(), &t.owner);
+    assert_eq!(checkpoint.original_site(), t.site);
+    assert!(checkpoint.retained_bytes() > 0);
+    let receiver = checkpoint.replay().expect("replay must restore VT states");
+    assert!(receiver.screen().alternate_screen());
+    assert!(receiver.screen().bracketed_paste());
+    assert_eq!(receiver.screen().contents(), "ALT_MARK");
+    assert_eq!(receiver.screen().size(), (original.rows, original.cols));
+    for (index, expected) in original.cells.iter().enumerate() {
+        let row = (index / usize::from(original.cols)) as u16;
+        let col = (index % usize::from(original.cols)) as u16;
+        let current = receiver.screen().cell(row, col).unwrap();
+        assert_eq!(current.contents(), expected.text);
+        assert_eq!(current.bold(), expected.bold);
+        assert_eq!(current.is_wide(), expected.wide);
+        assert_eq!(current.is_wide_continuation(), expected.continuation);
+        if expected.fg == aw_terminal::Color::Indexed(1) {
+            assert_eq!(current.fgcolor(), vt100::Color::Idx(1));
+        }
+    }
+    assert!(t.input(b"NOT_ALLOWED\r".to_vec()).is_err());
+    drop(paused); // rollback must resume the one original shell and reader
+    t.input(b"accepted\r".to_vec()).unwrap();
+    wait(&t, "END=accepted");
+    assert_eq!(t.id, original.id);
+    t.terminate();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn quiesced_checkpoint_replays_a_live_pty_resize_before_cutover() {
+    let t = Terminal::spawn(
+        options("printf 'BEFORE_RESIZE'; read -r answer; stty size; sleep 2"),
+        || {},
+    )
+    .unwrap();
+    wait(&t, "BEFORE_RESIZE");
+    t.resize(19, 47).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while t.snapshot(0).rows != 19 || t.snapshot(0).cols != 47 {
+        assert!(
+            Instant::now() < deadline,
+            "original PTY resize did not apply"
+        );
+        thread::sleep(Duration::from_millis(15));
+    }
+    let gated = t.quiesce(Duration::from_secs(2)).unwrap();
+    let original = gated.snapshot();
+    let replay = gated.checkpoint().unwrap().replay().unwrap();
+    assert_eq!(replay.screen().size(), (19, 47));
+    let content = original
+        .cells
+        .chunks(usize::from(original.cols))
+        .map(|line| line.iter().map(|c| c.text.as_str()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(replay.screen().contents().trim_end(), content.trim_end());
+    drop(gated);
+    t.input(b"continue\r".to_vec()).unwrap();
+    wait(&t, "19 47");
+    t.terminate();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn checkpoint_receiver_child_process() {
+    if std::env::var_os("AW_TEST_CHECKPOINT_CHILD").is_none() {
+        return; // ordinary integration-test invocation
+    }
+    use std::io::Read;
+    let mut encoded = Vec::new();
+    std::io::stdin()
+        .take((aw_terminal::MAX_CHECKPOINT_WIRE_BYTES + 1) as u64)
+        .read_to_end(&mut encoded)
+        .unwrap();
+    let checkpoint = aw_terminal::Checkpoint::from_wire(&encoded)
+        .expect("independent process must reject unsupported checkpoint data");
+    assert!(checkpoint.terminal_id().starts_with("pty_"));
+    assert_eq!(checkpoint.original_owner(), "fixture");
+    let mut restored = checkpoint.replay().unwrap();
+    assert!(restored.screen().alternate_screen());
+    assert!(restored.screen().bracketed_paste());
+    assert!(restored.screen().contents().contains("ALT_CHILD"));
+    restored.process(b"\x1b[?1049l");
+    assert!(!restored.screen().alternate_screen());
+    assert!(restored.screen().contents().contains("MAIN_CHILD"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_quiesced_shell_checkpoint_replays_in_independent_process_without_release() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let t = Terminal::spawn(
+        options(
+            "printf 'MAIN_CHILD\\r\\n\\033[?1049h\\033[?2004hALT_CHILD'; \
+             read -r command; printf '\\033[?1049lRESUMED=%s' \"$command\"; sleep 2",
+        ),
+        || {},
+    )
+    .unwrap();
+    wait(&t, "ALT_CHILD");
+    let original = t.snapshot(0);
+    let gate = t.quiesce(Duration::from_secs(2)).unwrap();
+    let bytes = gate.checkpoint().unwrap().to_wire().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let mut child = Command::new(executable)
+        .args([
+            "--exact",
+            "checkpoint_receiver_child_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("AW_TEST_CHECKPOINT_CHILD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&bytes).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "independent checkpoint replay failed: {} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(t.snapshot(0).id, original.id);
+    assert_eq!(t.snapshot(0).version, original.version);
+    assert!(t.input(b"ILLEGAL\r".to_vec()).is_err());
+    drop(gate); // cross-process replay was never an ownership transfer
+    t.input(b"accepted\r".to_vec()).unwrap();
+    wait(&t, "RESUMED=accepted");
+    assert_eq!(t.id, original.id);
     t.terminate();
 }

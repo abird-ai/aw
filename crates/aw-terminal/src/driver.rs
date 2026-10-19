@@ -133,6 +133,8 @@ pub(crate) fn run(
                     pixel_height: 0,
                 }) {
                     Ok(()) => changed(&shared, |state| {
+                        #[cfg(target_os = "linux")]
+                        state.journal.resize(rows, cols);
                         state.parser.screen_mut().set_size(rows, cols)
                     }),
                     Err(_) => changed(&shared, |state| {
@@ -157,6 +159,39 @@ pub(crate) fn run(
                             "PTY quiescence request was revoked",
                         )));
                     }
+                }
+                #[cfg(target_os = "linux")]
+                Message::Stage { epoch, reply } => {
+                    let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let prepared = state.quiescing
+                        && state.quiesce_epoch == epoch
+                        && state.status == Status::Running
+                        && !shared.stop.load(Ordering::Acquire)
+                        && shared.pending.load(Ordering::Acquire) == 0
+                        && shared.reader_pause_requested.load(Ordering::Acquire);
+                    let result = if prepared {
+                        match (master.as_raw_fd(), child.process_id()) {
+                            (Some(fd), Some(pid)) => (|| -> crate::Result<_> {
+                                use std::os::fd::AsFd;
+                                let master = aw_platform::pty_poll::duplicate(fd)?;
+                                let pidfd = aw_platform::pid_identity::open(pid)?;
+                                if aw_platform::pid_identity::exited(pidfd.as_fd())? {
+                                    return Err(crate::Error::Unavailable(
+                                        "original PTY child already exited",
+                                    ));
+                                }
+                                Ok((master, pidfd))
+                            })(),
+                            _ => Err(crate::Error::Unavailable(
+                                "original PTY or child process identity unavailable",
+                            )),
+                        }
+                    } else {
+                        Err(crate::Error::Unavailable(
+                            "PTY escrow requires live acknowledged reader pause",
+                        ))
+                    };
+                    let _ = reply.send(result);
                 }
                 Message::Stop => {
                     shared.stop.store(true, Ordering::Release);
@@ -242,10 +277,16 @@ pub(crate) fn run(
                 }
             }
             Ok(ReadEvent::Bytes(bytes)) => {
-                let bytes = filter.push(&bytes);
+                let sanitized = filter.push(&bytes);
                 let mut replies = Vec::new();
                 changed(&shared, |state| {
-                    state.parser.process(&bytes);
+                    #[cfg(target_os = "linux")]
+                    state.journal.output(&sanitized);
+                    #[cfg(target_os = "linux")]
+                    {
+                        state.checkpoint_filter = filter.clone();
+                    }
+                    state.parser.process(&sanitized);
                     replies = std::mem::take(&mut state.parser.callbacks_mut().bytes);
                 });
                 if !replies.is_empty()

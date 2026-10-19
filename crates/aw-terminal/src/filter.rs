@@ -2,7 +2,8 @@
 /// hyperlink, image, shell integration or window-control bridge is implemented.
 /// CSI buffering is bounded; ordinary UTF-8 passes unchanged, including split
 /// multi-byte characters. This filters 7-bit ESC strings, not Unicode bytes.
-#[derive(Default)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Filter {
     state: u8,
     osc: bool,
@@ -11,6 +12,13 @@ pub(crate) struct Filter {
     utf8: u8,
 }
 impl Filter {
+    pub(crate) fn valid_checkpoint(&self) -> bool {
+        self.state <= 4
+            && self.utf8 <= 3
+            && self.csi.len() <= 256
+            && (self.state != 3 || self.csi.starts_with(b"\x1b["))
+    }
+
     pub fn push(&mut self, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len());
         for &b in input {

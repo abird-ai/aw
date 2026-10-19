@@ -1,12 +1,18 @@
 //! Real local PTYs with bounded screen/scrollback and asynchronous input.
 //! Explicit trusted host capability; not a model tool, sandbox or remote server.
 //! Spawn on a blocking worker. Hidden views do not stop output draining.
+#[cfg(target_os = "linux")]
+mod checkpoint;
 mod driver;
 mod filter;
 mod input;
+#[cfg(target_os = "linux")]
+pub use checkpoint::{Checkpoint, Replayed, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_WIRE_BYTES};
 pub use input::{encode_key, encode_paste, Key, Modifiers};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
 use std::{
@@ -148,6 +154,10 @@ pub(crate) struct State {
     pub quiescing: bool,
     #[cfg(target_os = "linux")]
     pub quiesce_epoch: u64,
+    #[cfg(target_os = "linux")]
+    pub journal: checkpoint::Journal,
+    #[cfg(target_os = "linux")]
+    pub checkpoint_filter: filter::Filter,
 }
 pub(crate) struct Shared {
     pub state: Mutex<State>,
@@ -166,6 +176,11 @@ pub(crate) enum Message {
     Quiesce {
         epoch: u64,
         reply: mpsc::SyncSender<Result<()>>,
+    },
+    #[cfg(target_os = "linux")]
+    Stage {
+        epoch: u64,
+        reply: mpsc::SyncSender<Result<(OwnedFd, OwnedFd)>>,
     },
     Stop,
 }
@@ -246,6 +261,10 @@ impl Terminal {
                 quiescing: false,
                 #[cfg(target_os = "linux")]
                 quiesce_epoch: 0,
+                #[cfg(target_os = "linux")]
+                journal: checkpoint::Journal::new(options.rows, options.cols),
+                #[cfg(target_os = "linux")]
+                checkpoint_filter: filter::Filter::default(),
             }),
             stop: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
@@ -387,6 +406,7 @@ impl Terminal {
             Ok(Ok(())) => Ok(Quiesced {
                 terminal: self,
                 epoch,
+                staged: false,
             }),
             _ => {
                 self.release_quiescence(epoch);
@@ -469,11 +489,147 @@ impl Terminal {
 pub struct Quiesced<'a> {
     terminal: &'a Terminal,
     epoch: u64,
+    staged: bool,
 }
 #[cfg(target_os = "linux")]
-impl Quiesced<'_> {
+impl<'owner> Quiesced<'owner> {
+    fn still_exclusive(&self) -> bool {
+        let state = self
+            .terminal
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.quiescing
+            && state.quiesce_epoch == self.epoch
+            && state.status == Status::Running
+            && !self.terminal.shared.stop.load(Ordering::Acquire)
+            && self.terminal.shared.pending.load(Ordering::Acquire) == 0
+            && self
+                .terminal
+                .shared
+                .reader_pause_requested
+                .load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.terminal.snapshot(0)
+    }
+    /// Memory-only bounded parser-state checkpoint; not an adoption or
+    /// permission to release the original PTY/child. Drop still rolls back.
+    pub fn checkpoint(&self) -> Result<Checkpoint> {
+        let state = self
+            .terminal
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !state.quiescing
+            || state.quiesce_epoch != self.epoch
+            || state.status != Status::Running
+            || self.terminal.shared.stop.load(Ordering::Acquire)
+            || self.terminal.shared.pending.load(Ordering::Acquire) != 0
+            || !self
+                .terminal
+                .shared
+                .reader_pause_requested
+                .load(Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "source PTY not in acknowledged quiescence",
+            ));
+        }
+        state.journal.checkpoint(
+            &self.terminal.id,
+            &self.terminal.root,
+            &self.terminal.owner,
+            &self.terminal.site,
+            self.epoch,
+            &state.checkpoint_filter,
+        )
+    }
+
+    /// Prepare a single atomic PTY-master/pidfd escrow while the original
+    /// output reader is actually paused. This is NOT a migration commit:
+    /// dropping this guard still resumes the source, and every staged handle
+    /// closes unless a separate authenticated receiver takes custody.
+    pub fn stage<'stage>(&'stage mut self) -> Result<Staged<'stage, 'owner>> {
+        if self.staged {
+            return Err(Error::Unavailable(
+                "PTY escrow already staged for this generation",
+            ));
+        }
+        let checkpoint = self.checkpoint()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.terminal
+            .tx
+            .try_send(Message::Stage {
+                epoch: self.epoch,
+                reply: sender,
+            })
+            .map_err(|_| Error::Full)?;
+        let (master, pidfd) = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| Error::Unavailable("PTY kernel escrow unavailable; source retained"))??;
+        // One stage per reader-pause generation; no implicit second attempt
+        // on an unknown SCM_RIGHTS transport outcome.
+        self.staged = true;
+        Ok(Staged {
+            gate: self,
+            checkpoint,
+            master,
+            pidfd,
+            sent: false,
+        })
+    }
+}
+
+/// Sender-held escrow from one exact original PTY and child. The duplicated
+/// file descriptors carry no Agent/Source/Tool authority; the original
+/// driver/ChildGuard are STILL the sole active owner until an independent,
+/// owner-fenced commit protocol is introduced.
+#[cfg(target_os = "linux")]
+pub struct Staged<'stage, 'owner> {
+    gate: &'stage Quiesced<'owner>,
+    checkpoint: Checkpoint,
+    master: OwnedFd,
+    pidfd: OwnedFd,
+    sent: bool,
+}
+#[cfg(target_os = "linux")]
+impl Staged<'_, '_> {
+    pub fn checkpoint(&self) -> &Checkpoint {
+        &self.checkpoint
+    }
+
+    /// Stage an atomic pair; no destination may read/write until it has
+    /// received a separate release receipt from the original owner.
+    pub fn send_once(
+        &mut self,
+        socket: &std::os::unix::net::UnixStream,
+        proof: &[u8; 32],
+    ) -> Result<()> {
+        use std::os::fd::AsFd;
+        if self.sent {
+            return Err(Error::Unavailable("PTY escrow cannot be sent twice"));
+        }
+        if !self.gate.still_exclusive() || self.child_exited()? {
+            return Err(Error::Unavailable(
+                "PTY escrow source no longer has exclusive live reader custody",
+            ));
+        }
+        self.sent = true; // even an unknown/short send cannot be retried
+        aw_platform::fd_transfer::send_pair(
+            socket,
+            self.master.as_fd(),
+            self.pidfd.as_fd(),
+            proof,
+        )?;
+        Ok(())
+    }
+    pub fn child_exited(&self) -> Result<bool> {
+        use std::os::fd::AsFd;
+        aw_platform::pid_identity::exited(self.pidfd.as_fd()).map_err(Error::Io)
     }
 }
 #[cfg(target_os = "linux")]

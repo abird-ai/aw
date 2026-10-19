@@ -13,6 +13,7 @@ portable-pty = "=0.9.0"
 vt100 = "=0.16.2"
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
