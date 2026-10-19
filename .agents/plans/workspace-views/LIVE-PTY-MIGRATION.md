@@ -1,7 +1,7 @@
 # Live Workspace PTY → persistent broker
 
-Status: **Kernel prerequisites verified; production migration NOT implemented**
-Linux source: `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a` and `a1100a9d344c5835eb73dedc673e55570ad17219`
+Status: **FD+pidfd escrow and reversible reader gate verified; production migration NOT implemented**
+Linux source: `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a`, `a1100a9d344c5835eb73dedc673e55570ad17219`, `635e1ec6e6763caf438999b1551932b5e37bfa81`
 Owner: @pvl (Workspace views)
 
 ## Decision
@@ -22,6 +22,28 @@ Linux `pid_identity::{open,exited}` provides an owned kernel pidfd and nonblocki
 
 `aw-terminal` confirms that `vt100::Screen::state_formatted` reconstructs the visible screen and bracketed-paste mode but **does not recreate alternate-screen ownership**. It cannot be used as a lossless migration checkpoint by itself. Scrollback and partial parser/input escape state need equally explicit treatment.
 
+## Verified original-reader quiescence
+
+`aw-terminal::Terminal::quiesce` is a Linux-only, internal Rust API.
+It atomically refuses new original-owner input/resize, honors earlier
+FIFO commands and waits for the **only existing reader** to pause. All
+previously delivered VT bytes and replies finish processing before ACK.
+The reader polls a duplicated CLOEXEC descriptor, not a potentially
+recycled original FD.
+
+Only one `Quiesced` guard is admitted. A timeout (at most five seconds),
+cancellation or guard drop resumes the source. Stale-generation ACKs
+cannot consume later receipts. The **same original PTY, parser and child**
+remain owned by the source, and original-owner termination stays possible.
+No FD or process capability moves to a broker.
+
+Real PTY tests verify shell PID unchanged, held output read **after**
+resume, 24 cancellation/retry generations, denied input/resize,
+shutdown and original in-process alternate-screen/SGR/bracketed-paste
+state. The child can still emit output into the kernel PTY buffer while
+paused; this does **not** complete parser serialization, child effect
+acknowledgment or migration between processes.
+
 ## Ownership invariants
 
 1. **One reader:** exactly one process may consume output from the master FD at any instant. Duplicating the FD is not transferring the driver, its blocking reader thread, or VT100 parser.
@@ -34,14 +56,14 @@ Linux `pid_identity::{open,exited}` provides an owned kernel pidfd and nonblocki
 
 ## Implementation gates
 
-- [ ] Introduce a *single-reader quiesce barrier* in `aw-terminal::driver`, rather than racing its existing blocking reader thread. Drain queued output and input/protocol replies to a known watermark; source terminal commands fail closed while migrating. Support explicit resume if admission is rejected.
+- [x] Add reversible Linux single-reader quiescence, deny input/resize, drain queued commands/output/replies before pause ACK and resume on guard drop, failure or timeout. Signed `635e1ec`. **Not yet wired** to the broker adoption or owner-release transaction.
 - [ ] Define a bounded **complete parser checkpoint** with round-trip tests for alternate screen, preexisting main screen, scrollback, partial CSI/UTF-8, color and input modes. Reject unsupported state without discarding the original process.
 - [x] Linux-owned `pidfd_open`/poll observation and **atomic two-FD `SCM_RIGHTS` master+pidfd escrow** verified in real two-process Bash tests. Neither is wired to the product migration path.
 - [ ] Introduce a separately tested **adopted-process lifecycle** using transferred pidfd, signal/reap responsibility and `ChildGuard` disarm only after signed original-owner commit. Broker must reject wrong root/terminal/epoch/identity.
 - [ ] Implement explicit `Prepared → Quiesced → FD Received → Original Released → Broker Active` protocol. The recipient holds the FD but **does not read** before source's release; source retains complete rollback until then. Expiring offers are one-use and scoped to one exact source lifetime.
 - [ ] Integrate a deliberately invoked `terminal-promote` command **only after** complete safety gates; retain current running shell PID and terminal contents throughout; no fallback new shell.
 - [ ] Real two-process Linux/PTy verification: `bash`, long output, `less`/`vim` alternate screen, Unicode, scrollback, resize, paste, Ctrl+C, in-flight writes, source crash at each admission boundary, receiver crash, lost/duplicate ACK, wrong UID/proof, stale generation, source exit after release, explicit stop and clean terminal restoration.
-- [x] On `a1100a9` source candidate, `cargo fmt --all -- --check` and strict `aw-platform-unix --all-targets` / `aw-terminal` / `aw-cli --lib` Clippy passed. `cargo test --workspace --locked --exclude aw-store -- --test-threads=4`: **1,333 passed, 4 ignored**; Store lib **201**, Store integrations **156**, Node **174**, web-only Rust **139**, workspace/minimal builds and byte-identical 8/8 frontend assets passed. Full Rust coverage is complementary split package gates, **not** a claimed monolithic Cargo run.
+- [x] On signed `635e1ec`, strict `aw-platform-unix --all-targets`, `aw-terminal --all-targets` and `aw-cli --lib` Clippy and `cargo fmt --all -- --check` passed. `cargo test --workspace --locked --exclude aw-store -- --test-threads=4`: **1,338 passed, 4 ignored**; Store library **201**, five Store integrations **156**, Node **174**, web-only Rust **139**, Workspace/minimal feature builds and 8/8 byte-identical frontend assets passed. Split package Cargo coverage, **not** one uninterrupted workspace command.
 - [ ] Non-Linux/macOS/Windows process-ownership and final live-migration acceptance remain separate; no migration-complete claim until all protocol barriers pass.
 
 ## Acceptance criterion
