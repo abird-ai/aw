@@ -96,7 +96,8 @@ fn send_exact(socket: &UnixStream, fds: &[BorrowedFd<'_>], proof: &[u8; 32]) -> 
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast::<c_void>();
-    msg.msg_controllen = ctrl_size;
+    // Bounded sizes fit musl socklen_t and glibc size_t.
+    msg.msg_controllen = ctrl_size as _;
     // SAFETY: aligned control allocation and valid msghdr/iovec; exactly
     // one or two owned source FDs copied as SCM_RIGHTS, not dereferenced.
     unsafe {
@@ -168,7 +169,7 @@ fn receive_exact(
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast::<c_void>();
-    msg.msg_controllen = ctrl_size;
+    msg.msg_controllen = ctrl_size as _;
     // SAFETY: socket, iovec and ancillary storage are valid for recvmsg;
     // MSG_CMSG_CLOEXEC protects both descriptors from exec inheritance.
     let n = unsafe {
@@ -189,10 +190,12 @@ fn receive_exact(
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                 let header_len = libc::CMSG_LEN(0) as usize;
-                if (*cmsg).cmsg_len < header_len {
+                // musl uses socklen_t here; glibc uses size_t.
+                let cmsg_len: usize = (*cmsg).cmsg_len as _;
+                if cmsg_len < header_len {
                     return Err(invalid("malformed ancillary descriptor header"));
                 }
-                let bytes = (*cmsg).cmsg_len - header_len;
+                let bytes = cmsg_len - header_len;
                 if !bytes.is_multiple_of(size_of::<RawFd>()) {
                     return Err(invalid("misaligned ancillary descriptors"));
                 }
