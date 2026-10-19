@@ -309,7 +309,8 @@ pub fn trusted_direct_filesystem_supported(path: &Path) -> io::Result<bool> {
         if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let magic = unsafe { stats.assume_init() }.f_type as u64;
+        // f_type signedness varies by libc.
+        let magic: u64 = unsafe { stats.assume_init() }.f_type as _;
         Ok(matches!(
             magic,
             0xEF53
