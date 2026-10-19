@@ -45,6 +45,55 @@ pub enum Status {
     Stopping,
     Exited(u32),
     Failed,
+    /// This source has relinquished PTY I/O and termination custody.
+    #[cfg(target_os = "linux")]
+    Released,
+}
+
+/// Local source-worker facts, not broker authentication or activation authority.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceRelease {
+    Retained,
+    Pending(u64),
+    Released(u64),
+}
+
+/// Minted only after the source reader has joined and all source PTY FDs
+/// have closed. A future authenticated owner protocol must bind this fact
+/// to its exact recipient/transaction; this is not a wire bearer grant.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct SourceReleaseReceipt {
+    terminal_id: String,
+    epoch: u64,
+}
+#[cfg(target_os = "linux")]
+impl SourceReleaseReceipt {
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// Dropping a pending receipt cannot cancel an admitted release. Inspect
+/// the exact source epoch after ACK loss; never resume or repeat input.
+#[cfg(target_os = "linux")]
+#[must_use = "release is admitted; await the receipt or inspect the source epoch"]
+pub struct PendingSourceRelease {
+    receipt: mpsc::Receiver<Result<SourceReleaseReceipt>>,
+}
+#[cfg(target_os = "linux")]
+impl PendingSourceRelease {
+    pub fn wait(self, timeout: Duration) -> Result<SourceReleaseReceipt> {
+        self.receipt
+            .recv_timeout(timeout.min(Duration::from_secs(5)))
+            .map_err(|_| {
+                Error::Unavailable("PTY source release UNKNOWN; inspect source epoch, never replay")
+            })?
+    }
 }
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -158,6 +207,8 @@ pub(crate) struct State {
     pub journal: checkpoint::Journal,
     #[cfg(target_os = "linux")]
     pub checkpoint_filter: filter::Filter,
+    #[cfg(target_os = "linux")]
+    pub source_release: SourceRelease,
 }
 pub(crate) struct Shared {
     pub state: Mutex<State>,
@@ -168,6 +219,8 @@ pub(crate) struct Shared {
     pub reader_pause_requested: AtomicBool,
     #[cfg(target_os = "linux")]
     pub reader_epoch: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub reader_retired: AtomicBool,
 }
 pub(crate) enum Message {
     Input(Vec<u8>),
@@ -181,6 +234,12 @@ pub(crate) enum Message {
     Stage {
         epoch: u64,
         reply: mpsc::SyncSender<Result<(OwnedFd, OwnedFd)>>,
+    },
+    #[cfg(target_os = "linux")]
+    Release {
+        epoch: u64,
+        terminal_id: String,
+        reply: mpsc::SyncSender<Result<SourceReleaseReceipt>>,
     },
     Stop,
 }
@@ -245,6 +304,16 @@ impl Terminal {
                 .ok_or(Error::Unavailable("native PTY descriptor missing"))?,
         )?;
         let reader = pair.master.try_clone_reader().map_err(backend)?;
+        // portable-pty's Unix writer injects newline + VEOF on Drop. A
+        // custody release must close without sending any shell input.
+        #[cfg(target_os = "linux")]
+        let writer: Box<dyn std::io::Write + Send> =
+            Box::new(std::fs::File::from(aw_platform::pty_poll::duplicate(
+                pair.master
+                    .as_raw_fd()
+                    .ok_or(Error::Unavailable("native PTY descriptor missing"))?,
+            )?));
+        #[cfg(not(target_os = "linux"))]
         let writer = pair.master.take_writer().map_err(backend)?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -265,6 +334,8 @@ impl Terminal {
                 journal: checkpoint::Journal::new(options.rows, options.cols),
                 #[cfg(target_os = "linux")]
                 checkpoint_filter: filter::Filter::default(),
+                #[cfg(target_os = "linux")]
+                source_release: SourceRelease::Retained,
             }),
             stop: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
@@ -273,6 +344,8 @@ impl Terminal {
             reader_pause_requested: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             reader_epoch: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            reader_retired: AtomicBool::new(false),
         });
         let child = driver::ChildGuard::new(pair.slave.spawn_command(command).map_err(backend)?);
         drop(pair.slave);
@@ -420,7 +493,10 @@ impl Terminal {
     #[cfg(target_os = "linux")]
     fn release_quiescence(&self, epoch: u64) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.quiescing && state.quiesce_epoch == epoch {
+        if state.quiescing
+            && state.quiesce_epoch == epoch
+            && state.source_release == SourceRelease::Retained
+        {
             state.quiescing = false;
             self.shared
                 .reader_pause_requested
@@ -428,8 +504,23 @@ impl Terminal {
         }
     }
     pub fn terminate(&self) {
+        #[cfg(target_os = "linux")]
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_os = "linux")]
+        if state.source_release != SourceRelease::Retained {
+            return;
+        }
         self.shared.stop.store(true, Ordering::Release);
         let _ = self.tx.try_send(Message::Stop);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn source_release(&self) -> SourceRelease {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .source_release
     }
     pub fn snapshot(&self, scrollback: usize) -> Snapshot {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -503,6 +594,7 @@ impl<'owner> Quiesced<'owner> {
         state.quiescing
             && state.quiesce_epoch == self.epoch
             && state.status == Status::Running
+            && state.source_release == SourceRelease::Retained
             && !self.terminal.shared.stop.load(Ordering::Acquire)
             && self.terminal.shared.pending.load(Ordering::Acquire) == 0
             && self
@@ -580,6 +672,7 @@ impl<'owner> Quiesced<'owner> {
             master,
             pidfd,
             sent: false,
+            transmitted: false,
         })
     }
 }
@@ -595,6 +688,7 @@ pub struct Staged<'stage, 'owner> {
     master: OwnedFd,
     pidfd: OwnedFd,
     sent: bool,
+    transmitted: bool,
 }
 #[cfg(target_os = "linux")]
 impl Staged<'_, '_> {
@@ -625,7 +719,70 @@ impl Staged<'_, '_> {
             self.pidfd.as_fd(),
             proof,
         )?;
+        self.transmitted = true;
         Ok(())
+    }
+
+    /// Irreversible, trusted-native source primitive. Caller must first
+    /// authenticate the exact recipient's readiness and commit its owner
+    /// intent. NOT exposed by the broker/CLI; a kernel send alone is not
+    /// recipient readiness. No destination activation is performed here.
+    ///
+    /// After queue admission, timeout/ACK loss is UNKNOWN: inspect
+    /// Terminal::source_release, never retry or resume the old reader.
+    pub fn release_source(self) -> Result<PendingSourceRelease> {
+        if !self.transmitted {
+            return Err(Error::Unavailable(
+                "PTY escrow has no confirmed kernel send",
+            ));
+        }
+        let Self {
+            gate,
+            master,
+            pidfd,
+            ..
+        } = self;
+        // Sender-held escrow duplicates must close before a release receipt.
+        drop(master);
+        drop(pidfd);
+        let (reply, receipt) = mpsc::sync_channel(1);
+        {
+            let mut state = gate
+                .terminal
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !state.quiescing
+                || state.quiesce_epoch != gate.epoch
+                || state.source_release != SourceRelease::Retained
+                || state.status != Status::Running
+                || gate.terminal.shared.stop.load(Ordering::Acquire)
+                || gate.terminal.shared.pending.load(Ordering::Acquire) != 0
+                || !gate
+                    .terminal
+                    .shared
+                    .reader_pause_requested
+                    .load(Ordering::Acquire)
+            {
+                return Err(Error::Unavailable("PTY source release was revoked"));
+            }
+            state.source_release = SourceRelease::Pending(gate.epoch);
+            if gate
+                .terminal
+                .tx
+                .try_send(Message::Release {
+                    epoch: gate.epoch,
+                    terminal_id: gate.terminal.id.clone(),
+                    reply,
+                })
+                .is_err()
+            {
+                state.source_release = SourceRelease::Retained;
+                return Err(Error::Full);
+            }
+        }
+        Ok(PendingSourceRelease { receipt })
     }
     pub fn child_exited(&self) -> Result<bool> {
         use std::os::fd::AsFd;

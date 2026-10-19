@@ -40,6 +40,9 @@ pub(crate) fn run(
             loop {
                 #[cfg(target_os = "linux")]
                 {
+                    if reader_state.reader_retired.load(Ordering::Acquire) {
+                        break;
+                    }
                     if reader_state.reader_pause_requested.load(Ordering::Acquire) {
                         let generation = reader_state.reader_epoch.load(Ordering::Acquire);
                         if last_paused_generation != Some(generation) {
@@ -98,6 +101,8 @@ pub(crate) fn run(
         });
         return;
     }
+    #[cfg(target_os = "linux")]
+    let reader_thread = reader_thread.expect("reader spawn already checked");
 
     let mut filter = Filter::default();
     let mut output_closed = false;
@@ -166,6 +171,7 @@ pub(crate) fn run(
                     let prepared = state.quiescing
                         && state.quiesce_epoch == epoch
                         && state.status == Status::Running
+                        && state.source_release == crate::SourceRelease::Retained
                         && !shared.stop.load(Ordering::Acquire)
                         && shared.pending.load(Ordering::Acquire) == 0
                         && shared.reader_pause_requested.load(Ordering::Acquire);
@@ -192,6 +198,82 @@ pub(crate) fn run(
                         ))
                     };
                     let _ = reply.send(result);
+                }
+                #[cfg(target_os = "linux")]
+                Message::Release {
+                    epoch,
+                    terminal_id,
+                    reply,
+                } => {
+                    let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let exclusive = state.source_release == crate::SourceRelease::Pending(epoch)
+                        && state.quiescing
+                        && state.quiesce_epoch == epoch
+                        && state.status == Status::Running
+                        && shared.pending.load(Ordering::Acquire) == 0
+                        && shared.reader_pause_requested.load(Ordering::Acquire)
+                        && !shared.stop.load(Ordering::Acquire);
+                    let live = matches!(child.try_wait(), Ok(None));
+                    if !exclusive || !live {
+                        drop(state);
+                        changed(&shared, |state| {
+                            if state.source_release == crate::SourceRelease::Pending(epoch)
+                                && state.quiesce_epoch == epoch
+                            {
+                                state.source_release = crate::SourceRelease::Retained;
+                                state.quiescing = false;
+                                shared
+                                    .reader_pause_requested
+                                    .store(false, Ordering::Release);
+                            }
+                        });
+                        let _ = reply.send(Err(crate::Error::Unavailable(
+                            "PTY source release rejected before custody changed",
+                        )));
+                        continue;
+                    }
+                    // Admission is irreversible to the caller. No RAII pause
+                    // rollback or original-owner Stop may reactivate custody.
+                    shared.reader_retired.store(true, Ordering::Release);
+                    drop(state);
+                    if reader_thread.join().is_err() {
+                        changed(&shared, |state| {
+                            state.status = Status::Failed;
+                            state.notice = "PTY reader retirement failed; inspect custody".into();
+                        });
+                        let _ = reply.send(Err(crate::Error::Unavailable(
+                            "PTY source release UNKNOWN after reader retirement failure",
+                        )));
+                        return; // original armed guard still owns failure cleanup
+                    }
+                    // Reader, its poll duplicate, and every sender escrow FD
+                    // are closed before the final source master/writer closes.
+                    drop(writer);
+                    drop(master);
+                    let mut waiter = child.into_waiter();
+                    {
+                        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.source_release = crate::SourceRelease::Released(epoch);
+                        state.status = Status::Released;
+                        state.notice =
+                            "PTY source released; destination activation is separate".into();
+                        state.version = state.version.wrapping_add(1);
+                    }
+                    let _ = reply.send(Ok(crate::SourceReleaseReceipt { terminal_id, epoch }));
+                    // Observer faults must not strand the original-parent
+                    // waiter or undo the already factual source release.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (shared.notify)()
+                    }));
+                    // Reuse this existing worker as the original parent's
+                    // non-signaling reaper. Source exit lets Linux reparent.
+                    if waiter.wait().is_err() {
+                        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.notice =
+                            "PTY source released; parent wait failed, inspect child custody".into();
+                        state.version = state.version.wrapping_add(1);
+                    }
+                    return;
                 }
                 Message::Stop => {
                     shared.stop.store(true, Ordering::Release);
@@ -345,12 +427,30 @@ pub(crate) fn run(
 /// Launch/worker failure must not orphan a child merely because no public handle
 /// was returned. This guard is created immediately after successful spawn.
 pub(crate) struct ChildGuard {
-    inner: Box<dyn Child + Send + Sync>,
+    inner: Option<Box<dyn Child + Send + Sync>>,
 }
 
 impl ChildGuard {
     pub fn new(inner: Box<dyn Child + Send + Sync>) -> Self {
-        Self { inner }
+        Self { inner: Some(inner) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn into_waiter(mut self) -> ChildWaiter {
+        ChildWaiter {
+            inner: self.inner.take().expect("owned original child"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ChildWaiter {
+    inner: Box<dyn Child + Send + Sync>,
+}
+#[cfg(target_os = "linux")]
+impl ChildWaiter {
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        self.inner.wait()
     }
 }
 
@@ -358,24 +458,27 @@ impl std::ops::Deref for ChildGuard {
     type Target = dyn Child + Send + Sync;
 
     fn deref(&self) -> &Self::Target {
-        self.inner.as_ref()
+        self.inner.as_deref().expect("owned original child")
     }
 }
 
 impl std::ops::DerefMut for ChildGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner.as_mut()
+        self.inner.as_deref_mut().expect("owned original child")
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if matches!(self.inner.try_wait(), Ok(None)) {
-            if let Some(pid) = self.inner.process_id() {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        if matches!(inner.try_wait(), Ok(None)) {
+            if let Some(pid) = inner.process_id() {
                 aw_platform::kill_process_group(pid);
             }
-            let _ = self.inner.kill();
-            let _ = self.inner.wait();
+            let _ = inner.kill();
+            let _ = inner.wait();
         }
     }
 }

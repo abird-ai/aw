@@ -3,7 +3,7 @@ Owner: @pvl
 
 # Adopted PTY child lifecycle
 
-Status: **exit observation/reap primitives tested; custody transfer pending**.
+Status: **local source release and passive reaping tested; production custody protocol pending**.
 Continuation of [live migration](LIVE-PTY-MIGRATION.md).
 
 ## Kernel contract
@@ -30,7 +30,37 @@ unavailable. Preserve that distinction from `ChildExit::Code(0)` and from
 `ChildExit::Signal`. These operations grant no custody, Actor, root, Tool,
 or PTY-reader permission. Unsupported wait APIs fail closed.
 
-## Required custody transition — not implemented
+## Local source release — implemented Rust primitive
+
+Only a trusted original host holding the non-cloneable `Staged` capability
+can call `release_source`, after a successful kernel send. The caller must
+independently authenticate recipient readiness and commit its owner intent
+before calling. **No shipping broker/CLI calls this API.** It does not
+implement authentication, signed cross-process release or broker activation.
+
+- Queue admission changes the exact source epoch from Retained to Pending.
+  Source Stop/Drop and pause-guard rollback are fenced from then onward.
+- `PendingSourceRelease::wait` has a five-second maximum. Timeout or lost
+  ACK is UNKNOWN, not cancellation; inspect `Terminal::source_release`.
+- Worker verifies the acknowledged pause, epoch, input drain and live child,
+  retires and joins the only reader, then closes master/writer descriptors.
+  Sender-held escrow duplicates close before admission.
+- Only afterward, move the armed `ChildGuard` into a distinct passive
+  `ChildWaiter`. The existing worker retains original-parent wait/reap
+  responsibility with no signaling or additional reaper thread.
+- `SourceReleaseReceipt` and `Status::Released` are factual local results
+  after descriptor closure/disarm. Observer panic cannot undo release or
+  strand the passive waiter. Receipt is not a transferable bearer grant.
+- Linux uses a plain CLOEXEC master-FD writer. The pinned `portable-pty`
+  writer injects newline + VEOF on Drop; that is forbidden during release.
+  Other platforms retain their existing backend; release is Linux-only.
+
+Definite pre-admission failure leaves original custody intact. Once admitted,
+there is no automatic rollback on timeout or lost reply. A worker rejection
+before disarm may return custody to the exact original epoch; a failed
+reader join stays fenced/UNKNOWN with the armed guard's failure cleanup.
+
+## Required production custody transaction — pending
 
 1. Inert recipient validates exact source lifetime, terminal, root/site,
    Actor and epoch, pidfd identity, parser checkpoint and escrow. It may
@@ -39,12 +69,12 @@ or PTY-reader permission. Unsupported wait APIs fail closed.
    the authenticated release transaction commits. Receipt of FDs is not
    that commit. Pre-release cancellation closes recipient escrow and
    resumes the source; no shell/input recreation.
-3. The source's irreversible transition must prevent every old input,
+3. Reuse the local source primitive to prevent every old input,
    resize, protocol reply, termination and RAII reader-resume path. Join
    the paused reader and relinquish all source master/writer duplicates
    before publishing release authority. A timeout cannot revive it.
-4. Disarm the original guard's **termination** responsibility only through
-   that transition, preserving a non-signaling original-parent waiter
+4. Use that primitive to disarm original **termination** responsibility
+   only through that transition, preserving a non-signaling parent waiter
    while the Workspace lives. Avoid blocking the UI on shell exit or
    leaking an unreaped child if the broker outlives its source.
 5. The recipient activates once against the exact committed epoch. It
@@ -56,9 +86,11 @@ or PTY-reader permission. Unsupported wait APIs fail closed.
    UNKNOWN until the authoritative transition is inspected. Broker loss
    must not cause automatic shell/input replay or source reactivation.
 
-Release-record ownership, publication ordering, retained source waiter,
-wrong-pidfd admission, stop escalation and crash recovery still need their
-own implementation and real process tests. No public promotion command.
+Authenticated release-record ownership/publication, recipient identity and
+wrong-pidfd admission, adopted live driver, stop escalation and crash
+recovery still need implementation and real process tests. Source-side
+passive waiting alone does not make the broker the shell's parent. No
+public promotion command.
 
 ## Tests and verification
 
@@ -73,6 +105,18 @@ own implementation and real process tests. No public promotion command.
   not exercise production `ChildGuard` disarm or broker activation.
 - Strict platform all-targets Clippy passed. Broader candidate gate results
   are recorded in the [canonical TODO](TODO.md).
+- `cargo test --locked -p aw-terminal --all-targets`: 20 unit, 17 PTY,
+  5 replay/staging and 7 source-release tests passed; strict terminal
+  all-targets Clippy passed in the pinned shell.
+- Local source tests cover unsent/failed escrow refusal, pre-release Stop,
+  passive parent reaping, lost ACK/guard-drop fencing, observer panic and
+  no injected newline/EOF. Restoring the old portable writer reproduces a
+  failing live-shell survival test; the plain FD writer passes it.
+- An independent source using the real `Terminal`/`ChildGuard` exits after
+  release; receiver retains the identical Bash PID, replayed alternate
+  screen/Unicode/bracketed-paste modes and new explicit input/output. This
+  is a synthetic native-owner test, **not** production Workspace/broker
+  integration or complete crash/UNKNOWN acceptance.
 
 References: Linux [waitid](https://man7.org/linux/man-pages/man2/waitid.2.html)
 and [pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
