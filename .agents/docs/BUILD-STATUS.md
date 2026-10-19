@@ -23,6 +23,7 @@ The only shared gate is the product build and test:
 ```sh
 bash scripts/bootstrap.sh
 cargo fmt --all -- --check
+python3 tests/release_output.test.py
 cargo test --workspace --locked
 node --test tests/web_model.test.mjs tests/web_workspace.test.mjs \
   tests/web_context_flow.test.mjs tests/web_multiplayer.test.mjs \

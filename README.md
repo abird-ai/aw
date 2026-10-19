@@ -141,6 +141,9 @@ The previous output is replaced atomically only after the new artifacts are
 staged. Build failures preserve it; directories containing unrelated files are
 refused. Cross-builds do not establish native Windows/macOS/ARM runtime
 qualification or authorize publication.
+The helper requires Linux atomic directory exchange (`renameat2`); unsupported
+filesystems fail before replacing output. Existing nonempty output must contain
+the complete flat release-file set, with no symlinks or unrelated entries.
 
 ## Implementation status and roadmap
 

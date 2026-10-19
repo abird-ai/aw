@@ -42,6 +42,7 @@ jobs:
           nix develop --no-write-lock-file --command bash -c '
             set -euo pipefail
             cargo fmt --all -- --check
+            python3 tests/release_output.test.py
             cargo test --workspace --locked
             npm ci --prefix web --ignore-scripts --no-audit --no-fund
             node --test tests/web_model.test.mjs tests/web_workspace.test.mjs \

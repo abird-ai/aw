@@ -76,6 +76,7 @@ let
     root = sourceRoot;
     fileset = lib.fileset.union webFiles (selectedFiles [
       (sourceRoot + "/scripts/build-release-artifacts.sh")
+      (sourceRoot + "/scripts/release-output.py")
       (sourceRoot + "/scripts/bootstrap.sh")
       (sourceRoot + "/tests")
       (sourceRoot + "/crates/aw-store/migrations")
