@@ -3,7 +3,7 @@ Owner: @pvl
 
 # Adopted PTY child lifecycle
 
-Status: **Linux production custody integrated and native-tested; actual cross-UID runtime gate pending**.
+Status: **Linux production custody integrated and native-tested, including different-UID FD admission refusal**.
 Continuation of [live migration](LIVE-PTY-MIGRATION.md).
 
 ## Kernel contract
@@ -107,10 +107,12 @@ reader join stays fenced/UNKNOWN with the armed guard's failure cleanup.
 
 The [native custody protocol](NATIVE-PTY-CUSTODY.md) now integrates signed
 original-worker publication, exact recipient admission and crash inspection.
-Real Workspace exit/SIGKILL and synthetic boundary failures pass; actual
-different-UID runtime rejection still needs a privileged runner. Source-side
-passive waiting alone does not make the broker the shell's parent. No
-public promotion command.
+Real Workspace exit/SIGKILL, synthetic boundary failures and actual
+different-UID FD admission refusal pass. The latter uses isolated mapped
+UIDs without host privilege changes; see the exact namespace command in the
+[native custody verification](NATIVE-PTY-CUSTODY.md#different-uid-runtime-gate).
+Source-side passive waiting alone does not make the broker the shell's parent.
+Linux `terminal-promote` is available after the real Workspace acceptance.
 
 ## Tests and verification
 

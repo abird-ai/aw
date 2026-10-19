@@ -106,11 +106,30 @@ Current continuation of [migration prerequisites](LIVE-PTY-MIGRATION.md) and
   web-only Rust **139**; platform/terminal/CLI strict all-target Clippy,
   formatting, minimal/Workspace checks and `aw 0.15.0` build passed.
   Workspace retains two existing feature-only dead-code warnings.
-- [ ] Actual different-UID runtime rejection — privileged runner unavailable;
-  `sudo -n -u nobody` requires a password. Same-UID and bad-proof/identity
-  paths are executed; the actual SO_PEERCRED UID check remains in source.
+- [x] Actual different-UID runtime FD admission rejection — `65f04ca`:
+  mapped UIDs 0/1 in an isolated user namespace, both transfer directions,
+  peer lookup plus single/pair send/receive. Protocol bytes remain untouched
+  and original PTY/pidfd handles remain usable. No host privilege changes.
 - [ ] macOS/Windows, remote/distinct-Actor custody, broker crash/reboot recovery
   and arbitrary terminal-application compatibility — separate unimplemented
   acceptance, not inferred from Linux fixture success.
+
+## Different-UID runtime gate
+
+Requires Linux user namespaces, `unshare`, subordinate UID/GID mappings and
+`newuidmap`/`newgidmap`. The test refuses initial-namespace root. Only its
+isolated child changes UID; no persistent account or host configuration changes.
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' develop --no-update-lock-file -c \
+  unshare --user --map-auto --map-root-user -- \
+  cargo test --locked -p aw-platform-unix --test cross_uid_fd_handoff -- \
+  --ignored --exact different_uid_is_rejected_before_descriptor_io --nocapture
+```
+
+This explicit host gate passed. Ordinary `cargo test` intentionally leaves it
+ignored on runners lacking mappings; that skip does not certify the UID gate.
+It tests the exact product FD admission helpers, not cross-user custody or an
+Actor delegation grant.
 
 AW 0.15.0; SQLite v33; JSONL v1; native layout v4 unchanged.

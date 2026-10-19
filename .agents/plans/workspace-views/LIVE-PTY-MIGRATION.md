@@ -11,8 +11,9 @@
   signs release only after reader join, descriptor closure and ChildGuard
   disarm. Missing proof stays UNKNOWN; no input/shell replay or source resume.
 - Real native parser/`vim`/`less`/source-crash flows and 26 adversarial process
-  cases pass. Actual different-UID rejection remains **unexecuted**: the host
-  requires a sudo password. Remote/distinct-Actor and non-Linux acceptance,
+  cases pass. Real different-UID FD admission rejection also passes in both
+  directions in an isolated user namespace (`65f04ca`), without sudo or host
+  privilege changes. Remote/distinct-Actor and non-Linux acceptance,
   broker-SIGKILL/reboot execution survival remain separate.
 - Current protocol, limits and recovery: [Linux custody](NATIVE-PTY-CUSTODY.md).
   The prerequisite record below describes its named historical revisions;

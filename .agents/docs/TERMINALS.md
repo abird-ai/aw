@@ -20,9 +20,10 @@ SIGKILL, real `vim`/`less`, Unicode/attributes/partial CSI, one new DSR response
 exclusive input, Ctrl+C, F12/termios restoration, explicit stop, 3,000-line
 stream cutover and 26 admission/crash cases. SIGKILL cannot restore the killed
 source terminal; the attached recipient still restores its own terminal.
-Actual different-UID rejection remains unexecuted because the host requires
-privileged credentials. Linux trusted-local scope only; no broker crash/reboot
-restoration or remote/distinct-Actor grant is claimed.
+Real different-UID FD admission rejection also passes in both directions
+using an isolated user namespace (`65f04ca`); host privileges are unchanged.
+Linux trusted-local scope only; no broker crash/reboot restoration or
+remote/distinct-Actor grant is claimed.
 
 See [custody protocol](../plans/workspace-views/NATIVE-PTY-CUSTODY.md) and
 [canonical verification](../plans/workspace-views/TODO.md). The older

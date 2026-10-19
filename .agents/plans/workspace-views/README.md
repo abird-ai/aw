@@ -7,7 +7,7 @@ independent resources inside one Workspace without changing the current Agent.
 The native slices preserve independent view state, exact authority and one
 execution owner. Browser read-only Agent tabs use the same strict reader; scoped
 browser Files/Git containers use exact launch-root and verified-worktree
-capabilities. Browser File/Review and native Unix docking are implemented; a dedicated broker now also keeps *newly launched* PTYs alive after a Workspace frontend exits. Migration of older Workspace PTYs and distinct-Actor delegation remain planned.
+capabilities. Browser File/Review and native Unix docking are implemented. A dedicated broker keeps newly launched PTYs alive after frontend exit; Linux `terminal-promote` also migrates an existing Workspace shell with its exact PID and parser state. Distinct-Actor delegation remains planned.
 
 ## Design
 
@@ -808,9 +808,10 @@ Read-only custody inspection and exact-pidfd stop reuse the existing native
 broker/Pool/Control architecture. No Agent, Store, ToolPolicy or active root is
 retargeted. The earlier `bd87e5d` limitation above is historical for Linux.
 
-Actual different-UID rejection remains unexecuted on this host; remote or
-separate-Actor authority, macOS/Windows and broker crash/reboot restoration
-remain separate. Current source commits and pinned gates are in [TODO](TODO.md).
+Actual different-UID FD admission rejection passes in an isolated user
+namespace without host privilege changes (`65f04ca`). Remote or separate-Actor
+authority, macOS/Windows and broker crash/reboot restoration remain separate.
+Current source commits and pinned gates are in [TODO](TODO.md).
 
 A second browser/native window has a **different presentation lifetime**;
 a string ID, URL, browser message or persisted layout may only request a view,

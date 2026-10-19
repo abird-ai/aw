@@ -259,7 +259,13 @@ Design and binding decisions: [README.md](README.md).
 - [x] Fence the original Control registry during migration; definite source rejection alone restores local control. Pending/Released cannot resume on timeout, old handles, Stop, lost/duplicate ACK or source death. Preserve authoritative diagnosis on later failures.
 - [x] Share the existing persistent Pool/Control/attach loop. Actual Workspace-launched shell survives original Workspace exit/SIGKILL with its exact PID/parser and exclusive input/output; enable deliberately invoked Linux `terminal-promote` only after that real acceptance.
 - [x] Read-only `workspace persistent inspect`; observed-exit stop receipt, quoted invitation commands, source projection forgetting, and passive reaping without retaining forgotten parser/history. No new Agent, Store, ToolPolicy, provider call, saved-layout authority or schema/version change.
-- [x] Real parser/`vim`/`less`/source-crash frontend flows, 26 adversarial admission/process-loss cases, five existing broker regressions and complete scoped pinned gates below pass. Different-UID runtime acceptance remains blocked, not certified.
+- [x] Real parser/`vim`/`less`/source-crash frontend flows, 26 adversarial admission/process-loss cases, five existing broker regressions and complete scoped pinned gates below pass. Different-UID runtime admission is verified separately in `65f04ca` below.
+
+### `65f04caa5305e37671b818e3e9995089b7acc1d6` — real different-UID admission refusal
+
+- [x] Isolated mapped Linux UIDs 0/1 exercise actual SO_PEERCRED rejection in both directions for peer lookup, single-FD and master/pidfd sends and receives. Rejected admission neither emits nor consumes protocol bytes; original PTY/pidfd handles remain usable. No host credential/configuration change or production fault switch.
+- [x] Pinned platform gate: 10 unit + 4 existing process tests passed; the new namespace-only test passed through explicit `--ignored` execution. Ordinary Cargo runs deliberately skip this host-dependent gate; do not count that skip as execution. Strict all-target platform Clippy and formatting passed. Exact command: [Linux custody verification](NATIVE-PTY-CUSTODY.md#different-uid-runtime-gate).
+- [x] Same-UID Linux live-migration acceptance is complete within its documented limits. Remote/distinct-Actor, macOS/Windows and broker crash/reboot restoration remain separate scope.
 
 Historical pending scope before this transaction, retained verbatim and
 superseded for Linux by the checked implementation above:
@@ -269,7 +275,7 @@ superseded for Linux by the checked implementation above:
 ## Uncommitted
 
 - [~] **Distinct user/Actor** delegation, individually narrowed/revocable browser grants and remote-device trust remain unimplemented. Browser post-ACK crashes/partitions are inspect-only; recent ACK never proves perpetual process liveness.
-- [ ] Actual different-UID native migration rejection requires a privileged runner; no host privilege change was made. Remote/distinct-Actor, macOS/Windows custody and broker-SIGKILL/reboot execution restoration remain separate unimplemented acceptance.
+- [ ] Remote/distinct-Actor, macOS/Windows custody and broker-SIGKILL/reboot execution restoration remain separate unimplemented acceptance; same-UID Linux migration is complete within the documented limits.
 
 
 ## Tests and verification
@@ -280,7 +286,7 @@ superseded for Linux by the checked implementation above:
 - [x] `tests/native_migration_protocol.py`: **26 passed**, including wrong binding/proof/kernel identity, absent/forged/stale release, bounded/incomplete frames, lost/duplicate ACK, receiver crashes and original source death at intent/escrow/prepared/released boundaries. Death alone never activates escrow.
 - [x] `tests/native_persistent_pty.py` reconnect/competition/workspace-exit/shell-exit/broker-loss: **5 passed**, private TMPDIR paths with spaces/quotes, same PID over three frontends, token/control fencing, explicit stop, termios and fixture/endpoint cleanup.
 - [x] Final terminal target: **55 passed** (20 unit, 17 PTY, 5 replay/staging, 7 source-release, 6 adoption). Forgotten source parser/history is freed while the same shell stays alive and its passive parent waiter still reaps it.
-- [ ] Actual different-UID process rejection — blocked: `sudo -n -u nobody` requires a password. Existing kernel SO_PEERCRED UID enforcement is retained; executed same-UID and bad-proof/peer tests are not a privileged cross-UID runtime result.
+- [x] Actual different-UID FD admission rejection — `65f04ca`: explicit isolated-user-namespace gate passed in both directions using mapped UIDs 0/1. No sudo, host privilege change or production behavior change. Pinned platform 14 ordinary tests, strict all-target Clippy and formatting passed; this does not imply remote/distinct-Actor admission.
 
 
 - [x] Product source `7ced795`, pinned Nix: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` — **1,365 passed, 4 ignored**, 104 targets; Store library — **201 passed**; five explicit Store integrations `composite_design`, `context_flow`, `custody_inventory`, `resources`, `store` — **7+29+9+23+88 = 156 passed**. Zero failures; split-package execution. Final non-Store run includes source parent-wait error reporting.
