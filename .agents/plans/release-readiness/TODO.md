@@ -47,6 +47,14 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 - [x] Check the Workspace-only feature boundary and Windows platform-test/Git-library target compilation; native Windows execution remains open.
 - [x] Exercise two existing private worktrees in actual terminal sessions, including exact selected-index staging, stale refusal, restart/reconnect, unchanged Agent/Files/draft and zero model/tool effect rows.
 
+### `e2281d642fcdc380b0a8b328c2d71d6daa132ea0` — safe release output and native package custody
+
+- [x] Reproduce release-helper data loss in private filesystem fixtures: unrelated files and linked output were replaced; incomplete artifacts were published. Refuse unrelated/incomplete/linked destinations before building and before publication; publish a complete flat file set by Linux atomic directory exchange, preserving prior output on build/staging failure. Cleanup never recursively deletes a caller-selected directory.
+- [x] Eight focused filesystem regressions pass in the pinned Nix shell, including concurrent output changes, continuous readers, quoted paths and output preservation. Add this real filesystem gate to CI; hosted execution remains unclaimed. Validate Bash syntax, pinned Nix formatting and exact helper-source inclusion.
+- [x] Evaluate all 18 native/release package derivations, including five cross-target definitions, on this source. Evaluation is not compilation or target-host execution.
+- [x] Build the native Linux Nix package from a scoped immutable export of this signed commit; no reserved subtree or concurrent documentation patch enters the export. `bin/aw --version` reports `aw 0.15.0`. Product Rust/Cargo/web inputs are unchanged by the release-helper fix.
+- [x] Execute that exact optimized Nix binary in all 35 native scenarios: original-Workspace migration `parser`, `vim`, `less`, `source-crash` (4); adversarial migration protocol/process-loss cases (26); existing dedicated broker `reconnect`, `competition`, `workspace-exit`, `shell-exit`, `broker-loss` (5). These are local Linux synthetic fixtures, not portable musl release-asset or other-host qualification, provider/billing execution, identity signing or publication.
+
 ## Uncommitted
 
 - [ ] Complete release-asset execution on remaining target hosts, locally or with hosted jobs when available; Linux emulation cannot certify missing macOS/Windows/ARM hosts.
@@ -56,6 +64,9 @@ permission. Source 0.15.0, SQLite v33 and JSONL v1 remain unchanged.
 - [ ] Obtain an independent security review; product tests do not supply independent certification.
 
 ## Tests and verification
+
+- [x] `e2281d6`: pinned `python3 tests/release_output.test.py` — 8 passed; `bash -n scripts/build-release-artifacts.sh`, pinned `nixfmt --check nix/source.nix`, and exact Nix helper-source inclusion passed. Pre-fix fixture control: 3 failures in the original six-case suite; post-fix eight-case suite passes.
+- [x] `e2281d6`: `nix eval path:/tmp/aw-native-package-uzwr5iux/final-source#packages.x86_64-linux --apply 'p: builtins.mapAttrs (_: value: value.drvPath) p' --json --no-update-lock-file` — all 18 package derivations evaluated. `nix build path:/tmp/aw-native-package-uzwr5iux/final-source#aw --no-link --print-out-paths --no-update-lock-file` — native package built; version and the 35 actual optimized-binary native scenarios above passed with `AW_TEST_BINARY=/nix/store/yc6f12xrm9g432kzqkn87rv0jyhnkyd3-aw-0.15.0/bin/aw` in the pinned Nix shell. Scoped source export contains the signed tracked compile/build inputs, excluding `.agents` and all concurrent work. No full Rust/Node suite rerun is inferred from this focused script/package validation.
 
 - [x] `bash scripts/bootstrap.sh` — pinned Nix shell on `b33a418`, passed.
 - [x] `cargo fmt --all -- --check` — pinned Nix shell on `b33a418`, passed.
