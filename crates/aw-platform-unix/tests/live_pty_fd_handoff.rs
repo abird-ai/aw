@@ -211,6 +211,20 @@ fn probe_handoff(approve: bool, with_pidfd: bool) {
         (receive_one(&socket, &PROOF).unwrap(), None)
     };
     let pre = wait_for_file(&root.join("before.pid"), Duration::from_secs(3));
+    if let Some(identity) = &stable_process {
+        // Receipt of the pidfd does not make this receiver the parent.
+        // ECHILD must not be interpreted as shell exit or successful reap.
+        assert_eq!(
+            pid_identity::inspect_exit(identity.as_fd()).unwrap(),
+            pid_identity::ExitObservation::Running
+        );
+        assert_eq!(
+            pid_identity::reap_child(identity.as_fd())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
     socket.write_all(if approve { b"A" } else { b"N" }).unwrap();
     let exit = owner.0.wait().unwrap();
     assert!(exit.success(), "original owner failed to settle its PTY");
@@ -221,6 +235,16 @@ fn probe_handoff(approve: bool, with_pidfd: bool) {
             assert!(
                 !pid_identity::exited(identity.as_fd()).unwrap(),
                 "original shell must still be alive after the source exits"
+            );
+            assert_eq!(
+                pid_identity::inspect_exit(identity.as_fd()).unwrap(),
+                pid_identity::ExitObservation::Running
+            );
+            assert_eq!(
+                pid_identity::reap_child(identity.as_fd())
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ECHILD)
             );
         }
         let mut master = File::from(owned_master);
@@ -241,6 +265,17 @@ fn probe_handoff(approve: bool, with_pidfd: bool) {
                 );
                 thread::sleep(Duration::from_millis(20));
             }
+            // Exit is observable, but its status belongs to the actual reaper.
+            assert_eq!(
+                pid_identity::inspect_exit(identity.as_fd()).unwrap(),
+                pid_identity::ExitObservation::Exited { status: None }
+            );
+            assert_eq!(
+                pid_identity::reap_child(identity.as_fd())
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ECHILD)
+            );
         }
     } else {
         // Denied admission: receiver closes the FD and the old controller

@@ -1,5 +1,5 @@
 //! Stable Linux process identity for future PTY ownership transfer.
-//! No implicit signal, child adoption, wait/reap, or execution authority.
+//! No implicit signal, child adoption, or execution authority.
 use std::{
     io,
     os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
@@ -91,10 +91,196 @@ pub fn signal(pidfd: BorrowedFd<'_>, signal: ProcessSignal) -> io::Result<()> {
     }
 }
 
+/// Factual wait status, available only to the kernel-designated parent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildExit {
+    Code(u8),
+    Signal { number: i32, core_dumped: bool },
+}
+
+/// A nonchild's readable pidfd proves exit, never its exit code or reaping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitObservation {
+    Running,
+    Exited { status: Option<ChildExit> },
+}
+
+/// Nonblocking observation without consuming the original parent's wait
+/// status. SCM_RIGHTS does not change parentage. ECHILD alone is not exit.
+/// No procfs/PID lookup, subreaper installation, or signal is performed.
+pub fn inspect_exit(pidfd: BorrowedFd<'_>) -> io::Result<ExitObservation> {
+    match wait_child(pidfd, libc::WNOWAIT) {
+        Ok(Some(status)) => Ok(ExitObservation::Exited {
+            status: Some(status),
+        }),
+        Ok(None) => Ok(ExitObservation::Running),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+            if exited(pidfd)? {
+                Ok(ExitObservation::Exited { status: None })
+            } else {
+                Ok(ExitObservation::Running)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Explicit nonblocking reap of this exact pidfd *only if* it is our child.
+/// Caller must exclusively own wait responsibility; do not race ChildGuard
+/// or another waiter. Nonchildren and previously reaped children return
+/// ECHILD, never a synthetic success/status. No fallback to waitpid by PID.
+pub fn reap_child(pidfd: BorrowedFd<'_>) -> io::Result<Option<ChildExit>> {
+    wait_child(pidfd, 0)
+}
+
+fn wait_child(pidfd: BorrowedFd<'_>, flags: i32) -> io::Result<Option<ChildExit>> {
+    loop {
+        // SAFETY: all-zero siginfo_t is valid storage; waitid initializes it.
+        // Zero si_pid distinguishes WNOHANG with no waitable child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: valid writable siginfo_t, borrowed FD, no PID resolution.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | flags,
+            )
+        };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: waitid wrote the SIGCHLD union fields (or left zero si_pid).
+        let (pid, status) = unsafe { (info.si_pid(), info.si_status()) };
+        if pid == 0 {
+            return Ok(None);
+        }
+        if info.si_signo != libc::SIGCHLD {
+            return Err(rejected());
+        }
+        return match info.si_code {
+            libc::CLD_EXITED => u8::try_from(status)
+                .map(ChildExit::Code)
+                .map(Some)
+                .map_err(|_| rejected()),
+            libc::CLD_KILLED | libc::CLD_DUMPED if status > 0 => Ok(Some(ChildExit::Signal {
+                number: status,
+                core_dumped: info.si_code == libc::CLD_DUMPED,
+            })),
+            _ => Err(rejected()),
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::fd::AsFd, process::Command, thread, time::Duration};
+    use std::{
+        io::Write,
+        os::fd::AsFd,
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    struct PrivateChild(Child);
+    impl Drop for PrivateChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    fn waiting_child() -> PrivateChild {
+        PrivateChild(
+            Command::new("/bin/sh")
+                .args(["-c", "read ignored; exit 37"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    }
+    fn await_exit(identity: BorrowedFd<'_>) -> ExitObservation {
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed = inspect_exit(identity).unwrap();
+            if observed != ExitObservation::Running {
+                return observed;
+            }
+            assert!(Instant::now() < until, "private child did not exit");
+            thread::sleep(Duration::from_millis(3));
+        }
+    }
+
+    #[test]
+    fn inspection_preserves_parent_wait_status_and_reap_is_exact_and_once() {
+        let mut target = waiting_child();
+        let sentinel = waiting_child();
+        let identity = open(target.0.id()).unwrap();
+        let sentinel_identity = open(sentinel.0.id()).unwrap();
+        assert_eq!(
+            inspect_exit(identity.as_fd()).unwrap(),
+            ExitObservation::Running
+        );
+        assert_eq!(reap_child(identity.as_fd()).unwrap(), None);
+        target.0.stdin.take().unwrap().write_all(b"done\n").unwrap();
+        let expected = ExitObservation::Exited {
+            status: Some(ChildExit::Code(37)),
+        };
+        assert_eq!(await_exit(identity.as_fd()), expected);
+        assert_eq!(inspect_exit(identity.as_fd()).unwrap(), expected);
+        assert_eq!(
+            reap_child(identity.as_fd()).unwrap(),
+            Some(ChildExit::Code(37))
+        );
+        assert_eq!(
+            reap_child(identity.as_fd()).unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_eq!(
+            inspect_exit(identity.as_fd()).unwrap(),
+            ExitObservation::Exited { status: None }
+        );
+        assert_eq!(
+            inspect_exit(sentinel_identity.as_fd()).unwrap(),
+            ExitObservation::Running
+        );
+    }
+
+    #[test]
+    fn signalled_child_keeps_factual_signal_and_inspection_does_not_reap() {
+        let mut target = waiting_child();
+        let identity = open(target.0.id()).unwrap();
+        signal(identity.as_fd(), ProcessSignal::Terminate).unwrap();
+        assert_eq!(
+            await_exit(identity.as_fd()),
+            ExitObservation::Exited {
+                status: Some(ChildExit::Signal {
+                    number: libc::SIGTERM,
+                    core_dumped: false
+                }),
+            }
+        );
+        // The ordinary original parent still receives its own wait receipt.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(target.0.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert_eq!(
+            inspect_exit(identity.as_fd()).unwrap(),
+            ExitObservation::Exited { status: None }
+        );
+    }
+
+    #[test]
+    fn ordinary_file_cannot_be_used_as_a_process_lifecycle_identity() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(inspect_exit(file.as_fd()).is_err());
+        assert!(reap_child(file.as_fd()).is_err());
+    }
 
     #[test]
     fn pidfd_signals_only_the_exact_private_child_and_never_resolves_a_reused_pid() {
