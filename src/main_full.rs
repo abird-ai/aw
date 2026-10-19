@@ -1545,6 +1545,10 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             Some(resources_cli::WorkspaceCommand::Persistent { command }) => {
                 use resources_cli::PersistentTerminalCommand as Persistent;
                 match command {
+                    #[cfg(target_os = "linux")]
+                    Persistent::Adopt { directory } => workspace::native_dock::serve_adoption(&directory),
+                    #[cfg(target_os = "linux")]
+                    Persistent::Inspect { directory } => workspace::native_dock::inspect_migration(&directory),
                     Persistent::Start { root, shell } =>
                         workspace::native_dock::start_persistent(&root, &shell),
                     Persistent::Stop { invite } =>
@@ -6149,7 +6153,7 @@ fn r14_full_cli_parses_and_exports_from_small_outer_stack() {
             if cfg!(feature = "full") {
                 if cfg!(target_os = "linux") {
                     assert_eq!(schema.counts.flags,1719);
-                    assert_eq!(schema.counts.command_paths,244 + 5 * usize::from(cfg!(all(feature = "workspace", unix))));
+                    assert_eq!(schema.counts.command_paths,244 + 7 * usize::from(cfg!(all(feature = "workspace", unix))));
                 } else {
                     assert_eq!(schema.counts.flags,1670);
                     assert_eq!(schema.counts.command_paths,235 + 5 * usize::from(cfg!(all(feature = "workspace", unix))));

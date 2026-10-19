@@ -287,11 +287,16 @@ pub(crate) fn run(backend: Backend, rx: mpsc::Receiver<Message>, shared: Arc<Sha
                     }));
                     // Reuse this existing worker as the original parent's
                     // non-signaling reaper. Source exit lets Linux reparent.
+                    let projection = Arc::downgrade(&shared);
+                    drop(shared); // a passive waiter need not retain parser/history
                     if waiter.wait().is_err() {
-                        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                        state.notice =
-                            "PTY source released; parent wait failed, inspect child custody".into();
-                        state.version = state.version.wrapping_add(1);
+                        if let Some(shared) = projection.upgrade() {
+                            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                            state.notice =
+                                "PTY source released; parent wait failed, inspect child custody"
+                                    .into();
+                            state.version = state.version.wrapping_add(1);
+                        }
                     }
                     return;
                 }

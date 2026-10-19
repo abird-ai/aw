@@ -1,5 +1,5 @@
-//! Dedicated PTY owner, opt-in at launch. Existing Workspace PTYs cannot be
-//! moved here: the master fd/parser already belong to their original process.
+//! Dedicated PTY owner. Explicit new-shell launch and Linux original-PTY
+//! adoption share the retained Pool/attach loop; only start launches a shell.
 use super::*;
 use std::process::{Command, Stdio};
 
@@ -18,7 +18,7 @@ fn validate_shell(root: &Path, shell: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((root, shell))
 }
 
-fn write_invitation(path: &Path, invitation: &Invite) -> Result<()> {
+pub(super) fn write_invitation(path: &Path, invitation: &Invite) -> Result<()> {
     let next = path.with_file_name("invite-next");
     let data = serde_json::to_vec(invitation)
         .map_err(|error| fail(error.to_string()))?;
@@ -66,8 +66,8 @@ pub fn start_persistent(root: &Path, shell: &Path) -> Result<u8> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if invite_path.exists() && read_invite(&invite_path).is_ok() {
-            println!("aw workspace attach {}", invite_path.display());
-            println!("aw workspace persistent stop {}", invite_path.display());
+            println!("{}", attach_hint(&invite_path));
+            println!("aw workspace persistent stop {}", quoted_path(&invite_path));
             return Ok(0);
         }
         if let Some(status) = child.try_wait().map_err(Error::Io)? {
@@ -86,7 +86,7 @@ pub fn start_persistent(root: &Path, shell: &Path) -> Result<u8> {
 
 /// Never make a hidden "serve" CLI into a generic directory cleaner.
 /// Only a fresh, AW-generated private endpoint may become a broker owner.
-fn validate_new_broker_directory(directory: &Path) -> Result<()> {
+pub(super) fn validate_new_broker_directory(directory: &Path) -> Result<()> {
     let basename = directory.file_name().and_then(|name| name.to_str());
     if !directory.is_absolute() || directory.parent() != Some(std::env::temp_dir().as_path())
         || !basename.is_some_and(|name|
@@ -116,15 +116,20 @@ pub fn serve_persistent(root: &Path, shell: &Path, directory: &Path) -> Result<u
     // One retained shell per isolated broker. Its ID embeds this process
     // lifetime, not a restorable layout or a borrowed Agent identity.
     let id = pool.launch(root, shell, "trusted-local-persistent-pty".into())?;
+    serve_pool(&pool, &id, directory, listener)?;
+    Ok(0)
+}
+
+pub(super) fn serve_pool(pool: &terminals::Pool, id: &str, directory: &Path, listener: UnixListener) -> Result<()> {
     let mut idle_since = Instant::now();
     let invite_path = directory.join("invite");
     let mut current: Option<Invite> = None;
     while idle_since.elapsed() < BROKER_IDLE_TTL && !pool.is_shutting_down() {
-        let Some(terminal) = pool.get(&id) else { break };
+        let Some(terminal) = pool.get(id) else { break };
         if terminal.status() != aw_terminal::Status::Running {
             break;
         }
-        match pool.dock_mode(&id) {
+        match pool.dock_mode(id) {
             Some(super::super::terminal_control::Mode::Local)
             | Some(super::super::terminal_control::Mode::Offered) => {}
             Some(super::super::terminal_control::Mode::Settling)
@@ -132,11 +137,13 @@ pub fn serve_persistent(root: &Path, shell: &Path, directory: &Path) -> Result<u
                 std::thread::sleep(Duration::from_millis(30));
                 continue;
             }
+            #[cfg(target_os = "linux")]
+            Some(super::super::terminal_control::Mode::Migrating) => break,
             None => break,
         }
         if current.as_ref().is_none_or(|invite|
-            !pool.has_invitation(&id, &invite.ticket)) {
-            let issued = pool.prepare_dock(&id)?;
+            !pool.has_invitation(id, &invite.ticket)) {
+            let issued = pool.prepare_dock(id)?;
             let invite = Invite {
                 version: PROTOCOL,
                 socket: directory.join("socket"),
@@ -144,7 +151,7 @@ pub fn serve_persistent(root: &Path, shell: &Path, directory: &Path) -> Result<u
                 ticket: issued.ticket,
             };
             if let Err(error) = write_invitation(&invite_path, &invite) {
-                let _ = pool.cancel_dock(&id);
+                let _ = pool.cancel_dock(id);
                 return Err(error);
             }
             current = Some(invite);
@@ -155,7 +162,7 @@ pub fn serve_persistent(root: &Path, shell: &Path, directory: &Path) -> Result<u
                 // Bad credentials cannot prolong an idle shell. A completed
                 // admitted session resets its idle lifetime; active sessions
                 // are never cut off just because the broker is old.
-                if matches!(serve(connection, &pool, invite, true), Ok(true)) {
+                if matches!(serve(connection, pool, invite, true), Ok(true)) {
                     idle_since = Instant::now();
                 }
             }
@@ -165,7 +172,10 @@ pub fn serve_persistent(root: &Path, shell: &Path, directory: &Path) -> Result<u
         }
     }
     pool.shutdown();
-    Ok(0)
+    if pool.all().iter().any(|terminal| !terminal.status().exited()) {
+        return Err(Error::Denied("broker shutdown uncertain; inspect original process effects"));
+    }
+    Ok(())
 }
 
 /// Explicit PTY teardown. A stopped or missing owner is not reported as a

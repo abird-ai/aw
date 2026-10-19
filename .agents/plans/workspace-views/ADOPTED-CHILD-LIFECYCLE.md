@@ -3,7 +3,7 @@ Owner: @pvl
 
 # Adopted PTY child lifecycle
 
-Status: **local source release, passive reaping and adopted reactor tested; production custody protocol pending**.
+Status: **Linux production custody integrated and native-tested; actual cross-UID runtime gate pending**.
 Continuation of [live migration](LIVE-PTY-MIGRATION.md).
 
 ## Kernel contract
@@ -79,7 +79,7 @@ reader join stays fenced/UNKNOWN with the armed guard's failure cleanup.
   reader join, descriptor closure and guard disarm. ACK loss or publisher
   panic cannot restore custody or strand the passive parent waiter.
 
-## Required production custody transaction — pending
+## Production custody transaction — integrated on Linux
 
 1. Inert recipient validates exact source lifetime, terminal, root/site,
    Actor and epoch, pidfd identity, parser checkpoint and escrow. It may
@@ -97,16 +97,18 @@ reader join stays fenced/UNKNOWN with the armed guard's failure cleanup.
    while the Workspace lives. Avoid blocking the UI on shell exit or
    leaking an unreaped child if the broker outlives its source.
 5. The recipient activates once against the exact committed epoch. It
-   uses pidfd exit observation and exact signals; it reaps only if Linux
-   actually makes it the parent. Descendant cleanup and process-group
+   uses pidfd exit observation and exact signals; the original parent retains
+   its passive wait receipt. A sibling broker never claims parentage. Descendant cleanup and process-group
    identity need separate proof; shell exit is not whole-job termination.
 6. Source crash before release does not authorize activation. After
    release, source never resumes; missing release/activation ACK remains
    UNKNOWN until the authoritative transition is inspected. Broker loss
    must not cause automatic shell/input replay or source reactivation.
 
-Authenticated production release-record ownership/publication, recipient
-identity and crash recovery still need integration and real process tests. Source-side
+The [native custody protocol](NATIVE-PTY-CUSTODY.md) now integrates signed
+original-worker publication, exact recipient admission and crash inspection.
+Real Workspace exit/SIGKILL and synthetic boundary failures pass; actual
+different-UID runtime rejection still needs a privileged runner. Source-side
 passive waiting alone does not make the broker the shell's parent. No
 public promotion command.
 
@@ -145,7 +147,8 @@ and [pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
   resize, exact stop, lost publication ACK and publisher panic are covered.
 - Pinned platform + terminal all-target tests: **66 passed**. Both crates'
   strict all-target Clippy passed. This checkpoint does not certify the
-  production broker protocol or Workspace command.
+  production broker protocol or Workspace command at that backend checkpoint. Later integration
+  and native acceptance are recorded in the canonical TODO.
 
 - Linux teardown now retires/joins the sole reader even if a silent descendant
   retains the slave. Drop the output receiver before joining, so a full bounded
@@ -155,3 +158,8 @@ and [pidfd_open](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
   paused drains exactly once after cutover; inactive main screen and bounded
   scrollback remain available. Focused adopted-backend tests: **5 passed**;
   strict terminal all-target Clippy passed.
+
+- Released source projections follow their last view/Pool reference. Passive
+  parent waiting retains only a weak projection reference; a forgotten parser
+  and history are freed while the same shell remains alive, then the passive
+  waiter still reaps it. Transfer wire buffers are discarded before activation.

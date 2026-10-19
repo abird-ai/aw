@@ -57,7 +57,7 @@ session-interop = ["dep:aw-session-format"]
 web = ["durable", "dep:aw-client", "dep:axum", "dep:futures-util", "dep:getrandom", "dep:sha2", "dep:subtle"]
 surfaces = ["dep:aw-surfaces"]
 web-workspace = ["web", "surfaces"]
-workspace = ["durable", "dep:aw-workspace", "dep:aw-git", "dep:aw-terminal", "dep:futures-util", "dep:syntect"]
+workspace = ["durable", "dep:ed25519-dalek", "dep:aw-workspace", "dep:aw-git", "dep:aw-terminal", "dep:futures-util", "dep:syntect"]
 
 # Durable authority/coordination layers.
 coordination = ["durable"]

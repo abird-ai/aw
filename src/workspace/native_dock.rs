@@ -1,11 +1,13 @@
-//! Opt-in same-machine, same-owner second-terminal PTY presentation.
-//!
-//! A temporary private Unix socket and one-use invitation file admit a second
-//! native display to *the already running PTY*. The original Workspace
-//! process, Pool and Agent remain the sole owners. No background daemon,
-//! shell replay, saved layout token, provider access or new PTY is created.
-//! If that owner process dies the client disconnects and fails closed.
+//! Human-invited same-machine native PTY presentation and custody.
+//! Live-owner docking and persistent brokers share the existing Pool/control
+//! lease. Linux migration admits inert original-master/pidfd escrow and
+//! activates only after authenticated original-worker release. No Agent,
+//! provider, Store, shell replay or saved-layout authority is created.
 mod persistent;
+#[cfg(target_os = "linux")]
+mod migration;
+#[cfg(target_os = "linux")]
+pub use migration::{promote, serve_adoption, inspect_migration};
 pub use persistent::{serve_persistent, start_persistent, stop_persistent};
 use super::{terminal_control::INVITE_TTL, terminals};
 use aw::{Error, Result};
@@ -76,8 +78,18 @@ impl Drop for Cleanup {
         let _ = fs::remove_file(self.0.join("invite"));
         let _ = fs::remove_file(self.0.join("invite-next"));
         let _ = fs::remove_file(self.0.join("socket"));
+        // Only fixed broker transaction artifacts within this owned endpoint.
+        for name in ["control", "transaction", "prepared", "released", "released-next", "active", "failed"] {
+            let _ = fs::remove_file(self.0.join(name));
+        }
         let _ = fs::remove_dir(&self.0);
     }
+}
+pub(super) fn quoted_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+pub(super) fn attach_hint(path: &Path) -> String {
+    format!("aw workspace attach {}", quoted_path(path))
 }
 fn fail(message: impl Into<String>) -> Error {
     Error::Config(message.into())
@@ -146,7 +158,7 @@ fn serve(
         pool.cancel_dock(&invite.terminal)
             .map_err(|error| io::Error::other(error.to_string()))?;
         pool.shutdown();
-        if pool.running() {
+        if pool.all().iter().any(|terminal| !terminal.status().exited()) {
             send(&mut stream, &Reply::Error {
                 message: "PTY termination uncertain; inspect launched processes".into(),
             })?;

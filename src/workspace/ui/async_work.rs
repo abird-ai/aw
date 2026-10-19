@@ -637,6 +637,14 @@ impl Ui {
     pub(super) fn apply_background_result(&mut self, result: UiBackgroundResult) {
         match result {
             UiBackgroundResult::AgentView(reply) => self.apply_agent_view_reply(reply),
+            #[cfg(target_os = "linux")]
+            UiBackgroundResult::TerminalMigration(result) => {
+                self.terminal_pending = false;
+                self.notice = match result {
+                    Ok(invite) => format!("Original PTY now independent. Attach: {}", super::super::native_dock::attach_hint(&invite)),
+                    Err(error) => error,
+                };
+            }
             UiBackgroundResult::Terminal(result) => {
                 self.terminal_pending = false;
                 match result {

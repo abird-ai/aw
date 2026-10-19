@@ -19,6 +19,8 @@ pub enum Mode {
     Offered,
     Docked,
     Settling,
+    #[cfg(target_os = "linux")]
+    Migrating,
 }
 
 struct Offer {
@@ -30,6 +32,10 @@ enum Owner {
     Local,
     Docked(u64),
     Settling,
+    #[cfg(target_os = "linux")]
+    Migrating,
+    #[cfg(target_os = "linux")]
+    MigrationUnknown,
 }
 struct Entry {
     epoch: u64,
@@ -43,6 +49,8 @@ impl Entry {
             Owner::Local => Mode::Local,
             Owner::Docked(_) => Mode::Docked,
             Owner::Settling => Mode::Settling,
+            #[cfg(target_os = "linux")]
+            Owner::Migrating | Owner::MigrationUnknown => Mode::Migrating,
         }
     }
 }
@@ -69,6 +77,26 @@ pub struct Lease {
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+/// Fences docking/local control across the full source custody transaction.
+#[cfg(target_os = "linux")]
+pub struct Migration {
+    registry: Arc<Mutex<Registry>>,
+    terminal: Arc<Terminal>,
+}
+#[cfg(target_os = "linux")]
+impl Drop for Migration {
+    fn drop(&mut self) {
+        let mut state = lock(&self.registry);
+        if let Some(entry) = state.entries.get_mut(&self.terminal.id) {
+            if matches!(entry.owner, Owner::Migrating) {
+                entry.owner = if self.terminal.source_release() == aw_terminal::SourceRelease::Retained {
+                    Owner::Local
+                } else { Owner::MigrationUnknown };
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Control {
     registry: Arc<Mutex<Registry>>,
@@ -88,6 +116,19 @@ fn denied(message: &'static str) -> aw::Error {
 }
 
 impl Control {
+    #[cfg(target_os = "linux")]
+    pub fn begin_migration(&self, terminal: Arc<Terminal>) -> aw::Result<Migration> {
+        let mut state = lock(&self.registry);
+        if state.closed { return Err(denied("terminal pool is shutting down")); }
+        let entry = state.entries.get_mut(&terminal.id).ok_or(denied("unknown retained PTY"))?;
+        Self::settle(entry, &terminal);
+        if !matches!(entry.owner, Owner::Local) || entry.offer.is_some()
+            || terminal.status() != aw_terminal::Status::Running {
+            return Err(denied("migration requires exclusive local control and no invitation"));
+        }
+        entry.owner = Owner::Migrating;
+        Ok(Migration { registry: self.registry.clone(), terminal })
+    }
     pub fn register(&self, id: &str) -> aw::Result<()> {
         let mut state = lock(&self.registry);
         if state.closed {
@@ -113,6 +154,12 @@ impl Control {
         }
     }
     fn settle(entry: &mut Entry, terminal: &Terminal) {
+        #[cfg(target_os = "linux")]
+        if matches!(entry.owner, Owner::MigrationUnknown)
+            && terminal.source_release() == aw_terminal::SourceRelease::Retained {
+            // Only a definite source-worker rejection can restore custody.
+            entry.owner = Owner::Local;
+        }
         if matches!(entry.owner, Owner::Settling) && terminal.snapshot(0).pending_input == 0 {
             entry.owner = Owner::Local;
         }
@@ -251,6 +298,30 @@ impl Drop for Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migration_fence_excludes_every_controller_and_rolls_back_only_retained_source() {
+        let shell = std::env::var_os("AW_BASH").map(std::path::PathBuf::from).unwrap_or_else(|| "/bin/bash".into());
+        let terminal = Arc::new(Terminal::spawn(aw_terminal::Options::bash(std::env::temp_dir(), shell, "synthetic-controller"), || {}).unwrap());
+        let control = Control::default();
+        control.register(&terminal.id).unwrap();
+        let fence = control.begin_migration(terminal.clone()).unwrap();
+        assert_eq!(control.mode(&terminal.id, &terminal), Some(Mode::Migrating));
+        assert!(control.local(&terminal.id, &terminal, || terminal.input(b"forbidden".to_vec())).is_err());
+        assert!(control.invite(&terminal.id, &terminal).is_err());
+        assert!(control.begin_migration(terminal.clone()).is_err());
+        drop(fence);
+        assert_eq!(control.mode(&terminal.id, &terminal), Some(Mode::Local));
+        // A lost caller may leave a fenced registry entry. Only a factual
+        // Retained worker result, not elapsed time or source death, settles it.
+        lock(&control.registry).entries.get_mut(&terminal.id).unwrap().owner = Owner::MigrationUnknown;
+        assert_eq!(control.mode(&terminal.id, &terminal), Some(Mode::Local));
+        let invitation = control.invite(&terminal.id, &terminal).unwrap();
+        assert!(control.begin_migration(terminal.clone()).is_err());
+        control.cancel(&terminal.id).unwrap();
+        assert!(!control.has_offer(&terminal.id, &invitation.ticket));
+        terminal.terminate();
+    }
     #[test]
     fn digest_comparison_and_token_bounds() {
         let known = digest("a".repeat(64).as_str());

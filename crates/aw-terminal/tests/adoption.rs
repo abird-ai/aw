@@ -319,3 +319,50 @@ fn streaming_cutover_drains_once_and_preserves_main_and_scrollback() {
     adopted.input(b"finish\n".to_vec()).unwrap();
     until(|| adopted.status().exited());
 }
+
+#[test]
+fn passive_reaper_does_not_retain_a_forgotten_source_parser_or_history() {
+    let marker = std::sync::Arc::new(());
+    let released = std::sync::Arc::downgrade(&marker);
+    let shell: std::path::PathBuf = std::env::var_os("AW_BASH")
+        .map(Into::into)
+        .unwrap_or_else(|| "/bin/bash".into());
+    let mut options = Options::bash(std::env::temp_dir(), shell, "synthetic-source-projection");
+    options.args = vec![
+        "--noprofile".into(),
+        "--norc".into(),
+        "-c".into(),
+        "printf READY; IFS= read -r done".into(),
+    ];
+    let original = Terminal::spawn(options, move || {
+        let _ = &marker;
+    })
+    .unwrap();
+    until(|| contents(&original).contains("READY"));
+    let mut gate = original.quiesce(Duration::from_secs(2)).unwrap();
+    let mut stage = gate.stage().unwrap();
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    stage.send_once(&sender, &[41; 32]).unwrap();
+    let (master, pidfd) = aw_platform::fd_transfer::receive_pair(&receiver, &[41; 32]).unwrap();
+    stage
+        .release_source()
+        .unwrap()
+        .wait(Duration::from_secs(2))
+        .unwrap();
+    drop(gate);
+    drop(original);
+    until(|| released.upgrade().is_none());
+    assert!(!aw_platform::pid_identity::exited(pidfd.as_fd()).unwrap());
+    aw_platform::pid_identity::signal(
+        pidfd.as_fd(),
+        aw_platform::pid_identity::ProcessSignal::Kill,
+    )
+    .unwrap();
+    until(|| {
+        matches!(
+            aw_platform::pid_identity::inspect_exit(pidfd.as_fd()).unwrap(),
+            aw_platform::pid_identity::ExitObservation::Exited { status: None }
+        )
+    });
+    drop(master);
+}

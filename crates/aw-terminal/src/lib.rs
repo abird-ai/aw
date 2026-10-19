@@ -81,7 +81,7 @@ pub enum SourceRelease {
 }
 
 /// Minted only after the source reader has joined and all source PTY FDs
-/// have closed. A future authenticated owner protocol must bind this fact
+/// have closed. The authenticated native owner protocol must bind this fact
 /// to its exact recipient/transaction; this is not a wire bearer grant.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -755,7 +755,7 @@ impl Staged<'_, '_> {
 
     /// Irreversible, trusted-native source primitive. Caller must first
     /// authenticate the exact recipient's readiness and commit its owner
-    /// intent. NOT exposed by the broker/CLI; a kernel send alone is not
+    /// intent. Not a broker/CLI authorization; a kernel send alone is not
     /// recipient readiness. No destination activation is performed here.
     ///
     /// After queue admission, timeout/ACK loss is UNKNOWN: inspect

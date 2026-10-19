@@ -1052,6 +1052,13 @@ pub(crate) enum PersistentTerminalCommand {
     },
     /// Terminate the explicitly owned persistent PTY, after admission.
     Stop { invite: PathBuf },
+    /// Inspect an original-PTY migration without changing custody.
+    #[cfg(target_os = "linux")]
+    Inspect { directory: PathBuf },
+    /// Internal inert recipient; accepts no shell/executable argument.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Adopt { directory: PathBuf },
     /// Internal broker; never use this as a shell/Agent command.
     #[command(hide = true)]
     Serve {

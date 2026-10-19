@@ -622,6 +622,7 @@ impl Ui {
                         | "terminal"
                         | "terminal-open"
                         | "terminals"
+                        | "terminal-promote"
                         | "terminal-dock"
                         | "terminal-dock-cancel"
                         | "terminal-scroll"
@@ -727,8 +728,8 @@ impl Ui {
                 match (&self.terminal_pool, id) {
                     (Some(pool), Some(id)) => match super::super::native_dock::invite(pool.clone(), &id) {
                         Ok(invite) => self.notice = format!(
-                            "Dock: aw workspace attach {}",
-                            invite.display()
+                            "Dock: {}",
+                            super::super::native_dock::attach_hint(&invite)
                         ),
                         Err(error) => { self.notice = error.to_string(); accepted = false; }
                     },
@@ -744,6 +745,36 @@ impl Ui {
                         Err(error) => { self.notice = error.to_string(); accepted = false; }
                     },
                     _ => { self.notice = "Focus a terminal with a pending invitation".into(); accepted = false; }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            "terminal-promote" => {
+                if self.terminal_pending {
+                    self.notice = "Terminal operation already pending".into();
+                    return Some(false);
+                }
+                let Some(pool) = self.terminal_pool.clone() else { return Some(false) };
+                let Some(id) = self.terminal().map(|terminal| terminal.id.clone()) else {
+                    self.notice = "Focus a running locally controlled terminal".into();
+                    return Some(false);
+                };
+                self.terminal_pending = true;
+                self.notice = "Moving original PTY custody; input paused until owner outcome is known".into();
+                let out = self.background_tx.clone();
+                let panic_out = out.clone();
+                if let Err(error) = self.background.try_submit_with_panic(
+                    "terminal",
+                    move || {
+                        let result = super::super::native_dock::promote(&pool, &id).map_err(|error| error.to_string());
+                        let _ = out.blocking_send(UiBackgroundResult::TerminalMigration(result));
+                    },
+                    move || { let _ = panic_out.blocking_send(UiBackgroundResult::TerminalMigration(Err(
+                        "Migration worker failed; custody UNKNOWN. Inspect original terminal and transaction; never replay input".into(),
+                    ))); },
+                ) {
+                    self.terminal_pending = false;
+                    self.notice = error.to_string();
+                    accepted = false;
                 }
             }
             "terminal-start" => {
@@ -850,7 +881,7 @@ impl Ui {
                     match pool.forget(id) {
                         Ok(()) => {
                             self.notice =
-                                "Forgot exited resource; existing views show unavailable".into();
+                                "Forgot terminal resource; existing views show unavailable".into();
                         }
                         Err(e) => {
                             self.notice = e.to_string();

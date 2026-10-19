@@ -619,6 +619,8 @@ struct ConversationPending {
 enum UiBackgroundResult {
     AgentView(agent_views::Reply),
     Terminal(std::result::Result<String, String>),
+    #[cfg(target_os = "linux")]
+    TerminalMigration(std::result::Result<PathBuf, String>),
     InitialLayout {
         base_generation: u64,
         result: std::result::Result<Option<Workspace>, String>,

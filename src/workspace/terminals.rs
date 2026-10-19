@@ -69,6 +69,24 @@ impl Pool {
         self.tick.send_modify(|n| *n = n.wrapping_add(1));
         Ok(id)
     }
+    #[cfg(target_os = "linux")]
+    pub fn begin_migration(&self, id: &str) -> aw::Result<super::terminal_control::Migration> {
+        self.control.begin_migration(self.get(id).ok_or(aw::Error::Denied("unknown retained PTY"))?)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn adopt(&self, escrow: aw_terminal::Adoption) -> aw::Result<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if self.control.is_shutdown() || !inner.terminals.is_empty() || inner.starting != 0 {
+            return Err(aw::Error::Denied("adoption requires an empty live broker pool"));
+        }
+        let tick = self.tick.clone();
+        let terminal = escrow.activate(move || tick.send_modify(|n| *n = n.wrapping_add(1)))
+            .map_err(|error| aw::Error::Config(error.to_string()))?;
+        let id = terminal.id.clone();
+        self.control.register(&id)?;
+        inner.terminals.insert(id.clone(), Arc::new(terminal));
+        Ok(id)
+    }
     pub fn get(&self, id: &str) -> Option<Arc<Terminal>> {
         self.inner
             .lock()
@@ -160,7 +178,12 @@ impl Pool {
         if matches!(terminal.status(), Status::Running | Status::Stopping) {
             return Err(aw::Error::Denied("stop the terminal before forgetting it"));
         }
-        if !matches!(self.control.mode(id, terminal), Some(Mode::Local | Mode::Offered)) {
+        let forgettable = matches!(self.control.mode(id, terminal), Some(Mode::Local | Mode::Offered));
+        #[cfg(target_os = "linux")]
+        let forgettable = forgettable || (terminal.status() == Status::Released
+            && matches!(terminal.source_release(), aw_terminal::SourceRelease::Released(_))
+            && self.control.mode(id, terminal) == Some(Mode::Migrating));
+        if !forgettable {
             return Err(aw::Error::Denied(
                 "detach the other native terminal before forgetting this PTY",
             ));
@@ -315,6 +338,8 @@ fn render_snapshot(
             Some(Mode::Offered) => " · invite pending",
             Some(Mode::Docked) => " · docked · read only",
             Some(Mode::Settling) => " · remote input settling · read only",
+            #[cfg(target_os = "linux")]
+            Some(Mode::Migrating) => " · migration fenced",
             None => " · control unavailable",
         };
         format!(

@@ -386,7 +386,7 @@ impl WorkspaceCommand {
             | "terminal-live"
             | "terminal-scroll 20"
             | "terminal-scroll -20"
-            | "terminal-forget" | "terminal-dock" | "terminal-dock-cancel" => context.terminal_focused,
+            | "terminal-forget" | "terminal-promote" | "terminal-dock" | "terminal-dock-cancel" => context.terminal_focused,
             "stage" | "unstage" | "hunk-next" | "hunk-prev" | "reviewed" | "comment"
             | "send-review" => context.diff_focused,
             "filter" => context.navigator_focused,
@@ -522,6 +522,13 @@ pub const WORKSPACE_COMMANDS: &[WorkspaceCommand] = &[
         command: "terminals",
         label: "List Terminals",
         description: "show retained local terminal resources and status",
+        shortcut: "",
+    },
+    #[cfg(target_os = "linux")]
+    WorkspaceCommand {
+        command: "terminal-promote",
+        label: "Keep original PTY in an independent owner…",
+        description: "move this running shell to a local broker; attach from a separate terminal",
         shortcut: "",
     },
     #[cfg(unix)]

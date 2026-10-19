@@ -24,7 +24,7 @@ assert mode in ('reconnect','broker-loss','competition','shell-exit','workspace-
 assert sys.platform.startswith('linux'), 'native persistent PTY process test requires Linux /proc'
 root=pathlib.Path(tempfile.mkdtemp(prefix='aw-broker-host-fixture-'))
 work=root/'work';work.mkdir()
-socketbase=root/'tmp';socketbase.mkdir(mode=0o700)
+socketbase=root/"tmp 'q'";socketbase.mkdir(mode=0o700)
 (work/'fixture.txt').write_text('private explicit persistent shell fixture\n')
 binary=os.environ.get('AW_TEST_BINARY',str(pathlib.Path(__file__).resolve().parents[1]/'target/debug/aw'))
 bash=subprocess.run(['which','bash'],capture_output=True,text=True,check=True).stdout.strip()
@@ -45,9 +45,12 @@ except Exception:
   raise
 text=launcher.stdout
 import re
-match=re.search(r'(?m)^aw workspace attach (/[^\r\n]+/invite)$',text)
+import shlex
+match=re.search(r'(?m)^aw workspace attach (.+)$',text)
 assert match, 'missing broker invitation, got '+repr(text[:300])
-invite=pathlib.Path(match.group(1))
+words=shlex.split(match.group(1))
+assert len(words)==1
+invite=pathlib.Path(words[0])
 def read_code():
   return json.loads(invite.read_text())['ticket']
 initial_token=read_code()
