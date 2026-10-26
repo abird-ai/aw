@@ -1,77 +1,87 @@
 # Current native tool surface — dotlink-aligned (2026-10-26)
 
-This section supersedes the older R2a/Phase-3 tool descriptions **below**,
-which remain a dated record of the prior native tool surface.
+This is the current native tool contract; older R2a/Phase-3 descriptions below
+are dated history. AW retains its original Agent/TurnMachine/ToolRegistry/
+ToolPolicy, exact actor/source/site/epoch grants, durable intent-before-effect
+journal and **model-directed** parallelism. No new tool executor or implicit
+model authority was added.
 
-AW retains its original ToolRegistry, ToolPolicy, exact source/actor/site/epoch
-authorization, TurnMachine, journal-before-effect receipts and explicit
-model-directed `parallel:true` waves. File operations live in
-`crates/aw-tools/src/{search,text,edit,patch,binary}.rs` and
-`crates/aw-platform-{unix,win}/src/scoped_fs/`. No second agent executor
-or tool authority exists. External MCP and extension effects remain Unknown
-until explicitly authorized by their own source-bound grants.
-
-| `--tools-mode` | Native tools visible by default |
+| `--tools-mode` | Host-granted tools |
 | --- | --- |
-| `off` | none |
+| `off` (default) | none |
 | `read-only` | `ls`, `grep`, `read`, `bread` |
-| `workspace` | all read-only + `write`, `edit`, `patch`, `bwrite`, `bedit` |
-| `trusted` | workspace tools + explicit unsandboxed `bash` on Unix |
+| `workspace` | read-only + `write`, `edit`, `patch`, `bwrite`, `bedit` |
+| `trusted` | workspace + unsandboxed `bash` (Unix) or `powershell` (Windows) |
 
-`--tools-allow` narrows the mode; only tools in the intersected list are
-registered and granted. Model-facing `find` is removed: recursive `ls` with
-`pattern`/`depth` covers file discovery. Existing human UI Find stays.
-Child agent selections remain exactly the established `read` or
-`read,write,edit` subset; this port does not widen them.
+`--tools-allow` only narrows that set. Native subagents keep the preexisting
+`read` or `read,write,edit` subset. `find` is retired as a model tool
+(recursive `ls` replaces it); human Workspace Find remains unchanged.
 
-Native tool contracts:
+| Tool | Argument contract |
+| --- | --- |
+| `ls` | `path?, pattern?, depth?, kind?, sort?, limit?, gitignore?, skip_hidden?, parallel?` |
+| `grep` | `pattern, path?, glob?, literal?, ignore_case?, output_mode?, before?, after?, numbered?, offset?, limit?, gitignore?, skip_hidden?, parallel?` |
+| `read` | `path, offset?, limit?, numbered?, parallel?` |
+| `write` | `path,content,create_only?,expected_sha256?` |
+| `edit` | `path?,edits:[{path?,old_text,new_text,replace_all?}]` |
+| `patch` | `dir?,patch,best_effort?` |
+| `bread` | `path,format=mcp|base64|hex?,offset?,limit?,parallel?` |
+| `bwrite` | `path,data,encoding=base64|hex?,create_only?,expected_sha256?` |
+| `bedit` | `path,edits:[{offset,length?,data?,encoding?}],sha256?` |
+| `bash` / `powershell` | `command,dir?,stdin?,timeout_secs?,max_output_bytes?,parallel?` |
 
-- `ls`: directory `path` (default `.`), glob `pattern` relative to that
-  directory, `depth`, `kind` (`file|dir|any`), `sort` (`path|mtime`) and
-  `limit`; bounded JSON output.
-- `grep`: required regex/literal `pattern`, optional directory/single-file
-  `path`, `glob`, `before`/`after`, `numbered`, `ignore_case`,
-  `output_mode=content|files|count`, `offset`/`limit`,
-  `gitignore` and `skip_hidden` (both opt-in). Result-byte and scan bounds
-  are explicit; large/non-UTF8 files are skipped.
-- `read`: `path`, 1-based `offset` (default 1), `limit` (lines, default
-  4096), `numbered` (default true, `N\t` prefix). `numbered=false`
-  returns the selected bytes unmodified, including CRLF and terminal newline.
-  The tool streams the window instead of preloading a whole source file.
-- `write`: `path, content`, create or atomically replace, create missing
-  parent directories. Unlike the historical create-only AW write, replacement
-  is intentional and explicit through the granted write tool.
-- `edit`: ordered `edits:[{path?,old_text,new_text,replace_all?}]`, optional
-  inherited top-level `path`. Maximum 64 edits / 16 files. Each original
-  exact text must be unique unless `replace_all` is true.
-- `patch`: `dir`, Codex `*** Begin Patch` text, `best_effort` (default
-  false); Update/Add sections only. Ambiguous hunks, duplicates, and Delete/
-  Move fail. One-file atomic installs, *not* an all-files transaction.
-- `bread`: `path, offset, limit, format=base64|hex` for bounded byte windows.
-  `bwrite`: `path,data,encoding` as base64/hex, atomic create/replace.
-  `bedit`: `path,edits:[{offset,length?,data,encoding}]`, optional SHA-256
-  precondition. Offsets address original bytes, ranges cannot overlap.
+Tool schemas and executable validators agree, including limits/defaults.
+`parallel:true` remains only an opt-in scheduling hint on an already granted
+read or trusted Process call; all writes are barriers. Host ceilings and
+journal ordering still govern dispatch.
 
-All tools obey AW's existing model-request argument envelope. Windows/Unix
-file-scoped IO does not follow symlinks/reparse points or accept multiply linked
-regular files. File writes plan from snapshots and stage private sibling files;
-existing-file updates recheck bytes at publication. Unix writes coordinate
-across cooperating processes using advisory directory `flock` held through
-commit; roots also serialize native mutation tasks locally, *not reads*.
-Parallel reads remain model-directed (`parallel:true` on already granted
-read tools) and are no longer serialized by the per-root mutation mutex.
-Trusted `bash` remains an unsandboxed Process effect and may race any
-filesystem writer. Missing receipts and partial multi-file publication remain
-unknown effects requiring inspection; never silently replay.
+Filesystem semantics:
 
-Typed MCP image/audio/blob `bread` output is not ported because AW's current
-`ToolOutput` is text-only. Binary data is returned as bounded encoded JSON,
-without changing the core engine. Windows DACL handling uses ACL-preserving
-staging and `ReplaceFileW` recovery; native Windows compilation/runtime
-testing is still an outstanding gate.
+- Linux: no-follow, descriptor-pinned `openat2` operations with no-cross-mount;
+  Unix other than Linux: component-wise no-follow `openat`; Windows: pinned
+  directory handles/reparse refusal. Single-link regular files only.
+- `ls`: globally top-ranked path/newest entries using a bounded heap, not
+  the first items encountered. `gitignore`/`skip_hidden` are opt-in. JSON
+  carries `truncated` and `scan_incomplete` explicitly.
+- `grep`: content/files/count modes; literal/regex; bounded context/pagination,
+  regular UTF-8 text without binary control bytes. Directory discovery up to
+  100,000 entries; content scan at most 32 MiB / 4,096 candidate files;
+  1 MiB per file; bounded candidate set. Incomplete results name their
+  directory/candidate/content budget. Direct-file grep honors glob/ignore too.
+- Ignore processing: .gitignore max 64 KiB/1,024 lines per file, plus cumulative
+  4 MiB/256-file budget. Invalid/oversized ignore rules fail closed.
+- `read`: streams numbered or byte-exact CRLF UTF-8 line windows, checks
+  skipped text prefixes for binary controls, and scans at most 32 MiB to
+  reach the requested line offset. Truncation markers contain whole lines.
+- `write`/`bwrite`: create or replace; optional `create_only` and
+  `expected_sha256` preconditions. Identical bytes are no-ops with unchanged
+  inode/mtime and factual receipts. New parent directories are created as needed.
+- `edit`/`patch`/`bedit`: plan/verify/stage/commit, exact old-text matches,
+  deterministic ordered ranges/hunks, ambiguity errors. Each file replacement
+  is atomic; multi-file publication is **not** a transaction. Aborted stages
+  remove temporary files and try to remove newly created empty directories.
+- Unix writes coordinate via sorted ancestor SH/nearest-parent EX advisory
+  `flock`, matching current dotlink; Windows via matching named path mutexes.
+  Concurrent reads do not wait on writer locks. Noncooperating shell/external
+  writers can still race; no arbitrary-workspace sandbox is implied.
+- Windows trusted PowerShell Process jobs launch suspended and are assigned to
+  a private Job Object before resuming; the existing AW Process owner kills
+  the job on timeout, cancellation, interrupted output or drop. This is
+  best-effort descendant containment, **not** a filesystem/network sandbox.
+- The Agent preserves structured JSON truncation markers under small per-call
+  context budgets, rather than returning malformed partially cut JSON.
+
+**Compatibility boundary:** `bread(format=mcp)` is accepted, but native AW
+currently transports a MIME-labeled base64 JSON envelope
+(`transport:"encoded_json"`), **not** dotlink's typed MCP image/audio/blob.
+The Agent's text-only `ToolOutput` must be deliberately extended before
+claiming true typed-media parity. Trusted Bash/PowerShell is explicitly
+**unsandboxed** and remains a Process effect; dotlink's Bubblewrap isolation
+would require a separately granted execution mode. Windows/macOS native
+runtime validation remains unverified in this Linux environment.
 
 See `crates/aw-tools/README.md` and
-`.agents/plans/dotlink-tool-port/` for porting decisions and validation.
+`.agents/plans/dotlink-tool-port/` for implementation/validation.
 
 ---
 

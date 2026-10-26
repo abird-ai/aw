@@ -1,6 +1,8 @@
 //! Windows counterparts of AW's bounded file windows and staged writes.
 //! Directory handles are retained across both staging and publication.
 use super::{is_reparse, pin_directory, validate_path, wide, Parent, Result, Root, ScopedError};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -16,6 +18,7 @@ use windows_sys::Win32::{
 };
 
 const MAX_BATCH_FILE: usize = 64 * 1024 * 1024;
+const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
 static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 fn regular(file: &File) -> Result<u64> {
     let meta = file.metadata()?;
@@ -38,19 +41,39 @@ fn stream_bytes(file: File, cap: usize) -> Result<Vec<u8>> {
     }
     Ok(data)
 }
-fn skip_line(reader: &mut BufReader<File>) -> io::Result<bool> {
+/// Skipped lines must not allocate, but also cannot scan an unlimited file.
+fn skip_line(
+    reader: &mut BufReader<File>,
+    scanned: &mut usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool> {
     let mut seen = false;
     loop {
+        if cancelled() {
+            return Err(ScopedError::Cancelled);
+        }
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
             return Ok(seen);
         }
-        if let Some(at) = buf.iter().position(|&byte| byte == b'\n') {
-            reader.consume(at + 1);
+        let end = buf.iter().position(|&byte| byte == b'\n');
+        let take = end.map_or(buf.len(), |at| at + 1);
+        if buf[..take]
+            .iter()
+            .any(|byte| matches!(byte,0..=8 | 11..=12 | 14..=31 | 127))
+        {
+            return Err(ScopedError::Denied("binary file; use bread"));
+        }
+        *scanned = scanned.saturating_add(take);
+        if *scanned > MAX_READ_SCAN_BYTES {
+            return Err(ScopedError::Limit(
+                "read offset requires scanning more than 32 MiB",
+            ));
+        }
+        reader.consume(take);
+        if end.is_some() {
             return Ok(true);
         }
-        let n = buf.len();
-        reader.consume(n);
         seen = true;
     }
 }
@@ -73,16 +96,129 @@ fn next_line(reader: &mut BufReader<File>, cap: usize) -> Result<Option<Vec<u8>>
         }
     }
 }
+/// Cross-process, thread-affine Windows named mutex. Same canonical path
+/// hashing and kernel namespace as dotlink, so the tools coordinate.
+struct NamedMutationLock(windows_sys::Win32::Foundation::HANDLE);
+impl Drop for NamedMutationLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+        // SAFETY: Drop runs on the blocking worker that acquired the mutex.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
 pub struct MutationGuard<'a> {
     _local: MutexGuard<'a, ()>,
+    _names: Vec<NamedMutationLock>,
+}
+fn named_lock_key(path: &std::path::Path) -> String {
+    let hash = Sha256::digest(path.to_string_lossy().to_lowercase().as_bytes());
+    let digest = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("Global\\abird-dotlink-path-{digest}")
+}
+/// Own newly created parents until the staged write is safely published.
+struct PreparedParent {
+    parent: Option<Parent>,
+    created: Vec<PathBuf>,
+}
+impl PreparedParent {
+    fn path(&self) -> &std::path::Path {
+        &self.parent.as_ref().expect("prepared parent").path
+    }
+    fn release(mut self) -> (Parent, Vec<PathBuf>) {
+        (
+            self.parent.take().expect("prepared parent"),
+            std::mem::take(&mut self.created),
+        )
+    }
+}
+impl Drop for PreparedParent {
+    fn drop(&mut self) {
+        // Windows directory handles deny delete sharing; release before rmdir.
+        drop(self.parent.take());
+        for path in self.created.iter().rev() {
+            let _ = fs::remove_dir(path); // only empty directories
+        }
+    }
 }
 impl Root {
     pub fn lock_mutations<'a>(&'a self, paths: &[String]) -> Result<MutationGuard<'a>> {
+        self.lock_mutations_with_cancel(paths, &|| false)
+    }
+    pub fn lock_mutations_with_cancel<'a>(
+        &'a self,
+        paths: &[String],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<MutationGuard<'a>> {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{CreateMutexW, WaitForSingleObject},
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let local = loop {
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
+            }
+            match self.serial.try_lock() {
+                Ok(lock) => break lock,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(ScopedError::Denied("file root is poisoned; inspect"))
+                }
+                Err(std::sync::TryLockError::WouldBlock)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(ScopedError::Denied("local mutation lock timed out"))
+                }
+            }
+        };
+        let mut keys = BTreeSet::new();
         for path in paths {
             validate_path(path)?;
+            keys.insert(named_lock_key(&self.root.join(path)));
+        }
+        let mut locks = Vec::new();
+        for key in keys {
+            let wide = key.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            // SAFETY: NUL-terminated name and an initially unowned mutex.
+            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error().into());
+            }
+            loop {
+                if cancelled() {
+                    // SAFETY: an unacquired live mutex handle.
+                    unsafe { CloseHandle(handle) };
+                    return Err(ScopedError::Cancelled);
+                }
+                // SAFETY: handle was returned by CreateMutexW, 10ms wait
+                // keeps cancellation responsive without async thread migration.
+                let code = unsafe { WaitForSingleObject(handle, 10) };
+                if code == WAIT_OBJECT_0 || code == WAIT_ABANDONED {
+                    locks.push(NamedMutationLock(handle));
+                    break;
+                }
+                if code != WAIT_TIMEOUT || std::time::Instant::now() >= deadline {
+                    let error = io::Error::last_os_error();
+                    unsafe { CloseHandle(handle) };
+                    return if code == WAIT_TIMEOUT {
+                        Err(ScopedError::Denied("Windows mutation lock timed out"))
+                    } else {
+                        Err(error.into())
+                    };
+                }
+            }
         }
         Ok(MutationGuard {
-            _local: self.lock()?,
+            _local: local,
+            _names: locks,
         })
     }
     /// Metadata through a validated parent chain; neither directory nor
@@ -145,6 +281,17 @@ impl Root {
         cap: usize,
         numbered: bool,
     ) -> Result<(String, bool)> {
+        self.read_window_with_cancel(path, offset, limit, cap, numbered, &|| false)
+    }
+    pub fn read_window_with_cancel(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        cap: usize,
+        numbered: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(String, bool)> {
         if offset == 0 || limit == 0 || cap == 0 || cap > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("invalid file window"));
         }
@@ -152,16 +299,20 @@ impl Root {
         let file = super::super::open_nofollow_read(&target)?;
         regular(&file)?;
         let mut reader = BufReader::new(file);
+        let mut scanned = 0usize;
         for _ in 1..offset {
-            if !skip_line(&mut reader)? {
+            if !skip_line(&mut reader, &mut scanned, cancelled)? {
                 return Err(ScopedError::Denied("read offset is past the end of file"));
             }
         }
         let mut output = Vec::new();
         let mut truncated = false;
         for row in 0..=limit {
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
+            }
             if row == limit {
-                truncated = skip_line(&mut reader)?;
+                truncated = !reader.fill_buf()?.is_empty();
                 break;
             }
             let Some(line) = next_line(&mut reader, cap)? else {
@@ -206,32 +357,33 @@ impl Root {
             truncated,
         ))
     }
-    fn parent_for_write(&self, path: &str) -> Result<(Parent, PathBuf)> {
+    fn parent_for_write(&self, path: &str) -> Result<(PreparedParent, PathBuf)> {
         validate_path(path)?;
         let mut parts: Vec<&str> = path.split('/').collect();
         parts.pop();
-        let mut current = self.root.clone();
-        let mut pinned = Vec::new();
+        let mut prepared = PreparedParent {
+            parent: Some(Parent {
+                path: self.root.clone(),
+                directories: Vec::new(),
+            }),
+            created: Vec::new(),
+        };
         for part in parts {
-            current.push(part);
-            let next = match pin_directory(&current) {
+            let parent = prepared.parent.as_mut().expect("prepared parent");
+            parent.path.push(part);
+            let next = match pin_directory(&parent.path) {
                 Ok(opened) => opened,
                 Err(ScopedError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                    fs::create_dir(&current)?;
-                    pin_directory(&current)?
+                    fs::create_dir(&parent.path)?;
+                    prepared.created.push(parent.path.clone());
+                    pin_directory(&parent.path)?
                 }
                 Err(e) => return Err(e),
             };
-            pinned.push(next);
+            parent.directories.push(next);
         }
         let target = self.root.join(path);
-        Ok((
-            Parent {
-                path: current,
-                directories: pinned,
-            },
-            target,
-        ))
+        Ok((prepared, target))
     }
     pub fn stage_create(
         &self,
@@ -271,7 +423,7 @@ impl Root {
         if cancel() {
             return Err(ScopedError::Cancelled);
         }
-        let (parent, target) = self.parent_for_write(path)?;
+        let (prepared, target) = self.parent_for_write(path)?;
         let old = match super::super::open_nofollow_read(&target) {
             Ok(file) => {
                 regular(&file)?;
@@ -295,7 +447,7 @@ impl Root {
         // restrictive DACL before writing *any* user bytes. A default file
         // created under a more permissive parent must not leak a private file.
         let dacl = old.as_ref().map(|_| file_dacl(&target)).transpose()?;
-        let temp = parent.path.join(format!(
+        let temp = prepared.path().join(format!(
             ".aw-stage-{}-{:016x}.tmp",
             std::process::id(),
             TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -322,8 +474,10 @@ impl Root {
             let _ = fs::remove_file(&temp);
             return Err(error);
         }
+        let (parent, created) = prepared.release();
         Ok(StagedWrite {
-            _parent: parent,
+            parent: Some(parent),
+            created,
             target,
             temp,
             expected: match kind {
@@ -346,7 +500,8 @@ enum StageKind<'a> {
 /// Staging on Windows requires security-preserving installation; MoveFileEx
 /// would inherit the parent directory ACL rather than the existing target.
 pub struct StagedWrite {
-    _parent: Parent,
+    parent: Option<Parent>,
+    created: Vec<PathBuf>,
     target: PathBuf,
     temp: PathBuf,
     expected: Option<Vec<u8>>,
@@ -422,6 +577,10 @@ impl Drop for StagedWrite {
     fn drop(&mut self) {
         if !self.committed && !self.preserve_on_failure {
             let _ = fs::remove_file(&self.temp);
+            drop(self.parent.take());
+            for path in self.created.iter().rev() {
+                let _ = fs::remove_dir(path); // never remove a nonempty parent
+            }
         }
     }
 }

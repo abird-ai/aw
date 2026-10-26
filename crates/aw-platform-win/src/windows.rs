@@ -162,6 +162,126 @@ pub fn configure_child_group(_command: &mut Command) {
     // object ownership can be added here without changing callers.
 }
 
+/// Managed native-tool processes differ from Git/helper processes: the
+/// caller will attach an OS Job Object before allowing any command to run.
+pub fn configure_managed_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+    command.creation_flags(CREATE_SUSPENDED);
+}
+
+/// Resume only the suspended primary thread after the child is job-bound.
+fn resume_managed_process(pid: u32) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        },
+        Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+    };
+    // SAFETY: TH32CS_SNAPTHREAD requests a read-only kernel snapshot.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot.is_null() || snapshot as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the returned snapshot is owned until this function exits.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        // SAFETY: Windows defines remaining fields as zero-initialized.
+        ..unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: a live snapshot and a correctly sized writable entry.
+    let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
+    while found {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: the ID comes from the system thread snapshot.
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: OpenThread returned an owned handle.
+            let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+            // SAFETY: no child user code has run yet; resume its primary thread.
+            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        // SAFETY: the snapshot and entry remain valid.
+        found = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
+    }
+    Err(io::Error::other(
+        "cannot find suspended child primary thread",
+    ))
+}
+
+/// Own the entire descendant Job Object of one specific child process.
+/// Dropping/terminating it cannot signal an unrelated reused PID.
+pub struct ManagedProcessGuard {
+    job: std::os::windows::io::OwnedHandle,
+    active: bool,
+}
+impl ManagedProcessGuard {
+    pub fn attach(pid: u32, child_handle: std::os::windows::io::RawHandle) -> io::Result<Self> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // SAFETY: null security/name create a fresh private unnamed job.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: ownership of a successfully created Windows handle.
+        let job = unsafe { OwnedHandle::from_raw_handle(handle) };
+        // SAFETY: both job and child process handles remain valid.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child_handle) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let guard = Self { job, active: true };
+        // On failure, the RAII guard kills the still-suspended process group.
+        resume_managed_process(pid)?;
+        Ok(guard)
+    }
+    pub fn terminate(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: the job object belongs exclusively to this process invocation.
+        unsafe {
+            TerminateJobObject(self.job.as_raw_handle(), 1);
+        }
+    }
+}
+impl Drop for ManagedProcessGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(test)]
+mod managed_process_tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+
+    #[test]
+    fn suspended_child_can_only_run_after_job_attachment() {
+        let system_root =
+            std::env::var_os("SystemRoot").expect("Windows runner must have a SystemRoot");
+        let program = Path::new(&system_root).join("System32").join("cmd.exe");
+        let mut command = Command::new(program);
+        configure_managed_process(&mut command);
+        command.arg("/C").arg("exit /B 0");
+        let mut child = command.spawn().expect("suspended child");
+        let job = ManagedProcessGuard::attach(child.id(), child.as_raw_handle())
+            .expect("attach and resume only after Job Object membership");
+        assert!(child.wait().expect("child wait").success());
+        drop(job);
+    }
+}
+
 /// Windows job-object graceful signaling is not currently supported; fail
 /// explicitly so a hosted supervisor can attempt a forced termination.
 pub fn terminate_process_group(_pid: u32) -> io::Result<()> {

@@ -353,7 +353,8 @@ pub(crate) struct ToolCliArgs {
     tool_root: Option<PathBuf>,
     /// Explicit trusted shell executable when shell access is granted.
 
-    #[arg(long = "tools-bash", env = "AW_BASH")]
+    #[cfg_attr(unix, arg(long = "tools-bash", env = "AW_BASH"))]
+    #[cfg_attr(windows, arg(long = "tools-powershell", env = "AW_POWERSHELL"))]
     bash: Option<PathBuf>,
     /// Permit the Agent to spawn bounded durable child Sessions through the
     /// native subagent tool. This can incur additional provider usage.

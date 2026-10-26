@@ -1564,7 +1564,7 @@ impl Agent {
                             .take(self.tool_policy.max_parallel_bash)
                             .take_while(|(call, _, spec)| {
                                 spec.effect == ToolEffect::Process
-                                    && call.name == "bash"
+                                    && (call.name == "bash" || call.name == "powershell")
                                     && call.arguments.get("parallel").and_then(|v| v.as_bool())
                                         == Some(true)
                                     && self
@@ -2323,6 +2323,26 @@ fn portable_step<T>(result: std::result::Result<T, aw_agent_kernel::turn::Error>
 /// The persisted receipt and model-visible projection both mark truncation.
 fn bounded_tool_output(mut output: ToolOutput, budget: usize) -> ToolOutput {
     if output.content.len() > budget {
+        // A truncated JSON object is neither a valid machine result nor
+        // transparent to the model. Preserve truthful machine-readable
+        // truncation metadata instead of slicing through encoded binary data.
+        if output.content.starts_with('{') || output.content.starts_with('[') {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.content) {
+                if value.is_object() || value.is_array() {
+                    const MARKERS: [&str; 2] = [
+                        r#"{"truncated":true,"incomplete_reason":"output_budget","hint":"retry with smaller limit or narrower path"}"#,
+                        r#"{"truncated":true}"#,
+                    ];
+                    for marker in MARKERS {
+                        if marker.len() <= budget {
+                            output.content = marker.to_owned();
+                            output.truncated = true;
+                            return output;
+                        }
+                    }
+                }
+            }
+        }
         let mut boundary = budget;
         while !output.content.is_char_boundary(boundary) {
             boundary -= 1;
@@ -2331,6 +2351,26 @@ fn bounded_tool_output(mut output: ToolOutput, budget: usize) -> ToolOutput {
         output.truncated = true;
     }
     output
+}
+
+#[cfg(test)]
+mod output_projection_tests {
+    use super::*;
+    #[test]
+    fn structured_json_is_never_cut_mid_token_when_budget_allows_marker() {
+        let data = serde_json::json!({"entries":["a".repeat(400)],"truncated":false}).to_string();
+        let bounded = bounded_tool_output(ToolOutput::text(data), 160);
+        assert!(bounded.truncated);
+        let parsed: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["incomplete_reason"], "output_budget");
+    }
+    #[test]
+    fn ordinary_text_truncates_at_unicode_boundary() {
+        let bounded = bounded_tool_output(ToolOutput::text("snow 雪 works"), 7);
+        assert!(bounded.truncated);
+        assert_eq!(bounded.content, "snow ");
+    }
 }
 
 fn tool_result_message(id: u64, call: &ToolCall, output: &ToolOutput) -> Message {

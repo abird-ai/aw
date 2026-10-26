@@ -166,7 +166,8 @@ struct Cli {
     tool_root: Option<PathBuf>,
     /// Absolute trusted shell executable for --tools-mode trusted.
 
-    #[arg(long = "tools-bash", env = "AW_BASH")]
+    #[cfg_attr(unix, arg(long = "tools-bash", env = "AW_BASH"))]
+    #[cfg_attr(windows, arg(long = "tools-powershell", env = "AW_POWERSHELL"))]
     #[arg(help_heading = "Tools & execution")]
     bash: Option<PathBuf>,
     /// Working directory for this process/tool root default.

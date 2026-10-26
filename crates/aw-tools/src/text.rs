@@ -42,6 +42,9 @@ struct ReadArgs {
 struct WriteArgs {
     path: String,
     content: String,
+    #[serde(default)]
+    create_only: bool,
+    expected_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,7 +119,9 @@ impl Tool for Text {
                 "Create or atomically replace a UTF-8 file, creating missing parent directories. Existing regular-file permissions are preserved. Model must inspect the file first when replacement is not intended. The write is not a multi-file transaction.",
                 json!({"type":"object","properties":{
                     "path":{"type":"string"},
-                    "content":{"type":"string","maxLength":MAX_WRITE_BYTES}},"required":["path","content"],"additionalProperties":false}),
+                    "content":{"type":"string","maxLength":MAX_WRITE_BYTES},
+                    "create_only":{"type":"boolean"},
+                    "expected_sha256":{"type":"string"}},"required":["path","content"],"additionalProperties":false}),
                 ToolEffect::Write,
             ),
         };
@@ -143,6 +148,8 @@ impl Tool for Text {
                 if a.content.len() > MAX_WRITE_BYTES {
                     return Err(Error::Limit("write payload exceeds 48 KiB"));
                 }
+                crate::text_class::require_text(a.content.as_bytes())?;
+                crate::mutate::validate_digest(a.expected_sha256.as_deref())?;
             }
         }
         Ok(())
@@ -160,9 +167,15 @@ impl Tool for Text {
                 match op {
                     Operation::Read => {
                         let a: ReadArgs = parse(&value)?;
-                        let (window, truncated) = platform_fs(
-                            root.read_window(&a.path, a.offset, a.limit, READ_BYTES, a.numbered),
-                        )?;
+                        let (window, truncated) = platform_fs(root.read_window_with_cancel(
+                            &a.path,
+                            a.offset,
+                            a.limit,
+                            READ_BYTES,
+                            a.numbered,
+                            &|| ctx.cancellation.is_cancelled(),
+                        ))?;
+                        crate::text_class::require_text(window.as_bytes())?;
                         let (body, truncated) =
                             bounded_window(window, a.offset, READ_BYTES, truncated);
                         Ok(ToolOutput {
@@ -173,22 +186,19 @@ impl Tool for Text {
                     }
                     Operation::Write => {
                         let a: WriteArgs = parse(&value)?;
-                        let _guard =
-                            platform_fs(root.lock_mutations(std::slice::from_ref(&a.path)))?;
-                        let staged = platform_fs(root.stage_replace(
+                        let changed = crate::mutate::write(
+                            &root,
                             &a.path,
                             a.content.as_bytes(),
+                            a.create_only,
+                            a.expected_sha256.as_deref(),
                             &|| ctx.cancellation.is_cancelled(),
-                        ))?;
-                        if ctx.cancellation.is_cancelled() {
-                            return Err(Error::Cancelled);
-                        }
-                        platform_fs(staged.commit())?;
+                        )?;
                         Ok(ToolOutput::text(
                             json!({
                                 "path": a.path,
-                                "bytes_written": a.content.len(),
-                                "changed": true
+                                "bytes_written": if changed { a.content.len() } else { 0 },
+                                "changed": changed
                             })
                             .to_string(),
                         ))

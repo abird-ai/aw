@@ -12,6 +12,7 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BinaryHeap,
     path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -19,6 +20,9 @@ use std::{
 
 const MAX_ENTRY_RESULTS: usize = 16384;
 const MAX_CANDIDATES: usize = 65536;
+const MAX_WALK_VISITS: usize = 100_000;
+const MAX_GREP_SCAN_BYTES: usize = 32 * 1024 * 1024;
+const MAX_GREP_SCAN_FILES: usize = 4096;
 const MAX_DEPTH: usize = 128;
 const MAX_OUTPUT: usize = 96 * 1024;
 const MAX_GREP_HITS: usize = 200;
@@ -27,6 +31,50 @@ const MAX_PATTERN: usize = 1024;
 const MAX_TEXT_FILE: usize = 1024 * 1024;
 const MAX_GITIGNORE_BYTES: usize = 64 * 1024;
 const MAX_GITIGNORE_LINES: usize = 1024;
+const MAX_IGNORE_SCAN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IGNORE_SCAN_FILES: usize = 256;
+#[derive(Default)]
+struct IgnoreBudget {
+    bytes: usize,
+    files: usize,
+    unavailable: bool,
+}
+impl IgnoreBudget {
+    fn consume(&mut self, bytes: usize) -> Result<()> {
+        if self.files >= MAX_IGNORE_SCAN_FILES
+            || self.bytes.saturating_add(bytes) > MAX_IGNORE_SCAN_BYTES
+        {
+            return Err(Error::Limit(
+                "gitignore search budget exhausted; narrow path or disable gitignore",
+            ));
+        }
+        self.files += 1;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+#[derive(Default, Clone, Copy)]
+struct WalkProgress {
+    budget_exhausted: bool,
+    traversal_error: bool,
+    ignore_unavailable: bool,
+}
+impl WalkProgress {
+    fn incomplete(self) -> bool {
+        self.budget_exhausted || self.traversal_error || self.ignore_unavailable
+    }
+    fn reason(self) -> Option<&'static str> {
+        if self.budget_exhausted {
+            Some("directory_budget")
+        } else if self.traversal_error {
+            Some("traversal_error")
+        } else if self.ignore_unavailable {
+            Some("ignore_rules")
+        } else {
+            None
+        }
+    }
+}
 fn default_limit() -> usize {
     200
 }
@@ -100,6 +148,10 @@ struct LsArgs {
     #[serde(default = "ls_limit")]
     limit: usize,
     #[serde(default)]
+    gitignore: bool,
+    #[serde(default)]
+    skip_hidden: bool,
+    #[serde(default)]
     parallel: bool,
 }
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -148,6 +200,46 @@ struct Listed {
     #[serde(skip)]
     modified: Option<SystemTime>,
 }
+/// Worst ranked entry sits at the heap root, independent of walk order.
+struct Ranked {
+    entry: Listed,
+    sort: Sort,
+}
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Ranked {}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.sort {
+            Sort::Path => self.entry.path.cmp(&other.entry.path),
+            Sort::Mtime => other
+                .entry
+                .modified
+                .cmp(&self.entry.modified)
+                .then_with(|| self.entry.path.cmp(&other.entry.path)),
+        }
+    }
+}
+fn retain_best<T: Ord>(heap: &mut BinaryHeap<T>, value: T, limit: usize) -> bool {
+    if heap.len() < limit {
+        heap.push(value);
+        false
+    } else {
+        if heap.peek().is_some_and(|worst| value < *worst) {
+            heap.pop();
+            heap.push(value);
+        }
+        true
+    }
+}
 #[derive(Serialize)]
 struct Counted {
     path: String,
@@ -179,6 +271,12 @@ fn glob(pattern: &str) -> Result<GlobMatcher> {
         .build()
         .map_err(|_| Error::Denied("invalid search glob"))?
         .compile_matcher())
+}
+fn optional_glob(value: Option<&str>) -> Result<Option<GlobMatcher>> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(glob)
+        .transpose()
 }
 fn regex(args: &GrepArgs) -> Result<Regex> {
     pattern(&args.pattern)?;
@@ -218,7 +316,7 @@ fn hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 fn staged_temp(name: &str) -> bool {
-    name.starts_with(".aw-stage-") && name.ends_with(".tmp")
+    (name.starts_with(".aw-stage-") || name.starts_with(".aw-backup-")) && name.ends_with(".tmp")
 }
 struct IgnoreLevel {
     rules: Option<ignore::gitignore::Gitignore>,
@@ -244,17 +342,23 @@ fn read_ignore(
     root: &Root,
     dir: &str,
     parent: Option<Arc<IgnoreLevel>>,
+    work: &mut IgnoreBudget,
 ) -> Result<Arc<IgnoreLevel>> {
     let name = if dir.is_empty() {
         ".gitignore".to_owned()
     } else {
         format!("{dir}/.gitignore")
     };
-    let rules = match root.read(&name) {
-        Ok(content) => {
-            if content.len() > MAX_GITIGNORE_BYTES || content.lines().count() > MAX_GITIGNORE_LINES
-            {
-                return Err(Error::Limit("gitignore exceeds configured search bound"));
+    let rules = match root.read_bytes(&name, MAX_GITIGNORE_BYTES + 1) {
+        Ok(contents) => {
+            if contents.len() > MAX_GITIGNORE_BYTES {
+                return Err(Error::Limit("gitignore exceeds 64 KiB byte limit"));
+            }
+            work.consume(contents.len())?;
+            let content = std::str::from_utf8(&contents)
+                .map_err(|_| Error::Denied("gitignore must be UTF-8"))?;
+            if content.lines().count() > MAX_GITIGNORE_LINES {
+                return Err(Error::Limit("gitignore exceeds 1024-line limit"));
             }
             let mut builder = GitignoreBuilder::new(dir);
             for line in content.lines() {
@@ -273,18 +377,35 @@ fn read_ignore(
         {
             None
         }
-        Err(_) => return Err(Error::Denied("cannot inspect requested gitignore rules")),
+        // An inaccessible or unsafe ignore file cannot be treated as absent.
+        // Continue with independently authorized entries but explicitly mark
+        // the entire search incomplete. Invalid/oversized ignore files above
+        // remain hard errors rather than silently dropping their rules.
+        Err(aw_platform::scoped_fs::ScopedError::Io(_))
+        | Err(aw_platform::scoped_fs::ScopedError::Denied(_)) => {
+            work.unavailable = true;
+            None
+        }
+        Err(aw_platform::scoped_fs::ScopedError::Limit(_)) => {
+            return Err(Error::Limit("gitignore exceeds 64 KiB; narrow search"));
+        }
+        Err(aw_platform::scoped_fs::ScopedError::Cancelled) => return Err(Error::Cancelled),
     };
     Ok(Arc::new(IgnoreLevel { rules, parent }))
 }
-fn ancestors(root: &Root, path: &str, enabled: bool) -> Result<Option<Arc<IgnoreLevel>>> {
+fn ancestors(
+    root: &Root,
+    path: &str,
+    enabled: bool,
+    work: &mut IgnoreBudget,
+) -> Result<Option<Arc<IgnoreLevel>>> {
     if !enabled {
         return Ok(None);
     }
     let mut current = None;
     let mut parent = String::new();
     for part in path.split('/').filter(|part| !part.is_empty()) {
-        current = Some(read_ignore(root, &parent, current)?);
+        current = Some(read_ignore(root, &parent, current, work)?);
         if !parent.is_empty() {
             parent.push('/');
         }
@@ -305,21 +426,24 @@ fn walk(
     skip_hidden: bool,
     cancel: &CancellationToken,
     mut visit: impl FnMut(&str, &str, &EntryKind) -> Result<bool>,
-) -> Result<bool> {
+) -> Result<WalkProgress> {
+    let mut work = IgnoreBudget::default();
     let mut stack = vec![Level {
         path: start.to_owned(),
         depth: 0,
-        ignore: ancestors(root, start, gitignore)?,
+        ignore: ancestors(root, start, gitignore, &mut work)?,
     }];
     let mut seen = 0usize;
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut truncated = false;
+    let mut progress = WalkProgress::default();
     while let Some(level) = stack.pop() {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        if Instant::now() >= deadline || seen >= MAX_CANDIDATES || level.depth >= MAX_DEPTH {
-            return Ok(true);
+        if Instant::now() >= deadline || seen >= MAX_WALK_VISITS || level.depth >= MAX_DEPTH {
+            progress.budget_exhausted = true;
+            progress.ignore_unavailable = work.unavailable;
+            return Ok(progress);
         }
         let listing = match root.list_with_limit(&level.path, MAX_ENTRY_RESULTS) {
             Ok(listing) => listing,
@@ -327,12 +451,12 @@ fn walk(
                 return Err(crate::platform_fs::<()>(Err(err)).unwrap_err())
             }
             Err(_) => {
-                truncated = true;
+                progress.traversal_error = true;
                 continue;
             }
         };
         let rules = if gitignore {
-            Some(read_ignore(root, &level.path, level.ignore)?)
+            Some(read_ignore(root, &level.path, level.ignore, &mut work)?)
         } else {
             None
         };
@@ -344,8 +468,10 @@ fn walk(
                 return Err(Error::Cancelled);
             }
             seen += 1;
-            if seen > MAX_CANDIDATES || Instant::now() >= deadline {
-                return Ok(true);
+            if seen > MAX_WALK_VISITS || Instant::now() >= deadline {
+                progress.budget_exhausted = true;
+                progress.ignore_unavailable = work.unavailable;
+                return Ok(progress);
             }
             if staged_temp(&entry.name)
                 || (skip_hidden && hidden(&entry.name))
@@ -359,13 +485,14 @@ fn walk(
                 continue;
             }
             if visit(&entry.path, &entry.name, &entry.kind)? {
-                return Ok(true);
+                progress.ignore_unavailable = work.unavailable;
+                return Ok(progress);
             }
             if entry.kind == EntryKind::Directory && level.depth + 1 < max_depth {
                 children.push(entry.path);
             }
         }
-        truncated |= listing.incomplete;
+        progress.budget_exhausted |= listing.incomplete;
         for child in children.into_iter().rev() {
             stack.push(Level {
                 path: child,
@@ -374,7 +501,8 @@ fn walk(
             });
         }
     }
-    Ok(truncated)
+    progress.ignore_unavailable = work.unavailable;
+    Ok(progress)
 }
 fn trim_json<T>(
     mut data: Vec<T>,
@@ -399,55 +527,73 @@ fn trim_json<T>(
 }
 fn list(root: &Root, args: &LsArgs, cancel: &CancellationToken) -> Result<ToolOutput> {
     let start = path(&args.path)?;
-    let filter = args.pattern.as_deref().map(glob).transpose()?;
-    let mut result = Vec::<Listed>::new();
-    let mut matched = 0usize;
+    let filter = optional_glob(args.pattern.as_deref())?;
+    let mut selected = BinaryHeap::<Ranked>::with_capacity(args.limit);
+    let mut exceeded = false;
+    let mut unreadable = false;
     let depth = depth_for(args);
-    let truncated = walk(
+    let progress = walk(
         root,
         start,
         depth,
-        false,
-        false,
+        args.gitignore,
+        args.skip_hidden,
         cancel,
-        |path, name, kind| {
+        |full, name, kind| {
             if !args.kind.accepts(kind)
                 || filter
                     .as_ref()
-                    .is_some_and(|filter| !matches_path(filter, path, name, start))
+                    .is_some_and(|matcher| !matches_path(matcher, full, name, start))
             {
                 return Ok(false);
             }
-            matched += 1;
-            if matched > args.limit {
-                return Ok(true);
-            }
-            let (size, modified) = match root.entry_info(path) {
+            let (size, modified) = match root.entry_info(full) {
                 Ok(info) => info,
-                Err(_) => return Ok(false),
+                Err(_) => {
+                    unreadable = true;
+                    return Ok(false);
+                }
             };
-            result.push(Listed {
-                path: path.into(),
-                kind: if *kind == EntryKind::File {
-                    "file"
-                } else {
-                    "dir"
+            exceeded |= retain_best(
+                &mut selected,
+                Ranked {
+                    entry: Listed {
+                        path: full.to_owned(),
+                        kind: if *kind == EntryKind::File {
+                            "file"
+                        } else {
+                            "dir"
+                        },
+                        size,
+                        modified,
+                    },
+                    sort: args.sort,
                 },
-                size,
-                modified,
-            });
+                args.limit,
+            );
             Ok(false)
         },
     )?;
+    let mut entries: Vec<Listed> = selected.into_iter().map(|item| item.entry).collect();
     match args.sort {
-        Sort::Path => result.sort_by(|a, b| a.path.cmp(&b.path)),
-        Sort::Mtime => result.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path))),
+        Sort::Path => entries.sort_by(|a, b| a.path.cmp(&b.path)),
+        Sort::Mtime => entries.sort_by(|a, b| {
+            b.modified
+                .cmp(&a.modified)
+                .then_with(|| a.path.cmp(&b.path))
+        }),
     }
-    let (body, truncated) = trim_json(
-        result,
-        truncated || matched > args.limit,
-        |entries, truncated| json!({"entries":entries,"truncated":truncated}).to_string(),
-    );
+    let incomplete = progress.incomplete() || unreadable;
+    let reason = progress.reason().or(if unreadable {
+        Some("traversal_error")
+    } else {
+        None
+    });
+    let (body, truncated) = trim_json(entries, exceeded || incomplete, |entries, truncated| {
+        json!({"entries":entries, "truncated":truncated,
+            "scan_incomplete":incomplete, "incomplete_reason":reason})
+        .to_string()
+    });
     Ok(ToolOutput {
         content: body,
         is_error: false,
@@ -464,50 +610,120 @@ fn content_line(path: &str, line: usize, text: &str, numbered: bool, hit: bool) 
 fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<ToolOutput> {
     let start = path(&args.path)?;
     let re = regex(args)?;
-    let filter = args.glob.as_deref().map(glob).transpose()?;
-    let mut candidates = Vec::<String>::new();
-    let mut candidate_truncated = false;
-    if !start.is_empty() && root.read_bytes(start, MAX_TEXT_FILE).is_ok() {
-        candidates.push(start.into());
+    let filter = optional_glob(args.glob.as_deref())?;
+    let mut candidates = BinaryHeap::<String>::new();
+    let mut candidate_capped = false;
+    let mut progress = WalkProgress::default();
+    let mut unreadable_files = false;
+    let mut explicit_ignore_unavailable = false;
+
+    // AW additionally permits an exact-file grep. It must honor the same
+    // glob, hidden and ignore rules as a directory-scoped search.
+    let explicit_file = if start.is_empty() {
+        false
     } else {
-        candidate_truncated = walk(
+        root.list(start).is_err() && root.entry_info(start).is_ok()
+    };
+    if explicit_file {
+        let basename = start.rsplit('/').next().unwrap_or(start);
+        if platform_fs(root.entry_info(start))?.0 > MAX_TEXT_FILE as u64 {
+            return Err(Error::Limit("grep file exceeds 1 MiB; use read or bread"));
+        }
+        let hidden = args.skip_hidden && start.split('/').any(|name| name.starts_with('.'));
+        let ignored = if args.gitignore {
+            let parent = start.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let mut work = IgnoreBudget::default();
+            let parents = ancestors(root, parent, true, &mut work)?;
+            let ignored = read_ignore(root, parent, parents, &mut work)?.ignored(start, false);
+            explicit_ignore_unavailable = work.unavailable;
+            ignored
+        } else {
+            false
+        };
+        if !hidden
+            && !ignored
+            && filter
+                .as_ref()
+                .is_none_or(|f| matches_path(f, start, basename, ""))
+        {
+            candidates.push(start.into());
+        }
+    } else {
+        progress = walk(
             root,
             start,
             usize::MAX,
             args.gitignore,
             args.skip_hidden,
             cancel,
-            |path, name, kind| {
+            |full, name, kind| {
                 if *kind != EntryKind::File
                     || filter
                         .as_ref()
-                        .is_some_and(|f| !matches_path(f, path, name, start))
+                        .is_some_and(|f| !matches_path(f, full, name, start))
                 {
                     return Ok(false);
                 }
-                candidates.push(path.to_owned());
-                Ok(candidates.len() >= MAX_CANDIDATES)
+                candidate_capped |= retain_best(&mut candidates, full.to_owned(), MAX_CANDIDATES);
+                Ok(false)
             },
         )?;
     }
-    candidates.sort();
+    let mut candidates = candidates.into_sorted_vec();
+    candidates.dedup();
+
     let mut seen = 0usize;
     let mut emitted = 0usize;
     let mut files = Vec::<String>::new();
     let mut counts = Vec::<Counted>::new();
     let mut content = String::new();
-    let mut truncated = candidate_truncated;
-    'file: for path in candidates {
+    let mut scan_incomplete = progress.incomplete() || explicit_ignore_unavailable;
+    let mut truncated = candidate_capped || scan_incomplete;
+    let mut stop_reason = progress.reason().or(if explicit_ignore_unavailable {
+        Some("ignore_rules")
+    } else {
+        None
+    });
+    let mut bytes_left = MAX_GREP_SCAN_BYTES;
+    let mut files_left = MAX_GREP_SCAN_FILES;
+    'file: for file in candidates {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let bytes = match root.read_bytes(&path, MAX_TEXT_FILE) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
+        if bytes_left == 0 || files_left == 0 {
+            scan_incomplete = true;
+            stop_reason = Some("content_budget");
+            truncated = true;
+            break;
+        }
+        files_left -= 1;
+        let size = match root.entry_info(&file) {
+            Ok((size, _)) => size,
+            Err(_) => {
+                unreadable_files = true;
+                continue;
+            }
         };
-        let text = match std::str::from_utf8(&bytes) {
-            Ok(text) => text,
-            Err(_) => continue,
+        if size > MAX_TEXT_FILE as u64 {
+            continue;
+        }
+        if size > bytes_left as u64 {
+            scan_incomplete = true;
+            stop_reason = Some("content_budget");
+            truncated = true;
+            break;
+        }
+        let bytes = match root.read_bytes(&file, MAX_TEXT_FILE) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                unreadable_files = true;
+                continue;
+            }
+        };
+        bytes_left = bytes_left.saturating_sub(bytes.len());
+        let text = match crate::text_class::text_bytes(&bytes) {
+            Some(text) => text,
+            None => continue,
         };
         let lines: Vec<_> = text.lines().collect();
         let matches = lines
@@ -529,10 +745,10 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
                     break;
                 }
                 if matches!(args.output_mode, OutputMode::Files) {
-                    files.push(path);
+                    files.push(file);
                 } else {
                     counts.push(Counted {
-                        path,
+                        path: file,
                         count: matches.len(),
                     });
                 }
@@ -554,22 +770,24 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
                     let through = (i + args.after + 1).min(lines.len());
                     let mut block = String::new();
                     for (row, line) in lines.iter().enumerate().take(through).skip(from) {
-                        if included.contains(&row) {
-                            continue;
-                        }
-                        // A match outside this page must not be emitted as context.
-                        if row != i && re.is_match(line) {
+                        if included.contains(&row) || (row != i && re.is_match(line)) {
                             continue;
                         }
                         block.push_str(&content_line(
-                            &path,
+                            &file,
                             row + 1,
                             line,
                             args.numbered,
                             row == i,
                         ));
                     }
-                    if content.len().saturating_add(block.len()) + 128 > MAX_OUTPUT {
+                    // Always reserve enough bytes for one complete suffix.
+                    if content
+                        .len()
+                        .saturating_add(block.len())
+                        .saturating_add(256)
+                        > MAX_OUTPUT
+                    {
                         truncated = true;
                         break 'file;
                     }
@@ -585,10 +803,24 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
             }
         }
     }
+    if candidate_capped && stop_reason.is_none() {
+        scan_incomplete = true;
+        stop_reason = Some("candidate_budget");
+    }
+    if unreadable_files {
+        scan_incomplete = true;
+        if stop_reason.is_none() {
+            stop_reason = Some("unreadable_files");
+        }
+    }
+    truncated |= scan_incomplete;
+    let incomplete_reason = stop_reason;
     match args.output_mode {
         OutputMode::Files => {
             let (body, truncated) = trim_json(files, truncated, |files, truncated| {
-                json!({"files":files,"truncated":truncated}).to_string()
+                json!({"files":files,"truncated":truncated,"scan_incomplete":scan_incomplete,
+                    "incomplete_reason":incomplete_reason})
+                .to_string()
             });
             Ok(ToolOutput {
                 content: body,
@@ -599,7 +831,9 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
         OutputMode::Count => {
             let (body, truncated) = trim_json(counts, truncated, |counts, truncated| {
                 let page_total = counts.iter().map(|count| count.count).sum::<usize>();
-                json!({"counts":counts,"page_total":page_total,"truncated":truncated}).to_string()
+                json!({"counts":counts,"page_total":page_total,"truncated":truncated,
+                    "scan_incomplete":scan_incomplete,"incomplete_reason":incomplete_reason})
+                .to_string()
             });
             Ok(ToolOutput {
                 content: body,
@@ -608,8 +842,30 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
             })
         }
         OutputMode::Content => {
-            if truncated {
-                content.push_str(&format!("… truncated at {emitted} hits\n"));
+            if let Some(reason) = incomplete_reason {
+                let suffix = format!("… search scan incomplete ({reason}); narrow path or glob\n");
+                if content.len().saturating_add(suffix.len()) <= MAX_OUTPUT {
+                    content.push_str(&suffix);
+                }
+            }
+            if progress.ignore_unavailable || explicit_ignore_unavailable {
+                const SUFFIX: &str =
+                    "… ignore rules unavailable; results may include ignored files\n";
+                if content.len().saturating_add(SUFFIX.len()) <= MAX_OUTPUT {
+                    content.push_str(SUFFIX);
+                }
+            }
+            if progress.traversal_error || unreadable_files {
+                const SUFFIX: &str = "… unreadable entries; search results incomplete\n";
+                if content.len().saturating_add(SUFFIX.len()) <= MAX_OUTPUT {
+                    content.push_str(SUFFIX);
+                }
+            }
+            if incomplete_reason.is_none() && truncated {
+                let suffix = format!("… truncated at {emitted} hits\n");
+                if content.len().saturating_add(suffix.len()) <= MAX_OUTPUT {
+                    content.push_str(&suffix);
+                }
             } else if emitted == 0 && args.offset > 0 {
                 content.push_str(&format!("… no hits at offset {}\n", args.offset));
             }
@@ -630,6 +886,7 @@ impl Tool for Search {
                 "kind":{"type":"string","enum":["any","file","dir"]},
                 "sort":{"type":"string","enum":["path","mtime"]},
                 "limit":{"type":"integer","minimum":1,"maximum":MAX_ENTRY_RESULTS},
+                "gitignore":{"type":"boolean"},"skip_hidden":{"type":"boolean"},
                 "parallel":{"type":"boolean"}},"additionalProperties":false})),
             Operation::Grep=>("Search granted UTF-8 files using bounded regex/literal text and a glob filter. output_mode is content/files/count, before/after control context, offset and limit page matches/files. gitignore and skip_hidden opt in; all outputs are byte-bounded. Set parallel=true only for independent reads.",
                 json!({"type":"object","properties":{"pattern":{"type":"string"},
@@ -658,9 +915,7 @@ impl Tool for Search {
                 if !(1..=MAX_ENTRY_RESULTS).contains(&a.limit) || a.depth == Some(0) {
                     return Err(Error::Denied("invalid ls depth or limit"));
                 }
-                if let Some(pattern) = a.pattern {
-                    glob(&pattern)?;
-                }
+                optional_glob(a.pattern.as_deref())?;
                 let _ = a.parallel;
             }
             Operation::Grep => {
@@ -673,9 +928,7 @@ impl Tool for Search {
                     return Err(Error::Denied("invalid grep limit or context"));
                 }
                 regex(&a)?;
-                if let Some(glob_pattern) = &a.glob {
-                    glob(glob_pattern)?;
-                }
+                optional_glob(a.glob.as_deref())?;
                 let _ = a.parallel;
             }
         }

@@ -89,6 +89,8 @@ impl Tool for Edit {
                     }
                 }
             }
+            crate::text_class::require_text(edit.old_text.as_bytes())?;
+            crate::text_class::require_text(edit.new_text.as_bytes())?;
             if edit.old_text.is_empty() {
                 return Err(Error::Denied("edit old_text must be nonempty"));
             }
@@ -112,7 +114,7 @@ impl Tool for Edit {
             let answer=tokio::task::spawn_blocking(move||->Result<ToolOutput>{
                 let paths=args.edits.iter().map(|edit|edit.path.as_ref().or(args.path.as_ref())
                     .expect("validated path").clone()).collect::<Vec<_>>();
-                let _guard=platform_fs(root.lock_mutations(&paths))?;
+                let _guard=platform_fs(root.lock_mutations_with_cancel(&paths,&||ctx.cancellation.is_cancelled()))?;
                 let mut plans=BTreeMap::<String,Plan>::new();
                 let total=args.edits.len();
                 for (index,edit) in args.edits.iter().enumerate(){
@@ -120,8 +122,7 @@ impl Tool for Edit {
                     let path=paths[index].clone();
                     if !plans.contains_key(&path){
                         let original=platform_fs(root.read_bytes(&path,MAX_FILE_BYTES))?;
-                        let text=String::from_utf8(original.clone())
-                            .map_err(|_|Error::Denied("edit expects UTF-8; use bedit for binary data"))?;
+                        let text=crate::text_class::require_text(&original)?.to_owned();
                         plans.insert(path.clone(),Plan{
                             original,text,edits:0,predecessor_texts:Vec::new(),
                         });

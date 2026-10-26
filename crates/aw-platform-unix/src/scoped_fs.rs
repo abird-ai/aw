@@ -125,12 +125,41 @@ fn cstring(value: &str) -> Result<CString> {
     CString::new(value).map_err(|_| ScopedError::Denied("invalid path"))
 }
 
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
 fn at(dir: &File, name: &str, flags: i32, mode: u32) -> Result<File> {
     let name = cstring(name)?;
-    // Keep mode at C unsigned-int width for variadic argument promotion;
-    // Darwin's narrower mode_t cannot be passed directly to openat.
-    // SAFETY: dir is live and name is NUL-terminated. The result is checked and
-    // owned exactly once below.
+    // A single component below an already-pinned granted directory. Linux
+    // additionally enforces no traversal through mountpoints with openat2.
+    #[cfg(target_os = "linux")]
+    let fd = {
+        const RESOLVE_NO_XDEV: u64 = 0x01;
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const RESOLVE_BENEATH: u64 = 0x08;
+        let how = OpenHow {
+            flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+            mode: mode as u64,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV,
+        };
+        // SAFETY: live descriptor, NUL-terminated name, fixed-layout input.
+        // The kernel copies OpenHow; returned fd is checked before ownership.
+        unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            ) as i32
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
@@ -142,8 +171,16 @@ fn at(dir: &File, name: &str, flags: i32, mode: u32) -> Result<File> {
     if fd < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    // SAFETY: fd is newly owned by this function.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    // SAFETY: successful syscall returned one owned descriptor.
+    let opened = unsafe { File::from_raw_fd(fd) };
+    // macOS and other Unix targets have no Linux openat2. Each component
+    // remains no-follow; refuse crossing a mount boundary at this lowest
+    // pinned-descriptor layer rather than following a path fallback.
+    #[cfg(not(target_os = "linux"))]
+    if opened.metadata()?.dev() != dir.metadata()?.dev() {
+        return Err(io::Error::from_raw_os_error(libc::EXDEV).into());
+    }
+    Ok(opened)
 }
 
 impl Root {

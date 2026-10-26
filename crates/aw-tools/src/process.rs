@@ -194,6 +194,8 @@ pub struct PipeProcess {
     /// live host-owned PipeProcess is always refused, even after an unknown
     /// Process exit or a cancelled caller; never silently resend a signal.
     termination_attempted: bool,
+    #[cfg(windows)]
+    job: aw_platform::ManagedProcessGuard,
 }
 impl PipeProcess {
     pub async fn spawn(spec: PipeSpec) -> crate::Result<Self> {
@@ -215,11 +217,22 @@ impl PipeProcess {
         for (key, value) in spec.env {
             cmd.env(key, value);
         }
+        #[cfg(unix)]
         aw_platform::configure_child_group(cmd.as_std_mut());
+        #[cfg(windows)]
+        aw_platform::configure_managed_process(cmd.as_std_mut());
         let mut child = cmd.spawn().map_err(crate::Error::Io)?;
         let pid = child
             .id()
             .ok_or(crate::Error::Protocol("process has no PID"))?;
+        #[cfg(windows)]
+        let job = aw_platform::ManagedProcessGuard::attach(
+            pid,
+            child.raw_handle().ok_or(crate::Error::Protocol(
+                "managed child process has no Windows handle",
+            ))?,
+        )
+        .map_err(crate::Error::Io)?;
         let stdout = child
             .stdout
             .take()
@@ -239,6 +252,8 @@ impl PipeProcess {
             stderr: err,
             readers: vec![out_task, err_task],
             termination_attempted: false,
+            #[cfg(windows)]
+            job,
         })
     }
     pub fn mode(&self) -> ProcessMode {
@@ -298,6 +313,12 @@ impl PipeProcess {
             && !s.stdout.read_failed
             && !s.stderr.read_failed
     }
+    fn kill_group(&mut self) {
+        #[cfg(unix)]
+        aw_platform::kill_process_group(self.pid);
+        #[cfg(windows)]
+        self.job.terminate();
+    }
     async fn stop(&mut self) -> Outcome {
         self.termination_attempted = true;
         self.stdin.take();
@@ -308,7 +329,7 @@ impl PipeProcess {
                 return Outcome::Cancelled;
             }
         }
-        aw_platform::kill_process_group(self.pid);
+        self.kill_group();
         let _ = self.child.start_kill();
         match timeout(REAP_DEADLINE, self.child.wait()).await {
             Ok(Ok(_)) => Outcome::Cancelled,
@@ -339,7 +360,7 @@ impl PipeProcess {
         if !output_complete {
             // Same original descendant cleanup as wait(); never assert that
             // a single exited direct child proves its group has stopped.
-            aw_platform::kill_process_group(self.pid);
+            self.kill_group();
         }
         Ok(ProcessReceipt {
             outcome,
@@ -368,7 +389,7 @@ impl PipeProcess {
         if !output_complete {
             // A descendant may still hold an inherited pipe after its parent
             // has exited. Do not detach that group's possible external effects.
-            aw_platform::kill_process_group(self.pid);
+            self.kill_group();
         }
         let output = self.snapshot();
         ProcessReceipt {
@@ -392,7 +413,7 @@ impl Drop for PipeProcess {
         // remain in its process group with stdout/stderr redirected. Preserve
         // the old Bash guard's unconditional group teardown. Escaped children
         // and same-UID code remain outside this best-effort boundary.
-        aw_platform::kill_process_group(self.pid);
+        self.kill_group();
     }
 }
 #[cfg(feature = "pty")]

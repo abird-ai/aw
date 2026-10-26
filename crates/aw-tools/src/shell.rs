@@ -8,12 +8,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::PathBuf};
 
-pub(crate) struct Bash {
+pub(crate) struct NativeShell {
     root: PathBuf,
     executable: PathBuf,
     path: String,
 }
-impl Bash {
+#[cfg(unix)]
+pub(crate) type Bash = NativeShell;
+#[cfg(windows)]
+pub(crate) type PowerShell = NativeShell;
+impl NativeShell {
     pub fn new(root: PathBuf, executable: PathBuf) -> Result<Self> {
         Ok(Self {
             root,
@@ -29,10 +33,30 @@ struct Args {
     /// Model scheduling metadata, never an additional tool grant.
     #[serde(default)]
     parallel: bool,
+    #[serde(default = "dot")]
+    dir: String,
+    stdin: Option<String>,
+    timeout_secs: Option<u64>,
+    max_output_bytes: Option<usize>,
 }
-impl Tool for Bash {
+fn dot() -> String {
+    ".".into()
+}
+impl Tool for NativeShell {
     fn spec(&self) -> ToolSpec {
-        ToolSpec{name:"bash".into(),description:"Run an explicitly granted TRUSTED Bash command with the OS user's rights (not a sandbox). Optionally set parallel=true ONLY for independent commands: adjacent opted-in commands may overlap and race on shared files unless host safety constraints force serial execution. Omit/false for ordered execution. The host keeps intent/receipt ordering and never retries ambiguous effects.".into(),parameters:json!({"type":"object","properties":{"command":{"type":"string"},"parallel":{"type":"boolean","description":"Model may overlap independent adjacent Bash calls; host policy may constrain concurrency. Set false/omit for dependent commands."}},"required":["command"],"additionalProperties":false}),effect:ToolEffect::Process}
+        ToolSpec {
+            name:"bash".into(),
+            description:"Run explicitly granted trusted native shell with the OS user's rights (NOT a sandbox). Supports a workspace-relative dir, stdin, timeout_secs and per-stream max_output_bytes under host ceilings. Only parallel=true opts adjacent independent commands into AW's model-directed Process waves; writes may race.".into(),
+            parameters:json!({"type":"object","properties":{
+                "command":{"type":"string"},
+                "dir":{"type":"string","description":"Working directory under the host-selected root, default ."},
+                "stdin":{"type":"string","maxLength":16384},
+                "timeout_secs":{"type":"integer","minimum":1,"maximum":600},
+                "max_output_bytes":{"type":"integer","minimum":1,"maximum":49152},
+                "parallel":{"type":"boolean"}
+            },"required":["command"],"additionalProperties":false}),
+            effect:ToolEffect::Process
+        }
     }
     fn validate(&self, v: &Value) -> Result<()> {
         let args: Args = serde_json::from_value(v.clone())
@@ -43,6 +67,20 @@ impl Tool for Bash {
         {
             return Err(Error::Denied("invalid or oversized bash command"));
         }
+        if args.dir != "." {
+            aw_platform::scoped_fs::validate_path(&args.dir)
+                .map_err(|_| Error::Denied("shell dir must be relative to granted root"))?;
+        }
+        if args
+            .stdin
+            .as_deref()
+            .is_some_and(|value| value.len() > 16_384)
+        {
+            return Err(Error::Limit("shell stdin exceeds 16 KiB"));
+        }
+        if args.timeout_secs == Some(0) || args.max_output_bytes == Some(0) {
+            return Err(Error::Denied("shell timeout/output limit must be positive"));
+        }
         Ok(())
     }
     fn execute<'a>(&'a self, ctx: ToolContext, v: &'a Value) -> ToolFuture<'a> {
@@ -51,33 +89,73 @@ impl Tool for Bash {
             let args: Args = serde_json::from_value(v.clone())
                 .map_err(|_| Error::Denied("invalid bash arguments"))?;
             let _ = args.parallel;
+            let cwd = if args.dir == "." {
+                self.root.clone()
+            } else {
+                let selected = self
+                    .root
+                    .join(&args.dir)
+                    .canonicalize()
+                    .map_err(|_| Error::Denied("shell dir does not exist"))?;
+                if !selected.starts_with(&self.root) || !selected.is_dir() {
+                    return Err(Error::Denied("shell dir escapes granted root"));
+                }
+                selected
+            };
             if ctx.cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
             // Program, cwd and environment come from the host-created tool,
             // not from the model-supplied JSON. The Agent has journaled Tool
             // intent and rechecked exact Process authority before execute.
+            #[cfg(unix)]
+            let shell_args = vec![
+                "--noprofile".into(),
+                "--norc".into(),
+                "-c".into(),
+                args.command,
+            ];
+            #[cfg(windows)]
+            let shell_args = vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                args.command,
+            ];
+            let environment = BTreeMap::from([
+                ("PATH".into(), self.path.clone()),
+                ("HOME".into(), self.root.to_string_lossy().into_owned()),
+                ("LANG".into(), "C.UTF-8".into()),
+            ]);
+            #[cfg(windows)]
+            let mut environment = environment;
+            #[cfg(windows)]
+            {
+                environment.insert(
+                    "SystemRoot".into(),
+                    std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+                );
+                environment.insert(
+                    "USERPROFILE".into(),
+                    self.root.to_string_lossy().into_owned(),
+                );
+            }
             let spec = PipeSpec {
-                root: self.root.clone(),
+                root: cwd,
                 program: self.executable.clone(),
-                args: vec![
-                    "--noprofile".into(),
-                    "--norc".into(),
-                    "-c".into(),
-                    args.command,
-                ],
-                env: BTreeMap::from([
-                    ("PATH".into(), self.path.clone()),
-                    ("HOME".into(), self.root.to_string_lossy().into_owned()),
-                    ("LANG".into(), "C.UTF-8".into()),
-                ]),
-                stdin_open: false,
+                args: shell_args,
+                env: environment,
+                stdin_open: args.stdin.is_some(),
             };
-            let process = PipeProcess::spawn(spec).await?;
+            let mut process = PipeProcess::spawn(spec).await?;
+            if let Some(stdin) = &args.stdin {
+                process.write(stdin.as_bytes()).await?;
+                process.close_stdin();
+            }
             let receipt = process
                 .wait(
                     ctx.cancellation.cancelled(),
-                    std::time::Duration::from_secs(600),
+                    std::time::Duration::from_secs(args.timeout_secs.unwrap_or(600).clamp(1, 600)),
                 )
                 .await;
             if !receipt.output_complete {
@@ -94,22 +172,31 @@ impl Tool for Bash {
                     return Err(Error::Transport("process outcome uncertain"))
                 }
             };
+            let cap = args
+                .max_output_bytes
+                .unwrap_or(48 * 1024)
+                .clamp(1, 48 * 1024);
+            let cut =
+                |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(cap)]).into_owned();
             let content = format!(
                 "exit: {}\nstdout:\n{}\nstderr:\n{}",
                 code,
-                String::from_utf8_lossy(&receipt.output.stdout.head),
-                String::from_utf8_lossy(&receipt.output.stderr.head)
+                cut(&receipt.output.stdout.head),
+                cut(&receipt.output.stderr.head)
             );
             Ok(ToolOutput {
                 content,
                 is_error,
-                truncated: receipt.output.stdout.truncated || receipt.output.stderr.truncated,
+                truncated: receipt.output.stdout.truncated
+                    || receipt.output.stderr.truncated
+                    || receipt.output.stdout.head.len() > cap
+                    || receipt.output.stderr.head.len() > cap,
             })
         })
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     fn executable() -> PathBuf {

@@ -1,57 +1,92 @@
 # aw-tools — native host tooling
 
-Native implementations of AW's **existing** `aw-agent-core::Tool` contract.
-The tool registry, exact actor/source/site/effect grants, immutable
-`TurnMachine`, journal-first dispatch, cancellation and model-directed
-parallelism remain in `aw-agent-core` / `aw-agent-kernel`.
+Native adapters for AW's existing `aw-agent-core::Tool`. There is **one**
+Agent, ToolRegistry, ToolPolicy, TurnMachine and durable intent/receipt journal;
+no filesystem library may grant its own model/tool authority.
 
-## Surface
+## Tool schema
 
-| Mode | Built-in tools | Authority |
+| Tool | Arguments | Execution |
 | --- | --- | --- |
-| `off` | none | default |
-| `read-only` | `ls`, `grep`, `read`, `bread` | scoped reads |
-| `workspace` | read-only + `write`, `edit`, `patch`, `bwrite`, `bedit` | scoped writes |
-| `trusted` | workspace + optional `bash` (Unix) | unsandboxed OS-user process |
+| `ls` | `path?, pattern?, depth?, kind?, sort?, limit?, gitignore?, skip_hidden?, parallel?` | bounded glob traversal; global top-N; incomplete flag |
+| `grep` | `pattern, path?, glob?, literal?, ignore_case?, output_mode?, before?, after?, numbered?, offset?, limit?, gitignore?, skip_hidden?, parallel?` | content/files/count; 32 MiB/4096 file content budget |
+| `read` | `path, offset?, limit?, numbered?, parallel?` | exact UTF-8 line window; 32 MiB seek budget |
+| `write` | `path, content, create_only?, expected_sha256?` | conditional atomic UTF-8 create/replace; no-op receipts |
+| `edit` | `path?, edits:[{path?,old_text,new_text,replace_all?}]` | ordered exact multi-file edits |
+| `patch` | `dir?, patch, best_effort?` | Codex Update/Add, preflight and staged per-file publication |
+| `bread` | `path, format?, offset?, limit?, parallel?` | base64/hex byte windows; `mcp` complete-file JSON envelope |
+| `bwrite` | `path, data, encoding?, create_only?, expected_sha256?` | conditional atomic binary create/replace |
+| `bedit` | `path, edits:[{offset,length?,data?,encoding?}], sha256?` | original-relative bounded byte ranges |
+| `bash` (Unix) / `powershell` (Windows) | `command, dir?, stdin?, timeout_secs?, max_output_bytes?, parallel?` | explicitly trusted Process |
 
-`--tools-allow` intersects the mode; it never adds authorization.
-Read tools accept `parallel: true` as the model's *explicit* scheduling
-choice. AW's existing host ceiling and journal enforce ordering. No implicit
-parallelism, no parallel writes, no source-grant changes, and no untrusted MCP
-read-only hints. Child agents retain their **existing**, narrower selection.
+`find` is retired only as a **model tool**. Recursive `ls` handles globbed
+discovery; human Workspace Find is unaffected. Tool schema parity is checked
+by tests, and the dotlink-only compatibility constraint is documented below.
 
-`find` has been retired as a model-facing tool. Recursive `ls` with
-`pattern` and `depth` subsumes globbed path discovery. The human-facing
-find/search UI is unchanged.
+## Authorization and scheduling
 
-- `ls`: recursive glob, `depth`, `kind`, `sort`, `limit`.
-- `grep`: regex/literal, glob, `content|files|count`, numbered context,
-  offset/limit and opt-in Gitignore/hidden filtering.
-- `read`: streamed 1-based `offset` / `limit`, optional line numbers,
-  exact CRLF/text window with `numbered=false`.
-- `write`: atomic UTF-8 create/replace, missing parent directories permitted.
-- `edit`: ordered exact multi-file `edits[]`, unique matches or `replace_all`.
-- `patch`: bounded Codex-style update/add grammar, strict or `best_effort`.
-- `bread`: bounded base64/hex byte windows; `bwrite`: atomic binary replace;
-  `bedit`: SHA-256-conditional, multi-range binary edits.
+- `--tools-mode off` (default): no tools.
+- `read-only`: `ls`, `grep`, `read`, `bread`.
+- `workspace`: read-only plus `write`, `edit`, `patch`, `bwrite`, `bedit`.
+- `trusted`: workspace plus the **unsandboxed** host-selected native shell
+  (`--tools-bash` on Unix, `--tools-powershell` on Windows).
+- `--tools-allow` intersects, never widens, those tool sets. Child agents
+  retain their original narrower read/read-write-edit subsets.
+- AW's TurnMachine admits concurrent calls **only** for adjacent, explicitly
+  model-selected `parallel:true` reads or already-granted trusted Process
+  calls. Writes remain barriers. No execution in tool metadata or discoverers.
+- The host's 64 KiB argument / 128 KiB result envelopes are authoritative;
+  lower per-tool budgets protect file scanning, result rendering and memory.
 
-File safety belongs to `aw-platform-{unix,win}::scoped_fs`, not the agent:
-pinned/no-follow paths, single-link regular files, bounded IO, snapshot
-verification, sibling staging, atomic per-file publication, cancellation and
-cooperating mutation locks. Reads are independently concurrent; writes on a
-shared Unix workspace coordinate via advisory directory `flock`. Filesystem
-locks are not a sandbox against an unrelated shell, external editor or malicious
-same-UID process. Multi-file publication is **not a transaction**; a late
-commit failure may leave earlier files updated and must be inspected.
+## Filesystem guarantees
 
-AW has a text-only `ToolOutput` today. `bread` returns base64/hex JSON, not
-dotlink's typed MCP image/audio/blob result. Typed media needs a separately
-reviewed adapter; no raw media is implicitly placed into model context.
+- Descriptor-pinned, component-by-component, no-follow reads/writes; only
+  singly linked regular files as content. Linux uses `openat2` with
+  `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`; no fallback that
+  silently drops required resolution guarantees.
+- File content is validated as UTF-8 with no binary control bytes for
+  `read`/`grep`/`write`/`edit`/`patch`. Arbitrary bytes use binary tools.
+- Bounded heap top-K listing and sorted candidate selection. `scan_incomplete`
+  and `incomplete_reason` distinguish global traversal/content budgets
+  from ordinary result `truncated`. Opt-in Gitignore/hidden filtering is
+  bounded by both per-file and aggregate work ceilings.
+- Snapshot verification, sibling staging with original restrictive mode/DACL
+  applied **before** replacement bytes, per-file atomic install, no-op
+  detection, optional exact SHA-256 write preconditions. No incomplete
+  target file is exposed; stage cleanup attempts to remove newly created,
+  still-empty parent directories when strict publication aborts.
+- Unix mutations use the same sorted ancestor-intention/nearest-parent
+  exclusive advisory `flock` convention as dotlink; Windows mutations use
+  the same canonical-path-derived named kernel mutex convention. Read tools
+  never acquire the mutation mutex. External programs ignoring the protocol
+  can still race, and a multi-file commit is **not** a transaction.
+- Cancellation, tool timeout, failed staging, and uncertain Process/write
+  effects remain subject to AW's durable journal and inspection/no-replay.
+- Windows native Process children are started suspended, assigned to an
+  invocation-owned Job Object, and only then resumed. Killing/dropping a
+  Process cleans its job rather than signalling a possibly reused PID.
+  AW Git/terminal launch paths are unaffected by this added managed mode.
+- The Agent's shared output-budget projection preserves valid JSON
+  truncation envelopes for oversized native JSON results; no interrupted
+  partial JSON is silently presented as complete structured output.
 
-Windows uses the existing conservative per-root mutation mutex; the new
-staging path copies the target DACL to the empty temporary and uses
-`ReplaceFileW` with backup recovery. Native Windows compile/runtime/ACL
-verification remains outstanding and is not implied by Linux tests.
+## Deliberate compatibility boundaries
 
-See [live tool documentation](../../.agents/docs/TOOLS.md) and
-[port plan](../../.agents/plans/dotlink-tool-port/README.md).
+Dotlink's `bread(format=mcp)` returns true MCP typed image/audio/blob
+`ContentBlock`. AW's native `ToolOutput` is presently **text-only**, so
+the same `format=mcp` input returns a complete-file, MIME-labeled,
+base64-encoded JSON envelope with `transport:"encoded_json"`. It does not
+pretend to be a model-visible typed image. True typed output requires an
+explicitly designed Agent/provider media adapter; never bypass tool grants.
+
+Dotlink's Bubblewrap shell is a separately sandboxed *machine execution
+facility*. AW retains its existing explicitly trusted, **unsandboxed**
+host-selected Process boundary. Sandbox mounts, network grants, and OS
+isolation must be added as a distinct host-approved execution mode, not by
+silently changing the meaning of `trusted`.
+
+Windows/macOS native compilation and runtime hardening tests remain a
+separate validation gate; Linux tests do not certify those targets.
+
+See [current tool contract](../../.agents/docs/TOOLS.md) and
+[tool-port plan](../../.agents/plans/dotlink-tool-port/README.md).

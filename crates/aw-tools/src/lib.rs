@@ -10,14 +10,15 @@ use std::{
 
 mod binary;
 mod edit;
+mod mutate;
 mod patch;
 mod search;
 mod text;
+mod text_class;
 
 pub mod browse;
 pub mod media_port;
 pub mod process;
-#[cfg(unix)]
 mod shell;
 
 fn platform_fs<T>(result: aw_platform::scoped_fs::Result<T>) -> Result<T> {
@@ -221,10 +222,27 @@ pub fn configure(
         }
         #[cfg(windows)]
         {
-            if selected.is_empty() || selected.contains("bash") {
-                return Err(Error::Config(
-                    "trusted shell is not enabled on Windows; select read/file tools".into(),
-                ));
+            if selected.is_empty() || selected.contains("powershell") {
+                let executable = options.bash.clone().ok_or_else(|| {
+                    Error::Config(
+                        "trusted mode needs an absolute --tools-powershell executable".into(),
+                    )
+                })?;
+                if !executable.is_absolute() || !executable.is_file() {
+                    return Err(Error::Config(
+                        "powershell executable must be absolute".into(),
+                    ));
+                }
+                builder = offer(
+                    builder,
+                    shell::PowerShell::new(options.root.canonicalize()?, executable)?,
+                    &selected,
+                    &mut available,
+                    &mut policy,
+                    &actor,
+                )?;
+            } else {
+                available.insert("powershell".into());
             }
         }
     }

@@ -50,3 +50,63 @@ Design/decisions: [README.md](README.md).
   connector command timeout interrupted later split runs
 - [ ] Native Windows compile, file ACL/atomic-write/symlink tests: no Windows
   Rust target available; target check reports missing `core`
+
+
+## Hardening parity follow-up (2026-10-26)
+
+- [x] Compare live dotlink schemas, tool implementation and new hardening
+  against AW (including shell and `bread` formats).
+- [x] Top-N `ls`, ignore/hidden discovery, bounded `grep` search and
+  aggregate ignore budgets, shared text classification, exact-file filters.
+- [x] Conditional/idempotent writes, cancellable read/lock budgets, staged
+  parent-directory cleanup, mutation lock protocol matching dotlink.
+- [x] Shell parameter parity and trusted Windows PowerShell registration.
+- [x] Linux mandatory no-symlink/no-cross-mount `openat2`; Windows named
+  kernel mutex coordination and ACL-preserving staged publication source.
+- [x] Additional source-level compatibility and adversarial regression tests.
+- [ ] Typed `bread` MCP ContentBlock media, distinct from encoded native JSON
+  (requires explicit Agent/provider data contract; preserve existing policy).
+- [ ] Host-selected sandbox execution separate from `trusted` Process:
+  Bubblewrap mounts/network/security require dedicated platform validation.
+- [ ] Windows/macOS native compile/runtime, ACL/recovery, process/mutex and
+  unsupported platform checks.
+- [ ] Cross-repo live MCP wire/media interoperability under AW's exact-source
+  authorization, not remote read-only hints.
+
+## Parity validation
+
+- [x] `cargo fmt --all --check`
+- [x] `AW_BASH=/absolute/bash cargo test -p aw-tools --offline --locked --lib`
+  (53 tests passed, including unreadable-tree / missing-vs-inaccessible
+  ignore-file regressions and full argument-schema fixtures)
+- [x] `cargo clippy -p aw-tools --all-targets --offline --locked -- -D warnings`
+- [x] AW CLI `--bin aw` 383 passed, 1 ignored; AW `--lib`
+  226 passed, 2 ignored in an earlier full integration run
+- [x] Platform/Agent/tools package group, MCP/providers/extension package
+  group and workspace/editor/Git/terminal package group passed
+- [x] `cargo check --workspace --all-targets --offline --locked` passed;
+  strict tool/Agent Clippy and formatting passed
+- [ ] Remaining complete workspace package groups (one monolithic runner
+  invocation was interrupted by the connector, not a returned test failure)
+- [ ] Native Windows/macOS runners and typed media integration checks
+- [x] Review all dotlink `fc53fc9..9c771d2` commits and uncommitted
+  native-tool hardening; record applicable vs non-applicable subsystems in
+  README crosswalk
+- [x] Integrate unreadable subtree/candidate and denied .gitignore reporting,
+  bounded ignore loading and partial-result reasons
+- [x] Windows managed PowerShell process contained in a Job Object before
+  resuming suspended child; cleanup owned by existing Process service
+- [x] AW Agent result budget now preserves valid JSON truncation envelopes
+- [x] Windows Process service owns suspended native PowerShell children
+  through a private Job Object before resume; no PID-only termination
+  for those Process instances. Windows-native execution still pending.
+- [x] Source-checked Windows Job Object and ToolHelp APIs in the pinned
+  windows-sys 0.61.2 dependency; no claim of Windows target compilation.
+- [x] Relevant `aw-store` exact-source tool-event regression passed (1 test);
+  full 201-test store unit suite exceeded connector command lifetime.
+- [x] Remaining pipeline/inference/identity/collaboration, store API/session
+  format, workspace/editor/Git/terminal, platform/Agent/tool, MCP/provider
+  and extension package groups passed in separate bounded runs.
+- [x] No-std `aw-agent-kernel --no-default-features --features alloc`
+  compiled; `aw-cli --bin aw` 383/383 active tests passed, 1 ignored;
+  `aw-cli --lib` 226/226 active tests passed, 2 ignored.

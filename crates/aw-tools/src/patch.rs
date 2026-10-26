@@ -409,6 +409,7 @@ impl Tool for Patch {
         if args.patch.len() > MAX_PATCH_BYTES {
             return Err(Error::Limit("patch text exceeds 48 KiB"));
         }
+        crate::text_class::require_text(args.patch.as_bytes())?;
         if args.dir != "." {
             validate_patch_path(&args.dir)?;
         }
@@ -426,30 +427,9 @@ impl Tool for Patch {
                     Err(e) => return Ok(ToolOutput::error(e.to_string())),
                 };
                 let mut paths = Vec::new();
+                let mut eligible = Vec::new();
                 let mut claimed = BTreeSet::new();
-                for op in &ops {
-                    let relative = match op {
-                        PatchOp::Update { path, .. } | PatchOp::Add { path, .. } => path,
-                    };
-                    let name = join_patch_path(&args.dir, relative);
-                    if let Err(e) = validate_patch_path(&name) {
-                        return Ok(ToolOutput::error(format!("patch path refused: {e}")));
-                    }
-                    // Windows names are case-insensitive; two sections that
-                    // differ only in case must not target the same file.
-                    let claim = if cfg!(windows) {
-                        name.to_lowercase()
-                    } else {
-                        name.clone()
-                    };
-                    if !claimed.insert(claim) {
-                        return Ok(ToolOutput::error(format!(
-                            "patch path appears in more than one section: {name}"
-                        )));
-                    }
-                    paths.push(name);
-                }
-                let _guard = platform_fs(root.lock_mutations(&paths))?;
+                let mut failures = Vec::<Value>::new();
                 let total_hunks = ops
                     .iter()
                     .map(|op| match op {
@@ -457,14 +437,45 @@ impl Tool for Patch {
                         PatchOp::Add { .. } => 0,
                     })
                     .sum::<usize>();
-                let mut hunk_index = 0;
-                let mut plans = Vec::<Plan>::new();
-                let mut failures = Vec::<Value>::new();
-                for (op, path) in ops.into_iter().zip(paths) {
-                    let op_hunks = match &op {
-                        PatchOp::Update { hunks, .. } => hunks.len(),
-                        PatchOp::Add { .. } => 0,
+                let mut next_hunk = 0usize;
+                for op in ops {
+                    let relative = match &op {
+                        PatchOp::Update { path, .. } | PatchOp::Add { path, .. } => path,
                     };
+                    let first_hunk = next_hunk;
+                    if let PatchOp::Update { hunks, .. } = &op {
+                        next_hunk += hunks.len();
+                    }
+                    let name = join_patch_path(&args.dir, relative);
+                    if let Err(error) = validate_patch_path(&name) {
+                        if !args.best_effort {
+                            return Ok(ToolOutput::error(format!("patch path refused: {error}")));
+                        }
+                        failures.push(json!({"path":name,"error":format!("{error}")}));
+                        continue;
+                    }
+                    let claim = if cfg!(windows) {
+                        name.to_lowercase()
+                    } else {
+                        name.clone()
+                    };
+                    if !claimed.insert(claim) {
+                        if !args.best_effort {
+                            return Ok(ToolOutput::error(format!(
+                                "patch path appears in more than one section: {name}"
+                            )));
+                        }
+                        failures.push(json!({"path":name,"error":"duplicate patch path"}));
+                        continue;
+                    }
+                    paths.push(name.clone());
+                    eligible.push((op, name, first_hunk));
+                }
+                let _guard = platform_fs(
+                    root.lock_mutations_with_cancel(&paths, &|| ctx.cancellation.is_cancelled()),
+                )?;
+                let mut plans = Vec::<Plan>::new();
+                for (op, path, first_hunk) in eligible {
                     if ctx.cancellation.is_cancelled() {
                         return Err(Error::Cancelled);
                     }
@@ -475,18 +486,22 @@ impl Tool for Patch {
                                     root.read_bytes(&path, MAX_FILE_BYTES).map_err(|_| {
                                         anyhow::anyhow!("cannot read existing update target")
                                     })?;
-                                let text = std::str::from_utf8(&original)
-                                    .map_err(|_| anyhow::anyhow!("update target is not UTF-8"))?;
+                                let text =
+                                    crate::text_class::text_bytes(&original).ok_or_else(|| {
+                                        anyhow::anyhow!("update target is binary; use bedit")
+                                    })?;
                                 let (changed, added, removed) = apply_patch_hunks(
                                     text,
                                     &hunks,
                                     &path,
-                                    hunk_index,
+                                    first_hunk,
                                     total_hunks,
                                 )?;
                                 if changed.len() > MAX_FILE_BYTES {
                                     bail!("patch replacement exceeds 1 MiB");
                                 }
+                                crate::text_class::require_text(changed.as_bytes())
+                                    .map_err(|_| anyhow::anyhow!("patch replacement is binary"))?;
                                 Ok(Plan {
                                     path: path.clone(),
                                     expected: Some(original),
@@ -505,6 +520,8 @@ impl Tool for Patch {
                                 if text.len() > MAX_FILE_BYTES {
                                     bail!("patch addition exceeds 1 MiB");
                                 }
+                                crate::text_class::require_text(text.as_bytes())
+                                    .map_err(|_| anyhow::anyhow!("patch addition is binary"))?;
                                 Ok(Plan {
                                     path: path.clone(),
                                     expected: None,
@@ -524,9 +541,6 @@ impl Tool for Patch {
                     } else {
                         plans.push(res.expect("checked"));
                     }
-                    // Keep the hunk numbering in request order, even when a
-                    // file failed planning in best-effort mode.
-                    hunk_index += op_hunks;
                 }
                 // Every strict-mode plan must stage successfully before the
                 // first commit. StagedWrite::Drop cleans any uncommitted temp.
@@ -556,9 +570,12 @@ impl Tool for Patch {
                             failures.push(json!({"path":plan.path,"error":format!("{error:?}")}))
                         }
                         Some(Err(error)) => {
-                            return Err(crate::platform_fs::<()>(Err(error)).unwrap_err())
+                            while let Some((_, pending, _)) = staged.pop() {
+                                drop(pending);
+                            }
+                            return Err(crate::platform_fs::<()>(Err(error)).unwrap_err());
                         }
-                        None => receipts.push(receipt),
+                        None => {} // unchanged file; no receipt or metadata churn
                     }
                 }
                 let mut committed = 0usize;
