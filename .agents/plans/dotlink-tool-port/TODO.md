@@ -4,7 +4,9 @@ Base AW: `53206b2`; dotlink: `fc53fc9` plus uncommitted tool-hardening tree.
 
 Design/decisions: [README.md](README.md).
 
-## Uncommitted
+## Committed
+
+### `7ce39d9` — native dotlink-style tooling under original AW authority
 
 - [x] Native `ls,grep,read,write,edit,patch,bread,bwrite,bedit` surface; retire
   model-facing `find`, leave human Find untouched
@@ -19,6 +21,9 @@ Design/decisions: [README.md](README.md).
 - [x] New cross-process, read/list race, symlink, CRLF, preflight and staging
   regression tests
 - [x] Update tool-facing reference documentation
+
+## Uncommitted
+
 - [ ] Native Windows compile/tests including DACL preservation/recovery (no
   Windows target in current environment)
 - [ ] Typed media `bread` transport/ToolOutput support (requires separate
@@ -30,7 +35,7 @@ Design/decisions: [README.md](README.md).
 
 - [x] `cargo fmt --all` (Linux)
 - [x] `AW_BASH=/absolute/bash cargo test --offline --locked -p aw-tools --lib`
-  (36 passed; tool tests added since then)
+  (36 passed)
 - [x] `cargo check --offline --locked --workspace --all-targets` (passed)
 - [x] `cargo clippy --offline --locked -p aw-tools --all-targets -- -D warnings`
 - [x] AW CLI binary: `AW_GIT=... AW_BASH=... cargo test --offline --locked

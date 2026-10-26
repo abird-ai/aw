@@ -8,7 +8,6 @@ use std::{
     os::windows::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
-        io::AsRawHandle,
     },
     path::{Component, Path, PathBuf},
     sync::{
@@ -17,13 +16,9 @@ use std::{
     },
 };
 
-use windows_sys::Win32::{
-    Foundation::HANDLE,
-    Storage::FileSystem::{
-        GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    },
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 #[path = "scoped_fs/port.rs"]
@@ -111,17 +106,6 @@ fn is_reparse(meta: &fs::Metadata) -> bool {
 
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
-}
-
-fn file_identity(file: &File) -> io::Result<(u32, u64)> {
-    unsafe {
-        let mut info = std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>();
-        if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-        Ok((info.dwVolumeSerialNumber, index))
-    }
 }
 
 fn pin_directory(path: &Path) -> Result<File> {
