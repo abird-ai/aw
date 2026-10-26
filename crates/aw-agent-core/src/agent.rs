@@ -2353,40 +2353,29 @@ fn bounded_tool_output(mut output: ToolOutput, budget: usize) -> ToolOutput {
     output
 }
 
-#[cfg(test)]
-mod output_projection_tests {
-    use super::*;
-    #[test]
-    fn structured_json_is_never_cut_mid_token_when_budget_allows_marker() {
-        let data = serde_json::json!({"entries":["a".repeat(400)],"truncated":false}).to_string();
-        let bounded = bounded_tool_output(ToolOutput::text(data), 160);
-        assert!(bounded.truncated);
-        let parsed: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
-        assert_eq!(parsed["truncated"], true);
-        assert_eq!(parsed["incomplete_reason"], "output_budget");
-    }
-    #[test]
-    fn ordinary_text_truncates_at_unicode_boundary() {
-        let bounded = bounded_tool_output(ToolOutput::text("snow 雪 works"), 7);
-        assert!(bounded.truncated);
-        assert_eq!(bounded.content, "snow ");
-    }
-}
-
 fn tool_result_message(id: u64, call: &ToolCall, output: &ToolOutput) -> Message {
+    // JSON results carry status inside their envelope. Appending human prose
+    // corrupts the machine result and hides failures from the model.
+    let structured = serde_json::from_str::<serde_json::Value>(&output.content)
+        .ok()
+        .filter(|value| value.is_object() || value.is_array());
+    let body = match (structured.as_ref(), output.is_error) {
+        (Some(value), true) => serde_json::json!({
+            "is_error":true,"truncated":output.truncated,"result":value
+        })
+        .to_string(),
+        (Some(_), false) => output.content.clone(),
+        (None, true) => format!("ERROR: {}", output.content),
+        (None, false) => output.content.clone(),
+    };
     let mut message = Message::text(
         id,
         Role::Tool,
-        format!(
-            "{}{}{}",
-            if output.is_error { "ERROR: " } else { "" },
-            output.content,
-            if output.truncated {
-                "\n[output truncated]"
-            } else {
-                ""
-            },
-        ),
+        if output.truncated && structured.is_none() {
+            format!("{body}\n[output truncated]")
+        } else {
+            body
+        },
     );
     message.tool_call_id = Some(call.id.clone());
     message.name = Some(call.name.clone());
@@ -2426,4 +2415,59 @@ where
         let _ = sender.send(event.clone());
     }
     callback(&event)
+}
+
+#[cfg(test)]
+mod output_projection_tests {
+    use super::*;
+    #[test]
+    fn structured_json_is_never_cut_mid_token_when_budget_allows_marker() {
+        let data = serde_json::json!({"entries":["a".repeat(400)],"truncated":false}).to_string();
+        let bounded = bounded_tool_output(ToolOutput::text(data), 160);
+        assert!(bounded.truncated);
+        let parsed: serde_json::Value = serde_json::from_str(&bounded.content).unwrap();
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["incomplete_reason"], "output_budget");
+    }
+    #[test]
+    fn model_receives_parseable_json_when_tool_signals_truncation() {
+        let call = ToolCall {
+            id: "one".into(),
+            name: "ls".into(),
+            arguments: serde_json::json!({"path":"."}),
+        };
+        let output = ToolOutput {
+            content: r#"{"entries":[{"path":"a"}],"truncated":true}"#.into(),
+            is_error: false,
+            truncated: true,
+        };
+        let message = tool_result_message(7, &call, &output);
+        let parsed: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["entries"][0]["path"], "a");
+    }
+
+    #[test]
+    fn structured_error_result_remains_json_and_visible_as_error() {
+        let call = ToolCall {
+            id: "call1".into(),
+            name: "tool".into(),
+            arguments: serde_json::json!({}),
+        };
+        let output = ToolOutput {
+            content: r#"{"message":"denied"}"#.into(),
+            is_error: true,
+            truncated: false,
+        };
+        let message = tool_result_message(3, &call, &output);
+        let json: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(json["is_error"], true);
+        assert_eq!(json["result"]["message"], "denied");
+    }
+    #[test]
+    fn ordinary_text_truncates_at_unicode_boundary() {
+        let bounded = bounded_tool_output(ToolOutput::text("snow 雪 works"), 7);
+        assert!(bounded.truncated);
+        assert_eq!(bounded.content, "snow ");
+    }
 }

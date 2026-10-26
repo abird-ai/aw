@@ -50,11 +50,18 @@ by tests, and the dotlink-only compatibility constraint is documented below.
   and `incomplete_reason` distinguish global traversal/content budgets
   from ordinary result `truncated`. Opt-in Gitignore/hidden filtering is
   bounded by both per-file and aggregate work ceilings.
-- Snapshot verification, sibling staging with original restrictive mode/DACL
-  applied **before** replacement bytes, per-file atomic install, no-op
-  detection, optional exact SHA-256 write preconditions. No incomplete
-  target file is exposed; stage cleanup attempts to remove newly created,
-  still-empty parent directories when strict publication aborts.
+- Snapshot verification, sibling staging, per-file atomic install, no-op
+  detection, optional exact SHA-256 write preconditions. Existing Unix file
+  owner/mode and supported ACLs/xattrs are preserved; setuid/setgid files and
+  Linux `security.capability` require separate privileged host operations.
+  Linux create-only publication uses atomic no-replace rename, never a
+  link-then-unlink sequence that could publish a doubly linked file.
+  Windows existing-target DACL is supplied at CreateFileW time before any
+  staging bytes are written, avoiding a transient permissive ACL.
+- Aborted stages remove temporary files. Empty parent directory cleanup uses
+  recorded file identity to avoid removing a directory already replaced by
+  another actor. Non-cooperating same-user processes can still race directory
+  name resolution; no filesystem capability model is claimed to sandbox them.
 - Unix mutations use the same sorted ancestor-intention/nearest-parent
   exclusive advisory `flock` convention as dotlink; Windows mutations use
   the same canonical-path-derived named kernel mutex convention. Read tools
@@ -66,9 +73,18 @@ by tests, and the dotlink-only compatibility constraint is documented below.
   invocation-owned Job Object, and only then resumed. Killing/dropping a
   Process cleans its job rather than signalling a possibly reused PID.
   AW Git/terminal launch paths are unaffected by this added managed mode.
-- The Agent's shared output-budget projection preserves valid JSON
-  truncation envelopes for oversized native JSON results; no interrupted
-  partial JSON is silently presented as complete structured output.
+- The Agent's shared output-budget projection and final model-visible tool
+  message preserve parseable JSON, including for structured errors and
+  truncated output. Human notices are appended only to plain-text results.
+- `grep` preserves the location of oversized matching lines via explicit
+  abbreviated-line markers, honors the requested hit limit across files
+  (without an undocumented 50-hit/file cap), and distinguishes line
+  abbreviation from result-page truncation. `read` reports the last returned
+  line in its truncation marker.
+- Discovery excludes exact AW and dotlink staging temporary filenames, not
+  ordinary user files with similar names. Shell argument validators enforce
+  the same limits advertised in their JSON schemas; PowerShell is registered
+  under `powershell`, not `bash`.
 
 ## Deliberate compatibility boundaries
 
@@ -85,8 +101,11 @@ host-selected Process boundary. Sandbox mounts, network grants, and OS
 isolation must be added as a distinct host-approved execution mode, not by
 silently changing the meaning of `trusted`.
 
-Windows/macOS native compilation and runtime hardening tests remain a
-separate validation gate; Linux tests do not certify those targets.
+Windows GNU cross-compilation of `aw-platform-win` and `aw-tools`,
+including test targets, is verified. Native Windows and macOS runtime
+hardening tests remain separate gates: cross-compilation cannot attest ACL,
+job-object or filesystem recovery behavior. Full Windows CLI cross-compilation
+requires a MinGW C compiler for the bundled SQLite dependency.
 
 See [current tool contract](../../.agents/docs/TOOLS.md) and
 [tool-port plan](../../.agents/plans/dotlink-tool-port/README.md).

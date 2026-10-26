@@ -316,7 +316,20 @@ fn hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 fn staged_temp(name: &str) -> bool {
-    (name.starts_with(".aw-stage-") || name.starts_with(".aw-backup-")) && name.ends_with(".tmp")
+    let Some(stem) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    let prefix = [".aw-stage-", ".aw-backup-", ".dotlink-"]
+        .iter()
+        .find_map(|prefix| stem.strip_prefix(prefix));
+    let Some(rest) = prefix else { return false };
+    let Some((pid, nonce)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && nonce.len() == 16
+        && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 struct IgnoreLevel {
     rules: Option<ignore::gitignore::Gitignore>,
@@ -601,10 +614,27 @@ fn list(root: &Root, args: &LsArgs, cancel: &CancellationToken) -> Result<ToolOu
     })
 }
 fn content_line(path: &str, line: usize, text: &str, numbered: bool, hit: bool) -> String {
-    if numbered {
-        format!("{path}:{}:{}{}\n", line, if hit { "" } else { "-" }, text)
+    const MAX_LINE: usize = 2048;
+    // Full source lines cannot always fit within one tool-result budget.
+    // Preserve the hit and its location instead of silently omitting it.
+    let visible = if text.len() > MAX_LINE {
+        format!(
+            "[{}-byte {} line omitted; use read offset={line} to inspect]",
+            text.len(),
+            if hit { "matching" } else { "context" }
+        )
     } else {
-        format!("{path}:{}{}\n", if hit { "" } else { "-" }, text)
+        text.to_owned()
+    };
+    if numbered {
+        format!(
+            "{path}:{}:{}{}\n",
+            line,
+            if hit { "" } else { "-" },
+            visible
+        )
+    } else {
+        format!("{path}:{}{}\n", if hit { "" } else { "-" }, visible)
     }
 }
 fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<ToolOutput> {
@@ -677,6 +707,8 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
     let mut files = Vec::<String>::new();
     let mut counts = Vec::<Counted>::new();
     let mut content = String::new();
+    let mut abbreviated = false;
+    let mut page_truncated = false;
     let mut scan_incomplete = progress.incomplete() || explicit_ignore_unavailable;
     let mut truncated = candidate_capped || scan_incomplete;
     let mut stop_reason = progress.reason().or(if explicit_ignore_unavailable {
@@ -755,14 +787,14 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
                 emitted += 1;
             }
             OutputMode::Content => {
-                let mut per_file = 0usize;
                 let mut included = std::collections::BTreeSet::<usize>::new();
                 for i in matches {
                     if seen < args.offset {
                         seen += 1;
                         continue;
                     }
-                    if emitted >= args.limit || per_file >= 50 {
+                    if emitted >= args.limit {
+                        page_truncated = true;
                         truncated = true;
                         break 'file;
                     }
@@ -772,6 +804,9 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
                     for (row, line) in lines.iter().enumerate().take(through).skip(from) {
                         if included.contains(&row) || (row != i && re.is_match(line)) {
                             continue;
+                        }
+                        if line.len() > 2048 {
+                            abbreviated = true;
                         }
                         block.push_str(&content_line(
                             &file,
@@ -788,6 +823,7 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
                         .saturating_add(256)
                         > MAX_OUTPUT
                     {
+                        page_truncated = true;
                         truncated = true;
                         break 'file;
                     }
@@ -797,7 +833,6 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
                         }
                     }
                     content.push_str(&block);
-                    per_file += 1;
                     emitted += 1;
                 }
             }
@@ -842,6 +877,13 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
             })
         }
         OutputMode::Content => {
+            if abbreviated {
+                const NOTICE: &str = "… long source lines abbreviated; use read to inspect\n";
+                if content.len().saturating_add(NOTICE.len()) <= MAX_OUTPUT {
+                    content.push_str(NOTICE);
+                }
+                truncated = true;
+            }
             if let Some(reason) = incomplete_reason {
                 let suffix = format!("… search scan incomplete ({reason}); narrow path or glob\n");
                 if content.len().saturating_add(suffix.len()) <= MAX_OUTPUT {
@@ -861,8 +903,8 @@ fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<Tool
                     content.push_str(SUFFIX);
                 }
             }
-            if incomplete_reason.is_none() && truncated {
-                let suffix = format!("… truncated at {emitted} hits\n");
+            if page_truncated {
+                let suffix = format!("… result page stopped after {emitted} hits\n");
                 if content.len().saturating_add(suffix.len()) <= MAX_OUTPUT {
                     content.push_str(&suffix);
                 }

@@ -10,10 +10,7 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
-    },
+    sync::{Mutex, MutexGuard},
 };
 
 use windows_sys::Win32::Storage::FileSystem::{
@@ -26,7 +23,10 @@ mod port;
 pub use port::{MutationGuard, StagedWrite};
 
 const MAX_FILE: usize = 1024 * 1024;
-static TEMP: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
 pub enum ScopedError {

@@ -45,7 +45,7 @@ fn dot() -> String {
 impl Tool for NativeShell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name:"bash".into(),
+            name:if cfg!(windows){"powershell"}else{"bash"}.into(),
             description:"Run explicitly granted trusted native shell with the OS user's rights (NOT a sandbox). Supports a workspace-relative dir, stdin, timeout_secs and per-stream max_output_bytes under host ceilings. Only parallel=true opts adjacent independent commands into AW's model-directed Process waves; writes may race.".into(),
             parameters:json!({"type":"object","properties":{
                 "command":{"type":"string"},
@@ -78,8 +78,12 @@ impl Tool for NativeShell {
         {
             return Err(Error::Limit("shell stdin exceeds 16 KiB"));
         }
-        if args.timeout_secs == Some(0) || args.max_output_bytes == Some(0) {
-            return Err(Error::Denied("shell timeout/output limit must be positive"));
+        if args.timeout_secs.is_some_and(|v| !(1..=600).contains(&v))
+            || args
+                .max_output_bytes
+                .is_some_and(|v| !(1..=49_152).contains(&v))
+        {
+            return Err(Error::Denied("shell limits must match the declared schema"));
         }
         Ok(())
     }
@@ -155,7 +159,7 @@ impl Tool for NativeShell {
             let receipt = process
                 .wait(
                     ctx.cancellation.cancelled(),
-                    std::time::Duration::from_secs(args.timeout_secs.unwrap_or(600).clamp(1, 600)),
+                    std::time::Duration::from_secs(args.timeout_secs.unwrap_or(600)),
                 )
                 .await;
             if !receipt.output_complete {
@@ -172,10 +176,7 @@ impl Tool for NativeShell {
                     return Err(Error::Transport("process outcome uncertain"))
                 }
             };
-            let cap = args
-                .max_output_bytes
-                .unwrap_or(48 * 1024)
-                .clamp(1, 48 * 1024);
+            let cap = args.max_output_bytes.unwrap_or(48 * 1024);
             let cut =
                 |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(cap)]).into_owned();
             let content = format!(
@@ -232,6 +233,25 @@ mod tests {
             scope: None,
         }
     }
+    #[test]
+    fn trusted_shell_schema_and_validation_agree_on_caps() {
+        let tool = Bash::new(std::env::temp_dir(), executable()).unwrap();
+        assert_eq!(tool.spec().name, "bash");
+        assert!(tool
+            .validate(&json!({"command":"true","timeout_secs":600,
+            "max_output_bytes":49_152}))
+            .is_ok());
+        assert!(tool
+            .validate(&json!({"command":"true","timeout_secs":601}))
+            .is_err());
+        assert!(tool
+            .validate(&json!({"command":"true","max_output_bytes":49_153}))
+            .is_err());
+        assert!(tool
+            .validate(&json!({"command":"true","timeout_secs":0}))
+            .is_err());
+    }
+
     #[tokio::test]
     async fn shell_is_real_and_captures_output() {
         let b = Bash::new(std::env::temp_dir(), executable()).unwrap();

@@ -110,3 +110,25 @@ Design/decisions: [README.md](README.md).
 - [x] No-std `aw-agent-kernel --no-default-features --features alloc`
   compiled; `aw-cli --bin aw` 383/383 active tests passed, 1 ignored;
   `aw-cli --lib` 226/226 active tests passed, 2 ignored.
+
+
+## Audit-remediation validation — 2026-10-27
+
+- [x] Reproduce oversized-grep match, >50 hits/file, read line marker,
+  dotlink temporary leakage, invalid model-visible JSON, metadata loss,
+  unsafe parent rollback, doubly linked create, shell/schema mismatch and
+  Windows cross-target build failures
+- [x] Fix search, result, schema, native publication and metadata behavior
+  at shared tool/Agent/platform layers without a second executor
+- [x] Native `aw-platform-unix` publication tests: atomic one-link create,
+  create-only conflict, replaced-parent identity and owner/mode/xattr
+- [x] `aw-tools` 59 unit/regression tests passed
+- [x] `aw-platform-unix` 14 tests passed
+- [x] `aw-agent-core` 70 active tests passed, 1 ignored
+- [x] Windows GNU cross-compile `aw-platform-win` and `aw-tools`
+  with `--all-targets` (Rust 1.98.1 and installed std target) passed
+- [ ] Windows native Job Object, ACL, reparse-point, DACL-initial-create,
+  metadata and rollback tests (requires actual Windows runtime)
+- [ ] Full Windows CLI target build (requires MinGW C compiler for SQLite)
+- [ ] macOS native ACL/xattr and filesystem publication tests
+- [ ] Typed MCP media and sandboxed Process (separate authorized design)

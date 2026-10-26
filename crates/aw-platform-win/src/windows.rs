@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::windows::{
-        ffi::{OsStrExt, OsStringExt},
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawHandle,
     },

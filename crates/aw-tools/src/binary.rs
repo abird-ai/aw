@@ -300,7 +300,10 @@ impl Tool for Binary {
                     }
                     Operation::Edit=>{
                         let a:BeditArgs=parse(&value)?;
-                        let _guard=platform_fs(root.lock_mutations(std::slice::from_ref(&a.path)))?;
+                        let _guard=platform_fs(root.lock_mutations_with_cancel(
+                            std::slice::from_ref(&a.path),
+                            &||ctx.cancellation.is_cancelled()
+                        ))?;
                         let original=platform_fs(root.read_bytes(&a.path,MAX_FILE_BYTES))?;
                         if let Some(sha)=a.sha256 {
                             if format!("{:x}",Sha256::digest(&original))!=sha.to_ascii_lowercase(){

@@ -163,3 +163,42 @@ Windows/macOS runtime verification. AW `bread(format=mcp)` is encoded
 JSON, **not** typed MCP media. Sandboxed shell and typed provider-native
 tool results remain explicitly separate design gates. Neither was declared
 complete by the filesystem hardening commit.
+
+
+## Final filesystem and model-result remediation — 2026-10-27
+
+The follow-up reproduced and addressed the remaining audit defects while
+preserving the original Agent/ToolPolicy/TurnMachine, durable journal and
+model-directed concurrency:
+
+- `grep` preserves oversized match locations and advances beyond 50 matches
+  in one file; independent line-abbreviation and page-limit notices. `read`
+  truncation markers report the last emitted source line and cannot spin on
+  an impossibly small output cap.
+- Exact AW/dotlink temporary names are not exposed by native `ls`/`grep`.
+  Plain similarly named user files remain searchable.
+- Native shell schema caps are executable validation rules. On Windows the
+  trusted native shell registers as `powershell`, matching ToolPolicy name
+  selection, not a `bash` alias.
+- JSON output and structured failures stay valid JSON through the final
+  Agent model-visible `Tool` message. No `[output truncated]` suffix is
+  attached to structured results; plain-text notices are unchanged.
+- Unix staged create installs via atomic `renameat2(RENAME_NOREPLACE)` on
+  Linux. Other Unix uses link+cleanup but never reports clean publication if
+  cleanup fails; it requires native platform testing.
+- Existing-file replacement copies owner/mode and supported ACL/xattr data,
+  refusing setuid/setgid and Linux privilege-bearing capability metadata.
+  Linux tests verify mode, owner, user xattr and single-link create semantics.
+- Parent rollback cleanup records directory identity before attempting
+  nonrecursive `rmdir`. It does not remove a directory that was already
+  replaced by another actor; residual same-UID non-cooperating TOCTOU is not a
+  security boundary. Both Unix and Windows use conservative checks.
+- Windows scoped staging now compiles for the GNU target, applies the target
+  DACL atomically at `CreateFileW`, handles AlreadyExists races for missing
+  parent directories and records identities for cleanup. Linux validation
+  does not prove native NTFS ACL or backup-recovery correctness.
+
+Full Windows CLI cross-compilation requires a MinGW C compiler for bundled
+SQLite and cannot be completed with the current cross-target Rust standard
+library alone. Typed `bread(format=mcp)` media and sandboxed Process remain
+separate host-authorized design gates; neither was claimed as completed.

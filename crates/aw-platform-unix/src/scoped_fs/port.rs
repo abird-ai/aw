@@ -94,6 +94,148 @@ fn next_line(reader: &mut BufReader<File>, cap: usize) -> Result<Option<Vec<u8>>
     }
 }
 
+/// Existing-file metadata is part of the replacement precondition. A
+/// replacement must not silently erase ownership, ACLs or extended attributes.
+fn preserve_metadata(old: &File, staged: &File, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    let metadata = old.metadata()?;
+    // Never manufacture privilege-bearing executable bytes from a model
+    // replacement. Elevated file capabilities are refused below as well.
+    if metadata.mode() & 0o6000 != 0 {
+        return Err(ScopedError::Denied(
+            "setuid/setgid file replacement requires an explicit privileged host operation",
+        ));
+    }
+    // Newly created staging files initially belong to the effective user.
+    // Only change ownership when necessary; unprivileged fchown to the same
+    // owner/group is not guaranteed to succeed on every filesystem.
+    let stage_meta = staged.metadata()?;
+    if stage_meta.uid() != metadata.uid() || stage_meta.gid() != metadata.gid() {
+        // SAFETY: owned, open staging descriptor and validated source metadata.
+        if unsafe { libc::fchown(staged.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    // Mode is applied after all bytes have been written, avoiding broader
+    // temporary permissions while the file is incomplete.
+    if unsafe { libc::fchmod(staged.as_raw_fd(), metadata.mode() & 0o7777) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    #[cfg(target_os = "linux")]
+    preserve_linux_xattrs(old, staged, cancelled)?;
+    #[cfg(target_os = "macos")]
+    {
+        if cancelled() {
+            return Err(ScopedError::Cancelled);
+        }
+        // Darwin's descriptor-based copyfile supports ACLs and resource-fork
+        // xattrs without reopening an ambient pathname or copying file data.
+        // SAFETY: both live descriptors are regular files; no mutable state.
+        if unsafe {
+            libc::fcopyfile(
+                old.as_raw_fd(),
+                staged.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_XATTR | libc::COPYFILE_ACL,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn preserve_linux_xattrs(old: &File, staged: &File, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    use std::ffi::CString;
+    const MAX_NAMES: usize = 64 * 1024;
+    const MAX_TOTAL: usize = 1024 * 1024;
+    // SAFETY: a null buffer asks the kernel for the required list size.
+    let needed = unsafe { libc::flistxattr(old.as_raw_fd(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENOTSUP)) {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    if needed as usize > MAX_NAMES {
+        return Err(ScopedError::Limit("too many extended-attribute names"));
+    }
+    let mut names = vec![0u8; needed as usize];
+    if !names.is_empty() {
+        // SAFETY: capacity came from the kernel and buffer is writable.
+        let read =
+            unsafe { libc::flistxattr(old.as_raw_fd(), names.as_mut_ptr().cast(), names.len()) };
+        if read < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if read as usize > names.len() {
+            return Err(ScopedError::Limit("xattr names changed during staging"));
+        }
+        names.truncate(read as usize);
+    }
+    let mut total = 0usize;
+    for raw in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        if cancelled() {
+            return Err(ScopedError::Cancelled);
+        }
+        if raw == b"security.capability" {
+            // Never reattach file capabilities to model-generated executable
+            // bytes. Editing privileged executable content requires an
+            // explicit separate host operation.
+            return Err(ScopedError::Denied(
+                "file has security.capability; refuse replacement",
+            ));
+        }
+        let name = CString::new(raw).map_err(|_| ScopedError::Denied("malformed xattr name"))?;
+        // SAFETY: query an owned source descriptor with a valid xattr name.
+        let needed =
+            unsafe { libc::fgetxattr(old.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if needed < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        total = total
+            .saturating_add(needed as usize)
+            .saturating_add(raw.len());
+        if total > MAX_TOTAL {
+            return Err(ScopedError::Limit("file metadata exceeds 1 MiB"));
+        }
+        let mut data = vec![0u8; needed as usize];
+        let got = unsafe {
+            libc::fgetxattr(
+                old.as_raw_fd(),
+                name.as_ptr(),
+                data.as_mut_ptr().cast(),
+                data.len(),
+            )
+        };
+        if got < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if got as usize != data.len() {
+            return Err(ScopedError::Denied("source xattr changed while staging"));
+        }
+        // SAFETY: staging fd is privately owned, byte slice remains live.
+        if unsafe {
+            libc::fsetxattr(
+                staged.as_raw_fd(),
+                name.as_ptr(),
+                data.as_ptr().cast(),
+                data.len(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
 /// An operation-level mutation guard. Held through planning, staging and commit;
 /// local writers share Root's mutex, cooperating processes flock the same
 /// stable parent inode even when the target is atomically renamed.
@@ -400,10 +542,18 @@ impl Root {
                         if error.kind() != io::ErrorKind::AlreadyExists {
                             return Err(error.into());
                         }
+                        at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
                     } else {
-                        created.0.push((dir.try_clone()?, part.to_owned()));
+                        let child = at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                        let identity = child.metadata()?;
+                        created.0.push((
+                            dir.try_clone()?,
+                            part.to_owned(),
+                            identity.dev(),
+                            identity.ino(),
+                        ));
+                        child
                     }
-                    at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
                 }
                 Err(e) => return Err(e),
             };
@@ -476,9 +626,9 @@ impl Root {
                 return Err(ScopedError::Denied("target changed before update"));
             }
         }
-        let mode = old.as_ref().map_or(0o600, |file| {
-            file.metadata().map(|m| m.mode() & 0o7777).unwrap_or(0o600)
-        });
+        // Every temporary starts private. The original mode is applied only
+        // after writing, by preserve_metadata.
+        let mode = 0o600;
         let name = format!(
             ".aw-stage-{}-{:016x}.tmp",
             std::process::id(),
@@ -497,12 +647,8 @@ impl Root {
                 }
                 out.write_all(chunk)?;
             }
-            // umask might have narrowed mode; reapply the original file mode.
-            if old.is_some() {
-                // SAFETY: this is the owned staging file descriptor.
-                if unsafe { libc::fchmod(out.as_raw_fd(), mode as libc::mode_t) } != 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
+            if let Some(ref source) = old {
+                preserve_metadata(source, &out, cancel)?;
             }
             out.sync_all()?;
             Ok(())
@@ -545,7 +691,7 @@ enum StageKind<'a> {
 /// Each directory created by this staging attempt. On uncommitted Drop,
 /// remove only if empty, so unrelated user files are never removed.
 #[derive(Default)]
-struct CreatedParents(Vec<(File, String)>);
+struct CreatedParents(Vec<(File, String, u64, u64)>);
 impl CreatedParents {
     fn disarm(&mut self) {
         self.0.clear();
@@ -553,12 +699,23 @@ impl CreatedParents {
 }
 impl Drop for CreatedParents {
     fn drop(&mut self) {
-        for (parent, name) in self.0.drain(..).rev() {
-            if let Ok(name) = cstring(&name) {
-                // SAFETY: a clean single component below the pinned parent.
-                unsafe {
-                    libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
-                }
+        for (parent, name, device, inode) in self.0.drain(..).rev() {
+            let Ok(current) = at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0) else {
+                continue;
+            };
+            let Ok(info) = current.metadata() else {
+                continue;
+            };
+            if info.dev() != device || info.ino() != inode {
+                continue;
+            }
+            drop(current);
+            let Ok(name) = cstring(&name) else { continue };
+            // Inode checks prevent deleting a stale *already* replaced name.
+            // There remains a non-cooperating same-UID TOCTOU window between
+            // check and rmdir; no recursive deletion is ever attempted.
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
             }
         }
     }
@@ -592,20 +749,51 @@ impl StagedWrite {
         let src = cstring(&self.temp)?;
         let dst = cstring(&self.name)?;
         if self.create {
-            // SAFETY: linkat installs only when the target name does not exist.
-            if unsafe {
-                libc::linkat(
-                    self.parent.as_raw_fd(),
-                    src.as_ptr(),
-                    self.parent.as_raw_fd(),
-                    dst.as_ptr(),
-                    0,
-                )
-            } < 0
+            #[cfg(target_os = "linux")]
             {
-                return Err(io::Error::last_os_error().into());
+                // Atomic install with no replacement and no second staging
+                // hardlink. An unlink failure can no longer strand nlink=2.
+                // SAFETY: pinned parent and live C strings; openat2 requires
+                // Linux 5.6+, which also supports renameat2.
+                let code = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        self.parent.as_raw_fd(),
+                        src.as_ptr(),
+                        self.parent.as_raw_fd(),
+                        dst.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                };
+                if code != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
             }
-            unlink(&self.parent, &self.temp);
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Other Unix kernels may not have rename-no-replace. Do not
+                // pretend a failed cleanup leaves a singly linked file.
+                let code = unsafe {
+                    libc::linkat(
+                        self.parent.as_raw_fd(),
+                        src.as_ptr(),
+                        self.parent.as_raw_fd(),
+                        dst.as_ptr(),
+                        0,
+                    )
+                };
+                if code != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                let removed = unsafe { libc::unlinkat(self.parent.as_raw_fd(), src.as_ptr(), 0) };
+                if removed != 0 {
+                    self.committed = true;
+                    self.created.disarm();
+                    return Err(ScopedError::Denied(
+                        "file published but temporary hardlink cleanup failed; inspect workspace",
+                    ));
+                }
+            }
         } else {
             // Reject symlink/non-regular targets, even if staged before a swap.
             match at(
@@ -645,5 +833,137 @@ impl Drop for StagedWrite {
         if !self.committed {
             unlink(&self.parent, &self.temp);
         }
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aw-scoped-publish-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn root(&self) -> Root {
+            Root::open(&self.0).unwrap()
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn atomic_create_installs_one_link_without_leaking_a_temporary() {
+        let temp = Temp::new();
+        let root = temp.root();
+        let _lock = root.lock_mutations(&["created.txt".to_owned()]).unwrap();
+        root.stage_create("created.txt", b"content", &|| false)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(fs::metadata(temp.0.join("created.txt")).unwrap().nlink(), 1);
+        assert_eq!(root.read_bytes("created.txt", 128).unwrap(), b"content");
+        assert!(!fs::read_dir(&temp.0).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".aw-stage-")));
+    }
+
+    #[test]
+    fn atomic_create_refuses_concurrent_existing_target() {
+        let temp = Temp::new();
+        let root = temp.root();
+        let _lock = root.lock_mutations(&["created.txt".to_owned()]).unwrap();
+        let stage = root
+            .stage_create("created.txt", b"ours", &|| false)
+            .unwrap();
+        fs::write(temp.0.join("created.txt"), "theirs").unwrap();
+        assert!(stage.commit().is_err());
+        assert_eq!(fs::read(temp.0.join("created.txt")).unwrap(), b"theirs");
+    }
+
+    #[test]
+    fn aborted_stage_never_deletes_a_different_directory_identity() {
+        let temp = Temp::new();
+        let root = temp.root();
+        let _lock = root.lock_mutations(&["fresh/file.txt".to_owned()]).unwrap();
+        let stage = root
+            .stage_create("fresh/file.txt", b"payload", &|| false)
+            .unwrap();
+        fs::rename(temp.0.join("fresh"), temp.0.join("renamed")).unwrap();
+        fs::create_dir(temp.0.join("fresh")).unwrap();
+        drop(stage);
+        assert!(
+            temp.0.join("fresh").is_dir(),
+            "another actor's replacement must survive our cleanup"
+        );
+        assert!(temp.0.join("renamed").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replacement_keeps_owner_mode_and_extended_attributes() {
+        use std::{
+            ffi::CString,
+            os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+        };
+        let temp = Temp::new();
+        let path = temp.0.join("sensitive.txt");
+        fs::write(&path, b"before").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let name = CString::new("user.aw_test_metadata").unwrap();
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let data = b"must survive";
+        // SAFETY: pathname and metadata buffer are valid during the call.
+        let set = unsafe {
+            libc::setxattr(
+                path_c.as_ptr(),
+                name.as_ptr(),
+                data.as_ptr().cast(),
+                data.len(),
+                0,
+            )
+        };
+        if set != 0 {
+            let e = io::Error::last_os_error();
+            if matches!(e.raw_os_error(), Some(libc::ENOTSUP)) {
+                return;
+            }
+            panic!("cannot create test xattr: {e}");
+        }
+        let original = fs::metadata(&path).unwrap();
+        let root = temp.root();
+        let _lock = root.lock_mutations(&["sensitive.txt".to_owned()]).unwrap();
+        root.stage_update("sensitive.txt", b"before", b"after", &|| false)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let replaced = fs::metadata(&path).unwrap();
+        assert_eq!(replaced.mode() & 0o777, 0o700);
+        assert_eq!(
+            (replaced.uid(), replaced.gid()),
+            (original.uid(), original.gid())
+        );
+        let mut stored = [0u8; 64];
+        // SAFETY: valid, live pathname/name and writable output buffer.
+        let n = unsafe {
+            libc::getxattr(
+                path_c.as_ptr(),
+                name.as_ptr(),
+                stored.as_mut_ptr().cast(),
+                stored.len(),
+            )
+        };
+        assert_eq!(n as usize, data.len(), "existing xattr must not be dropped");
+        assert_eq!(&stored[..data.len()], data);
     }
 }

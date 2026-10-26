@@ -4,17 +4,17 @@ use super::{is_reparse, pin_directory, validate_path, wide, Parent, Result, Root
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::MutexGuard,
 };
 use windows_sys::Win32::{
-    Security::{
-        GetFileSecurityW, SetFileSecurityW, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION,
+    Security::{GetFileSecurityW, DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES},
+    Storage::FileSystem::{
+        CreateFileW, MoveFileW, ReplaceFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
-    Storage::FileSystem::{MoveFileW, ReplaceFileW},
 };
 
 const MAX_BATCH_FILE: usize = 64 * 1024 * 1024;
@@ -121,16 +121,51 @@ fn named_lock_key(path: &std::path::Path) -> String {
         .collect::<String>();
     format!("Global\\abird-dotlink-path-{digest}")
 }
+struct CreatedDir {
+    path: PathBuf,
+    volume: u32,
+    index: u64,
+}
+fn directory_identity(file: &File) -> Result<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    // SAFETY: an opened directory HANDLE and an initialized output buffer.
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+fn cleanup_created_dirs(dirs: &mut Vec<CreatedDir>) {
+    for created in dirs.drain(..).rev() {
+        let Ok(file) = pin_directory(&created.path) else {
+            continue;
+        };
+        let matches = directory_identity(&file)
+            .is_ok_and(|(volume, index)| volume == created.volume && index == created.index);
+        drop(file);
+        if matches {
+            // Refuse any nonempty directory; a noncooperating same-user writer
+            // may still race the check, so never recursively remove anything.
+            let _ = fs::remove_dir(&created.path);
+        }
+    }
+}
 /// Own newly created parents until the staged write is safely published.
 struct PreparedParent {
     parent: Option<Parent>,
-    created: Vec<PathBuf>,
+    created: Vec<CreatedDir>,
 }
 impl PreparedParent {
     fn path(&self) -> &std::path::Path {
         &self.parent.as_ref().expect("prepared parent").path
     }
-    fn release(mut self) -> (Parent, Vec<PathBuf>) {
+    fn release(mut self) -> (Parent, Vec<CreatedDir>) {
         (
             self.parent.take().expect("prepared parent"),
             std::mem::take(&mut self.created),
@@ -141,9 +176,7 @@ impl Drop for PreparedParent {
     fn drop(&mut self) {
         // Windows directory handles deny delete sharing; release before rmdir.
         drop(self.parent.take());
-        for path in self.created.iter().rev() {
-            let _ = fs::remove_dir(path); // only empty directories
-        }
+        cleanup_created_dirs(&mut self.created);
     }
 }
 impl Root {
@@ -374,9 +407,21 @@ impl Root {
             let next = match pin_directory(&parent.path) {
                 Ok(opened) => opened,
                 Err(ScopedError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                    fs::create_dir(&parent.path)?;
-                    prepared.created.push(parent.path.clone());
-                    pin_directory(&parent.path)?
+                    let made = match fs::create_dir(&parent.path) {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+                        Err(error) => return Err(error.into()),
+                    };
+                    let opened = pin_directory(&parent.path)?;
+                    if made {
+                        let (volume, index) = directory_identity(&opened)?;
+                        prepared.created.push(CreatedDir {
+                            path: parent.path.clone(),
+                            volume,
+                            index,
+                        });
+                    }
+                    opened
                 }
                 Err(e) => return Err(e),
             };
@@ -432,8 +477,8 @@ impl Root {
                 }
                 Some(file)
             }
-            Err(ScopedError::Io(e)) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
         };
         if old.is_none() && matches!(kind, StageKind::Update(_)) {
             return Err(ScopedError::Denied("target changed before update"));
@@ -452,14 +497,11 @@ impl Root {
             std::process::id(),
             TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        // Install the existing DACL at CreateFileW, not after open. A process
+        // must never observe a temporarily permissive file and keep that handle
+        // while model-generated bytes are written.
+        let mut out = secure_staging_file(&temp, dacl.as_deref())?;
         let result = (|| -> Result<()> {
-            if let Some(ref dacl) = dacl {
-                protect_temporary(&temp, dacl)?;
-            }
             for chunk in data.chunks(65536) {
                 if cancel() {
                     return Err(ScopedError::Cancelled);
@@ -501,7 +543,7 @@ enum StageKind<'a> {
 /// would inherit the parent directory ACL rather than the existing target.
 pub struct StagedWrite {
     parent: Option<Parent>,
-    created: Vec<PathBuf>,
+    created: Vec<CreatedDir>,
     target: PathBuf,
     temp: PathBuf,
     expected: Option<Vec<u8>>,
@@ -528,12 +570,12 @@ impl StagedWrite {
                     return Err(ScopedError::Denied("target appeared before create"));
                 }
             }
-            Err(ScopedError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if self.existed {
                     return Err(ScopedError::Denied("replacement target disappeared"));
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
         if !self.existed {
             // MoveFileW cannot overwrite an occupied name, unlike MoveFileExW.
@@ -578,9 +620,7 @@ impl Drop for StagedWrite {
         if !self.committed && !self.preserve_on_failure {
             let _ = fs::remove_file(&self.temp);
             drop(self.parent.take());
-            for path in self.created.iter().rev() {
-                let _ = fs::remove_dir(path); // never remove a nonempty parent
-            }
+            cleanup_created_dirs(&mut self.created);
         }
     }
 }
@@ -619,21 +659,40 @@ fn file_dacl(path: &std::path::Path) -> Result<Vec<u8>> {
     }
     Ok(descriptor)
 }
-fn protect_temporary(path: &std::path::Path, dacl: &[u8]) -> Result<()> {
-    let path = wide(path);
-    // SAFETY: this is the complete self-relative security descriptor from
-    // GetFileSecurityW. The staging file is empty until the ACL is set.
-    if unsafe {
-        SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            dacl.as_ptr().cast_mut().cast(),
+fn secure_staging_file(path: &std::path::Path, dacl: Option<&[u8]>) -> Result<File> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    let name = wide(path);
+    // Windows accepts a self-relative security descriptor here. The kernel
+    // assigns its DACL atomically with creation; no widening window exists.
+    let mut attrs = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: dacl
+            .map_or(std::ptr::null_mut(), |data| data.as_ptr().cast_mut().cast()),
+        bInheritHandle: 0,
+    };
+    let attributes = if dacl.is_some() {
+        &mut attrs as *mut _
+    } else {
+        std::ptr::null_mut()
+    };
+    // SAFETY: NUL-terminated pathname, live SECURITY_ATTRIBUTES/descriptor,
+    // CREATE_NEW refuses overwriting an existing path. Handle is owned below.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
         )
-    } == 0
-    {
+    };
+    if handle.is_null() || handle as isize == -1 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(())
+    // SAFETY: a successful CreateFileW returns exactly one owned handle.
+    Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
 }
 fn install_create(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     let src = wide(src);

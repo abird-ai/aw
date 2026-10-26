@@ -932,3 +932,170 @@ async fn missing_versus_inaccessible_gitignore_are_distinguished() {
     assert_eq!(data["files"], json!(["hit.txt"]));
     assert_eq!(data["scan_incomplete"], false);
 }
+
+#[tokio::test]
+async fn grep_preserves_long_matching_line_location_and_pages_beyond_fifty() {
+    let tree = Tree::new();
+    let long = format!("needle{}\n", "x".repeat(100_000));
+    fs::write(tree.path("long.txt"), long).unwrap();
+    fs::write(tree.path("many.txt"), "needle\n".repeat(60)).unwrap();
+    fs::write(tree.path("other.txt"), "needle\n".repeat(3)).unwrap();
+    let grep = search::Search::new(tree.root(), search::Operation::Grep);
+    let one = call(
+        &grep,
+        json!({"path":"long.txt","pattern":"needle","limit":200}),
+    )
+    .await;
+    assert!(!one.is_error, "{}", one.content);
+    assert!(one.content.contains("long.txt:1:"));
+    assert!(
+        one.content.contains("matching line omitted"),
+        "{}",
+        one.content
+    );
+    assert!(
+        !one.content.contains("truncated at 0 hits"),
+        "{}",
+        one.content
+    );
+
+    let all = call(
+        &grep,
+        json!({"pattern":"needle","limit":200,"output_mode":"content"}),
+    )
+    .await;
+    assert!(!all.is_error, "{}", all.content);
+    assert_eq!(all.content.matches(":needle\n").count(), 63);
+    assert!(
+        all.content.contains("many.txt:60:needle"),
+        "{}",
+        all.content
+    );
+    assert!(
+        all.content.contains("other.txt:3:needle"),
+        "{}",
+        all.content
+    );
+    assert!(!all.content.contains("truncated at 50 hits"));
+}
+
+#[tokio::test]
+async fn both_native_file_discovery_tools_hide_only_exact_staging_names() {
+    let tree = Tree::new();
+    fs::write(
+        tree.path(".dotlink-321-0123456789abcdef.tmp"),
+        "STAGING_SECRET",
+    )
+    .unwrap();
+    fs::write(tree.path(".dotlink-notes.tmp"), "normal").unwrap();
+    fs::write(
+        tree.path(".aw-stage-321-0123456789abcdef.tmp"),
+        "STAGING_SECRET",
+    )
+    .unwrap();
+    fs::write(tree.path("ordinary.txt"), "STAGING_SECRET").unwrap();
+    let root = tree.root();
+    let ls = search::Search::new(root.clone(), search::Operation::Ls);
+    let listed = call(&ls, json!({"pattern":"**/*","kind":"file"})).await;
+    let entries: Value = serde_json::from_str(&listed.content).unwrap();
+    let paths = entries["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&"ordinary.txt"));
+    assert!(paths.contains(&".dotlink-notes.tmp"));
+    assert!(!paths.iter().any(|s| s.contains("0123456789abcdef")));
+    let grep = search::Search::new(root, search::Operation::Grep);
+    let result = call(
+        &grep,
+        json!({"pattern":"STAGING_SECRET","output_mode":"files"}),
+    )
+    .await;
+    let files: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(files["files"], json!(["ordinary.txt"]));
+}
+
+#[tokio::test]
+async fn read_truncation_marker_reports_last_returned_line() {
+    let tree = Tree::new();
+    fs::write(tree.path("lines.txt"), "one\ntwo\n").unwrap();
+    let read = text::Text::new(tree.root(), text::Operation::Read);
+    let result = call(&read, json!({"path":"lines.txt","offset":1,"limit":1})).await;
+    assert!(
+        result.content.contains("truncated after line 1"),
+        "{}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("truncated after line 2"),
+        "{}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn grep_abbreviated_hit_and_page_limit_both_remain_visible() {
+    let tree = Tree::new();
+    let long = format!("needle{}\n", "x".repeat(70_000));
+    fs::write(tree.path("hits.txt"), format!("{long}needle second\n")).unwrap();
+    let grep = search::Search::new(tree.root(), search::Operation::Grep);
+    let out = call(
+        &grep,
+        json!({"path":"hits.txt","pattern":"needle",
+        "limit":1,"output_mode":"content"}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.truncated);
+    assert!(out.content.contains("hits.txt:1:"), "{}", out.content);
+    assert!(
+        out.content.contains("matching line omitted"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("long source lines abbreviated"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("result page stopped after 1 hits"),
+        "{}",
+        out.content
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn privileged_mode_replacement_is_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    let tree = Tree::new();
+    fs::write(tree.path("privileged.sh"), "old").unwrap();
+    fs::set_permissions(
+        tree.path("privileged.sh"),
+        fs::Permissions::from_mode(0o4755),
+    )
+    .unwrap();
+    let root = tree.root();
+    let _lock = root.lock_mutations(&["privileged.sh".to_owned()]).unwrap();
+    let planned = root.stage_update("privileged.sh", b"old", b"new", &|| false);
+    assert!(
+        planned.is_err(),
+        "must not create privileged executable bytes"
+    );
+    assert_eq!(fs::read(tree.path("privileged.sh")).unwrap(), b"old");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_native_shell_identity_is_powershell() {
+    let tree = Tree::new();
+    let shell = super::shell::PowerShell::new(
+        tree.0.clone(),
+        PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+    )
+    .unwrap();
+    assert_eq!(shell.spec().name, "powershell");
+}

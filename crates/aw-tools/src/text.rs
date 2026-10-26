@@ -81,7 +81,19 @@ fn bounded_window(
     loop {
         let rows = window.bytes().filter(|b| *b == b'\n').count()
             + usize::from(!window.is_empty() && !window.ends_with('\n'));
-        let marker = format!("… truncated at line {}\n", offset.saturating_add(rows));
+        let detailed = format!(
+            "… truncated after line {}\n",
+            offset.saturating_add(rows).saturating_sub(1)
+        );
+        let marker = if detailed.len() <= cap {
+            detailed
+        } else if "… truncated\n".len() <= cap {
+            "… truncated\n".to_owned()
+        } else {
+            // Even a fixed marker does not fit; never spin trying to make
+            // an impossible suffix fit the caller's byte budget.
+            return (String::new(), true);
+        };
         let join = usize::from(!window.is_empty() && !window.ends_with('\n'));
         if window
             .len()

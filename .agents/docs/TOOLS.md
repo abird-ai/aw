@@ -55,11 +55,17 @@ Filesystem semantics:
   reach the requested line offset. Truncation markers contain whole lines.
 - `write`/`bwrite`: create or replace; optional `create_only` and
   `expected_sha256` preconditions. Identical bytes are no-ops with unchanged
-  inode/mtime and factual receipts. New parent directories are created as needed.
+  inode/mtime and factual receipts. Linux create-only publication uses atomic
+  no-replace rename; replacements preserve existing owner/mode and bounded
+  Linux ACL/xattr metadata, refusing privilege-bearing file metadata.
+  macOS uses descriptor-scoped ACL/xattr copying; native validation is pending.
+  Windows applies the original DACL at temporary creation, not afterward.
 - `edit`/`patch`/`bedit`: plan/verify/stage/commit, exact old-text matches,
   deterministic ordered ranges/hunks, ambiguity errors. Each file replacement
   is atomic; multi-file publication is **not** a transaction. Aborted stages
-  remove temporary files and try to remove newly created empty directories.
+  remove temporary files and identity-check newly created empty directories
+  before attempted cleanup. Same-user non-cooperating writers still lie
+  outside the cooperative lock contract.
 - Unix writes coordinate via sorted ancestor SH/nearest-parent EX advisory
   `flock`, matching current dotlink; Windows via matching named path mutexes.
   Concurrent reads do not wait on writer locks. Noncooperating shell/external
@@ -68,8 +74,15 @@ Filesystem semantics:
   a private Job Object before resuming; the existing AW Process owner kills
   the job on timeout, cancellation, interrupted output or drop. This is
   best-effort descendant containment, **not** a filesystem/network sandbox.
-- The Agent preserves structured JSON truncation markers under small per-call
-  context budgets, rather than returning malformed partially cut JSON.
+- The Agent preserves parseable structured JSON (including errors) all the
+  way into model-visible messages, with truncation represented in the result
+  rather than appended after it. Plain-text results retain human notices.
+- Grep oversized matching lines retain their file/line location with an
+  explicit abbreviation marker; pagination no longer stops after an
+  undocumented 50 hits per file. `read` markers report the last returned line.
+- Discovery suppresses exact AW/dotlink in-flight staging names; ordinary
+  similarly named files are visible. Native shell argument limits are
+  validated exactly as declared. Windows tool identity is `powershell`.
 
 **Compatibility boundary:** `bread(format=mcp)` is accepted, but native AW
 currently transports a MIME-labeled base64 JSON envelope
@@ -77,8 +90,10 @@ currently transports a MIME-labeled base64 JSON envelope
 The Agent's text-only `ToolOutput` must be deliberately extended before
 claiming true typed-media parity. Trusted Bash/PowerShell is explicitly
 **unsandboxed** and remains a Process effect; dotlink's Bubblewrap isolation
-would require a separately granted execution mode. Windows/macOS native
-runtime validation remains unverified in this Linux environment.
+would require a separately granted execution mode. Windows GNU cross-target `aw-platform-win` and `aw-tools`
+compilation (including tests) passes; Windows/macOS **runtime** validation
+remains outstanding. The full Windows CLI cross-build additionally needs a
+MinGW C compiler for the bundled SQLite dependency.
 
 See `crates/aw-tools/README.md` and
 `.agents/plans/dotlink-tool-port/` for implementation/validation.
