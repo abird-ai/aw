@@ -92,6 +92,14 @@ Use --tools-mode off|read-only|workspace|trusted (OFF by default), --tools-allow
     aw --tools-mode trusted --tools-bash /absolute/path/bash --tools-parallel off --output-print "Run serially"
     aw --tools-parallel-limit 16 --tools-parallel-read-limit 8 --tools-parallel-bash-limit 2 --output-print "Constrain scheduling"
 
+Native filesystem tools now comprise `ls`, `grep`, `read`, `bread` (read-only)
+and `write`, `edit`, `patch`, `bwrite`, `bedit` (workspace/trusted).
+`ls --pattern`-style tool arguments subsume the former model-facing `find`
+tool; this is unrelated to workspace/UI Find. `write` now permits bounded
+atomic create/replace under an existing grant. Only explicitly marked
+`parallel:true` read calls can overlap; mutations remain serialized and
+cooperatively lock their workspace. Native Windows validation is pending.
+
 Canonical options are --tools-mode, --tools-allow, --tools-root, --tools-bash, --tools-parallel, --tools-parallel-limit, --tools-parallel-read-limit and --tools-parallel-bash-limit. Optional specific ceilings inherit the shared limit; none can raise it. MCP, extension and subagent flags retain their own integration-specific namespaces. A model cannot enable disabled tools, gain credential/root authority, or turn a Bash Process effect into Read merely by requesting parallel:true.
 
 

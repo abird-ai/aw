@@ -689,14 +689,17 @@ dependencies = [
 name = "aw-tools"
 version = "0.15.0"
 dependencies = [
+ "anyhow",
  "aw-agent-core",
  "aw-platform",
  "aw-terminal",
+ "base64 0.22.1",
  "globset",
  "ignore",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 

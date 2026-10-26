@@ -1854,7 +1854,7 @@ mod tests {
                         tool_calls: vec![ToolCall {
                             id: "child-read".into(),
                             name: "read".into(),
-                            arguments: json!({"path":"base.txt","start_line":1,"max_lines":20}),
+                            arguments: json!({"path":"base.txt","offset":1,"limit":20}),
                         }],
                         provider_context: None,
                     })

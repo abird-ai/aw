@@ -4,7 +4,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read},
     os::windows::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
@@ -25,6 +25,10 @@ use windows_sys::Win32::{
         FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     },
 };
+
+#[path = "scoped_fs/port.rs"]
+mod port;
+pub use port::{MutationGuard, StagedWrite};
 
 const MAX_FILE: usize = 1024 * 1024;
 static TEMP: AtomicU64 = AtomicU64::new(1);
@@ -212,6 +216,13 @@ impl Root {
     }
 
     pub fn list(&self, path: &str) -> Result<Listing> {
+        self.list_with_limit(path, 512)
+    }
+
+    pub fn list_with_limit(&self, path: &str, max_entries: usize) -> Result<Listing> {
+        if !(1..=16384).contains(&max_entries) {
+            return Err(ScopedError::Limit("listing limit outside 1..=16384"));
+        }
         let dir = if path.is_empty() {
             Parent {
                 path: self.root.clone(),
@@ -287,7 +298,7 @@ impl Root {
                 path: joined,
                 kind,
             });
-            if entries.len() >= 512 {
+            if entries.len() >= max_entries {
                 incomplete = true;
                 break;
             }
@@ -308,18 +319,11 @@ impl Root {
         })
     }
 
+    /// Existing create-only platform API, now sharing the staged writer.
     pub fn create(&self, path: &str, content: &str, cancelled: &dyn Fn() -> bool) -> Result<()> {
-        let (_parent, target) = self.parent(path)?;
-        if cancelled() {
-            return Err(ScopedError::Cancelled);
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        Ok(())
+        let _mutation = self.lock_mutations(&[path.to_owned()])?;
+        self.stage_create(path, content.as_bytes(), cancelled)?
+            .commit()
     }
 
     pub fn edit(
@@ -332,57 +336,22 @@ impl Root {
         if old.is_empty() {
             return Err(ScopedError::Denied("empty edit match"));
         }
-        let (dir, target) = self.parent(path)?;
-        let mut source = super::open_nofollow_read(&target)?;
-        let before_identity = file_identity(&source)?;
-        let text = Self::contents(&mut source)?;
+        let _mutation = self.lock_mutations(&[path.to_owned()])?;
+        let original = self.read_bytes(path, MAX_FILE)?;
+        let text = std::str::from_utf8(&original)
+            .map_err(|_| ScopedError::Denied("file is not UTF-8 text"))?;
         if text.match_indices(old).count() != 1 {
-            return Err(ScopedError::Denied(
-                "edit needs exactly one match; no fuzzy replacement performed",
-            ));
+            return Err(ScopedError::Denied("edit needs exactly one match"));
         }
         let replacement = text.replacen(old, new, 1);
         if replacement.len() > MAX_FILE {
             return Err(ScopedError::Limit("edited file would exceed 1 MiB"));
         }
-
-        let temp = dir.path.join(format!(
-            ".aw-edit-{}-{}",
-            std::process::id(),
-            TEMP.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        let result = (|| {
-            out.write_all(replacement.as_bytes())?;
-            out.sync_all()?;
-
-            let mut current = super::open_nofollow_read(&target)?;
-            if file_identity(&current)? != before_identity || Self::contents(&mut current)? != text
-            {
-                return Err(ScopedError::Denied(
-                    "file changed concurrently; edit not committed",
-                ));
-            }
-            if cancelled() {
-                return Err(ScopedError::Cancelled);
-            }
-
-            let target_w = wide(&target);
-            let temp_w = wide(&temp);
-            // SAFETY: both paths are valid NUL-terminated UTF-16 buffers and
-            // remain alive for the duration of the call.
-            let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-            if unsafe { MoveFileExW(temp_w.as_ptr(), target_w.as_ptr(), flags) } == 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            Ok(())
-        })();
-
-        let _ = fs::remove_file(&temp);
-        result
+        if replacement.as_bytes() == original {
+            return Ok(());
+        }
+        self.stage_update(path, &original, replacement.as_bytes(), cancelled)?
+            .commit()
     }
 }
 

@@ -1,3 +1,80 @@
+# Current native tool surface — dotlink-aligned (2026-10-26)
+
+This section supersedes the older R2a/Phase-3 tool descriptions **below**,
+which remain a dated record of the prior native tool surface.
+
+AW retains its original ToolRegistry, ToolPolicy, exact source/actor/site/epoch
+authorization, TurnMachine, journal-before-effect receipts and explicit
+model-directed `parallel:true` waves. File operations live in
+`crates/aw-tools/src/{search,text,edit,patch,binary}.rs` and
+`crates/aw-platform-{unix,win}/src/scoped_fs/`. No second agent executor
+or tool authority exists. External MCP and extension effects remain Unknown
+until explicitly authorized by their own source-bound grants.
+
+| `--tools-mode` | Native tools visible by default |
+| --- | --- |
+| `off` | none |
+| `read-only` | `ls`, `grep`, `read`, `bread` |
+| `workspace` | all read-only + `write`, `edit`, `patch`, `bwrite`, `bedit` |
+| `trusted` | workspace tools + explicit unsandboxed `bash` on Unix |
+
+`--tools-allow` narrows the mode; only tools in the intersected list are
+registered and granted. Model-facing `find` is removed: recursive `ls` with
+`pattern`/`depth` covers file discovery. Existing human UI Find stays.
+Child agent selections remain exactly the established `read` or
+`read,write,edit` subset; this port does not widen them.
+
+Native tool contracts:
+
+- `ls`: directory `path` (default `.`), glob `pattern` relative to that
+  directory, `depth`, `kind` (`file|dir|any`), `sort` (`path|mtime`) and
+  `limit`; bounded JSON output.
+- `grep`: required regex/literal `pattern`, optional directory/single-file
+  `path`, `glob`, `before`/`after`, `numbered`, `ignore_case`,
+  `output_mode=content|files|count`, `offset`/`limit`,
+  `gitignore` and `skip_hidden` (both opt-in). Result-byte and scan bounds
+  are explicit; large/non-UTF8 files are skipped.
+- `read`: `path`, 1-based `offset` (default 1), `limit` (lines, default
+  4096), `numbered` (default true, `N\t` prefix). `numbered=false`
+  returns the selected bytes unmodified, including CRLF and terminal newline.
+  The tool streams the window instead of preloading a whole source file.
+- `write`: `path, content`, create or atomically replace, create missing
+  parent directories. Unlike the historical create-only AW write, replacement
+  is intentional and explicit through the granted write tool.
+- `edit`: ordered `edits:[{path?,old_text,new_text,replace_all?}]`, optional
+  inherited top-level `path`. Maximum 64 edits / 16 files. Each original
+  exact text must be unique unless `replace_all` is true.
+- `patch`: `dir`, Codex `*** Begin Patch` text, `best_effort` (default
+  false); Update/Add sections only. Ambiguous hunks, duplicates, and Delete/
+  Move fail. One-file atomic installs, *not* an all-files transaction.
+- `bread`: `path, offset, limit, format=base64|hex` for bounded byte windows.
+  `bwrite`: `path,data,encoding` as base64/hex, atomic create/replace.
+  `bedit`: `path,edits:[{offset,length?,data,encoding}]`, optional SHA-256
+  precondition. Offsets address original bytes, ranges cannot overlap.
+
+All tools obey AW's existing model-request argument envelope. Windows/Unix
+file-scoped IO does not follow symlinks/reparse points or accept multiply linked
+regular files. File writes plan from snapshots and stage private sibling files;
+existing-file updates recheck bytes at publication. Unix writes coordinate
+across cooperating processes using advisory directory `flock` held through
+commit; roots also serialize native mutation tasks locally, *not reads*.
+Parallel reads remain model-directed (`parallel:true` on already granted
+read tools) and are no longer serialized by the per-root mutation mutex.
+Trusted `bash` remains an unsandboxed Process effect and may race any
+filesystem writer. Missing receipts and partial multi-file publication remain
+unknown effects requiring inspection; never silently replay.
+
+Typed MCP image/audio/blob `bread` output is not ported because AW's current
+`ToolOutput` is text-only. Binary data is returned as bounded encoded JSON,
+without changing the core engine. Windows DACL handling uses ACL-preserving
+staging and `ReplaceFileW` recovery; native Windows compilation/runtime
+testing is still an outstanding gate.
+
+See `crates/aw-tools/README.md` and
+`.agents/plans/dotlink-tool-port/` for porting decisions and validation.
+
+---
+
 ## R11 — project instructions are data, never permissions
 
 Selecting or trusting source-pinned project instructions, named skills, named prompt templates or named semantic themes does NOT grant access to read/write/search/Bash/MCP/extension tools or any provider credential, remote executor or Session owner. These continue to require the existing exact --tools-* mode/actor/site/source/epoch grants and durable intent-before-effect receipts. Approved project content is loaded from the existing descriptor-relative no-follow scoped filesystem and only the exact current owner-approved SHA256 snapshot is presented to an Agent. Trust/revoke require explicit CLI actions and no provider or shell startup. The model never gets to approve its own file sources. Project data cannot change accounts/endpoint/tool grant by merely appearing in instruction text.

@@ -6,20 +6,19 @@
 use std::{
     ffi::{CStr, CString},
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
-    },
+    sync::{Mutex, MutexGuard},
 };
 
+mod port;
+pub use port::{MutationGuard, StagedWrite};
+
 const MAX_FILE: usize = 1024 * 1024;
-static TEMP: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(any(
     target_os = "linux",
@@ -207,8 +206,18 @@ impl Root {
     }
 
     pub fn list(&self, path: &str) -> Result<Listing> {
+        self.list_with_limit(path, 512)
+    }
+
+    pub fn list_with_limit(&self, path: &str, max_entries: usize) -> Result<Listing> {
+        if !(1..=16384).contains(&max_entries) {
+            return Err(ScopedError::Limit("listing limit outside 1..=16384"));
+        }
         let dir = if path.is_empty() {
-            self.directory.try_clone()?
+            // A fresh open file description has an independent readdir cursor.
+            // `try_clone()` shares the directory offset and races with
+            // parallel root listings after dropping the old global read lock.
+            at(&self.directory, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?
         } else {
             let (dir, name) = self.parent(path)?;
             at(&dir, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
@@ -238,8 +247,8 @@ impl Root {
         let mut entries = Vec::new();
         let mut incomplete = false;
 
-        for scanned in 0..4096 {
-            if scanned == 4095 {
+        for scanned in 0..65536 {
+            if scanned == 65535 {
                 incomplete = true;
             }
             unsafe {
@@ -306,7 +315,7 @@ impl Root {
                 path: joined,
                 kind,
             });
-            if entries.len() >= 512 || scanned == 4095 {
+            if entries.len() >= max_entries || scanned == 65535 {
                 incomplete = true;
                 break;
             }
@@ -327,23 +336,16 @@ impl Root {
         })
     }
 
+    /// Retained scoped API: create is still create-only but publication now
+    /// uses the same atomic stage/commit path as the model-facing tools.
     pub fn create(&self, path: &str, content: &str, cancelled: &dyn Fn() -> bool) -> Result<()> {
-        let (dir, name) = self.parent(path)?;
-        if cancelled() {
-            return Err(ScopedError::Cancelled);
-        }
-        let mut file = at(
-            &dir,
-            &name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            0o600,
-        )?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        dir.sync_all()?;
-        Ok(())
+        let _mutation = self.lock_mutations(&[path.to_owned()])?;
+        self.stage_create(path, content.as_bytes(), cancelled)?
+            .commit()
     }
 
+    /// Retained single-span API, implemented through the shared snapshot and
+    /// atomic mutation path; no second truncate/rename implementation.
     pub fn edit(
         &self,
         path: &str,
@@ -354,65 +356,21 @@ impl Root {
         if old.is_empty() {
             return Err(ScopedError::Denied("empty edit match"));
         }
-        let (dir, name) = self.parent(path)?;
-        let mut source = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-        let before = source.metadata()?;
-        let text = Self::contents(&mut source)?;
+        let _mutation = self.lock_mutations(&[path.to_owned()])?;
+        let original = self.read_bytes(path, MAX_FILE)?;
+        let text = std::str::from_utf8(&original)
+            .map_err(|_| ScopedError::Denied("file is not UTF-8 text"))?;
         if text.match_indices(old).count() != 1 {
-            return Err(ScopedError::Denied(
-                "edit needs exactly one match; no fuzzy replacement performed",
-            ));
+            return Err(ScopedError::Denied("edit needs exactly one match"));
         }
         let replacement = text.replacen(old, new, 1);
         if replacement.len() > MAX_FILE {
             return Err(ScopedError::Limit("edited file would exceed 1 MiB"));
         }
-
-        let temp = format!(
-            ".aw-edit-{}-{}",
-            std::process::id(),
-            TEMP.fetch_add(1, Ordering::Relaxed)
-        );
-        let mut out = at(
-            &dir,
-            &temp,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            before.mode() & 0o777,
-        )?;
-        let result = (|| {
-            out.write_all(replacement.as_bytes())?;
-            out.sync_all()?;
-            let mut current = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-            let now = current.metadata()?;
-            if before.ino() != now.ino()
-                || before.dev() != now.dev()
-                || Self::contents(&mut current)? != text
-            {
-                return Err(ScopedError::Denied(
-                    "file changed concurrently; edit not committed",
-                ));
-            }
-            if cancelled() {
-                return Err(ScopedError::Cancelled);
-            }
-            let from = cstring(&temp)?;
-            let to = cstring(&name)?;
-            // SAFETY: both names and the held directory descriptor are live.
-            if unsafe {
-                libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr())
-            } < 0
-            {
-                return Err(io::Error::last_os_error().into());
-            }
-            dir.sync_all()?;
-            Ok(())
-        })();
-
-        let temp = cstring(&temp)?;
-        // SAFETY: cleanup addresses only our unique temporary basename.
-        unsafe {
-            libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+        if replacement.as_bytes() == original {
+            return Ok(());
         }
-        result
+        self.stage_update(path, &original, replacement.as_bytes(), cancelled)?
+            .commit()
     }
 }
