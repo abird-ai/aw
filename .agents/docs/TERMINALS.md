@@ -76,6 +76,10 @@ feature-boundary, formatting and scoped Clippy gates passed; see
 
 **Limit:** Already-running Workspace-owned PTYs are **not transferable**
 to the new broker. They still require the original Workspace owner.
+Linux-only, non-user-facing checkpoint/escrow primitives (`207c552`)
+can stage parser state and actual master/pidfd while the original
+reader is paused; this is **not** a committed child-custody handoff,
+and there is no `terminal-promote` command.
 No shell survives broker SIGKILL or OS reboot by promise, and
 remote/multi-user control and Windows/macOS host acceptance remain open.
 

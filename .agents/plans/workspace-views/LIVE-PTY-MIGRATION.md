@@ -20,8 +20,8 @@
   its earlier “unimplemented” notes are superseded for this Linux path.
 
 
-Status: **FD+pidfd escrow and reversible reader gate verified; production migration NOT implemented**
-Linux source: `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a`, `a1100a9d344c5835eb73dedc673e55570ad17219`, `635e1ec6e6763caf438999b1551932b5e37bfa81`
+Status: **FD+pidfd escrow, reader quiescence, bounded parser replay and source-bound staging verified; production migration NOT implemented**
+Linux source: `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a`, `a1100a9d344c5835eb73dedc673e55570ad17219`, `635e1ec6e6763caf438999b1551932b5e37bfa81`, `207c55215ec15407946e25c34e0f3aefdbaff345`
 Owner: @pvl (Workspace views)
 
 ## Decision
@@ -64,6 +64,37 @@ state. The child can still emit output into the kernel PTY buffer while
 paused; this does **not** complete parser serialization, child effect
 acknowledgment or migration between processes.
 
+## Bounded checkpoint and reversible kernel stage — signed `207c552`
+
+Source quiesces its single reader and command queue; `Quiesced::checkpoint`
+records a bounded, sanitizer-filtered event stream from initial PTY spawn
+rather than rebuilding from visible cells. Parser replay handles successful
+resizes, inactive/alternate screen and input modes without resending
+historical device-status replies. A future adopted live parser must answer
+*new* DSR queries only once; `Replayed::process_live` supports that,
+separate from passive inspection.
+
+`Quiesced::stage` asks the original worker for an atomic master/pidfd pair
+*after* its reader ACK. It can stage once per generation; the `Staged`
+handle borrows the original quiescence guard for its entire lifetime,
+preventing release of source reader exclusivity during transmission.
+Source termination rejects unsent escrow. `send_once` never retries
+a possibly accepted kernel send. Kernel FDs, replay bytes or same UID
+still carry **no** right to activate an input/output reader.
+
+Real independent-process integration validates the original live pidfd,
+escrowed PTY master, exact terminal identity and checkpoint; receiver
+only inspects and closes them. Original Bash resumes and accepts a new
+command with its original PID and parser state. No new PTY, Agent,
+provider call, Store transaction or retained user token.
+
+**Remaining irreversible boundary:** Broker must prepare a bounded,
+identity-checked, owner-fenced recipient, source must transfer child
+custody without triggering `ChildGuard` termination, and recipient must
+activate exactly once after a committed release with deterministic
+crash/UNKNOWN behavior. Before those gates, **do not** expose
+`terminal-promote` or claim source-process survival.
+
 ## Ownership invariants
 
 1. **One reader:** exactly one process may consume output from the master FD at any instant. Duplicating the FD is not transferring the driver, its blocking reader thread, or VT100 parser.
@@ -77,8 +108,9 @@ acknowledgment or migration between processes.
 ## Implementation gates
 
 - [x] Add reversible Linux single-reader quiescence, deny input/resize, drain queued commands/output/replies before pause ACK and resume on guard drop, failure or timeout. Signed `635e1ec`. **Not yet wired** to the broker adoption or owner-release transaction.
-- [ ] Define a bounded **complete parser checkpoint** with round-trip tests for alternate screen, preexisting main screen, scrollback, partial CSI/UTF-8, color and input modes. Reject unsupported state without discarding the original process.
+- [x] Define a bounded **replay-based parser checkpoint** (8 MiB memory journal, up to 48 MiB wire, 32,768 events) and real-PTY/cross-process round trips for main/alternate screen, scrollback, partial sanitizer/UTF-8, color, resize and input modes. Invalid/overflowed history fails closed with original process intact. Replay discards historical device-status responses.
 - [x] Linux-owned `pidfd_open`/poll observation and **atomic two-FD `SCM_RIGHTS` master+pidfd escrow** verified in real two-process Bash tests. Neither is wired to the product migration path.
+- [x] Add one-shot **staged kernel custody** under a borrowed reader-pause guard: original driver duplicates its actual PTY master and opens a live child pidfd only for that generation. Real independent process receives both FDs plus parser checkpoint, validates them and declines without reading/replaying; source continues. This is not an adoption commit.
 - [ ] Introduce a separately tested **adopted-process lifecycle** using transferred pidfd, signal/reap responsibility and `ChildGuard` disarm only after signed original-owner commit. Broker must reject wrong root/terminal/epoch/identity.
 - [ ] Implement explicit `Prepared → Quiesced → FD Received → Original Released → Broker Active` protocol. The recipient holds the FD but **does not read** before source's release; source retains complete rollback until then. Expiring offers are one-use and scoped to one exact source lifetime.
 - [ ] Integrate a deliberately invoked `terminal-promote` command **only after** complete safety gates; retain current running shell PID and terminal contents throughout; no fallback new shell.

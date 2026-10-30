@@ -203,7 +203,7 @@ Design and binding decisions: [README.md](README.md).
 - [x] One exclusive RAII guard; drop, failure and at-most-five-second admission timeout resume original reader. Generations fence stale/cancelled replies. Original-owner termination is still available. No shell/input replay.
 - [x] Actual Bash tests: same PID, denied input/resize/concurrent gate, deferred shell output consumed on resume, **24 rapid rollback/retry cycles**, safe shutdown, and unchanged original in-process alternate-screen, SGR and bracketed-paste modes. Platform tests confirm poll doesn't read and duplicated FD remains valid after original closes.
 - [x] **Signed exact-HEAD** pinned Nix: **1,338 non-Store Rust** (4 ignored), Store lib **201**, Store integrations **156**, Node **174**, web-only Rust **139**. Strict platform/terminal all-targets and CLI-library Clippy, fmt, Workspace/minimal builds, binary `aw 0.15.0` and 8/8 identical Vite artifacts passed; split Cargo coverage.
-- [ ] Production migration remains open: complete parser/scrollback/partial-escape checkpoint, pidfd custody and `ChildGuard` disarm, authenticated broker activation and release/rollback/UNKNOWN fencing. No user-facing `terminal-promote`.
+- [ ] Production migration remains open: the later `207c552` milestone verifies bounded parser checkpoint and reversible escrow, but adopted child custody/`ChildGuard` disarm, broker activation and release/rollback/UNKNOWN fencing remain unimplemented. No user-facing `terminal-promote`.
 
 ### `a1100a9d344c5835eb73dedc673e55570ad17219` — atomic PTY-master plus pidfd escrow (kernel-only)
 
@@ -218,6 +218,14 @@ Design and binding decisions: [README.md](README.md).
 - [x] VT100 parser test confirms visible-cell reconstruction is insufficient for lossless migration: formatted output does not preserve **alternate-screen ownership**. Reader quiescence, complete parser state, child guard/pidfd, and atomic commit remain hard gates.
 - [x] Pinned source candidate: `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` (**1,330 passed; 4 ignored**), Store library (**201 passed**), five Store integration targets (**156 passed**), browser Node (**174 passed**), web-only Rust (**139 passed**), strict platform/terminal/library Clippy, formatting and Workspace/minimal builds; 8/8 byte-identical browser assets. This is split-package coverage, not a claimed monolithic Cargo run.
 - [x] Full protocol constraints and next acceptance steps recorded in [Live PTY migration design](LIVE-PTY-MIGRATION.md). **Do not add `terminal-promote` or mark live migration implemented** until the complete production acceptance gate passes.
+
+### `207c55215ec15407946e25c34e0f3aefdbaff345` — bounded paused-PTY checkpoint and staged owner FD escrow
+
+- [x] Linux-only, **memory-only 8 MiB VT100 journal** records sanitized PTY bytes and successful resize ordering from original spawn; event cap 32,768, bounded 48 MiB transfer envelope. Full replay retains main/alternate screen, scrollback, SGR/cursor, Unicode and input modes, with partial sanitizer/filter state and no repeated device-status replies. Unsupported/overflowed history fails closed while source PTY remains usable.
+- [x] Only the exact **acknowledged original-reader quiescence** can stage one kernel-atomic PTY master + child pidfd pair. The original driver checks live child identity and pending-input drain; sender escrow borrows the reader-pause guard, so it cannot outlive source exclusivity. One send only, even after ambiguous transport outcomes. Original termination revokes an unsent stage.
+- [x] Actual independent-process Linux test receives the *same original* PTY master, pidfd and bounded parser checkpoint, verifies child identity/modes, performs **no shell input or PTY read**, rejects adoption, then exits; the original Bash continues with unchanged terminal ID and newly accepted input after rollback. Additional tests cover initial alternate/scrollback/resize/partial state, passive-versus-live DSR handling, replay/invalid checkpoint denial, oversized state, and stage refusal.
+- [x] **Signed exact source HEAD**: split Rust `cargo test --workspace --locked --exclude aw-store -- --test-threads=4` (**1,354 passed, 4 ignored**), Store library (**201 passed**), five Store integrations (**156 passed**), 12 browser Node suites (**174 passed**), web-only Rust (**139 passed**); strict all-targets terminal and CLI-library Clippy, formatting, Workspace/minimal feature checks, `aw 0.15.0` binary, 8/8 identical Vite assets. Focused exact-HEAD PTY **17** and staging **5** tests passed. Split Cargo coverage, not a claimed monolithic run.
+- [ ] Still no production promotion: the sender's `ChildGuard` remains armed, receiver has no owner-commit acknowledgment or adopted PTY driver, and no owner-death/unknown commit fencing. An FD/checkpoint receipt is **not** permission to read or replay the live shell. No `terminal-promote` CLI or saved-layout authority was added.
 
 ### `62f3735aedf07e364a98bc2453e1d7f33c83a3c3` — exact pidfd exit facts, custody still pending
 
@@ -270,7 +278,7 @@ Design and binding decisions: [README.md](README.md).
 Historical pending scope before this transaction, retained verbatim and
 superseded for Linux by the checked implementation above:
 
-- [ ] **Live migration of an already-running Workspace-owned PTY** remains unimplemented. Kernel-atomic PTY master + pidfd transfer is a proven prerequisite, **not a completed promotion**. The reversible single-reader barrier is verified; complete parser/scrollback/escape checkpoint, adopted child custody with `ChildGuard` disarm, and authenticated release/rollback/UNKNOWN fencing remain open. Newly created broker-owned PTYs survive launcher/frontend exit, not broker SIGKILL or reboot. Remote/multi-machine control and Windows/macOS certification remain separate.
+- [ ] **Live migration of an already-running Workspace-owned PTY** remains unimplemented. Reader-pause, bounded parser checkpoint and staged PTY/pidfd escrow are verified prerequisites, **not a completed promotion**. Adopted child custody/`ChildGuard` disarm, broker activation and authenticated irreversible release/rollback/UNKNOWN fencing remain open. New broker-owned shells survive launcher/frontend exit, not broker SIGKILL or reboot. Remote/multi-machine control and Windows/macOS certification remain separate.
 
 ## Uncommitted
 
