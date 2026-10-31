@@ -1,4 +1,82 @@
-# Current native tool surface — dotlink-aligned (2026-10-26)
+# Current AI-native filesystem tool surface — DL-150 (2026-10-31)
+
+Source of truth: dotlink's DL-150 approved specification, applied to AW
+with aw-tools-core as the shared, transport-neutral engine and aw-tools as
+the Agent ToolPolicy/TurnJournal adapter. Dotlink itself is unchanged.
+
+- Off (default): no model tools.
+- Read-only: ls, find, grep, read, bread.
+- RW: all read tools plus write, edit, patch, cp, mv, rm, bwrite, bedit.
+- Full: RW plus explicit unsandboxed bash or pwsh (Windows) grant.
+- Old workspace/trusted CLI mode spellings remain accepted.
+- All tool visibility intersects selected-tool limits, source/actor grants
+  and the original bound Agent Envelope; no feature enables authority.
+
+ls inspects one directory; find locates names/types/metadata recursively;
+grep scans contents with a filename glob. Meta columns are opt-in.
+Time names mtime, ctime, btime are precise, with unavailable reported
+as -; hidden and gitignore default false. Results are compact lines,
+more offset and incomplete coverage markers are independent and
+explicit, and writes return ok/unchanged.
+Edit uses path and compact edits=[[old,new,all?],...] tuples against one
+original snapshot; overlaps are denied before the single publication.
+Legacy multi-file and singular edit shapes remain AW input-only adapters. Read uses canonical line/lines/byte UTF-8 continuation; old
+offset/limit is input-only compatibility. AW currently represents
+partial numbered=false reads as JSON data/status rather than native
+multiple MCP content blocks. The persistent child-session SQLite mode
+continues to store workspace even when the CLI displays rw.
+Patch advertises strict Codex Update/Add only; legacy best_effort is
+input-only. Cp copies bounded directory trees by default without an advertised
+recursive flag. Exact cp/mv/rm avoid
+shell-style globs, destination inference, overwrite or fallback. Native
+Unix/Windows lifecycle adapters reuse pinned root, mutation guards and
+private staged publication; macOS uses no-replace exclusive rename when
+supported. Runtime Windows/macOS and native sandbox isolation are
+separate acceptance gates.
+
+Build presets: aw-tools-core read-only, rw, full; pure sealed batch graph
+compiler and advisory shell writes-scope validation are now present, but
+model-facing batch/replay is pending host journal integration.
+Specialized read/write/
+binary/lifecycle/async/durable/sandbox. Feature selection never mints
+a model grant. DOTLINK ADOPTION IS A LATER SEPARATE PHASE.
+
+Detailed AW source/verification:
+.agents/plans/dotlink-tool-port/AI-NATIVE-FS-IMPLEMENTATION-2026-10-31.md
+
+---
+
+# Historical native tool surface — shared toolset follow-up (2026-10-30)
+
+Tool algorithms shared with dotlink live in crates/aw-tools-core: synchronous
+core by default, AW-selected async+durable host features, and an optional
+sandbox policy interface. AW's original Agent, ToolRegistry, exact ToolPolicy,
+TurnMachine, durable TurnJournal and model-directed parallel waves remain
+unchanged. Pure shared code cannot mint a tool grant, launch a durable job,
+read a credential or bypass the scoped filesystem backend.
+
+The post-sync tool update raises bounded exact edits to 512 operations /
+64 files with a 64 MiB aggregate original+working budget and 48 KiB AW
+argument envelope; moves patch KMP/EOF/CRLF matching, streaming binary
+splices and cross-platform read windows into the shared crate; and uses
+bounded preflight receipts, a 4,096-file candidate/32 MiB content search
+budget and exhaustive incomplete-reasons metadata.
+
+AW retains synchronous native shell and durable Agent/Session/Process
+ownership. Dotlink's background job_* API and JobManager are **not**
+implicitly registered in AW: their opt-in task budget, acknowledgement,
+output-spool and host-ownership contracts are shared, but an AW adapter must
+first use its existing exact owner/journal and no-replay semantics. A sandbox
+feature provides no OS isolation until a host-approved sandbox adapter exists.
+True typed MCP media remains separate from native encoded JSON.
+
+See crates/aw-tools-core/README.md and
+.agents/plans/dotlink-tool-port/PORT-RESULTS-2026-10-30.md for exact
+fully/adapted/partial/skipped inventory and validation gates.
+
+---
+
+# Historical native tool surface — dotlink-aligned (2026-10-26)
 
 This is the current native tool contract; older R2a/Phase-3 descriptions below
 are dated history. AW retains its original Agent/TurnMachine/ToolRegistry/
@@ -255,3 +333,172 @@ The root-only `team` tool accepts only `task` plus optional `title`. A host-sele
 ## Phase 49 planner output is not tool authority
 
 The root `plan` tool can request a bounded generative task proposal, but planner output is data only. Task roles are semantic labels and cannot grant files, shell, worktree, route/account/model, depth or budget authority. Each planned task is executed through the already configured subagent Service, so its effective local tools remain exactly the host-selected `off`, `read-only` or `workspace` grant and `trusted`/bash remains forbidden for these children. The planner provider invocation itself is tool-free.
+
+
+### Shared toolset follow-up — 2026-10-30
+
+- AW's supervised Process uses RAII stdout/stderr writer leases, seals reader
+  registration on terminal settle, and requires completed writers before
+  publishing a complete output receipt.
+- Inert `ProcessOutputPage` provides bounded exact head/tail pages; missing
+  middle bytes are explicit. Monotonic acknowledgement is permitted only for
+  the contiguous bytes actually delivered, never an unseen suffix.
+- `bread(format=mcp)` now carries SHA-256 and a conservative MIME source
+  derived from bounded complete-file magic rather than an extension, but
+  **remains encoded JSON**, not typed provider/MCP media.
+- `aw-tools-core/sandbox` validates host-specified paths, symlink/reparse
+  exclusions, nested writes and broad-root write opt-in. It cannot start or
+  certify a sandbox; AW trusted shells remain unsandboxed.
+- Validation of TS-N1..N5: 38 shared-core, 68 native-tool, 15 Unix platform
+  tests; Windows GNU all-target compile and strict Clippy passed using the
+  ignored l5 dependency-adjusted fixture. Original pinned full-workspace
+  Cargo remains blocked by l5 registry/TLS, not reported as passing.
+
+### TS-N6..N10 tooling continuation — 2026-10-31
+
+- `aw-tools-core/task_fence`: exact host actor/source epoch/execution site/
+  session/branch/call/effect and generation must match on every task
+  operation. AW's host-only FencedProcessSpools enforces this for output
+  summaries, pages and acknowledgements. Every terminal transition requires
+  actual writer quiescence.
+- Host-authorized PipeProcess may opt into `HostSpoolFiles` with pre-opened
+  independent stdout/stderr files. The shared 64 MiB/stream and 512 MiB/session
+  limits bound retained bytes, while all discarded bytes are still counted.
+  Fast overflow accounting avoids blocking disk work after quota exhaustion.
+  No second task manager, implicit background job or model-owned spool path.
+- A bounded `MediaPacket` rechecks complete bytes, SHA-256 and MIME signature
+  before an explicit provider host can attach bytes. Native `bread` remains
+  `transport:"encoded_json"`; this is **not** a provider-native ContentBlock.
+- Linux `BwrapPlan` is an opt-in host-only executable plan using pinned
+  workspace/runtime/binary FDs, a no-network default and RAII child ownership.
+  It is not registered under AW's trusted shell. Native l5 sandbox smoke
+  failed to mount /proc (EPERM), so no runtime sandbox certification is claimed.
+- Real AW pinned Cargo.lock validated: 51 shared-core all-feature tests,
+  72 native tool tests, 15 Unix platform, 70 Agent-core active tests,
+  383 CLI binary and 226 CLI library active tests; workspace all-target
+  compilation, strict Clippy, Windows GNU cross-compilation and no_std passed.
+  The monolithic full-workspace test did not produce a terminal result.
+
+### Windows mutation-admission interoperability — 2026-10-31
+
+Windows native scoped mutations reserve a separate pathname admission
+mutex before the path mutex and file resolution. Both mutex namespaces
+use invariant Windows UTF-16 uppercase SHA-256 identities compatible with
+current dotlink. One cancel/deadline budget is shared; permissions remain
+with AW ToolPolicy. Cross-target compilation passes; native Windows
+cross-process runtime verification is still pending.
+
+### Fresh tool correctness pass — 2026-10-31
+
+- Shared spool truncation is irreversible and quota is RAII-owned.
+  Preflight requires distinct R/W regular file handles on both Unix
+  and Windows. Quiescence and successful output are separate facts:
+  Failed/Uncertain settlement is possible after persistence errors,
+  but Completed still requires valid stored output.
+- One bounded blocking writer per pipe uses 64KiB batches, with no
+  batch allocation when the host has not enabled durable spooling.
+- Grep marks oversized skipped files as partial results and prefers
+  the matching source line over optional excessive context.
+- Binary no-ops revalidate the complete source; patch additions use
+  linear lookahead; pinned sandbox authorization survives pathname
+  replacement and sandbox Drop reaps killed child processes.
+- Source and tests: tooling plan REVIEW-FIX-2026-10-31.md.
+
+### TS-N11..N20 shared tooling — 2026-10-31
+
+- Task transitions require durable journal-first CAS. Unknown/panicking
+  journal effects fence the local projection pending original-host
+  inspection; no automatic replay.
+- A versioned spool checkpoint verifies pinned file identity, exact SHA
+  digest, source epoch, generation, immutable output bytes and historical
+  ACKs before host-handle recovery. Quota is recharged exactly.
+- Uncertain effects cannot be expired; retention cleanup requires an
+  authenticated settled task and actual host disposal. Host-only bounded
+  TaskOps is bridged to the original Process owner without new grants.
+- Provider-declared typed media MIME/byte policy is explicit; current
+  native bread output remains encoded JSON. Linux sandbox plans refuse
+  nested user namespaces and expose checked launcher outcomes.
+- Shared output-prefix accounting permanently prevents gap refills;
+  platform execution and original Agent/TurnJournal remain authoritative.
+- Exact implementation/test gates and remaining storage, native runtime
+  and model-facing job integrations: tooling plan NEXT-TEN-2026-10-31.md.
+
+### Post-N20 eight-cycle correctness audit — 2026-10-31
+
+Checkpoint hashing uses positional reads without shared cursor effects;
+snapshots reject unsettled tasks or Completed with failed output.
+Ambiguous journal callbacks fence future operations, and CAS proposals
+carry exact task-binding identity. Retention cleanup is exclusive within
+the lease owner and persists confirmed-release state. Host media and
+Process source/cancellation callback panics fail closed or return a
+durable unknown-effect classification. Media attachment errors and panics
+both preserve unknown-delivery semantics. Spool byte quotas transfer only
+after StreamSummary commits. Regression/validation: tooling plan
+REVIEW-FIX-N20-2026-10-31.md; native runtime gates remain open.
+
+
+Post-N20 final eight-pass audit result: original Cargo.lock regression
+suites pass (34 shared sync, 85 shared all-features, 81 native tools,
+15 Unix, 70 active Agent, 383 CLI binary, 226 CLI library); workspace
+all-targets compile, strict Clippy, Windows GNU cross-compile and
+no_std+alloc compile pass. Native runtime and monolithic workspace-test
+completion remain separate open gates. Source/evidence:
+tooling plan REVIEW-FIX-N20-2026-10-31.md.
+
+
+### Sealed DL-150 current validation (2026-10-31)
+
+Original pinned AW feature suites passed: aw-tools-core read-only 41,
+rw 64, full 120; aw-tools 96; Unix platform 15; Agent 70 active;
+AW CLI binary 383 and library 226. Strict Clippy, workspace compilation,
+Windows GNU cross-compilation, no_std+alloc and formatting passed.
+The shared batch schema/compiler and cumulative progress types are
+reusable but do not register model-visible batch execution or durable
+subcalls. Complete platform backend extraction and dotlink consumption
+remain future validated phases; no alternate filesystem authority exists.
+
+
+The sealed dotlink V2 shared durable-job specification at 8a3e7bb
+requires one execution lifecycle and ID namespace for shell and batch,
+automatic resume rather than re-execution, explicit job_restart,
+and terminal-before-dependent journal checkpoints. AW's pure batch
+compiler now treats .err as known fail/partial only; .uncertain is
+an explicit branch. Model-facing durable batch/job integration is still
+pending the original AW host journal and Process owner.
+
+
+Dotlink sealed a156142: V2 uses one canonical Job(Graph[Node]) execution
+owner for standalone bash/pwsh, explicit job_start and batch. It remains a
+future integration to AW's original journal and Process supervisor; it
+must not create a second execution manager. AW's Windows model shell
+name is pwsh, with powershell retained only as selected-tool input alias.
+
+## Latest shared engine validation — 2026-10-31
+
+Source and test record: owned tooling plan CORE-ENGINE-RESUME-2026-10-31.md.
+aw-tools-core is the reusable synchronous filesystem planning/execution
+engine. aw-tools-fs-unix/win provide the original pinned/no-follow
+native backends. aw-tools is the one AW Agent/ToolPolicy adapter;
+write/edit/copy/mv/rm all use shared operations with original locks.
+Pure Job(Graph) source-bound journal replay and no-launch proof are
+validated but not registered as model-facing batch/job_*: original AW
+TurnJournal and Process owner must control execution and recovery.
+
+
+## Current c34ea5a sealed DL-150 parity checkpoint (2026-10-31)
+
+Complete source-of-truth spec: owned dotlink-tool-port/reference/
+DL150-SEALED-c34ea5a-README.md and TODO.md. Fresh implementation
+parity review: dotlink-tool-port/PARITY-AUDIT-2026-10-31.md.
+Handoff and copy-ready next agent prompt:
+dotlink-tool-port/NEXT-AGENT-HANDOFF-2026-10-31.md.
+
+Recent shared fixes: caller-root .gitignore isolation, bounded invalid
+ignore as incomplete coverage, canonical slash-vs-basename glob,
+no non-advancing discovery first page, unaddressable UTF-8 filename
+path_encoding report, and complete atomic grep hit/context records.
+No new model grant, shell permission, process supervisor or database.
+High-priority pending: final-symlink dual authorization; protected
+recursive mutation descendants; exact grep context group coalescing;
+host-owned journaled Job(Graph) execution and provider-native
+data/control ContentBlocks.
