@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::MutexGuard,
 };
@@ -18,7 +18,6 @@ use windows_sys::Win32::{
 };
 
 const MAX_BATCH_FILE: usize = 64 * 1024 * 1024;
-const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
 static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 fn regular(file: &File) -> Result<u64> {
     let meta = file.metadata()?;
@@ -42,59 +41,29 @@ fn stream_bytes(file: File, cap: usize) -> Result<Vec<u8>> {
     Ok(data)
 }
 /// Skipped lines must not allocate, but also cannot scan an unlimited file.
-fn skip_line(
-    reader: &mut BufReader<File>,
-    scanned: &mut usize,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<bool> {
-    let mut seen = false;
-    loop {
-        if cancelled() {
-            return Err(ScopedError::Cancelled);
-        }
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            return Ok(seen);
-        }
-        let end = buf.iter().position(|&byte| byte == b'\n');
-        let take = end.map_or(buf.len(), |at| at + 1);
-        if buf[..take]
-            .iter()
-            .any(|byte| matches!(byte,0..=8 | 11..=12 | 14..=31 | 127))
-        {
-            return Err(ScopedError::Denied("binary file; use bread"));
-        }
-        *scanned = scanned.saturating_add(take);
-        if *scanned > MAX_READ_SCAN_BYTES {
-            return Err(ScopedError::Limit(
-                "read offset requires scanning more than 32 MiB",
-            ));
-        }
-        reader.consume(take);
-        if end.is_some() {
-            return Ok(true);
-        }
-        seen = true;
+fn digest_file(file: File) -> Result<(u64, [u8; 32])> {
+    let size = regular(&file)?;
+    if size > MAX_BATCH_FILE as u64 {
+        return Err(ScopedError::Limit("binary source exceeds 64 MiB"));
     }
-}
-fn next_line(reader: &mut BufReader<File>, cap: usize) -> Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
+    let mut reader = file;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
     loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            return Ok(if line.is_empty() { None } else { Some(line) });
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
         }
-        let newline = buf.iter().position(|&byte| byte == b'\n');
-        let take = newline.map_or(buf.len(), |at| at + 1);
-        if take > cap.saturating_sub(line.len()) {
-            return Err(ScopedError::Limit("one line exceeds tool byte limit"));
+        total = total
+            .checked_add(n as u64)
+            .ok_or(ScopedError::Limit("binary source size overflow"))?;
+        if total > MAX_BATCH_FILE as u64 {
+            return Err(ScopedError::Limit("binary source grew past 64 MiB"));
         }
-        line.extend_from_slice(&buf[..take]);
-        reader.consume(take);
-        if newline.is_some() {
-            return Ok(Some(line));
-        }
+        digest.update(&buffer[..n]);
     }
+    Ok((total, digest.finalize().into()))
 }
 /// Cross-process, thread-affine Windows named mutex. Same canonical path
 /// hashing and kernel namespace as dotlink, so the tools coordinate.
@@ -113,25 +82,69 @@ pub struct MutationGuard<'a> {
     _local: MutexGuard<'a, ()>,
     _names: Vec<NamedMutationLock>,
 }
-fn named_lock_key(path: &std::path::Path) -> String {
-    let hash = Sha256::digest(path.to_string_lossy().to_lowercase().as_bytes());
+/// Match dotlink's Windows mutation name identity exactly: invariant
+/// Windows UTF-16 uppercase mapping, then SHA-256 over little-endian
+/// code units. Rust Unicode case-folding would choose different mutexes
+/// for case-equivalent NTFS names.
+fn named_lock_key(path: &std::path::Path, scope: &str) -> Result<String> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Globalization::{
+        LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT,
+    };
+    let source = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let count = i32::try_from(source.len())
+        .map_err(|_| ScopedError::Limit("mutation path exceeds UTF-16 length"))?;
+    // SAFETY: fixed valid UTF-16 input; first call sizes destination.
+    let required = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            count,
+            ptr::null_mut(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
+    if required <= 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut mapped = vec![0u16; required as usize];
+    // SAFETY: destination matches kernel-provided length.
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            count,
+            mapped.as_mut_ptr(),
+            required,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
+    if written != required {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut hash = Sha256::new();
+    for unit in mapped {
+        hash.update(unit.to_le_bytes());
+    }
     let digest = hash
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!("Global\\abird-dotlink-path-{digest}")
-}
-struct CreatedDir {
-    path: PathBuf,
-    volume: u32,
-    index: u64,
+    Ok(format!("Global\\abird-dotlink-{scope}-{digest}"))
 }
 fn directory_identity(file: &File) -> Result<(u32, u64)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     };
-    // SAFETY: an opened directory HANDLE and an initialized output buffer.
     let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(io::Error::last_os_error().into());
@@ -141,42 +154,15 @@ fn directory_identity(file: &File) -> Result<(u32, u64)> {
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     ))
 }
-fn cleanup_created_dirs(dirs: &mut Vec<CreatedDir>) {
-    for created in dirs.drain(..).rev() {
-        let Ok(file) = pin_directory(&created.path) else {
-            continue;
-        };
-        let matches = directory_identity(&file)
-            .is_ok_and(|(volume, index)| volume == created.volume && index == created.index);
-        drop(file);
-        if matches {
-            // Refuse any nonempty directory; a noncooperating same-user writer
-            // may still race the check, so never recursively remove anything.
-            let _ = fs::remove_dir(&created.path);
-        }
-    }
-}
-/// Own newly created parents until the staged write is safely published.
 struct PreparedParent {
     parent: Option<Parent>,
-    created: Vec<CreatedDir>,
 }
 impl PreparedParent {
     fn path(&self) -> &std::path::Path {
         &self.parent.as_ref().expect("prepared parent").path
     }
-    fn release(mut self) -> (Parent, Vec<CreatedDir>) {
-        (
-            self.parent.take().expect("prepared parent"),
-            std::mem::take(&mut self.created),
-        )
-    }
-}
-impl Drop for PreparedParent {
-    fn drop(&mut self) {
-        // Windows directory handles deny delete sharing; release before rmdir.
-        drop(self.parent.take());
-        cleanup_created_dirs(&mut self.created);
+    fn release(mut self) -> Parent {
+        self.parent.take().expect("prepared parent")
     }
 }
 impl Root {
@@ -212,13 +198,21 @@ impl Root {
                 }
             }
         };
-        let mut keys = BTreeSet::new();
+        // The newest dotlink protocol acquires lexical pathname admissions
+        // before canonical mutation locks. Use separate namespaces so one
+        // request can own both without self-deadlocking.
+        let mut admissions = BTreeSet::new();
+        let mut targets = BTreeSet::new();
         for path in paths {
             validate_path(path)?;
-            keys.insert(named_lock_key(&self.root.join(path)));
+            let lexical = self.root.join(path);
+            admissions.insert(named_lock_key(&lexical, "admission")?);
+            targets.insert(named_lock_key(&lexical, "path")?);
         }
-        let mut locks = Vec::new();
-        for key in keys {
+        let mut locks = Vec::with_capacity(admissions.len() + targets.len());
+        // One absolute deadline applies to both tiers; cancellation is
+        // checked during every kernel mutex wait.
+        for key in admissions.into_iter().chain(targets) {
             let wide = key.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
             // SAFETY: NUL-terminated name and an initially unowned mutex.
             let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
@@ -254,6 +248,52 @@ impl Root {
             _names: locks,
         })
     }
+    /// No-follow metadata on a pinned Windows parent chain. Unavailable
+    /// status-change timestamps stay None, never synthesized from birth time.
+    pub fn entry_meta(&self, path: &str) -> Result<aw_tools_core::filesystem::EntryMeta> {
+        use aw_tools_core::filesystem::{EntryMeta, Kind};
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        let (_parent, target) = self.parent(path)?;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&target)?;
+        let stat = file.metadata()?;
+        let kind = if stat.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            if stat.file_type().is_symlink() {
+                Kind::Symlink
+            } else {
+                Kind::Other
+            }
+        } else if stat.is_dir() {
+            Kind::Dir
+        } else if stat.is_file() && super::super::file_link_count(&file)? == 1 {
+            Kind::File
+        } else {
+            Kind::Other
+        };
+        Ok(EntryMeta {
+            kind,
+            size: if kind == Kind::File {
+                Some(stat.len())
+            } else {
+                None
+            },
+            mtime: stat.modified().ok(),
+            ctime: None,
+            btime: stat.created().ok(),
+            mode: None,
+        })
+    }
+
     /// Metadata through a validated parent chain; neither directory nor
     /// regular-file handles permit following reparse points.
     pub fn entry_info(&self, path: &str) -> Result<(u64, Option<std::time::SystemTime>)> {
@@ -325,110 +365,47 @@ impl Root {
         numbered: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, bool)> {
-        if offset == 0 || limit == 0 || cap == 0 || cap > MAX_BATCH_FILE {
-            return Err(ScopedError::Limit("invalid file window"));
-        }
         let (_parent, target) = self.parent(path)?;
         let file = super::super::open_nofollow_read(&target)?;
         regular(&file)?;
         let mut reader = BufReader::new(file);
-        let mut scanned = 0usize;
-        for _ in 1..offset {
-            if !skip_line(&mut reader, &mut scanned, cancelled)? {
-                return Err(ScopedError::Denied("read offset is past the end of file"));
-            }
-        }
-        let mut output = Vec::new();
-        let mut truncated = false;
-        for row in 0..=limit {
-            if cancelled() {
-                return Err(ScopedError::Cancelled);
-            }
-            if row == limit {
-                truncated = !reader.fill_buf()?.is_empty();
-                break;
-            }
-            let Some(line) = next_line(&mut reader, cap)? else {
-                if row == 0 && offset != 1 {
-                    return Err(ScopedError::Denied("read offset is past the end of file"));
-                }
-                break;
-            };
-            let prefix = if numbered {
-                format!("{}\t", offset + row).into_bytes()
-            } else {
-                Vec::new()
-            };
-            let body = if numbered {
-                let mut end = line.len();
-                if end > 0 && line[end - 1] == b'\n' {
-                    end -= 1;
-                }
-                if end > 0 && line[end - 1] == b'\r' {
-                    end -= 1;
-                }
-                let mut v = line[..end].to_vec();
-                v.push(b'\n');
-                v
-            } else {
-                line
-            };
-            if output
-                .len()
-                .saturating_add(prefix.len())
-                .saturating_add(body.len())
-                > cap
-            {
-                truncated = true;
-                break;
-            }
-            output.extend(prefix);
-            output.extend(body);
-        }
-        Ok((
-            String::from_utf8(output).map_err(|_| ScopedError::Denied("file is not UTF-8 text"))?,
-            truncated,
-        ))
+        aw_tools_core::read::window(&mut reader, offset, limit, cap, numbered, cancelled).map_err(
+            |error| match error {
+                aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
+                aw_tools_core::read::ReadError::Denied(message) => ScopedError::Denied(message),
+                aw_tools_core::read::ReadError::Limit(message) => ScopedError::Limit(message),
+                aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+            },
+        )
     }
-    fn parent_for_write(&self, path: &str) -> Result<(PreparedParent, PathBuf)> {
-        validate_path(path)?;
-        let mut parts: Vec<&str> = path.split('/').collect();
-        parts.pop();
-        let mut prepared = PreparedParent {
-            parent: Some(Parent {
-                path: self.root.clone(),
-                directories: Vec::new(),
-            }),
-            created: Vec::new(),
-        };
-        for part in parts {
-            let parent = prepared.parent.as_mut().expect("prepared parent");
-            parent.path.push(part);
-            let next = match pin_directory(&parent.path) {
-                Ok(opened) => opened,
-                Err(ScopedError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                    let made = match fs::create_dir(&parent.path) {
-                        Ok(()) => true,
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-                        Err(error) => return Err(error.into()),
-                    };
-                    let opened = pin_directory(&parent.path)?;
-                    if made {
-                        let (volume, index) = directory_identity(&opened)?;
-                        prepared.created.push(CreatedDir {
-                            path: parent.path.clone(),
-                            volume,
-                            index,
-                        });
-                    }
-                    opened
-                }
-                Err(e) => return Err(e),
-            };
-            parent.directories.push(next);
-        }
-        let target = self.root.join(path);
-        Ok((prepared, target))
+    /// DL-150 resumable line/byte window, entirely on a previously
+    /// authorized regular file descriptor. Exact UTF-8 boundaries are
+    /// determined by aw-tools-core, independently of the host platform.
+    pub fn read_page_with_cancel(
+        &self,
+        path: &str,
+        request: aw_tools_core::read::PageRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<aw_tools_core::read::Page> {
+        let (_parent, target) = self.parent(path)?;
+        let file = super::super::open_nofollow_read(&target)?;
+        regular(&file)?;
+        let mut reader = BufReader::new(file);
+        aw_tools_core::read::page(
+            &mut reader,
+            request.line,
+            request.lines,
+            request.byte,
+            request.cap,
+            request.numbered,
+            cancelled,
+        )
+        .map_err(|error| match error {
+            aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
+            aw_tools_core::read::ReadError::Denied(reason) => ScopedError::Denied(reason),
+            aw_tools_core::read::ReadError::Limit(reason) => ScopedError::Limit(reason),
+            aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+        })
     }
     pub fn stage_create(
         &self,
@@ -455,21 +432,163 @@ impl Root {
     ) -> Result<StagedWrite> {
         self.stage(path, data, StageKind::Update(expected), cancel)
     }
+    pub fn open_regular(&self, path: &str) -> Result<File> {
+        let (_parent, target) = self.parent(path)?;
+        let file = super::super::open_nofollow_read(&target)?;
+        regular(&file)?;
+        Ok(file)
+    }
+    pub fn stage_stream_create(
+        &self,
+        path: &str,
+        writer: impl FnOnce(&mut File) -> Result<()>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StagedWrite> {
+        self.stage_with(path, StageKind::Create, cancelled, writer)
+    }
+    pub fn stage_stream_update(
+        &self,
+        path: &str,
+        expected: (u64, [u8; 32]),
+        writer: impl FnOnce(&mut File) -> Result<()>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StagedWrite> {
+        self.stage_with(path, StageKind::UpdateDigest(expected), cancelled, writer)
+    }
     fn stage(
         &self,
         path: &str,
         data: &[u8],
         kind: StageKind<'_>,
-        cancel: &dyn Fn() -> bool,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<StagedWrite> {
         if data.len() > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("staged file exceeds 64 MiB"));
         }
-        if cancel() {
+        self.stage_with(path, kind, cancelled, |out| {
+            for chunk in data.chunks(64 * 1024) {
+                if cancelled() {
+                    return Err(ScopedError::Cancelled);
+                }
+                out.write_all(chunk)?;
+            }
+            Ok(())
+        })
+    }
+    fn missing_parent(&self, path: &str) -> Result<Option<(Parent, Vec<String>, String)>> {
+        validate_path(path)?;
+        let mut parts = path.split('/').collect::<Vec<_>>();
+        let leaf = parts.pop().ok_or(ScopedError::Denied("missing target"))?;
+        let mut parent = Parent {
+            path: self.root.clone(),
+            directories: Vec::new(),
+        };
+        for (idx, part) in parts.iter().enumerate() {
+            let next = parent.path.join(part);
+            match pin_directory(&next) {
+                Ok(opened) => {
+                    parent.path = next;
+                    parent.directories.push(opened);
+                }
+                Err(ScopedError::Io(ref err)) if err.kind() == io::ErrorKind::NotFound => {
+                    let missing = parts[idx..]
+                        .iter()
+                        .map(|s| (*s).to_owned())
+                        .collect::<Vec<_>>();
+                    if missing.len() > aw_tools_core::filesystem::lifecycle::MAX_LIFECYCLE_DEPTH {
+                        return Err(ScopedError::Limit("missing parent suffix too deep"));
+                    }
+                    return Ok(Some((parent, missing, leaf.to_owned())));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
+    }
+    fn stage_missing_suffix(
+        &self,
+        parent: Parent,
+        missing: Vec<String>,
+        leaf: String,
+        cancelled: &dyn Fn() -> bool,
+        writer: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<StagedWrite> {
+        let temp = parent.path.join(format!(
+            ".aw-stage-{}-{:016x}.tmp",
+            std::process::id(),
+            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&temp)?;
+        let opened = pin_directory(&temp)?;
+        let identity = directory_identity(&opened)?;
+        drop(opened);
+        let result = (|| -> Result<()> {
+            let mut target = temp.clone();
+            let mut handles = Vec::with_capacity(missing.len());
+            for part in missing.iter().skip(1) {
+                if cancelled() {
+                    return Err(ScopedError::Cancelled);
+                }
+                target.push(part);
+                fs::create_dir(&target)?;
+                handles.push(pin_directory(&target)?);
+            }
+            let filename = target.join(&leaf);
+            let mut output = secure_staging_file(&filename, None)?;
+            writer(&mut output)?;
+            if output.metadata()?.len() > MAX_BATCH_FILE as u64 {
+                return Err(ScopedError::Limit("staged file exceeds 64 MiB"));
+            }
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
+            }
+            output.sync_all()?;
+            drop(output);
+            drop(handles);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            lifecycle::cleanup_stage_tree(&temp, identity);
+            return Err(error);
+        }
+        let published = parent.path.join(&missing[0]);
+        Ok(StagedWrite {
+            parent: Some(parent),
+            target: published,
+            temp,
+            expected: None,
+            create: true,
+            existed: false,
+            committed: false,
+            preserve_on_failure: false,
+            temp_dir_identity: Some(identity),
+        })
+    }
+    fn stage_with(
+        &self,
+        path: &str,
+        kind: StageKind<'_>,
+        cancelled: &dyn Fn() -> bool,
+        writer: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<StagedWrite> {
+        if cancelled() {
             return Err(ScopedError::Cancelled);
         }
-        let (prepared, target) = self.parent_for_write(path)?;
-        let old = match super::super::open_nofollow_read(&target) {
+        if let Some((parent, missing, leaf)) = self.missing_parent(path)? {
+            if matches!(kind, StageKind::Update(_) | StageKind::UpdateDigest(_)) {
+                return Err(ScopedError::Denied("target changed before update"));
+            }
+            return self.stage_missing_suffix(parent, missing, leaf, cancelled, writer);
+        }
+        let (existing, target) = self.parent(path)?;
+        let prepared = PreparedParent {
+            parent: Some(existing),
+        };
+        let old = match if matches!(kind, StageKind::Replace) {
+            super::super::open_nofollow_metadata(&target)
+        } else {
+            super::super::open_nofollow_read(&target)
+        } {
             Ok(file) => {
                 regular(&file)?;
                 if matches!(kind, StageKind::Create) {
@@ -480,33 +599,38 @@ impl Root {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        if old.is_none() && matches!(kind, StageKind::Update(_)) {
+        if old.is_none() && matches!(kind, StageKind::Update(_) | StageKind::UpdateDigest(_)) {
             return Err(ScopedError::Denied("target changed before update"));
         }
-        if let (Some(file), StageKind::Update(expected)) = (&old, kind) {
-            if stream_bytes(file.try_clone()?, MAX_BATCH_FILE)? != expected {
-                return Err(ScopedError::Denied("target changed before update"));
+        if let Some(ref file) = old {
+            match kind {
+                StageKind::Update(bytes)
+                    if stream_bytes(file.try_clone()?, MAX_BATCH_FILE)? != bytes =>
+                {
+                    return Err(ScopedError::Denied("target changed before update"))
+                }
+                StageKind::UpdateDigest(expected)
+                    if digest_file(file.try_clone()?)? != expected =>
+                {
+                    return Err(ScopedError::Denied("binary source changed before staging"))
+                }
+                _ => {}
             }
         }
-        // Secure the still-empty staging file with the existing target's
-        // restrictive DACL before writing *any* user bytes. A default file
-        // created under a more permissive parent must not leak a private file.
         let dacl = old.as_ref().map(|_| file_dacl(&target)).transpose()?;
         let temp = prepared.path().join(format!(
             ".aw-stage-{}-{:016x}.tmp",
             std::process::id(),
             TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        // Install the existing DACL at CreateFileW, not after open. A process
-        // must never observe a temporarily permissive file and keep that handle
-        // while model-generated bytes are written.
         let mut out = secure_staging_file(&temp, dacl.as_deref())?;
         let result = (|| -> Result<()> {
-            for chunk in data.chunks(65536) {
-                if cancel() {
-                    return Err(ScopedError::Cancelled);
-                }
-                out.write_all(chunk)?;
+            writer(&mut out)?;
+            if out.metadata()?.len() > MAX_BATCH_FILE as u64 {
+                return Err(ScopedError::Limit("staged output exceeds 64 MiB"));
+            }
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
             }
             out.sync_all()?;
             Ok(())
@@ -516,20 +640,21 @@ impl Root {
             let _ = fs::remove_file(&temp);
             return Err(error);
         }
-        let (parent, created) = prepared.release();
+        let parent = prepared.release();
         Ok(StagedWrite {
             parent: Some(parent),
-            created,
             target,
             temp,
             expected: match kind {
-                StageKind::Update(bytes) => Some(bytes.to_vec()),
+                StageKind::Update(bytes) => Some(Expected::Bytes(bytes.to_vec())),
+                StageKind::UpdateDigest(digest) => Some(Expected::Digest(digest)),
                 _ => None,
             },
             create: matches!(kind, StageKind::Create),
             existed: old.is_some(),
             committed: false,
             preserve_on_failure: false,
+            temp_dir_identity: None,
         })
     }
 }
@@ -538,32 +663,52 @@ enum StageKind<'a> {
     Create,
     Replace,
     Update(&'a [u8]),
+    UpdateDigest((u64, [u8; 32])),
+}
+enum Expected {
+    Bytes(Vec<u8>),
+    Digest((u64, [u8; 32])),
 }
 /// Staging on Windows requires security-preserving installation; MoveFileEx
 /// would inherit the parent directory ACL rather than the existing target.
 pub struct StagedWrite {
     parent: Option<Parent>,
-    created: Vec<CreatedDir>,
     target: PathBuf,
     temp: PathBuf,
-    expected: Option<Vec<u8>>,
+    expected: Option<Expected>,
     create: bool,
     existed: bool,
     committed: bool,
     preserve_on_failure: bool,
+    temp_dir_identity: Option<(u32, u64)>,
 }
 impl StagedWrite {
     pub fn commit(mut self) -> Result<()> {
+        if let Some(expected) = self.temp_dir_identity {
+            let opened = pin_directory(&self.temp)?;
+            if directory_identity(&opened)? != expected {
+                return Err(ScopedError::Denied("staged suffix directory changed"));
+            }
+            drop(opened);
+        }
         if let Some(expected) = &self.expected {
-            if stream_bytes(
-                super::super::open_nofollow_read(&self.target)?,
-                MAX_BATCH_FILE,
-            )? != *expected
-            {
+            let file = super::super::open_nofollow_read(&self.target)?;
+            let valid = match expected {
+                Expected::Bytes(bytes) => stream_bytes(file, MAX_BATCH_FILE)? == *bytes,
+                Expected::Digest(digest) => digest_file(file)? == *digest,
+            };
+            if !valid {
                 return Err(ScopedError::Denied("target changed before commit"));
             }
         }
-        match super::super::open_nofollow_read(&self.target) {
+        // A normal write-only replacement needs metadata evidence,
+        // not access to read the target's payload.
+        let final_entry = if self.expected.is_none() {
+            super::super::open_nofollow_metadata(&self.target)
+        } else {
+            super::super::open_nofollow_read(&self.target)
+        };
+        match final_entry {
             Ok(file) => {
                 regular(&file)?;
                 if self.create || !self.existed {
@@ -618,9 +763,12 @@ impl StagedWrite {
 impl Drop for StagedWrite {
     fn drop(&mut self) {
         if !self.committed && !self.preserve_on_failure {
-            let _ = fs::remove_file(&self.temp);
+            if let Some(identity) = self.temp_dir_identity {
+                lifecycle::cleanup_stage_tree(&self.temp, identity);
+            } else {
+                let _ = fs::remove_file(&self.temp);
+            }
             drop(self.parent.take());
-            cleanup_created_dirs(&mut self.created);
         }
     }
 }
@@ -713,5 +861,30 @@ fn recover_backup(target: &std::path::Path, backup: &std::path::Path) -> bool {
         (Some(true), Some(false)) => true,
         (Some(false), Some(true)) => install_create(backup, target).is_ok(),
         _ => false,
+    }
+}
+
+#[path = "port/lifecycle.rs"]
+mod lifecycle;
+
+#[cfg(test)]
+mod mutation_lock_key_tests {
+    use super::*;
+    #[test]
+    fn windows_case_equivalent_paths_share_admission_identity() {
+        let a = std::path::Path::new(r"C:\AW\Workspace\FILE.TXT");
+        let b = std::path::Path::new(r"c:\aw\workspace\file.txt");
+        assert_eq!(
+            named_lock_key(a, "path").unwrap(),
+            named_lock_key(b, "path").unwrap()
+        );
+        assert_eq!(
+            named_lock_key(a, "admission").unwrap(),
+            named_lock_key(b, "admission").unwrap()
+        );
+        assert_ne!(
+            named_lock_key(a, "admission").unwrap(),
+            named_lock_key(a, "path").unwrap()
+        );
     }
 }

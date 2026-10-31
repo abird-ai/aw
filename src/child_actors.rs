@@ -248,7 +248,7 @@ impl Service {
         target_site: &str,
     ) -> Result<SiteTransferBinding> {
         if target_site != format!("subagent:{}", info.id)
-            || !matches!(info.tool_mode.as_str(), "read-only" | "workspace")
+            || !matches!(info.tool_mode.as_str(),"read-only"|"workspace")
         {
             return Err(Error::Denied(
                 "child execution site is not its managed worktree site",

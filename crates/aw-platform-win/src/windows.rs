@@ -29,8 +29,7 @@ use windows_sys::Win32::{
     },
 };
 
-#[path = "scoped_fs.rs"]
-pub mod scoped_fs;
+pub use aw_tools_fs_win::scoped_fs;
 
 pub const FAMILY: &str = "windows";
 

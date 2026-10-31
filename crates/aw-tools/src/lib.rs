@@ -10,6 +10,7 @@ use std::{
 
 mod binary;
 mod edit;
+mod lifecycle;
 mod mutate;
 mod patch;
 mod search;
@@ -21,6 +22,52 @@ pub mod media_port;
 pub mod process;
 mod shell;
 
+/// Transport-neutral canonical DL-150 schemas come from aw-tools-core;
+/// AW maps their access requirement into the original Agent effect type.
+fn core_spec(
+    tool: aw_tools_core::filesystem::schema::Tool,
+    caps: aw_tools_core::filesystem::schema::SchemaCaps,
+) -> ToolSpec {
+    use aw_tools_core::filesystem::access::Action;
+    let core = aw_tools_core::filesystem::schema::spec(tool, caps);
+    let effect = match core.action {
+        Action::Read => ToolEffect::Read,
+        Action::Shell => ToolEffect::Process,
+        _ => ToolEffect::Write,
+    };
+    ToolSpec {
+        name: core.name.into(),
+        description: core.description,
+        parameters: core.parameters,
+        effect,
+    }
+}
+/// Map shared-operation failures without creating a second tool-policy path.
+fn file_operation_error(
+    error: aw_tools_core::filesystem::operations::Error<aw_platform::scoped_fs::ScopedError>,
+) -> Error {
+    use aw_tools_core::filesystem::operations::Error as E;
+    match error {
+        E::InvalidPath(_) => Error::Denied("expected exact clean relative path"),
+        E::TooLarge => Error::Limit("file exceeds bounded write size"),
+        E::InvalidText => Error::Denied("binary or control-containing content; use binary tools"),
+        E::Edit(_) => Error::Denied("invalid or ambiguous exact replacement"),
+        E::DestinationExists => Error::Denied("destination already exists"),
+        E::Cancelled => Error::Cancelled,
+        E::Backend(error) => platform_fs::<()>(Err(error)).unwrap_err(),
+        E::UnknownCommit(_) => {
+            Error::Protocol("unknown filesystem commit; do not retry; inspect workspace")
+        }
+    }
+}
+/// One model-path admission rule for every filesystem adapter, including
+/// read/binary/edit/patch (not only the exact lifecycle tools).
+fn model_path(path: &str) -> Result<()> {
+    if aw_tools_core::filesystem::is_protected_path(path) {
+        return Err(Error::Denied("private mutation stage path is protected"));
+    }
+    platform_fs(aw_platform::scoped_fs::validate_path(path))
+}
 fn platform_fs<T>(result: aw_platform::scoped_fs::Result<T>) -> Result<T> {
     result.map_err(|error| match error {
         aw_platform::scoped_fs::ScopedError::Io(error) => Error::Io(error),
@@ -34,11 +81,15 @@ fn platform_fs<T>(result: aw_platform::scoped_fs::Result<T>) -> Result<T> {
 /// interrupted/uncertain mutator remains a journal-visible execution failure.
 fn tool_failure(outcome: Result<ToolOutput>, mutating: bool) -> Result<ToolOutput> {
     match outcome {
-        Err(Error::Denied(reason)) | Err(Error::Limit(reason)) => Ok(ToolOutput::error(reason)),
+        Err(Error::Denied(reason)) | Err(Error::Limit(reason)) => {
+            Ok(ToolOutput::error(format!("fail {reason}")))
+        }
         Err(Error::Io(_)) if mutating => Err(Error::Protocol(
-            "filesystem mutation failed; inspect workspace before retrying",
+            "unknown commit; do not retry; inspect workspace",
         )),
-        Err(Error::Io(_)) => Ok(ToolOutput::error("file unavailable under the granted root")),
+        Err(Error::Io(_)) => Ok(ToolOutput::error(
+            "fail file unavailable under the granted root",
+        )),
         other => other,
     }
 }
@@ -48,8 +99,30 @@ pub enum ToolMode {
     #[default]
     Off,
     ReadOnly,
+    #[serde(rename = "rw", alias = "workspace")]
     Workspace,
+    #[serde(rename = "full", alias = "trusted")]
     Trusted,
+}
+impl ToolMode {
+    /// Existing constrained SQLite child-mode representation.
+    pub fn storage_label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ReadOnly => "read-only",
+            Self::Workspace => "workspace",
+            Self::Trusted => "trusted",
+        }
+    }
+    fn access(self) -> aw_tools_core::filesystem::access::Access {
+        use aw_tools_core::filesystem::access::Access;
+        match self {
+            Self::Off => Access::Off,
+            Self::ReadOnly => Access::ReadOnly,
+            Self::Workspace => Access::ReadWrite,
+            Self::Trusted => Access::Full,
+        }
+    }
 }
 impl std::str::FromStr for ToolMode {
     type Err = String;
@@ -57,9 +130,9 @@ impl std::str::FromStr for ToolMode {
         match s {
             "off" => Ok(Self::Off),
             "read-only" => Ok(Self::ReadOnly),
-            "workspace" => Ok(Self::Workspace),
-            "trusted" => Ok(Self::Trusted),
-            _ => Err("use off, read-only, workspace or trusted".into()),
+            "rw" | "workspace" => Ok(Self::Workspace),
+            "full" | "trusted" => Ok(Self::Trusted),
+            _ => Err("use off, read-only, rw or full".into()),
         }
     }
 }
@@ -68,8 +141,8 @@ impl std::fmt::Display for ToolMode {
         f.write_str(match self {
             Self::Off => "off",
             Self::ReadOnly => "read-only",
-            Self::Workspace => "workspace",
-            Self::Trusted => "trusted",
+            Self::Workspace => "rw",
+            Self::Trusted => "full",
         })
     }
 }
@@ -126,6 +199,8 @@ pub fn configure(
     let selected = options
         .selected_tools
         .iter()
+        // Input-only legacy selection alias. The registered model tool
+        // advertises the sealed DL-150 pwsh identity on Windows.
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let mut available = BTreeSet::new();
@@ -141,7 +216,11 @@ pub fn configure(
         &mut policy,
         &actor,
     )?;
-    for operation in [search::Operation::Ls, search::Operation::Grep] {
+    for operation in [
+        search::Operation::Ls,
+        search::Operation::Find,
+        search::Operation::Grep,
+    ] {
         builder = offer(
             builder,
             search::Search::new(root.clone(), operation),
@@ -159,7 +238,11 @@ pub fn configure(
         &mut policy,
         &actor,
     )?;
-    if matches!(options.mode, ToolMode::Workspace | ToolMode::Trusted) {
+    if options
+        .mode
+        .access()
+        .permits(aw_tools_core::filesystem::access::Action::Write)
+    {
         builder = offer(
             builder,
             text::Text::new(root.clone(), text::Operation::Write),
@@ -184,6 +267,20 @@ pub fn configure(
             &mut policy,
             &actor,
         )?;
+        for operation in [
+            lifecycle::Operation::Copy,
+            lifecycle::Operation::Move,
+            lifecycle::Operation::Remove,
+        ] {
+            builder = offer(
+                builder,
+                lifecycle::Lifecycle::new(root.clone(), operation),
+                &selected,
+                &mut available,
+                &mut policy,
+                &actor,
+            )?;
+        }
         for operation in [binary::Operation::Write, binary::Operation::Edit] {
             builder = offer(
                 builder,
@@ -195,7 +292,11 @@ pub fn configure(
             )?;
         }
     }
-    if options.mode == ToolMode::Trusted {
+    if options
+        .mode
+        .access()
+        .permits(aw_tools_core::filesystem::access::Action::Shell)
+    {
         #[cfg(unix)]
         {
             // The selected subset must not force an excluded shell to start.
@@ -222,7 +323,7 @@ pub fn configure(
         }
         #[cfg(windows)]
         {
-            if selected.is_empty() || selected.contains("powershell") {
+            if selected.is_empty() || selected.contains("pwsh") || selected.contains("powershell") {
                 let executable = options.bash.clone().ok_or_else(|| {
                     Error::Config(
                         "trusted mode needs an absolute --tools-powershell executable".into(),
@@ -233,16 +334,19 @@ pub fn configure(
                         "powershell executable must be absolute".into(),
                     ));
                 }
+                let shell = shell::PowerShell::new(options.root.canonicalize()?, executable)?;
+                // Exact prepared interpreter identity. A selected pwsh is
+                // never silently substituted with Windows PowerShell.
                 builder = offer(
                     builder,
-                    shell::PowerShell::new(options.root.canonicalize()?, executable)?,
+                    shell,
                     &selected,
                     &mut available,
                     &mut policy,
                     &actor,
                 )?;
             } else {
-                available.insert("powershell".into());
+                // No shell requested in this selected-tool subset.
             }
         }
     }

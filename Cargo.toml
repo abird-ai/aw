@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aw-agent-kernel", "examples/sdk-kernel", "crates/aw-embedded", "examples/sdk-embedded",
     "crates/aw-embedded-ffi", "examples/sdk-embedded-ffi-staticlib",
+    "crates/aw-tools-core", "crates/aw-tools-fs-unix", "crates/aw-tools-fs-win",
     "crates/aw-mcp", "crates/aw-extensions", "examples/process-extension-rust",
     "crates/aw-editor", "crates/aw-ui-extension", "crates/aw-collab", "crates/aw-pipeline", "crates/aw-routing",
     "crates/aw-platform", "crates/aw-platform-unix", "crates/aw-platform-win",

@@ -41,7 +41,8 @@ fn listing(value: aw_platform::scoped_fs::Listing) -> Listing {
                 kind: match entry.kind {
                     aw_platform::scoped_fs::EntryKind::Directory => EntryKind::Directory,
                     aw_platform::scoped_fs::EntryKind::File => EntryKind::File,
-                    aw_platform::scoped_fs::EntryKind::Unsupported => EntryKind::Unsupported,
+                    aw_platform::scoped_fs::EntryKind::Symlink
+                    | aw_platform::scoped_fs::EntryKind::Unsupported => EntryKind::Unsupported,
                 },
             })
             .collect(),
@@ -56,13 +57,21 @@ impl WorkspaceFiles {
     }
 
     pub fn read(&self, path: &str) -> Result<String> {
+        crate::model_path(path)?;
         let _guard = crate::platform_fs(self.root.lock())?;
         crate::platform_fs(self.root.read(path))
     }
 
     pub fn list(&self, path: &str) -> Result<Listing> {
+        if !path.is_empty() {
+            crate::model_path(path)?;
+        }
         let _guard = crate::platform_fs(self.root.lock())?;
-        crate::platform_fs(self.root.list(path)).map(listing)
+        let mut result = crate::platform_fs(self.root.list(path)).map(listing)?;
+        result
+            .entries
+            .retain(|entry| !aw_tools_core::filesystem::is_protected_path(&entry.path));
+        Ok(result)
     }
 
     /// Bounded filename/path search for the human workspace navigator. This is
@@ -147,6 +156,26 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    #[test]
+    fn human_browse_does_not_expose_private_stage_names() {
+        let root = std::env::temp_dir().join(format!(
+            "aw-browse-private-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".aw-stage-42-0123456789abcdef.tmp"), "secret").unwrap();
+        fs::write(root.join("ordinary.txt"), "public").unwrap();
+        let browser = WorkspaceFiles::open(&root).unwrap();
+        let listed = browser.list("").unwrap();
+        assert!(listed.entries.iter().any(|e| e.name == "ordinary.txt"));
+        assert!(!listed.entries.iter().any(|e| e.name.contains(".aw-stage-")));
+        assert!(browser.read(".aw-stage-42-0123456789abcdef.tmp").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn cancellable_search_stops_before_traversing_more_directories() {
         let root = std::env::temp_dir().join(format!("aw-browse-cancel-{}", std::process::id()));

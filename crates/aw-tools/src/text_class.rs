@@ -1,17 +1,6 @@
 //! Shared text/binary distinction for model-facing text tools.
 //! Binary transfer is explicit through bread/bwrite/bedit.
-pub(crate) fn has_binary_control(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .any(|byte| matches!(byte, 0..=8 | 11..=12 | 14..=31 | 127))
-}
-
-pub(crate) fn text_bytes(bytes: &[u8]) -> Option<&str> {
-    if has_binary_control(bytes) {
-        return None;
-    }
-    std::str::from_utf8(bytes).ok()
-}
+pub(crate) use aw_tools_core::text::text_bytes;
 
 pub(crate) fn require_text(bytes: &[u8]) -> crate::Result<&str> {
     text_bytes(bytes).ok_or(aw_agent_core::Error::Denied(

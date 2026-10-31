@@ -1,0 +1,16 @@
+[package]
+name = "aw-tools-fs-unix"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Reusable descriptor-rooted Unix filesystem backend for aw-tools-core"
+
+[dependencies]
+aw-tools-core = { path = "../aw-tools-core", version = "=0.15.0", features = ["rw"] }
+libc = "=0.2.177"
+sha2 = "=0.10.9"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

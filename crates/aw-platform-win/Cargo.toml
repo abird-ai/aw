@@ -8,9 +8,11 @@ license = "MIT"
 description = "Windows platform primitives for aw"
 
 [dependencies]
+aw-tools-fs-win = { path = "../aw-tools-fs-win", version = "=0.15.0" }
 sha2 = "=0.10.9"
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_System_Memory",

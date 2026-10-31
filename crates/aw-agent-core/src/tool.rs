@@ -173,7 +173,20 @@ pub trait Tool: Send + Sync {
     /// Must check the complete schema and semantic constraints. Advertising a
     /// JSON schema does not validate data; untrusted tool arguments still need this.
     fn validate(&self, arguments: &Value) -> Result<()>;
+    /// Conservative scheduling hint for two calls to this same trusted
+    /// tool instance. Never a grant, sandbox or mutation lock.
+    fn can_run_parallel(&self, _first: &Value, _second: &Value) -> bool {
+        false
+    }
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a>;
+}
+/// A trusted tool's scheduling hint is still untrusted computation over
+/// model arguments. Panics conservatively become a serialization barrier.
+pub(crate) fn guarded_parallel_hint(tool: &dyn Tool, first: &Value, second: &Value) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tool.can_run_parallel(first, second)
+    }))
+    .unwrap_or(false)
 }
 /// Host-controlled tool origin. An external source revision must be minted by
 /// the trusted registry owner; a server-reported version string is not authority.
@@ -478,4 +491,34 @@ pub struct ToolRecord {
     pub execution_site: String,
     pub status: ToolStatus,
     pub output: Option<ToolOutput>,
+}
+
+#[cfg(test)]
+mod parallel_hint_tests {
+    use super::*;
+    struct PanickingHostTool;
+    impl Tool for PanickingHostTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "panic_sched".into(),
+                description: "host fixture".into(),
+                parameters: serde_json::json!({"type":"object"}),
+                effect: ToolEffect::Process,
+            }
+        }
+        fn validate(&self, _: &Value) -> Result<()> {
+            Ok(())
+        }
+        fn can_run_parallel(&self, _: &Value, _: &Value) -> bool {
+            panic!("untrusted scheduling hook panic");
+        }
+        fn execute<'a>(&'a self, _: ToolContext, _: &'a Value) -> ToolFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::text("unused")) })
+        }
+    }
+    #[test]
+    fn panicking_scheduling_hint_is_serial_barrier() {
+        let value = serde_json::json!({"parallel":true,"writes":[]});
+        assert!(!guarded_parallel_hint(&PanickingHostTool, &value, &value));
+    }
 }

@@ -4,17 +4,11 @@ use crate::{platform_fs, tool_failure};
 use aw_agent_core::*;
 use aw_platform::scoped_fs::Root;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::sync::Arc;
 
 const READ_BYTES: usize = 96 * 1024;
 const MAX_WRITE_BYTES: usize = 48 * 1024;
-fn one() -> usize {
-    1
-}
-fn four_k() -> usize {
-    4096
-}
 fn yes() -> bool {
     true
 }
@@ -27,15 +21,31 @@ fn parse<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
     path: String,
-    #[serde(default = "one")]
-    offset: usize,
-    #[serde(default = "four_k")]
-    limit: usize,
+    line: Option<usize>,
+    lines: Option<usize>,
+    byte: Option<usize>,
     #[serde(default = "yes")]
     numbered: bool,
-    /// Only the TurnMachine interprets this scheduling suggestion.
+    // The old offset/limit read envelope is an input-only compatibility
+    // adapter, absent from the shared advertised schema.
+    offset: Option<usize>,
+    limit: Option<usize>,
     #[serde(default)]
     parallel: bool,
+}
+impl ReadArgs {
+    fn legacy(&self) -> bool {
+        self.offset.is_some() || self.limit.is_some()
+    }
+    fn line(&self) -> usize {
+        self.line.or(self.offset).unwrap_or(1)
+    }
+    fn lines(&self) -> usize {
+        self.lines.or(self.limit).unwrap_or(4096)
+    }
+    fn byte(&self) -> usize {
+        self.byte.unwrap_or(0)
+    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,14 +62,7 @@ pub(crate) enum Operation {
     Read,
     Write,
 }
-impl Operation {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-        }
-    }
-}
+
 pub(crate) struct Text {
     root: Arc<Root>,
     op: Operation,
@@ -116,47 +119,37 @@ fn bounded_window(
 }
 impl Tool for Text {
     fn spec(&self) -> ToolSpec {
-        let (description, parameters, effect) = match self.op {
-            Operation::Read => (
-                "Stream a UTF-8 line window from a granted regular file. offset is 1-based (default 1), limit defaults to 4096, numbered=true prefixes N and a tab; numbered=false preserves exact bytes including CRLF and terminal newline. A bounded reply reports truncation. Set parallel=true only for independent reads.",
-                json!({"type":"object","properties":{
-                    "path":{"type":"string"},
-                    "offset":{"type":"integer","minimum":1},
-                    "limit":{"type":"integer","minimum":1,"maximum":65536},
-                    "numbered":{"type":"boolean"},
-                    "parallel":{"type":"boolean"}},"required":["path"],"additionalProperties":false}),
-                ToolEffect::Read,
-            ),
-            Operation::Write => (
-                "Create or atomically replace a UTF-8 file, creating missing parent directories. Existing regular-file permissions are preserved. Model must inspect the file first when replacement is not intended. The write is not a multi-file transaction.",
-                json!({"type":"object","properties":{
-                    "path":{"type":"string"},
-                    "content":{"type":"string","maxLength":MAX_WRITE_BYTES},
-                    "create_only":{"type":"boolean"},
-                    "expected_sha256":{"type":"string"}},"required":["path","content"],"additionalProperties":false}),
-                ToolEffect::Write,
-            ),
+        use aw_tools_core::filesystem::schema::{SchemaCaps, Tool as C};
+        let tool = match self.op {
+            Operation::Read => C::Read,
+            Operation::Write => C::Write,
         };
-        ToolSpec {
-            name: self.op.name().into(),
-            description: description.into(),
-            parameters,
-            effect,
-        }
+        crate::core_spec(
+            tool,
+            SchemaCaps {
+                parallel_reads: true,
+                text_write_bytes: MAX_WRITE_BYTES,
+                ..Default::default()
+            },
+        )
     }
     fn validate(&self, value: &Value) -> Result<()> {
         match self.op {
             Operation::Read => {
                 let a: ReadArgs = parse(value)?;
-                platform_fs(aw_platform::scoped_fs::validate_path(&a.path))?;
-                if a.offset == 0 || a.limit == 0 || a.limit > 65_536 {
-                    return Err(Error::Denied("invalid read window"));
+                crate::model_path(&a.path)?;
+                if a.line() == 0
+                    || !(1..=65536).contains(&a.lines())
+                    || a.byte() > aw_tools_core::read::MAX_OFFSET_SCAN_BYTES
+                    || (a.legacy() && (a.line.is_some() || a.lines.is_some() || a.byte.is_some()))
+                {
+                    return Err(Error::Denied("invalid read line/lines/byte cursor"));
                 }
                 let _ = a.parallel;
             }
             Operation::Write => {
                 let a: WriteArgs = parse(value)?;
-                platform_fs(aw_platform::scoped_fs::validate_path(&a.path))?;
+                crate::model_path(&a.path)?;
                 if a.content.len() > MAX_WRITE_BYTES {
                     return Err(Error::Limit("write payload exceeds 48 KiB"));
                 }
@@ -172,55 +165,122 @@ impl Tool for Text {
             let value = value.clone();
             let root = self.root.clone();
             let op = self.op;
-            let answer = tokio::task::spawn_blocking(move || -> Result<ToolOutput> {
-                if ctx.cancellation.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                match op {
-                    Operation::Read => {
-                        let a: ReadArgs = parse(&value)?;
-                        let (window, truncated) = platform_fs(root.read_window_with_cancel(
-                            &a.path,
-                            a.offset,
-                            a.limit,
-                            READ_BYTES,
-                            a.numbered,
-                            &|| ctx.cancellation.is_cancelled(),
-                        ))?;
-                        crate::text_class::require_text(window.as_bytes())?;
-                        let (body, truncated) =
-                            bounded_window(window, a.offset, READ_BYTES, truncated);
-                        Ok(ToolOutput {
-                            content: body,
-                            is_error: false,
-                            truncated,
-                        })
+            let answer =
+                aw_tools_core::asynchronous::run_blocking(move || -> Result<ToolOutput> {
+                    if ctx.cancellation.is_cancelled() {
+                        return Err(Error::Cancelled);
                     }
-                    Operation::Write => {
-                        let a: WriteArgs = parse(&value)?;
-                        let changed = crate::mutate::write(
-                            &root,
-                            &a.path,
-                            a.content.as_bytes(),
-                            a.create_only,
-                            a.expected_sha256.as_deref(),
-                            &|| ctx.cancellation.is_cancelled(),
-                        )?;
-                        Ok(ToolOutput::text(
-                            json!({
-                                "path": a.path,
-                                "bytes_written": if changed { a.content.len() } else { 0 },
-                                "changed": changed
-                            })
-                            .to_string(),
-                        ))
+                    match op {
+                        Operation::Read => {
+                            let a: ReadArgs = parse(&value)?;
+                            if a.legacy() {
+                                let (window, truncated) =
+                                    platform_fs(root.read_window_with_cancel(
+                                        &a.path,
+                                        a.line(),
+                                        a.lines(),
+                                        READ_BYTES,
+                                        a.numbered,
+                                        &|| ctx.cancellation.is_cancelled(),
+                                    ))?;
+                                crate::text_class::require_text(window.as_bytes())?;
+                                let (body, truncated) =
+                                    bounded_window(window, a.line(), READ_BYTES, truncated);
+                                return Ok(ToolOutput {
+                                    content: body,
+                                    is_error: false,
+                                    truncated,
+                                });
+                            }
+                            let page = platform_fs(root.read_page_with_cancel(
+                                &a.path,
+                                aw_tools_core::read::PageRequest {
+                                    line: a.line(),
+                                    lines: a.lines(),
+                                    byte: a.byte(),
+                                    cap: if a.numbered {
+                                        READ_BYTES
+                                    } else {
+                                        READ_BYTES / 2
+                                    },
+                                    numbered: a.numbered,
+                                },
+                                &|| ctx.cancellation.is_cancelled(),
+                            ))?;
+                            let partial = page.next.is_some() || page.io_fault;
+                            if !partial {
+                                return Ok(ToolOutput::text(page.data));
+                            }
+                            let status = aw_tools_core::filesystem::status::read(
+                                page.next.map(|c| (c.line, c.byte)),
+                                page.io_fault,
+                            )
+                            .expect("partial page has a status");
+                            if a.numbered {
+                                let mut data = page.data;
+                                if !data.ends_with('\n') {
+                                    data.push('\n');
+                                }
+                                data.push_str(&status);
+                                Ok(ToolOutput {
+                                    content: data,
+                                    is_error: page.io_fault,
+                                    truncated: true,
+                                })
+                            } else {
+                                // AW currently exposes one text ToolOutput,
+                                // not separate exact-data/status MCP blocks.
+                                // JSON preserves data bytes unambiguously on
+                                // partial pages; complete reads stay raw.
+                                Ok(ToolOutput {
+                                    content: serde_json::json!({
+                                        "data":page.data,
+                                        "status":if page.io_fault{"mixed"}else{"more"},
+                                        "next":page.next.map(|c|serde_json::json!({
+                                            "line":c.line,"byte":c.byte
+                                        }))
+                                    })
+                                    .to_string(),
+                                    is_error: page.io_fault,
+                                    truncated: true,
+                                })
+                            }
+                        }
+                        Operation::Write => {
+                            let a: WriteArgs = parse(&value)?;
+                            if !a.create_only && a.expected_sha256.is_none() {
+                                let outcome = aw_tools_core::filesystem::operations::write_text(
+                                    root.as_ref(),
+                                    &a.path,
+                                    &a.content,
+                                    MAX_WRITE_BYTES,
+                                    &|| ctx.cancellation.is_cancelled(),
+                                )
+                                .map_err(crate::file_operation_error)?;
+                                Ok(ToolOutput::text(outcome.as_str()))
+                            } else {
+                                // Legacy conditional checks retain their pinned
+                                // preimage semantics until core offers them too.
+                                let changed = crate::mutate::write(
+                                    &root,
+                                    &a.path,
+                                    a.content.as_bytes(),
+                                    a.create_only,
+                                    a.expected_sha256.as_deref(),
+                                    &|| ctx.cancellation.is_cancelled(),
+                                )?;
+                                Ok(ToolOutput::text(aw_tools_core::mutation::compact_success(
+                                    usize::from(changed),
+                                    None,
+                                )))
+                            }
+                        }
                     }
-                }
-            })
-            .await
-            .map_err(|_| {
-                Error::Protocol("file worker failed; inspect workspace before retrying")
-            })?;
+                })
+                .await
+                .map_err(|_| {
+                    Error::Protocol("file worker failed; inspect workspace before retrying")
+                })?;
             tool_failure(answer, matches!(op, Operation::Write))
         })
     }

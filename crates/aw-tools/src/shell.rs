@@ -12,6 +12,7 @@ pub(crate) struct NativeShell {
     root: PathBuf,
     executable: PathBuf,
     path: String,
+    tool_name: &'static str,
 }
 #[cfg(unix)]
 pub(crate) type Bash = NativeShell;
@@ -19,10 +20,28 @@ pub(crate) type Bash = NativeShell;
 pub(crate) type PowerShell = NativeShell;
 impl NativeShell {
     pub fn new(root: PathBuf, executable: PathBuf) -> Result<Self> {
+        #[cfg(unix)]
+        let tool_name = "bash";
+        #[cfg(windows)]
+        let tool_name = match executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("pwsh.exe" | "pwsh") => "pwsh",
+            Some("powershell.exe" | "powershell") => "powershell",
+            _ => {
+                return Err(Error::Config(
+                    "trusted Windows shell executable must be pwsh or powershell".into(),
+                ))
+            }
+        };
         Ok(Self {
             root,
             executable,
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            tool_name,
         })
     }
 }
@@ -38,6 +57,7 @@ struct Args {
     stdin: Option<String>,
     timeout_secs: Option<u64>,
     max_output_bytes: Option<usize>,
+    writes: Option<Vec<String>>,
 }
 fn dot() -> String {
     ".".into()
@@ -45,15 +65,17 @@ fn dot() -> String {
 impl Tool for NativeShell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name:if cfg!(windows){"powershell"}else{"bash"}.into(),
-            description:"Run explicitly granted trusted native shell with the OS user's rights (NOT a sandbox). Supports a workspace-relative dir, stdin, timeout_secs and per-stream max_output_bytes under host ceilings. Only parallel=true opts adjacent independent commands into AW's model-directed Process waves; writes may race.".into(),
+            name:self.tool_name.into(),
+            description:"Run explicitly granted trusted native shell with the OS user's rights (NOT a sandbox). Supports a workspace-relative dir, stdin, timeout_secs and per-stream max_output_bytes under host ceilings. Parallel waves require parallel=true and non-overlapping explicit writes scopes on every command. Writes are advisory scheduling hints, never permissions, sandboxing, or coordination guarantees.".into(),
             parameters:json!({"type":"object","properties":{
                 "command":{"type":"string"},
                 "dir":{"type":"string","description":"Working directory under the host-selected root, default ."},
                 "stdin":{"type":"string","maxLength":16384},
                 "timeout_secs":{"type":"integer","minimum":1,"maximum":600},
                 "max_output_bytes":{"type":"integer","minimum":1,"maximum":49152},
-                "parallel":{"type":"boolean"}
+                "parallel":{"type":"boolean"},
+                "writes":{"type":["array","null"],"maxItems":64,
+                    "items":{"type":"string"}}
             },"required":["command"],"additionalProperties":false}),
             effect:ToolEffect::Process
         }
@@ -71,6 +93,11 @@ impl Tool for NativeShell {
             aw_platform::scoped_fs::validate_path(&args.dir)
                 .map_err(|_| Error::Denied("shell dir must be relative to granted root"))?;
         }
+        // The host does not treat a hint as authority or a guarantee that
+        // arbitrary shell writes are limited to these paths.
+        let effective = self.root.join(&args.dir);
+        aw_tools_core::filesystem::write_hint::normalize(&effective, args.writes.as_deref())
+            .map_err(|_| Error::Denied("invalid shell writes hint"))?;
         if args
             .stdin
             .as_deref()
@@ -86,6 +113,32 @@ impl Tool for NativeShell {
             return Err(Error::Denied("shell limits must match the declared schema"));
         }
         Ok(())
+    }
+    fn can_run_parallel(&self, first: &Value, second: &Value) -> bool {
+        use aw_tools_core::filesystem::write_hint::{normalize_names, overlaps};
+        let scopes = |value: &Value| {
+            let dir = value.get("dir").and_then(Value::as_str).unwrap_or(".");
+            let cwd = self.root.join(dir);
+            let mut items = Vec::new();
+            let values = match value.get("writes") {
+                None | Some(Value::Null) => {
+                    return normalize_names(&cwd, Option::<std::iter::Empty<&str>>::None).ok()
+                }
+                Some(Value::Array(values)) => values,
+                _ => return None,
+            };
+            if values.len() > aw_tools_core::filesystem::write_hint::MAX_SCOPES {
+                return None;
+            }
+            for item in values {
+                items.push(item.as_str()?);
+            }
+            normalize_names(&cwd, Some(items.into_iter())).ok()
+        };
+        match (scopes(first), scopes(second)) {
+            (Some(a), Some(b)) => !overlaps(&a, &b),
+            _ => false,
+        }
     }
     fn execute<'a>(&'a self, ctx: ToolContext, v: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
@@ -305,6 +358,52 @@ mod tests {
             .validate(&json!({"command":"printf ok","parallel":true,"cwd":"/tmp"}))
             .is_err());
         assert_eq!(b.spec().effect, ToolEffect::Process);
+    }
+    #[test]
+    fn shell_parallel_waves_require_disjoint_explicit_write_scopes() {
+        let shell = Bash::new(std::env::temp_dir(), executable()).unwrap();
+        let command = |writes: Value, dir: &str| {
+            json!({
+                "command":"true","parallel":true,
+                "dir":dir,"writes":writes,
+            })
+        };
+        let unknown = json!({"command":"true","parallel":true});
+        let a = command(json!(["src/a.rs"]), ".");
+        let b = command(json!(["src/b.rs"]), ".");
+        let overlap = command(json!(["src"]), ".");
+        let nested = command(json!(["a.rs"]), "src");
+        let empty = command(json!([]), ".");
+        assert!(shell.can_run_parallel(&a, &b));
+        assert!(!shell.can_run_parallel(&a, &overlap));
+        assert!(!shell.can_run_parallel(&a, &nested));
+        assert!(!shell.can_run_parallel(&a, &unknown));
+        assert!(!shell.can_run_parallel(&unknown, &b));
+        assert!(shell.can_run_parallel(&a, &empty));
+    }
+    #[test]
+    fn advisory_shell_write_footprints_are_checked_but_not_grants() {
+        let shell = Bash::new(std::env::temp_dir(), executable()).unwrap();
+        assert!(shell
+            .validate(&json!({"command":"true","writes":null}))
+            .is_ok());
+        assert!(shell
+            .validate(&json!({"command":"true","writes":[]}))
+            .is_ok());
+        assert!(shell
+            .validate(&json!({"command":"true","writes":["src",
+            "src/foo.rs"]}))
+            .is_ok());
+        assert!(shell
+            .validate(&json!({"command":"true","writes":["*.rs"]}))
+            .is_err());
+        assert!(shell
+            .validate(&json!({"command":"true","writes":["src/$X"]}))
+            .is_err());
+        assert!(shell.spec().parameters["properties"]
+            .get("writes")
+            .is_some());
+        assert_eq!(shell.spec().effect, ToolEffect::Process);
     }
     #[test]
     fn arguments_are_not_arbitrary_program_or_environment() {

@@ -1,17 +1,17 @@
 //! Bounded file windows, staged mutation and cooperative workspace writes.
 //! Filesystem authority comes exclusively from the pinned `Root`.
 use super::{at, cstring, validate_path, Result, Root, ScopedError};
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     sync::MutexGuard,
     time::{Duration, Instant},
 };
 
 const MAX_BATCH_FILE: usize = 64 * 1024 * 1024;
-const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
 static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn regular(file: &File) -> Result<u64> {
@@ -37,63 +37,33 @@ fn stream_bytes(file: File, cap: usize) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-// Skip a line without buffering arbitrary bytes (including an overlong line).
-/// Skipped lines must not allocate, but also cannot scan an unlimited file.
-fn skip_line(
-    reader: &mut BufReader<File>,
-    scanned: &mut usize,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<bool> {
-    let mut seen = false;
-    loop {
-        if cancelled() {
-            return Err(ScopedError::Cancelled);
-        }
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            return Ok(seen);
-        }
-        let end = buf.iter().position(|&byte| byte == b'\n');
-        let take = end.map_or(buf.len(), |at| at + 1);
-        if buf[..take]
-            .iter()
-            .any(|byte| matches!(byte,0..=8 | 11..=12 | 14..=31 | 127))
-        {
-            return Err(ScopedError::Denied("binary file; use bread"));
-        }
-        *scanned = scanned.saturating_add(take);
-        if *scanned > MAX_READ_SCAN_BYTES {
-            return Err(ScopedError::Limit(
-                "read offset requires scanning more than 32 MiB",
-            ));
-        }
-        reader.consume(take);
-        if end.is_some() {
-            return Ok(true);
-        }
-        seen = true;
+/// Hash a singly-linked regular file with fixed scratch memory.
+fn digest_file(mut file: File) -> Result<(u64, [u8; 32])> {
+    let size = regular(&file)?;
+    if size > MAX_BATCH_FILE as u64 {
+        return Err(ScopedError::Limit("binary source exceeds 64 MiB"));
     }
-}
-fn next_line(reader: &mut BufReader<File>, cap: usize) -> Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
+    let mut digest = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut count = 0u64;
     loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            return Ok(if line.is_empty() { None } else { Some(line) });
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
-        let newline = buf.iter().position(|&byte| byte == b'\n');
-        let take = newline.map_or(buf.len(), |at| at + 1);
-        if take > cap.saturating_sub(line.len()) {
-            return Err(ScopedError::Limit("one line exceeds tool byte limit"));
+        count = count
+            .checked_add(n as u64)
+            .ok_or(ScopedError::Limit("binary source size overflow"))?;
+        if count > MAX_BATCH_FILE as u64 {
+            return Err(ScopedError::Limit("binary source grew past 64 MiB"));
         }
-        line.extend_from_slice(&buf[..take]);
-        reader.consume(take);
-        if newline.is_some() {
-            return Ok(Some(line));
-        }
+        digest.update(&buf[..n]);
     }
+    Ok((count, digest.finalize().into()))
 }
 
+// Skip a line without buffering arbitrary bytes (including an overlong line).
+/// Skipped lines must not allocate, but also cannot scan an unlimited file.
 /// Existing-file metadata is part of the replacement precondition. A
 /// replacement must not silently erase ownership, ACLs or extended attributes.
 fn preserve_metadata(old: &File, staged: &File, cancelled: &dyn Fn() -> bool) -> Result<()> {
@@ -352,6 +322,100 @@ impl Root {
         })
     }
 
+    /// Descriptor-rooted, no-follow metadata. Linux statx gathers change
+    /// time and birth time in one syscall where the filesystem supplies it.
+    pub fn entry_meta(&self, path: &str) -> Result<aw_tools_core::filesystem::EntryMeta> {
+        use aw_tools_core::filesystem::{EntryMeta, Kind};
+        let (dir, name) = self.parent(path)?;
+        let name = cstring(&name)?;
+        #[cfg(target_os = "linux")]
+        {
+            let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+            // SAFETY: pinned parent + valid leaf; statx never follows link.
+            let result = unsafe {
+                libc::statx(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    libc::STATX_BASIC_STATS | libc::STATX_BTIME,
+                    stat.as_mut_ptr(),
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            let stat = unsafe { stat.assume_init() };
+            let kind = match stat.stx_mode as u32 & libc::S_IFMT {
+                libc::S_IFDIR => Kind::Dir,
+                libc::S_IFREG if stat.stx_nlink == 1 => Kind::File,
+                libc::S_IFLNK => Kind::Symlink,
+                _ => Kind::Other,
+            };
+            let time = |part: libc::statx_timestamp| {
+                aw_tools_core::filesystem::system_time_from_unix(part.tv_sec, part.tv_nsec)
+            };
+            Ok(EntryMeta {
+                kind,
+                size: if matches!(kind, Kind::File | Kind::Symlink) {
+                    Some(stat.stx_size)
+                } else {
+                    None
+                },
+                mtime: if stat.stx_mask & libc::STATX_MTIME != 0 {
+                    time(stat.stx_mtime)
+                } else {
+                    None
+                },
+                ctime: if stat.stx_mask & libc::STATX_CTIME != 0 {
+                    time(stat.stx_ctime)
+                } else {
+                    None
+                },
+                btime: if stat.stx_mask & libc::STATX_BTIME != 0 {
+                    time(stat.stx_btime)
+                } else {
+                    None
+                },
+                mode: Some(stat.stx_mode as u32 & 0o7777),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error().into());
+            }
+            let stat = unsafe { stat.assume_init() };
+            let kind = match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => Kind::Dir,
+                libc::S_IFREG if stat.st_nlink == 1 => Kind::File,
+                libc::S_IFLNK => Kind::Symlink,
+                _ => Kind::Other,
+            };
+            let time = |secs: i64| aw_tools_core::filesystem::system_time_from_unix(secs, 0);
+            Ok(EntryMeta {
+                kind,
+                size: if matches!(kind, Kind::File | Kind::Symlink) {
+                    Some(stat.st_size.max(0) as u64)
+                } else {
+                    None
+                },
+                mtime: time(stat.st_mtime),
+                ctime: time(stat.st_ctime),
+                btime: None,
+                mode: Some(stat.st_mode as u32 & 0o7777),
+            })
+        }
+    }
+
     /// Metadata is resolved below the pinned parent and does not require
     /// read permission for a file merely to list its name/size.
     pub fn entry_info(&self, path: &str) -> Result<(u64, Option<std::time::SystemTime>)> {
@@ -456,111 +520,48 @@ impl Root {
         numbered: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, bool)> {
-        if offset == 0 || limit == 0 || cap == 0 || cap > MAX_BATCH_FILE {
-            return Err(ScopedError::Limit("invalid file window"));
-        }
         let (dir, name) = self.parent(path)?;
         let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         regular(&file)?;
         let mut reader = BufReader::new(file);
-        let mut scanned = 0usize;
-        for _ in 1..offset {
-            if !skip_line(&mut reader, &mut scanned, cancelled)? {
-                return Err(ScopedError::Denied("read offset is past the end of file"));
-            }
-        }
-        let mut output = Vec::new();
-        let mut truncated = false;
-        for row in 0..=limit {
-            if cancelled() {
-                return Err(ScopedError::Cancelled);
-            }
-            if row == limit {
-                truncated = !reader.fill_buf()?.is_empty();
-                break;
-            }
-            let Some(line) = next_line(&mut reader, cap)? else {
-                if row == 0 && offset != 1 {
-                    return Err(ScopedError::Denied("read offset is past the end of file"));
-                }
-                break;
-            };
-            let prefix = if numbered {
-                format!("{}\t", offset + row).into_bytes()
-            } else {
-                Vec::new()
-            };
-            let body = if numbered {
-                let mut end = line.len();
-                if end > 0 && line[end - 1] == b'\n' {
-                    end -= 1;
-                }
-                if end > 0 && line[end - 1] == b'\r' {
-                    end -= 1;
-                }
-                let mut v = line[..end].to_vec();
-                v.push(b'\n');
-                v
-            } else {
-                line
-            };
-            if output
-                .len()
-                .saturating_add(prefix.len())
-                .saturating_add(body.len())
-                > cap
-            {
-                truncated = true;
-                break;
-            }
-            output.extend(prefix);
-            output.extend(body);
-        }
-        Ok((
-            String::from_utf8(output).map_err(|_| ScopedError::Denied("file is not UTF-8 text"))?,
-            truncated,
-        ))
+        aw_tools_core::read::window(&mut reader, offset, limit, cap, numbered, cancelled).map_err(
+            |error| match error {
+                aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
+                aw_tools_core::read::ReadError::Denied(message) => ScopedError::Denied(message),
+                aw_tools_core::read::ReadError::Limit(message) => ScopedError::Limit(message),
+                aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+            },
+        )
     }
-
-    fn parent_for_write(&self, path: &str) -> Result<(File, String, CreatedParents)> {
-        validate_path(path)?;
-        let mut parts: Vec<&str> = path.split('/').collect();
-        let leaf = parts
-            .pop()
-            .ok_or(ScopedError::Denied("missing file path"))?
-            .to_owned();
-        let mut dir = self.directory.try_clone()?;
-        let mut created = CreatedParents::default();
-        for part in parts {
-            dir = match at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
-                Ok(opened) => opened,
-                Err(ScopedError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                    let part_c = cstring(part)?;
-                    // SAFETY: the directory is pinned and part is one clean component.
-                    if unsafe { libc::mkdirat(dir.as_raw_fd(), part_c.as_ptr(), 0o777) } != 0 {
-                        let error = io::Error::last_os_error();
-                        if error.kind() != io::ErrorKind::AlreadyExists {
-                            return Err(error.into());
-                        }
-                        at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
-                    } else {
-                        let child = at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-                        let identity = child.metadata()?;
-                        created.0.push((
-                            dir.try_clone()?,
-                            part.to_owned(),
-                            identity.dev(),
-                            identity.ino(),
-                        ));
-                        child
-                    }
-                }
-                Err(e) => return Err(e),
-            };
-        }
-        Ok((dir, leaf, created))
+    /// DL-150 resumable line/byte window, entirely on a previously
+    /// authorized regular file descriptor. Exact UTF-8 boundaries are
+    /// determined by aw-tools-core, independently of the host platform.
+    pub fn read_page_with_cancel(
+        &self,
+        path: &str,
+        request: aw_tools_core::read::PageRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<aw_tools_core::read::Page> {
+        let (dir, name) = self.parent(path)?;
+        let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+        regular(&file)?;
+        let mut reader = BufReader::new(file);
+        aw_tools_core::read::page(
+            &mut reader,
+            request.line,
+            request.lines,
+            request.byte,
+            request.cap,
+            request.numbered,
+            cancelled,
+        )
+        .map_err(|error| match error {
+            aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
+            aw_tools_core::read::ReadError::Denied(reason) => ScopedError::Denied(reason),
+            aw_tools_core::read::ReadError::Limit(reason) => ScopedError::Limit(reason),
+            aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+        })
     }
-
     /// Only call this while holding `lock_mutations` for the target.
     pub fn stage_create(
         &self,
@@ -589,6 +590,33 @@ impl Root {
     ) -> Result<StagedWrite> {
         self.stage(path, data, StageKind::Update(expected), cancel)
     }
+    /// Open one safe pinned regular file for zero-copy streamed edits.
+    pub fn open_regular(&self, path: &str) -> Result<File> {
+        let (dir, name) = self.parent(path)?;
+        let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+        regular(&file)?;
+        Ok(file)
+    }
+
+    /// Stage a binary edit without allocating the original or replacement.
+    /// The caller holds lock_mutations and owns the source digest/cancellation.
+    pub fn stage_stream_create(
+        &self,
+        path: &str,
+        writer: impl FnOnce(&mut File) -> Result<()>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<StagedWrite> {
+        self.stage_with(path, StageKind::Create, cancel, writer)
+    }
+    pub fn stage_stream_update(
+        &self,
+        path: &str,
+        expected: (u64, [u8; 32]),
+        writer: impl FnOnce(&mut File) -> Result<()>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<StagedWrite> {
+        self.stage_with(path, StageKind::UpdateDigest(expected), cancel, writer)
+    }
     fn stage(
         &self,
         path: &str,
@@ -599,11 +627,147 @@ impl Root {
         if data.len() > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("staged file exceeds 64 MiB"));
         }
+        self.stage_with(path, kind, cancel, |out| {
+            for chunk in data.chunks(64 * 1024) {
+                if cancel() {
+                    return Err(ScopedError::Cancelled);
+                }
+                out.write_all(chunk)?;
+            }
+            Ok(())
+        })
+    }
+    /// The first missing component is the only public rename target.
+    /// Never materialize any missing parent directly in the public tree.
+    fn missing_parent(&self, path: &str) -> Result<Option<(File, Vec<String>, String)>> {
+        validate_path(path)?;
+        let mut parts = path.split('/').collect::<Vec<_>>();
+        let leaf = parts.pop().ok_or(ScopedError::Denied("missing target"))?;
+        let mut parent = self.directory.try_clone()?;
+        for (i, part) in parts.iter().enumerate() {
+            match at(&parent, part, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(next) => parent = next,
+                Err(ScopedError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound => {
+                    let missing = parts[i..]
+                        .iter()
+                        .map(|s| (*s).to_owned())
+                        .collect::<Vec<_>>();
+                    if missing.len() > aw_tools_core::filesystem::lifecycle::MAX_LIFECYCLE_DEPTH {
+                        return Err(ScopedError::Limit("missing parent suffix is too deep"));
+                    }
+                    return Ok(Some((parent, missing, leaf.to_owned())));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+    fn stage_missing_suffix(
+        &self,
+        existing: File,
+        missing: Vec<String>,
+        leaf: String,
+        cancel: &dyn Fn() -> bool,
+        writer: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<StagedWrite> {
+        let temp = format!(
+            ".aw-stage-{}-{:016x}.tmp",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let cname = cstring(&temp)?;
+        if unsafe { libc::mkdirat(existing.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let identity = (|| -> Result<(u64, u64)> {
+            let stage = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let meta = stage.metadata()?;
+            Ok((meta.dev(), meta.ino()))
+        })()
+        .inspect_err(|_| {
+            lifecycle::remove_empty_stage(&existing, &temp);
+        })?;
+        let result = (|| -> Result<()> {
+            let mut current = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let mut directories = vec![current.try_clone()?];
+            for component in missing.iter().skip(1) {
+                if cancel() {
+                    return Err(ScopedError::Cancelled);
+                }
+                let name = cstring(component)?;
+                if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                current = at(&current, component, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                directories.push(current.try_clone()?);
+            }
+            let mut file = at(
+                &current,
+                &leaf,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )?;
+            writer(&mut file)?;
+            if file.metadata()?.len() > MAX_BATCH_FILE as u64 {
+                return Err(ScopedError::Limit("staged output exceeds 64 MiB"));
+            }
+            if cancel() {
+                return Err(ScopedError::Cancelled);
+            }
+            file.sync_all()?;
+            drop(file);
+            for dir in directories.into_iter().rev() {
+                dir.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
+            return Err(error);
+        }
+        Ok(StagedWrite {
+            parent: existing,
+            name: missing[0].clone(),
+            temp,
+            expected: None,
+            create: true,
+            committed: false,
+            temp_directory: true,
+            temp_identity: Some(identity),
+        })
+    }
+    fn stage_with(
+        &self,
+        path: &str,
+        kind: StageKind<'_>,
+        cancel: &dyn Fn() -> bool,
+        writer: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<StagedWrite> {
         if cancel() {
             return Err(ScopedError::Cancelled);
         }
-        let (parent, target, created) = self.parent_for_write(path)?;
-        let old = match at(&parent, &target, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        if let Some((existing, missing, leaf)) = self.missing_parent(path)? {
+            if matches!(kind, StageKind::Update(_) | StageKind::UpdateDigest(_)) {
+                return Err(ScopedError::Denied("target changed before update"));
+            }
+            return self.stage_missing_suffix(existing, missing, leaf, cancel, writer);
+        }
+        // The ordinary branch accepts only an already-pinned parent;
+        // concurrent removals must not trigger visible mkdir fallbacks.
+        let (parent, target) = self.parent(path)?;
+        // Plain canonical replacement never opens the target for reading
+        // its contents. The old FD is solely metadata/xattr evidence.
+        let existing_handle = if matches!(kind, StageKind::Replace) {
+            match at(&parent, &target, libc::O_WRONLY | libc::O_NONBLOCK, 0) {
+                Err(ScopedError::Io(ref err)) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    at(&parent, &target, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+                }
+                other => other,
+            }
+        } else {
+            at(&parent, &target, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+        };
+        let old = match existing_handle {
             Ok(file) => {
                 regular(&file)?;
                 if matches!(kind, StageKind::Create) {
@@ -617,38 +781,61 @@ impl Root {
             }
             Err(e) => return Err(e),
         };
-        if old.is_none() && matches!(kind, StageKind::Update(_)) {
+        if old.is_none() && matches!(kind, StageKind::Update(_) | StageKind::UpdateDigest(_)) {
             return Err(ScopedError::Denied("target changed before update"));
         }
-        if let (Some(existing), StageKind::Update(expected)) = (&old, kind) {
-            let current = stream_bytes(existing.try_clone()?, MAX_BATCH_FILE)?;
-            if current != expected {
-                return Err(ScopedError::Denied("target changed before update"));
+        if let Some(ref existing) = old {
+            match kind {
+                StageKind::Update(expected)
+                    if stream_bytes(existing.try_clone()?, MAX_BATCH_FILE)? != expected =>
+                {
+                    return Err(ScopedError::Denied("target changed before update"));
+                }
+                StageKind::UpdateDigest((len, digest))
+                    if digest_file(existing.try_clone()?)? != (len, digest) =>
+                {
+                    return Err(ScopedError::Denied("binary source changed before staging"));
+                }
+                _ => {}
             }
         }
-        // Every temporary starts private. The original mode is applied only
-        // after writing, by preserve_metadata.
-        let mode = 0o600;
         let name = format!(
             ".aw-stage-{}-{:016x}.tmp",
             std::process::id(),
             NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        // Stage privately: source metadata is restored only after all bytes.
         let mut out = at(
             &parent,
             &name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            mode,
+            0o600,
         )?;
         let written = (|| -> Result<()> {
-            for chunk in data.chunks(64 * 1024) {
-                if cancel() {
-                    return Err(ScopedError::Cancelled);
+            if let Some(ref source) = old {
+                let metadata = source.metadata()?;
+                if metadata.mode() & 0o6000 != 0 {
+                    return Err(ScopedError::Denied(
+                        "setuid/setgid file replacement requires privileged host operation",
+                    ));
                 }
-                out.write_all(chunk)?;
+                // Keep an in-flight stage no broader than old mode.
+                // File descriptor opened O_WRONLY remains writable after
+                // narrowing its mode, until publication restores old mode.
+                let mode = metadata.mode() & 0o600;
+                if unsafe { libc::fchmod(out.as_raw_fd(), mode) } != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
+            writer(&mut out)?;
+            if out.metadata()?.len() > MAX_BATCH_FILE as u64 {
+                return Err(ScopedError::Limit("staged output exceeds 64 MiB"));
             }
             if let Some(ref source) = old {
                 preserve_metadata(source, &out, cancel)?;
+            }
+            if cancel() {
+                return Err(ScopedError::Cancelled);
             }
             out.sync_all()?;
             Ok(())
@@ -660,15 +847,17 @@ impl Root {
         }
         Ok(StagedWrite {
             parent,
-            created,
             name: target,
             temp: name,
             expected: match kind {
-                StageKind::Update(expected) => Some(expected.to_vec()),
+                StageKind::Update(expected) => Some(Expected::Bytes(expected.to_vec())),
+                StageKind::UpdateDigest(hash) => Some(Expected::Digest(hash)),
                 _ => None,
             },
             create: matches!(kind, StageKind::Create),
             committed: false,
+            temp_directory: false,
+            temp_identity: None,
         })
     }
 }
@@ -686,63 +875,50 @@ enum StageKind<'a> {
     Create,
     Replace,
     Update(&'a [u8]),
+    UpdateDigest((u64, [u8; 32])),
+}
+enum Expected {
+    Bytes(Vec<u8>),
+    Digest((u64, [u8; 32])),
 }
 
-/// Each directory created by this staging attempt. On uncommitted Drop,
-/// remove only if empty, so unrelated user files are never removed.
-#[derive(Default)]
-struct CreatedParents(Vec<(File, String, u64, u64)>);
-impl CreatedParents {
-    fn disarm(&mut self) {
-        self.0.clear();
-    }
-}
-impl Drop for CreatedParents {
-    fn drop(&mut self) {
-        for (parent, name, device, inode) in self.0.drain(..).rev() {
-            let Ok(current) = at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0) else {
-                continue;
-            };
-            let Ok(info) = current.metadata() else {
-                continue;
-            };
-            if info.dev() != device || info.ino() != inode {
-                continue;
-            }
-            drop(current);
-            let Ok(name) = cstring(&name) else { continue };
-            // Inode checks prevent deleting a stale *already* replaced name.
-            // There remains a non-cooperating same-UID TOCTOU window between
-            // check and rmdir; no recursive deletion is ever attempted.
-            unsafe {
-                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
-            }
-        }
-    }
-}
 /// A fully synced sibling file; publishing is a single rename/link operation.
 pub struct StagedWrite {
     parent: File,
-    created: CreatedParents,
     name: String,
     temp: String,
-    expected: Option<Vec<u8>>,
+    expected: Option<Expected>,
     create: bool,
     committed: bool,
+    temp_directory: bool,
+    temp_identity: Option<(u64, u64)>,
 }
 impl StagedWrite {
     pub fn commit(mut self) -> Result<()> {
-        if let Some(expected) = &self.expected {
-            let current = stream_bytes(
-                at(
-                    &self.parent,
-                    &self.name,
-                    libc::O_RDONLY | libc::O_NONBLOCK,
-                    0,
-                )?,
-                MAX_BATCH_FILE,
+        if let Some((dev, ino)) = self.temp_identity {
+            let opened = at(
+                &self.parent,
+                &self.temp,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
             )?;
-            if &current != expected {
+            let identity = opened.metadata()?;
+            if identity.dev() != dev || identity.ino() != ino {
+                return Err(ScopedError::Denied("staging directory identity changed"));
+            }
+        }
+        if let Some(expected) = &self.expected {
+            let current = at(
+                &self.parent,
+                &self.name,
+                libc::O_RDONLY | libc::O_NONBLOCK,
+                0,
+            )?;
+            let valid = match expected {
+                Expected::Bytes(bytes) => stream_bytes(current, MAX_BATCH_FILE)? == *bytes,
+                Expected::Digest(digest) => digest_file(current)? == *digest,
+            };
+            if !valid {
                 return Err(ScopedError::Denied("target changed before commit"));
             }
         }
@@ -770,7 +946,9 @@ impl StagedWrite {
                 }
             }
             #[cfg(not(target_os = "linux"))]
-            {
+            if self.temp_directory {
+                lifecycle::rename_exact(&self.parent, &self.temp, &self.parent, &self.name)?;
+            } else {
                 // Other Unix kernels may not have rename-no-replace. Do not
                 // pretend a failed cleanup leaves a singly linked file.
                 let code = unsafe {
@@ -788,26 +966,48 @@ impl StagedWrite {
                 let removed = unsafe { libc::unlinkat(self.parent.as_raw_fd(), src.as_ptr(), 0) };
                 if removed != 0 {
                     self.committed = true;
-                    self.created.disarm();
-                    return Err(ScopedError::Denied(
+                    return Err(ScopedError::Io(io::Error::other(
                         "file published but temporary hardlink cleanup failed; inspect workspace",
-                    ));
+                    )));
                 }
             }
         } else {
             // Reject symlink/non-regular targets, even if staged before a swap.
-            match at(
-                &self.parent,
-                &self.name,
-                libc::O_RDONLY | libc::O_NONBLOCK,
-                0,
-            ) {
-                Ok(file) => {
-                    regular(&file)?;
+            if self.expected.is_none() {
+                // A write-only caller may not read the replaced file;
+                // fstatat checks final-component type/identity without
+                // opening its payload or following symlinks.
+                let name = cstring(&self.name)?;
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                let result = unsafe {
+                    libc::fstatat(
+                        self.parent.as_raw_fd(),
+                        name.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if result == 0 {
+                    let stat = unsafe { stat.assume_init() };
+                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
+                        return Err(ScopedError::Denied(
+                            "replacement requires singly-linked regular target",
+                        ));
+                    }
+                } else {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(error.into());
+                    }
                 }
-                Err(ScopedError::Io(e))
-                    if e.kind() == io::ErrorKind::NotFound && self.expected.is_none() => {}
-                Err(e) => return Err(e),
+            } else {
+                let file = at(
+                    &self.parent,
+                    &self.name,
+                    libc::O_RDONLY | libc::O_NONBLOCK,
+                    0,
+                )?;
+                regular(&file)?;
             }
             // SAFETY: paths are clean basenames beneath one pinned directory.
             if unsafe {
@@ -823,7 +1023,6 @@ impl StagedWrite {
             }
         }
         self.committed = true;
-        self.created.disarm();
         let _ = self.parent.sync_all(); // committed; never invite a retry after sync failure
         Ok(())
     }
@@ -831,10 +1030,17 @@ impl StagedWrite {
 impl Drop for StagedWrite {
     fn drop(&mut self) {
         if !self.committed {
-            unlink(&self.parent, &self.temp);
+            if self.temp_directory {
+                lifecycle::cleanup_stage_tree(&self.parent, &self.temp, self.temp_identity);
+            } else {
+                unlink(&self.parent, &self.temp);
+            }
         }
     }
 }
+
+#[path = "port/lifecycle.rs"]
+mod lifecycle;
 
 #[cfg(test)]
 mod publication_tests {
@@ -861,6 +1067,48 @@ mod publication_tests {
         }
     }
 
+    #[test]
+    fn missing_parent_suffix_remains_invisible_until_single_commit() {
+        let temp = Temp::new();
+        let root = temp.root();
+        let _guard = root.lock_mutations(&["new/deep/x.txt".into()]).unwrap();
+        let staged = root
+            .stage_create("new/deep/x.txt", b"contents", &|| false)
+            .unwrap();
+        assert!(!temp.0.join("new").exists());
+        staged.commit().unwrap();
+        assert_eq!(
+            fs::read(temp.0.join("new/deep/x.txt")).unwrap(),
+            b"contents"
+        );
+    }
+    #[test]
+    fn failed_writer_or_dropped_stage_leaves_no_visible_new_parent() {
+        let temp = Temp::new();
+        let root = temp.root();
+        let _guard = root.lock_mutations(&["new/deep/x.txt".into()]).unwrap();
+        let failed = root.stage_stream_create(
+            "new/deep/x.txt",
+            |out| {
+                use std::io::Write;
+                out.write_all(b"some bytes")?;
+                Err(ScopedError::Denied("intentional staging fault"))
+            },
+            &|| false,
+        );
+        assert!(failed.is_err());
+        assert!(!temp.0.join("new").exists());
+        let staged = root
+            .stage_create("new/deep/x.txt", b"contents", &|| false)
+            .unwrap();
+        assert!(!temp.0.join("new").exists());
+        drop(staged);
+        assert!(!temp.0.join("new").exists());
+        assert!(!fs::read_dir(&temp.0).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".aw-stage-")));
+    }
     #[test]
     fn atomic_create_installs_one_link_without_leaking_a_temporary() {
         let temp = Temp::new();
@@ -899,14 +1147,72 @@ mod publication_tests {
         let stage = root
             .stage_create("fresh/file.txt", b"payload", &|| false)
             .unwrap();
-        fs::rename(temp.0.join("fresh"), temp.0.join("renamed")).unwrap();
-        fs::create_dir(temp.0.join("fresh")).unwrap();
+        assert!(!temp.0.join("fresh").exists());
+        let private = fs::read_dir(&temp.0)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".aw-stage-")
+            })
+            .unwrap();
+        fs::rename(&private, temp.0.join("renamed")).unwrap();
+        fs::create_dir(&private).unwrap();
         drop(stage);
         assert!(
-            temp.0.join("fresh").is_dir(),
-            "another actor's replacement must survive our cleanup"
+            private.is_dir(),
+            "another actor's private replacement survives"
         );
         assert!(temp.0.join("renamed").is_dir());
+        assert!(!temp.0.join("fresh").exists());
+    }
+
+    #[test]
+    fn streaming_update_hash_rechecks_preimage_before_publish() {
+        let temp = Temp::new();
+        let path = temp.0.join("blob.bin");
+        fs::write(&path, b"abcdefghij").unwrap();
+        let original = b"abcdefghij";
+        let expected = (
+            original.len() as u64,
+            <[u8; 32]>::from(Sha256::digest(original)),
+        );
+        let root = temp.root();
+        let _lock = root.lock_mutations(&["blob.bin".to_owned()]).unwrap();
+        let stage = root
+            .stage_stream_update(
+                "blob.bin",
+                expected,
+                |out| {
+                    out.write_all(b"abcXYZghij")?;
+                    Ok(())
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        stage.commit().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abcXYZghij");
+        assert_eq!(fs::metadata(&path).unwrap().nlink(), 1);
+
+        let expected = (10, <[u8; 32]>::from(Sha256::digest(b"abcXYZghij")));
+        let stage = root
+            .stage_stream_update(
+                "blob.bin",
+                expected,
+                |out| {
+                    out.write_all(b"post change")?;
+                    Ok(())
+                },
+                &|| false,
+            )
+            .unwrap();
+        fs::write(&path, b"external!!").unwrap();
+        assert!(stage.commit().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"external!!");
     }
 
     #[cfg(target_os = "linux")]

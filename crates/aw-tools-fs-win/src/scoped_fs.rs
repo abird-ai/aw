@@ -48,6 +48,7 @@ pub type Result<T> = std::result::Result<T, ScopedError>;
 pub enum EntryKind {
     Directory,
     File,
+    Symlink,
     Unsupported,
 }
 
@@ -56,6 +57,8 @@ pub struct Entry {
     pub name: String,
     pub path: String,
     pub kind: EntryKind,
+    /// Native-hidden attribute or dot-prefix, obtained during the no-follow walk.
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +66,8 @@ pub struct Listing {
     pub path: String,
     pub entries: Vec<Entry>,
     pub incomplete: bool,
+    /// A filename could not be represented as an exact JSON/UTF-8 path.
+    pub path_encoding: bool,
 }
 
 pub struct Root {
@@ -221,6 +226,7 @@ impl Root {
 
         let mut entries = Vec::new();
         let mut incomplete = false;
+        let mut path_encoding = false;
         for (scanned, item) in fs::read_dir(&dir.path)?.enumerate() {
             if scanned >= 4096 {
                 incomplete = true;
@@ -234,11 +240,11 @@ impl Root {
                 }
             };
             let Some(name) = item.file_name().to_str().map(str::to_owned) else {
-                incomplete = true;
+                path_encoding = true;
                 continue;
             };
             if validate_path(&name).is_err() {
-                incomplete = true;
+                path_encoding = true;
                 continue;
             }
             let meta = match fs::symlink_metadata(item.path()) {
@@ -249,7 +255,11 @@ impl Root {
                 }
             };
             let kind = if is_reparse(&meta) {
-                EntryKind::Unsupported
+                if meta.file_type().is_symlink() {
+                    EntryKind::Symlink
+                } else {
+                    EntryKind::Unsupported
+                }
             } else if meta.is_dir() {
                 EntryKind::Directory
             } else if meta.is_file() {
@@ -277,10 +287,15 @@ impl Root {
                 incomplete = true;
                 continue;
             }
+            let hidden = name.starts_with('.')
+                || meta.file_attributes()
+                    & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN
+                    != 0;
             entries.push(Entry {
                 name,
                 path: joined,
                 kind,
+                hidden,
             });
             if entries.len() >= max_entries {
                 incomplete = true;
@@ -292,7 +307,8 @@ impl Root {
             let rank = |kind: &EntryKind| match kind {
                 EntryKind::Directory => 0,
                 EntryKind::File => 1,
-                EntryKind::Unsupported => 2,
+                EntryKind::Symlink => 2,
+                EntryKind::Unsupported => 3,
             };
             rank(&a.kind).cmp(&rank(&b.kind)).then(a.name.cmp(&b.name))
         });
@@ -300,6 +316,7 @@ impl Root {
             path: path.into(),
             entries,
             incomplete,
+            path_encoding,
         })
     }
 
@@ -447,5 +464,130 @@ mod tests {
         assert!(pin_directory(&alias).is_err());
         assert!(root.read("alias/secret").is_err());
         assert!(root.list("alias").is_err());
+    }
+}
+
+/// Shared traversal with pinned Windows ancestor handles; no reparse follow.
+impl aw_tools_core::filesystem::walk::Backend for Root {
+    type Error = ScopedError;
+    fn list(
+        &self,
+        path: &str,
+        max: usize,
+    ) -> std::result::Result<aw_tools_core::filesystem::walk::Listing, Self::Error> {
+        use aw_tools_core::filesystem::{walk, Kind};
+        let listing = self.list_with_limit(path, max)?;
+        Ok(walk::Listing {
+            incomplete: listing.incomplete,
+            path_encoding: listing.path_encoding,
+            entries: listing
+                .entries
+                .into_iter()
+                .map(|item| {
+                    let kind = match item.kind {
+                        EntryKind::File => Kind::File,
+                        EntryKind::Directory => Kind::Dir,
+                        EntryKind::Symlink => Kind::Symlink,
+                        EntryKind::Unsupported => Kind::Other,
+                    };
+                    walk::WalkEntry {
+                        name: item.name,
+                        path: item.path,
+                        kind,
+                        hidden: item.hidden,
+                    }
+                })
+                .collect(),
+        })
+    }
+    fn read_bytes(&self, path: &str, max: usize) -> std::result::Result<Vec<u8>, Self::Error> {
+        Root::read_bytes(self, path, max)
+    }
+    fn classify(&self, error: &Self::Error) -> aw_tools_core::filesystem::walk::BackendErrorKind {
+        use aw_tools_core::filesystem::walk::BackendErrorKind as K;
+        match error {
+            ScopedError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => K::Missing,
+            ScopedError::Io(_) | ScopedError::Denied(_) => K::Unavailable,
+            ScopedError::Limit(_) => K::Limit,
+            ScopedError::Cancelled => K::Other,
+        }
+    }
+}
+
+impl aw_tools_core::filesystem::backend::MetadataBackend for Root {
+    fn entry_meta(&self, path: &str) -> Result<aw_tools_core::filesystem::EntryMeta> {
+        Root::entry_meta(self, path)
+    }
+}
+impl aw_tools_core::filesystem::backend::StagedPublication for port::StagedWrite {
+    type Error = ScopedError;
+    fn commit(self) -> Result<()> {
+        port::StagedWrite::commit(self)
+    }
+}
+impl aw_tools_core::filesystem::backend::SecuredFilesystem for Root {
+    type Guard<'a> = port::MutationGuard<'a>;
+    type Stage = port::StagedWrite;
+    fn lock<'a>(&'a self, paths: &[String], cancel: &dyn Fn() -> bool) -> Result<Self::Guard<'a>> {
+        self.lock_mutations_with_cancel(paths, cancel)
+    }
+    fn stage_create(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self::Stage> {
+        Root::stage_create(self, path, bytes, cancel)
+    }
+    fn stage_replace(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self::Stage> {
+        Root::stage_replace(self, path, bytes, cancel)
+    }
+    fn stage_update(
+        &self,
+        path: &str,
+        expected: &[u8],
+        bytes: &[u8],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self::Stage> {
+        Root::stage_update(self, path, expected, bytes, cancel)
+    }
+    fn classify_publication_failure(
+        &self,
+        error: &Self::Error,
+    ) -> aw_tools_core::filesystem::backend::CommitFailure {
+        use aw_tools_core::filesystem::backend::CommitFailure;
+        match error {
+            ScopedError::Denied(_) | ScopedError::Limit(_) | ScopedError::Cancelled => {
+                CommitFailure::NoPublication
+            }
+            ScopedError::Io(_) => CommitFailure::Unknown,
+        }
+    }
+    fn copy_exact(&self, source: &str, destination: &str, cancel: &dyn Fn() -> bool) -> Result<()> {
+        Root::copy_path(self, source, destination, true, cancel)
+    }
+    fn move_exact(&self, source: &str, destination: &str, cancel: &dyn Fn() -> bool) -> Result<()> {
+        Root::move_path(self, source, destination, cancel)
+    }
+    fn remove_exact(
+        &self,
+        paths: &[String],
+        recursive: bool,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<aw_tools_core::filesystem::lifecycle::RemoveOutcome> {
+        Root::remove_paths(self, paths, recursive, cancel)
+    }
+    fn read_page(
+        &self,
+        path: &str,
+        request: aw_tools_core::read::PageRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<aw_tools_core::read::Page> {
+        Root::read_page_with_cancel(self, path, request, cancel)
     }
 }

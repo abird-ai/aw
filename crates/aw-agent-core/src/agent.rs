@@ -1558,24 +1558,32 @@ impl Agent {
                     // Only an explicitly granted trusted Bash and the user's
                     // opt-in can honor the model's parallel=true preference.
                     // Adjacent commands marked false/omitted are barriers.
-                    let bash_size = if self.tool_policy.allow_parallel_bash {
-                        batch[cursor..]
-                            .iter()
-                            .take(self.tool_policy.max_parallel_bash)
-                            .take_while(|(call, _, spec)| {
-                                spec.effect == ToolEffect::Process
-                                    && (call.name == "bash" || call.name == "powershell")
-                                    && call.arguments.get("parallel").and_then(|v| v.as_bool())
-                                        == Some(true)
-                                    && self
-                                        .tools
-                                        .source_of(&call.name)
-                                        .is_some_and(|source| *source == ToolSource::trusted_host())
-                            })
-                            .count()
-                    } else {
-                        0
-                    };
+                    let bash_size=if self.tool_policy.allow_parallel_bash {
+                        let pending=&batch[cursor..];
+                        let mut count=0usize;
+                        for (call,tool,spec) in pending.iter()
+                            .take(self.tool_policy.max_parallel_bash){
+                            let candidate=spec.effect==ToolEffect::Process
+                                &&matches!(call.name.as_str(),
+                                    "bash"|"pwsh"|"powershell")
+                                &&call.arguments.get("parallel")
+                                    .and_then(|v|v.as_bool())==Some(true)
+                                &&self.tools.source_of(&call.name).is_some_and(
+                                    |source|*source==ToolSource::trusted_host()
+                                );
+                            if !candidate || pending[..count].iter().any(
+                                |(earlier,_,_)|earlier.name!=call.name
+                                    ||!crate::tool::guarded_parallel_hint(
+                                        tool.as_ref(),
+                                        &earlier.arguments,&call.arguments
+                                    )
+                            ){
+                                break;
+                            }
+                            count+=1;
+                        }
+                        count
+                    }else{0};
                     let wave = if read_size >= 2 {
                         Some((WaveKind::Read, read_size))
                     } else if bash_size >= 2 {

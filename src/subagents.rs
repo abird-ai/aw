@@ -911,7 +911,7 @@ impl Service {
             ctx.turn_id,
             delegation_root_id,
             delegation_allocation_id,
-            &inner.child_tool_mode.to_string(),
+            inner.child_tool_mode.storage_label(),
             &repo_root,
             &execution_root,
             &base_revision,
@@ -1058,7 +1058,7 @@ impl Service {
                 return Err(error);
             }
         };
-        let tool_mode = inner.child_tool_mode.to_string();
+        let tool_mode=inner.child_tool_mode.storage_label().to_owned();
         let creation = inner.store.create_subagent_session(
             &ctx.actor,
             &scope.session_id,
@@ -3055,7 +3055,7 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(relation.state, "completed");
-        assert_eq!(relation.tool_mode, "workspace");
+        assert_eq!(relation.tool_mode,"workspace");
         let (actor_info, descriptor) = actor_service.status(&relation.id).unwrap();
         assert_eq!(actor_info.child_session_id, relation.child_session_id);
         assert_eq!(descriptor.depth, 1);

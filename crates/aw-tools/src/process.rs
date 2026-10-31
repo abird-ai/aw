@@ -1,8 +1,15 @@
 //! Host-owned process I/O service: no model tool, sandbox or second Agent.
 //! A trusted caller must authenticate grants and journal Process intent
 //! before spawn. Pipes and optional PTYs share lifecycle ownership.
+use aw_tools_core::{
+    task::{SpoolWriterLease, SpoolWriters, StreamSummary, TaskDisposition},
+    task_fence::{FenceError, TaskFence, TaskIdentity, TaskTransition},
+    task_ops::{HostTaskOperations, Stream as TaskStream, TaskInfo},
+    task_spool::{BoundedFileSpool, SessionQuota, SpoolError},
+};
 use std::{
     collections::{BTreeMap, VecDeque},
+    fs::File,
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -124,6 +131,325 @@ impl CaptureState {
         }
     }
 }
+/// The host opens uniquely-owned spool file capabilities before calling
+/// spawn. Model arguments cannot select these paths or create task IDs.
+pub struct HostSpoolFiles {
+    pub stdout: File,
+    pub stderr: File,
+    pub session_quota: Arc<Mutex<SessionQuota>>,
+}
+#[derive(Clone)]
+pub struct ProcessSpoolAccess {
+    stdout: Arc<Mutex<BoundedFileSpool>>,
+    stderr: Arc<Mutex<BoundedFileSpool>>,
+}
+impl ProcessSpoolAccess {
+    fn stream(&self, kind: OutputStream) -> &Arc<Mutex<BoundedFileSpool>> {
+        match kind {
+            OutputStream::Stdout => &self.stdout,
+            OutputStream::Stderr => &self.stderr,
+        }
+    }
+    fn writers_finished(&self) -> Result<bool, SpoolError> {
+        // Poisoned output state is a failure, not a reason to strand Task
+        // Failed/Uncertain settlement. Only terminal status may recover it.
+        let out = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
+        let err = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(out.writers_quiesced() && err.writers_quiesced())
+    }
+    fn output_ready(&self) -> Result<bool, SpoolError> {
+        let out = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
+        let err = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(!self.stdout.is_poisoned()
+            && !self.stderr.is_poisoned()
+            && out.is_quiesced()
+            && err.is_quiesced())
+    }
+    pub(crate) fn summary(&self, kind: OutputStream) -> Result<StreamSummary, SpoolError> {
+        self.stream(kind)
+            .lock()
+            .map_err(|_| SpoolError::Poisoned)
+            .map(|spool| spool.summary())
+    }
+    pub(crate) fn page(
+        &self,
+        kind: OutputStream,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>, SpoolError> {
+        self.stream(kind)
+            .lock()
+            .map_err(|_| SpoolError::Poisoned)?
+            .page(offset, limit)
+    }
+    pub fn acknowledge(&self, kind: OutputStream, through: u64) -> Result<bool, SpoolError> {
+        self.stream(kind)
+            .lock()
+            .map_err(|_| SpoolError::Poisoned)?
+            .acknowledge(through)
+    }
+}
+/// Exact-source, generation-fenced host projection over one durable
+/// Process receipt. It contains no task DB or model-generated task grants.
+pub struct FencedProcessSpools {
+    access: ProcessSpoolAccess,
+    fence: Mutex<TaskFence>,
+}
+#[derive(Debug)]
+pub enum FencedProcessError {
+    Fence(FenceError),
+    Spool(SpoolError),
+    Poisoned,
+    NotSettled,
+    CancelUnavailable,
+    SourceCheckPanicked,
+    CancelOutcomeUnknown,
+}
+impl From<FenceError> for FencedProcessError {
+    fn from(error: FenceError) -> Self {
+        Self::Fence(error)
+    }
+}
+impl From<SpoolError> for FencedProcessError {
+    fn from(error: SpoolError) -> Self {
+        Self::Spool(error)
+    }
+}
+impl FencedProcessSpools {
+    /// The host calls this only after its immutable ToolStarted journal
+    /// entry is committed, with its own authenticated TaskIdentity.
+    pub fn after_journal(
+        identity: TaskIdentity,
+        intent_sequence: u64,
+        access: ProcessSpoolAccess,
+    ) -> Result<Self, FenceError> {
+        if identity.effect != aw_tools_core::ToolEffect::Process {
+            return Err(FenceError::InvalidIdentity);
+        }
+        Ok(Self {
+            access,
+            fence: Mutex::new(TaskFence::after_journal(identity, intent_sequence)?),
+        })
+    }
+    pub fn summary(
+        &self,
+        live: &TaskIdentity,
+        expected: u64,
+        source_live: bool,
+        stream: OutputStream,
+    ) -> Result<StreamSummary, FencedProcessError> {
+        let guard = self
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?;
+        guard.verify(live, expected, source_live)?;
+        self.access.summary(stream).map_err(Into::into)
+    }
+    pub fn generation(&self) -> Result<u64, FencedProcessError> {
+        Ok(self
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?
+            .generation())
+    }
+    /// Persist transition through the original Session/TurnJournal CAS
+    /// before changing the local generation. Never starts a second journal.
+    pub fn transition_journaled(
+        &self,
+        live: &TaskIdentity,
+        expected: u64,
+        source_live: bool,
+        state: TaskDisposition,
+        recovery_proven: bool,
+        persist: impl FnOnce(TaskTransition) -> Result<(), FenceError>,
+    ) -> Result<u64, FencedProcessError> {
+        let mut guard = self
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?;
+        guard.verify(live, expected, source_live)?;
+        if state.terminal()
+            && (!self.access.writers_finished()?
+                || (state == TaskDisposition::Completed && !self.access.output_ready()?))
+        {
+            return Err(FencedProcessError::NotSettled);
+        }
+        guard
+            .transition_journaled(live, expected, source_live, state, recovery_proven, persist)
+            .map_err(Into::into)
+    }
+    pub fn page(
+        &self,
+        live: &TaskIdentity,
+        expected: u64,
+        source_live: bool,
+        stream: OutputStream,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>, FencedProcessError> {
+        let guard = self
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?;
+        guard.verify(live, expected, source_live)?;
+        self.access.page(stream, offset, limit).map_err(Into::into)
+    }
+    pub fn acknowledge(
+        &self,
+        live: &TaskIdentity,
+        expected: u64,
+        source_live: bool,
+        stream: OutputStream,
+        through: u64,
+    ) -> Result<bool, FencedProcessError> {
+        let guard = self
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?;
+        guard.verify(live, expected, source_live)?;
+        self.access.acknowledge(stream, through).map_err(Into::into)
+    }
+}
+
+/// One host-verified Process projection over TaskOps. A model-visible task
+/// ID never authenticates itself: the original AW host supplies live source
+/// liveness on *each* get/page/ack/cancel operation.
+pub struct BoundProcessTaskHost<'a> {
+    process: &'a FencedProcessSpools,
+    verify_source: &'a dyn Fn(&TaskIdentity) -> bool,
+    cancel: &'a dyn Fn(&TaskInfo) -> Result<bool, FencedProcessError>,
+}
+impl<'a> BoundProcessTaskHost<'a> {
+    fn live(&self, id: &TaskIdentity) -> Result<bool, FencedProcessError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.verify_source)(id)))
+            .map_err(|_| FencedProcessError::SourceCheckPanicked)
+    }
+    pub fn new(
+        process: &'a FencedProcessSpools,
+        verify_source: &'a dyn Fn(&TaskIdentity) -> bool,
+        cancel: &'a dyn Fn(&TaskInfo) -> Result<bool, FencedProcessError>,
+    ) -> Self {
+        Self {
+            process,
+            verify_source,
+            cancel,
+        }
+    }
+}
+fn output_stream(kind: TaskStream) -> OutputStream {
+    match kind {
+        TaskStream::Stdout => OutputStream::Stdout,
+        TaskStream::Stderr => OutputStream::Stderr,
+    }
+}
+impl HostTaskOperations for BoundProcessTaskHost<'_> {
+    type Error = FencedProcessError;
+    fn inspect(&self, binding: &TaskIdentity) -> Result<TaskInfo, Self::Error> {
+        let live = self.live(binding)?;
+        let fence = self
+            .process
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?;
+        fence.verify(binding, fence.generation(), live)?;
+        Ok(TaskInfo {
+            binding: fence.binding().clone(),
+            generation: fence.generation(),
+            journal_sequence: fence.journal_intent_sequence(),
+            state: fence.state(),
+            source_live: live,
+        })
+    }
+    fn list(&self, scope: &TaskIdentity, limit: usize) -> Result<Vec<TaskInfo>, Self::Error> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let binding = self
+            .process
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?
+            .binding()
+            .clone();
+        let live = self.live(&binding)?;
+        let fence = self
+            .process
+            .fence
+            .lock()
+            .map_err(|_| FencedProcessError::Poisoned)?;
+        if fence.binding() != &binding {
+            return Err(FencedProcessError::Fence(FenceError::WrongSourceOrScope));
+        }
+        if binding.actor != scope.actor
+            || binding.source_kind != scope.source_kind
+            || binding.source_id != scope.source_id
+            || binding.source_epoch != scope.source_epoch
+            || binding.execution_site != scope.execution_site
+            || binding.session != scope.session
+            || binding.branch != scope.branch
+            || !live
+        {
+            return Ok(Vec::new());
+        }
+        Ok(vec![TaskInfo {
+            binding: binding.clone(),
+            generation: fence.generation(),
+            journal_sequence: fence.journal_intent_sequence(),
+            state: fence.state(),
+            source_live: true,
+        }])
+    }
+    fn output(
+        &self,
+        task: &TaskInfo,
+        stream: TaskStream,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>, Self::Error> {
+        self.process.page(
+            &task.binding,
+            task.generation,
+            self.live(&task.binding)?,
+            output_stream(stream),
+            offset,
+            limit,
+        )
+    }
+    fn acknowledge(
+        &self,
+        task: &TaskInfo,
+        stream: TaskStream,
+        through: u64,
+    ) -> Result<bool, Self::Error> {
+        self.process.acknowledge(
+            &task.binding,
+            task.generation,
+            self.live(&task.binding)?,
+            output_stream(stream),
+            through,
+        )
+    }
+    fn request_cancel(&self, task: &TaskInfo) -> Result<bool, Self::Error> {
+        {
+            let live = self.live(&task.binding)?;
+            let fence = self
+                .process
+                .fence
+                .lock()
+                .map_err(|_| FencedProcessError::Poisoned)?;
+            fence.verify(&task.binding, task.generation, live)?;
+            if fence.state().terminal() {
+                return Err(FencedProcessError::CancelUnavailable);
+            }
+        }
+        // Cancellation may journal a transition through the same Process
+        // fence. Never call an external host callback with that lock held.
+        // The host must recheck the exact generation/grant before OS effects.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.cancel)(task)))
+            .unwrap_or(Err(FencedProcessError::CancelOutcomeUnknown))
+    }
+}
+
 #[derive(Clone)]
 struct Reader {
     state: Arc<Mutex<CaptureState>>,
@@ -135,23 +461,102 @@ impl Reader {
             .unwrap_or_else(|e| e.into_inner())
             .snapshot()
     }
-    fn start<R: AsyncRead + Unpin + Send + 'static>(input: R) -> (Self, JoinHandle<()>) {
+    fn start<R: AsyncRead + Unpin + Send + 'static>(
+        input: R,
+        writer_lease: SpoolWriterLease,
+        spool: Option<Arc<Mutex<BoundedFileSpool>>>,
+    ) -> (Self, JoinHandle<()>) {
+        const PIPE_BUFFER: usize = 16 * 1024;
+        const SPOOL_BATCH: usize = 64 * 1024;
+        const SPOOL_QUEUE: usize = 4;
         let state = Arc::new(Mutex::new(CaptureState::default()));
         let shared = state.clone();
         let task = tokio::spawn(async move {
+            let _lease = writer_lease;
             let mut input = input;
-            let mut buffer = [0u8; 4096];
-            let failed = loop {
+            let (mut sender, writer) = if let Some(spool) = spool {
+                // One fixed blocking writer per stream, bounded in-flight
+                // buffering; no per-chunk worker spawning.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(SPOOL_QUEUE);
+                let worker = tokio::task::spawn_blocking(move || -> Result<(), SpoolError> {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut failed = false;
+                        while let Some(chunk) = rx.blocking_recv() {
+                            let mut store = spool.lock().unwrap_or_else(|e| e.into_inner());
+                            let result = if failed {
+                                store.observe_after_failure(chunk.len() as u64).map(|_| 0)
+                            } else {
+                                match store.discard_if_full(chunk.len() as u64) {
+                                    Ok(true) => Ok(0),
+                                    Ok(false) => store.append(&chunk),
+                                    Err(error) => Err(error),
+                                }
+                            };
+                            if result.is_err() {
+                                failed = true;
+                            }
+                        }
+                        failed
+                    }));
+                    // A panicking writer cannot leave its spool lease held
+                    // forever. Mark failure and close regardless of output.
+                    let mut store = spool.lock().unwrap_or_else(|e| e.into_inner());
+                    let failed = outcome.unwrap_or(true);
+                    if failed {
+                        store.mark_writer_failed();
+                    }
+                    let sync = store.finish_writer();
+                    if failed {
+                        return Err(SpoolError::WriteFailed);
+                    }
+                    sync
+                });
+                (Some(tx), Some(worker))
+            } else {
+                (None, None)
+            };
+            // Foreground Process without durable spooling pays no extra
+            // batch allocation; the queue exists only in the opt-in path.
+            let mut batch = if sender.is_some() {
+                Vec::with_capacity(SPOOL_BATCH)
+            } else {
+                Vec::new()
+            };
+            let mut buffer = [0u8; PIPE_BUFFER];
+            let mut failed = loop {
                 match input.read(&mut buffer).await {
                     Ok(0) => break false,
-                    Ok(n) => shared
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .append(&buffer[..n]),
+                    Ok(n) => {
+                        shared
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .append(&buffer[..n]);
+                        if let Some(ref tx) = sender {
+                            batch.extend_from_slice(&buffer[..n]);
+                            if batch.len() >= SPOOL_BATCH {
+                                let full =
+                                    std::mem::replace(&mut batch, Vec::with_capacity(SPOOL_BATCH));
+                                if tx.send(full).await.is_err() {
+                                    sender = None;
+                                    break true;
+                                }
+                            }
+                        }
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break true,
                 }
             };
+            if let Some(tx) = sender {
+                if !batch.is_empty() && tx.send(batch).await.is_err() {
+                    failed = true;
+                }
+            }
+            if let Some(worker) = writer {
+                if !matches!(worker.await, Ok(Ok(()))) {
+                    failed = true;
+                }
+            }
             let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
             state.closed = true;
             state.read_failed = failed;
@@ -159,12 +564,163 @@ impl Reader {
         (Self { state }, task)
     }
 }
+/// A bounded, exact byte-range read from the existing host-owned capture.
+/// Unlike a durable disk spool, the head/tail ring may contain an unavailable
+/// middle range. No page is invented or silently rewound across that gap.
+pub const MAX_PROCESS_PAGE_BYTES: usize = 48 * 1024;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessOutputPage {
+    pub offset: u64,
+    pub next_offset: u64,
+    pub total_bytes: u64,
+    pub data: Vec<u8>,
+    /// Unrecoverable captured-output gap, if the head and tail don't meet.
+    pub missing_range: Option<(u64, u64)>,
+    pub stream_closed: bool,
+    pub read_failed: bool,
+    pub at_eof: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputPageError {
+    InvalidLimit,
+    PastEnd,
+    Gap { start: u64, end: u64 },
+}
+impl StreamSnapshot {
+    fn retained_gap(&self) -> Option<(u64, u64)> {
+        let head = self.head.len() as u64;
+        let start = self.total_bytes.saturating_sub(self.tail.len() as u64);
+        if head < start {
+            Some((head, start))
+        } else {
+            None
+        }
+    }
+    /// Returns only original bytes; reads never cross a missing middle.
+    pub fn page(&self, offset: u64, limit: usize) -> Result<ProcessOutputPage, OutputPageError> {
+        if limit == 0 || limit > MAX_PROCESS_PAGE_BYTES {
+            return Err(OutputPageError::InvalidLimit);
+        }
+        if offset > self.total_bytes {
+            return Err(OutputPageError::PastEnd);
+        }
+        let gap = self.retained_gap();
+        if let Some((start, end)) = gap {
+            if (start..end).contains(&offset) {
+                return Err(OutputPageError::Gap { start, end });
+            }
+        }
+        let target_end = self.total_bytes.min(offset.saturating_add(limit as u64));
+        let end = gap.map_or(target_end, |(start, _)| {
+            if offset < start {
+                target_end.min(start)
+            } else {
+                target_end
+            }
+        });
+        let mut data = Vec::with_capacity((end - offset) as usize);
+        let head_end = self.head.len() as u64;
+        if offset < head_end {
+            let next = end.min(head_end);
+            data.extend_from_slice(&self.head[offset as usize..next as usize]);
+        }
+        let suffix_start = self.total_bytes.saturating_sub(self.tail.len() as u64);
+        let tail_from = offset.max(head_end).max(suffix_start);
+        if tail_from < end {
+            let begin = (tail_from - suffix_start) as usize;
+            let len = (end - tail_from) as usize;
+            data.extend_from_slice(&self.tail[begin..begin + len]);
+        }
+        debug_assert_eq!(data.len(), (end - offset) as usize);
+        Ok(ProcessOutputPage {
+            offset,
+            next_offset: end,
+            total_bytes: self.total_bytes,
+            data,
+            missing_range: gap,
+            stream_closed: self.closed,
+            read_failed: self.read_failed,
+            at_eof: end == self.total_bytes,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessSnapshot {
     pub pid: u32,
     pub stdout: StreamSnapshot,
     pub stderr: StreamSnapshot,
 }
+impl ProcessSnapshot {
+    pub fn output(&self, stream: OutputStream) -> &StreamSnapshot {
+        match stream {
+            OutputStream::Stdout => &self.stdout,
+            OutputStream::Stderr => &self.stderr,
+        }
+    }
+    pub fn page(
+        &self,
+        stream: OutputStream,
+        offset: u64,
+        limit: usize,
+    ) -> Result<ProcessOutputPage, OutputPageError> {
+        self.output(stream).page(offset, limit)
+    }
+}
+
+/// Host-only cursored delivery/ACK projection. The acknowledged range is a
+/// contiguous byte prefix actually returned by this cursor, never a guessed
+/// high-water mark over an unavailable head/tail gap.
+pub struct ProcessOutputCursor {
+    stream: StreamSnapshot,
+    delivered_prefix: u64,
+    acknowledged: u64,
+}
+impl ProcessOutputCursor {
+    pub fn new(snapshot: &ProcessSnapshot, stream: OutputStream) -> Self {
+        Self {
+            stream: snapshot.output(stream).clone(),
+            delivered_prefix: 0,
+            acknowledged: 0,
+        }
+    }
+    pub fn page(
+        &mut self,
+        offset: u64,
+        limit: usize,
+    ) -> Result<ProcessOutputPage, OutputPageError> {
+        let page = self.stream.page(offset, limit)?;
+        if offset <= self.delivered_prefix {
+            self.delivered_prefix = self.delivered_prefix.max(page.next_offset);
+        }
+        Ok(page)
+    }
+    pub fn acknowledge(&mut self, through: u64) -> Result<bool, OutputPageError> {
+        if through > self.delivered_prefix {
+            return Err(OutputPageError::Gap {
+                start: self.delivered_prefix,
+                end: through,
+            });
+        }
+        if through <= self.acknowledged {
+            return Ok(false);
+        }
+        self.acknowledged = through;
+        Ok(true)
+    }
+    pub fn delivered_prefix(&self) -> u64 {
+        self.delivered_prefix
+    }
+    pub fn acknowledged(&self) -> u64 {
+        self.acknowledged
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Exited(i32),
@@ -177,6 +733,9 @@ pub struct ProcessReceipt {
     pub outcome: Outcome,
     pub output: ProcessSnapshot,
     pub output_complete: bool,
+    /// Present only when the trusted host supplied durable output handles.
+    /// Ownership is the original Process; no model-facing job ID exists.
+    pub spools: Option<ProcessSpoolAccess>,
 }
 impl ProcessReceipt {
     pub fn finished(&self) -> bool {
@@ -190,6 +749,9 @@ pub struct PipeProcess {
     stdout: Reader,
     stderr: Reader,
     readers: Vec<JoinHandle<()>>,
+    /// Host-owned output lifetime; no independent job or task ledger.
+    spool_writers: Arc<SpoolWriters>,
+    spools: Option<ProcessSpoolAccess>,
     /// Fenced original OS termination attempt. A second attempt on this
     /// live host-owned PipeProcess is always refused, even after an unknown
     /// Process exit or a cancelled caller; never silently resend a signal.
@@ -199,7 +761,57 @@ pub struct PipeProcess {
 }
 impl PipeProcess {
     pub async fn spawn(spec: PipeSpec) -> crate::Result<Self> {
+        Self::spawn_inner(spec, None).await
+    }
+    /// Opt-in host-authorized durable spooling. Host constructs handles and
+    /// journals Process intent; no new background task or model grant.
+    pub async fn spawn_with_host_spools(
+        spec: PipeSpec,
+        files: HostSpoolFiles,
+    ) -> crate::Result<Self> {
+        Self::spawn_inner(spec, Some(files)).await
+    }
+    async fn spawn_inner(spec: PipeSpec, files: Option<HostSpoolFiles>) -> crate::Result<Self> {
         spec.validate()?;
+        let spool_writers = Arc::new(SpoolWriters::default());
+        // Validate and reserve spool capabilities *before* external spawn.
+        let spools = if let Some(files) = files {
+            // Do not launch a child with an already-poisoned accounting
+            // owner; a later poison becomes a durable output failure.
+            {
+                let _quota_check = files.session_quota.lock().map_err(|_| {
+                    crate::Error::Denied(
+                        "host spool quota is poisoned; inspect before process launch",
+                    )
+                })?;
+            }
+            // Shared descriptor identity is stable on Unix and Windows.
+            // Verify link count and R/W access before spawning a child.
+            let a = aw_tools_core::task_spool::spool_file_identity(&files.stdout)
+                .map_err(|_| crate::Error::Denied("invalid host stdout spool"))?;
+            let b = aw_tools_core::task_spool::spool_file_identity(&files.stderr)
+                .map_err(|_| crate::Error::Denied("invalid host stderr spool"))?;
+            if a == b {
+                return Err(crate::Error::Denied(
+                    "stdout and stderr require distinct spool files",
+                ));
+            }
+            let out = BoundedFileSpool::new(
+                files.stdout,
+                files.session_quota.clone(),
+                spool_writers.clone(),
+            )
+            .map_err(|_| crate::Error::Denied("invalid host stdout spool"))?;
+            let err =
+                BoundedFileSpool::new(files.stderr, files.session_quota, spool_writers.clone())
+                    .map_err(|_| crate::Error::Denied("invalid host stderr spool"))?;
+            Some(ProcessSpoolAccess {
+                stdout: Arc::new(Mutex::new(out)),
+                stderr: Arc::new(Mutex::new(err)),
+            })
+        } else {
+            None
+        };
         // Only trusted host config sets these values. The existing Agent
         // journals and revalidates Process grants before calling this port.
         let mut cmd = Command::new(spec.program);
@@ -242,8 +854,19 @@ impl PipeProcess {
             .take()
             .ok_or(crate::Error::Protocol("missing stderr pipe"))?;
         let stdin = child.stdin.take();
-        let (out, out_task) = Reader::start(stdout);
-        let (err, err_task) = Reader::start(stderr);
+        let [out_lease, err_lease] = spool_writers.begin::<2>().ok_or(crate::Error::Protocol(
+            "new process spool writers already sealed",
+        ))?;
+        let (out, out_task) = Reader::start(
+            stdout,
+            out_lease,
+            spools.as_ref().map(|access| access.stdout.clone()),
+        );
+        let (err, err_task) = Reader::start(
+            stderr,
+            err_lease,
+            spools.as_ref().map(|access| access.stderr.clone()),
+        );
         Ok(Self {
             child,
             pid,
@@ -251,6 +874,8 @@ impl PipeProcess {
             stdout: out,
             stderr: err,
             readers: vec![out_task, err_task],
+            spool_writers,
+            spools,
             termination_attempted: false,
             #[cfg(windows)]
             job,
@@ -296,18 +921,26 @@ impl PipeProcess {
         self.stdin.take();
     }
     async fn drain_output(&mut self) -> bool {
+        // No new reader may enter once terminal output settlement begins.
+        // Await actual reader completion: cancellation of a future alone is
+        // not evidence that its in-flight read/append stopped.
+        self.spool_writers.seal();
         let mut complete = true;
         for task in &mut self.readers {
             match timeout(READER_DRAIN_DEADLINE, &mut *task).await {
                 Ok(Ok(())) => {}
                 _ => {
                     task.abort();
+                    // Poll the abort to completion; if even cancellation
+                    // cannot quiesce the reader, preserve an incomplete result.
+                    let _ = timeout(READER_DRAIN_DEADLINE, &mut *task).await;
                     complete = false;
                 }
             }
         }
         let s = self.snapshot();
         complete
+            && self.spool_writers.is_idle()
             && s.stdout.closed
             && s.stderr.closed
             && !s.stdout.read_failed
@@ -366,6 +999,7 @@ impl PipeProcess {
             outcome,
             output: self.snapshot(),
             output_complete,
+            spools: self.spools.clone(),
         })
     }
     /// Caller retains the resource across model steps if needed. Output drains
@@ -396,6 +1030,7 @@ impl PipeProcess {
             outcome,
             output,
             output_complete,
+            spools: self.spools.clone(),
         }
     }
     fn status_outcome(status: ExitStatus) -> Outcome {
@@ -406,6 +1041,7 @@ impl PipeProcess {
 }
 impl Drop for PipeProcess {
     fn drop(&mut self) {
+        self.spool_writers.seal();
         for task in &self.readers {
             task.abort();
         }
@@ -511,6 +1147,623 @@ mod tests {
             "post-settlement original Process must never receive a second signal"
         );
     }
+    fn host_spool_file(label: &str) -> (File, std::path::PathBuf) {
+        use std::{
+            fs::OpenOptions,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aw-host-spool-{}-{unique}-{label}",
+            std::process::id()
+        ));
+        let handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        (handle, path)
+    }
+    #[tokio::test]
+    async fn host_opened_process_spools_retained_prefix_and_ack_are_exact() {
+        let (stdout, out_path) = host_spool_file("out");
+        let (stderr, err_path) = host_spool_file("err");
+        let quota = Arc::new(Mutex::new(SessionQuota::new(65536)));
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("head -c 90000 /dev/zero | tr '\\0' Z"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: quota.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(5)).await;
+        assert!(receipt.finished());
+        let spools = receipt.spools.as_ref().expect("explicit host spool");
+        let stdout = spools.summary(OutputStream::Stdout).unwrap();
+        assert_eq!(stdout.total_bytes, 90_000);
+        assert_eq!(stdout.retained_bytes, 65_536);
+        assert!(stdout.truncated);
+        assert_eq!(quota.lock().unwrap().used(), 65_536);
+        let first = spools.page(OutputStream::Stdout, 0, 16_384).unwrap();
+        assert_eq!(first, b"Z".repeat(16_384));
+        assert!(spools.acknowledge(OutputStream::Stdout, 16_385).is_err());
+        assert!(spools.acknowledge(OutputStream::Stdout, 16_384).unwrap());
+        let mut next = 16_384u64;
+        while next < 65_536 {
+            let page = spools.page(OutputStream::Stdout, next, 16_384).unwrap();
+            assert!(page.iter().all(|&b| b == b'Z'));
+            next += page.len() as u64;
+        }
+        assert_eq!(next, 65_536);
+        assert!(spools.acknowledge(OutputStream::Stdout, next).unwrap());
+        assert_eq!(spools.page(OutputStream::Stdout, next, 100).unwrap(), b"");
+        assert!(spools.page(OutputStream::Stdout, next + 1, 100).is_err());
+        assert_eq!(spools.summary(OutputStream::Stderr).unwrap().total_bytes, 0);
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    fn task_binding() -> TaskIdentity {
+        TaskIdentity {
+            actor: "owner".into(),
+            source_kind: "host".into(),
+            source_id: "trusted".into(),
+            source_epoch: 1,
+            execution_site: "local".into(),
+            session: "session-one".into(),
+            branch: "main".into(),
+            turn_id: 5,
+            call_id: "call-a".into(),
+            effect: aw_tools_core::ToolEffect::Process,
+        }
+    }
+    #[tokio::test]
+    async fn terminal_status_waits_for_real_spool_quiescence() {
+        let (stdout, out_path) = host_spool_file("pending-out");
+        let (stderr, err_path) = host_spool_file("pending-err");
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("printf available; sleep 0.02"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(4096))),
+            },
+        )
+        .await
+        .unwrap();
+        let access = process.spools.clone().unwrap();
+        let fence = FencedProcessSpools::after_journal(task_binding(), 1, access).unwrap();
+        assert_eq!(
+            fence
+                .transition_journaled(
+                    &task_binding(),
+                    1,
+                    true,
+                    TaskDisposition::Running,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            2
+        );
+        for state in [
+            TaskDisposition::Completed,
+            TaskDisposition::Failed,
+            TaskDisposition::Uncertain,
+        ] {
+            assert!(matches!(
+                fence.transition_journaled(&task_binding(), 2, true, state, false, |_| Ok(())),
+                Err(FencedProcessError::NotSettled)
+            ));
+        }
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert!(receipt.finished());
+        assert_eq!(
+            fence
+                .transition_journaled(
+                    &task_binding(),
+                    2,
+                    true,
+                    TaskDisposition::Completed,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            3
+        );
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn panicking_host_callbacks_are_fail_closed_and_cancel_is_unknown() {
+        use aw_tools_core::task_ops::{run, TaskAction, TaskInfo};
+        let (stdout, out_path) = host_spool_file("panic-out");
+        let (stderr, err_path) = host_spool_file("panic-err");
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("printf ok"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(32))),
+            },
+        )
+        .await
+        .unwrap();
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert!(receipt.finished());
+        let fence = FencedProcessSpools::after_journal(task_binding(), 14, receipt.spools.unwrap())
+            .unwrap();
+        let panic_live = |_: &TaskIdentity| -> bool { panic!("host source check failed") };
+        let none = |_: &TaskInfo| -> Result<bool, FencedProcessError> {
+            panic!("must not issue cancellation without a live source")
+        };
+        let host = BoundProcessTaskHost::new(&fence, &panic_live, &none);
+        assert!(matches!(
+            run(&host, &task_binding(), 1, TaskAction::Inspect),
+            Err(aw_tools_core::task_ops::TaskOpsError::Host(
+                FencedProcessError::SourceCheckPanicked
+            ))
+        ));
+        let live = |_: &TaskIdentity| true;
+        let cancel = |_: &TaskInfo| -> Result<bool, FencedProcessError> {
+            panic!("OS signal may already have been sent")
+        };
+        let host = BoundProcessTaskHost::new(&fence, &live, &cancel);
+        assert!(matches!(
+            run(&host, &task_binding(), 1, TaskAction::RequestCancel),
+            Err(aw_tools_core::task_ops::TaskOpsError::Host(
+                FencedProcessError::CancelOutcomeUnknown
+            ))
+        ));
+        assert_eq!(fence.generation().unwrap(), 1);
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn task_cancel_callback_may_reenter_its_fence_without_deadlock() {
+        use aw_tools_core::task_ops::{run, TaskAction, TaskInfo};
+        let (stdout, out_path) = host_spool_file("reenter-out");
+        let (stderr, err_path) = host_spool_file("reenter-err");
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("printf READY"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(64))),
+            },
+        )
+        .await
+        .unwrap();
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert!(receipt.finished());
+        let fence = FencedProcessSpools::after_journal(task_binding(), 13, receipt.spools.unwrap())
+            .unwrap();
+        let live = |_: &TaskIdentity| {
+            assert_eq!(
+                fence.generation().unwrap(),
+                1,
+                "source check must not run under Process fence"
+            );
+            true
+        };
+        let cancel = |_: &TaskInfo| {
+            assert_eq!(fence.generation().unwrap(), 1);
+            // The original Process host remains the only OS terminator.
+            Err(FencedProcessError::CancelUnavailable)
+        };
+        let host = BoundProcessTaskHost::new(&fence, &live, &cancel);
+        assert!(matches!(
+            run(&host, &task_binding(), 1, TaskAction::Inspect),
+            Ok(aw_tools_core::task_ops::TaskReply::Info(_))
+        ));
+        assert_eq!(
+            aw_tools_core::task_ops::list_bound(&host, &task_binding(), 2)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(run(&host, &task_binding(), 1, TaskAction::RequestCancel).is_err());
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn task_ops_bridge_rechecks_source_and_journals_before_generation() {
+        use aw_tools_core::task_ops::{list_bound, run, Stream, TaskAction, TaskReply};
+        let (stdout, out_path) = host_spool_file("ops-out");
+        let (stderr, err_path) = host_spool_file("ops-err");
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("printf hello"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(4096))),
+            },
+        )
+        .await
+        .unwrap();
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert!(receipt.finished());
+        let fenced =
+            FencedProcessSpools::after_journal(task_binding(), 42, receipt.spools.unwrap())
+                .unwrap();
+        let live = std::sync::atomic::AtomicBool::new(true);
+        let allowed = |_: &TaskIdentity| live.load(std::sync::atomic::Ordering::Acquire);
+        let denied_cancel =
+            |_: &aw_tools_core::task_ops::TaskInfo| Err(FencedProcessError::CancelUnavailable);
+        let host = BoundProcessTaskHost::new(&fenced, &allowed, &denied_cancel);
+        let id = task_binding();
+        let reply = run(
+            &host,
+            &id,
+            1,
+            TaskAction::Output {
+                stream: Stream::Stdout,
+                offset: 0,
+                limit: 16,
+            },
+        )
+        .unwrap();
+        assert!(matches!(reply,TaskReply::Bytes(bytes) if bytes==b"hello"));
+        assert!(matches!(
+            run(
+                &host,
+                &id,
+                1,
+                TaskAction::Acknowledge {
+                    stream: Stream::Stdout,
+                    through: 5
+                }
+            )
+            .unwrap(),
+            TaskReply::Acknowledged(true)
+        ));
+        assert_eq!(list_bound(&host, &id, 10).unwrap().len(), 1);
+        assert!(run(&host, &id, 1, TaskAction::RequestCancel).is_err());
+        assert!(matches!(
+            fenced.transition_journaled(&id, 1, true, TaskDisposition::Running, false, |_| Err(
+                FenceError::JournalRejectedNoEffect
+            )),
+            Err(FencedProcessError::Fence(
+                FenceError::JournalRejectedNoEffect
+            ))
+        ));
+        assert_eq!(fenced.generation().unwrap(), 1);
+        assert_eq!(
+            fenced
+                .transition_journaled(&id, 1, true, TaskDisposition::Running, false, |proposal| {
+                    assert_eq!(proposal.journal_intent_sequence, 42);
+                    Ok(())
+                })
+                .unwrap(),
+            2
+        );
+        assert!(run(&host, &id, 1, TaskAction::Inspect).is_err());
+        live.store(false, std::sync::atomic::Ordering::Release);
+        assert!(run(&host, &id, 2, TaskAction::Inspect).is_err());
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn durable_spool_access_rechecks_exact_binding_and_generation() {
+        let (stdout, out_path) = host_spool_file("fenced-out");
+        let (stderr, err_path) = host_spool_file("fenced-err");
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("printf READY"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(65536))),
+            },
+        )
+        .await
+        .unwrap();
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(4)).await;
+        assert!(receipt.finished());
+        let fenced =
+            FencedProcessSpools::after_journal(task_binding(), 11, receipt.spools.unwrap())
+                .unwrap();
+        let mut wrong = task_binding();
+        wrong.source_epoch = 2;
+        assert!(matches!(
+            fenced.page(&wrong, 1, true, OutputStream::Stdout, 0, 5),
+            Err(FencedProcessError::Fence(FenceError::WrongSourceOrScope))
+        ));
+        assert!(matches!(
+            fenced.page(&task_binding(), 1, false, OutputStream::Stdout, 0, 5),
+            Err(FencedProcessError::Fence(FenceError::Revoked))
+        ));
+        assert_eq!(
+            fenced
+                .page(&task_binding(), 1, true, OutputStream::Stdout, 0, 5)
+                .unwrap(),
+            b"READY"
+        );
+        assert!(fenced
+            .acknowledge(&task_binding(), 1, true, OutputStream::Stdout, 6)
+            .is_err());
+        assert!(fenced
+            .acknowledge(&task_binding(), 1, true, OutputStream::Stdout, 5)
+            .unwrap());
+        assert_eq!(
+            fenced
+                .transition_journaled(
+                    &task_binding(),
+                    1,
+                    true,
+                    TaskDisposition::Running,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            fenced.page(&task_binding(), 1, true, OutputStream::Stdout, 0, 1),
+            Err(FencedProcessError::Fence(FenceError::StaleGeneration))
+        ));
+        assert_eq!(
+            fenced
+                .transition_journaled(
+                    &task_binding(),
+                    2,
+                    true,
+                    TaskDisposition::Completed,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(fenced.generation().unwrap(), 3);
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn poisoned_spool_mutex_does_not_strand_failure_settlement() {
+        let (stdout, out_path) = host_spool_file("poisoned-out");
+        let (stderr, err_path) = host_spool_file("poisoned-err");
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("printf data"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(4096))),
+            },
+        )
+        .await
+        .unwrap();
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert!(receipt.finished());
+        let access = receipt.spools.unwrap();
+        let state = access.stdout.clone();
+        let _ = std::thread::spawn(move || {
+            let mut owner = state.lock().unwrap();
+            owner.mark_writer_failed();
+            panic!("test only: poison spool mutex");
+        })
+        .join();
+        let fence = FencedProcessSpools::after_journal(task_binding(), 1, access).unwrap();
+        assert_eq!(
+            fence
+                .transition_journaled(
+                    &task_binding(),
+                    1,
+                    true,
+                    TaskDisposition::Running,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            fence.transition_journaled(
+                &task_binding(),
+                2,
+                true,
+                TaskDisposition::Completed,
+                false,
+                |_| Ok(())
+            ),
+            Err(FencedProcessError::NotSettled)
+        ));
+        assert_eq!(
+            fence
+                .transition_journaled(
+                    &task_binding(),
+                    2,
+                    true,
+                    TaskDisposition::Failed,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            3
+        );
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn runtime_spool_failure_allows_failed_not_completed_task_settlement() {
+        let (stdout, out_path) = host_spool_file("failure-out");
+        let (stderr, err_path) = host_spool_file("failure-err");
+        let quota = Arc::new(Mutex::new(SessionQuota::new(1024)));
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("sleep 0.05; printf output"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: quota.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let snapshot = process.spools.clone().unwrap();
+        let after_spawn = quota.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = after_spawn.lock().unwrap();
+            panic!("test only: corrupt quota accounting after spawn");
+        })
+        .join();
+        let result = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert!(!result.finished(), "failed disk accounting is incomplete");
+        assert!(!result.output_complete);
+        let fenced = FencedProcessSpools::after_journal(task_binding(), 11, snapshot).unwrap();
+        assert_eq!(
+            fenced
+                .transition_journaled(
+                    &task_binding(),
+                    1,
+                    true,
+                    TaskDisposition::Running,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            fenced.transition_journaled(
+                &task_binding(),
+                2,
+                true,
+                TaskDisposition::Completed,
+                false,
+                |_| Ok(())
+            ),
+            Err(FencedProcessError::NotSettled)
+        ));
+        assert_eq!(
+            fenced
+                .transition_journaled(
+                    &task_binding(),
+                    2,
+                    true,
+                    TaskDisposition::Failed,
+                    false,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            3
+        );
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn separate_handles_to_the_same_spool_are_refused_before_spawn() {
+        let (stdout, path) = host_spool_file("alias");
+        let stderr = stdout.try_clone().unwrap();
+        let outcome = PipeProcess::spawn_with_host_spools(
+            spec("printf should-not-start"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(16))),
+            },
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "distinct streams require distinct file identities"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+    #[tokio::test]
+    async fn bounded_stream_pipeline_preserves_multi_megabyte_source_totals() {
+        let (stdout, out_path) = host_spool_file("batched-out");
+        let (stderr, err_path) = host_spool_file("batched-err");
+        let process = PipeProcess::spawn_with_host_spools(
+            spec("head -c 2097152 /dev/zero | tr '\\0' Z"),
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(65536))),
+            },
+        )
+        .await
+        .unwrap();
+        let result = process.wait(pending::<()>(), Duration::from_secs(5)).await;
+        assert!(
+            result.finished(),
+            "bounded queue must drain before terminal"
+        );
+        let summary = result
+            .spools
+            .as_ref()
+            .unwrap()
+            .summary(OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(summary.total_bytes, 2097152);
+        assert_eq!(summary.retained_bytes, 65536);
+        assert!(summary.truncated);
+        let out = result
+            .spools
+            .unwrap()
+            .page(OutputStream::Stdout, 0, 4096)
+            .unwrap();
+        assert_eq!(out, b"Z".repeat(4096));
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn invalid_host_spool_fails_before_launching_the_process() {
+        use std::io::Write;
+        let (mut stdout, out_path) = host_spool_file("invalid");
+        stdout.write_all(b"not empty").unwrap();
+        let (stderr, err_path) = host_spool_file("err");
+        let marker =
+            std::env::temp_dir().join(format!("aw-spool-preflight-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut command = spec("true");
+        command.args[3] = format!("printf launched > {}", marker.display());
+        let denied = PipeProcess::spawn_with_host_spools(
+            command,
+            HostSpoolFiles {
+                stdout,
+                stderr,
+                session_quota: Arc::new(Mutex::new(SessionQuota::new(2048))),
+            },
+        )
+        .await;
+        assert!(denied.is_err());
+        assert!(
+            !marker.exists(),
+            "an invalid host spool cannot launch a child"
+        );
+        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(err_path);
+    }
+    #[tokio::test]
+    async fn process_writer_leases_seal_and_quiesce_before_terminal_receipt() {
+        let process = PipeProcess::spawn(spec("printf first; sleep 0.02; printf second >&2"))
+            .await
+            .unwrap();
+        let writer_gate = process.spool_writers.clone();
+        assert!(!writer_gate.is_sealed());
+        assert!(!writer_gate.is_idle());
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert!(receipt.finished());
+        assert!(writer_gate.is_sealed());
+        assert!(writer_gate.is_idle());
+        assert!(
+            writer_gate.begin::<1>().is_none(),
+            "late writer cannot publish into a terminal Process snapshot"
+        );
+    }
+    #[tokio::test]
+    async fn dropped_process_seals_registration_without_claiming_terminal_output() {
+        let process = PipeProcess::spawn(spec("sleep 2")).await.unwrap();
+        let writer_gate = process.spool_writers.clone();
+        drop(process);
+        assert!(writer_gate.is_sealed());
+        assert!(writer_gate.begin::<1>().is_none());
+    }
     #[tokio::test]
     async fn process_spawns_drains_and_receipts_exit() {
         let p = PipeProcess::spawn(spec("printf hello; sleep 0.05; printf tail >&2"))
@@ -570,6 +1823,60 @@ mod tests {
             Outcome::DeadlineExceeded | Outcome::Unknown
         ));
         assert!(!receipt.finished());
+    }
+    #[tokio::test]
+    async fn existing_process_capture_pages_exact_overlapping_head_and_tail() {
+        let p = PipeProcess::spawn(spec("head -c 90000 /dev/zero | tr '\\0' Z"))
+            .await
+            .unwrap();
+        let receipt = p.wait(pending::<()>(), Duration::from_secs(5)).await;
+        assert!(receipt.finished());
+        let mut cursor = ProcessOutputCursor::new(&receipt.output, OutputStream::Stdout);
+        let mut pos = 0u64;
+        let mut total = 0;
+        while pos < 90_000 {
+            let page = cursor.page(pos, MAX_PROCESS_PAGE_BYTES).unwrap();
+            assert!(page.data.iter().all(|&b| b == b'Z'));
+            assert_eq!(page.offset, pos);
+            pos = page.next_offset;
+            total += page.data.len();
+        }
+        assert_eq!(total, 90_000);
+        assert!(cursor.acknowledge(90_000).unwrap());
+        assert!(!cursor.acknowledge(89_000).unwrap());
+        assert!(cursor.page(90_000, 10).unwrap().at_eof);
+    }
+    #[tokio::test]
+    async fn capture_gap_is_not_fabricated_and_ack_cannot_skip_it() {
+        let p = PipeProcess::spawn(spec("head -c 300000 /dev/zero | tr '\\0' Q"))
+            .await
+            .unwrap();
+        let receipt = p.wait(pending::<()>(), Duration::from_secs(5)).await;
+        assert!(receipt.finished());
+        let mut cursor = ProcessOutputCursor::new(&receipt.output, OutputStream::Stdout);
+        let first = cursor.page(0, MAX_PROCESS_PAGE_BYTES).unwrap();
+        assert_eq!(first.next_offset, CAPTURE_HEAD as u64);
+        let missing_start = CAPTURE_HEAD as u64;
+        let missing_end = 300_000 - CAPTURE_TAIL as u64;
+        assert_eq!(first.missing_range, Some((missing_start, missing_end)));
+        assert_eq!(
+            cursor.page(missing_start, 10).unwrap_err(),
+            OutputPageError::Gap {
+                start: missing_start,
+                end: missing_end
+            }
+        );
+        let tail = cursor.page(missing_end, 32).unwrap();
+        assert_eq!(tail.data, b"Q".repeat(32));
+        assert_eq!(
+            cursor.delivered_prefix(),
+            missing_start,
+            "a suffix page cannot certify unobserved middle bytes"
+        );
+        assert!(cursor.acknowledge(missing_start).unwrap());
+        assert!(cursor.acknowledge(missing_end).is_err());
+        assert!(cursor.page(0, MAX_PROCESS_PAGE_BYTES + 1).is_err());
+        assert!(cursor.page(300_001, 1).is_err());
     }
     #[tokio::test]
     async fn bounded_head_and_tail_preserve_truncation() {

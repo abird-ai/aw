@@ -217,7 +217,10 @@ fn validate_sha256(value: &str) -> Result<()> {
 }
 
 fn validate_tool_mode(value: &str) -> Result<()> {
-    if matches!(value, "off" | "read-only" | "workspace" | "trusted") {
+    if matches!(
+        value,
+        "off" | "read-only" | "rw" | "full" | "workspace" | "trusted"
+    ) {
         Ok(())
     } else {
         Err(Error::Config("invalid subagent tool mode".into()))
@@ -1553,7 +1556,7 @@ impl SessionStore {
         base_revision: &str,
     ) -> Result<SubagentExecutionBindingInfo> {
         label(binding_id, 160)?;
-        if !matches!(tool_mode, "read-only" | "workspace") {
+        if !matches!(tool_mode, "read-only" | "rw" | "workspace") {
             return Err(Error::Denied(
                 "Phase 42 managed children allow only read-only or workspace file tools",
             ));
@@ -1932,7 +1935,7 @@ impl SessionStore {
         label(title, 160)?;
         validate_sha256(task_sha256)?;
         validate_tool_mode(tool_mode)?;
-        if tool_mode == "trusted" {
+        if matches!(tool_mode, "trusted" | "full") {
             return Err(Error::Denied(
                 "Phase 42 does not grant trusted shell tools to child Agents",
             ));
