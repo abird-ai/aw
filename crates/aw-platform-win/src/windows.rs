@@ -73,6 +73,48 @@ impl DirectoryIdentity {
     }
 }
 
+/// An observed regular-file identity, retained without locking its pathname.
+/// Reparse points are refused so a configured interpreter cannot silently
+/// change object identity behind an alias.
+#[derive(Debug)]
+pub struct FileIdentity(File);
+impl FileIdentity {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file identity requires a regular file without a reparse point",
+            ));
+        }
+        Ok(Self(file))
+    }
+
+    pub fn identity(&self) -> io::Result<(u64, u64)> {
+        // SAFETY: self owns a valid handle and info is writable.
+        unsafe {
+            let mut info = std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>();
+            if GetFileInformationByHandle(self.0.as_raw_handle() as HANDLE, &mut info) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            ))
+        }
+    }
+
+    pub fn is_current(&self, path: &Path) -> io::Result<bool> {
+        let current = Self::open(path)?;
+        Ok(self.identity()? == current.identity()?)
+    }
+}
+
 fn win_error() -> io::Error {
     io::Error::last_os_error()
 }

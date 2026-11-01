@@ -5,10 +5,10 @@ edition = "2021"
 rust-version = "1.88"
 publish = false
 license = "MIT"
-description = "Reusable descriptor-rooted Unix filesystem backend for aw-tools-core"
+description = "Reusable descriptor-rooted Unix filesystem backend for aw-tools"
 
 [dependencies]
-aw-tools-core = { path = "../aw-tools-core", version = "=0.15.0", features = ["rw"] }
+aw-tools = { path = "../aw-tools", version = "=0.15.0", default-features = false, features = ["rw"] }
 libc = "=0.2.177"
 sha2 = "=0.10.9"
 

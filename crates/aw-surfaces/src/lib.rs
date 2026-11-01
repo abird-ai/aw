@@ -115,7 +115,7 @@ pub struct SurfaceHost {
     options: Options,
     source_id: String,
     root_scope: String,
-    files: aw_tools::browse::WorkspaceFiles,
+    files: aw_tools_adapter::browse::WorkspaceFiles,
     root_identity: aw_platform::DirectoryIdentity,
     inner: Mutex<Inner>,
 }
@@ -165,7 +165,7 @@ impl SurfaceHost {
         }
         let root_identity = aw_platform::DirectoryIdentity::open(&options.root)
             .map_err(|_| Error::Unavailable("workspace root unavailable"))?;
-        let files = aw_tools::browse::WorkspaceFiles::open(&options.root)
+        let files = aw_tools_adapter::browse::WorkspaceFiles::open(&options.root)
             .map_err(|_| Error::Unavailable("file root unavailable"))?;
         if !root_identity.is_current(&options.root).unwrap_or(false) {
             return Err(Error::Denied("workspace root changed during authorization"));

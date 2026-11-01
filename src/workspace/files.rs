@@ -2,7 +2,7 @@
 //! opened local roots supply them. Jobs retain the exact authorized root.
 use super::background::Executor;
 use aw::{Error, Result};
-use aw_tools::browse::{Entry, Listing, WorkspaceFiles};
+use aw_tools_adapter::browse::{Entry, Listing, WorkspaceFiles};
 use aw_workspace::ScopeId;
 use std::{
     collections::{BTreeMap, BTreeSet},

@@ -5,7 +5,7 @@ use super::machinelink::{
 use super::reachability::open_punched_quic;
 use super::*;
 use aw::PrincipalId;
-use aw_tools::browse::{EntryKind, WorkspaceFiles};
+use aw_tools_adapter::browse::{EntryKind, WorkspaceFiles};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 

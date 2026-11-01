@@ -43,6 +43,37 @@ impl DirectoryIdentity {
     }
 }
 
+/// An observed regular-file identity, retained without locking its pathname.
+/// Used to bind configured executables/resources to the object observed during
+/// trusted host preparation; callers still revalidate immediately before use.
+#[derive(Debug)]
+pub struct FileIdentity(File);
+impl FileIdentity {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file identity requires a regular file",
+            ));
+        }
+        Ok(Self(file))
+    }
+
+    pub fn identity(&self) -> io::Result<(u64, u64)> {
+        let meta = self.0.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    pub fn is_current(&self, path: &Path) -> io::Result<bool> {
+        let current = Self::open(path)?;
+        Ok(self.identity()? == current.identity()?)
+    }
+}
+
 pub fn local_principal() -> io::Result<String> {
     // SAFETY: geteuid has no arguments or memory-safety preconditions.
     Ok(format!("unix:{}", unsafe { libc::geteuid() }))

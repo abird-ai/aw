@@ -87,19 +87,18 @@ Sealed model-facing semantics were not modified in dotlink.
 - [ ] Full failure-injection coverage of every stage/commit/durability
       boundary for write, edit, patch, cp, mv and rm, and durable per-item
       journal state for exceptional multi-file partial effects.
-- [ ] Model-visible sealed batch(ops) graph execution with deterministic
-      per-node journal/replay identities, cancellation and bounded result
-      allocation; parser/compiler is ready, but no unsafe second executor
-      or mutation-capable model tool was installed.
-- [ ] Shell write-hint scheduling integration and durable job_start hints;
-      validated hint inputs are advisory in the current AW shell adapter.
-- [ ] Sealed V2 canonical Job(Graph[Node...]) runtime: bash/pwsh are
-      one-node Jobs, batch is a multi-node Job, job_start exposes a one-node
-      shell Job immediately. One namespace/Task projection, persisted
-      pending/claimed/running/terminal node checkpoints, automatic resume,
-      explicit replay-protected job_restart, retention and bounded output.
-      No second JobManager, Agent, or TurnJournal. Shell graph nodes must
-      not be enabled merely by marking them batchable.
+- [x] Model-visible sealed `batch(ops)` Graph execution with immutable
+      NodePlans, deterministic conflict admission, cancellation/revocation,
+      bounded retained results and exact current-grant revalidation through the
+      original AW host runtime.
+- [x] Shell `writes` hint scheduling and `job_start` integration; hints remain
+      advisory scheduling metadata, never authority or sandbox policy.
+- [x] Sealed V2 canonical Job(Graph[Node...]) runtime: direct bash/pwsh are
+      one-node Jobs, batch/job_start use the same Graph constructor, and all
+      job_* controls share one JobManager/ID namespace. AW deliberately does
+      **not** persist/reconstruct per-node Graph state across process loss: the
+      original outer TurnJournal intent is the durable no-replay fence, so an
+      interrupted invocation remains uncertain rather than automatically resumed.
 - [x] Windows model-facing shell tool renamed to pwsh; old powershell
       selection remains input-only compatibility while --tools-powershell
       continues to select its trusted executable. GNU cross-compiles.
@@ -139,23 +138,23 @@ Executed against AW's original pinned Cargo.lock:
 | no_std+alloc kernel | passed |
 | cargo fmt --all --check; git diff --check | passed |
 
-The aw-store full library suite was attempted with a 55-second bound,
-timed out while running tests (not a pass). Previous monolithic workspace
-test attempts also lacked a terminal result. The SQLite child-mode
-integration is specifically validated by the passing 383-test AW CLI
-binary suite.
+Later convergence validation supersedes the earlier bounded-suite note: the
+full AW workspace target matrix has terminal results through connector-safe
+package partitions, including `aw-store` 201/201 split across exhaustive
+module partitions, AW CLI binary 383 active tests and library 226 active tests.
 
 13 canonical filesystem tool schemas total 6,177 serialized bytes
 in AW after the sealed compact-tuple edit and read-cursor migration,
 versus 7,111 bytes at the earlier schema checkpoint.
-The separately compiled batch(ops) schema does not duplicate nested tool
-schemas and is NOT registered without host-owned replay safety. Representative 100-entry compact listing:
+The compact Graph schema does not duplicate nested tool schemas. It is now
+registered only through AW's host-owned replay-safe `JobRuntime`. Representative 100-entry compact listing:
 2,000 bytes versus 5,504 bytes legacy-style JSON (~64% smaller).
 
 ## Further convergence before dotlink adoption
 
-The sealed public AW semantics are in place for its 13 filesystem tools,
-and the shared batch graph compiler is available but not executing.
+The sealed public AW semantics are in place for its 13 filesystem tools, and
+the shared Graph/Job runtime is executing through the original AW authority and
+Process owner.
 Actual dotlink replacement requires first moving the platform-specific
 pinned-root, mutation-lock and stage/rename/delete implementations behind a
 reusable core/backend boundary, avoiding a second filesystem authority.

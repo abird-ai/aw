@@ -103,6 +103,8 @@ pub struct AgentBuilder {
     extensions: Vec<Arc<dyn Extension>>,
     tools: Vec<Arc<dyn Tool>>,
     tool_policy: ToolPolicy,
+    binding_authority: crate::tool::ToolBindingAuthority,
+    scope_lifecycles: Vec<Arc<dyn crate::InvocationScopeLifecycle>>,
     revision_policy: Option<Arc<dyn crate::tool::ToolRevisionPolicy>>,
     account: Option<(AccountDescriptor, PrincipalId, String)>,
     delegated_default: bool,
@@ -127,6 +129,22 @@ impl AgentBuilder {
     }
     pub fn tool_policy(mut self, policy: ToolPolicy) -> Self {
         self.tool_policy = policy;
+        self
+    }
+    /// Current host-owned policy for composition by trusted adapters. This is a
+    /// snapshot only; callers must return the updated policy through tool_policy().
+    pub fn tool_policy_snapshot(&self) -> ToolPolicy {
+        self.tool_policy.clone()
+    }
+    /// Read-only live tool authority for host services registered by this builder.
+    pub fn tool_binding_authority(&self) -> crate::tool::ToolBindingAuthority {
+        self.binding_authority.clone()
+    }
+    /// Register a host-owned live-runtime scope listener. The listener cannot
+    /// create a scope; it only observes/refuses authenticated journal scope
+    /// replacement at `load_history`.
+    pub fn scope_lifecycle(mut self, lifecycle: Arc<dyn crate::InvocationScopeLifecycle>) -> Self {
+        self.scope_lifecycles.push(lifecycle);
         self
     }
     /// Explicit trusted host authorization, never inferred from an external
@@ -213,6 +231,8 @@ impl AgentBuilder {
             pool.select(&actor, &descriptor.id, &self.options.model)?;
             (self.provider.clone(), pool, descriptor, actor)
         };
+        let binding_authority = self.binding_authority.clone();
+        binding_authority.publish(&tools, &self.tool_policy)?;
         Ok(Agent {
             conversation: Conversation::new(self.options.system_prompt.clone())?,
             provider,
@@ -220,6 +240,8 @@ impl AgentBuilder {
             extensions: self.extensions,
             tools,
             tool_policy: self.tool_policy,
+            binding_authority,
+            scope_lifecycles: self.scope_lifecycles,
             revision_policy: self.revision_policy,
             default_pool: pool,
             default_account: descriptor,
@@ -249,6 +271,8 @@ pub struct Agent {
     extensions: Vec<Arc<dyn Extension>>,
     tools: ToolRegistry,
     tool_policy: ToolPolicy,
+    binding_authority: crate::tool::ToolBindingAuthority,
+    scope_lifecycles: Vec<Arc<dyn crate::InvocationScopeLifecycle>>,
     revision_policy: Option<Arc<dyn crate::tool::ToolRevisionPolicy>>,
     default_pool: ProviderAccounts,
     default_account: AccountDescriptor,
@@ -270,6 +294,8 @@ impl Agent {
             extensions: Vec::new(),
             tools: Vec::new(),
             tool_policy: ToolPolicy::default(),
+            binding_authority: crate::tool::ToolBindingAuthority::default(),
+            scope_lifecycles: Vec::new(),
             revision_policy: None,
             account: None,
             delegated_default: false,
@@ -291,6 +317,8 @@ impl Agent {
             extensions: Vec::new(),
             tools: Vec::new(),
             tool_policy: ToolPolicy::default(),
+            binding_authority: crate::tool::ToolBindingAuthority::default(),
+            scope_lifecycles: Vec::new(),
             revision_policy: None,
             account: None,
             delegated_default: false,
@@ -328,21 +356,33 @@ impl Agent {
     /// Explicit host resource ceiling. 16 by default; no read permission is
     /// created by this setting, even at the maximum supported 128.
     pub fn set_max_parallel_reads(&mut self, value: usize) -> Result<()> {
-        if !(1..=aw_agent_kernel::turn::MAX_READ_WAVE).contains(&value) {
-            return Err(Error::Config("parallel read ceiling must be 1..128".into()));
+        let mut next = self.tool_policy.parallelism();
+        next.max_parallel_reads = value;
+        let next = next.validate()?;
+        for lifecycle in &self.scope_lifecycles {
+            lifecycle.validate_tool_parallelism(next)?;
         }
-        self.tool_policy.max_parallel_reads = value;
+        self.tool_policy.set_parallelism(next);
+        for lifecycle in &self.scope_lifecycles {
+            lifecycle.apply_tool_parallelism(next);
+        }
         Ok(())
     }
     /// The host permits concurrent TRUSTED Bash only when explicitly enabled.
     /// The model must additionally mark each command parallel=true; this does
     /// not change Process/Unknown journal and reconciliation semantics.
     pub fn set_parallel_bash(&mut self, enabled: bool, limit: usize) -> Result<()> {
-        if !(1..=aw_agent_kernel::turn::MAX_READ_WAVE).contains(&limit) {
-            return Err(Error::Config("parallel bash ceiling must be 1..128".into()));
+        let mut next = self.tool_policy.parallelism();
+        next.allow_parallel_shell = enabled;
+        next.max_parallel_shell = limit;
+        let next = next.validate()?;
+        for lifecycle in &self.scope_lifecycles {
+            lifecycle.validate_tool_parallelism(next)?;
         }
-        self.tool_policy.allow_parallel_bash = enabled;
-        self.tool_policy.max_parallel_bash = limit;
+        self.tool_policy.set_parallelism(next);
+        for lifecycle in &self.scope_lifecycles {
+            lifecycle.apply_tool_parallelism(next);
+        }
         Ok(())
     }
     /// The most recent actual hosted turn's portable transition decisions.
@@ -377,6 +417,28 @@ impl Agent {
     /// part of a discovered source batch. It never confers a grant.
     pub fn registered_tool_names(&self) -> Vec<String> {
         self.tools.tools.keys().cloned().collect()
+    }
+    /// Exact current registry/source/effect snapshot for host-owned Job planning.
+    /// This creates no new grant: the tool must already be visible to `actor`
+    /// under the current ToolPolicy.
+    pub fn tool_binding_authority(&self) -> crate::tool::ToolBindingAuthority {
+        self.binding_authority.clone()
+    }
+
+    pub fn permitted_tool_binding(
+        &self,
+        actor: &PrincipalId,
+        name: &str,
+    ) -> Result<crate::tool::ToolBindingSnapshot> {
+        self.binding_authority.permitted_binding(actor, name)
+    }
+
+    pub fn revalidate_tool_binding(
+        &self,
+        actor: &PrincipalId,
+        binding: &crate::tool::ToolBindingSnapshot,
+    ) -> Result<()> {
+        self.binding_authority.revalidate(actor, binding)
     }
     /// Host-only extension metadata. Remote manifest names do not authorize
     /// gates; approval is a separate host decision before registration.
@@ -414,7 +476,9 @@ impl Agent {
             &name,
             &crate::tool::ToolSource::trusted_host(),
             effect,
-        )
+        )?;
+        self.binding_authority
+            .publish(&self.tools, &self.tool_policy)
     }
     /// Register a third-party tool without granting it to anyone. Its source
     /// epoch is host-minted; neither an MCP schema nor a plugin may claim
@@ -429,7 +493,9 @@ impl Agent {
                 "external registrations cannot impersonate a Host tool source",
             ));
         }
-        self.tools.register_from(tool, source)
+        self.tools.register_from(tool, source)?;
+        self.binding_authority
+            .publish(&self.tools, &self.tool_policy)
     }
 
     /// Grant the exact currently registered external tool source/effect.
@@ -454,18 +520,65 @@ impl Agent {
             .tools
             .effect_of(name)
             .ok_or(Error::Denied("tool effect missing"))?;
-        self.tool_policy.permit_source(actor, name, source, effect)
+        self.tool_policy
+            .permit_source(actor, name, source, effect)?;
+        self.binding_authority
+            .publish(&self.tools, &self.tool_policy)
     }
 
-    /// Revocation removes future advertisements and authorization. In-flight
-    /// effects still obey the existing journal's unknown-effect fencing.
+    /// Trusted-host counterpart to external-source regrant. This does not
+    /// register or replace a tool; it only restores the exact already-registered
+    /// Host source/effect for an actor and publishes a fresh grant generation.
+    pub fn permit_registered_host_tool(&mut self, actor: PrincipalId, name: &str) -> Result<()> {
+        let source = self
+            .tools
+            .source_of(name)
+            .ok_or(Error::Denied("tool not registered"))?;
+        if source != &crate::tool::ToolSource::trusted_host() {
+            return Err(Error::Denied("registered tool is not a trusted Host tool"));
+        }
+        let effect = self
+            .tools
+            .effect_of(name)
+            .ok_or(Error::Denied("tool effect missing"))?;
+        self.tool_policy.permit_host(actor, name, effect)?;
+        self.binding_authority
+            .publish(&self.tools, &self.tool_policy)
+    }
+
+    /// Revoke a set of already-registered grants as one host-policy update.
+    /// All grants are removed before publishing the read-only binding snapshot,
+    /// so rollback cannot expose a partially revoked authority view.
+    pub fn revoke_registered_source_tools<I, S>(
+        &mut self,
+        actor: &PrincipalId,
+        names: I,
+        source: &crate::tool::ToolSource,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in names {
+            self.tool_policy.revoke_source(actor, name.as_ref(), source);
+        }
+        self.binding_authority
+            .publish(&self.tools, &self.tool_policy)
+    }
+
+    /// One-tool specialization of the atomic host-policy revocation path.
+    /// In-flight effects still obey the existing journal's unknown-effect fencing.
     pub fn revoke_registered_source_tool(
         &mut self,
         actor: &PrincipalId,
         name: &str,
         source: &crate::tool::ToolSource,
-    ) {
-        self.tool_policy.revoke_source(actor, name, source);
+    ) -> Result<()> {
+        self.revoke_registered_source_tools(actor, [name], source)
+    }
+
+    pub fn tool_parallelism(&self) -> crate::ToolParallelism {
+        self.tool_policy.parallelism()
     }
 
     pub fn tool_execution_site(&self) -> &str {
@@ -687,6 +800,15 @@ impl Agent {
         journal: Option<Arc<dyn TurnJournal>>,
     ) -> Result<()> {
         let restored = Conversation::from_history(self.options.system_prompt.clone(), &state)?;
+        let previous_scope = self.journal_scope()?;
+        let next_scope = journal
+            .as_ref()
+            .map_or(Ok(None), |journal| journal.invocation_scope())?;
+        if previous_scope != next_scope {
+            for lifecycle in &self.scope_lifecycles {
+                lifecycle.replace_scope(previous_scope.as_ref(), next_scope.as_ref())?;
+            }
+        }
         self.conversation = restored;
         self.last_portable_trace.clear();
         self.needs_reconciliation = state.needs_reconciliation;
@@ -1499,18 +1621,11 @@ impl Agent {
                     .map(Message::context_bytes)
                     .sum::<usize>()
                     .saturating_add(proposed_bytes);
-                const RESULT_OVERHEAD_BYTES: usize = 512;
-                let per_call_capacity = limits::MAX_CONTEXT_BYTES
-                    .saturating_sub(context_used)
-                    .min(tool::MAX_TRACE_BYTES.saturating_sub(trace_used))
-                    / batch.len();
-                if per_call_capacity <= RESULT_OVERHEAD_BYTES {
-                    return Err(Error::Limit(
-                        "insufficient context budget for complete tool batch; no tools executed",
-                    ));
-                }
-                let per_tool_output_bytes =
-                    (per_call_capacity - RESULT_OVERHEAD_BYTES).min(tool::MAX_TOOL_RESULT_BYTES);
+                let per_tool_output_bytes = per_tool_result_budget(
+                    limits::MAX_CONTEXT_BYTES.saturating_sub(context_used),
+                    tool::MAX_TRACE_BYTES.saturating_sub(trace_used),
+                    batch.len(),
+                )?;
                 if let Some(gate) = step_gate {
                     // The provider invocation and assistant answer are
                     // durable; no tool intent has been admitted yet.
@@ -1763,8 +1878,18 @@ impl Agent {
                                         ToolContext {
                                             actor: identity.actor.clone(),
                                             turn_id: id,
+                                            call_id: call.id.clone(),
+                                            source: registry
+                                                .source_of(&call.name)
+                                                .ok_or(Error::Denied("tool source missing at dispatch"))?
+                                                .clone(),
+                                            effect: registry
+                                                .effect_of(&call.name)
+                                                .ok_or(Error::Denied("tool effect missing at dispatch"))?
+                                                .clone(),
                                             execution_site: policy.execution_site.clone(),
                                             cancellation: token,
+                                            result_budget_bytes: per_tool_output_bytes,
                                             identity: identity.clone(),
                                             scope,
                                         },
@@ -2057,8 +2182,20 @@ impl Agent {
                                 ToolContext {
                                     actor: identity.actor.clone(),
                                     turn_id: id,
+                                    call_id: call.id.clone(),
+                                    source: self
+                                        .tools
+                                        .source_of(&call.name)
+                                        .ok_or(Error::Denied("tool source missing at dispatch"))?
+                                        .clone(),
+                                    effect: self
+                                        .tools
+                                        .effect_of(&call.name)
+                                        .ok_or(Error::Denied("tool effect missing at dispatch"))?
+                                        .clone(),
                                     execution_site: self.tool_policy.execution_site.clone(),
                                     cancellation: token,
+                                    result_budget_bytes: per_tool_output_bytes,
                                     identity: identity.clone(),
                                     scope: invocation_context.scope.clone(),
                                 },
@@ -2329,6 +2466,30 @@ fn portable_step<T>(result: std::result::Result<T, aw_agent_kernel::turn::Error>
 }
 /// Explicitly bound one actual result to its fair share of this model batch.
 /// The persisted receipt and model-visible projection both mark truncation.
+const TOOL_RESULT_OVERHEAD_BYTES: usize = 512;
+
+fn per_tool_result_budget(
+    context_remaining: usize,
+    trace_remaining: usize,
+    calls: usize,
+) -> Result<usize> {
+    if calls == 0 {
+        return Err(Error::Protocol(
+            "tool result budget requires a nonempty batch",
+        ));
+    }
+    let per_call_capacity = context_remaining.min(trace_remaining) / calls;
+    let budget = per_call_capacity
+        .saturating_sub(TOOL_RESULT_OVERHEAD_BYTES)
+        .min(tool::MAX_TOOL_RESULT_BYTES);
+    if budget < tool::MIN_TOOL_RESULT_BYTES {
+        return Err(Error::Limit(
+            "insufficient context budget for factual tool receipts; no tools executed",
+        ));
+    }
+    Ok(budget)
+}
+
 fn bounded_tool_output(mut output: ToolOutput, budget: usize) -> ToolOutput {
     if output.content.len() > budget {
         // A truncated JSON object is neither a valid machine result nor
@@ -2428,6 +2589,130 @@ where
 #[cfg(test)]
 mod output_projection_tests {
     use super::*;
+    struct ParallelPolicyProvider;
+    impl Provider for ParallelPolicyProvider {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    struct RejectParallelism {
+        validations: std::sync::atomic::AtomicUsize,
+        applies: std::sync::atomic::AtomicUsize,
+    }
+    impl InvocationScopeLifecycle for RejectParallelism {
+        fn replace_scope(
+            &self,
+            _: Option<&InvocationScope>,
+            _: Option<&InvocationScope>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn validate_tool_parallelism(&self, _: ToolParallelism) -> Result<()> {
+            self.validations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Conflict("fixture rejects parallel policy"))
+        }
+        fn apply_tool_parallelism(&self, _: ToolParallelism) {
+            self.applies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn parallel_policy_setters_remain_bounded_host_configuration_after_build() {
+        let mut agent = Agent::builder(
+            std::sync::Arc::new(ParallelPolicyProvider),
+            AgentOptions::new("fixture", "model"),
+        )
+        .build()
+        .unwrap();
+        let initial = agent.tool_policy.parallelism();
+        agent
+            .set_max_parallel_reads(initial.max_parallel_reads + 1)
+            .unwrap();
+        agent
+            .set_parallel_bash(true, initial.max_parallel_shell.saturating_add(1).min(128))
+            .unwrap();
+        assert_eq!(
+            agent.tool_policy.max_parallel_reads,
+            initial.max_parallel_reads + 1
+        );
+        assert!(agent.tool_policy.allow_parallel_bash);
+        assert!(agent.set_max_parallel_reads(129).is_err());
+        assert!(agent.set_parallel_bash(true, 129).is_err());
+    }
+
+    #[test]
+    fn host_parallel_setters_preserve_bounded_widen_and_narrow_sdk_contract() {
+        let mut agent = Agent::builder(
+            std::sync::Arc::new(ParallelPolicyProvider),
+            AgentOptions::new("fixture", "model"),
+        )
+        .build()
+        .unwrap();
+        agent.set_max_parallel_reads(64).unwrap();
+        agent.set_parallel_bash(true, 48).unwrap();
+        assert_eq!(agent.tool_policy.max_parallel_reads, 64);
+        assert!(agent.tool_policy.allow_parallel_bash);
+        assert_eq!(agent.tool_policy.max_parallel_bash, 48);
+        agent.set_max_parallel_reads(2).unwrap();
+        agent.set_parallel_bash(false, 3).unwrap();
+        assert_eq!(agent.tool_policy.max_parallel_reads, 2);
+        assert!(!agent.tool_policy.allow_parallel_bash);
+        assert_eq!(agent.tool_policy.max_parallel_bash, 3);
+        assert!(agent.set_max_parallel_reads(129).is_err());
+        assert!(agent.set_parallel_bash(true, 129).is_err());
+    }
+
+    #[test]
+    fn rejected_parallel_policy_update_is_transactional() {
+        let lifecycle = std::sync::Arc::new(RejectParallelism {
+            validations: std::sync::atomic::AtomicUsize::new(0),
+            applies: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut agent = Agent::builder(
+            std::sync::Arc::new(ParallelPolicyProvider),
+            AgentOptions::new("fixture", "model"),
+        )
+        .scope_lifecycle(lifecycle.clone())
+        .build()
+        .unwrap();
+        let before = agent.tool_policy.parallelism();
+        assert!(agent.set_max_parallel_reads(1).is_err());
+        assert_eq!(agent.tool_policy.parallelism(), before);
+        assert_eq!(
+            lifecycle
+                .validations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            lifecycle.applies.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn tool_result_budget_reserves_a_factual_receipt_before_effect_admission() {
+        let exact = TOOL_RESULT_OVERHEAD_BYTES + tool::MIN_TOOL_RESULT_BYTES;
+        assert_eq!(
+            per_tool_result_budget(exact, exact, 1).unwrap(),
+            tool::MIN_TOOL_RESULT_BYTES
+        );
+        assert!(per_tool_result_budget(exact - 1, exact - 1, 1).is_err());
+        assert_eq!(
+            per_tool_result_budget(usize::MAX, usize::MAX, 1).unwrap(),
+            tool::MAX_TOOL_RESULT_BYTES
+        );
+        assert!(per_tool_result_budget(exact, exact, 0).is_err());
+    }
+
     #[test]
     fn structured_json_is_never_cut_mid_token_when_budget_allows_marker() {
         let data = serde_json::json!({"entries":["a".repeat(400)],"truncated":false}).to_string();

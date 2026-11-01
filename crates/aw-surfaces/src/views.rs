@@ -431,8 +431,8 @@ impl SurfaceHost {
     }
 }
 
-fn entries(values: Vec<aw_tools::browse::Entry>) -> Vec<Value> {
-    values.into_iter().map(|entry| json!({"name":entry.name,"path":entry.path,"kind":match entry.kind { aw_tools::browse::EntryKind::Directory=>"directory",aw_tools::browse::EntryKind::File=>"file",_=>"unsupported" }})).collect()
+fn entries(values: Vec<aw_tools_adapter::browse::Entry>) -> Vec<Value> {
+    values.into_iter().map(|entry| json!({"name":entry.name,"path":entry.path,"kind":match entry.kind { aw_tools_adapter::browse::EntryKind::Directory=>"directory",aw_tools_adapter::browse::EntryKind::File=>"file",_=>"unsupported" }})).collect()
 }
 
 #[cfg(test)]

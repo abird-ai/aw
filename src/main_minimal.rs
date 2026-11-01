@@ -265,9 +265,6 @@ struct Host {
     sessions: Option<minimal_sessions::Sessions>,
     mcp: aw_mcp::Options,
     extensions: aw_extensions::Options,
-    parallel_reads: u32,
-    parallel_bash: bool,
-    parallel_bash_limit: u32,
     project: Option<aw::project_resources::Catalog>,
     resources: resource_cli_args::ResourcesArgs,
     resource_config_path: Option<PathBuf>,
@@ -417,8 +414,6 @@ impl Host {
             None
         };
         if let Some(agent) = self.agent.as_mut() {
-            agent.set_max_parallel_reads(self.parallel_reads as usize)?;
-            agent.set_parallel_bash(self.parallel_bash, self.parallel_bash_limit as usize)?;
             agent.set_pre_dispatch_retries(self.provider_pre_dispatch_retries)?;
         }
         self.attach_mcp()?;
@@ -1012,6 +1007,30 @@ Explicitly requested, owner-approved project skill {} (data, no execution grants
         idle_timeout: Duration::from_secs(args.idle_timeout),
         max_output_bytes: config::MAX_OUTPUT_BYTES,
     };
+    let parallel_reads = if args.tools_parallel == "off" {
+        1
+    } else {
+        args.tools_parallel_read_limit
+            .unwrap_or(args.tools_parallel_limit)
+            .min(args.tools_parallel_limit)
+    };
+    let parallel_shell = args.tools_parallel == "model";
+    let parallel_shell_limit = args
+        .tools_parallel_bash_limit
+        .unwrap_or(args.tools_parallel_limit)
+        .min(args.tools_parallel_limit);
+    let tool_concurrency = aw::LocalToolConcurrency {
+        graph_width: if args.tools_parallel == "off" {
+            1
+        } else {
+            args.tools_parallel_limit.min(8) as usize
+        },
+        parallelism: aw_agent_core::ToolParallelism {
+            max_parallel_reads: parallel_reads as usize,
+            allow_parallel_shell: parallel_shell,
+            max_parallel_shell: parallel_shell_limit as usize,
+        },
+    };
     let tools = aw::LocalToolOptions {
         root: args
             .tool_root
@@ -1024,6 +1043,18 @@ Explicitly requested, owner-approved project skill {} (data, no execution grants
             .bash
             .clone()
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
+        concurrency: tool_concurrency,
+        limits: aw::LocalToolLimits::default(),
+        private_state_dir: {
+            #[cfg(feature = "jsonl")]
+            {
+                sessions.as_ref().map(|sessions| sessions.state_dir().to_path_buf())
+            }
+            #[cfg(not(feature = "jsonl"))]
+            {
+                None
+            }
+        },
     };
     let agent = if settings.profile.model.is_some() {
         Some(aw::configured_execution(&settings, &context, &tools, false)?)
@@ -1053,13 +1084,6 @@ Explicitly requested, owner-approved project skill {} (data, no execution grants
         sessions,
         mcp: args.mcp.clone(),
         extensions: args.extensions.clone(),
-        parallel_reads: if args.tools_parallel == "off" { 1 } else {
-            args.tools_parallel_read_limit.unwrap_or(args.tools_parallel_limit)
-                .min(args.tools_parallel_limit)
-        },
-        parallel_bash: args.tools_parallel == "model",
-        parallel_bash_limit: args.tools_parallel_bash_limit
-            .unwrap_or(args.tools_parallel_limit).min(args.tools_parallel_limit),
         project,
         resources: args.resources.clone(),
         resource_config_path: args.config.clone(),
@@ -1084,8 +1108,6 @@ Explicitly requested, owner-approved project skill {} (data, no execution grants
         host.ui.validate()?;
     }
     if let Some(agent) = host.agent.as_mut() {
-        agent.set_max_parallel_reads(host.parallel_reads as usize)?;
-        agent.set_parallel_bash(host.parallel_bash, host.parallel_bash_limit as usize)?;
         agent.set_pre_dispatch_retries(host.provider_pre_dispatch_retries)?;
     }
     #[cfg(feature = "jsonl")]

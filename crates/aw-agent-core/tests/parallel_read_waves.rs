@@ -86,6 +86,15 @@ impl Tool for FixtureTool {
             Err(Error::Denied("unexpected arguments"))
         }
     }
+    fn can_run_parallel(&self, first: &Value, second: &Value) -> bool {
+        // The real trusted shell adapter performs conservative write-scope
+        // overlap checks here. This fixture has no filesystem scopes, so the
+        // explicit test contract is simply that two model-opted-in fake bash
+        // calls are host-approved to overlap.
+        self.name == "bash"
+            && first.get("parallel").and_then(Value::as_bool) == Some(true)
+            && second.get("parallel").and_then(Value::as_bool) == Some(true)
+    }
     fn execute<'a>(&'a self, _ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
             self.validate(arguments)?;

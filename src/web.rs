@@ -3446,6 +3446,9 @@ mod tests {
             selected_tools: Vec::new(),
             execution_site: "local".into(),
             bash: None,
+            private_state_dir: None,
+            concurrency: crate::LocalToolConcurrency::default(),
+            limits: crate::LocalToolLimits::default(),
         };
         let agent = crate::unconfigured_execution(&settings, &context, &tools).unwrap();
         let local = LocalWebOptions {

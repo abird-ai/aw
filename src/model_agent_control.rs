@@ -103,7 +103,7 @@ pub fn install_pause_after_turn(owner: &Service, agent: &mut Agent) -> Result<()
             &identity.actor,
             TOOL_NAME,
             &ToolSource::trusted_host(),
-        );
+        )?;
         return Err(error);
     }
     Ok(())

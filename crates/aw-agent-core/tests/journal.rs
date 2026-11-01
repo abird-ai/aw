@@ -173,6 +173,118 @@ async fn restore_refuses_hidden_provider_continuations() {
     state.turns[0].context_messages[0].provider_context = Some("not portable".into());
     assert!(a.load_history(state, None).is_err());
 }
+struct ScopedJournal {
+    scope: InvocationScope,
+}
+impl TurnJournal for ScopedJournal {
+    fn invocation_scope(&self) -> Result<Option<InvocationScope>> {
+        Ok(Some(self.scope.clone()))
+    }
+    fn begin<'a>(&'a self, _: TurnStart) -> JournalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn append<'a>(&'a self, _: u64, _: JournalEntry) -> JournalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn finish<'a>(&'a self, _: Turn) -> JournalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn acknowledge<'a>(&'a self, _: String) -> JournalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct ScopeGate {
+    refuse: AtomicBool,
+    calls: Mutex<Vec<(Option<InvocationScope>, Option<InvocationScope>)>>,
+}
+impl InvocationScopeLifecycle for ScopeGate {
+    fn replace_scope(
+        &self,
+        previous: Option<&InvocationScope>,
+        next: Option<&InvocationScope>,
+    ) -> Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((previous.cloned(), next.cloned()));
+        if self.refuse.load(Ordering::SeqCst) {
+            Err(Error::Conflict("fixture scope replacement refused"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn refused_scope_replacement_keeps_original_journal_scope_and_history() {
+    let gate = Arc::new(ScopeGate {
+        refuse: AtomicBool::new(false),
+        calls: Mutex::new(Vec::new()),
+    });
+    let mut agent = Agent::builder(
+        Arc::new(Echo(Arc::new(AtomicUsize::new(0)))),
+        AgentOptions::new("scope-fixture", "model"),
+    )
+    .scope_lifecycle(gate.clone())
+    .build()
+    .unwrap();
+    let a = InvocationScope {
+        session_id: "session-a".into(),
+        branch_id: "main".into(),
+    };
+    let b = InvocationScope {
+        session_id: "session-b".into(),
+        branch_id: "main".into(),
+    };
+    let original = HistoryState {
+        summary: Some("original".into()),
+        ..HistoryState::default()
+    };
+    agent
+        .load_history(
+            original.clone(),
+            Some(Arc::new(ScopedJournal { scope: a.clone() })),
+        )
+        .unwrap();
+    assert_eq!(agent.history_state().summary.as_deref(), Some("original"));
+
+    gate.refuse.store(true, Ordering::SeqCst);
+    let replacement = HistoryState {
+        summary: Some("replacement".into()),
+        ..HistoryState::default()
+    };
+    assert!(agent
+        .load_history(
+            replacement,
+            Some(Arc::new(ScopedJournal { scope: b.clone() }))
+        )
+        .is_err());
+    assert_eq!(
+        agent.history_state().summary.as_deref(),
+        Some("original"),
+        "history must not change when the live runtime refuses Session replacement"
+    );
+
+    gate.refuse.store(false, Ordering::SeqCst);
+    // Same original scope should be a no-op for listeners if the failed switch
+    // truly left the current journal unchanged.
+    let calls_before = gate.calls.lock().unwrap().len();
+    agent
+        .load_history(original, Some(Arc::new(ScopedJournal { scope: a })))
+        .unwrap();
+    assert_eq!(gate.calls.lock().unwrap().len(), calls_before);
+    let calls = gate.calls.lock().unwrap();
+    assert!(calls.iter().any(|(previous, next)| {
+        previous
+            .as_ref()
+            .is_some_and(|scope| scope.session_id == "session-a")
+            && next
+                .as_ref()
+                .is_some_and(|scope| scope.session_id == "session-b")
+    }));
+}
+
 #[tokio::test]
 async fn history_load_preserves_current_account_and_grants() {
     let (mut a, _, _) = setup("");

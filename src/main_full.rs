@@ -1018,6 +1018,7 @@ pub(crate) struct RunArgs {
     resources: resource_cli_args::ResourcesArgs,
     tools: aw::ToolMode,
     tool_allow: Vec<String>,
+    parallel_graph_limit: u32,
     parallel_reads: u32,
     parallel_bash: bool,
     parallel_bash_limit: u32,
@@ -1156,6 +1157,11 @@ impl RunArgs {
             resources: provider.resources,
             tools: tools.tools,
             tool_allow: tools.tool_allow,
+            parallel_graph_limit: if tools.tools_parallel == "off" {
+                1
+            } else {
+                tools.tools_parallel_limit.min(8)
+            },
             parallel_reads: if tools.tools_parallel == "off" { 1 } else {
                 tools.tools_parallel_read_limit.unwrap_or(tools.tools_parallel_limit)
                     .min(tools.tools_parallel_limit)
@@ -2232,6 +2238,16 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             .bash
             .clone()
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
+        concurrency: aw::LocalToolConcurrency {
+            graph_width: args.parallel_graph_limit as usize,
+            parallelism: aw_agent_core::ToolParallelism {
+                max_parallel_reads: args.parallel_reads as usize,
+                allow_parallel_shell: args.parallel_bash,
+                max_parallel_shell: args.parallel_bash_limit as usize,
+            },
+        },
+        limits: aw::LocalToolLimits::default(),
+        private_state_dir: directory.clone(),
     };
     if !wants_host && !args.shared_profiles.is_empty() {
         return Err(Error::Config(
@@ -2761,9 +2777,6 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         host.ui.theme_accent=theme.accent;
         host.ui.validate()?;
     }
-    host.parallel_reads = args.parallel_reads;
-    host.parallel_bash = args.parallel_bash;
-    host.parallel_bash_limit = args.parallel_bash_limit;
     host.pre_dispatch_retries = args.pre_dispatch_retries;
     host.project = project;
     host.resources = args.resources.clone();
@@ -3161,9 +3174,6 @@ struct Host {
     last_route_operation: Option<String>,
     agent: Option<Agent>,
     actor_owner: Option<aw::actor_owner::Service>,
-    parallel_reads: u32,
-    parallel_bash: bool,
-    parallel_bash_limit: u32,
     pre_dispatch_retries: u8,
     context_compaction_policy:aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -3568,9 +3578,6 @@ impl Host {
             last_route_operation: None,
             agent: None,
             actor_owner: None,
-            parallel_reads: 16,
-            parallel_bash: false,
-            parallel_bash_limit: 16,
             pre_dispatch_retries: 0,
             context_compaction_policy:aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -3761,8 +3768,6 @@ impl Host {
         } else {
             aw::configured_execution(&self.settings, &self.context, &self.tools, web)?
         };
-        agent.set_max_parallel_reads(self.parallel_reads as usize)?;
-        agent.set_parallel_bash(self.parallel_bash, self.parallel_bash_limit as usize)?;
         agent.set_pre_dispatch_retries(self.pre_dispatch_retries)?;
         if !self.mcp.is_empty() {
             if self.runtime.is_none() {
@@ -4004,7 +4009,8 @@ impl Host {
                 state_dir,
                 trusted_git,
             )
-            .with_child_routing(child_routing);
+            .with_child_routing(child_routing)
+            .with_child_tool_runtime(self.tools.concurrency, self.tools.limits)?;
             let service = subagents::Service::new(
                 persistent.store.clone(),
                 agent.provider_accounts(),

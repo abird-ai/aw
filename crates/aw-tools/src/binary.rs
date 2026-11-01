@@ -1,500 +1,429 @@
-//! Bounded binary tools; media rendering remains a separate AW provider port.
-use crate::{platform_fs, tool_failure};
-use aw_agent_core::*;
-use aw_platform::scoped_fs::Root;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use serde::Deserialize;
-use serde_json::{json, Value};
-use std::sync::Arc;
-const READ_WINDOW: usize = 24 * 1024;
-const MAX_DATA: usize = 48 * 1024;
-const MAX_EDIT_RANGES: usize = 32;
-const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
-#[derive(Clone, Copy, Debug, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum BreadFormat {
-    #[default]
-    Mcp,
-    Base64,
-    Hex,
+//! Bounded binary editing of original-relative ranges. No file-sized
+//! allocation is needed when the host supplies source/staging streams.
+use anyhow::{anyhow, bail, Result};
+use sha2::{Digest as _, Sha256};
+use std::io::{Read, Seek, SeekFrom, Write};
+const CHUNK: usize = 64 * 1024;
+#[derive(Clone, Copy, Debug)]
+pub struct ByteSplice<'a> {
+    pub offset: usize,
+    pub end: usize,
+    pub data: &'a [u8],
 }
 
-/// Resource IDs encode each component independently: punctuation cannot
-/// become a fragment, query or unintended path separator.
-fn resource_uri(path: &str) -> Result<String> {
-    let mut uri = url::Url::parse("abird://file/")
-        .map_err(|_| Error::Protocol("invalid binary resource URI base"))?;
-    uri.path_segments_mut()
-        .map_err(|_| Error::Protocol("invalid binary resource URI path"))?
-        .pop_if_empty()
-        .extend(path.split('/'));
-    Ok(uri.into())
+pub const MAX_EDIT_RANGES: usize = crate::MAX_BINARY_EDIT_RANGES;
+
+#[derive(Debug)]
+pub struct RequestedSplice {
+    pub offset: usize,
+    pub length: Option<usize>,
+    pub data: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum Encoding {
-    #[default]
-    Base64,
-    Hex,
+#[derive(Debug)]
+pub struct OwnedByteSplice {
+    pub offset: usize,
+    pub end: usize,
+    pub data: Vec<u8>,
 }
-impl Encoding {
-    fn decode(self, data: &str) -> Result<Vec<u8>> {
-        if data.len() > MAX_DATA {
-            return Err(Error::Limit("encoded binary payload exceeds 48 KiB"));
+impl OwnedByteSplice {
+    pub fn borrowed(&self) -> ByteSplice<'_> {
+        ByteSplice {
+            offset: self.offset,
+            end: self.end,
+            data: &self.data,
         }
-        let bytes = match self {
-            Self::Base64 => BASE64
-                .decode(data)
-                .map_err(|_| Error::Denied("invalid base64"))?,
-            Self::Hex => {
-                if !data.len().is_multiple_of(2) {
-                    return Err(Error::Denied("invalid hex"));
-                }
-                data.as_bytes()
-                    .chunks_exact(2)
-                    .map(|pair| {
-                        let text =
-                            std::str::from_utf8(pair).map_err(|_| Error::Denied("invalid hex"))?;
-                        u8::from_str_radix(text, 16).map_err(|_| Error::Denied("invalid hex"))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            }
-        };
-        Ok(bytes)
     }
-}
-fn parse<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
-    serde_json::from_value(value.clone())
-        .map_err(|_| Error::Denied("invalid, missing or unknown binary arguments"))
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BreadArgs {
-    path: String,
-    #[serde(default)]
-    offset: u64,
-    #[serde(default = "read_window")]
-    limit: usize,
-    #[serde(default)]
-    format: BreadFormat,
-    #[serde(default)]
-    parallel: bool,
-}
-fn read_window() -> usize {
-    READ_WINDOW
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BwriteArgs {
-    path: String,
-    data: String,
-    #[serde(default)]
-    encoding: Encoding,
-    #[serde(default)]
-    create_only: bool,
-    expected_sha256: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BeditArgs {
-    path: String,
-    #[serde(deserialize_with = "bounded_ranges")]
-    edits: Vec<Range>,
-    sha256: Option<String>,
-}
-fn bounded_ranges<'de, D: serde::Deserializer<'de>>(
-    de: D,
-) -> std::result::Result<Vec<Range>, D::Error> {
-    aw_tools_core::mutation::bounded_array::<D, Range, MAX_EDIT_RANGES>(de, "bedit", "ranges")
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Range {
-    offset: usize,
-    length: Option<usize>,
-    #[serde(default)]
-    data: String,
-    #[serde(default)]
-    encoding: Encoding,
-}
-#[derive(Clone, Copy)]
-pub(crate) enum Operation {
-    Read,
-    Write,
-    Edit,
 }
 
-pub(crate) struct Binary {
-    root: Arc<Root>,
-    op: Operation,
+#[derive(Debug)]
+pub struct SplicePlan {
+    pub edits: Vec<OwnedByteSplice>,
+    pub payload_bytes: usize,
+    pub output_len: usize,
 }
-impl Binary {
-    pub(crate) fn new(root: Arc<Root>, op: Operation) -> Self {
-        Self { root, op }
-    }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanError {
+    Empty,
+    TooMany,
+    RangeOverflow,
+    PastEof,
+    Overlap,
+    PayloadOverflow,
+    OutputOverflow,
+    OutputTooLarge,
 }
-#[cfg(test)]
-fn plan_edits(original: &[u8], ranges: Vec<Range>) -> Result<(Vec<u8>, usize)> {
-    if ranges.is_empty() || ranges.len() > MAX_EDIT_RANGES {
-        return Err(Error::Limit("bedit requires 1..=32 ranges"));
-    }
-    let mut sorted = Vec::with_capacity(ranges.len());
-    for (i, range) in ranges.into_iter().enumerate() {
-        let bytes = range.encoding.decode(&range.data)?;
-        let length = range.length.unwrap_or(bytes.len());
-        let end = range
-            .offset
-            .checked_add(length)
-            .ok_or(Error::Limit("binary range overflows"))?;
-        if end > original.len() {
-            return Err(Error::Denied("binary range is past EOF"));
-        }
-        sorted.push((range.offset, length, i, bytes));
-    }
-    sorted.sort_by_key(|r| (r.0, r.1, r.2));
-    let mut out = Vec::new();
-    let mut cursor = 0;
-    let mut written = 0usize;
-    for (offset, length, _, new_bytes) in sorted {
-        written = written.saturating_add(new_bytes.len());
-        if offset < cursor {
-            return Err(Error::Denied("binary edit ranges overlap"));
-        }
-        out.extend_from_slice(&original[cursor..offset]);
-        out.extend_from_slice(&new_bytes);
-        if out.len() > MAX_FILE_BYTES {
-            return Err(Error::Limit("binary edit result exceeds 64 MiB"));
-        }
-        cursor = offset + length;
-    }
-    out.extend_from_slice(&original[cursor..]);
-    if out.len() > MAX_FILE_BYTES {
-        return Err(Error::Limit("binary edit result exceeds 64 MiB"));
-    }
-    Ok((out, written))
-}
-struct PreparedRange {
-    offset: usize,
-    end: usize,
-    data: Vec<u8>,
-}
-/// Decode only requested bytes, not the original file or its replacement.
-fn prepare_ranges(
-    ranges: Vec<Range>,
+
+/// Plan original-relative binary edits once. Zero-length inserts at the same
+/// offset retain request order and run before a replacement starting there;
+/// positive-length source ranges may never overlap.
+pub fn plan_splices(
+    requested: Vec<RequestedSplice>,
     source_size: usize,
-) -> Result<(Vec<PreparedRange>, usize, usize)> {
-    if ranges.is_empty() || ranges.len() > MAX_EDIT_RANGES {
-        return Err(Error::Limit("bedit requires 1..=32 ranges"));
+    max_output: usize,
+) -> std::result::Result<SplicePlan, PlanError> {
+    if requested.is_empty() {
+        return Err(PlanError::Empty);
     }
-    let mut requested = Vec::with_capacity(ranges.len());
-    for (order, range) in ranges.into_iter().enumerate() {
-        let data = range.encoding.decode(&range.data)?;
-        let length = range.length.unwrap_or(data.len());
-        let end = range
+    if requested.len() > MAX_EDIT_RANGES {
+        return Err(PlanError::TooMany);
+    }
+
+    let mut sorted = Vec::with_capacity(requested.len());
+    for (order, request) in requested.into_iter().enumerate() {
+        let length = request.length.unwrap_or(request.data.len());
+        let end = request
             .offset
             .checked_add(length)
-            .ok_or(Error::Limit("binary range overflow"))?;
+            .ok_or(PlanError::RangeOverflow)?;
         if end > source_size {
-            return Err(Error::Denied("binary range is past EOF"));
+            return Err(PlanError::PastEof);
         }
-        requested.push((range.offset, length, order, data));
+        sorted.push((request.offset, length, order, end, request.data));
     }
-    requested.sort_by_key(|(offset, length, order, _)| (*offset, *length, *order));
-    let (mut cursor, mut output_len, mut written) = (0usize, 0usize, 0usize);
-    let mut prepared = Vec::with_capacity(requested.len());
-    for (offset, length, _, data) in requested {
+    sorted.sort_by_key(|(offset, length, order, _, _)| (*offset, *length, *order));
+
+    let mut cursor = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut output_len = 0usize;
+    let mut edits = Vec::with_capacity(sorted.len());
+    for (offset, _length, _order, end, data) in sorted {
         if offset < cursor {
-            return Err(Error::Denied("binary edit ranges overlap"));
+            return Err(PlanError::Overlap);
         }
         output_len = output_len
             .checked_add(offset - cursor)
-            .and_then(|n| n.checked_add(data.len()))
-            .ok_or(Error::Limit("binary output size overflow"))?;
-        written = written
+            .and_then(|value| value.checked_add(data.len()))
+            .ok_or(PlanError::OutputOverflow)?;
+        payload_bytes = payload_bytes
             .checked_add(data.len())
-            .ok_or(Error::Limit("binary payload overflow"))?;
-        cursor = offset + length;
-        prepared.push(PreparedRange {
-            offset,
-            end: cursor,
-            data,
-        });
+            .ok_or(PlanError::PayloadOverflow)?;
+        cursor = end;
+        edits.push(OwnedByteSplice { offset, end, data });
     }
     output_len = output_len
         .checked_add(source_size - cursor)
-        .ok_or(Error::Limit("binary output size overflow"))?;
-    if output_len > MAX_FILE_BYTES {
-        return Err(Error::Limit("binary edit exceeds 64 MiB"));
+        .ok_or(PlanError::OutputOverflow)?;
+    if output_len > max_output {
+        return Err(PlanError::OutputTooLarge);
     }
-    Ok((prepared, written, output_len))
+    Ok(SplicePlan {
+        edits,
+        payload_bytes,
+        output_len,
+    })
 }
-impl Tool for Binary {
-    fn spec(&self) -> ToolSpec {
-        use aw_tools_core::filesystem::schema::{SchemaCaps, Tool as C};
-        let tool = match self.op {
-            Operation::Read => C::Bread,
-            Operation::Write => C::Bwrite,
-            Operation::Edit => C::Bedit,
-        };
-        crate::core_spec(
-            tool,
-            SchemaCaps {
-                binary_data_bytes: MAX_DATA,
-                binary_edit_ranges: MAX_EDIT_RANGES,
-                parallel_reads: true,
-                ..Default::default()
-            },
-        )
+pub fn digest_limited(source: &mut impl Read, limit: usize) -> Result<(usize, [u8; 32])> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; CHUNK];
+    let mut total = 0usize;
+    loop {
+        let requested = limit
+            .saturating_sub(total)
+            .saturating_add(1)
+            .min(buffer.len());
+        let read = source.read(&mut buffer[..requested])?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read)
+            .ok_or_else(|| anyhow!("binary input size overflow"))?;
+        if total > limit {
+            bail!("binary source exceeds {limit} byte limit");
+        }
+        hasher.update(&buffer[..read]);
     }
-    fn validate(&self, value: &Value) -> Result<()> {
-        match self.op {
-            Operation::Read => {
-                let a: BreadArgs = parse(value)?;
-                crate::model_path(&a.path)?;
-                if a.limit == 0 || a.limit > 65536 {
-                    return Err(Error::Limit("binary window too large"));
-                }
-                if matches!(a.format, BreadFormat::Mcp) && a.offset != 0 {
-                    return Err(Error::Denied("format=mcp requires offset=0"));
-                }
-                if !matches!(a.format, BreadFormat::Mcp) && a.limit > READ_WINDOW {
-                    return Err(Error::Limit("encoded binary window exceeds 24 KiB"));
-                }
-                let _ = a.parallel;
+    Ok((total, hasher.finalize().into()))
+}
+/// Recheck the complete pinned source after inspecting candidate no-op
+/// spans. Matching only the edited ranges is insufficient if an external
+/// writer changed unrelated bytes between the initial digest and return.
+pub fn verify_preimage(
+    source: &mut (impl Read + Seek),
+    expected: (usize, [u8; 32]),
+    limit: usize,
+) -> Result<()> {
+    source.seek(SeekFrom::Start(0))?;
+    let current = digest_limited(source, limit)?;
+    if current != expected {
+        bail!("binary source changed during no-op verification");
+    }
+    Ok(())
+}
+pub fn splices_are_unchanged(
+    source: &mut (impl Read + Seek),
+    splices: &[ByteSplice<'_>],
+) -> Result<bool> {
+    let mut scratch = [0u8; CHUNK];
+    for splice in splices {
+        if splice.end.checked_sub(splice.offset) != Some(splice.data.len()) {
+            return Ok(false);
+        }
+        source.seek(SeekFrom::Start(splice.offset as u64))?;
+        for chunk in splice.data.chunks(scratch.len()) {
+            source.read_exact(&mut scratch[..chunk.len()])?;
+            if &scratch[..chunk.len()] != chunk {
+                return Ok(false);
             }
-            Operation::Write => {
-                let a: BwriteArgs = parse(value)?;
-                crate::model_path(&a.path)?;
-                a.encoding.decode(&a.data)?;
-                crate::mutate::validate_digest(a.expected_sha256.as_deref())?;
+        }
+    }
+    Ok(true)
+}
+pub fn stream_splice(
+    source: &mut impl Read,
+    output: &mut impl Write,
+    expected: (usize, [u8; 32]),
+    splices: &[ByteSplice<'_>],
+) -> Result<bool> {
+    stream_splice_with_stop(source, output, expected, splices, &|| false)
+}
+pub fn stream_splice_with_stop(
+    source: &mut impl Read,
+    output: &mut impl Write,
+    expected: (usize, [u8; 32]),
+    splices: &[ByteSplice<'_>],
+    stop: &dyn Fn() -> bool,
+) -> Result<bool> {
+    fn copy_chunk(
+        source: &mut impl Read,
+        out: &mut impl Write,
+        mut remaining: usize,
+        old_hash: &mut Sha256,
+        new_hash: &mut Sha256,
+        copy: bool,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let mut buffer = [0u8; CHUNK];
+        while remaining > 0 {
+            if stop() {
+                bail!("binary edit cancelled");
             }
-            Operation::Edit => {
-                let a: BeditArgs = parse(value)?;
-                crate::model_path(&a.path)?;
-                if a.edits.is_empty() || a.edits.len() > MAX_EDIT_RANGES {
-                    return Err(Error::Limit("too many binary edits"));
-                }
-                for r in &a.edits {
-                    if r.data.len() > MAX_DATA {
-                        return Err(Error::Limit("encoded binary data too large"));
-                    }
-                }
-                if let Some(hash) = a.sha256 {
-                    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                        return Err(Error::Denied("sha256 must be 64 hexadecimal characters"));
-                    }
-                }
+            let take = remaining.min(buffer.len());
+            let len = source.read(&mut buffer[..take])?;
+            if len == 0 {
+                bail!("source changed during staged edit");
             }
+            old_hash.update(&buffer[..len]);
+            if copy {
+                out.write_all(&buffer[..len])?;
+                new_hash.update(&buffer[..len]);
+            }
+            remaining -= len;
         }
         Ok(())
     }
-    fn execute<'a>(&'a self, ctx: ToolContext, value: &'a Value) -> ToolFuture<'a> {
-        Box::pin(async move {
-            self.validate(value)?;
-            let value = value.clone();
-            let root = self.root.clone();
-            let op = self.op;
-            let answer = aw_tools_core::asynchronous::run_blocking(move || -> Result<ToolOutput> {
-                if ctx.cancellation.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                match op {
-                    Operation::Read => {
-                        let a: BreadArgs = parse(&value)?;
-                        if matches!(a.format, BreadFormat::Mcp) {
-                            let bytes = platform_fs(root.read_bytes(&a.path, a.limit))?;
-                            let packet=aw_tools_core::media::MediaPacket::from_complete_bytes(bytes)
-                                .map_err(|_|Error::Limit("inline media exceeds 64 KiB"))?;
-                            let descriptor=packet.descriptor();
-                            let mime=descriptor.mime;
-                            let kind=descriptor.kind.as_str();
-                            // Transport-neutral encoding. A future typed adapter
-                            // can project this into real MCP ContentBlock media.
-                            let output = json!({
-                                "type":kind, "mime_type":mime, "format":"mcp",
-                                "path":a.path,"data":BASE64.encode(packet.bytes()),
-                                "uri":if kind=="resource"{Some(resource_uri(&a.path)?)}else{None},
-                                "bytes":packet.bytes().len(),
-                                "sha256":descriptor.sha256_hex(),
-                                "mime_source":if descriptor.signature_identified{"signature"}else{"fallback"},
-                                "transport":"encoded_json"
-                            });
-                            Ok(ToolOutput::text(output.to_string()))
-                        } else {
-                            let (data, total, truncated) =
-                                platform_fs(root.read_binary_window(&a.path, a.offset, a.limit))?;
-                            let (format, encoded) = match a.format {
-                                BreadFormat::Base64 => ("base64", BASE64.encode(&data)),
-                                BreadFormat::Hex => (
-                                    "hex",
-                                    data.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                                ),
-                                BreadFormat::Mcp => unreachable!(),
-                            };
-                            Ok(ToolOutput {
-                                content: json!({"path":a.path,"data":encoded,"format":format,
-                                    "encoding":format,"offset":a.offset,"bytes":data.len(),
-                                    "total_size":total,"total_bytes":total,"truncated":truncated})
-                                .to_string(),
-                                is_error: false,
-                                truncated,
-                            })
-                        }
-                    }
-                    Operation::Write => {
-                        let a: BwriteArgs = parse(&value)?;
-                        let bytes = a.encoding.decode(&a.data)?;
-                        if !a.create_only && a.expected_sha256.is_none(){
-                            let result=aw_tools_core::filesystem::operations::write_bytes(
-                                root.as_ref(),&a.path,&bytes,MAX_FILE_BYTES,
-                                &||ctx.cancellation.is_cancelled()
-                            ).map_err(crate::file_operation_error)?;
-                            Ok(ToolOutput::text(result.as_str()))
-                        }else{
-                            let changed=crate::mutate::write(
-                                &root,&a.path,&bytes,a.create_only,
-                                a.expected_sha256.as_deref(),
-                                &||ctx.cancellation.is_cancelled()
-                            )?;
-                            Ok(ToolOutput::text(
-                                aw_tools_core::mutation::compact_success(
-                                    usize::from(changed),None
-                                )
-                            ))
-                        }
-                    }
-                    Operation::Edit => {
-                        let a: BeditArgs = parse(&value)?;
-                        let _guard = platform_fs(
-                            root.lock_mutations_with_cancel(std::slice::from_ref(&a.path), &|| {
-                                ctx.cancellation.is_cancelled()
-                            }),
-                        )?;
-                        {
-                            use aw_tools_core::binary::{
-                                digest_limited,splices_are_unchanged,stream_splice_with_stop,
-                                verify_preimage,ByteSplice,
-                            };
-                            use std::io::{Seek, SeekFrom};
-                            let mut source = platform_fs(root.open_regular(&a.path))?;
-                            let (size, digest) = digest_limited(&mut source, MAX_FILE_BYTES)
-                                .map_err(|_| {
-                                    Error::Limit("binary source exceeds 64 MiB or changed")
-                                })?;
-                            let (prepared,_bytes_written,size_after)=
-                                prepare_ranges(a.edits,size)?;
-                            if let Some(sha) = a.sha256 {
-                                let actual = digest
-                                    .iter()
-                                    .map(|b| format!("{b:02x}"))
-                                    .collect::<String>();
-                                if actual != sha.to_ascii_lowercase() {
-                                    return Ok(ToolOutput::error(
-                                        "bedit: sha256 precondition mismatch",
-                                    ));
-                                }
-                            }
-                            let splices = prepared
-                                .iter()
-                                .map(|r| ByteSplice {
-                                    offset: r.offset,
-                                    end: r.end,
-                                    data: &r.data,
-                                })
-                                .collect::<Vec<_>>();
-                            let changed = !(size == size_after
-                                && splices_are_unchanged(&mut source, &splices).map_err(|_| {
-                                    Error::Protocol("binary source changed during no-op check")
-                                })?);
-                            if !changed {
-                                if ctx.cancellation.is_cancelled(){return Err(Error::Cancelled);}
-                                let mut current=platform_fs(root.open_regular(&a.path))?;
-                                verify_preimage(&mut current,(size,digest),MAX_FILE_BYTES)
-                                    .map_err(|_|Error::Protocol(
-                                        "binary target changed during no-op; inspect workspace"
-                                    ))?;
-                            }
-                            if changed {
-                                if ctx.cancellation.is_cancelled() {
-                                    return Err(Error::Cancelled);
-                                }
-                                let pending = platform_fs(root.stage_stream_update(
-                                    &a.path,
-                                    (size as u64, digest),
-                                    |output| {
-                                        source.seek(SeekFrom::Start(0))?;
-                                        stream_splice_with_stop(
-                                            &mut source,
-                                            output,
-                                            (size, digest),
-                                            &splices,
-                                            &||ctx.cancellation.is_cancelled(),
-                                        )
-                                        .map_err(|_| {
-                                            aw_platform::scoped_fs::ScopedError::Denied(
-                                                "binary source changed during staged edit",
-                                            )
-                                        })?;
-                                        Ok(())
-                                    },
-                                    &|| ctx.cancellation.is_cancelled(),
-                                ))?;
-                                if ctx.cancellation.is_cancelled() {
-                                    return Err(Error::Cancelled);
-                                }
-                                platform_fs(pending.commit())?;
-                            }
-                            Ok(ToolOutput::text(
-                                aw_tools_core::mutation::compact_success(
-                                    usize::from(changed),None)
-                            ))
-                        }
-                    }
-                }
-            })
-            .await
-            .map_err(|_| {
-                Error::Protocol("binary worker failed; inspect workspace before retrying")
-            })?;
-            tool_failure(answer, !matches!(op, Operation::Read))
-        })
+    if stop() {
+        bail!("binary edit cancelled");
     }
+    let mut old = Sha256::new();
+    let mut new = Sha256::new();
+    let (size, digest) = expected;
+    let (mut cursor, mut written) = (0usize, 0usize);
+    for splice in splices {
+        if splice.offset < cursor || splice.end < splice.offset || splice.end > size {
+            bail!("invalid or overlapping binary edit ranges");
+        }
+        let span = splice.offset - cursor;
+        copy_chunk(source, output, span, &mut old, &mut new, true, stop)?;
+        written = written
+            .checked_add(span)
+            .ok_or_else(|| anyhow!("output size overflow"))?;
+        copy_chunk(
+            source,
+            output,
+            splice.end - splice.offset,
+            &mut old,
+            &mut new,
+            false,
+            stop,
+        )?;
+        if stop() {
+            bail!("binary edit cancelled");
+        }
+        output.write_all(splice.data)?;
+        new.update(splice.data);
+        written = written
+            .checked_add(splice.data.len())
+            .ok_or_else(|| anyhow!("output size overflow"))?;
+        cursor = splice.end;
+    }
+    copy_chunk(
+        source,
+        output,
+        size - cursor,
+        &mut old,
+        &mut new,
+        true,
+        stop,
+    )?;
+    written = written
+        .checked_add(size - cursor)
+        .ok_or_else(|| anyhow!("output size overflow"))?;
+    let mut extra = [0u8];
+    if source.read(&mut extra)? != 0 || <[u8; 32]>::from(old.finalize()) != digest {
+        bail!("binary source changed during staged edit");
+    }
+    Ok(written != size || <[u8; 32]>::from(new.finalize()) != digest)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     #[test]
-    fn binary_ranges_are_original_relative_and_check_overlap() {
-        let ranges = vec![
-            Range {
-                offset: 1,
-                length: Some(1),
-                data: "Wg==".into(),
-                encoding: Encoding::Base64,
-            },
-            Range {
-                offset: 3,
-                length: Some(0),
-                data: "WQ==".into(),
-                encoding: Encoding::Base64,
-            },
-        ];
-        assert_eq!(plan_edits(b"abcd", ranges).unwrap().0, b"aZcYd");
-        let ranges = vec![
-            Range {
-                offset: 1,
-                length: Some(2),
-                data: String::new(),
-                encoding: Encoding::Base64,
-            },
-            Range {
+    fn streamed_edits_and_verified_preimage() {
+        let original = b"abcdefghijkl";
+        let expected = (original.len(), sha2::Sha256::digest(original).into());
+        let patches = [
+            ByteSplice {
                 offset: 2,
-                length: Some(1),
-                data: String::new(),
-                encoding: Encoding::Base64,
+                end: 5,
+                data: b"XX",
+            },
+            ByteSplice {
+                offset: 8,
+                end: 8,
+                data: b"!",
             },
         ];
-        assert!(plan_edits(b"abcd", ranges).is_err());
+        let mut output = Vec::new();
+        assert!(
+            stream_splice(&mut Cursor::new(original), &mut output, expected, &patches).unwrap()
+        );
+        assert_eq!(output, b"abXXfgh!ijkl");
+        assert!(stream_splice(
+            &mut Cursor::new(b"mutated"),
+            &mut Vec::new(),
+            expected,
+            &patches
+        )
+        .is_err());
+    }
+    #[test]
+    fn cancelling_a_streamed_splice_never_reports_success() {
+        let original = b"abcdef";
+        let digest = (original.len(), sha2::Sha256::digest(original).into());
+        let splice = [ByteSplice {
+            offset: 0,
+            end: 0,
+            data: b"!",
+        }];
+        let mut staged = Vec::new();
+        assert!(stream_splice_with_stop(
+            &mut Cursor::new(original),
+            &mut staged,
+            digest,
+            &splice,
+            &|| true
+        )
+        .is_err());
+        assert!(staged.is_empty());
+    }
+    #[test]
+    fn unchanged_splice_does_not_hide_unrelated_source_changes() {
+        let original = b"abcdef".to_vec();
+        let expected = (original.len(), Sha256::digest(&original).into());
+        let edit = [ByteSplice {
+            offset: 2,
+            end: 4,
+            data: b"cd",
+        }];
+        let mut input = std::io::Cursor::new(original);
+        assert!(splices_are_unchanged(&mut input, &edit).unwrap());
+        input.get_mut()[0] = b'Z';
+        assert!(splices_are_unchanged(&mut input, &edit).unwrap());
+        assert!(verify_preimage(&mut input, expected, 64).is_err());
+    }
+    #[test]
+    fn planner_orders_same_offset_inserts_before_replacement() {
+        let plan = plan_splices(
+            vec![
+                RequestedSplice {
+                    offset: 1,
+                    length: Some(1),
+                    data: b"R".to_vec(),
+                },
+                RequestedSplice {
+                    offset: 1,
+                    length: Some(0),
+                    data: b"A".to_vec(),
+                },
+                RequestedSplice {
+                    offset: 1,
+                    length: Some(0),
+                    data: b"B".to_vec(),
+                },
+            ],
+            3,
+            64,
+        )
+        .unwrap();
+        assert_eq!(plan.output_len, 5);
+        assert_eq!(plan.payload_bytes, 3);
+        assert_eq!(
+            plan.edits
+                .iter()
+                .map(|edit| (edit.offset, edit.end, edit.data.as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                (1, 1, b"A".as_slice()),
+                (1, 1, b"B".as_slice()),
+                (1, 2, b"R".as_slice())
+            ]
+        );
+    }
+
+    #[test]
+    fn planner_rejects_positive_overlap_and_bounds_output() {
+        assert_eq!(
+            plan_splices(
+                vec![
+                    RequestedSplice {
+                        offset: 1,
+                        length: Some(2),
+                        data: vec![],
+                    },
+                    RequestedSplice {
+                        offset: 2,
+                        length: Some(1),
+                        data: vec![],
+                    },
+                ],
+                4,
+                64,
+            )
+            .unwrap_err(),
+            PlanError::Overlap
+        );
+        assert_eq!(
+            plan_splices(
+                vec![RequestedSplice {
+                    offset: 0,
+                    length: Some(0),
+                    data: vec![0; 5],
+                }],
+                4,
+                8,
+            )
+            .unwrap_err(),
+            PlanError::OutputTooLarge
+        );
+    }
+
+    #[test]
+    fn noop_verified() {
+        let mut original = Cursor::new(b"abcd");
+        assert!(splices_are_unchanged(
+            &mut original,
+            &[ByteSplice {
+                offset: 1,
+                end: 3,
+                data: b"bc"
+            }]
+        )
+        .unwrap());
+        assert_eq!(digest_limited(&mut Cursor::new(b"hello"), 5).unwrap().0, 5);
+        assert!(digest_limited(&mut Cursor::new(b"hello!"), 5).is_err());
     }
 }

@@ -10,7 +10,7 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use windows_sys::Win32::Storage::FileSystem::{
@@ -18,6 +18,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
+pub mod capability;
 #[path = "scoped_fs/port.rs"]
 mod port;
 pub use port::{MutationGuard, StagedWrite};
@@ -74,6 +75,7 @@ pub struct Root {
     root: PathBuf,
     _directories: Vec<File>,
     serial: Mutex<()>,
+    private: Arc<aw_tools::filesystem::private_artifact::Registry>,
 }
 
 /// Directory handles keep every traversed path component in place until the
@@ -134,21 +136,68 @@ fn pin_directory(path: &Path) -> Result<File> {
     Ok(directory)
 }
 
+fn root_relative_utf8(root: &Path, target: &Path) -> Result<String> {
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| ScopedError::Denied("resolved content target escapes granted root"))?;
+    if relative.as_os_str().is_empty() {
+        return Err(ScopedError::Denied("content target is not a regular file"));
+    }
+    let mut result = String::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(ScopedError::Denied(
+                "resolved content target is not reusable",
+            ));
+        };
+        let part = part
+            .to_str()
+            .ok_or(ScopedError::Denied("resolved content target is not UTF-8"))?;
+        if !result.is_empty() {
+            result.push('/');
+        }
+        result.push_str(part);
+    }
+    Ok(result)
+}
+
 impl Root {
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_private_artifacts(
+            root,
+            aw_tools::filesystem::private_artifact::Registry::memory(),
+        )
+    }
+
+    pub fn open_with_private_artifacts(
+        root: &Path,
+        private: Arc<aw_tools::filesystem::private_artifact::Registry>,
+    ) -> Result<Self> {
         let root = root.canonicalize()?;
+        // Bind preparation to the exact non-reparse directory object first.
+        // The subsequent top-down ancestor pins protect the reusable namespace;
+        // the final object identity comparison closes replacement races between
+        // canonicalization and publication of the retained capability.
+        let expected = pin_directory(&root)?;
+        let expected_identity = super::file_identity(&expected)?;
         let mut ancestors = root.ancestors().collect::<Vec<_>>();
         ancestors.reverse();
         let mut directories = Vec::with_capacity(ancestors.len());
         for ancestor in ancestors {
-            // Pin drive/share root first. Each later open is protected by all
-            // preceding handles, including ancestors outside the granted root.
             directories.push(pin_directory(ancestor)?);
         }
+        let actual = directories
+            .last()
+            .ok_or(ScopedError::Denied("missing pinned root directory"))?;
+        if super::file_identity(actual)? != expected_identity {
+            return Err(ScopedError::Denied("granted root changed while opening"));
+        }
+        drop(expected);
         Ok(Self {
             root,
             _directories: directories,
             serial: Mutex::new(()),
+            private,
         })
     }
 
@@ -156,6 +205,170 @@ impl Root {
         self.serial
             .lock()
             .map_err(|_| ScopedError::Denied("file root is poisoned; stop and inspect"))
+    }
+
+    fn parent_artifact_identity(
+        &self,
+        parent: &Parent,
+    ) -> Result<aw_tools::filesystem::private_artifact::ObjectIdentity> {
+        let handle = parent
+            .directories
+            .last()
+            .or_else(|| self._directories.last())
+            .ok_or(ScopedError::Denied("missing pinned root directory"))?;
+        let (volume, object) = super::file_identity(handle)?;
+        Ok(aw_tools::filesystem::private_artifact::ObjectIdentity {
+            volume: u64::from(volume),
+            object,
+        })
+    }
+
+    pub fn private_artifacts(&self) -> &Arc<aw_tools::filesystem::private_artifact::Registry> {
+        &self.private
+    }
+
+    pub fn is_private_path(&self, path: &str) -> Result<bool> {
+        validate_path(path)?;
+        let (parent, target) = match self.parent(path) {
+            Ok(value) => value,
+            Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let name = target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(ScopedError::Denied("private artifact name is not reusable"))?;
+        let parent_id = self.parent_artifact_identity(&parent)?;
+        let file = match OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&target)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let (volume, object) = super::file_identity(&file)?;
+        self.private
+            .owns(
+                parent_id,
+                name,
+                aw_tools::filesystem::private_artifact::ObjectIdentity {
+                    volume: u64::from(volume),
+                    object,
+                },
+            )
+            .map_err(|_| ScopedError::Denied("private mutation artifact registry unavailable"))
+    }
+
+    pub(crate) fn ensure_public_path(&self, path: &str) -> Result<()> {
+        if self.is_private_path(path)? {
+            return Err(ScopedError::Denied(
+                "private mutation artifact is not externally addressable",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_final_path(
+        &self,
+        path: &str,
+        allow_missing: bool,
+        directory: bool,
+        label: &'static str,
+    ) -> Result<String> {
+        validate_path(path)?;
+        let (_parent, target) = match self.parent(path) {
+            Ok(value) => value,
+            Err(ScopedError::Io(error))
+                if allow_missing && error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(path.to_owned());
+            }
+            Err(error) => return Err(error),
+        };
+        let entry = match fs::symlink_metadata(&target) {
+            Ok(entry) => entry,
+            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {
+                return Ok(path.to_owned());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !is_reparse(&entry) {
+            if entry.is_dir() == directory && (entry.is_dir() || entry.is_file()) {
+                return Ok(path.to_owned());
+            }
+            return Err(ScopedError::Denied(label));
+        }
+        if !entry.file_type().is_symlink() {
+            return Err(ScopedError::Denied("unsupported final reparse point"));
+        }
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+        };
+        let followed = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&target)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    ScopedError::Denied("dangling final symlink is not a missing target")
+                } else {
+                    ScopedError::Io(error)
+                }
+            })?;
+        let followed_meta = followed.metadata()?;
+        if followed_meta.is_dir() != directory
+            || (!followed_meta.is_dir() && !followed_meta.is_file())
+        {
+            return Err(ScopedError::Denied(label));
+        }
+        let followed_id = super::file_identity(&followed)?;
+        let canonical = target.canonicalize().map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                ScopedError::Denied("dangling final symlink is not a missing target")
+            } else {
+                ScopedError::Io(error)
+            }
+        })?;
+        let resolved = root_relative_utf8(&self.root, &canonical)?;
+        let (_verified_parent, verified_path) = self.parent(&resolved)?;
+        let verified = if directory {
+            pin_directory(&verified_path)?
+        } else {
+            super::open_nofollow_metadata(&verified_path)?
+        };
+        let verified_meta = verified.metadata()?;
+        if verified_meta.is_dir() != directory
+            || (!verified_meta.is_dir() && !verified_meta.is_file())
+            || super::file_identity(&verified)? != followed_id
+        {
+            return Err(ScopedError::Denied(
+                "final symlink target changed during resolution",
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// Metadata-only final content-link resolution. Parent handles omit
+    /// FILE_SHARE_DELETE, so the traversed namespace remains pinned while the
+    /// final target spelling/identity is revalidated.
+    pub fn resolve_content_path(&self, path: &str, allow_missing: bool) -> Result<String> {
+        self.resolve_final_path(
+            path,
+            allow_missing,
+            false,
+            "final symlink target is not a regular file",
+        )
+    }
+
+    pub fn resolve_directory_path(&self, path: &str) -> Result<String> {
+        self.resolve_final_path(path, false, true, "discovery root is not a directory")
     }
 
     fn parent(&self, path: &str) -> Result<(Parent, PathBuf)> {
@@ -180,10 +393,8 @@ impl Root {
 
     fn contents(file: &mut File) -> Result<String> {
         let meta = file.metadata()?;
-        if !meta.is_file() || super::file_link_count(file)? != 1 || is_reparse(&meta) {
-            return Err(ScopedError::Denied(
-                "only singly-linked regular files are permitted",
-            ));
+        if !meta.is_file() || is_reparse(&meta) {
+            return Err(ScopedError::Denied("only regular files are permitted"));
         }
         if meta.len() > MAX_FILE as u64 {
             return Err(ScopedError::Limit(
@@ -199,6 +410,7 @@ impl Root {
     }
 
     pub fn read(&self, path: &str) -> Result<String> {
+        self.ensure_public_path(path)?;
         let (_parent, path) = self.parent(path)?;
         let mut file = super::open_nofollow_read(&path)?;
         Self::contents(&mut file)
@@ -209,6 +421,9 @@ impl Root {
     }
 
     pub fn list_with_limit(&self, path: &str, max_entries: usize) -> Result<Listing> {
+        if !path.is_empty() {
+            self.ensure_public_path(path)?;
+        }
         if !(1..=16384).contains(&max_entries) {
             return Err(ScopedError::Limit("listing limit outside 1..=16384"));
         }
@@ -263,18 +478,7 @@ impl Root {
             } else if meta.is_dir() {
                 EntryKind::Directory
             } else if meta.is_file() {
-                let file = match super::open_nofollow_read(&item.path()) {
-                    Ok(file) => file,
-                    Err(_) => {
-                        incomplete = true;
-                        continue;
-                    }
-                };
-                if super::file_link_count(&file).unwrap_or(2) == 1 {
-                    EntryKind::File
-                } else {
-                    EntryKind::Unsupported
-                }
+                EntryKind::File
             } else {
                 EntryKind::Unsupported
             };
@@ -468,14 +672,14 @@ mod tests {
 }
 
 /// Shared traversal with pinned Windows ancestor handles; no reparse follow.
-impl aw_tools_core::filesystem::walk::Backend for Root {
+impl aw_tools::filesystem::walk::Backend for Root {
     type Error = ScopedError;
     fn list(
         &self,
         path: &str,
         max: usize,
-    ) -> std::result::Result<aw_tools_core::filesystem::walk::Listing, Self::Error> {
-        use aw_tools_core::filesystem::{walk, Kind};
+    ) -> std::result::Result<aw_tools::filesystem::walk::Listing, Self::Error> {
+        use aw_tools::filesystem::{walk, Kind};
         let listing = self.list_with_limit(path, max)?;
         Ok(walk::Listing {
             incomplete: listing.incomplete,
@@ -503,8 +707,8 @@ impl aw_tools_core::filesystem::walk::Backend for Root {
     fn read_bytes(&self, path: &str, max: usize) -> std::result::Result<Vec<u8>, Self::Error> {
         Root::read_bytes(self, path, max)
     }
-    fn classify(&self, error: &Self::Error) -> aw_tools_core::filesystem::walk::BackendErrorKind {
-        use aw_tools_core::filesystem::walk::BackendErrorKind as K;
+    fn classify(&self, error: &Self::Error) -> aw_tools::filesystem::walk::BackendErrorKind {
+        use aw_tools::filesystem::walk::BackendErrorKind as K;
         match error {
             ScopedError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => K::Missing,
             ScopedError::Io(_) | ScopedError::Denied(_) => K::Unavailable,
@@ -512,22 +716,37 @@ impl aw_tools_core::filesystem::walk::Backend for Root {
             ScopedError::Cancelled => K::Other,
         }
     }
+    fn private_entry(&self, path: &str) -> Result<bool> {
+        self.is_private_path(path)
+    }
 }
 
-impl aw_tools_core::filesystem::backend::MetadataBackend for Root {
-    fn entry_meta(&self, path: &str) -> Result<aw_tools_core::filesystem::EntryMeta> {
+impl aw_tools::filesystem::backend::MetadataBackend for Root {
+    fn entry_meta(&self, path: &str) -> Result<aw_tools::filesystem::EntryMeta> {
         Root::entry_meta(self, path)
     }
 }
-impl aw_tools_core::filesystem::backend::StagedPublication for port::StagedWrite {
+impl aw_tools::filesystem::backend::ExplicitPathBackend for Root {
+    fn resolve_content_path(&self, path: &str, allow_missing: bool) -> Result<String> {
+        Root::resolve_content_path(self, path, allow_missing)
+    }
+    fn resolve_directory_path(&self, path: &str) -> Result<String> {
+        Root::resolve_directory_path(self, path)
+    }
+}
+impl aw_tools::filesystem::backend::StagedPublication for port::StagedWrite {
     type Error = ScopedError;
     fn commit(self) -> Result<()> {
         port::StagedWrite::commit(self)
     }
 }
-impl aw_tools_core::filesystem::backend::SecuredFilesystem for Root {
+impl aw_tools::filesystem::backend::SecuredFilesystem for Root {
     type Guard<'a> = port::MutationGuard<'a>;
     type Stage = port::StagedWrite;
+    fn mutation_path_key(&self, path: &str) -> Result<Vec<u8>> {
+        validate_path(path)?;
+        port::folded_namespace_key(&self.root.join(path))
+    }
     fn lock<'a>(&'a self, paths: &[String], cancel: &dyn Fn() -> bool) -> Result<Self::Guard<'a>> {
         self.lock_mutations_with_cancel(paths, cancel)
     }
@@ -559,8 +778,8 @@ impl aw_tools_core::filesystem::backend::SecuredFilesystem for Root {
     fn classify_publication_failure(
         &self,
         error: &Self::Error,
-    ) -> aw_tools_core::filesystem::backend::CommitFailure {
-        use aw_tools_core::filesystem::backend::CommitFailure;
+    ) -> aw_tools::filesystem::backend::CommitFailure {
+        use aw_tools::filesystem::backend::CommitFailure;
         match error {
             ScopedError::Denied(_) | ScopedError::Limit(_) | ScopedError::Cancelled => {
                 CommitFailure::NoPublication
@@ -579,15 +798,15 @@ impl aw_tools_core::filesystem::backend::SecuredFilesystem for Root {
         paths: &[String],
         recursive: bool,
         cancel: &dyn Fn() -> bool,
-    ) -> Result<aw_tools_core::filesystem::lifecycle::RemoveOutcome> {
+    ) -> Result<aw_tools::filesystem::lifecycle::RemoveOutcome> {
         Root::remove_paths(self, paths, recursive, cancel)
     }
     fn read_page(
         &self,
         path: &str,
-        request: aw_tools_core::read::PageRequest,
+        request: aw_tools::read::PageRequest,
         cancel: &dyn Fn() -> bool,
-    ) -> Result<aw_tools_core::read::Page> {
+    ) -> Result<aw_tools::read::Page> {
         Root::read_page_with_cancel(self, path, request, cancel)
     }
 }

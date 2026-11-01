@@ -3656,7 +3656,7 @@ mod tests {
     #[tokio::test]
     async fn aw_p6_10b_rebound_actor_cannot_inherit_host_registered_process_handles() {
         use crate::model_management::ProcessRegistry;
-        use aw_tools::process::{PipeProcess, PipeSpec};
+        use aw_tools_adapter::process::{PipeProcess, PipeSpec};
         use std::collections::BTreeMap;
 
         let temp = PrivateTemp::new();
@@ -3783,7 +3783,7 @@ mod tests {
     #[tokio::test]
     async fn aw_p6_9d2b2b1_real_agent_terminates_only_separately_approved_original_process() {
         use crate::model_management::ProcessRegistry;
-        use aw_tools::process::{PipeProcess, PipeSpec};
+        use aw_tools_adapter::process::{PipeProcess, PipeSpec};
         use std::collections::BTreeMap;
         let tmp = PrivateTemp::new();
         let store = SessionStore::open(&tmp.0).unwrap();
@@ -3937,7 +3937,7 @@ mod tests {
     #[tokio::test]
     async fn aw_p6_9d2b2b1_duplicate_termination_proposals_preserve_original_unknown_hazard() {
         use crate::model_management::ProcessRegistry;
-        use aw_tools::process::{PipeProcess, PipeSpec};
+        use aw_tools_adapter::process::{PipeProcess, PipeSpec};
         use std::collections::BTreeMap;
         let tmp = PrivateTemp::new();
         let store = SessionStore::open(&tmp.0).unwrap();
@@ -4064,7 +4064,7 @@ mod tests {
     #[tokio::test]
     async fn aw_p6_9d2b2a_original_agent_closes_only_host_owned_process_stdin_with_receipts() {
         use crate::model_management::ProcessRegistry;
-        use aw_tools::process::{PipeProcess, PipeSpec};
+        use aw_tools_adapter::process::{PipeProcess, PipeSpec};
         use std::collections::BTreeMap;
         let tmp = PrivateTemp::new();
         let store = SessionStore::open(&tmp.0).unwrap();
@@ -4204,7 +4204,7 @@ mod tests {
     #[tokio::test]
     async fn aw_p6_10f_retired_original_actor_after_tool_intent_never_touches_real_process() {
         use crate::model_management::ProcessRegistry;
-        use aw_tools::process::{PipeProcess, PipeSpec};
+        use aw_tools_adapter::process::{PipeProcess, PipeSpec};
         use std::collections::BTreeMap;
         let tmp = PrivateTemp::new();
         let store = SessionStore::open(&tmp.0).unwrap();
@@ -4344,7 +4344,7 @@ mod tests {
     #[tokio::test]
     async fn aw_p6_9d2b2a_double_process_close_tool_proposal_is_unsettled_not_repeated() {
         use crate::model_management::ProcessRegistry;
-        use aw_tools::process::{PipeProcess, PipeSpec};
+        use aw_tools_adapter::process::{PipeProcess, PipeSpec};
         use std::collections::BTreeMap;
         let tmp = PrivateTemp::new();
         let store = SessionStore::open(&tmp.0).unwrap();
@@ -4845,7 +4845,7 @@ mod tests {
     #[tokio::test]
     async fn aw_p6_9d1_model_management_uses_original_journal_and_read_only_tool_grants() {
         use crate::model_management::{self, Observer, ProcessRegistry};
-        use aw_tools::process::PipeSpec;
+        use aw_tools_adapter::process::PipeSpec;
         use std::collections::{BTreeMap, BTreeSet};
         let principal = PrincipalId::new("local").unwrap();
         let temp = PrivateTemp::new();
@@ -4890,7 +4890,7 @@ mod tests {
             .find(|path| path.is_file())
             .expect("test environment needs a cat fixture in PATH");
         let process = Arc::new(tokio::sync::Mutex::new(
-            aw_tools::process::PipeProcess::spawn(PipeSpec {
+            aw_tools_adapter::process::PipeProcess::spawn(PipeSpec {
                 program: process_name,
                 root: std::env::temp_dir(),
                 args: vec![],
@@ -5033,8 +5033,12 @@ mod tests {
         let context = aw_agent_core::ToolContext {
             actor: f.owner.owner.clone(),
             turn_id: 1,
+            call_id: "host-direct".into(),
+            source: aw_agent_core::ToolSource::trusted_host(),
+            effect: aw_agent_core::ToolEffect::Unknown,
             execution_site: "local".into(),
             cancellation: aw_agent_core::CancellationToken::new(),
+            result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: f.agent.default_identity().unwrap(),
             scope: f.agent.journal_scope().unwrap(),
         };
@@ -5074,8 +5078,12 @@ mod tests {
         let ctx = aw_agent_core::ToolContext {
             actor: owner.owner.clone(),
             turn_id: 1,
+            call_id: "host-direct".into(),
+            source: aw_agent_core::ToolSource::trusted_host(),
+            effect: aw_agent_core::ToolEffect::Unknown,
             execution_site: "local".into(),
             cancellation: aw_agent_core::CancellationToken::new(),
+            result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: fixture.agent.default_identity().unwrap(),
             scope: fixture.agent.journal_scope().unwrap(),
         };

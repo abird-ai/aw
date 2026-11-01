@@ -21,6 +21,27 @@ pub struct InvocationScope {
     pub session_id: String,
     pub branch_id: String,
 }
+/// Synchronous host lifecycle hook for replacing the authenticated invocation
+/// scope. Implementations may refuse a replacement while old-scope external
+/// work is still settling. This is a coordination hook, never an authority
+/// source and never a place to synthesize a Session from model input.
+pub trait InvocationScopeLifecycle: Send + Sync {
+    fn replace_scope(
+        &self,
+        previous: Option<&InvocationScope>,
+        next: Option<&InvocationScope>,
+    ) -> Result<()>;
+
+    /// Phase one of a trusted host resource-policy update. Implementations may
+    /// reject while live external work still depends on the old ceiling.
+    fn validate_tool_parallelism(&self, _next: crate::ToolParallelism) -> Result<()> {
+        Ok(())
+    }
+
+    /// Phase two runs only after every lifecycle accepted the new snapshot.
+    /// Implementations must make this a non-failing local publication.
+    fn apply_tool_parallelism(&self, _next: crate::ToolParallelism) {}
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvocationContext {

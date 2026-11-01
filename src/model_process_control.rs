@@ -138,7 +138,7 @@ pub fn install_close_stdin(
             &identity.actor,
             TOOL_NAME,
             &ToolSource::trusted_host(),
-        );
+        )?;
         return Err(error);
     }
     Ok(())
@@ -228,8 +228,10 @@ impl Tool for TerminateTool {
                 .prepare_model_process_terminate(&ctx, handle, &binding)?;
             self.owner.verify_model_observation(&ctx)?;
             let termination = guard.terminate().await?;
-            let completed = matches!(termination.outcome, aw_tools::process::Outcome::Cancelled)
-                && termination.output_complete;
+            let completed = matches!(
+                termination.outcome,
+                aw_tools_adapter::process::Outcome::Cancelled
+            ) && termination.output_complete;
             let terminal = if completed {
                 ModelProcessState::Applied
             } else {
@@ -294,7 +296,7 @@ pub fn install_terminate(
             &identity.actor,
             TERMINATE_TOOL_NAME,
             &ToolSource::trusted_host(),
-        );
+        )?;
         return Err(error);
     }
     Ok(())

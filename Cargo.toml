@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/aw-agent-kernel", "examples/sdk-kernel", "crates/aw-embedded", "examples/sdk-embedded",
     "crates/aw-embedded-ffi", "examples/sdk-embedded-ffi-staticlib",
-    "crates/aw-tools-core", "crates/aw-tools-fs-unix", "crates/aw-tools-fs-win",
+    "crates/aw-tools", "crates/aw-tools-fs-unix", "crates/aw-tools-fs-win",
     "crates/aw-mcp", "crates/aw-extensions", "examples/process-extension-rust",
     "crates/aw-editor", "crates/aw-ui-extension", "crates/aw-collab", "crates/aw-pipeline", "crates/aw-routing",
     "crates/aw-platform", "crates/aw-platform-unix", "crates/aw-platform-win",
@@ -12,7 +12,7 @@ members = [
     "crates/aw-identity", "examples/sdk-identity",
     "crates/aw-inference", "examples/sdk-inference",
     "crates/aw-client", "examples/sdk-client",
-    "examples/sdk-surfaces","crates/aw-surfaces", "crates/aw-agent-core", "crates/aw-providers", "crates/aw-tools", "crates/aw-store", "crates/aw-workspace", "crates/aw-git", "crates/aw-terminal", "examples/sdk-review", "examples/sdk-terminal", "examples/sdk-layout", "examples/sdk-state", "examples/rust-extension", "examples/sdk-host", "examples/sdk-accounts"]
+    "examples/sdk-surfaces","crates/aw-surfaces", "crates/aw-agent-core", "crates/aw-providers", "crates/aw-tools-adapter", "crates/aw-store", "crates/aw-workspace", "crates/aw-git", "crates/aw-terminal", "examples/sdk-review", "examples/sdk-terminal", "examples/sdk-layout", "examples/sdk-state", "examples/rust-extension", "examples/sdk-host", "examples/sdk-accounts"]
 default-members = ["."]
 
 [workspace.dependencies]
@@ -99,7 +99,7 @@ aw-store-api = { version = "=0.15.0", path = "crates/aw-store-api", optional = t
 aw-store-jsonl = { version = "=0.15.0", path = "crates/aw-store-jsonl", optional = true }
 aw-session-format = { version = "=0.15.0", path = "crates/aw-session-format", optional = true }
 aw-providers = { version = "=0.15.0", path = "crates/aw-providers" }
-aw-tools = { version = "=0.15.0", path = "crates/aw-tools" }
+aw-tools-adapter = { version = "=0.15.0", path = "crates/aw-tools-adapter" }
 aw-store = { version = "=0.15.0", path = "crates/aw-store", optional = true }
 aw-workspace = { version = "=0.15.0", path = "crates/aw-workspace", optional = true }
 ratatui = { version = "=0.30.0", default-features = false, features = ["crossterm_0_28"] }

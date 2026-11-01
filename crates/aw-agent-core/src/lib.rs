@@ -60,7 +60,10 @@ pub use journal::{
 #[cfg(feature = "planner")]
 pub use planner::{PlannerExecutor, PlannerInput, PlannerJournal, PlannerResult};
 pub use provider::{CompletionFuture, DeltaSink, Provider};
-pub use provider::{DelegatedBinding, InvocationContext, InvocationScope, ModelFuture, ModelReply};
+pub use provider::{
+    DelegatedBinding, InvocationContext, InvocationScope, InvocationScopeLifecycle, ModelFuture,
+    ModelReply,
+};
 pub use retry::{
     RetryPolicy as PreDispatchRetryPolicy, MAX_PRE_DISPATCH_RETRIES, MAX_PROVIDER_ATTEMPTS_PER_TURN,
 };
@@ -69,8 +72,8 @@ pub use reviewer::{ReviewExecutor, ReviewInput, ReviewJournal, ReviewResult};
 #[cfg(feature = "routing")]
 pub use routing::{RoutingExecutor, RoutingInput, RoutingJournal, RoutingResult};
 pub use tool::{
-    Tool, ToolCall, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolPolicy, ToolRecord,
-    ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec, ToolStatus,
+    Tool, ToolCall, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolParallelism, ToolPolicy,
+    ToolRecord, ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec, ToolStatus,
 };
 
 /// Revalidate the complete provider-bound context after trusted extensions.

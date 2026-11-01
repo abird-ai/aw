@@ -1,189 +1,324 @@
-//! Native descriptor-scoped discovery and grep. Globs/regex/gitignore match
-//! only already-authorized names and buffers. Reads never take mutation locks.
-use crate::{platform_fs, tool_failure};
-use aw_agent_core::{
-    CancellationToken, Error, Result, Tool, ToolContext, ToolFuture, ToolOutput, ToolSpec,
-};
-use aw_platform::scoped_fs::{EntryKind, Root};
-use aw_tools_core::filesystem::{
-    Filter as FsFilter, Kind as FsKind, MetaKey, Selection as FsSelection, Sort as FsSort,
-    TimeRange,
+//! Transport-independent search work/reply accounting.
+//! Filesystem walking and regex engines remain host adapters until both
+//! repositories agree on a single capability-rooted file reader.
+
+use crate::filesystem::{
+    self,
+    backend::MetadataBackend,
+    walk::{self, BackendErrorKind},
+    Kind,
 };
 use globset::{GlobBuilder, GlobMatcher};
 use regex::{Regex, RegexBuilder};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{collections::BinaryHeap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, BinaryHeap},
+    time::{Duration, Instant},
+};
 
-// The file scan admits at most 4096 candidates, not 65536 retained paths.
-const MAX_CANDIDATES: usize = 4096;
-const MAX_GREP_SCAN_BYTES: usize = 32 * 1024 * 1024;
-const MAX_GREP_SCAN_FILES: usize = 4096;
-const MAX_DEPTH: usize = 128;
-const MAX_OUTPUT: usize = 96 * 1024;
-const MAX_GREP_HITS: usize = 200;
-const MAX_GREP_CONTEXT: usize = 8;
-const MAX_PATTERN: usize = 1024;
-const MAX_TEXT_FILE: usize = 1024 * 1024;
-type WalkProgress = aw_tools_core::filesystem::walk::Progress;
-fn walk_error(
-    error: aw_tools_core::filesystem::walk::WalkError<aw_platform::scoped_fs::ScopedError>,
-) -> Error {
-    use aw_tools_core::filesystem::walk::WalkError;
-    match error {
-        WalkError::Source(error) => platform_fs::<()>(Err(error)).unwrap_err(),
-        WalkError::Cancelled => Error::Cancelled,
-        WalkError::IgnoreLimit => Error::Limit("gitignore search budget exhausted"),
-        WalkError::InvalidIgnore => Error::Denied("invalid gitignore pattern"),
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct Incomplete {
+    pub directory_budget: bool,
+    pub content_budget: bool,
+    pub candidate_budget: bool,
+    pub traversal_error: bool,
+    pub ignore_rules: bool,
+    pub path_encoding: bool,
+    pub unreadable_files: bool,
+    pub oversize_files: bool,
+}
+impl Incomplete {
+    pub fn any(self) -> bool {
+        self.directory_budget
+            || self.content_budget
+            || self.candidate_budget
+            || self.traversal_error
+            || self.ignore_rules
+            || self.path_encoding
+            || self.unreadable_files
+            || self.oversize_files
+    }
+    /// Stable cause priority, retaining every simultaneous cause.
+    pub fn reasons(self) -> Vec<&'static str> {
+        let mut causes = Vec::new();
+        if self.content_budget {
+            causes.push("content_budget");
+        }
+        if self.directory_budget {
+            causes.push("directory_budget");
+        }
+        if self.candidate_budget {
+            causes.push("candidate_budget");
+        }
+        if self.traversal_error {
+            causes.push("traversal_error");
+        }
+        if self.ignore_rules {
+            causes.push("ignore_rules");
+        }
+        if self.path_encoding {
+            causes.push("path_encoding");
+        }
+        if self.unreadable_files {
+            causes.push("unreadable_files");
+        }
+        if self.oversize_files {
+            causes.push("oversize_files");
+        }
+        causes
+    }
+    pub fn first(self) -> Option<&'static str> {
+        self.reasons().first().copied()
     }
 }
-fn walk(
-    root: &Root,
-    start: &str,
-    depth: usize,
-    gitignore: bool,
-    skip_hidden: bool,
-    token: &CancellationToken,
-    mut visit: impl FnMut(&str, &str, &EntryKind) -> Result<bool>,
-) -> Result<WalkProgress> {
-    let result = aw_tools_core::filesystem::walk::walk(
-        root,
-        start,
-        depth,
-        !skip_hidden,
-        gitignore,
-        &|| token.is_cancelled(),
-        |entry| {
-            let kind = match entry.kind {
-                FsKind::File => EntryKind::File,
-                FsKind::Dir => EntryKind::Directory,
-                FsKind::Symlink => EntryKind::Symlink,
-                _ => EntryKind::Unsupported,
-            };
-            visit(&entry.path, &entry.name, &kind).map_err(|error| {
-                aw_tools_core::filesystem::walk::WalkError::Source(match error {
-                    Error::Io(e) => aw_platform::scoped_fs::ScopedError::Io(e),
-                    Error::Cancelled => aw_platform::scoped_fs::ScopedError::Cancelled,
-                    Error::Denied(s) => aw_platform::scoped_fs::ScopedError::Denied(s),
-                    Error::Limit(s) => aw_platform::scoped_fs::ScopedError::Limit(s),
-                    _ => aw_platform::scoped_fs::ScopedError::Denied("filesystem visit failed"),
-                })
-            })
-        },
-    )
-    .map_err(walk_error)?;
-    Ok(result)
-}
-fn default_limit() -> usize {
-    200
-}
-fn ls_limit() -> usize {
-    4096
-}
-fn dot() -> String {
-    ".".into()
-}
-#[derive(Clone, Copy)]
-pub(crate) enum Operation {
-    Ls,
-    Find,
-    Grep,
+/// DL-150 compact public reasons. Internal causes remain precise for
+/// debugging and structured host logs, but models see a stable small set.
+pub fn compact_reasons(causes: Incomplete) -> Option<String> {
+    let mut labels = Vec::with_capacity(4);
+    if causes.content_budget
+        || causes.directory_budget
+        || causes.candidate_budget
+        || causes.oversize_files
+    {
+        labels.push("budget");
+    }
+    if causes.traversal_error || causes.unreadable_files {
+        labels.push("walk");
+    }
+    if causes.ignore_rules {
+        labels.push("gitignore");
+    }
+    if causes.path_encoding {
+        labels.push("path_encoding");
+    }
+    (!labels.is_empty()).then(|| labels.join(","))
 }
 
-pub(crate) struct Search {
-    root: Arc<Root>,
-    op: Operation,
+pub fn compact_incomplete(causes: Incomplete) -> Option<String> {
+    compact_reasons(causes).map(|reasons| format!("… incomplete:{reasons}\n"))
 }
-impl Search {
-    pub(crate) fn new(root: Arc<Root>, op: Operation) -> Self {
-        Self { root, op }
+pub struct WorkBudget {
+    deadline: Instant,
+    remaining_bytes: usize,
+    remaining_files: usize,
+}
+impl WorkBudget {
+    pub fn new(duration: Duration, bytes: usize, files: usize) -> Self {
+        Self {
+            deadline: Instant::now()
+                .checked_add(duration)
+                .unwrap_or_else(Instant::now),
+            remaining_bytes: bytes,
+            remaining_files: files,
+        }
+    }
+    /// Admission and actual byte accounting are distinct: files can grow
+    /// after metadata inspection, but may never exceed this request's budget.
+    pub fn begin_file(&mut self, declared_size: usize) -> bool {
+        if Instant::now() >= self.deadline
+            || self.remaining_files == 0
+            || declared_size > self.remaining_bytes
+        {
+            return false;
+        }
+        self.remaining_files -= 1;
+        true
+    }
+    pub fn charge(&mut self, actual_bytes: usize) -> bool {
+        if actual_bytes > self.remaining_bytes {
+            return false;
+        }
+        self.remaining_bytes -= actual_bytes;
+        true
+    }
+    /// An explicitly skipped path still consumes its source budget when
+    /// inspected, but does not carry bytes into future pages.
+    pub fn admit(&mut self, file_size: usize) -> bool {
+        self.begin_file(file_size) && self.charge(file_size)
+    }
+    pub fn remaining_files(&self) -> usize {
+        self.remaining_files
+    }
+    pub fn remaining_bytes(&self) -> usize {
+        self.remaining_bytes
     }
 }
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LsArgs {
-    #[serde(default = "dot")]
-    path: String,
-    #[serde(default)]
-    sort: FsSort,
-    #[serde(default)]
-    meta: Vec<MetaKey>,
-    #[serde(default)]
-    hidden: bool,
-    #[serde(default)]
-    gitignore: bool,
-    #[serde(default)]
-    offset: usize,
-    #[serde(default = "ls_limit")]
-    limit: usize,
-    #[serde(default)]
-    parallel: bool,
+/// Ordinary paths remain unchanged; ambiguous grammar characters are quoted.
+pub fn content_path_label(path: &str) -> String {
+    if path.contains(':')
+        || path.contains('\n')
+        || path.contains('\r')
+        || path.contains('\\')
+        || path.contains('"')
+    {
+        serde_json::to_string(path).unwrap_or_else(|_| "<invalid-path>".into())
+    } else {
+        path.into()
+    }
 }
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FindArgs {
-    #[serde(default = "dot")]
-    path: String,
-    glob: Option<String>,
-    regex: Option<String>,
-    depth: Option<usize>,
-    #[serde(default)]
-    kind: FsKind,
-    #[serde(default)]
-    hidden: bool,
-    #[serde(default)]
-    gitignore: bool,
-    mtime: Option<TimeRange>,
-    ctime: Option<TimeRange>,
-    btime: Option<TimeRange>,
-    #[serde(default)]
-    sort: FsSort,
-    #[serde(default)]
-    meta: Vec<MetaKey>,
-    #[serde(default)]
-    offset: usize,
-    #[serde(default = "default_limit")]
-    limit: usize,
-    #[serde(default)]
-    parallel: bool,
-}
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum OutputMode {
+
+pub const MAX_GREP_HITS: usize = 200;
+pub const MAX_GREP_CONTEXT: usize = 8;
+pub const MAX_GREP_PATTERN: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrepMode {
     #[default]
     Content,
     Files,
     Count,
 }
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GrepArgs {
-    pattern: String,
-    #[serde(default = "dot")]
-    path: String,
-    glob: Option<String>,
-    #[serde(default)]
-    literal: bool,
-    #[serde(default)]
-    ignore_case: bool,
-    #[serde(default, alias = "output_mode")]
-    mode: OutputMode,
-    #[serde(default)]
-    context: Option<usize>,
-    before: Option<usize>,
-    after: Option<usize>,
-    depth: Option<usize>,
-    #[serde(default)]
-    offset: usize,
-    #[serde(default = "default_limit")]
-    limit: usize,
-    #[serde(default)]
-    gitignore: bool,
-    #[serde(default)]
-    hidden: bool,
-    #[serde(default)]
-    parallel: bool,
+
+#[derive(Clone, Copy, Debug)]
+pub struct GrepLimits {
+    pub candidates: usize,
+    pub scan_bytes: usize,
+    pub scan_files: usize,
+    pub text_file_bytes: usize,
+    pub output_bytes: usize,
+    pub duration: Duration,
 }
+impl Default for GrepLimits {
+    fn default() -> Self {
+        Self {
+            candidates: 4096,
+            scan_bytes: 32 * 1024 * 1024,
+            scan_files: 4096,
+            text_file_bytes: 1024 * 1024,
+            output_bytes: 96 * 1024,
+            duration: Duration::from_secs(15),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GrepOptions<'a> {
+    pub pattern: &'a str,
+    /// Model-facing requested root/path.
+    pub path: &'a str,
+    /// Resolved authorized backend root/path. None means identical to `path`.
+    pub backend_path: Option<&'a str>,
+    pub glob: Option<&'a str>,
+    pub depth: usize,
+    pub literal: bool,
+    pub ignore_case: bool,
+    pub mode: GrepMode,
+    /// Internal compatibility can be asymmetric; the canonical schema passes
+    /// the same bounded `context` value for both fields.
+    pub before: usize,
+    pub after: usize,
+    pub hidden: bool,
+    pub gitignore: bool,
+    pub offset: usize,
+    pub limit: usize,
+    pub limits: GrepLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryError {
+    InvalidPattern,
+    InvalidGlob,
+    InvalidDepth,
+    InvalidContext,
+    InvalidPage,
+    InvalidLimits,
+}
+
+#[derive(Debug)]
+pub enum GrepError<E> {
+    Query(QueryError),
+    Source(E),
+    Walk(walk::WalkError<E>),
+    Cancelled,
+    ResultLimit(&'static str),
+}
+
+#[derive(Debug)]
+pub struct GrepPage {
+    pub content: String,
+    pub truncated: bool,
+    pub incomplete: Incomplete,
+}
+
+struct CompiledQuery {
+    regex: Regex,
+    glob: Option<(GlobMatcher, bool)>,
+}
+
+fn compile_query(options: &GrepOptions<'_>) -> Result<CompiledQuery, QueryError> {
+    if options.pattern.is_empty()
+        || options.pattern.len() > MAX_GREP_PATTERN
+        || options.pattern.chars().any(char::is_control)
+    {
+        return Err(QueryError::InvalidPattern);
+    }
+    if options.depth == 0 || options.depth > filesystem::MAX_WALK_DEPTH {
+        return Err(QueryError::InvalidDepth);
+    }
+    if options.before > MAX_GREP_CONTEXT || options.after > MAX_GREP_CONTEXT {
+        return Err(QueryError::InvalidContext);
+    }
+    if !(1..=MAX_GREP_HITS).contains(&options.limit)
+        || options.offset.checked_add(options.limit).is_none()
+    {
+        return Err(QueryError::InvalidPage);
+    }
+    let limits = options.limits;
+    if limits.candidates == 0
+        || limits.scan_bytes == 0
+        || limits.scan_files == 0
+        || limits.text_file_bytes == 0
+        || limits.output_bytes == 0
+        || limits.duration.is_zero()
+    {
+        return Err(QueryError::InvalidLimits);
+    }
+
+    let expression = if options.literal {
+        regex::escape(options.pattern)
+    } else {
+        options.pattern.to_owned()
+    };
+    let regex = RegexBuilder::new(&expression)
+        .case_insensitive(options.ignore_case)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+        .map_err(|_| QueryError::InvalidPattern)?;
+    let glob = options
+        .glob
+        .map(|pattern| {
+            if pattern.is_empty()
+                || pattern.len() > MAX_GREP_PATTERN
+                || pattern.chars().any(char::is_control)
+            {
+                return Err(QueryError::InvalidGlob);
+            }
+            GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map(|glob| (glob.compile_matcher(), pattern.contains('/')))
+                .map_err(|_| QueryError::InvalidGlob)
+        })
+        .transpose()?;
+    Ok(CompiledQuery { regex, glob })
+}
+
+pub fn validate_grep(options: &GrepOptions<'_>) -> Result<(), QueryError> {
+    compile_query(options).map(|_| ())
+}
+
+fn matches_path(glob: &(GlobMatcher, bool), entry: &str, name: &str, start: &str) -> bool {
+    let relative = if start.is_empty() {
+        entry
+    } else {
+        entry
+            .strip_prefix(start)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(entry)
+    };
+    glob.0.is_match(if glob.1 { relative } else { name })
+}
+
 fn retain_best<T: Ord>(heap: &mut BinaryHeap<T>, value: T, limit: usize) -> bool {
     if heap.len() < limit {
         heap.push(value);
@@ -196,561 +331,552 @@ fn retain_best<T: Ord>(heap: &mut BinaryHeap<T>, value: T, limit: usize) -> bool
         true
     }
 }
-#[derive(Serialize)]
-struct Counted {
-    path: String,
-    count: usize,
+
+fn hidden_path(path: &str) -> bool {
+    path.split('/').any(|part| part.starts_with('.'))
 }
-fn parse<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
-    serde_json::from_value(value.clone())
-        .map_err(|_| Error::Denied("invalid/unknown search arguments"))
-}
-fn path(root: &str) -> Result<&str> {
-    if root.is_empty() || root == "." {
-        return Ok("");
-    }
-    crate::model_path(root)?;
-    Ok(root)
-}
-fn pattern(value: &str) -> Result<()> {
-    if value.is_empty() || value.len() > MAX_PATTERN || value.chars().any(char::is_control) {
-        return Err(Error::Denied(
-            "search pattern must be bounded printable text",
-        ));
-    }
-    Ok(())
-}
-fn glob(pattern: &str) -> Result<GlobMatcher> {
-    self::pattern(pattern)?;
-    Ok(GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .build()
-        .map_err(|_| Error::Denied("invalid search glob"))?
-        .compile_matcher())
-}
-fn optional_glob(value: Option<&str>) -> Result<Option<GlobMatcher>> {
-    value
-        .filter(|value| !value.is_empty())
-        .map(glob)
-        .transpose()
-}
-fn regex(args: &GrepArgs) -> Result<Regex> {
-    pattern(&args.pattern)?;
-    let expression = if args.literal {
-        regex::escape(&args.pattern)
+
+fn line(path: &str, number: usize, text: &str, primary: bool) -> String {
+    let label = content_path_label(path);
+    if primary {
+        format!("{label}:{number}:{text}\n")
     } else {
-        args.pattern.clone()
-    };
-    RegexBuilder::new(&expression)
-        .case_insensitive(args.ignore_case)
-        .size_limit(1 << 20)
-        .dfa_size_limit(1 << 20)
-        .build()
-        .map_err(|_| Error::Denied("invalid or overly complex grep regex"))
-}
-/// Globs are relative to the directory requested by the caller. A bare
-/// basename glob also works at any depth (dotlink's single glob grammar).
-fn matches_path(glob: &GlobMatcher, entry: &str, name: &str, start: &str) -> bool {
-    let relative = if start.is_empty() {
-        entry
-    } else {
-        entry
-            .strip_prefix(start)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .unwrap_or(entry)
-    };
-    glob.is_match(relative) || glob.is_match(name)
-}
-fn require_meta(meta: &[MetaKey]) -> Result<()> {
-    if meta.len() > 5 {
-        return Err(Error::Limit("at most five metadata columns"));
+        format!("{label}-{number}-{text}\n")
     }
-    for (idx, key) in meta.iter().enumerate() {
-        if meta[..idx].contains(key) {
-            return Err(Error::Denied("duplicate metadata column"));
+}
+
+struct ContextGroup {
+    text: String,
+    primaries: usize,
+}
+
+fn context_groups(
+    path: &str,
+    lines: &[&str],
+    all_hits: &[usize],
+    selected_hits: &[usize],
+    before: usize,
+    after: usize,
+) -> Vec<ContextGroup> {
+    if selected_hits.is_empty() {
+        return Vec::new();
+    }
+    let selected = selected_hits.iter().copied().collect::<BTreeSet<_>>();
+    let all = all_hits.iter().copied().collect::<BTreeSet<_>>();
+    let mut intervals = Vec::<(usize, usize)>::new();
+    for &hit in selected_hits {
+        let start = hit.saturating_sub(before);
+        let end = (hit + after + 1).min(lines.len());
+        if let Some(last) = intervals.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
         }
+        intervals.push((start, end));
     }
-    Ok(())
+
+    let context_enabled = before != 0 || after != 0;
+    intervals
+        .into_iter()
+        .map(|(start, end)| {
+            let mut text = String::new();
+            let mut previous_visible = None;
+            let mut primaries = 0usize;
+            for (row, source) in lines.iter().enumerate().take(end).skip(start) {
+                // A matching line outside this logical page is not allowed to
+                // leak in as free context. Its omission creates a real gap.
+                if all.contains(&row) && !selected.contains(&row) {
+                    previous_visible = None;
+                    continue;
+                }
+                if context_enabled
+                    && previous_visible.is_some_and(|previous| row != previous + 1)
+                    && !text.is_empty()
+                {
+                    text.push_str("--\n");
+                }
+                let primary = selected.contains(&row);
+                primaries += usize::from(primary);
+                text.push_str(&line(path, row + 1, source, primary));
+                previous_visible = Some(row);
+            }
+            ContextGroup { text, primaries }
+        })
+        .collect()
 }
-fn run_discovery(
-    root: &Root,
-    query: aw_tools_core::filesystem::discovery::Options<'_>,
-    cancel: &CancellationToken,
-) -> Result<ToolOutput> {
-    use aw_tools_core::filesystem::discovery::{self, Error as E};
-    let validated = path(query.path)?;
-    let options = discovery::Options {
-        path: validated,
-        ..query
-    };
-    let page =
-        discovery::run(root, options, &|| cancel.is_cancelled()).map_err(|error| match error {
-            E::InvalidOptions(reason) => Error::Denied(reason),
-            E::Walk(error) => walk_error(error),
-        })?;
-    Ok(ToolOutput {
-        content: page.content,
-        is_error: false,
-        truncated: page.truncated,
-    })
+
+fn progress_flags(progress: walk::Progress) -> Incomplete {
+    Incomplete {
+        directory_budget: progress.directory_budget,
+        traversal_error: progress.traversal_error,
+        ignore_rules: progress.ignore_rules,
+        path_encoding: progress.path_encoding,
+        ..Incomplete::default()
+    }
 }
-fn list(root: &Root, args: &LsArgs, cancel: &CancellationToken) -> Result<ToolOutput> {
-    let filter =
-        FsFilter::compile(None, None, FsKind::Any, None, None, None).map_err(Error::Denied)?;
-    run_discovery(
-        root,
-        aw_tools_core::filesystem::discovery::Options {
-            path: &args.path,
-            depth: 1,
-            gitignore: args.gitignore,
-            hidden: args.hidden,
-            filter: &filter,
-            sort: args.sort,
-            meta: &args.meta,
-            offset: args.offset,
-            limit: args.limit,
-            basenames: true,
-            output_bytes: MAX_OUTPUT,
-        },
-        cancel,
-    )
-}
-fn find(root: &Root, args: &FindArgs, cancel: &CancellationToken) -> Result<ToolOutput> {
-    let filter = FsFilter::compile(
-        args.glob.as_deref(),
-        args.regex.as_deref(),
-        args.kind,
-        args.mtime,
-        args.ctime,
-        args.btime,
-    )
-    .map_err(Error::Denied)?;
-    run_discovery(
-        root,
-        aw_tools_core::filesystem::discovery::Options {
-            path: &args.path,
-            depth: args.depth.unwrap_or(MAX_DEPTH),
-            gitignore: args.gitignore,
-            hidden: args.hidden,
-            filter: &filter,
-            sort: args.sort,
-            meta: &args.meta,
-            offset: args.offset,
-            limit: args.limit,
-            basenames: false,
-            output_bytes: MAX_OUTPUT,
-        },
-        cancel,
-    )
-}
-fn content_line(path: &str, line: usize, text: &str, numbered: bool, hit: bool) -> String {
-    let label = aw_tools_core::search::content_path_label(path);
-    if numbered {
-        format!("{label}:{}:{}{}\n", line, if hit { "" } else { "-" }, text)
+
+fn model_path_for(backend_path: &str, backend_root: &str, model_root: &str) -> String {
+    if backend_path == backend_root {
+        return model_root.to_owned();
+    }
+    let relative = if backend_root.is_empty() {
+        backend_path
     } else {
-        format!("{label}:{}{}\n", if hit { "" } else { "-" }, text)
+        backend_path
+            .strip_prefix(backend_root)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(backend_path)
+    };
+    if model_root.is_empty() {
+        relative.to_owned()
+    } else if relative.is_empty() {
+        model_root.to_owned()
+    } else {
+        format!("{model_root}/{relative}")
     }
 }
-fn grep(root: &Root, args: &GrepArgs, cancel: &CancellationToken) -> Result<ToolOutput> {
-    let start = path(&args.path)?;
-    let re = regex(args)?;
-    let filter = optional_glob(args.glob.as_deref())?;
+
+pub fn grep<B: MetadataBackend>(
+    backend: &B,
+    options: GrepOptions<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<GrepPage, GrepError<B::Error>> {
+    let query = compile_query(&options).map_err(GrepError::Query)?;
+    let backend_root = options.backend_path.unwrap_or(options.path);
     let mut candidates = BinaryHeap::<String>::new();
     let mut candidate_capped = false;
-    let mut progress = WalkProgress::default();
-    let mut unreadable_files = false;
-    let mut oversize_files = false;
-    let mut explicit_ignore_unavailable = false;
+    let mut flags = Incomplete::default();
 
-    // AW additionally permits an exact-file grep. It must honor the same
-    // glob, hidden and ignore rules as a directory-scoped search.
-    let explicit_file = if start.is_empty() {
-        false
+    let root_kind = if backend_root.is_empty() {
+        Kind::Dir
     } else {
-        root.list(start).is_err() && root.entry_info(start).is_ok()
+        backend
+            .entry_meta(backend_root)
+            .map_err(GrepError::Source)?
+            .kind
     };
-    if explicit_file {
-        let basename = start.rsplit('/').next().unwrap_or(start);
-        if platform_fs(root.entry_info(start))?.0 > MAX_TEXT_FILE as u64 {
-            return Err(Error::Limit("grep file exceeds 1 MiB; use read or bread"));
-        }
-        let hidden = !args.hidden && start.split('/').any(|name| name.starts_with('.'));
-        let ignored = if args.gitignore {
-            let (ignored, unavailable) =
-                aw_tools_core::filesystem::walk::explicitly_ignored(root, start, false)
-                    .map_err(walk_error)?;
-            explicit_ignore_unavailable = unavailable;
-            ignored
-        } else {
-            false
-        };
-        if !hidden
-            && !ignored
-            && filter
-                .as_ref()
-                .is_none_or(|f| matches_path(f, start, basename, ""))
-        {
-            candidates.push(start.into());
-        }
-    } else {
-        progress = walk(
-            root,
-            start,
-            usize::MAX,
-            args.gitignore,
-            !args.hidden,
-            cancel,
-            |full, name, kind| {
-                if *kind != EntryKind::File
-                    || filter
+
+    match root_kind {
+        Kind::File => {
+            if !options.hidden && hidden_path(options.path) {
+                // Explicit hidden compatibility path is filtered like a walk.
+            } else {
+                let ignored = if options.gitignore {
+                    let (ignored, unavailable) =
+                        walk::explicitly_ignored(backend, options.path, false)
+                            .map_err(GrepError::Walk)?;
+                    flags.ignore_rules |= unavailable;
+                    ignored
+                } else {
+                    false
+                };
+                let name = options.path.rsplit('/').next().unwrap_or(options.path);
+                if !ignored
+                    && query
+                        .glob
                         .as_ref()
-                        .is_some_and(|f| !matches_path(f, full, name, start))
+                        .is_none_or(|glob| matches_path(glob, options.path, name, ""))
                 {
-                    return Ok(false);
+                    candidates.push(backend_root.to_owned());
                 }
-                candidate_capped |= retain_best(&mut candidates, full.to_owned(), MAX_CANDIDATES);
-                Ok(false)
-            },
-        )?;
+            }
+        }
+        Kind::Dir => {
+            let progress = walk::walk(
+                backend,
+                backend_root,
+                options.depth,
+                options.hidden,
+                options.gitignore,
+                cancelled,
+                |entry| {
+                    if entry.kind == Kind::File
+                        && query.glob.as_ref().is_none_or(|glob| {
+                            matches_path(glob, &entry.path, &entry.name, backend_root)
+                        })
+                    {
+                        candidate_capped |= retain_best(
+                            &mut candidates,
+                            entry.path.clone(),
+                            options.limits.candidates,
+                        );
+                    }
+                    Ok(false)
+                },
+            )
+            .map_err(GrepError::Walk)?;
+            flags = progress_flags(progress);
+        }
+        _ => return Err(GrepError::Query(QueryError::InvalidDepth)),
     }
+
+    flags.candidate_budget |= candidate_capped;
     let mut candidates = candidates.into_sorted_vec();
     candidates.dedup();
-
-    let mut seen = 0usize;
-    let mut emitted = 0usize;
-    let mut files = Vec::<String>::new();
-    let mut counts = Vec::<Counted>::new();
-    let mut content = String::new();
-    let mut page_truncated = false;
-    let mut paging_more = false;
-    let mut scan_incomplete = progress.incomplete() || explicit_ignore_unavailable;
-    let mut truncated = candidate_capped || scan_incomplete;
-    let mut stop_reason = progress.reason().or(if explicit_ignore_unavailable {
-        Some("ignore_rules")
-    } else {
-        None
-    });
-    let mut work = aw_tools_core::search::WorkBudget::new(
-        Duration::from_secs(15),
-        MAX_GREP_SCAN_BYTES,
-        MAX_GREP_SCAN_FILES,
+    let mut work = WorkBudget::new(
+        options.limits.duration,
+        options.limits.scan_bytes,
+        options.limits.scan_files,
     );
-    'file: for file in candidates {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
+    let mut logical_seen = 0usize;
+    let mut selected_total = 0usize;
+    let mut emitted = 0usize;
+    let mut more = false;
+    let mut out = String::new();
+    let mut file_rows = Vec::<(String, usize)>::new();
+    let reserve = 128usize.min(options.limits.output_bytes);
+
+    'files: for file in candidates {
+        if cancelled() {
+            return Err(GrepError::Cancelled);
         }
         if work.remaining_bytes() == 0 || work.remaining_files() == 0 {
-            scan_incomplete = true;
-            stop_reason = Some("content_budget");
-            truncated = true;
+            flags.content_budget = true;
             break;
         }
-        let size = match root.entry_info(&file) {
-            Ok((size, _)) => size,
+        let meta = match backend.entry_meta(&file) {
+            Ok(meta) if meta.kind == Kind::File => meta,
+            Ok(_) => {
+                flags.unreadable_files = true;
+                continue;
+            }
             Err(_) => {
-                unreadable_files = true;
+                flags.unreadable_files = true;
                 continue;
             }
         };
-        if size > MAX_TEXT_FILE as u64 {
-            oversize_files = true;
+        let Some(size) = meta.size.and_then(|size| usize::try_from(size).ok()) else {
+            flags.unreadable_files = true;
+            continue;
+        };
+        if size > options.limits.text_file_bytes {
+            if root_kind == Kind::File {
+                return Err(GrepError::ResultLimit(
+                    "grep file exceeds text-file ceiling; use read or bread",
+                ));
+            }
+            flags.oversize_files = true;
             continue;
         }
-        if !work.begin_file(size as usize) {
-            scan_incomplete = true;
-            stop_reason = Some("content_budget");
-            truncated = true;
+        if !work.begin_file(size) {
+            flags.content_budget = true;
             break;
         }
-        let bytes = match root.read_bytes(&file, MAX_TEXT_FILE.min(work.remaining_bytes())) {
+        let bytes = match backend.read_bytes(
+            &file,
+            options.limits.text_file_bytes.min(work.remaining_bytes()),
+        ) {
             Ok(bytes) => bytes,
-            Err(aw_platform::scoped_fs::ScopedError::Limit(_)) => {
-                scan_incomplete = true;
-                stop_reason = Some("content_budget");
-                truncated = true;
+            Err(error) if backend.classify(&error) == BackendErrorKind::Limit => {
+                flags.content_budget = true;
                 break;
             }
             Err(_) => {
-                unreadable_files = true;
+                flags.unreadable_files = true;
                 continue;
             }
         };
         if !work.charge(bytes.len()) {
-            scan_incomplete = true;
-            stop_reason = Some("content_budget");
-            truncated = true;
+            flags.content_budget = true;
             break;
         }
-        let text = match crate::text_class::text_bytes(&bytes) {
-            Some(text) => text,
-            None => continue,
+        let Some(text) = crate::text::text_bytes(&bytes) else {
+            // Binary/control/invalid-UTF8 files are outside grep's text domain,
+            // not incomplete coverage.
+            continue;
         };
-        let lines: Vec<_> = text.lines().collect();
-        let hits = lines.iter().filter(|line| re.is_match(line)).count();
-        if hits == 0 {
+        let lines = text.lines().collect::<Vec<_>>();
+        let hits = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| query.regex.is_match(line).then_some(index))
+            .collect::<Vec<_>>();
+        if hits.is_empty() {
             continue;
         }
-        match args.mode {
-            OutputMode::Files | OutputMode::Count => {
-                if seen < args.offset {
-                    seen += 1;
+        let display_file = model_path_for(&file, backend_root, options.path);
+
+        match options.mode {
+            GrepMode::Files | GrepMode::Count => {
+                if logical_seen < options.offset {
+                    logical_seen += 1;
                     continue;
                 }
-                if emitted >= args.limit {
-                    paging_more = true;
-                    truncated = true;
+                if selected_total >= options.limit {
+                    more = true;
                     break;
                 }
-                if matches!(args.mode, OutputMode::Files) {
-                    files.push(file);
-                } else {
-                    counts.push(Counted {
-                        path: file,
-                        count: hits,
-                    });
-                }
-                emitted += 1;
+                logical_seen += 1;
+                selected_total += 1;
+                file_rows.push((display_file, hits.len()));
             }
-            OutputMode::Content => {
-                let mut included = std::collections::BTreeSet::<usize>::new();
-                for i in lines
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, line)| re.is_match(line).then_some(i))
-                {
-                    if seen < args.offset {
-                        seen += 1;
+            GrepMode::Content => {
+                let mut selected = Vec::new();
+                for hit in hits.iter().copied() {
+                    if logical_seen < options.offset {
+                        logical_seen += 1;
                         continue;
                     }
-                    if emitted >= args.limit {
-                        page_truncated = true;
-                        truncated = true;
-                        break 'file;
+                    if selected_total >= options.limit {
+                        more = true;
+                        break;
                     }
-                    let from = i.saturating_sub(args.before.or(args.context).unwrap_or(0));
-                    let through =
-                        (i + args.after.or(args.context).unwrap_or(0) + 1).min(lines.len());
-                    let mut block = String::new();
-                    for (row, line) in lines.iter().enumerate().take(through).skip(from) {
-                        if included.contains(&row) || (row != i && re.is_match(line)) {
-                            continue;
-                        }
-                        block.push_str(&content_line(&file, row + 1, line, true, row == i));
-                    }
-                    // A primary hit and its requested/coalesced context is
-                    // one indivisible semantic result. Do not omit context
-                    // or replace a long match with a misleading placeholder.
-                    let available = MAX_OUTPUT.saturating_sub(content.len()).saturating_sub(256);
-                    if block.len() > available {
-                        if content.is_empty() {
-                            return Err(Error::Limit(
-                                "grep hit/context exceeds result ceiling; use context=0, read, or narrow path"
+                    logical_seen += 1;
+                    selected_total += 1;
+                    selected.push(hit);
+                }
+                for group in context_groups(
+                    &display_file,
+                    &lines,
+                    &hits,
+                    &selected,
+                    options.before,
+                    options.after,
+                ) {
+                    let separator = (options.before != 0 || options.after != 0) && !out.is_empty();
+                    let needed = group.text.len() + if separator { 3 } else { 0 };
+                    if out.len().saturating_add(needed).saturating_add(reserve)
+                        > options.limits.output_bytes
+                    {
+                        if out.is_empty() {
+                            return Err(GrepError::ResultLimit(
+                                "grep hit/context exceeds result ceiling; use context=0, read, or narrow path",
                             ));
                         }
-                        page_truncated = true;
-                        truncated = true;
-                        break 'file;
+                        more = true;
+                        break 'files;
                     }
-                    for (row, line) in lines.iter().enumerate().take(through).skip(from) {
-                        if row == i || !re.is_match(line) {
-                            included.insert(row);
-                        }
+                    if separator {
+                        out.push_str("--\n");
                     }
-                    content.push_str(&block);
-                    emitted += 1;
+                    out.push_str(&group.text);
+                    emitted += group.primaries;
+                }
+                if more {
+                    break;
                 }
             }
         }
     }
-    if candidate_capped && stop_reason.is_none() {
-        scan_incomplete = true;
-        stop_reason = Some("candidate_budget");
-    }
-    if unreadable_files {
-        scan_incomplete = true;
-        if stop_reason.is_none() {
-            stop_reason = Some("unreadable_files");
-        }
-    }
-    if oversize_files {
-        scan_incomplete = true;
-        if stop_reason.is_none() {
-            stop_reason = Some("oversize_files");
-        }
-    }
-    truncated |= scan_incomplete;
-    let flags = aw_tools_core::search::Incomplete {
-        content_budget: stop_reason == Some("content_budget"),
-        candidate_budget: candidate_capped,
-        directory_budget: progress.directory_budget,
-        traversal_error: progress.traversal_error,
-        ignore_rules: progress.ignore_rules || explicit_ignore_unavailable,
-        path_encoding: progress.path_encoding,
-        unreadable_files,
-        oversize_files,
-    };
-    match args.mode {
-        OutputMode::Files | OutputMode::Count => {
-            let mut out = String::new();
-            let mut shown = 0usize;
-            let mut overflow = false;
-            match args.mode {
-                OutputMode::Files => {
-                    for file in &files {
-                        let line = format!("{}\n", aw_tools_core::filesystem::safe_label(file));
-                        if out.len() + line.len() + 128 > MAX_OUTPUT {
-                            overflow = true;
-                            break;
-                        }
-                        out.push_str(&line);
-                        shown += 1;
-                    }
-                }
-                OutputMode::Count => {
-                    for item in &counts {
-                        let line = format!(
-                            "{}  {}\n",
-                            item.count,
-                            aw_tools_core::filesystem::safe_label(&item.path)
-                        );
-                        if out.len() + line.len() + 128 > MAX_OUTPUT {
-                            overflow = true;
-                            break;
-                        }
-                        out.push_str(&line);
-                        shown += 1;
-                    }
-                }
-                OutputMode::Content => unreachable!(),
-            }
-            let causes = aw_tools_core::search::compact_incomplete(flags);
-            let normalized = causes
-                .as_deref()
-                .map(|s| s.trim().trim_start_matches("… incomplete:"));
-            let next = (paging_more || overflow).then(|| args.offset + shown);
-            if let Some(status) = aw_tools_core::filesystem::status::query(next, normalized) {
-                if out.len() + status.len() <= MAX_OUTPUT {
-                    out.push_str(&status);
-                }
-            }
-            Ok(ToolOutput {
-                content: out,
-                is_error: false,
-                truncated: next.is_some() || scan_incomplete,
-            })
-        }
-        OutputMode::Content => {
-            let mut reasons = Vec::new();
-            if flags.content_budget
-                || flags.directory_budget
-                || flags.candidate_budget
-                || flags.oversize_files
+
+    if matches!(options.mode, GrepMode::Files | GrepMode::Count) {
+        for (path, count) in file_rows {
+            let row = match options.mode {
+                GrepMode::Files => format!("{}\n", filesystem::safe_label(&path)),
+                GrepMode::Count => format!("{count}  {}\n", filesystem::safe_label(&path)),
+                GrepMode::Content => unreachable!(),
+            };
+            if out.len().saturating_add(row.len()).saturating_add(reserve)
+                > options.limits.output_bytes
             {
-                reasons.push("budget");
-            }
-            if flags.traversal_error || flags.unreadable_files {
-                reasons.push("walk");
-            }
-            if flags.ignore_rules {
-                reasons.push("gitignore");
-            }
-            if flags.path_encoding {
-                reasons.push("path_encoding");
-            }
-            let incomplete = (!reasons.is_empty()).then(|| reasons.join(","));
-            let next = page_truncated.then(|| args.offset + emitted);
-            if let Some(status) =
-                aw_tools_core::filesystem::status::query(next, incomplete.as_deref())
-            {
-                if content.len() + status.len() <= MAX_OUTPUT {
-                    content.push_str(&status);
+                if out.is_empty() {
+                    return Err(GrepError::ResultLimit(
+                        "first grep result exceeds result ceiling; narrow path",
+                    ));
                 }
+                more = true;
+                break;
             }
-            Ok(ToolOutput {
-                content,
-                is_error: false,
-                truncated,
-            })
+            out.push_str(&row);
+            emitted += 1;
         }
     }
+
+    let next = more.then(|| options.offset + emitted);
+    let reasons = compact_reasons(flags);
+    if let Some(status) = filesystem::status::query(next, reasons.as_deref()) {
+        if out.len() + status.len() > options.limits.output_bytes {
+            return Err(GrepError::ResultLimit(
+                "grep status exceeds result ceiling; narrow query",
+            ));
+        }
+        out.push_str(&status);
+    }
+    Ok(GrepPage {
+        content: out,
+        truncated: more || flags.any(),
+        incomplete: flags,
+    })
 }
-impl Tool for Search {
-    fn spec(&self) -> ToolSpec {
-        use aw_tools_core::filesystem::schema::{SchemaCaps, Tool as C};
-        let tool = match self.op {
-            Operation::Ls => C::Ls,
-            Operation::Find => C::Find,
-            Operation::Grep => C::Grep,
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_concurrent_stop_reason_survives() {
+        let i = Incomplete {
+            directory_budget: true,
+            ignore_rules: true,
+            unreadable_files: true,
+            ..Incomplete::default()
         };
-        crate::core_spec(
-            tool,
-            SchemaCaps {
-                parallel_reads: true,
-                ..Default::default()
-            },
-        )
+        assert_eq!(
+            i.reasons(),
+            ["directory_budget", "ignore_rules", "unreadable_files"]
+        );
+        assert_eq!(i.first(), Some("directory_budget"));
     }
-    fn validate(&self, value: &Value) -> Result<()> {
-        match self.op {
-            Operation::Ls => {
-                let a: LsArgs = parse(value)?;
-                path(&a.path)?;
-                require_meta(&a.meta)?;
-                FsSelection::new(a.sort, a.offset, a.limit).map_err(Error::Limit)?;
-                let _ = a.parallel;
-            }
-            Operation::Find => {
-                let a: FindArgs = parse(value)?;
-                path(&a.path)?;
-                require_meta(&a.meta)?;
-                if a.depth.is_some_and(|v| !(1..=MAX_DEPTH).contains(&v)) {
-                    return Err(Error::Denied("invalid discovery depth"));
-                }
-                FsSelection::new(a.sort, a.offset, a.limit).map_err(Error::Limit)?;
-                FsFilter::compile(
-                    a.glob.as_deref(),
-                    a.regex.as_deref(),
-                    a.kind,
-                    a.mtime,
-                    a.ctime,
-                    a.btime,
-                )
-                .map_err(Error::Denied)?;
-                let _ = a.parallel;
-            }
-            Operation::Grep => {
-                let a: GrepArgs = parse(value)?;
-                path(&a.path)?;
-                if !(1..=MAX_GREP_HITS).contains(&a.limit)
-                    || a.before.or(a.context).is_some_and(|v| v > MAX_GREP_CONTEXT)
-                    || a.after.or(a.context).is_some_and(|v| v > MAX_GREP_CONTEXT)
-                    || (a.context.is_some() && (a.before.is_some() || a.after.is_some()))
-                    || a.depth.is_some_and(|v| !(1..=MAX_DEPTH).contains(&v))
-                {
-                    return Err(Error::Denied("invalid grep limit/depth/context"));
-                }
-                regex(&a)?;
-                optional_glob(a.glob.as_deref())?;
-                let _ = a.parallel;
+    #[test]
+    fn work_limits_do_not_skip_an_unaccounted_file() {
+        let mut w = WorkBudget::new(Duration::from_secs(10), 100, 2);
+        assert!(w.admit(60));
+        assert!(!w.admit(41));
+        assert_eq!(w.remaining_bytes(), 40);
+        assert!(w.admit(40));
+        assert!(!w.admit(0));
+    }
+    #[derive(Default)]
+    struct FakeFs {
+        dirs: std::collections::BTreeMap<String, Vec<walk::WalkEntry>>,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+    }
+    impl walk::Backend for FakeFs {
+        type Error = &'static str;
+        fn list(&self, path: &str, _: usize) -> Result<walk::Listing, Self::Error> {
+            self.dirs
+                .get(path)
+                .cloned()
+                .map(|entries| walk::Listing {
+                    entries,
+                    incomplete: false,
+                    path_encoding: false,
+                })
+                .ok_or("missing")
+        }
+        fn read_bytes(&self, path: &str, max: usize) -> Result<Vec<u8>, Self::Error> {
+            let bytes = self.files.get(path).ok_or("missing")?;
+            if bytes.len() > max {
+                Err("limit")
+            } else {
+                Ok(bytes.clone())
             }
         }
-        Ok(())
+        fn classify(&self, error: &&'static str) -> BackendErrorKind {
+            match *error {
+                "missing" => BackendErrorKind::Missing,
+                "limit" => BackendErrorKind::Limit,
+                _ => BackendErrorKind::Other,
+            }
+        }
     }
-    fn execute<'a>(&'a self, ctx: ToolContext, value: &'a Value) -> ToolFuture<'a> {
-        Box::pin(async move {
-            self.validate(value)?;
-            let request = value.clone();
-            let root = self.root.clone();
-            let op = self.op;
-            let token = ctx.cancellation.clone();
-            let answer = aw_tools_core::asynchronous::run_blocking(move || match op {
-                Operation::Ls => list(&root, &parse::<LsArgs>(&request)?, &token),
-                Operation::Find => find(&root, &parse::<FindArgs>(&request)?, &token),
-                Operation::Grep => grep(&root, &parse::<GrepArgs>(&request)?, &token),
-            })
-            .await
-            .map_err(|_| Error::Protocol("search worker failed"))?;
-            tool_failure(answer, false)
-        })
+    impl MetadataBackend for FakeFs {
+        fn entry_meta(&self, path: &str) -> Result<filesystem::EntryMeta, Self::Error> {
+            if self.dirs.contains_key(path) || (path.is_empty() && self.dirs.contains_key("")) {
+                return Ok(filesystem::EntryMeta {
+                    kind: Kind::Dir,
+                    ..Default::default()
+                });
+            }
+            self.files
+                .get(path)
+                .map(|bytes| filesystem::EntryMeta {
+                    kind: Kind::File,
+                    size: Some(bytes.len() as u64),
+                    ..Default::default()
+                })
+                .ok_or("missing")
+        }
+    }
+    fn file(name: &str, path: &str) -> walk::WalkEntry {
+        walk::WalkEntry {
+            name: name.into(),
+            path: path.into(),
+            kind: Kind::File,
+            hidden: false,
+        }
+    }
+    fn dir(name: &str, path: &str) -> walk::WalkEntry {
+        walk::WalkEntry {
+            name: name.into(),
+            path: path.into(),
+            kind: Kind::Dir,
+            hidden: false,
+        }
+    }
+    fn options<'a>(pattern: &'a str) -> GrepOptions<'a> {
+        GrepOptions {
+            pattern,
+            path: "",
+            backend_path: None,
+            glob: None,
+            depth: 128,
+            literal: true,
+            ignore_case: false,
+            mode: GrepMode::Content,
+            before: 0,
+            after: 0,
+            hidden: false,
+            gitignore: false,
+            offset: 0,
+            limit: 200,
+            limits: GrepLimits {
+                output_bytes: 4096,
+                ..GrepLimits::default()
+            },
+        }
+    }
+    #[test]
+    fn canonical_grep_respects_depth_and_coalesces_context() {
+        let fs = FakeFs {
+            dirs: std::collections::BTreeMap::from([
+                (
+                    "".into(),
+                    vec![file("top.txt", "top.txt"), dir("sub", "sub")],
+                ),
+                ("sub".into(), vec![file("nested.txt", "sub/nested.txt")]),
+            ]),
+            files: std::collections::BTreeMap::from([
+                ("top.txt".into(), b"a\nhit\nctx\nhit\nz\n".to_vec()),
+                ("sub/nested.txt".into(), b"hit\n".to_vec()),
+            ]),
+        };
+        let mut query = options("hit");
+        query.depth = 1;
+        query.before = 1;
+        query.after = 1;
+        let page = grep(&fs, query, &|| false).unwrap();
+        assert_eq!(
+            page.content,
+            "top.txt-1-a\ntop.txt:2:hit\ntop.txt-3-ctx\ntop.txt:4:hit\ntop.txt-5-z\n"
+        );
+        assert!(!page.content.contains("nested"));
+    }
+    #[test]
+    fn grep_page_clips_unselected_matching_context_and_advances_by_primary() {
+        let fs = FakeFs {
+            dirs: std::collections::BTreeMap::from([("".into(), vec![file("f", "f")])]),
+            files: std::collections::BTreeMap::from([("f".into(), b"hit\nhit\ntail\n".to_vec())]),
+        };
+        let mut query = options("hit");
+        query.before = 1;
+        query.after = 1;
+        query.offset = 1;
+        query.limit = 1;
+        let page = grep(&fs, query, &|| false).unwrap();
+        assert_eq!(page.content, "f:2:hit\nf-3-tail\n");
+        assert!(!page.truncated);
+    }
+    #[test]
+    fn grep_limit_and_output_units_never_return_nonadvancing_page() {
+        let fs = FakeFs {
+            dirs: std::collections::BTreeMap::from([("".into(), vec![file("f", "f")])]),
+            files: std::collections::BTreeMap::from([(
+                "f".into(),
+                format!("{}hit\n", "x".repeat(600)).into_bytes(),
+            )]),
+        };
+        let mut query = options("hit");
+        query.limits.output_bytes = 256;
+        assert!(matches!(
+            grep(&fs, query, &|| false),
+            Err(GrepError::ResultLimit(_))
+        ));
+    }
+
+    #[test]
+    fn escape_only_ambiguous_path_labels() {
+        assert_eq!(content_path_label("src/file.rs"), "src/file.rs");
+        assert_eq!(content_path_label("src/a:b.rs"), r#""src/a:b.rs""#);
     }
 }

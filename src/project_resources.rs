@@ -3,7 +3,7 @@
 //! no-follow, hardlink-rejecting scoped filesystem. Discovery is inert data;
 //! user-approved digests gate admission and never grant tools/provider access.
 use crate::{config, Error, Result};
-use aw_tools::browse::{EntryKind, Listing, WorkspaceFiles};
+use aw_tools_adapter::browse::{EntryKind, Listing, WorkspaceFiles};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},

@@ -4,17 +4,21 @@
 //! non-cooperating writers.
 
 use std::{
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, OsStr},
     fs::File,
     io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd},
-        unix::fs::{MetadataExt, OpenOptionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
     },
-    path::{Component, Path},
-    sync::{Mutex, MutexGuard},
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
+pub mod capability;
 mod port;
 pub use port::{MutationGuard, StagedWrite};
 
@@ -103,6 +107,7 @@ pub struct Listing {
 pub struct Root {
     directory: File,
     serial: Mutex<()>,
+    private: Arc<aw_tools::filesystem::private_artifact::Registry>,
 }
 
 pub fn validate_path(path: &str) -> Result<()> {
@@ -114,7 +119,6 @@ pub fn validate_path(path: &str) -> Result<()> {
         || path
             .split('/')
             .any(|s| s.is_empty() || s == "." || s == "..")
-        || path.chars().any(char::is_control)
         || Path::new(path)
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -188,16 +192,158 @@ fn at(dir: &File, name: &str, flags: i32, mode: u32) -> Result<File> {
     Ok(opened)
 }
 
+fn open_root_component(dir: &File, name: &OsStr) -> Result<File> {
+    let name =
+        CString::new(name.as_bytes()).map_err(|_| ScopedError::Denied("invalid root path"))?;
+    #[cfg(target_os = "linux")]
+    let fd = {
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const RESOLVE_BENEATH: u64 = 0x08;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        };
+        unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            ) as i32
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn pin_root_directory(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        return Err(ScopedError::Denied("capability root must be absolute"));
+    }
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                directory = open_root_component(&directory, part)?;
+            }
+            _ => return Err(ScopedError::Denied("capability root is not canonical")),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_path(file: &File) -> Result<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(Into::into)
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_path(file: &File) -> Result<PathBuf> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+    let mut bytes = vec![0u8; libc::PATH_MAX as usize];
+    let result = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_GETPATH,
+            bytes.as_mut_ptr().cast::<libc::c_char>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let path = unsafe { CStr::from_ptr(bytes.as_ptr().cast::<libc::c_char>()) };
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn descriptor_path(_file: &File) -> Result<PathBuf> {
+    Err(ScopedError::Denied(
+        "final symlink resolution is unsupported on this Unix platform",
+    ))
+}
+
+fn stat_leaf(parent: &File, name: &str, nofollow: bool) -> Result<libc::stat> {
+    let name = cstring(name)?;
+    let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let flags = if nofollow {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), info.as_mut_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { info.assume_init() })
+}
+
+fn root_relative_utf8(root: &Path, target: &Path) -> Result<String> {
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| ScopedError::Denied("resolved content target escapes granted root"))?;
+    if relative.as_os_str().is_empty() {
+        return Err(ScopedError::Denied("content target is not a regular file"));
+    }
+    let mut result = String::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(ScopedError::Denied(
+                "resolved content target is not reusable",
+            ));
+        };
+        let part = part
+            .to_str()
+            .ok_or(ScopedError::Denied("resolved content target is not UTF-8"))?;
+        if !result.is_empty() {
+            result.push('/');
+        }
+        result.push_str(part);
+    }
+    Ok(result)
+}
+
 impl Root {
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_private_artifacts(
+            root,
+            aw_tools::filesystem::private_artifact::Registry::memory(),
+        )
+    }
+
+    pub fn open_with_private_artifacts(
+        root: &Path,
+        private: Arc<aw_tools::filesystem::private_artifact::Registry>,
+    ) -> Result<Self> {
         let root = root.canonicalize()?;
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(root)?;
+        let expected = std::fs::metadata(&root)?;
+        if !expected.is_dir() {
+            return Err(ScopedError::Denied("granted root is not a directory"));
+        }
+        let directory = pin_root_directory(&root)?;
+        let actual = directory.metadata()?;
+        if (expected.dev(), expected.ino()) != (actual.dev(), actual.ino()) {
+            return Err(ScopedError::Denied("granted root changed while opening"));
+        }
         Ok(Self {
             directory,
             serial: Mutex::new(()),
+            private,
         })
     }
 
@@ -205,6 +351,157 @@ impl Root {
         self.serial
             .lock()
             .map_err(|_| ScopedError::Denied("file root is poisoned; stop and inspect"))
+    }
+
+    fn artifact_identity(
+        metadata: &std::fs::Metadata,
+    ) -> aw_tools::filesystem::private_artifact::ObjectIdentity {
+        aw_tools::filesystem::private_artifact::ObjectIdentity {
+            volume: metadata.dev(),
+            object: metadata.ino(),
+        }
+    }
+
+    pub fn private_artifacts(&self) -> &Arc<aw_tools::filesystem::private_artifact::Registry> {
+        &self.private
+    }
+
+    pub fn is_private_path(&self, path: &str) -> Result<bool> {
+        validate_path(path)?;
+        let (parent, name) = match self.parent(path) {
+            Ok(value) => value,
+            Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
+            Err(error) => return Err(error),
+        };
+        let parent_id = Self::artifact_identity(&parent.metadata()?);
+        let stat = match stat_leaf(&parent, &name, true) {
+            Ok(stat) => stat,
+            Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
+            Err(error) => return Err(error),
+        };
+        let object = aw_tools::filesystem::private_artifact::ObjectIdentity {
+            volume: stat.st_dev as u64,
+            object: stat.st_ino as u64,
+        };
+        self.private
+            .owns(parent_id, &name, object)
+            .map_err(|_| ScopedError::Denied("private mutation artifact registry unavailable"))
+    }
+
+    pub(crate) fn ensure_public_path(&self, path: &str) -> Result<()> {
+        if self.is_private_path(path)? {
+            return Err(ScopedError::Denied(
+                "private mutation artifact is not externally addressable",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_final_path(
+        &self,
+        path: &str,
+        allow_missing: bool,
+        expected_kind: libc::mode_t,
+        label: &'static str,
+    ) -> Result<String> {
+        validate_path(path)?;
+        let (parent, name) = match self.parent(path) {
+            Ok(value) => value,
+            Err(ScopedError::Io(error))
+                if allow_missing && error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(path.to_owned());
+            }
+            Err(error) => return Err(error),
+        };
+        let entry = match stat_leaf(&parent, &name, true) {
+            Ok(entry) => entry,
+            Err(ScopedError::Io(error))
+                if allow_missing && error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(path.to_owned());
+            }
+            Err(error) => return Err(error),
+        };
+        let entry_kind = entry.st_mode & libc::S_IFMT;
+        if entry_kind == expected_kind {
+            return Ok(path.to_owned());
+        }
+        if entry_kind != libc::S_IFLNK {
+            return Err(ScopedError::Denied(label));
+        }
+
+        // Follow only after proving that the caller's intermediate namespace was
+        // traversed without symlinks. fstatat is metadata-only and therefore
+        // does not turn write-only authority into a content read.
+        let followed = match stat_leaf(&parent, &name, false) {
+            Ok(value) => value,
+            Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ScopedError::Denied(
+                    "dangling final symlink is not a missing target",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if followed.st_mode & libc::S_IFMT != expected_kind {
+            return Err(ScopedError::Denied(label));
+        }
+        let root_meta = self.directory.metadata()?;
+        if followed.st_dev as u64 != root_meta.dev() {
+            return Err(ScopedError::Denied(
+                "final symlink target crosses filesystem boundary",
+            ));
+        }
+
+        // Resolve the current pathname of the already-pinned parent and root,
+        // then verify the canonical spelling identifies the same inode observed
+        // through the pinned parent. A rename/swap race becomes a mismatch, not
+        // authorization of a different object.
+        let parent_path = descriptor_path(&parent)?;
+        let root_path = descriptor_path(&self.directory)?;
+        let canonical = std::fs::canonicalize(parent_path.join(&name)).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                ScopedError::Denied("dangling final symlink is not a missing target")
+            } else {
+                ScopedError::Io(error)
+            }
+        })?;
+        let resolved = root_relative_utf8(&root_path, &canonical)?;
+        let (resolved_parent, resolved_name) = self.parent(&resolved)?;
+        let verified = stat_leaf(&resolved_parent, &resolved_name, true)?;
+        if verified.st_mode & libc::S_IFMT != expected_kind
+            || verified.st_dev != followed.st_dev
+            || verified.st_ino != followed.st_ino
+        {
+            return Err(ScopedError::Denied(
+                "final symlink target changed during resolution",
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// Resolve an explicitly named final content symlink without weakening the
+    /// ordinary no-follow open path. Intermediate components are pinned first.
+    pub fn resolve_content_path(&self, path: &str, allow_missing: bool) -> Result<String> {
+        self.resolve_final_path(
+            path,
+            allow_missing,
+            libc::S_IFREG,
+            "final symlink target is not a regular file",
+        )
+    }
+
+    pub fn resolve_directory_path(&self, path: &str) -> Result<String> {
+        self.resolve_final_path(
+            path,
+            false,
+            libc::S_IFDIR,
+            "discovery root is not a directory",
+        )
     }
 
     fn parent(&self, path: &str) -> Result<(File, String)> {
@@ -223,10 +520,8 @@ impl Root {
 
     fn contents(file: &mut File) -> Result<String> {
         let meta = file.metadata()?;
-        if !meta.is_file() || meta.nlink() != 1 {
-            return Err(ScopedError::Denied(
-                "only singly-linked regular files are permitted",
-            ));
+        if !meta.is_file() {
+            return Err(ScopedError::Denied("only regular files are permitted"));
         }
         if meta.len() > MAX_FILE as u64 {
             return Err(ScopedError::Limit(
@@ -242,6 +537,7 @@ impl Root {
     }
 
     pub fn read(&self, path: &str) -> Result<String> {
+        self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let mut file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         Self::contents(&mut file)
@@ -252,6 +548,9 @@ impl Root {
     }
 
     pub fn list_with_limit(&self, path: &str, max_entries: usize) -> Result<Listing> {
+        if !path.is_empty() {
+            self.ensure_public_path(path)?;
+        }
         if !(1..=16384).contains(&max_entries) {
             return Err(ScopedError::Limit("listing limit outside 1..=16384"));
         }
@@ -341,7 +640,7 @@ impl Root {
             let info = unsafe { info.assume_init() };
             let kind = match info.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => EntryKind::Directory,
-                libc::S_IFREG if info.st_nlink == 1 => EntryKind::File,
+                libc::S_IFREG => EntryKind::File,
                 libc::S_IFLNK => EntryKind::Symlink,
                 _ => EntryKind::Unsupported,
             };
@@ -423,14 +722,14 @@ impl Root {
 }
 
 /// Shared traversal on the pinned no-follow filesystem authority.
-impl aw_tools_core::filesystem::walk::Backend for Root {
+impl aw_tools::filesystem::walk::Backend for Root {
     type Error = ScopedError;
     fn list(
         &self,
         path: &str,
         max: usize,
-    ) -> std::result::Result<aw_tools_core::filesystem::walk::Listing, Self::Error> {
-        use aw_tools_core::filesystem::{walk, Kind};
+    ) -> std::result::Result<aw_tools::filesystem::walk::Listing, Self::Error> {
+        use aw_tools::filesystem::{walk, Kind};
         let listing = self.list_with_limit(path, max)?;
         Ok(walk::Listing {
             incomplete: listing.incomplete,
@@ -458,8 +757,8 @@ impl aw_tools_core::filesystem::walk::Backend for Root {
     fn read_bytes(&self, path: &str, max: usize) -> std::result::Result<Vec<u8>, Self::Error> {
         Root::read_bytes(self, path, max)
     }
-    fn classify(&self, error: &Self::Error) -> aw_tools_core::filesystem::walk::BackendErrorKind {
-        use aw_tools_core::filesystem::walk::BackendErrorKind as K;
+    fn classify(&self, error: &Self::Error) -> aw_tools::filesystem::walk::BackendErrorKind {
+        use aw_tools::filesystem::walk::BackendErrorKind as K;
         match error {
             ScopedError::Io(e) if e.kind() == io::ErrorKind::NotFound => K::Missing,
             ScopedError::Io(_) | ScopedError::Denied(_) => K::Unavailable,
@@ -467,22 +766,56 @@ impl aw_tools_core::filesystem::walk::Backend for Root {
             ScopedError::Cancelled => K::Other,
         }
     }
+    fn private_entry(&self, path: &str) -> Result<bool> {
+        self.is_private_path(path)
+    }
 }
 
-impl aw_tools_core::filesystem::backend::MetadataBackend for Root {
-    fn entry_meta(&self, path: &str) -> Result<aw_tools_core::filesystem::EntryMeta> {
+impl aw_tools::filesystem::backend::MetadataBackend for Root {
+    fn entry_meta(&self, path: &str) -> Result<aw_tools::filesystem::EntryMeta> {
         Root::entry_meta(self, path)
     }
 }
-impl aw_tools_core::filesystem::backend::StagedPublication for port::StagedWrite {
+impl aw_tools::filesystem::backend::ExplicitPathBackend for Root {
+    fn resolve_content_path(&self, path: &str, allow_missing: bool) -> Result<String> {
+        Root::resolve_content_path(self, path, allow_missing)
+    }
+    fn resolve_directory_path(&self, path: &str) -> Result<String> {
+        Root::resolve_directory_path(self, path)
+    }
+}
+impl aw_tools::filesystem::backend::StagedPublication for port::StagedWrite {
     type Error = ScopedError;
     fn commit(self) -> Result<()> {
         port::StagedWrite::commit(self)
     }
 }
-impl aw_tools_core::filesystem::backend::SecuredFilesystem for Root {
+impl aw_tools::filesystem::backend::SecuredFilesystem for Root {
     type Guard<'a> = port::MutationGuard<'a>;
     type Stage = port::StagedWrite;
+    fn mutation_path_key(&self, path: &str) -> Result<Vec<u8>> {
+        validate_path(path)?;
+        let parts = path.split('/').collect::<Vec<_>>();
+        let mut parent = self.directory.try_clone()?;
+        let mut suffix_at = parts.len().saturating_sub(1);
+        for (index, part) in parts.iter().take(parts.len().saturating_sub(1)).enumerate() {
+            match at(&parent, part, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(next) => parent = next,
+                Err(ScopedError::Io(ref error)) if error.kind() == io::ErrorKind::NotFound => {
+                    suffix_at = index;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let suffix = parts[suffix_at..].join("/");
+        let meta = parent.metadata()?;
+        let mut key = Vec::with_capacity(16 + suffix.len());
+        key.extend_from_slice(&meta.dev().to_le_bytes());
+        key.extend_from_slice(&meta.ino().to_le_bytes());
+        key.extend_from_slice(suffix.as_bytes());
+        Ok(key)
+    }
     fn lock<'a>(&'a self, paths: &[String], cancel: &dyn Fn() -> bool) -> Result<Self::Guard<'a>> {
         self.lock_mutations_with_cancel(paths, cancel)
     }
@@ -514,8 +847,8 @@ impl aw_tools_core::filesystem::backend::SecuredFilesystem for Root {
     fn classify_publication_failure(
         &self,
         error: &Self::Error,
-    ) -> aw_tools_core::filesystem::backend::CommitFailure {
-        use aw_tools_core::filesystem::backend::CommitFailure;
+    ) -> aw_tools::filesystem::backend::CommitFailure {
+        use aw_tools::filesystem::backend::CommitFailure;
         match error {
             ScopedError::Denied(_) | ScopedError::Limit(_) | ScopedError::Cancelled => {
                 CommitFailure::NoPublication
@@ -534,15 +867,55 @@ impl aw_tools_core::filesystem::backend::SecuredFilesystem for Root {
         paths: &[String],
         recursive: bool,
         cancel: &dyn Fn() -> bool,
-    ) -> Result<aw_tools_core::filesystem::lifecycle::RemoveOutcome> {
+    ) -> Result<aw_tools::filesystem::lifecycle::RemoveOutcome> {
         Root::remove_paths(self, paths, recursive, cancel)
     }
     fn read_page(
         &self,
         path: &str,
-        request: aw_tools_core::read::PageRequest,
+        request: aw_tools::read::PageRequest,
         cancel: &dyn Fn() -> bool,
-    ) -> Result<aw_tools_core::read::Page> {
+    ) -> Result<aw_tools::read::Page> {
         Root::read_page_with_cancel(self, path, request, cancel)
+    }
+}
+
+#[cfg(test)]
+mod namespace_identity_tests {
+    use super::*;
+    use aw_tools::filesystem::backend::SecuredFilesystem as _;
+    use std::fs;
+
+    #[test]
+    fn mutation_path_key_tracks_namespace_entry_across_overlapping_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "aw-namespace-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sub = base.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.txt"), b"a").unwrap();
+        fs::hard_link(sub.join("a.txt"), sub.join("hard.txt")).unwrap();
+        let outer = Root::open(&base).unwrap();
+        let inner = Root::open(&sub).unwrap();
+        assert_eq!(
+            outer.mutation_path_key("sub/a.txt").unwrap(),
+            inner.mutation_path_key("a.txt").unwrap()
+        );
+        assert_eq!(
+            outer.mutation_path_key("sub/new/deep.txt").unwrap(),
+            inner.mutation_path_key("new/deep.txt").unwrap(),
+            "missing suffix keys use the same nearest existing parent identity"
+        );
+        assert_ne!(
+            inner.mutation_path_key("a.txt").unwrap(),
+            inner.mutation_path_key("hard.txt").unwrap(),
+            "distinct hard-link names are distinct publication entries"
+        );
+        let _ = fs::remove_dir_all(base);
     }
 }

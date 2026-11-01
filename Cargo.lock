@@ -253,7 +253,7 @@ dependencies = [
  "aw-store-jsonl",
  "aw-surfaces",
  "aw-terminal",
- "aw-tools",
+ "aw-tools-adapter",
  "aw-ui-extension",
  "aw-workspace",
  "axum",
@@ -653,7 +653,7 @@ dependencies = [
  "aw-git",
  "aw-platform",
  "aw-terminal",
- "aw-tools",
+ "aw-tools-adapter",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
@@ -694,26 +694,6 @@ name = "aw-tools"
 version = "0.15.0"
 dependencies = [
  "anyhow",
- "aw-agent-core",
- "aw-platform",
- "aw-terminal",
- "aw-tools-core",
- "base64 0.22.1",
- "globset",
- "ignore",
- "regex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "aw-tools-core"
-version = "0.15.0"
-dependencies = [
- "anyhow",
  "chrono",
  "globset",
  "ignore",
@@ -728,10 +708,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-tools-adapter"
+version = "0.15.0"
+dependencies = [
+ "anyhow",
+ "aw-agent-core",
+ "aw-platform",
+ "aw-terminal",
+ "aw-tools",
+ "base64 0.22.1",
+ "futures-util",
+ "getrandom 0.3.4",
+ "globset",
+ "ignore",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "aw-tools-fs-unix"
 version = "0.15.0"
 dependencies = [
- "aw-tools-core",
+ "aw-tools",
  "libc",
  "sha2 0.10.9",
 ]
@@ -740,7 +742,7 @@ dependencies = [
 name = "aw-tools-fs-win"
 version = "0.15.0"
 dependencies = [
- "aw-tools-core",
+ "aw-tools",
  "sha2 0.10.9",
  "windows-sys 0.61.2",
 ]

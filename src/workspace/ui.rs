@@ -21,7 +21,7 @@ use crate::tui::{
     status::StatusContext,
 };
 use aw::{Error, Result};
-use aw_tools::browse::{Entry, EntryKind};
+use aw_tools_adapter::browse::{Entry, EntryKind};
 use aw_ui_extension::Slot;
 use aw_workspace::{
     Action, Axis, Editor, GitContextId, Id, Navigator, Pane, Rect as ModelRect, ScopeId, Side,

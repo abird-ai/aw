@@ -51,7 +51,6 @@ Design/decisions: [README.md](README.md).
 - [ ] Native Windows compile, file ACL/atomic-write/symlink tests: no Windows
   Rust target available; target check reports missing `core`
 
-
 ## Hardening parity follow-up (2026-10-26)
 
 - [x] Compare live dotlink schemas, tool implementation and new hardening
@@ -110,7 +109,6 @@ Design/decisions: [README.md](README.md).
 - [x] No-std `aw-agent-kernel --no-default-features --features alloc`
   compiled; `aw-cli --bin aw` 383/383 active tests passed, 1 ignored;
   `aw-cli --lib` 226/226 active tests passed, 2 ignored.
-
 
 ## Audit-remediation validation — 2026-10-27
 
@@ -188,7 +186,6 @@ Exact outcome: PORT-RESULTS-2026-10-30.md
       other pinned crates absent from l5 registry; online index TLS issuer
       failure. Fixture dependency substitutions are confined to ignored
       target/review-tool-integration and NOT written to tracked manifests.
-
 
 ## Five sequential shared-toolset continuation phases — 2026-10-30
 
@@ -309,7 +306,6 @@ Reference: REVIEW-FIX-N20-2026-10-31.md.
 - [ ] Monolithic workspace test run and native Windows/macOS/Bubblewrap
       runtime remain separate gates
 
-
 ### Sealed DL-150 convergence checkpoint — 2026-10-31
 
 Owned plan: AI-NATIVE-FS-IMPLEMENTATION-2026-10-31.md.
@@ -340,10 +336,10 @@ Reference: dotlink sealed spec at 5942393, consulted read-only.
 - [ ] Native platform backend extraction into shared core and
       actual dotlink consumer replacement (dotlink untouched)
 
-
 ### Latest sealed durable-job spec follow-up — 2026-10-31
 
 Dotlink reference: 8a3e7bb, consulted read-only.
+
 - [x] Batch .err selects only known fail/partial; .uncertain is explicit
       and cannot accidentally trigger recovery/compensation branches
 - [ ] One host-owned durable job substrate for shell and batch, with
@@ -355,17 +351,18 @@ Dotlink reference: 8a3e7bb, consulted read-only.
 - [ ] Job output paging, ACK, cancel, retention and Task projection
       use one ID namespace; no duplicate executor or journal
 
-
 ### Sealed canonical Job/Graph and Windows shell update — 2026-10-31
 
 Dotlink specification: a156142, consulted read-only.
+
 - [x] Model-visible Windows native shell identity pwsh; powershell selection
       remains input-only compatibility; original executable option unchanged
 - [x] Windows GNU aw-platform-win/aw-tools all-target cross compile
-- [ ] V2 single host-owned Job(Graph[Node]) substrate for shell/batch,
-      deterministic restart/resume and one ID/Task projection
-- [ ] Graph scheduler and model-visible batch only after exact durable
-      per-node replay and original journal checkpoints
+- [x] V2 single host-owned Job(Graph[Node]) substrate for shell/batch,
+      current-authority restart and one ID/Task projection; process replacement
+      intentionally does not reconstruct live Graph state
+- [x] Graph scheduler and model-visible batch/job_* bound to the original outer
+      AW journal replay fence and original Process owner
 
 ### Core-engine resumed verification — 2026-10-31
 
@@ -384,11 +381,11 @@ Full result: CORE-ENGINE-RESUME-2026-10-31.md
       383 CLI binary; 226 CLI library tests passed
 - [x] Strict Clippy, workspace all-target compile, Windows GNU cross,
       no_std+alloc, fmt and diff checks passed
-- [ ] Original TurnJournal per-node Job transitions and actual registered
-      batch/job_* with original Process owner and exact nested grants
+- [x] Registered batch/job_* and direct shells use the original TurnJournal
+      outer invocation fence, exact nested live grants and original Process owner;
+      per-node transitions remain intentionally bounded live-session state
 - [ ] Native Windows/macOS/Bubblewrap, provider typed blocks, recovery
       and original full monolithic workspace integration gates
-
 
 ### Parity audit and next-agent handoff — 2026-10-31 (current)
 
@@ -414,11 +411,107 @@ Full result: CORE-ENGINE-RESUME-2026-10-31.md
 - [x] Signed owned-source parity review record and next-agent handoff:
       PARITY-AUDIT-2026-10-31.md and
       NEXT-AGENT-HANDOFF-2026-10-31.md
-- [ ] P0 final-symlink resolved target dual authorization and native
-      protected descendant policy for recursive lifecycle operations
-- [ ] P0 original host-owned per-node durable batch/Job execution,
-      model-facing job_* and one original TurnJournal/Process owner
+- [x] P0 final-symlink lexical + resolved target authorization and protected
+      descendant/exclusion policy implemented in shared secured backends
+- [x] P0 original host-owned Job execution, model-facing batch/job_* and one
+      original TurnJournal/Process owner implemented without a second database
 - [ ] P1 adversarial grep context-coalescing/page-boundary correctness,
       provider native data/status ContentBlocks, native ignore edge cases
 - [ ] Native Windows/macOS security/runtime, Bubblewrap, crash-fault
       injection and monolithic workspace-suite completion
+
+## Shared `aw-tools` convergence plan — 2026-10-31
+
+Design: `SHARED-AW-TOOLS-CONVERGENCE-2026-10-31.md`.
+Cross-repo canonical implementation architecture: dotlink DL-150 `SHARED-IMPLEMENTATION.md`.
+Baseline: AW `6f7845d` / shared implementation `e337f0d`; dotlink semantic spec `c34ea5a`.
+Job persistence boundary: shared Jobs are live-session durable only. AW relies on its existing unresolved outer `ToolStarted` Session journal to forbid cross-process redispatch; do not add a persistent Graph/NodePlan/result workflow database. A transport that cannot prove retired-session non-redelivery may use only the sealed minimal replay tombstone strategy.
+
+- [x] Latest AW parity pass already fixed requested-root gitignore isolation, invalid-UTF8 `path_encoding`, source-glob semantics, first-record non-progress, atomic grep hit/context result units and write-only no-equality behavior — `e337f0d` + `6f7845d`
+- [ ] A0 record/finalize cross-repo plan; after dotlink's small pre-implementation spec clarifications land, refresh the exact canonical reference snapshot here.
+- [x] A1 mechanically rename `aw-tools-core -> aw-tools` and current `aw-tools -> aw-tools-adapter`; canonical shared crate and thin AW adapter names are now in place.
+- [x] A1 update AW root/surfaces/UI/subagent/process consumers to the adapter where they require AW-specific integration, while secured FS crates depend on canonical `aw-tools`.
+- [x] A1 baseline was rerun after the mechanical move before the semantic convergence phases.
+- [x] A2 move canonical grep, binary planning, strict patch execution, validation/result fitting and common mutation/lifecycle decisions into shared `aw-tools`; AW adapter retains projection/compatibility only.
+- [x] A2 keep AW Process/PTY custody, browse/UI helpers, ToolPolicy/TurnJournal/provider/config/compatibility behavior in `aw-tools-adapter`.
+- [x] A3 prepared operation-class targets use lexical + resolved authority; content final symlinks follow safely while lifecycle remains no-follow.
+- [x] A3 remove workspace-user-file `nlink==1` restrictions while retaining single-link integrity checks for private spool/control artifacts.
+- [x] A3 admit legal UTF-8 Unix control-character paths through reversible quoting; invalid-UTF8 remains explicit `path_encoding` incompleteness and native Windows restrictions remain.
+- [x] A3 preserve no-cross-mount/reparse and pinned-handle invariants with symlink/alias/hardlink/race coverage in the shared/native layers.
+- [x] A4 replace prefix-based staging/tombstone protection with exact bounded identity-owned private artifact records and restart reconciliation; user-created prefix lookalikes are not hidden.
+- [x] A4 complete shared cp/mv/rm descendant policy plus crash/failure, case-only/cross-device and hardlink semantics at the implementation/test layers.
+- [x] A5 consolidate Job + task fence/checkpoint/spool/retention primitives into one canonical live-session `aw-tools::JobManager`; no third manager.
+- [x] A5 immutable NodePlan captures canonical args, semantic budgets, registry/authority/runtime bindings, conservative native footprints and deterministic lower-coordinate conflict admission.
+- [x] A5 shared JobManager owns raw-byte output paging/ACK/owners, exact pre-effect result reservation, replay claims, cancellation/revocation, Task projection, live-session restart and paged job listing.
+- [x] A6 bind JobManager to original AW authority without a second journal/database/executor. One live `JobRuntime` owns mixed native + ShellNode Graph execution; exact outer call/source/effect identity, per-grant live `ToolBindingAuthority` generations, Session/branch lifecycle rebinding, deterministic conflict scheduling, claim-before-effect, terminal-before-dependent, explicit cancellation/revocation, current-authority restart, interpreter object identity, post-spawn unknown fencing, and process stop proof all reuse AW's existing authority + `PipeProcess` custody. Internal Graph state is intentionally live-session-only: the outer AW `ToolStarted/ToolFinished` journal is the durable replay fence, so process loss leaves the invocation uncertain rather than reconstructing/replaying a persistent Graph database.
+- [x] A6 enable the canonical model-facing runtime surface: `batch`, `job_start`, `job_list`, `job_get`, `job_output`, `job_ack`, `job_cancel`, `job_restart`, plus direct `bash`/`pwsh`/`powershell` through the same one-ShellNode Job path. Oversized/abandoned optimistic calls hand off the same Job; explicit cancellation records Job cancellation first. Native exact results and ShellNode streams use bounded JobManager-owned retention with raw-byte paging/ACK; fixed process terminal metadata survives result-payload ACK.
+- [ ] A7 produce one reviewed pinned shared-crate revision and reusable conformance fixture for dotlink. **Implemented:** `aw-tools`/secured backends have no AW Agent/adapter normal dependency; opt-in host-neutral `conformance` vectors cover canonical schemas/requests/Graph/status semantics; matching Unix/Windows `CapabilitySet` APIs now cover multiple pinned read/write grants, absolute/base-relative model paths, write-only destinations, cross-root lifecycle, final-symlink target identity, lexical/resolved exclusions, durable host-owned private-artifact registries/reconciliation, and exact grant-object identities. An isolated standalone consumer executes generic shared cross-root operations with no AW Agent types. Windows grant selection is exact/case-sensitive while namespace safety remains invariant-folded. **Remaining:** create the reviewed implementation commit and record its exact Git revision for standalone dotlink consumption. UNC/network-share model paths now use canonical `//server/share/...` spellings in the shared grammar/router and cross-compile on Windows; native Windows execution CI remains a separate verification item.
+- [ ] A8 support dotlink differential integration without importing dotlink transport/policy types into `aw-tools`. **Scaffolded:** dotlink now has a test-only fixture reporter consuming AW conformance JSON without a committed sibling path dependency. First explicit run reports the expected legacy gap: missing `find/cp/mv/rm`, schema drift for `ls/grep/read/write/edit/patch/bread/bwrite/bedit`, and four unreachable request vectors. Shared fixture generation accepts host `SchemaCaps` so configurable ceilings do not create false parity failures. Actual shared-engine execution remains gated on the exact pinned Git revision from A7.
+
+### Fresh pre-pin cross-repo review — 2026-11-01
+
+- [x] Revalidated AW against its larger architecture: one Agent/ToolPolicy/
+      TurnJournal, current Session authority, minimal/stateless builds and
+      no_std+alloc kernel boundaries remain intact.
+- [x] Unified host concurrency: the same trusted read/shell ceilings now govern
+      top-level Agent waves and nested Graphs; dynamic SDK narrowing is
+      transactional and live Jobs block a conflicting policy change.
+- [x] Added one AW `LocalToolLimits` narrowing contract so direct schemas,
+      validators, execution, Graph nodes, retained native results, shell streams
+      and Job admission share one host configuration. A Job-producing config is
+      rejected up front unless its aggregate spool can retain the exact result
+      reservations of one maximum-size Graph, so a valid Graph cannot self-starve
+      later nodes into quota-driven `skip` outcomes.
+- [x] Kept product policy out of shared safety bounds: shared render/result pages
+      and raw Job pages support up to 64 MiB, Graph JSON up to 64 MiB, and the
+      shared aggregate Job spool up to 8 GiB; AW retains its historical smaller
+      defaults while dotlink can map its larger configured ceilings. Internal
+      consumers now use `default-features = false` plus explicit `aw-tools`
+      features so future convenience-default changes cannot silently widen a host.
+- [x] Private-artifact custody now distinguishes volatile from durable stores:
+      volatile registries may own exact stage/backup names but can never authorize
+      an `rm` tombstone detach. AW therefore omits `rm` when secure durable mutation
+      records are unavailable instead of either weakening recovery or disabling the
+      rest of the safe filesystem toolset.
+- [x] Multi-root `rm` reserves every exact identity-bound tombstone record before
+      the first detach, revalidates source identity immediately before rename and
+      retires every unused reservation on pre-publication failure; injected failure
+      on reservation #2 leaves all requested roots intact.
+- [x] Direct tool presentation now receives the Agent's actual per-call result
+      budget before execution. Read/search/binary pages preserve advancing cursors,
+      mutation receipts preflight against the live budget, and oversized batch/shell
+      presentation hands off the same Job. Graph NodePlans retain their independently
+      captured semantic result ceilings, so outer context pressure cannot change
+      node status or dependent effects.
+- [x] Fresh dotlink normal matrix passed: 758 main tests with only the explicit
+      differential gate ignored, plus all integration binaries; fmt/check/strict
+      Clippy clean. Regenerated differential remains exactly the expected legacy
+      gap (missing find/cp/mv/rm, nine schema drifts, four unreachable vectors).
+      The temporary reporter also keeps Graph/aggregate/marker vectors explicitly
+      unverified, so schema parity alone can never turn the cutover gate green.
+- [x] Fresh AW product/config matrix passed after the pre-pin fixes: shared
+      219/219, Unix backend 30/30, AW adapter 175/175, Agent-core 78 active tests
+      plus 1 intentional ignore, no-default/stateless and `minimal` all-target
+      checks, no_std+alloc kernel check, workspace all-target compile and strict
+      Clippy for the affected stack. The previous Windows GNU cross-stack passed
+      before the latest fixes; its cached Rust 1.98 compiler was garbage-collected,
+      so the current source is deliberately not claimed freshly cross-validated.
+
+### Shared convergence verification
+
+- [ ] Pre/post mechanical-rename behavior/test matrix identical.
+- [ ] Final symlink lexical/resolved authorization matrix on native supported platforms.
+- [ ] User regular hardlink read/write/edit/cp/mv/rm tests and private-state single-link integrity tests.
+- [ ] UTF-8 quoted control-path + invalid-UTF8 path_encoding tests.
+- [ ] Exact private stage/backup/tombstone crash recovery and identity-mismatch tests.
+- [ ] Recursive lifecycle protected-descendant, mount/reparse and race tests.
+- [x] Graph conflict scheduling deterministic across runner timing.
+- [x] Node results/dependent effects invariant across outer result/transport budgets; oversized aggregate presentation hands off the same completed Job without changing node modifiers.
+- [x] Outer-journal no-replay ambiguity, current-authority restart, explicit Job cancellation/revocation, ShellNode stop proof, post-spawn unknown fencing, and exact-grant live revocation tests.
+- [x] Raw output offsets, lossy/base64 projection, ACK idempotence, explicit multi-owner retention and pressure cleanup tests.
+- [ ] Native Windows/macOS runtime gates. Earlier Windows GNU cross-builds were
+      green, but the latest source has not been freshly cross-checked because the
+      cached matching Rust 1.98 toolchain was garbage-collected; do not substitute
+      the host Rust 1.95 compiler against the old Windows std sysroot. Native
+      platform execution CI remains required regardless.
+- [x] Full AW workspace all-target test matrix passed with terminal results via bounded connector-safe partitions (including `aw-cli` lib/bin, core/tools/agent/platform, storage/client/surfaces, `aw-store` 201/201 in exhaustive partitions, and workspace/examples). A single monolithic command exceeds the connector response ceiling, so validation is partitioned without reducing target coverage.

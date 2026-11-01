@@ -5,27 +5,46 @@ edition = "2021"
 rust-version = "1.88"
 publish = false
 license = "MIT"
-description = "Explicit local filesystem and trusted-shell tools for aw-agent-core"
+description = "Canonical reusable tool semantics, Graph/Job runtime, and backend contracts"
 
 [features]
-default = []
-pty = ["dep:aw-terminal"]
+default = ["read-only"]
+# Presets select compiled algorithms, never issue runtime permissions.
+read-only = ["read", "binary"]
+rw = ["read-only", "write", "lifecycle"]
+full = ["rw", "async", "durable", "sandbox", "batch"]
+read = []
+write = []
+lifecycle = []
+batch = []
+# Host-neutral test vectors for differential consumers such as dotlink.
+conformance = ["batch"]
+binary = []
+sync = []
+async = ["dep:tokio"]
+durable = ["dep:libc", "dep:windows-sys"]
+sandbox = ["dep:libc"]
 
 [dependencies]
-aw-tools-core = { path = "../aw-tools-core", version = "=0.15.0", features = ["rw", "async", "durable"] }
-aw-terminal = { path = "../aw-terminal", version = "=0.15.0", optional = true }
-aw-platform = { version = "=0.15.0", path = "../aw-platform" }
-aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
+anyhow = "=1.0.104"
 serde = { workspace = true }
 serde_json = { workspace = true }
-regex = "=1.12.3"
-base64 = "=0.22.1"
-url = "=2.5.7"
 sha2 = "=0.10.9"
-anyhow = "=1.0.104"
+memchr = "=2.8.3"
+regex = "=1.12.3"
 globset = "=0.4.18"
 ignore = "=0.4.25"
-tokio = { version = "=1.48.0", features = ["rt", "macros", "process", "io-util", "time", "sync"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["std", "serde"] }
+tokio = { version = "=1.48.0", features = ["rt"], optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "=0.2.177", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", optional = true, features = [
+  "Win32_Foundation", "Win32_Storage_FileSystem"
+] }

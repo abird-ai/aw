@@ -434,8 +434,10 @@ mod tests {
         assert_eq!(invitation.terminal_id, id);
         assert_eq!(invitation.ticket.len(), 64);
         assert_eq!(pool.dock_mode(&id), Some(Mode::Offered));
-        assert!(pool.input_local(&id, vec![3]).is_ok(),
-            "invitation alone does not move PTY ownership");
+        assert!(
+            pool.input_local(&id, b"echo LOCAL_BEFORE_DOCK\n".to_vec()).is_ok(),
+            "invitation alone does not move PTY ownership"
+        );
         assert!(pool.accept_dock(&id, "f".repeat(64).as_str()).is_err());
         for _ in 0..120 {
             if original.snapshot(0).pending_input == 0 { break; }

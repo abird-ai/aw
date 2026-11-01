@@ -1,13 +1,16 @@
 //! Windows counterparts of AW's bounded file windows and staged writes.
 //! Directory handles are retained across both staging and publication.
 use super::{is_reparse, pin_directory, validate_path, wide, Parent, Result, Root, ScopedError};
+use aw_tools::filesystem::private_artifact::{
+    Kind as ArtifactKind, Lease as ArtifactLease, ObjectIdentity, Record,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::MutexGuard,
+    sync::{Arc, MutexGuard},
 };
 use windows_sys::Win32::{
     Security::{GetFileSecurityW, DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES},
@@ -21,10 +24,8 @@ const MAX_BATCH_FILE: usize = 64 * 1024 * 1024;
 static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 fn regular(file: &File) -> Result<u64> {
     let meta = file.metadata()?;
-    if !meta.is_file() || is_reparse(&meta) || super::super::file_link_count(file)? != 1 {
-        return Err(ScopedError::Denied(
-            "only singly-linked regular files are permitted",
-        ));
+    if !meta.is_file() || is_reparse(&meta) {
+        return Err(ScopedError::Denied("only regular files are permitted"));
     }
     Ok(meta.len())
 }
@@ -86,7 +87,7 @@ pub struct MutationGuard<'a> {
 /// Windows UTF-16 uppercase mapping, then SHA-256 over little-endian
 /// code units. Rust Unicode case-folding would choose different mutexes
 /// for case-equivalent NTFS names.
-fn named_lock_key(path: &std::path::Path, scope: &str) -> Result<String> {
+pub(super) fn folded_namespace_key(path: &std::path::Path) -> Result<Vec<u8>> {
     use std::{os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::Globalization::{
         LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT,
@@ -129,10 +130,16 @@ fn named_lock_key(path: &std::path::Path, scope: &str) -> Result<String> {
     if written != required {
         return Err(io::Error::last_os_error().into());
     }
-    let mut hash = Sha256::new();
+    let mut key = Vec::with_capacity(mapped.len() * 2);
     for unit in mapped {
-        hash.update(unit.to_le_bytes());
+        key.extend_from_slice(&unit.to_le_bytes());
     }
+    Ok(key)
+}
+
+fn named_lock_key(path: &std::path::Path, scope: &str) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(folded_namespace_key(path)?);
     let digest = hash
         .finalize()
         .iter()
@@ -140,6 +147,7 @@ fn named_lock_key(path: &std::path::Path, scope: &str) -> Result<String> {
         .collect::<String>();
     Ok(format!("Global\\abird-dotlink-{scope}-{digest}"))
 }
+
 fn directory_identity(file: &File) -> Result<(u32, u64)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -154,6 +162,38 @@ fn directory_identity(file: &File) -> Result<(u32, u64)> {
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     ))
 }
+fn parent_model_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn existing_parent_model_path(path: &str, missing_parents: usize) -> String {
+    let parts = path.split('/').collect::<Vec<_>>();
+    let keep = parts.len().saturating_sub(missing_parents + 1);
+    parts[..keep].join("/")
+}
+
+impl Root {
+    fn reserve_private_artifact(
+        &self,
+        parent: &Parent,
+        parent_path: String,
+        name: &str,
+        object: ObjectIdentity,
+        kind: ArtifactKind,
+    ) -> Result<ArtifactLease> {
+        let parent = self.parent_artifact_identity(parent)?;
+        self.private
+            .reserve(Record {
+                kind,
+                parent_path,
+                parent,
+                name: name.to_owned(),
+                object,
+            })
+            .map_err(|_| ScopedError::Denied("cannot durably reserve private mutation artifact"))
+    }
+}
+
 struct PreparedParent {
     parent: Option<Parent>,
 }
@@ -166,6 +206,79 @@ impl PreparedParent {
     }
 }
 impl Root {
+    pub fn reconcile_private_artifacts(&self) -> Result<()> {
+        for record in self
+            .private
+            .records()
+            .map_err(|_| ScopedError::Denied("private mutation artifact registry unavailable"))?
+        {
+            let path = if record.parent_path.is_empty() {
+                record.name.clone()
+            } else {
+                format!("{}/{}", record.parent_path, record.name)
+            };
+            let (parent, target) = match self.parent(&path) {
+                Ok(value) => value,
+                Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    self.private
+                        .retire_record(&record)
+                        .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if self.parent_artifact_identity(&parent)? != record.parent {
+                self.private
+                    .retire_record(&record)
+                    .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                continue;
+            }
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            };
+            let opened = match fs::OpenOptions::new()
+                .access_mode(0)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&target)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.private
+                        .retire_record(&record)
+                        .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let (volume, object) = super::super::file_identity(&opened)?;
+            if (ObjectIdentity {
+                volume: u64::from(volume),
+                object,
+            }) != record.object
+            {
+                self.private
+                    .retire_record(&record)
+                    .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                continue;
+            }
+            drop(opened);
+            let mut work = aw_tools::filesystem::lifecycle::WorkBudget::default();
+            lifecycle::cleanup_private(&target, 0, &mut work, &|| false)?;
+            if target.exists() {
+                return Err(ScopedError::Denied(
+                    "private mutation artifact cleanup incomplete",
+                ));
+            }
+            self.private
+                .retire_record(&record)
+                .map_err(|_| ScopedError::Denied("cannot retire cleaned private artifact"))?;
+        }
+        Ok(())
+    }
+
     pub fn lock_mutations<'a>(&'a self, paths: &[String]) -> Result<MutationGuard<'a>> {
         self.lock_mutations_with_cancel(paths, &|| false)
     }
@@ -250,8 +363,9 @@ impl Root {
     }
     /// No-follow metadata on a pinned Windows parent chain. Unavailable
     /// status-change timestamps stay None, never synthesized from birth time.
-    pub fn entry_meta(&self, path: &str) -> Result<aw_tools_core::filesystem::EntryMeta> {
-        use aw_tools_core::filesystem::{EntryMeta, Kind};
+    pub fn entry_meta(&self, path: &str) -> Result<aw_tools::filesystem::EntryMeta> {
+        self.ensure_public_path(path)?;
+        use aw_tools::filesystem::{EntryMeta, Kind};
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
@@ -275,7 +389,7 @@ impl Root {
             }
         } else if stat.is_dir() {
             Kind::Dir
-        } else if stat.is_file() && super::super::file_link_count(&file)? == 1 {
+        } else if stat.is_file() {
             Kind::File
         } else {
             Kind::Other
@@ -303,9 +417,6 @@ impl Root {
         if is_reparse(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
             return Err(ScopedError::Denied("unsupported filesystem entry"));
         }
-        if metadata.is_file() && super::super::file_link_count(&file)? != 1 {
-            return Err(ScopedError::Denied("multiply linked file is not granted"));
-        }
         Ok((
             if metadata.is_file() {
                 metadata.len()
@@ -317,6 +428,7 @@ impl Root {
     }
 
     pub fn read_bytes(&self, path: &str, cap: usize) -> Result<Vec<u8>> {
+        self.ensure_public_path(path)?;
         if cap > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("binary read cap exceeds 64 MiB"));
         }
@@ -330,6 +442,7 @@ impl Root {
         offset: u64,
         limit: usize,
     ) -> Result<(Vec<u8>, u64, bool)> {
+        self.ensure_public_path(path)?;
         if limit == 0 || limit > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("invalid binary window limit"));
         }
@@ -365,33 +478,35 @@ impl Root {
         numbered: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, bool)> {
+        self.ensure_public_path(path)?;
         let (_parent, target) = self.parent(path)?;
         let file = super::super::open_nofollow_read(&target)?;
         regular(&file)?;
         let mut reader = BufReader::new(file);
-        aw_tools_core::read::window(&mut reader, offset, limit, cap, numbered, cancelled).map_err(
+        aw_tools::read::window(&mut reader, offset, limit, cap, numbered, cancelled).map_err(
             |error| match error {
-                aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
-                aw_tools_core::read::ReadError::Denied(message) => ScopedError::Denied(message),
-                aw_tools_core::read::ReadError::Limit(message) => ScopedError::Limit(message),
-                aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+                aw_tools::read::ReadError::Io(e) => ScopedError::Io(e),
+                aw_tools::read::ReadError::Denied(message) => ScopedError::Denied(message),
+                aw_tools::read::ReadError::Limit(message) => ScopedError::Limit(message),
+                aw_tools::read::ReadError::Cancelled => ScopedError::Cancelled,
             },
         )
     }
     /// DL-150 resumable line/byte window, entirely on a previously
     /// authorized regular file descriptor. Exact UTF-8 boundaries are
-    /// determined by aw-tools-core, independently of the host platform.
+    /// determined by aw-tools, independently of the host platform.
     pub fn read_page_with_cancel(
         &self,
         path: &str,
-        request: aw_tools_core::read::PageRequest,
+        request: aw_tools::read::PageRequest,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<aw_tools_core::read::Page> {
+    ) -> Result<aw_tools::read::Page> {
+        self.ensure_public_path(path)?;
         let (_parent, target) = self.parent(path)?;
         let file = super::super::open_nofollow_read(&target)?;
         regular(&file)?;
         let mut reader = BufReader::new(file);
-        aw_tools_core::read::page(
+        aw_tools::read::page(
             &mut reader,
             request.line,
             request.lines,
@@ -401,10 +516,10 @@ impl Root {
             cancelled,
         )
         .map_err(|error| match error {
-            aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
-            aw_tools_core::read::ReadError::Denied(reason) => ScopedError::Denied(reason),
-            aw_tools_core::read::ReadError::Limit(reason) => ScopedError::Limit(reason),
-            aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+            aw_tools::read::ReadError::Io(e) => ScopedError::Io(e),
+            aw_tools::read::ReadError::Denied(reason) => ScopedError::Denied(reason),
+            aw_tools::read::ReadError::Limit(reason) => ScopedError::Limit(reason),
+            aw_tools::read::ReadError::Cancelled => ScopedError::Cancelled,
         })
     }
     pub fn stage_create(
@@ -433,6 +548,7 @@ impl Root {
         self.stage(path, data, StageKind::Update(expected), cancel)
     }
     pub fn open_regular(&self, path: &str) -> Result<File> {
+        self.ensure_public_path(path)?;
         let (_parent, target) = self.parent(path)?;
         let file = super::super::open_nofollow_read(&target)?;
         regular(&file)?;
@@ -495,7 +611,7 @@ impl Root {
                         .iter()
                         .map(|s| (*s).to_owned())
                         .collect::<Vec<_>>();
-                    if missing.len() > aw_tools_core::filesystem::lifecycle::MAX_LIFECYCLE_DEPTH {
+                    if missing.len() > aw_tools::filesystem::lifecycle::MAX_LIFECYCLE_DEPTH {
                         return Err(ScopedError::Limit("missing parent suffix too deep"));
                     }
                     return Ok(Some((parent, missing, leaf.to_owned())));
@@ -507,6 +623,7 @@ impl Root {
     }
     fn stage_missing_suffix(
         &self,
+        path: &str,
         parent: Parent,
         missing: Vec<String>,
         leaf: String,
@@ -522,6 +639,24 @@ impl Root {
         let opened = pin_directory(&temp)?;
         let identity = directory_identity(&opened)?;
         drop(opened);
+        let artifact = match self.reserve_private_artifact(
+            &parent,
+            existing_parent_model_path(path, missing.len()),
+            temp.file_name()
+                .and_then(|value| value.to_str())
+                .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
+            ObjectIdentity {
+                volume: u64::from(identity.0),
+                object: identity.1,
+            },
+            ArtifactKind::Stage,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                lifecycle::cleanup_stage_tree(&temp, identity);
+                return Err(error);
+            }
+        };
         let result = (|| -> Result<()> {
             let mut target = temp.clone();
             let mut handles = Vec::with_capacity(missing.len());
@@ -549,9 +684,13 @@ impl Root {
         })();
         if let Err(error) = result {
             lifecycle::cleanup_stage_tree(&temp, identity);
+            if !temp.exists() {
+                let _ = artifact.retire();
+            }
             return Err(error);
         }
         let published = parent.path.join(&missing[0]);
+        let parent_identity = self.parent_artifact_identity(&parent)?;
         Ok(StagedWrite {
             parent: Some(parent),
             target: published,
@@ -562,6 +701,10 @@ impl Root {
             committed: false,
             preserve_on_failure: false,
             temp_dir_identity: Some(identity),
+            artifact: Some(artifact),
+            private: self.private.clone(),
+            parent_identity,
+            parent_model_path: existing_parent_model_path(path, missing.len()),
         })
     }
     fn stage_with(
@@ -571,6 +714,7 @@ impl Root {
         cancelled: &dyn Fn() -> bool,
         writer: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<StagedWrite> {
+        self.ensure_public_path(path)?;
         if cancelled() {
             return Err(ScopedError::Cancelled);
         }
@@ -578,7 +722,7 @@ impl Root {
             if matches!(kind, StageKind::Update(_) | StageKind::UpdateDigest(_)) {
                 return Err(ScopedError::Denied("target changed before update"));
             }
-            return self.stage_missing_suffix(parent, missing, leaf, cancelled, writer);
+            return self.stage_missing_suffix(path, parent, missing, leaf, cancelled, writer);
         }
         let (existing, target) = self.parent(path)?;
         let prepared = PreparedParent {
@@ -624,6 +768,27 @@ impl Root {
             TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let mut out = secure_staging_file(&temp, dacl.as_deref())?;
+        let (stage_volume, stage_object) = super::super::file_identity(&out)?;
+        let parent_ref = prepared.parent.as_ref().expect("prepared parent");
+        let artifact = match self.reserve_private_artifact(
+            parent_ref,
+            parent_model_path(path).to_owned(),
+            temp.file_name()
+                .and_then(|value| value.to_str())
+                .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
+            ObjectIdentity {
+                volume: u64::from(stage_volume),
+                object: stage_object,
+            },
+            ArtifactKind::Stage,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                drop(out);
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        };
         let result = (|| -> Result<()> {
             writer(&mut out)?;
             if out.metadata()?.len() > MAX_BATCH_FILE as u64 {
@@ -638,8 +803,13 @@ impl Root {
         drop(out);
         if let Err(error) = result {
             let _ = fs::remove_file(&temp);
+            if !temp.exists() {
+                let _ = artifact.retire();
+            }
             return Err(error);
         }
+        let parent_identity =
+            self.parent_artifact_identity(prepared.parent.as_ref().expect("prepared parent"))?;
         let parent = prepared.release();
         Ok(StagedWrite {
             parent: Some(parent),
@@ -655,6 +825,10 @@ impl Root {
             committed: false,
             preserve_on_failure: false,
             temp_dir_identity: None,
+            artifact: Some(artifact),
+            private: self.private.clone(),
+            parent_identity,
+            parent_model_path: parent_model_path(path).to_owned(),
         })
     }
 }
@@ -681,6 +855,10 @@ pub struct StagedWrite {
     committed: bool,
     preserve_on_failure: bool,
     temp_dir_identity: Option<(u32, u64)>,
+    artifact: Option<ArtifactLease>,
+    private: Arc<aw_tools::filesystem::private_artifact::Registry>,
+    parent_identity: ObjectIdentity,
+    parent_model_path: String,
 }
 impl StagedWrite {
     pub fn commit(mut self) -> Result<()> {
@@ -708,9 +886,15 @@ impl StagedWrite {
         } else {
             super::super::open_nofollow_read(&self.target)
         };
+        let mut original_identity = None;
         match final_entry {
             Ok(file) => {
                 regular(&file)?;
+                let (volume, object) = super::super::file_identity(&file)?;
+                original_identity = Some(ObjectIdentity {
+                    volume: u64::from(volume),
+                    object,
+                });
                 if self.create || !self.existed {
                     return Err(ScopedError::Denied("target appeared before create"));
                 }
@@ -726,6 +910,11 @@ impl StagedWrite {
             // MoveFileW cannot overwrite an occupied name, unlike MoveFileExW.
             install_create(&self.temp, &self.target)?;
             self.committed = true;
+            if !self.temp.exists() {
+                if let Some(artifact) = self.artifact.take() {
+                    let _ = artifact.retire();
+                }
+            }
             return Ok(());
         }
         let backup = self.target.with_file_name(format!(
@@ -733,6 +922,22 @@ impl StagedWrite {
             std::process::id(),
             TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
+        let backup_name = backup
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(ScopedError::Denied("private backup name is not reusable"))?;
+        let backup_artifact = self
+            .private
+            .reserve(Record {
+                kind: ArtifactKind::Backup,
+                parent_path: self.parent_model_path.clone(),
+                parent: self.parent_identity,
+                name: backup_name.to_owned(),
+                object: original_identity.ok_or(ScopedError::Denied(
+                    "replacement target identity unavailable",
+                ))?,
+            })
+            .map_err(|_| ScopedError::Denied("cannot durably reserve replacement backup"))?;
         let dst = wide(&self.target);
         let src = wide(&self.temp);
         let bak = wide(&backup);
@@ -753,10 +958,29 @@ impl StagedWrite {
             // ReplaceFileW can move the original to the backup even on failure.
             // Never delete uncertain state.
             self.preserve_on_failure = !recover_backup(&self.target, &backup);
+            if !backup.exists() {
+                let _ = backup_artifact.retire();
+            }
             return Err(problem.into());
         }
         self.committed = true;
-        let _ = fs::remove_file(&backup); // after commit; best effort
+        if !self.temp.exists() {
+            if let Some(artifact) = self.artifact.take() {
+                let _ = artifact.retire();
+            }
+        }
+        match fs::remove_file(&backup) {
+            Ok(()) => {
+                let _ = backup_artifact.retire();
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let _ = backup_artifact.retire();
+            }
+            Err(_) => {
+                // Keep exact recovery ownership for the surviving backup.
+                drop(backup_artifact);
+            }
+        }
         Ok(())
     }
 }
@@ -767,6 +991,11 @@ impl Drop for StagedWrite {
                 lifecycle::cleanup_stage_tree(&self.temp, identity);
             } else {
                 let _ = fs::remove_file(&self.temp);
+            }
+            if !self.temp.exists() {
+                if let Some(artifact) = self.artifact.take() {
+                    let _ = artifact.retire();
+                }
             }
             drop(self.parent.take());
         }
@@ -865,7 +1094,7 @@ fn recover_backup(target: &std::path::Path, backup: &std::path::Path) -> bool {
 }
 
 #[path = "port/lifecycle.rs"]
-mod lifecycle;
+pub(super) mod lifecycle;
 
 #[cfg(test)]
 mod mutation_lock_key_tests {
@@ -875,8 +1104,19 @@ mod mutation_lock_key_tests {
         let a = std::path::Path::new(r"C:\AW\Workspace\FILE.TXT");
         let b = std::path::Path::new(r"c:\aw\workspace\file.txt");
         assert_eq!(
+            folded_namespace_key(a).unwrap(),
+            folded_namespace_key(b).unwrap(),
+            "mutation planning and lock admission must share Windows case identity"
+        );
+        assert_eq!(
             named_lock_key(a, "path").unwrap(),
             named_lock_key(b, "path").unwrap()
+        );
+        let parent_a = std::path::Path::new(r"C:\AW\Workspace\Dir");
+        let parent_b = std::path::Path::new(r"c:\aw\workspace\dir");
+        assert_eq!(
+            named_lock_key(parent_a, "overlap").unwrap(),
+            named_lock_key(parent_b, "overlap").unwrap()
         );
         assert_eq!(
             named_lock_key(a, "admission").unwrap(),

@@ -17,7 +17,7 @@ pub use aw_agent_core::{
 pub use aw_providers::{catalog, config, discovery, provider};
 #[cfg(feature = "durable")]
 use aw_store::SessionStore;
-pub use aw_tools::{LocalToolOptions, ToolMode};
+pub use aw_tools_adapter::{LocalToolConcurrency, LocalToolLimits, LocalToolOptions, ToolMode};
 use std::sync::Arc;
 #[cfg(test)]
 mod test_support;
@@ -317,7 +317,7 @@ pub fn configured_oauth_execution(
         settings.profile.effective_models(),
     );
     let builder = Agent::builder(provider, options).account(account, actor.clone(), "local");
-    aw_tools::configure(builder, actor, tool_options)?.build()
+    aw_tools_adapter::configure(builder, actor, tool_options)?.build()
 }
 
 /// Register one explicitly selected durable server/shared provider account into
@@ -408,7 +408,7 @@ pub fn unconfigured_execution(
         actor.clone(),
         "local",
     );
-    let agent = aw_tools::configure(builder, actor, tool_options)?.build()?;
+    let agent = aw_tools_adapter::configure(builder, actor, tool_options)?.build()?;
     agent.provider_accounts().revoke("__unconfigured")?;
     Ok(agent)
 }
@@ -476,7 +476,7 @@ pub fn configured_execution(
         )
     };
     builder = builder.account(account, actor.clone(), "local");
-    aw_tools::configure(builder, actor, tool_options)?.build()
+    aw_tools_adapter::configure(builder, actor, tool_options)?.build()
 }
 
 /// Register or replace one same-user OAuth-backed ChatGPT plan profile in the

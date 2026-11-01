@@ -9,11 +9,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 pub const MAX_TOOL_CALLS_PER_ROUND: usize = aw_agent_kernel::turn::MAX_BATCH;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+pub const MIN_TOOL_RESULT_BYTES: usize = 512;
 pub const MAX_TOOL_RESULT_BYTES: usize = 128 * 1024;
 pub const MAX_TRACE_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,8 +151,19 @@ pub(crate) fn envelope_permits_tool(
 pub struct ToolContext {
     pub actor: PrincipalId,
     pub turn_id: u64,
+    /// Exact host/tool-call identity. Agent dispatch uses ToolCall.id; direct
+    /// host invocations must supply an explicit synthetic identity.
+    pub call_id: String,
+    /// Exact admitted origin/effect for this invocation. These are factual
+    /// context, not additional authority.
+    pub source: ToolSource,
+    pub effect: ToolEffect,
     pub execution_site: String,
     pub cancellation: CancellationToken,
+    /// Maximum bytes this invocation may return without host-side truncation.
+    /// This is a presentation/resource ceiling, never tool authority. Composite
+    /// runtimes may replace it with a separately captured semantic node budget.
+    pub result_budget_bytes: usize,
     /// Exact provider/account/model identity selected and revalidated for this
     /// model round. This is evidence for a tool; it does not grant a tool the
     /// ability to select a different account/model.
@@ -160,6 +172,22 @@ pub struct ToolContext {
     /// journaled. Memory-only callers remain unscoped.
     pub scope: Option<InvocationScope>,
 }
+impl ToolContext {
+    pub fn result_budget(&self, ceiling: usize) -> Result<usize> {
+        let budget = self
+            .result_budget_bytes
+            .min(ceiling)
+            .min(MAX_TOOL_RESULT_BYTES);
+        if budget < MIN_TOOL_RESULT_BYTES {
+            Err(Error::Config(
+                "tool result budget must reserve at least 512 bytes".into(),
+            ))
+        } else {
+            Ok(budget)
+        }
+    }
+}
+
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>>;
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
@@ -190,6 +218,19 @@ pub(crate) fn guarded_parallel_hint(tool: &dyn Tool, first: &Value, second: &Val
 }
 /// Host-controlled tool origin. An external source revision must be minted by
 /// the trusted registry owner; a server-reported version string is not authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolBindingSnapshot {
+    pub name: String,
+    pub registry_revision: u64,
+    /// Host-minted generation of the effective registry+policy publication.
+    /// Revoke/regrant always advances this so stale prepared work cannot regain
+    /// authority merely because the same source/effect is visible again.
+    pub authority_revision: u64,
+    pub source: ToolSource,
+    pub effect: ToolEffect,
+    pub execution_site: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ToolSource {
     pub kind: SourceKind,
@@ -211,6 +252,13 @@ impl ToolSource {
             kind: SourceKind::Host,
             id: "trusted-host".into(),
             epoch: 1,
+        }
+    }
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            SourceKind::Host => "host",
+            SourceKind::Mcp => "mcp",
+            SourceKind::Extension => "extension",
         }
     }
     fn as_kernel(&self) -> Result<Source<'_>> {
@@ -250,6 +298,34 @@ impl ExactToolGrant {
             .is_some_and(|grant| grant.permits(actor, site, cap))
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolParallelism {
+    pub max_parallel_reads: usize,
+    pub allow_parallel_shell: bool,
+    pub max_parallel_shell: usize,
+}
+impl Default for ToolParallelism {
+    fn default() -> Self {
+        Self {
+            max_parallel_reads: aw_agent_kernel::turn::DEFAULT_PARALLEL_READS,
+            allow_parallel_shell: true,
+            max_parallel_shell: aw_agent_kernel::turn::DEFAULT_PARALLEL_BASH,
+        }
+    }
+}
+impl ToolParallelism {
+    pub fn validate(self) -> Result<Self> {
+        if !(1..=aw_agent_kernel::turn::MAX_READ_WAVE).contains(&self.max_parallel_reads)
+            || !(1..=aw_agent_kernel::turn::MAX_READ_WAVE).contains(&self.max_parallel_shell)
+        {
+            return Err(Error::Config(
+                "tool parallel ceilings must be within 1..=128".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolPolicy {
     pub execution_site: String,
@@ -274,14 +350,32 @@ impl Default for ToolPolicy {
             source_grants: BTreeMap::new(),
             max_model_rounds: 8,
             max_tool_calls: aw_agent_kernel::turn::MAX_CALLS,
-            max_parallel_reads: aw_agent_kernel::turn::DEFAULT_PARALLEL_READS,
-            allow_parallel_bash: true,
-            max_parallel_bash: aw_agent_kernel::turn::DEFAULT_PARALLEL_BASH,
+            max_parallel_reads: ToolParallelism::default().max_parallel_reads,
+            allow_parallel_bash: ToolParallelism::default().allow_parallel_shell,
+            max_parallel_bash: ToolParallelism::default().max_parallel_shell,
             timeout: Duration::from_secs(30),
         }
     }
 }
 impl ToolPolicy {
+    pub fn has_grants(&self) -> bool {
+        self.source_grants.values().any(|grants| !grants.is_empty())
+    }
+
+    pub fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism {
+            max_parallel_reads: self.max_parallel_reads,
+            allow_parallel_shell: self.allow_parallel_bash,
+            max_parallel_shell: self.max_parallel_bash,
+        }
+    }
+
+    pub(crate) fn set_parallelism(&mut self, value: ToolParallelism) {
+        self.max_parallel_reads = value.max_parallel_reads;
+        self.allow_parallel_bash = value.allow_parallel_shell;
+        self.max_parallel_bash = value.max_parallel_shell;
+    }
+
     /// Trusted host only: a built-in tool's cached name and effect are
     /// granted through the *same* source-bound predicate as MCP/extensions.
     /// A name by itself cannot authorize anything.
@@ -359,6 +453,7 @@ pub(crate) struct RegisteredTool {
     tool: Arc<dyn Tool>,
     spec: ToolSpec,
     source: ToolSource,
+    registered_revision: u64,
 }
 impl RegisteredTool {
     fn capability(&self) -> Result<Capability<'_>> {
@@ -424,13 +519,23 @@ impl ToolRegistry {
             _ => Error::Config("invalid tool registry snapshot".into()),
         })?;
         let name = spec.name.clone();
-        self.tools
-            .insert(name.clone(), RegisteredTool { tool, spec, source });
+        self.tools.insert(
+            name.clone(),
+            RegisteredTool {
+                tool,
+                spec,
+                source,
+                registered_revision: next_revision,
+            },
+        );
         self.revision = next_revision;
         Ok(name)
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    fn binding_revision(&self, name: &str) -> Option<u64> {
+        self.tools.get(name).map(|item| item.registered_revision)
     }
     pub fn visible(&self, actor: &PrincipalId, policy: &ToolPolicy) -> Vec<ToolSpec> {
         self.tools
@@ -475,6 +580,217 @@ impl ToolRegistry {
             .map(|item| (item.tool.clone(), item.spec.clone()))
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BindingKey {
+    actor: String,
+    name: String,
+    source_kind: u8,
+    source_id: String,
+    source_epoch: u64,
+    effect: u8,
+    site: String,
+}
+fn binding_effect_key(effect: &ToolEffect) -> u8 {
+    match effect {
+        ToolEffect::Read => 0,
+        ToolEffect::Write => 1,
+        ToolEffect::Process => 2,
+        ToolEffect::Unknown => 3,
+    }
+}
+fn binding_source_key(kind: SourceKind) -> u8 {
+    match kind {
+        SourceKind::Host => 0,
+        SourceKind::Mcp => 1,
+        SourceKind::Extension => 2,
+    }
+}
+fn binding_key(
+    actor: &PrincipalId,
+    name: &str,
+    source: &ToolSource,
+    effect: &ToolEffect,
+    site: &str,
+) -> BindingKey {
+    BindingKey {
+        actor: actor.as_str().to_owned(),
+        name: name.to_owned(),
+        source_kind: binding_source_key(source.kind),
+        source_id: source.id.clone(),
+        source_epoch: source.epoch,
+        effect: binding_effect_key(effect),
+        site: site.to_owned(),
+    }
+}
+
+#[derive(Clone, Default)]
+struct BindingView {
+    registry: ToolRegistry,
+    policy: ToolPolicy,
+    generations: BTreeMap<BindingKey, u64>,
+    next_generation: u64,
+    publication_revision: u64,
+}
+
+/// Read-only live view of the current tool registry + grants for long-lived
+/// host services such as Job execution. It can never register or grant tools.
+struct ToolBindingAuthorityInner {
+    view: RwLock<BindingView>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+#[derive(Clone)]
+pub struct ToolBindingAuthority {
+    inner: Arc<ToolBindingAuthorityInner>,
+}
+impl Default for ToolBindingAuthority {
+    fn default() -> Self {
+        let (changes, _) = tokio::sync::watch::channel(0u64);
+        Self {
+            inner: Arc::new(ToolBindingAuthorityInner {
+                view: RwLock::new(BindingView::default()),
+                changes,
+            }),
+        }
+    }
+}
+impl ToolBindingAuthority {
+    pub(crate) fn publish(&self, registry: &ToolRegistry, policy: &ToolPolicy) -> Result<()> {
+        let mut view = self
+            .inner
+            .view
+            .write()
+            .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
+        let current = policy
+            .source_grants
+            .iter()
+            .flat_map(|(actor, grants)| {
+                grants.iter().map(move |grant| {
+                    binding_key(
+                        actor,
+                        &grant.name,
+                        &grant.source,
+                        match grant.effect {
+                            Effect::Read => &ToolEffect::Read,
+                            Effect::Write => &ToolEffect::Write,
+                            Effect::Process => &ToolEffect::Process,
+                            Effect::Unknown => &ToolEffect::Unknown,
+                        },
+                        &grant.site,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let previous = std::mem::take(&mut view.generations);
+        let mut generations = BTreeMap::new();
+        let mut next_generation = view.next_generation;
+        for key in current {
+            let generation = if let Some(existing) = previous.get(&key) {
+                *existing
+            } else {
+                next_generation = next_generation
+                    .checked_add(1)
+                    .ok_or(Error::Limit("tool authority generations exhausted"))?;
+                next_generation
+            };
+            generations.insert(key, generation);
+        }
+        view.registry = registry.clone();
+        view.policy = policy.clone();
+        view.generations = generations;
+        view.next_generation = next_generation;
+        view.publication_revision = view
+            .publication_revision
+            .checked_add(1)
+            .ok_or(Error::Limit("tool authority publications exhausted"))?;
+        let revision = view.publication_revision;
+        drop(view);
+        self.inner.changes.send_replace(revision);
+        Ok(())
+    }
+
+    pub fn permitted_binding(
+        &self,
+        actor: &PrincipalId,
+        name: &str,
+    ) -> Result<ToolBindingSnapshot> {
+        let view = self
+            .inner
+            .view
+            .read()
+            .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
+        if !view.registry.allows(actor, &view.policy, name) {
+            return Err(Error::Denied("tool is not currently permitted"));
+        }
+        let source = view
+            .registry
+            .source_of(name)
+            .ok_or(Error::Denied("tool source unavailable"))?
+            .clone();
+        let effect = view
+            .registry
+            .effect_of(name)
+            .ok_or(Error::Denied("tool effect unavailable"))?
+            .clone();
+        let key = binding_key(actor, name, &source, &effect, &view.policy.execution_site);
+        let authority_revision = *view
+            .generations
+            .get(&key)
+            .ok_or(Error::Denied("tool grant generation unavailable"))?;
+        Ok(ToolBindingSnapshot {
+            name: name.to_owned(),
+            registry_revision: view
+                .registry
+                .binding_revision(name)
+                .ok_or(Error::Denied("tool registry binding unavailable"))?,
+            authority_revision,
+            source,
+            effect,
+            execution_site: view.policy.execution_site.clone(),
+        })
+    }
+
+    /// Wait until this exact captured binding is no longer live. Unrelated
+    /// publications merely wake and revalidate; they never revoke this binding.
+    /// A poisoned/unavailable authority fails closed as not-live.
+    pub async fn wait_until_not_live(&self, actor: &PrincipalId, binding: &ToolBindingSnapshot) {
+        let mut changes = self.inner.changes.subscribe();
+        loop {
+            if self.revalidate(actor, binding).is_err() {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub fn revalidate(&self, actor: &PrincipalId, binding: &ToolBindingSnapshot) -> Result<()> {
+        let view = self
+            .inner
+            .view
+            .read()
+            .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
+        let key = binding_key(
+            actor,
+            &binding.name,
+            &binding.source,
+            &binding.effect,
+            &binding.execution_site,
+        );
+        if view.registry.binding_revision(&binding.name) != Some(binding.registry_revision)
+            || view.generations.get(&key).copied() != Some(binding.authority_revision)
+            || binding.execution_site != view.policy.execution_site
+            || view.registry.source_of(&binding.name) != Some(&binding.source)
+            || view.registry.effect_of(&binding.name) != Some(&binding.effect)
+            || !view.registry.allows(actor, &view.policy, &binding.name)
+        {
+            return Err(Error::Denied("captured tool binding is no longer live"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
@@ -491,6 +807,117 @@ pub struct ToolRecord {
     pub execution_site: String,
     pub status: ToolStatus,
     pub output: Option<ToolOutput>,
+}
+
+#[cfg(test)]
+mod binding_authority_tests {
+    use super::*;
+
+    struct ReadTool(&'static str);
+    impl Tool for ReadTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.0.into(),
+                description: "fixture".into(),
+                parameters: serde_json::json!({"type":"object"}),
+                effect: ToolEffect::Read,
+            }
+        }
+        fn validate(&self, _: &Value) -> Result<()> {
+            Ok(())
+        }
+        fn execute<'a>(&'a self, _: ToolContext, _: &'a Value) -> ToolFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::text("ok")) })
+        }
+    }
+
+    #[test]
+    fn unrelated_registration_and_grant_preserve_exact_binding_generation() {
+        let actor = PrincipalId::new("a").unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(Arc::new(ReadTool("one"))).unwrap();
+        let mut policy = ToolPolicy::default();
+        policy
+            .permit_host(actor.clone(), "one", &ToolEffect::Read)
+            .unwrap();
+        let authority = ToolBindingAuthority::default();
+        authority.publish(&registry, &policy).unwrap();
+        let original = authority.permitted_binding(&actor, "one").unwrap();
+
+        registry.register(Arc::new(ReadTool("two"))).unwrap();
+        policy
+            .permit_host(actor.clone(), "two", &ToolEffect::Read)
+            .unwrap();
+        authority.publish(&registry, &policy).unwrap();
+        let current = authority.permitted_binding(&actor, "one").unwrap();
+        assert_eq!(original, current);
+        authority.revalidate(&actor, &original).unwrap();
+    }
+
+    #[tokio::test]
+    async fn binding_change_wait_ignores_unrelated_publish_and_finishes_on_exact_revoke() {
+        let actor = PrincipalId::new("a").unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(Arc::new(ReadTool("one"))).unwrap();
+        registry.register(Arc::new(ReadTool("two"))).unwrap();
+        let mut policy = ToolPolicy::default();
+        policy
+            .permit_host(actor.clone(), "one", &ToolEffect::Read)
+            .unwrap();
+        let authority = ToolBindingAuthority::default();
+        authority.publish(&registry, &policy).unwrap();
+        let binding = authority.permitted_binding(&actor, "one").unwrap();
+        let waiter = {
+            let authority = authority.clone();
+            let actor = actor.clone();
+            let binding = binding.clone();
+            tokio::spawn(async move {
+                authority.wait_until_not_live(&actor, &binding).await;
+            })
+        };
+        policy
+            .permit_host(actor.clone(), "two", &ToolEffect::Read)
+            .unwrap();
+        authority.publish(&registry, &policy).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "unrelated grant must not revoke binding"
+        );
+        policy.revoke_source(&actor, "one", &ToolSource::trusted_host());
+        authority.publish(&registry, &policy).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("exact revoke must wake binding waiter")
+            .unwrap();
+    }
+
+    #[test]
+    fn revoke_then_regrant_mints_new_exact_grant_generation() {
+        let actor = PrincipalId::new("a").unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(Arc::new(ReadTool("one"))).unwrap();
+        let mut policy = ToolPolicy::default();
+        policy
+            .permit_host(actor.clone(), "one", &ToolEffect::Read)
+            .unwrap();
+        let authority = ToolBindingAuthority::default();
+        authority.publish(&registry, &policy).unwrap();
+        let original = authority.permitted_binding(&actor, "one").unwrap();
+
+        policy.revoke_source(&actor, "one", &ToolSource::trusted_host());
+        authority.publish(&registry, &policy).unwrap();
+        assert!(authority.revalidate(&actor, &original).is_err());
+        policy
+            .permit_host(actor.clone(), "one", &ToolEffect::Read)
+            .unwrap();
+        authority.publish(&registry, &policy).unwrap();
+        let current = authority.permitted_binding(&actor, "one").unwrap();
+        assert_eq!(current.registry_revision, original.registry_revision);
+        assert!(current.authority_revision > original.authority_revision);
+        assert!(authority.revalidate(&actor, &original).is_err());
+        authority.revalidate(&actor, &current).unwrap();
+    }
 }
 
 #[cfg(test)]

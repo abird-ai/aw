@@ -22,7 +22,7 @@ use aw_agent_core::{
     InvocationIdentity, Tool, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSource, ToolSpec,
 };
 use aw_agent_kernel::actor::ActorKey;
-use aw_tools::process::PipeProcess;
+use aw_tools_adapter::process::PipeProcess;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -438,21 +438,21 @@ pub fn install(
             processes: processes.clone(),
         }));
         if let Err(error) = result {
-            for previous in &installed {
-                agent.revoke_registered_source_tool(
-                    &identity.actor,
-                    previous,
-                    &ToolSource::trusted_host(),
-                );
-            }
+            agent.revoke_registered_source_tools(
+                &identity.actor,
+                installed.iter().copied(),
+                &ToolSource::trusted_host(),
+            )?;
             return Err(error);
         }
         installed.push(item.name());
     }
     if let Err(error) = owner.verify_rpc_agent(agent) {
-        for name in installed {
-            agent.revoke_registered_source_tool(&identity.actor, name, &ToolSource::trusted_host());
-        }
+        agent.revoke_registered_source_tools(
+            &identity.actor,
+            installed,
+            &ToolSource::trusted_host(),
+        )?;
         return Err(error);
     }
     Ok(())

@@ -24,6 +24,7 @@ pub enum Selection<'a> {
 }
 
 pub struct Sessions {
+    state_dir: PathBuf,
     store: JsonlStore,
     actor: PrincipalId,
     current: Option<Arc<dyn SessionCursor>>,
@@ -57,10 +58,15 @@ impl Sessions {
             std::fs::create_dir_all(&root)?;
         }
         Ok(Self {
+            state_dir: root.clone(),
             store: JsonlStore::open(root.join("sessions-jsonl"))?,
             actor: PrincipalId::new(aw_platform::local_principal()?)?,
             current: None,
         })
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 
     pub fn list(&self) -> Result<Vec<SessionInfo>> {

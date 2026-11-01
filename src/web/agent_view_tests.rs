@@ -33,6 +33,9 @@ fn read_fixture() -> ReadFixture {
         selected_tools: vec![],
         execution_site: "local".into(),
         bash: None,
+        private_state_dir: None,
+        concurrency: crate::LocalToolConcurrency::default(),
+        limits: crate::LocalToolLimits::default(),
     };
     let binding = sessions::binding(&settings, &context, &tools).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));

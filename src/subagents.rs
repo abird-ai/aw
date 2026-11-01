@@ -1,6 +1,6 @@
 use aw::{
-    config::Settings, Agent, AgentOptions, CancellationToken, Error, LocalToolOptions, Result,
-    ToolMode,
+    config::Settings, Agent, AgentOptions, CancellationToken, Error, LocalToolConcurrency,
+    LocalToolLimits, LocalToolOptions, Result, ToolMode,
 };
 use aw_agent_core::{
     InvocationIdentity, JournalEntry, JournalFuture, ProviderAccounts, ProviderSelection, Tool,
@@ -112,6 +112,8 @@ pub struct ChildRoutingConfig;
 #[derive(Clone)]
 pub struct ServiceConfig {
     child_tool_mode: ToolMode,
+    child_tool_concurrency: LocalToolConcurrency,
+    child_tool_limits: LocalToolLimits,
     budget: BudgetConfig,
     child_routing: Option<ChildRoutingConfig>,
     state_dir: PathBuf,
@@ -127,6 +129,8 @@ impl ServiceConfig {
     ) -> Self {
         Self {
             child_tool_mode,
+            child_tool_concurrency: LocalToolConcurrency::default(),
+            child_tool_limits: LocalToolLimits::default(),
             budget,
             child_routing: None,
             state_dir,
@@ -138,6 +142,22 @@ impl ServiceConfig {
     pub fn with_child_routing(mut self, child_routing: Option<ChildRoutingConfig>) -> Self {
         self.child_routing = child_routing;
         self
+    }
+    /// Host-only resource ceilings inherited by every tool-enabled child.
+    /// These are never parsed from model subagent arguments.
+    pub fn with_child_tool_runtime(
+        mut self,
+        concurrency: LocalToolConcurrency,
+        limits: LocalToolLimits,
+    ) -> Result<Self> {
+        self.child_tool_concurrency = concurrency.validate()?;
+        self.child_tool_limits = limits.validate()?;
+        if self.child_tool_concurrency.graph_width > self.child_tool_limits.jobs.max_active_nodes {
+            return Err(Error::Config(
+                "child Graph parallel ceiling exceeds child Job active-node ceiling".into(),
+            ));
+        }
+        Ok(self)
     }
     /// Explicit host-only opt-in to Actor metadata/control for existing
     /// durable child Sessions; the ordinary child path remains unchanged.
@@ -153,6 +173,8 @@ struct Inner {
     accounts: ProviderAccounts,
     settings: Settings,
     child_tool_mode: ToolMode,
+    child_tool_concurrency: LocalToolConcurrency,
+    child_tool_limits: LocalToolLimits,
     budget: BudgetConfig,
     #[cfg(feature = "routing")]
     child_routing: Option<ChildRoutingConfig>,
@@ -361,6 +383,8 @@ impl Service {
     ) -> Result<Self> {
         let ServiceConfig {
             child_tool_mode,
+            child_tool_concurrency,
+            child_tool_limits,
             budget,
             child_routing,
             state_dir: _state_dir,
@@ -417,6 +441,8 @@ impl Service {
                 accounts,
                 settings,
                 child_tool_mode,
+                child_tool_concurrency,
+                child_tool_limits,
                 budget,
                 #[cfg(feature = "routing")]
                 child_routing,
@@ -1152,7 +1178,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                     ToolMode::Off | ToolMode::Trusted => unreachable!("child mode validated"),
                 };
                 child_tools.execution_site = format!("subagent:{}", info.id);
-                builder = aw_tools::configure(builder, ctx.actor.clone(), &child_tools)?;
+                child_tools.concurrency = inner.child_tool_concurrency;
+                child_tools.limits = inner.child_tool_limits;
+                child_tools.private_state_dir = Some(inner.state_dir.clone());
+                builder = aw_tools_adapter::configure(builder, ctx.actor.clone(), &child_tools)?;
             }
             let mut agent = builder.build()?;
             if allocation.depth < root.limits.max_depth {
@@ -2038,6 +2067,42 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn child_tool_runtime_is_host_owned_and_narrowing() {
+        let mut limits = LocalToolLimits::default();
+        limits.schema.text_write_bytes = 1024;
+        limits.jobs.max_active_nodes = 2;
+        let concurrency = LocalToolConcurrency {
+            graph_width: 2,
+            parallelism: aw_agent_core::ToolParallelism {
+                max_parallel_reads: 1,
+                allow_parallel_shell: false,
+                max_parallel_shell: 1,
+            },
+        };
+        let config = ServiceConfig::new(
+            ToolMode::ReadOnly,
+            BudgetConfig::default(),
+            PathBuf::from("/tmp"),
+            None,
+        )
+        .with_child_tool_runtime(concurrency, limits)
+        .unwrap();
+        assert_eq!(config.child_tool_concurrency, concurrency);
+        assert_eq!(config.child_tool_limits, limits);
+
+        let mut widened = LocalToolLimits::default();
+        widened.schema.text_write_bytes += 1;
+        assert!(ServiceConfig::new(
+            ToolMode::ReadOnly,
+            BudgetConfig::default(),
+            PathBuf::from("/tmp"),
+            None,
+        )
+        .with_child_tool_runtime(concurrency, widened)
+        .is_err());
+    }
+
     fn settings() -> Settings {
         let mut profile = config::builtins().remove("openai").unwrap();
         profile.model = Some("fixture-model".into());
@@ -2078,8 +2143,12 @@ mod tests {
         let context = ToolContext {
             actor: owner.clone(),
             turn_id: 1,
+            call_id: "host-direct".into(),
+            source: aw_agent_core::ToolSource::trusted_host(),
+            effect: aw_agent_core::ToolEffect::Unknown,
             execution_site: "local".into(),
             cancellation: CancellationToken::new(),
+            result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: selected.identity().clone(),
             scope: Some(InvocationScope {
                 session_id: root.id.clone(),
@@ -2272,8 +2341,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity: identity.clone(),
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),
@@ -2389,8 +2462,10 @@ mod tests {
             ServiceConfig::new(ToolMode::Off,BudgetConfig::default(),
                 PathBuf::from("/tmp"),None).with_child_actors(actors.clone())).unwrap();
         let response=service.execute(ToolContext{
-            actor:actor.clone(),turn_id:1,execution_site:"local".into(),
-            cancellation:CancellationToken::new(),identity,
+            actor:actor.clone(),turn_id:1,call_id:"host-direct".into(),source:aw_agent_core::ToolSource::trusted_host(),effect:aw_agent_core::ToolEffect::Unknown,execution_site:"local".into(),
+            cancellation:CancellationToken::new(),
+            result_budget_bytes:aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+            identity,
             scope:Some(InvocationScope{
                 session_id:parent.id.clone(),branch_id:branch.id.clone()
             }),
@@ -2505,8 +2580,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),
@@ -2670,8 +2749,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),
@@ -2884,8 +2967,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),
@@ -3024,8 +3111,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),
@@ -3213,8 +3304,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),
@@ -3344,8 +3439,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),
@@ -3467,8 +3566,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),

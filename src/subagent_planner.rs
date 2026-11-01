@@ -171,8 +171,12 @@ impl Service {
         ToolContext {
             actor: ctx.actor.clone(),
             turn_id: ctx.turn_id,
+            call_id: ctx.call_id.clone(),
+            source: ctx.source.clone(),
+            effect: ctx.effect.clone(),
             execution_site: ctx.execution_site.clone(),
             cancellation: ctx.cancellation.clone(),
+            result_budget_bytes: ctx.result_budget_bytes,
             identity: ctx.identity.clone(),
             scope: ctx.scope.clone(),
         }

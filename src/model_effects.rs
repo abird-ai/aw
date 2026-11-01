@@ -126,7 +126,7 @@ pub fn install_queue_enqueue(owner: &Service, agent: &mut Agent) -> Result<()> {
             &identity.actor,
             TOOL_NAME,
             &ToolSource::trusted_host(),
-        );
+        )?;
         return Err(error);
     }
     Ok(())
@@ -334,25 +334,21 @@ pub fn install_queue_dispositions(
             tool: *item,
         }));
         if let Err(error) = result {
-            for previous in installed {
-                agent.revoke_registered_source_tool(
-                    &original.actor,
-                    previous,
-                    &ToolSource::trusted_host(),
-                );
-            }
+            agent.revoke_registered_source_tools(
+                &original.actor,
+                installed.iter().copied(),
+                &ToolSource::trusted_host(),
+            )?;
             return Err(error);
         }
         installed.push(item.name());
     }
     if let Err(error) = owner.verify_rpc_agent(agent) {
-        for installed in installed {
-            agent.revoke_registered_source_tool(
-                &original.actor,
-                installed,
-                &ToolSource::trusted_host(),
-            );
-        }
+        agent.revoke_registered_source_tools(
+            &original.actor,
+            installed,
+            &ToolSource::trusted_host(),
+        )?;
         return Err(error);
     }
     Ok(())

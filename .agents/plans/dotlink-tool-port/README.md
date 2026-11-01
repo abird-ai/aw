@@ -6,6 +6,10 @@ Co-authors: ChatGPT GPT-6
 
 Owner: @pvl
 
+## Current convergence target — 2026-10-31
+
+The next implementation target supersedes older architecture notes in this historical plan where they conflict: [SHARED-AW-TOOLS-CONVERGENCE-2026-10-31.md](SHARED-AW-TOOLS-CONVERGENCE-2026-10-31.md). The final package direction is `aw-tools-core -> aw-tools`, current `aw-tools -> aw-tools-adapter`, with the canonical shared JobManager also living in `aw-tools`. Dotlink consumes the same shared implementation through a thin product adapter. The sealed DL-150 model-facing semantics remain authoritative.
+
 ## Scope
 
 Port dotlink's 2026-10-25 tool surface and available 2026-10-26 hardening
@@ -18,9 +22,10 @@ uncommitted tool-hardening working tree. Source/tests outrank historical plans.
 - **Keep AW**: its one original `Agent`, `ToolRegistry`, `ToolPolicy`,
   TurnMachine, durable intent-before-effect journal, source epochs and
   explicit model-directed read/Bash waves.
-- **Native tools**: `aw-tools` modules `search`, `text`, `edit`, `patch`,
-  `binary`. No additional agent, executor, tool policy or model-context
-  authorizer. `find` model tool retired; `ls` offers recursive glob discovery.
+- **Native tools**: canonical `aw-tools` owns the transport-neutral
+  `ls/find/grep/read/write/edit/patch/cp/mv/rm/bread/bwrite/bedit` semantics;
+  `aw-tools-adapter` owns AW projection/compatibility. No additional agent,
+  executor, tool policy or model-context authorizer exists.
 - **Lowest-layer primitives**: `aw-platform-{unix,win}::scoped_fs` owns
   no-follow IO, bounded line/byte windows, atomic create/update/replace,
   snapshot verification, permission/DACL protection and mutation coordination.
@@ -34,9 +39,11 @@ uncommitted tool-hardening working tree. Source/tests outrank historical plans.
 
 ## Decisions
 
-- AW's 64 KiB tool arguments and 128 KiB result bounds outrank dotlink's
-  larger profile-configurable transfer limits; the native file tool defaults
-  are correspondingly bounded.
+- Shared engine-safety maxima are deliberately larger than either product's
+  defaults: canonical schemas/rendering/Graph payloads and Job spool/page
+  primitives accept host-selected bounded ceilings without embedding AW policy.
+  AW's `LocalToolLimits` keeps its existing smaller defaults and may only narrow
+  them; dotlink may map its larger profile ceilings through the same shared API.
 - New `write` and `bwrite` explicitly support atomic create/replace,
   like dotlink, versus AW's older create-only model. The retained
   `Root::create` API stays create-only but shares the staged write path.
@@ -163,7 +170,6 @@ Windows/macOS runtime verification. AW `bread(format=mcp)` is encoded
 JSON, **not** typed MCP media. Sandboxed shell and typed provider-native
 tool results remain explicitly separate design gates. Neither was declared
 complete by the filesystem hardening commit.
-
 
 ## Final filesystem and model-result remediation — 2026-10-27
 

@@ -1,6 +1,9 @@
 //! Bounded file windows, staged mutation and cooperative workspace writes.
 //! Filesystem authority comes exclusively from the pinned `Root`.
 use super::{at, cstring, validate_path, Result, Root, ScopedError};
+use aw_tools::filesystem::private_artifact::{
+    Kind as ArtifactKind, Lease as ArtifactLease, ObjectIdentity, Record,
+};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
@@ -16,10 +19,8 @@ static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 fn regular(file: &File) -> Result<u64> {
     let meta = file.metadata()?;
-    if !meta.is_file() || meta.nlink() != 1 {
-        return Err(ScopedError::Denied(
-            "only singly-linked regular files are permitted",
-        ));
+    if !meta.is_file() {
+        return Err(ScopedError::Denied("only regular files are permitted"));
     }
     Ok(meta.len())
 }
@@ -60,6 +61,38 @@ fn digest_file(mut file: File) -> Result<(u64, [u8; 32])> {
         digest.update(&buf[..n]);
     }
     Ok((count, digest.finalize().into()))
+}
+
+fn parent_model_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn existing_parent_model_path(path: &str, missing_parents: usize) -> String {
+    let parts = path.split('/').collect::<Vec<_>>();
+    let keep = parts.len().saturating_sub(missing_parents + 1);
+    parts[..keep].join("/")
+}
+
+impl Root {
+    fn reserve_private_artifact(
+        &self,
+        parent: &File,
+        parent_path: String,
+        name: &str,
+        object: ObjectIdentity,
+        kind: ArtifactKind,
+    ) -> Result<ArtifactLease> {
+        let parent = Self::artifact_identity(&parent.metadata()?);
+        self.private
+            .reserve(Record {
+                kind,
+                parent_path,
+                parent,
+                name: name.to_owned(),
+                object,
+            })
+            .map_err(|_| ScopedError::Denied("cannot durably reserve private mutation artifact"))
+    }
 }
 
 // Skip a line without buffering arbitrary bytes (including an overlong line).
@@ -229,6 +262,84 @@ enum LockMode {
     Exclusive,
 }
 impl Root {
+    /// Reconcile durable private-artifact records once before this registry is
+    /// shared with model-facing roots. Exact identity is required for cleanup;
+    /// absent/replaced namespace entries only retire their stale record.
+    pub fn reconcile_private_artifacts(&self) -> Result<()> {
+        for record in self
+            .private
+            .records()
+            .map_err(|_| ScopedError::Denied("private mutation artifact registry unavailable"))?
+        {
+            let path = if record.parent_path.is_empty() {
+                record.name.clone()
+            } else {
+                format!("{}/{}", record.parent_path, record.name)
+            };
+            let (parent, name) = match self.parent(&path) {
+                Ok(value) => value,
+                Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    self.private
+                        .retire_record(&record)
+                        .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let parent_id = Self::artifact_identity(&parent.metadata()?);
+            if parent_id != record.parent {
+                self.private
+                    .retire_record(&record)
+                    .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                continue;
+            }
+            let stat = match super::stat_leaf(&parent, &name, true) {
+                Ok(stat) => stat,
+                Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    self.private
+                        .retire_record(&record)
+                        .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let object = ObjectIdentity {
+                volume: stat.st_dev as u64,
+                object: stat.st_ino as u64,
+            };
+            if object != record.object {
+                self.private
+                    .retire_record(&record)
+                    .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                continue;
+            }
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => lifecycle::cleanup_stage_tree(
+                    &parent,
+                    &name,
+                    Some((stat.st_dev as u64, stat.st_ino as u64)),
+                ),
+                libc::S_IFREG | libc::S_IFLNK => {
+                    unlink(&parent, &name);
+                }
+                _ => {
+                    return Err(ScopedError::Denied(
+                        "unsupported owned private mutation artifact",
+                    ));
+                }
+            }
+            if !stat_leaf_missing(&parent, &name) {
+                return Err(ScopedError::Denied(
+                    "private mutation artifact cleanup incomplete",
+                ));
+            }
+            self.private
+                .retire_record(&record)
+                .map_err(|_| ScopedError::Denied("cannot retire cleaned private artifact"))?;
+        }
+        Ok(())
+    }
+
     /// Compatible with dotlink: lock existing ancestor directories SH and
     /// the nearest existing parent EX; acquire in root-to-leaf path order.
     /// A missing parent inherits the EX lock on its existing ancestor.
@@ -324,8 +435,9 @@ impl Root {
 
     /// Descriptor-rooted, no-follow metadata. Linux statx gathers change
     /// time and birth time in one syscall where the filesystem supplies it.
-    pub fn entry_meta(&self, path: &str) -> Result<aw_tools_core::filesystem::EntryMeta> {
-        use aw_tools_core::filesystem::{EntryMeta, Kind};
+    pub fn entry_meta(&self, path: &str) -> Result<aw_tools::filesystem::EntryMeta> {
+        self.ensure_public_path(path)?;
+        use aw_tools::filesystem::{EntryMeta, Kind};
         let (dir, name) = self.parent(path)?;
         let name = cstring(&name)?;
         #[cfg(target_os = "linux")]
@@ -347,12 +459,12 @@ impl Root {
             let stat = unsafe { stat.assume_init() };
             let kind = match stat.stx_mode as u32 & libc::S_IFMT {
                 libc::S_IFDIR => Kind::Dir,
-                libc::S_IFREG if stat.stx_nlink == 1 => Kind::File,
+                libc::S_IFREG => Kind::File,
                 libc::S_IFLNK => Kind::Symlink,
                 _ => Kind::Other,
             };
             let time = |part: libc::statx_timestamp| {
-                aw_tools_core::filesystem::system_time_from_unix(part.tv_sec, part.tv_nsec)
+                aw_tools::filesystem::system_time_from_unix(part.tv_sec, part.tv_nsec)
             };
             Ok(EntryMeta {
                 kind,
@@ -396,11 +508,11 @@ impl Root {
             let stat = unsafe { stat.assume_init() };
             let kind = match stat.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => Kind::Dir,
-                libc::S_IFREG if stat.st_nlink == 1 => Kind::File,
+                libc::S_IFREG => Kind::File,
                 libc::S_IFLNK => Kind::Symlink,
                 _ => Kind::Other,
             };
-            let time = |secs: i64| aw_tools_core::filesystem::system_time_from_unix(secs, 0);
+            let time = |secs: i64| aw_tools::filesystem::system_time_from_unix(secs, 0);
             Ok(EntryMeta {
                 kind,
                 size: if matches!(kind, Kind::File | Kind::Symlink) {
@@ -436,7 +548,7 @@ impl Root {
         }
         let info = unsafe { info.assume_init() };
         let kind = info.st_mode & libc::S_IFMT;
-        if kind != libc::S_IFDIR && (kind != libc::S_IFREG || info.st_nlink != 1) {
+        if kind != libc::S_IFDIR && kind != libc::S_IFREG {
             return Err(ScopedError::Denied("unsupported filesystem entry"));
         }
         #[cfg(target_os = "linux")]
@@ -462,6 +574,7 @@ impl Root {
     /// Bounded bytes from a pinned regular file. Unlike `read`, the caller
     /// chooses its own hard limit; binary tools can opt into larger files.
     pub fn read_bytes(&self, path: &str, cap: usize) -> Result<Vec<u8>> {
+        self.ensure_public_path(path)?;
         if cap > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("binary read cap exceeds 64 MiB"));
         }
@@ -483,6 +596,7 @@ impl Root {
         offset: u64,
         limit: usize,
     ) -> Result<(Vec<u8>, u64, bool)> {
+        self.ensure_public_path(path)?;
         if limit == 0 || limit > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("invalid binary window limit"));
         }
@@ -520,33 +634,35 @@ impl Root {
         numbered: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, bool)> {
+        self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         regular(&file)?;
         let mut reader = BufReader::new(file);
-        aw_tools_core::read::window(&mut reader, offset, limit, cap, numbered, cancelled).map_err(
+        aw_tools::read::window(&mut reader, offset, limit, cap, numbered, cancelled).map_err(
             |error| match error {
-                aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
-                aw_tools_core::read::ReadError::Denied(message) => ScopedError::Denied(message),
-                aw_tools_core::read::ReadError::Limit(message) => ScopedError::Limit(message),
-                aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+                aw_tools::read::ReadError::Io(e) => ScopedError::Io(e),
+                aw_tools::read::ReadError::Denied(message) => ScopedError::Denied(message),
+                aw_tools::read::ReadError::Limit(message) => ScopedError::Limit(message),
+                aw_tools::read::ReadError::Cancelled => ScopedError::Cancelled,
             },
         )
     }
     /// DL-150 resumable line/byte window, entirely on a previously
     /// authorized regular file descriptor. Exact UTF-8 boundaries are
-    /// determined by aw-tools-core, independently of the host platform.
+    /// determined by aw-tools, independently of the host platform.
     pub fn read_page_with_cancel(
         &self,
         path: &str,
-        request: aw_tools_core::read::PageRequest,
+        request: aw_tools::read::PageRequest,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<aw_tools_core::read::Page> {
+    ) -> Result<aw_tools::read::Page> {
+        self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         regular(&file)?;
         let mut reader = BufReader::new(file);
-        aw_tools_core::read::page(
+        aw_tools::read::page(
             &mut reader,
             request.line,
             request.lines,
@@ -556,10 +672,10 @@ impl Root {
             cancelled,
         )
         .map_err(|error| match error {
-            aw_tools_core::read::ReadError::Io(e) => ScopedError::Io(e),
-            aw_tools_core::read::ReadError::Denied(reason) => ScopedError::Denied(reason),
-            aw_tools_core::read::ReadError::Limit(reason) => ScopedError::Limit(reason),
-            aw_tools_core::read::ReadError::Cancelled => ScopedError::Cancelled,
+            aw_tools::read::ReadError::Io(e) => ScopedError::Io(e),
+            aw_tools::read::ReadError::Denied(reason) => ScopedError::Denied(reason),
+            aw_tools::read::ReadError::Limit(reason) => ScopedError::Limit(reason),
+            aw_tools::read::ReadError::Cancelled => ScopedError::Cancelled,
         })
     }
     /// Only call this while holding `lock_mutations` for the target.
@@ -592,6 +708,7 @@ impl Root {
     }
     /// Open one safe pinned regular file for zero-copy streamed edits.
     pub fn open_regular(&self, path: &str) -> Result<File> {
+        self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         regular(&file)?;
@@ -652,7 +769,7 @@ impl Root {
                         .iter()
                         .map(|s| (*s).to_owned())
                         .collect::<Vec<_>>();
-                    if missing.len() > aw_tools_core::filesystem::lifecycle::MAX_LIFECYCLE_DEPTH {
+                    if missing.len() > aw_tools::filesystem::lifecycle::MAX_LIFECYCLE_DEPTH {
                         return Err(ScopedError::Limit("missing parent suffix is too deep"));
                     }
                     return Ok(Some((parent, missing, leaf.to_owned())));
@@ -664,6 +781,7 @@ impl Root {
     }
     fn stage_missing_suffix(
         &self,
+        path: &str,
         existing: File,
         missing: Vec<String>,
         leaf: String,
@@ -687,6 +805,22 @@ impl Root {
         .inspect_err(|_| {
             lifecycle::remove_empty_stage(&existing, &temp);
         })?;
+        let artifact = match self.reserve_private_artifact(
+            &existing,
+            existing_parent_model_path(path, missing.len()),
+            &temp,
+            ObjectIdentity {
+                volume: identity.0,
+                object: identity.1,
+            },
+            ArtifactKind::Stage,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
+                return Err(error);
+            }
+        };
         let result = (|| -> Result<()> {
             let mut current = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
             let mut directories = vec![current.try_clone()?];
@@ -723,6 +857,9 @@ impl Root {
         })();
         if let Err(error) = result {
             lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
+            if stat_leaf_missing(&existing, &temp) {
+                let _ = artifact.retire();
+            }
             return Err(error);
         }
         Ok(StagedWrite {
@@ -734,6 +871,7 @@ impl Root {
             committed: false,
             temp_directory: true,
             temp_identity: Some(identity),
+            artifact: Some(artifact),
         })
     }
     fn stage_with(
@@ -743,6 +881,7 @@ impl Root {
         cancel: &dyn Fn() -> bool,
         writer: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<StagedWrite> {
+        self.ensure_public_path(path)?;
         if cancel() {
             return Err(ScopedError::Cancelled);
         }
@@ -750,7 +889,7 @@ impl Root {
             if matches!(kind, StageKind::Update(_) | StageKind::UpdateDigest(_)) {
                 return Err(ScopedError::Denied("target changed before update"));
             }
-            return self.stage_missing_suffix(existing, missing, leaf, cancel, writer);
+            return self.stage_missing_suffix(path, existing, missing, leaf, cancel, writer);
         }
         // The ordinary branch accepts only an already-pinned parent;
         // concurrent removals must not trigger visible mkdir fallbacks.
@@ -811,6 +950,24 @@ impl Root {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )?;
+        let stage_meta = out.metadata()?;
+        let artifact = match self.reserve_private_artifact(
+            &parent,
+            parent_model_path(path).to_owned(),
+            &name,
+            ObjectIdentity {
+                volume: stage_meta.dev(),
+                object: stage_meta.ino(),
+            },
+            ArtifactKind::Stage,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                drop(out);
+                unlink(&parent, &name);
+                return Err(error);
+            }
+        };
         let written = (|| -> Result<()> {
             if let Some(ref source) = old {
                 let metadata = source.metadata()?;
@@ -843,6 +1000,9 @@ impl Root {
         drop(out);
         if let Err(error) = written {
             unlink(&parent, &name);
+            if stat_leaf_missing(&parent, &name) {
+                let _ = artifact.retire();
+            }
             return Err(error);
         }
         Ok(StagedWrite {
@@ -858,17 +1018,25 @@ impl Root {
             committed: false,
             temp_directory: false,
             temp_identity: None,
+            artifact: Some(artifact),
         })
     }
 }
 
-fn unlink(parent: &File, path: &str) {
-    if let Ok(name) = cstring(path) {
-        // SAFETY: a unique staging basename within this pinned parent.
-        unsafe {
-            libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
-        }
-    }
+fn stat_leaf_missing(parent: &File, path: &str) -> bool {
+    matches!(
+        super::stat_leaf(parent, path, true),
+        Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+    )
+}
+
+fn unlink(parent: &File, path: &str) -> bool {
+    let Ok(name) = cstring(path) else {
+        return false;
+    };
+    // SAFETY: caller supplies an exact basename beneath the pinned parent.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    result == 0 || io::Error::last_os_error().kind() == io::ErrorKind::NotFound
 }
 #[derive(Clone, Copy)]
 enum StageKind<'a> {
@@ -892,6 +1060,7 @@ pub struct StagedWrite {
     committed: bool,
     temp_directory: bool,
     temp_identity: Option<(u64, u64)>,
+    artifact: Option<ArtifactLease>,
 }
 impl StagedWrite {
     pub fn commit(mut self) -> Result<()> {
@@ -989,10 +1158,8 @@ impl StagedWrite {
                 };
                 if result == 0 {
                     let stat = unsafe { stat.assume_init() };
-                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
-                        return Err(ScopedError::Denied(
-                            "replacement requires singly-linked regular target",
-                        ));
+                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                        return Err(ScopedError::Denied("replacement requires regular target"));
                     }
                 } else {
                     let error = io::Error::last_os_error();
@@ -1024,6 +1191,11 @@ impl StagedWrite {
         }
         self.committed = true;
         let _ = self.parent.sync_all(); // committed; never invite a retry after sync failure
+        if stat_leaf_missing(&self.parent, &self.temp) {
+            if let Some(artifact) = self.artifact.take() {
+                let _ = artifact.retire();
+            }
+        }
         Ok(())
     }
 }
@@ -1035,12 +1207,17 @@ impl Drop for StagedWrite {
             } else {
                 unlink(&self.parent, &self.temp);
             }
+            if stat_leaf_missing(&self.parent, &self.temp) {
+                if let Some(artifact) = self.artifact.take() {
+                    let _ = artifact.retire();
+                }
+            }
         }
     }
 }
 
 #[path = "port/lifecycle.rs"]
-mod lifecycle;
+pub(super) mod lifecycle;
 
 #[cfg(test)]
 mod publication_tests {
@@ -1065,6 +1242,34 @@ mod publication_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn private_stage_registry_is_exact_and_retires_after_publication() {
+        let temp = Temp::new();
+        fs::write(temp.0.join("user.txt"), b"old").unwrap();
+        fs::write(
+            temp.0.join(".aw-stage-123-0123456789abcdef.tmp"),
+            b"ordinary user file",
+        )
+        .unwrap();
+        let root = temp.root();
+        let _guard = root.lock_mutations(&["user.txt".into()]).unwrap();
+        let staged = root.stage_replace("user.txt", b"new", &|| false).unwrap();
+        let records = root.private_artifacts().records().unwrap();
+        assert_eq!(records.len(), 1);
+        let private = &records[0];
+        let private_path = private.name.clone();
+        assert!(root.is_private_path(&private_path).unwrap());
+        assert!(
+            !root
+                .is_private_path(".aw-stage-123-0123456789abcdef.tmp")
+                .unwrap(),
+            "well-formed lookalike is not private without exact identity record"
+        );
+        staged.commit().unwrap();
+        assert!(root.private_artifacts().records().unwrap().is_empty());
+        assert_eq!(fs::read(temp.0.join("user.txt")).unwrap(), b"new");
     }
 
     #[test]

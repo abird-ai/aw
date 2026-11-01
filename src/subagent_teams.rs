@@ -87,8 +87,12 @@ impl Service {
         ToolContext {
             actor: ctx.actor.clone(),
             turn_id: ctx.turn_id,
+            call_id: ctx.call_id.clone(),
+            source: ctx.source.clone(),
+            effect: ctx.effect.clone(),
             execution_site: ctx.execution_site.clone(),
             cancellation: ctx.cancellation.clone(),
+            result_budget_bytes: ctx.result_budget_bytes,
             identity: ctx.identity.clone(),
             scope: ctx.scope.clone(),
         }
@@ -562,8 +566,12 @@ mod tests {
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
+                    call_id: "host-direct".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: aw_agent_core::ToolEffect::Unknown,
                     execution_site: "local".into(),
                     cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
                     identity,
                     scope: Some(InvocationScope {
                         session_id: parent.id.clone(),

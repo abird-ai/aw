@@ -219,7 +219,9 @@ async fn extension_origin_requires_exact_host_epoch_and_revocation_fences_tool()
         Outcome::Completed
     );
     assert_eq!(executions.load(Ordering::SeqCst), 1);
-    agent.revoke_registered_source_tool(&actor, "shared_name", &origin);
+    agent
+        .revoke_registered_source_tool(&actor, "shared_name", &origin)
+        .unwrap();
     assert!(agent.tool_specs().is_empty());
     assert_eq!(
         agent
@@ -268,7 +270,9 @@ async fn remote_tool_never_inherits_a_name_grant_and_rechecks_revocation() {
     assert_eq!(completed.outcome, Outcome::Completed);
     assert_eq!(n.load(Ordering::SeqCst), 1);
 
-    agent.revoke_registered_source_tool(&actor, "shared_name", &source);
+    agent
+        .revoke_registered_source_tool(&actor, "shared_name", &source)
+        .unwrap();
     assert!(agent.tool_specs().is_empty());
     let denied = agent
         .prompt("revoked", pending(), |_| Ok(()))
