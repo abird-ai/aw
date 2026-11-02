@@ -827,6 +827,13 @@ impl aw_tools::filesystem::backend::SecuredFilesystem for Root {
     ) -> Result<Self::Stage> {
         Root::stage_create(self, path, bytes, cancel)
     }
+    fn stage_create_many(
+        &self,
+        files: &[aw_tools::filesystem::backend::CreateFile<'_>],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<aw_tools::filesystem::backend::CreateStage<Self::Stage>>> {
+        Root::stage_create_many(self, files, cancel)
+    }
     fn stage_replace(
         &self,
         path: &str,
@@ -843,6 +850,41 @@ impl aw_tools::filesystem::backend::SecuredFilesystem for Root {
         cancel: &dyn Fn() -> bool,
     ) -> Result<Self::Stage> {
         Root::stage_update(self, path, expected, bytes, cancel)
+    }
+    fn open_regular_for_update(&self, path: &str) -> Result<std::fs::File> {
+        Root::open_regular(self, path)
+    }
+    fn stage_stream_update(
+        &self,
+        path: &str,
+        expected: (u64, [u8; 32]),
+        writer: &mut dyn FnMut(
+            &mut std::fs::File,
+        ) -> std::result::Result<
+            (),
+            aw_tools::filesystem::backend::StreamWriteError,
+        >,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self::Stage> {
+        Root::stage_stream_update(
+            self,
+            path,
+            expected,
+            |output| {
+                writer(output).map_err(|error| match error {
+                    aw_tools::filesystem::backend::StreamWriteError::Io(error) => {
+                        ScopedError::Io(error)
+                    }
+                    aw_tools::filesystem::backend::StreamWriteError::Cancelled => {
+                        ScopedError::Cancelled
+                    }
+                    aw_tools::filesystem::backend::StreamWriteError::Refused(reason) => {
+                        ScopedError::Denied(reason)
+                    }
+                })
+            },
+            cancel,
+        )
     }
     fn classify_publication_failure(
         &self,

@@ -56,8 +56,23 @@ fn file_operation_error(
         E::TooLarge => Error::Limit("file exceeds bounded write size"),
         E::InvalidText => Error::Denied("binary or control-containing content; use binary tools"),
         E::Edit(_) => Error::Denied("invalid or ambiguous exact replacement"),
+        E::BinaryPlan(_) => Error::Denied("invalid binary edit plan"),
+        E::BinaryPrecondition => Error::Denied("binary precondition mismatch"),
+        E::BinarySourceChanged => {
+            Error::Denied("binary source changed during edit; re-read before retrying")
+        }
+        E::Patch(_) => Error::Denied("invalid canonical patch"),
         E::DestinationExists => Error::Denied("destination already exists"),
         E::Cancelled => Error::Cancelled,
+        E::PartialCancelled { .. } => Error::Protocol(
+            "filesystem mutation partially committed before cancellation; inspect workspace",
+        ),
+        E::PatchCommitUnknown { .. } => {
+            Error::Protocol("patch publication outcome unknown; inspect workspace before retrying")
+        }
+        E::PartialCommit { .. } => Error::Protocol(
+            "filesystem mutation partially committed; inspect workspace before retrying",
+        ),
         E::Backend(error) => platform_fs::<()>(Err(error)).unwrap_err(),
         E::UnknownCommit(_) => {
             Error::Protocol("unknown filesystem commit; do not retry; inspect workspace")

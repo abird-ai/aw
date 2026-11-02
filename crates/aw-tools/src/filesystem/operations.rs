@@ -2,7 +2,10 @@
 //! task journaling, model replies and OS handles belong to the host;
 //! every backend call uses the original pinned filesystem capability.
 use super::{
-    backend::{MutationAccess, MutationExtent, MutationPath, SecuredFilesystem, StagedPublication},
+    backend::{
+        CreateFile, ExplicitPathBackend, MutationAccess, MutationExtent, MutationPath,
+        SecuredFilesystem, StagedPublication,
+    },
     exact_edit::{self, Replacement},
     lifecycle::{self, LifecycleError},
     status::Primary,
@@ -15,8 +18,30 @@ pub enum Error<E> {
     TooLarge,
     InvalidText,
     Edit(exact_edit::EditError),
+    BinaryPlan(crate::binary::PlanError),
+    BinaryPrecondition,
+    BinarySourceChanged,
+    Patch(String),
     DestinationExists,
     Cancelled,
+    PartialCancelled {
+        /// Exact 1-based patch sections already published.
+        published: Vec<usize>,
+    },
+    PatchCommitUnknown {
+        /// Exact 1-based patch sections in the publication unit whose commit
+        /// outcome is unknown.
+        sections: Vec<usize>,
+        error: E,
+    },
+    PartialCommit {
+        /// Exact 1-based patch sections already known published.
+        published: Vec<usize>,
+        /// Exact sections in the unit that failed/has unknown commit outcome.
+        failed: Vec<usize>,
+        error: E,
+        commit_unknown: bool,
+    },
     Backend(E),
     /// Commit may have published the bytes before returning an error. Do
     /// not replay automatically, even when the host's error looks like IO.
@@ -129,6 +154,350 @@ pub fn edit_text<B: SecuredFilesystem>(
         return Err(Error::Cancelled);
     }
     publish(backend, staged)?;
+    Ok(Primary::Ok)
+}
+
+/// Stream one canonical original-relative binary edit under one immutable
+/// preimage. The backend revalidates the digest both before staging and at
+/// commit; no-op edits re-open and verify the whole preimage before reporting
+/// unchanged, so unrelated source changes cannot be hidden by touched ranges.
+pub fn edit_binary<B: SecuredFilesystem>(
+    backend: &B,
+    path: &str,
+    edits: Vec<crate::binary::RequestedSplice>,
+    expected_sha256: Option<[u8; 32]>,
+    max_file: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Primary, Error<B::Error>> {
+    use crate::binary::{
+        digest_limited, plan_splices, splices_are_unchanged, stream_splice_with_stop,
+        verify_preimage,
+    };
+    use std::io::{Seek as _, SeekFrom};
+
+    admitted(path)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+    backend
+        .preflight_mutation(&[MutationPath {
+            path,
+            access: MutationAccess::ReadWrite,
+            extent: MutationExtent::Exact,
+        }])
+        .map_err(Error::Backend)?;
+    let _guard = backend
+        .lock(&[path.to_owned()], cancel)
+        .map_err(Error::Backend)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+
+    let mut source = backend
+        .open_regular_for_update(path)
+        .map_err(Error::Backend)?;
+    if source
+        .metadata()
+        .map_err(|_| Error::BinarySourceChanged)?
+        .len()
+        > max_file as u64
+    {
+        return Err(Error::TooLarge);
+    }
+    let (size, digest) =
+        digest_limited(&mut source, max_file).map_err(|_| Error::BinarySourceChanged)?;
+    if expected_sha256.is_some_and(|expected| expected != digest) {
+        return Err(Error::BinaryPrecondition);
+    }
+    let plan = plan_splices(edits, size, max_file).map_err(Error::BinaryPlan)?;
+    let splices = plan
+        .edits
+        .iter()
+        .map(crate::binary::OwnedByteSplice::borrowed)
+        .collect::<Vec<_>>();
+    let unchanged = size == plan.output_len
+        && splices_are_unchanged(&mut source, &splices).map_err(|_| Error::BinarySourceChanged)?;
+    if unchanged {
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        let mut current = backend
+            .open_regular_for_update(path)
+            .map_err(Error::Backend)?;
+        verify_preimage(&mut current, (size, digest), max_file)
+            .map_err(|_| Error::BinarySourceChanged)?;
+        return Ok(Primary::Unchanged);
+    }
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+
+    let mut writer = |output: &mut std::fs::File| {
+        source.seek(SeekFrom::Start(0))?;
+        stream_splice_with_stop(&mut source, output, (size, digest), &splices, cancel)
+            .map(|_| ())
+            .map_err(|_| {
+                if cancel() {
+                    super::backend::StreamWriteError::Cancelled
+                } else {
+                    super::backend::StreamWriteError::Refused(
+                        "binary source changed during staged edit",
+                    )
+                }
+            })
+    };
+    let staged = backend
+        .stage_stream_update(path, (size as u64, digest), &mut writer, cancel)
+        .map_err(Error::Backend)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+    publish(backend, staged)?;
+    Ok(Primary::Ok)
+}
+
+/// Execute the canonical strict Codex Update/Add patch as one fully planned
+/// mutation. Compatibility-only directory prefixes/best-effort behavior belong
+/// in host adapters; this path is the portable semantics shared by AW/dotlink.
+pub fn patch_text<B: SecuredFilesystem + ExplicitPathBackend>(
+    backend: &B,
+    patch: &str,
+    max_file: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Primary, Error<B::Error>> {
+    use crate::{
+        mutation::PlanBudget,
+        patch::{apply_patch_hunks, parse_patch, PatchOp},
+    };
+    use std::collections::BTreeSet;
+
+    #[derive(Debug)]
+    struct Plan {
+        section: usize,
+        path: String,
+        expected: Option<Vec<u8>>,
+        replacement: Vec<u8>,
+    }
+
+    let ops = parse_patch(patch).map_err(|error| Error::Patch(error.to_string()))?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+    let total_hunks = ops
+        .iter()
+        .map(|op| match op {
+            PatchOp::Update { hunks, .. } => hunks.len(),
+            PatchOp::Add { .. } => 0,
+        })
+        .sum::<usize>();
+
+    // Resolve every final content symlink and prove complete authority before
+    // any mutation lock or private staging object exists.
+    let mut next_hunk = 0usize;
+    let mut prepared = Vec::with_capacity(ops.len());
+    let mut claims = BTreeSet::<Vec<u8>>::new();
+    for (section, op) in ops.into_iter().enumerate() {
+        let (lexical, access, first_hunk) = match &op {
+            PatchOp::Update { path, hunks } => {
+                let first = next_hunk;
+                next_hunk += hunks.len();
+                (path.as_str(), MutationAccess::ReadWrite, first)
+            }
+            PatchOp::Add { path, .. } => (path.as_str(), MutationAccess::Write, next_hunk),
+        };
+        admitted::<B::Error>(lexical)?;
+        let effective = match &op {
+            PatchOp::Update { .. } => backend
+                .resolve_content_path(lexical, false)
+                .map_err(Error::Backend)?,
+            PatchOp::Add { .. } => lexical.to_owned(),
+        };
+        admitted::<B::Error>(&effective)?;
+        let claim = backend
+            .mutation_path_key(&effective)
+            .map_err(Error::Backend)?;
+        if !claims.insert(claim) {
+            return Err(Error::Patch(format!(
+                "patch path appears in more than one section: {lexical}"
+            )));
+        }
+        prepared.push((section, op, effective, first_hunk, access));
+    }
+    let preflight = prepared
+        .iter()
+        .map(|(_, _, path, _, access)| MutationPath {
+            path: path.as_str(),
+            access: *access,
+            extent: MutationExtent::Exact,
+        })
+        .collect::<Vec<_>>();
+    backend
+        .preflight_mutation(&preflight)
+        .map_err(Error::Backend)?;
+    let paths = prepared
+        .iter()
+        .map(|(_, _, path, _, _)| path.clone())
+        .collect::<Vec<_>>();
+    let _guard = backend.lock(&paths, cancel).map_err(Error::Backend)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+
+    // Build every replacement from immutable preimages before reserving any
+    // private publication object. PlanBudget bounds aggregate original+working
+    // memory independently of the per-file ceiling.
+    let mut work = PlanBudget::default();
+    let mut plans = Vec::<Plan>::with_capacity(prepared.len());
+    for (section, op, path, first_hunk, _) in prepared {
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        match op {
+            PatchOp::Update { hunks, .. } => {
+                let cap = work
+                    .copy_read_limit(max_file)
+                    .map_err(|error| Error::Patch(error.to_string()))?;
+                let original = backend.read_bytes(&path, cap).map_err(Error::Backend)?;
+                let text = crate::text::text_bytes(&original).ok_or_else(|| {
+                    Error::Patch(format!("patch: {path}: update target is binary; use bedit"))
+                })?;
+                let (replacement, _, _) =
+                    apply_patch_hunks(text, &hunks, &path, first_hunk, total_hunks)
+                        .map_err(|error| Error::Patch(error.to_string()))?;
+                if replacement.len() > max_file {
+                    return Err(Error::TooLarge);
+                }
+                if crate::text::has_binary_control(replacement.as_bytes()) {
+                    return Err(Error::InvalidText);
+                }
+                work.add(original.len(), replacement.len())
+                    .map_err(|error| Error::Patch(error.to_string()))?;
+                plans.push(Plan {
+                    section,
+                    path,
+                    expected: Some(original),
+                    replacement: replacement.into_bytes(),
+                });
+            }
+            PatchOp::Add { lines, .. } => {
+                let replacement = crate::patch::add_file_bytes(&lines);
+                if replacement.len() > max_file {
+                    return Err(Error::TooLarge);
+                }
+                if crate::text::has_binary_control(&replacement) {
+                    return Err(Error::InvalidText);
+                }
+                work.add(0, replacement.len())
+                    .map_err(|error| Error::Patch(error.to_string()))?;
+                plans.push(Plan {
+                    section,
+                    path,
+                    expected: None,
+                    replacement,
+                });
+            }
+        }
+    }
+
+    // Stage every publication before the first visible effect. Updates retain
+    // one original snapshot; additions are batch-staged so files under one new
+    // publication root become visible together by one rename.
+    struct Publication<S> {
+        first: usize,
+        sections: Vec<usize>,
+        stage: S,
+    }
+    let mut staged = Vec::<Publication<B::Stage>>::new();
+    let mut adds = Vec::<(usize, &str, &[u8])>::new();
+    for plan in &plans {
+        match &plan.expected {
+            Some(original) if original.as_slice() == plan.replacement.as_slice() => {}
+            Some(original) => staged.push(Publication {
+                first: plan.section + 1,
+                sections: vec![plan.section + 1],
+                stage: backend
+                    .stage_update(&plan.path, original, &plan.replacement, cancel)
+                    .map_err(Error::Backend)?,
+            }),
+            None => adds.push((
+                plan.section,
+                plan.path.as_str(),
+                plan.replacement.as_slice(),
+            )),
+        }
+    }
+    if !adds.is_empty() {
+        let create = adds
+            .iter()
+            .map(|(_, path, bytes)| CreateFile { path, bytes })
+            .collect::<Vec<_>>();
+        for unit in backend
+            .stage_create_many(&create, cancel)
+            .map_err(Error::Backend)?
+        {
+            let first = adds
+                .get(unit.first)
+                .ok_or_else(|| Error::Patch("invalid staged add publication index".into()))?
+                .0
+                + 1;
+            let sections = unit
+                .inputs
+                .iter()
+                .map(|input| {
+                    adds.get(*input)
+                        .map(|entry| entry.0 + 1)
+                        .ok_or_else(|| Error::Patch("invalid staged add publication index".into()))
+                })
+                .collect::<Result<Vec<_>, Error<B::Error>>>()?;
+            staged.push(Publication {
+                first,
+                sections,
+                stage: unit.stage,
+            });
+        }
+    }
+    staged.sort_by_key(|publication| publication.first);
+    if staged.is_empty() {
+        return Ok(Primary::Unchanged);
+    }
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+
+    let mut published = Vec::<usize>::new();
+    for publication in staged {
+        if cancel() {
+            return if published.is_empty() {
+                Err(Error::Cancelled)
+            } else {
+                Err(Error::PartialCancelled { published })
+            };
+        }
+        match publication.stage.commit() {
+            Ok(()) => published.extend(publication.sections),
+            Err(error) if published.is_empty() => {
+                return Err(match backend.classify_publication_failure(&error) {
+                    super::backend::CommitFailure::NoPublication => Error::Backend(error),
+                    super::backend::CommitFailure::Unknown => Error::PatchCommitUnknown {
+                        sections: publication.sections,
+                        error,
+                    },
+                });
+            }
+            Err(error) => {
+                let commit_unknown = matches!(
+                    backend.classify_publication_failure(&error),
+                    super::backend::CommitFailure::Unknown
+                );
+                return Err(Error::PartialCommit {
+                    published,
+                    failed: publication.sections,
+                    error,
+                    commit_unknown,
+                });
+            }
+        }
+    }
     Ok(Primary::Ok)
 }
 
@@ -301,7 +670,14 @@ mod tests {
         },
         read::{Page, PageRequest},
     };
-    use std::sync::{Arc, Mutex};
+    use std::{
+        io::{Read as _, Seek as _, SeekFrom, Write as _},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex,
+        },
+    };
+    static NEXT_STREAM_FILE: AtomicU64 = AtomicU64::new(1);
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Fault {
         NotFound,
@@ -316,6 +692,8 @@ mod tests {
         read_calls: usize,
         fail_after_commit: bool,
         fail_before_commit: bool,
+        fail_commit_attempt: Option<usize>,
+        commit_attempts: usize,
         deny_preflight: bool,
         preflight_calls: usize,
         lock_calls: usize,
@@ -329,7 +707,9 @@ mod tests {
         type Error = Fault;
         fn commit(self) -> Result<(), Fault> {
             let mut state = self.state.lock().unwrap();
-            if state.fail_before_commit {
+            state.commit_attempts += 1;
+            if state.fail_before_commit || state.fail_commit_attempt == Some(state.commit_attempts)
+            {
                 return Err(Fault::Denied);
             }
             state.bytes = Some(self.new);
@@ -374,6 +754,14 @@ mod tests {
             Err(Fault::NotFound)
         }
     }
+    impl super::super::backend::ExplicitPathBackend for Memory {
+        fn resolve_content_path(&self, path: &str, _: bool) -> Result<String, Fault> {
+            Ok(path.to_owned())
+        }
+        fn resolve_directory_path(&self, path: &str) -> Result<String, Fault> {
+            Ok(path.to_owned())
+        }
+    }
     impl SecuredFilesystem for Memory {
         type Guard<'a> = ();
         type Stage = Stage;
@@ -405,6 +793,24 @@ mod tests {
                 new: data.to_vec(),
             })
         }
+        fn stage_create_many(
+            &self,
+            files: &[super::super::backend::CreateFile<'_>],
+            cancel: &dyn Fn() -> bool,
+        ) -> Result<Vec<super::super::backend::CreateStage<Stage>>, Fault> {
+            files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| {
+                    self.stage_create(file.path, file.bytes, cancel)
+                        .map(|stage| super::super::backend::CreateStage {
+                            first: index,
+                            inputs: vec![index],
+                            stage,
+                        })
+                })
+                .collect()
+        }
         fn stage_replace(
             &self,
             _: &str,
@@ -424,6 +830,78 @@ mod tests {
                 return Err(Fault::Denied);
             }
             self.stage_create("", data, &|| false)
+        }
+        fn open_regular_for_update(&self, _: &str) -> Result<std::fs::File, Fault> {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap()
+                .bytes
+                .clone()
+                .ok_or(Fault::NotFound)?;
+            let path = std::env::temp_dir().join(format!(
+                "aw-tools-stream-test-{}-{}",
+                std::process::id(),
+                NEXT_STREAM_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|_| Fault::Denied)?;
+            file.write_all(&bytes).map_err(|_| Fault::Denied)?;
+            file.seek(SeekFrom::Start(0)).map_err(|_| Fault::Denied)?;
+            let _ = std::fs::remove_file(path);
+            Ok(file)
+        }
+        fn stage_stream_update(
+            &self,
+            _: &str,
+            expected: (u64, [u8; 32]),
+            writer: &mut dyn FnMut(
+                &mut std::fs::File,
+            )
+                -> Result<(), super::super::backend::StreamWriteError>,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Stage, Fault> {
+            use sha2::{Digest as _, Sha256};
+            let current = self
+                .0
+                .lock()
+                .unwrap()
+                .bytes
+                .clone()
+                .ok_or(Fault::NotFound)?;
+            if (
+                current.len() as u64,
+                <[u8; 32]>::from(Sha256::digest(&current)),
+            ) != expected
+            {
+                return Err(Fault::Denied);
+            }
+            let path = std::env::temp_dir().join(format!(
+                "aw-tools-stream-stage-test-{}-{}",
+                std::process::id(),
+                NEXT_STREAM_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|_| Fault::Denied)?;
+            writer(&mut file).map_err(|_| Fault::Denied)?;
+            file.seek(SeekFrom::Start(0)).map_err(|_| Fault::Denied)?;
+            let mut new = Vec::new();
+            file.read_to_end(&mut new).map_err(|_| Fault::Denied)?;
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            self.0.lock().unwrap().stage_calls += 1;
+            Ok(Stage {
+                state: self.0.clone(),
+                new,
+            })
         }
         fn classify_publication_failure(
             &self,
@@ -631,6 +1109,123 @@ mod tests {
             Err(Error::InvalidPath(_))
         ));
     }
+    #[test]
+    fn streamed_binary_edit_changes_bytes_and_noop_reverifies_preimage() {
+        use crate::binary::RequestedSplice;
+        let shared = Arc::new(Mutex::new(State {
+            bytes: Some(b"abcdef".to_vec()),
+            ..Default::default()
+        }));
+        let fs = Memory(shared.clone());
+        assert!(matches!(
+            edit_binary(
+                &fs,
+                "f.txt",
+                vec![RequestedSplice {
+                    offset: 2,
+                    length: Some(2),
+                    data: b"XY".to_vec(),
+                }],
+                None,
+                1024,
+                &|| false,
+            ),
+            Ok(Primary::Ok)
+        ));
+        assert_eq!(
+            shared.lock().unwrap().bytes.as_deref(),
+            Some(b"abXYef".as_slice())
+        );
+        assert_eq!(shared.lock().unwrap().commits, 1);
+
+        assert!(matches!(
+            edit_binary(
+                &fs,
+                "f.txt",
+                vec![RequestedSplice {
+                    offset: 2,
+                    length: Some(2),
+                    data: b"XY".to_vec(),
+                }],
+                None,
+                1024,
+                &|| false,
+            ),
+            Ok(Primary::Unchanged)
+        ));
+        assert_eq!(shared.lock().unwrap().commits, 1);
+    }
+
+    #[test]
+    fn binary_sha_precondition_and_plan_fail_before_staging() {
+        use crate::binary::RequestedSplice;
+        let shared = Arc::new(Mutex::new(State {
+            bytes: Some(b"abcdef".to_vec()),
+            ..Default::default()
+        }));
+        let fs = Memory(shared.clone());
+        assert!(matches!(
+            edit_binary(
+                &fs,
+                "f.txt",
+                vec![RequestedSplice {
+                    offset: 1,
+                    length: Some(1),
+                    data: b"x".to_vec(),
+                }],
+                Some([7; 32]),
+                1024,
+                &|| false,
+            ),
+            Err(Error::BinaryPrecondition)
+        ));
+        assert!(matches!(
+            edit_binary(
+                &fs,
+                "f.txt",
+                vec![RequestedSplice {
+                    offset: 99,
+                    length: Some(1),
+                    data: b"x".to_vec(),
+                }],
+                None,
+                1024,
+                &|| false,
+            ),
+            Err(Error::BinaryPlan(crate::binary::PlanError::PastEof))
+        ));
+        let state = shared.lock().unwrap();
+        assert_eq!(state.stage_calls, 0);
+        assert_eq!(state.commits, 0);
+    }
+
+    #[test]
+    fn strict_patch_later_publication_failure_is_explicit_partial_commit() {
+        let shared = Arc::new(Mutex::new(State {
+            fail_commit_attempt: Some(2),
+            ..Default::default()
+        }));
+        let fs = Memory(shared.clone());
+        let result = patch_text(
+            &fs,
+            "*** Begin Patch\n*** Add File: a.txt\n+a\n*** Add File: b.txt\n+b\n*** End Patch\n",
+            1024,
+            &|| false,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::PartialCommit {
+                published,
+                failed,
+                error: Fault::Denied,
+                commit_unknown: false,
+            }) if published == vec![1] && failed == vec![2]
+        ));
+        let state = shared.lock().unwrap();
+        assert_eq!(state.commit_attempts, 2);
+        assert_eq!(state.commits, 1);
+    }
+
     #[test]
     fn shared_lifecycle_admission_is_exact_and_single_owner() {
         let shared = Arc::new(Mutex::new(State {

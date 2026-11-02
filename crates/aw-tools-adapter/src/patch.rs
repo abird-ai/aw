@@ -78,6 +78,24 @@ impl Tool for Patch {
             let args: PatchArgs = serde_json::from_value(value.clone())
                 .map_err(|_| Error::Denied("invalid patch args"))?;
             let result_bytes = ctx.result_budget(self.limits.result_bytes)?;
+            if args.dir == "." && !args.best_effort {
+                let root = self.root.clone();
+                let patch = args.patch.clone();
+                let answer =
+                    aw_tools::asynchronous::run_blocking(move || -> agent::Result<ToolOutput> {
+                        use aw_tools::filesystem::operations::{self, Error as OperationError};
+                        match operations::patch_text(root.as_ref(), &patch, MAX_FILE_BYTES, &|| {
+                            ctx.cancellation.is_cancelled()
+                        }) {
+                            Ok(primary) => Ok(ToolOutput::text(primary.as_str())),
+                            Err(OperationError::Patch(message)) => Ok(ToolOutput::error(message)),
+                            Err(error) => Err(crate::file_operation_error(error)),
+                        }
+                    })
+                    .await
+                    .map_err(|_| Error::Protocol("patch worker failed; inspect workspace"))?;
+                return tool_failure(answer, true);
+            }
             let root = self.root.clone();
             let answer = aw_tools::asynchronous::run_blocking(move || -> agent::Result<ToolOutput> {
                 let ops = match parse_patch(&args.patch) {
@@ -200,23 +218,18 @@ impl Tool for Patch {
                                     removed,
                                 })
                             }
-                            PatchOp::Add { lines, crlf, .. } => {
-                                let text = if lines.is_empty() {
-                                    String::new()
-                                } else {
-                                    let separator = if crlf { "\r\n" } else { "\n" };
-                                    format!("{}{}", lines.join(separator), separator)
-                                };
-                                if text.len() > MAX_FILE_BYTES {
+                            PatchOp::Add { lines, .. } => {
+                                let bytes = aw_tools::patch::add_file_bytes(&lines);
+                                if bytes.len() > MAX_FILE_BYTES {
                                     bail!("patch addition exceeds 1 MiB");
                                 }
-                                crate::text_class::require_text(text.as_bytes())
+                                crate::text_class::require_text(&bytes)
                                     .map_err(|_| anyhow::anyhow!("patch addition is binary"))?;
-                                work.add(0,text.len())?;
+                                work.add(0,bytes.len())?;
                                 Ok(Plan {
                                     path: path.clone(),
                                     expected: None,
-                                    replacement: text.into_bytes(),
+                                    replacement: bytes,
                                     hunks: 0,
                                     added: lines.len(),
                                     removed: 0,

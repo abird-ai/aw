@@ -260,14 +260,13 @@ fn binary_plan_error(error: aw_tools::binary::PlanError) -> Error {
     }
 }
 
-/// Decode wire payloads in the AW adapter; ordering/overlap/size semantics live
-/// entirely in canonical aw-tools.
-fn prepare_ranges_with_limit(
+/// Decode only the transport encoding here; ordering/overlap/output-size
+/// semantics and filesystem execution remain canonical aw-tools behavior.
+fn decode_ranges_with_limit(
     ranges: Vec<Range>,
-    source_size: usize,
     max_data: usize,
-) -> Result<aw_tools::binary::SplicePlan> {
-    let requested = ranges
+) -> Result<Vec<aw_tools::binary::RequestedSplice>> {
+    ranges
         .into_iter()
         .map(|range| {
             Ok(aw_tools::binary::RequestedSplice {
@@ -276,17 +275,31 @@ fn prepare_ranges_with_limit(
                 data: range.encoding.decode_with_limit(&range.data, max_data)?,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
-    aw_tools::binary::plan_splices(requested, source_size, MAX_FILE_BYTES)
-        .map_err(binary_plan_error)
+        .collect()
 }
+
+fn parse_sha256(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::Denied("sha256 must be 64 hexadecimal characters"));
+    }
+    let mut digest = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair =
+            std::str::from_utf8(pair).map_err(|_| Error::Denied("sha256 must be hexadecimal"))?;
+        digest[index] = u8::from_str_radix(pair, 16)
+            .map_err(|_| Error::Denied("sha256 must be hexadecimal"))?;
+    }
+    Ok(digest)
+}
+
 #[cfg(test)]
 fn prepare_ranges(ranges: Vec<Range>, source_size: usize) -> Result<aw_tools::binary::SplicePlan> {
-    prepare_ranges_with_limit(
+    let requested = decode_ranges_with_limit(
         ranges,
-        source_size,
         aw_tools::filesystem::schema::SchemaCaps::default().binary_data_bytes,
-    )
+    )?;
+    aw_tools::binary::plan_splices(requested, source_size, MAX_FILE_BYTES)
+        .map_err(binary_plan_error)
 }
 
 impl Tool for Binary {
@@ -435,92 +448,31 @@ impl Tool for Binary {
                         }
                     }
                     Operation::Edit => {
+                        use aw_tools::filesystem::operations::{self, Error as OperationError};
                         let a: BeditArgs = parse(&value)?;
                         let content_path = crate::content_path(&root, &a.path, false)?;
-                        let _guard = platform_fs(
-                            root.lock_mutations_with_cancel(std::slice::from_ref(&content_path), &|| {
-                                ctx.cancellation.is_cancelled()
-                            }),
+                        let requested = decode_ranges_with_limit(
+                            a.edits,
+                            limits.schema.binary_data_bytes,
                         )?;
-                        {
-                            use aw_tools::binary::{
-                                digest_limited,splices_are_unchanged,stream_splice_with_stop,
-                                verify_preimage,
-                            };
-                            use std::io::{Seek, SeekFrom};
-                            let mut source = platform_fs(root.open_regular(&content_path))?;
-                            let (size, digest) = digest_limited(&mut source, MAX_FILE_BYTES)
-                                .map_err(|_| {
-                                    Error::Limit("binary source exceeds 64 MiB or changed")
-                                })?;
-                            let plan = prepare_ranges_with_limit(
-                                a.edits,
-                                size,
-                                limits.schema.binary_data_bytes,
-                            )?;
-                            let size_after = plan.output_len;
-                            if let Some(sha) = a.sha256 {
-                                let actual = digest
-                                    .iter()
-                                    .map(|b| format!("{b:02x}"))
-                                    .collect::<String>();
-                                if actual != sha.to_ascii_lowercase() {
-                                    return Ok(ToolOutput::error(
-                                        "bedit: sha256 precondition mismatch",
-                                    ));
-                                }
-                            }
-                            let splices = plan
-                                .edits
-                                .iter()
-                                .map(aw_tools::binary::OwnedByteSplice::borrowed)
-                                .collect::<Vec<_>>();
-                            let changed = !(size == size_after
-                                && splices_are_unchanged(&mut source, &splices).map_err(|_| {
-                                    Error::Protocol("binary source changed during no-op check")
-                                })?);
-                            if !changed {
-                                if ctx.cancellation.is_cancelled(){return Err(Error::Cancelled);}
-                                let mut current=platform_fs(root.open_regular(&content_path))?;
-                                verify_preimage(&mut current,(size,digest),MAX_FILE_BYTES)
-                                    .map_err(|_|Error::Protocol(
-                                        "binary target changed during no-op; inspect workspace"
-                                    ))?;
-                            }
-                            if changed {
-                                if ctx.cancellation.is_cancelled() {
-                                    return Err(Error::Cancelled);
-                                }
-                                let pending = platform_fs(root.stage_stream_update(
-                                    &content_path,
-                                    (size as u64, digest),
-                                    |output| {
-                                        source.seek(SeekFrom::Start(0))?;
-                                        stream_splice_with_stop(
-                                            &mut source,
-                                            output,
-                                            (size, digest),
-                                            &splices,
-                                            &||ctx.cancellation.is_cancelled(),
-                                        )
-                                        .map_err(|_| {
-                                            aw_platform::scoped_fs::ScopedError::Denied(
-                                                "binary source changed during staged edit",
-                                            )
-                                        })?;
-                                        Ok(())
-                                    },
-                                    &|| ctx.cancellation.is_cancelled(),
-                                ))?;
-                                if ctx.cancellation.is_cancelled() {
-                                    return Err(Error::Cancelled);
-                                }
-                                platform_fs(pending.commit())?;
-                            }
-                            Ok(ToolOutput::text(
-                                aw_tools::mutation::compact_success(
-                                    usize::from(changed),None)
-                            ))
+                        let expected = a.sha256.as_deref().map(parse_sha256).transpose()?;
+                        match operations::edit_binary(
+                            root.as_ref(),
+                            &content_path,
+                            requested,
+                            expected,
+                            MAX_FILE_BYTES,
+                            &|| ctx.cancellation.is_cancelled(),
+                        ) {
+                            Ok(primary) => Ok(ToolOutput::text(primary.as_str())),
+                            Err(OperationError::BinaryPlan(error)) => Err(binary_plan_error(error)),
+                            Err(OperationError::BinaryPrecondition) => Ok(ToolOutput::error(
+                                "bedit: sha256 precondition mismatch",
+                            )),
+                            Err(OperationError::BinarySourceChanged) => Ok(ToolOutput::error(
+                                "bedit: source changed during edit; re-read before retrying",
+                            )),
+                            Err(error) => Err(crate::file_operation_error(error)),
                         }
                     }
                 }

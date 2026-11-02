@@ -874,6 +874,237 @@ impl Root {
             artifact: Some(artifact),
         })
     }
+    fn stage_missing_group(
+        &self,
+        existing: File,
+        existing_model: String,
+        publication: String,
+        entries: Vec<(Vec<String>, String, &[u8])>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<StagedWrite> {
+        let temp = format!(
+            ".aw-stage-{}-{:016x}.tmp",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let cname = cstring(&temp)?;
+        if unsafe { libc::mkdirat(existing.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let identity = (|| -> Result<(u64, u64)> {
+            let stage = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let meta = stage.metadata()?;
+            Ok((meta.dev(), meta.ino()))
+        })()
+        .inspect_err(|_| {
+            lifecycle::remove_empty_stage(&existing, &temp);
+        })?;
+        let artifact = match self.reserve_private_artifact(
+            &existing,
+            existing_model,
+            &temp,
+            ObjectIdentity {
+                volume: identity.0,
+                object: identity.1,
+            },
+            ArtifactKind::Stage,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
+                return Err(error);
+            }
+        };
+        let result = (|| -> Result<()> {
+            let stage = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let mut sync_dirs = vec![stage.try_clone()?];
+            for (directories, leaf, bytes) in entries {
+                if cancel() {
+                    return Err(ScopedError::Cancelled);
+                }
+                let mut current = stage.try_clone()?;
+                for component in directories {
+                    let name = cstring(&component)?;
+                    if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::EEXIST) {
+                            return Err(error.into());
+                        }
+                    }
+                    current = at(&current, &component, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                    sync_dirs.push(current.try_clone()?);
+                }
+                let mut file = at(
+                    &current,
+                    &leaf,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )?;
+                for chunk in bytes.chunks(64 * 1024) {
+                    if cancel() {
+                        return Err(ScopedError::Cancelled);
+                    }
+                    file.write_all(chunk)?;
+                }
+                if file.metadata()?.len() > MAX_BATCH_FILE as u64 {
+                    return Err(ScopedError::Limit("staged output exceeds 64 MiB"));
+                }
+                file.sync_all()?;
+                sync_dirs.push(current.try_clone()?);
+            }
+            if cancel() {
+                return Err(ScopedError::Cancelled);
+            }
+            for directory in sync_dirs.into_iter().rev() {
+                directory.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
+            if stat_leaf_missing(&existing, &temp) {
+                let _ = artifact.retire();
+            }
+            return Err(error);
+        }
+        Ok(StagedWrite {
+            parent: existing,
+            name: publication,
+            temp,
+            expected: None,
+            create: true,
+            committed: false,
+            temp_directory: true,
+            temp_identity: Some(identity),
+            artifact: Some(artifact),
+        })
+    }
+
+    pub fn stage_create_many(
+        &self,
+        files: &[aw_tools::filesystem::backend::CreateFile<'_>],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<aw_tools::filesystem::backend::CreateStage<StagedWrite>>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut total = 0usize;
+        let mut components = Vec::with_capacity(files.len());
+        for file in files {
+            validate_path(file.path)?;
+            self.ensure_public_path(file.path)?;
+            total = total
+                .checked_add(file.bytes.len())
+                .ok_or(ScopedError::Limit("staged create batch size overflow"))?;
+            if total > MAX_BATCH_FILE {
+                return Err(ScopedError::Limit("staged create batch exceeds 64 MiB"));
+            }
+            components.push(file.path.split('/').collect::<Vec<_>>());
+        }
+        for left in 0..components.len() {
+            for right in left + 1..components.len() {
+                let a = &components[left];
+                let b = &components[right];
+                if (a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y))
+                    || (b.len() <= a.len() && b.iter().zip(a).all(|(x, y)| x == y))
+                {
+                    return Err(ScopedError::Denied("create paths overlap"));
+                }
+            }
+        }
+
+        struct Group<'a> {
+            first: usize,
+            inputs: Vec<usize>,
+            existing: File,
+            existing_model: String,
+            publication: String,
+            entries: Vec<(Vec<String>, String, &'a [u8])>,
+        }
+        enum Unit<'a> {
+            Single {
+                first: usize,
+                path: &'a str,
+                bytes: &'a [u8],
+            },
+            Group(Group<'a>),
+        }
+        impl Unit<'_> {
+            fn first(&self) -> usize {
+                match self {
+                    Self::Single { first, .. } | Self::Group(Group { first, .. }) => *first,
+                }
+            }
+        }
+
+        let mut units = Vec::<Unit<'_>>::new();
+        let mut groups = BTreeMap::<(String, String), usize>::new();
+        for (index, file) in files.iter().enumerate() {
+            if cancel() {
+                return Err(ScopedError::Cancelled);
+            }
+            match self.missing_parent(file.path)? {
+                None => units.push(Unit::Single {
+                    first: index,
+                    path: file.path,
+                    bytes: file.bytes,
+                }),
+                Some((existing, missing, leaf)) => {
+                    let existing_model = existing_parent_model_path(file.path, missing.len());
+                    let publication = missing[0].clone();
+                    let key = (existing_model.clone(), publication.clone());
+                    let directories = missing.into_iter().skip(1).collect::<Vec<_>>();
+                    if let Some(unit) = groups.get(&key).copied() {
+                        let Unit::Group(group) = &mut units[unit] else {
+                            unreachable!("group index points to group unit");
+                        };
+                        group.inputs.push(index);
+                        group.entries.push((directories, leaf, file.bytes));
+                    } else {
+                        let unit = units.len();
+                        units.push(Unit::Group(Group {
+                            first: index,
+                            inputs: vec![index],
+                            existing,
+                            existing_model,
+                            publication,
+                            entries: vec![(directories, leaf, file.bytes)],
+                        }));
+                        groups.insert(key, unit);
+                    }
+                }
+            }
+        }
+        units.sort_by_key(Unit::first);
+        let mut staged = Vec::with_capacity(units.len());
+        for unit in units {
+            if cancel() {
+                return Err(ScopedError::Cancelled);
+            }
+            match unit {
+                Unit::Single { first, path, bytes } => {
+                    staged.push(aw_tools::filesystem::backend::CreateStage {
+                        first,
+                        inputs: vec![first],
+                        stage: self.stage_create(path, bytes, cancel)?,
+                    });
+                }
+                Unit::Group(group) => staged.push(aw_tools::filesystem::backend::CreateStage {
+                    first: group.first,
+                    inputs: group.inputs,
+                    stage: self.stage_missing_group(
+                        group.existing,
+                        group.existing_model,
+                        group.publication,
+                        group.entries,
+                        cancel,
+                    )?,
+                }),
+            }
+        }
+        Ok(staged)
+    }
+
     fn stage_with(
         &self,
         path: &str,
@@ -1270,6 +1501,102 @@ mod publication_tests {
         staged.commit().unwrap();
         assert!(root.private_artifacts().records().unwrap().is_empty());
         assert_eq!(fs::read(temp.0.join("user.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn batch_create_coalesces_one_missing_publication_root() {
+        use aw_tools::filesystem::backend::CreateFile;
+        let temp = Temp::new();
+        let root = temp.root();
+        let _guard = root
+            .lock_mutations(&["new/a.txt".into(), "new/deep/b.txt".into()])
+            .unwrap();
+        let staged = root
+            .stage_create_many(
+                &[
+                    CreateFile {
+                        path: "new/a.txt",
+                        bytes: b"a",
+                    },
+                    CreateFile {
+                        path: "new/deep/b.txt",
+                        bytes: b"b",
+                    },
+                ],
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(staged.len(), 1, "one missing root is one publication unit");
+        assert_eq!(staged[0].first, 0);
+        assert_eq!(staged[0].inputs, [0, 1]);
+        assert!(!temp.0.join("new").exists());
+        staged.into_iter().next().unwrap().stage.commit().unwrap();
+        assert_eq!(fs::read(temp.0.join("new/a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(temp.0.join("new/deep/b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn batch_create_rejects_file_ancestor_conflict_before_staging() {
+        use aw_tools::filesystem::backend::CreateFile;
+        let temp = Temp::new();
+        let root = temp.root();
+        let _guard = root
+            .lock_mutations(&["new".into(), "new/deep/b.txt".into()])
+            .unwrap();
+        assert!(root
+            .stage_create_many(
+                &[
+                    CreateFile {
+                        path: "new",
+                        bytes: b"file",
+                    },
+                    CreateFile {
+                        path: "new/deep/b.txt",
+                        bytes: b"child",
+                    },
+                ],
+                &|| false,
+            )
+            .is_err());
+        assert!(!temp.0.join("new").exists());
+        assert!(root.private_artifacts().records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_patch_coalesces_adds_under_one_absent_subtree() {
+        let temp = Temp::new();
+        let root = temp.root();
+        let result = aw_tools::filesystem::operations::patch_text(
+            &root,
+            "*** Begin Patch\n*** Add File: new/a.txt\n+a\n*** Add File: new/deep/b.txt\n+b\n*** End Patch\n",
+            1024 * 1024,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(result, aw_tools::filesystem::status::Primary::Ok);
+        assert_eq!(fs::read(temp.0.join("new/a.txt")).unwrap(), b"a\n");
+        assert_eq!(fs::read(temp.0.join("new/deep/b.txt")).unwrap(), b"b\n");
+        assert!(root.private_artifacts().records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_patch_late_plan_failure_publishes_nothing() {
+        let temp = Temp::new();
+        let root = temp.root();
+        fs::write(temp.0.join("existing.txt"), b"before\n").unwrap();
+        let result = aw_tools::filesystem::operations::patch_text(
+            &root,
+            "*** Begin Patch\n*** Add File: new/a.txt\n+a\n*** Update File: existing.txt\n@@\n-not present\n+changed\n*** End Patch\n",
+            1024 * 1024,
+            &|| false,
+        );
+        assert!(matches!(
+            result,
+            Err(aw_tools::filesystem::operations::Error::Patch(_))
+        ));
+        assert!(!temp.0.join("new").exists());
+        assert_eq!(fs::read(temp.0.join("existing.txt")).unwrap(), b"before\n");
+        assert!(root.private_artifacts().records().unwrap().is_empty());
     }
 
     #[test]

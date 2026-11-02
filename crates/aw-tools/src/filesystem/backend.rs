@@ -6,6 +6,8 @@ use super::lifecycle::RemoveOutcome;
 use super::{walk, EntryMeta};
 #[cfg(feature = "rw")]
 use crate::read::{Page, PageRequest};
+#[cfg(feature = "rw")]
+use std::fs::File;
 
 pub trait MetadataBackend: walk::Backend {
     /// Name-only lstat: never follows links or materializes host paths.
@@ -41,6 +43,20 @@ pub enum CommitFailure {
     Unknown,
 }
 #[cfg(feature = "rw")]
+#[derive(Debug)]
+pub enum StreamWriteError {
+    Io(std::io::Error),
+    Cancelled,
+    Refused(&'static str),
+}
+#[cfg(feature = "rw")]
+impl From<std::io::Error> for StreamWriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[cfg(feature = "rw")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationAccess {
     Read,
@@ -53,6 +69,22 @@ pub enum MutationExtent {
     Exact,
     Subtree,
 }
+#[cfg(feature = "rw")]
+#[derive(Clone, Copy, Debug)]
+pub struct CreateFile<'a> {
+    pub path: &'a str,
+    pub bytes: &'a [u8],
+}
+
+#[cfg(feature = "rw")]
+pub struct CreateStage<S> {
+    /// Earliest input contributing to this atomic namespace publication unit.
+    pub first: usize,
+    /// All input indices that become visible with this one publication.
+    pub inputs: Vec<usize>,
+    pub stage: S,
+}
+
 #[cfg(feature = "rw")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MutationPath<'a> {
@@ -102,6 +134,14 @@ pub trait SecuredFilesystem: MetadataBackend {
         bytes: &[u8],
         cancel: &dyn Fn() -> bool,
     ) -> Result<Self::Stage, Self::Error>;
+    /// Stage ordered create-only files. Backends coalesce files that share one
+    /// not-yet-visible publication root and return units carrying every
+    /// contributing input index in deterministic earliest-contributor order.
+    fn stage_create_many(
+        &self,
+        files: &[CreateFile<'_>],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<CreateStage<Self::Stage>>, Self::Error>;
     fn stage_replace(
         &self,
         path: &str,
@@ -113,6 +153,18 @@ pub trait SecuredFilesystem: MetadataBackend {
         path: &str,
         expected: &[u8],
         bytes: &[u8],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self::Stage, Self::Error>;
+    /// Open an existing regular mutation source under read+write authority.
+    /// The returned handle pins the source object for streamed planning.
+    fn open_regular_for_update(&self, path: &str) -> Result<File, Self::Error>;
+    /// Stage a digest-verified streamed replacement. Writer errors occur before
+    /// public namespace publication and are mapped by the backend accordingly.
+    fn stage_stream_update(
+        &self,
+        path: &str,
+        expected: (u64, [u8; 32]),
+        writer: &mut dyn FnMut(&mut File) -> Result<(), StreamWriteError>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Self::Stage, Self::Error>;
     /// Stage-commit and exact copy failure classification. A post-publication

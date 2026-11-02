@@ -15,8 +15,9 @@ pub enum PatchOp {
     },
     Add {
         path: String,
+        /// Body lines without the grammar LF. A trailing `\r` is retained
+        /// when that individual patch line used CRLF.
         lines: Vec<String>,
-        crlf: bool,
     },
 }
 
@@ -105,7 +106,6 @@ pub fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
                 ops.push(PatchOp::Add {
                     path,
                     lines: Vec::new(),
-                    crlf: line.ends_with('\r'),
                 });
                 continue;
             }
@@ -159,18 +159,11 @@ pub fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
                     _ => bail!("patch: line {number}: unexpected text '{body}'"),
                 }
             }
-            PatchOp::Add { lines, crlf, .. } => {
-                let body = if *crlf {
-                    line.strip_suffix('\r').unwrap_or(line)
-                } else {
-                    line
-                };
-                match body.as_bytes().first() {
-                    Some(b'+') => lines.push(body[1..].to_owned()),
-                    _ if body.trim().is_empty() => lines.push(String::new()),
-                    _ => bail!("patch: line {number}: unexpected text '{body}'"),
-                }
-            }
+            PatchOp::Add { lines, .. } => match line.as_bytes().first() {
+                Some(b'+') => lines.push(line[1..].to_owned()),
+                _ if line.is_empty() || line == "\r" => lines.push(line.to_owned()),
+                _ => bail!("patch: line {number}: unexpected text '{line}'"),
+            },
         }
     }
 
@@ -225,6 +218,21 @@ fn parse_patch_anchor(rest: &str) -> Option<String> {
         true => None,
         false => Some(rest.to_owned()),
     }
+}
+
+/// Render one `*** Add File` body without normalizing line endings. Each
+/// stored line retains a trailing CR only when that grammar line used CRLF;
+/// the patch grammar contributes the LF terminator for every body line.
+pub fn add_file_bytes(lines: &[String]) -> Vec<u8> {
+    let size = lines
+        .iter()
+        .fold(0usize, |total, line| total.saturating_add(line.len() + 1));
+    let mut out = Vec::with_capacity(size);
+    for line in lines {
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Hunk location is content-based: exact match first, then a per-line
@@ -444,17 +452,27 @@ mod tests {
         assert!(update("old\n", "@@\n+new").is_err());
     }
     #[test]
+    fn add_file_preserves_each_patch_line_separator() {
+        let patch =
+            "*** Begin Patch\r\n*** Add File: mixed.txt\r\n+one\r\n+two\n+three\r\n*** End Patch\n";
+        let ops = parse_patch(patch).unwrap();
+        let PatchOp::Add { lines, .. } = &ops[0] else {
+            panic!("expected add");
+        };
+        assert_eq!(add_file_bytes(lines), b"one\r\ntwo\nthree\r\n");
+    }
+
+    #[test]
     fn crlf_patch_syntax_decodes_separators() {
         let patch =
             "*** Begin Patch\r\n*** Add File: f.txt\r\n+one\r\n+\r\n+two\r\n*** End Patch\r\n";
         let result = parse_patch(patch).unwrap();
-        let PatchOp::Add { lines, crlf, .. } = &result[0] else {
+        let PatchOp::Add { lines, .. } = &result[0] else {
             unreachable!()
         };
-        assert!(*crlf);
-        assert_eq!(lines, &["one", "", "two"]);
-        assert_eq!(format!("{}\r\n", lines.join("\r\n")), "one\r\n\r\ntwo\r\n");
+        assert_eq!(add_file_bytes(lines), b"one\r\n\r\ntwo\r\n");
     }
+
     #[test]
     fn malformed_duplicate_hunks_are_not_quadratic() {
         let source = (0..12_000).map(|_| "same\n").collect::<String>();

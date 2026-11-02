@@ -754,6 +754,71 @@ impl SecuredFilesystem for CapabilitySet {
         Root::stage_create(&routed.grant.root, &routed.relative, bytes, cancel)
     }
 
+    fn stage_create_many(
+        &self,
+        files: &[aw_tools::filesystem::backend::CreateFile<'_>],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<aw_tools::filesystem::backend::CreateStage<Self::Stage>>> {
+        let routed = files
+            .iter()
+            .map(|file| self.route(file.path, Need::Write))
+            .collect::<Result<Vec<_>>>()?;
+        for left in 0..routed.len() {
+            for right in left + 1..routed.len() {
+                let a = &routed[left].absolute;
+                let b = &routed[right].absolute;
+                if a == b || a.starts_with(b) || b.starts_with(a) {
+                    return Err(ScopedError::Denied("create paths overlap"));
+                }
+            }
+        }
+        let mut groups = BTreeMap::<usize, Vec<(usize, String, &[u8])>>::new();
+        for (index, (route, file)) in routed.iter().zip(files).enumerate() {
+            if route.relative.is_empty() {
+                return Err(ScopedError::Denied("mutation path must name an entry"));
+            }
+            groups.entry(route.index).or_default().push((
+                index,
+                route.relative.clone(),
+                file.bytes,
+            ));
+        }
+        let mut staged = Vec::new();
+        for (grant, entries) in groups {
+            let local = entries
+                .iter()
+                .map(
+                    |(_, path, bytes)| aw_tools::filesystem::backend::CreateFile {
+                        path: path.as_str(),
+                        bytes,
+                    },
+                )
+                .collect::<Vec<_>>();
+            for unit in Root::stage_create_many(&self.grants[grant].root, &local, cancel)? {
+                let first = entries
+                    .get(unit.first)
+                    .ok_or(ScopedError::Denied("invalid staged create unit index"))?
+                    .0;
+                let inputs = unit
+                    .inputs
+                    .iter()
+                    .map(|local_index| {
+                        entries
+                            .get(*local_index)
+                            .map(|entry| entry.0)
+                            .ok_or(ScopedError::Denied("invalid staged create unit index"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                staged.push(aw_tools::filesystem::backend::CreateStage {
+                    first,
+                    inputs,
+                    stage: unit.stage,
+                });
+            }
+        }
+        staged.sort_by_key(|unit| unit.first);
+        Ok(staged)
+    }
     fn stage_replace(
         &self,
         path: &str,
@@ -777,6 +842,45 @@ impl SecuredFilesystem for CapabilitySet {
             &routed.relative,
             expected,
             bytes,
+            cancel,
+        )
+    }
+
+    fn open_regular_for_update(&self, path: &str) -> Result<std::fs::File> {
+        let routed = self.route(path, Need::Both)?;
+        Root::open_regular(&routed.grant.root, &routed.relative)
+    }
+
+    fn stage_stream_update(
+        &self,
+        path: &str,
+        expected: (u64, [u8; 32]),
+        writer: &mut dyn FnMut(
+            &mut std::fs::File,
+        ) -> std::result::Result<
+            (),
+            aw_tools::filesystem::backend::StreamWriteError,
+        >,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self::Stage> {
+        let routed = self.route(path, Need::Both)?;
+        Root::stage_stream_update(
+            &routed.grant.root,
+            &routed.relative,
+            expected,
+            |output| {
+                writer(output).map_err(|error| match error {
+                    aw_tools::filesystem::backend::StreamWriteError::Io(error) => {
+                        ScopedError::Io(error)
+                    }
+                    aw_tools::filesystem::backend::StreamWriteError::Cancelled => {
+                        ScopedError::Cancelled
+                    }
+                    aw_tools::filesystem::backend::StreamWriteError::Refused(reason) => {
+                        ScopedError::Denied(reason)
+                    }
+                })
+            },
             cancel,
         )
     }

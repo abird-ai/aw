@@ -5,7 +5,7 @@ use aw_tools::filesystem::private_artifact::{
     Kind as ArtifactKind, Lease as ArtifactLease, ObjectIdentity, Record,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
@@ -707,6 +707,234 @@ impl Root {
             parent_model_path: existing_parent_model_path(path, missing.len()),
         })
     }
+    fn stage_missing_group(
+        &self,
+        parent: Parent,
+        existing_model: String,
+        publication: String,
+        entries: Vec<(Vec<String>, String, &[u8])>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StagedWrite> {
+        let temp = parent.path.join(format!(
+            ".aw-stage-{}-{:016x}.tmp",
+            std::process::id(),
+            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&temp)?;
+        let opened = pin_directory(&temp)?;
+        let identity = directory_identity(&opened)?;
+        drop(opened);
+        let artifact = match self.reserve_private_artifact(
+            &parent,
+            existing_model.clone(),
+            temp.file_name()
+                .and_then(|value| value.to_str())
+                .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
+            ObjectIdentity {
+                volume: u64::from(identity.0),
+                object: identity.1,
+            },
+            ArtifactKind::Stage,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                lifecycle::cleanup_stage_tree(&temp, identity);
+                return Err(error);
+            }
+        };
+        let result = (|| -> Result<()> {
+            let mut handles = vec![pin_directory(&temp)?];
+            for (directories, leaf, bytes) in entries {
+                if cancelled() {
+                    return Err(ScopedError::Cancelled);
+                }
+                let mut target = temp.clone();
+                for component in directories {
+                    target.push(&component);
+                    match fs::create_dir(&target) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    handles.push(pin_directory(&target)?);
+                }
+                let filename = target.join(&leaf);
+                let mut output = secure_staging_file(&filename, None)?;
+                for chunk in bytes.chunks(64 * 1024) {
+                    if cancelled() {
+                        return Err(ScopedError::Cancelled);
+                    }
+                    output.write_all(chunk)?;
+                }
+                if output.metadata()?.len() > MAX_BATCH_FILE as u64 {
+                    return Err(ScopedError::Limit("staged output exceeds 64 MiB"));
+                }
+                output.sync_all()?;
+                drop(output);
+                handles.push(pin_directory(&target)?);
+            }
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
+            }
+            drop(handles);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            lifecycle::cleanup_stage_tree(&temp, identity);
+            if !temp.exists() {
+                let _ = artifact.retire();
+            }
+            return Err(error);
+        }
+        let published = parent.path.join(&publication);
+        let parent_identity = self.parent_artifact_identity(&parent)?;
+        Ok(StagedWrite {
+            parent: Some(parent),
+            target: published,
+            temp,
+            expected: None,
+            create: true,
+            existed: false,
+            committed: false,
+            preserve_on_failure: false,
+            temp_dir_identity: Some(identity),
+            artifact: Some(artifact),
+            private: self.private.clone(),
+            parent_identity,
+            parent_model_path: existing_model,
+        })
+    }
+
+    pub fn stage_create_many(
+        &self,
+        files: &[aw_tools::filesystem::backend::CreateFile<'_>],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<aw_tools::filesystem::backend::CreateStage<StagedWrite>>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut total = 0usize;
+        let mut components = Vec::with_capacity(files.len());
+        for file in files {
+            validate_path(file.path)?;
+            self.ensure_public_path(file.path)?;
+            total = total
+                .checked_add(file.bytes.len())
+                .ok_or(ScopedError::Limit("staged create batch size overflow"))?;
+            if total > MAX_BATCH_FILE {
+                return Err(ScopedError::Limit("staged create batch exceeds 64 MiB"));
+            }
+            components.push(
+                file.path
+                    .split('/')
+                    .map(|component| folded_namespace_key(std::path::Path::new(component)))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        for left in 0..components.len() {
+            for right in left + 1..components.len() {
+                let a = &components[left];
+                let b = &components[right];
+                if (a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y))
+                    || (b.len() <= a.len() && b.iter().zip(a).all(|(x, y)| x == y))
+                {
+                    return Err(ScopedError::Denied("create paths overlap"));
+                }
+            }
+        }
+
+        struct Group<'a> {
+            first: usize,
+            inputs: Vec<usize>,
+            parent: Parent,
+            existing_model: String,
+            publication: String,
+            entries: Vec<(Vec<String>, String, &'a [u8])>,
+        }
+        enum Unit<'a> {
+            Single {
+                first: usize,
+                path: &'a str,
+                bytes: &'a [u8],
+            },
+            Group(Group<'a>),
+        }
+        impl Unit<'_> {
+            fn first(&self) -> usize {
+                match self {
+                    Self::Single { first, .. } | Self::Group(Group { first, .. }) => *first,
+                }
+            }
+        }
+
+        let mut units = Vec::<Unit<'_>>::new();
+        let mut groups = BTreeMap::<Vec<u8>, usize>::new();
+        for (index, file) in files.iter().enumerate() {
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
+            }
+            match self.missing_parent(file.path)? {
+                None => units.push(Unit::Single {
+                    first: index,
+                    path: file.path,
+                    bytes: file.bytes,
+                }),
+                Some((parent, missing, leaf)) => {
+                    let existing_model = existing_parent_model_path(file.path, missing.len());
+                    let publication = missing[0].clone();
+                    let key = folded_namespace_key(&parent.path.join(&publication))?;
+                    let directories = missing.into_iter().skip(1).collect::<Vec<_>>();
+                    if let Some(unit) = groups.get(&key).copied() {
+                        let Unit::Group(group) = &mut units[unit] else {
+                            unreachable!("group index points to group unit");
+                        };
+                        group.inputs.push(index);
+                        group.entries.push((directories, leaf, file.bytes));
+                    } else {
+                        let unit = units.len();
+                        units.push(Unit::Group(Group {
+                            first: index,
+                            inputs: vec![index],
+                            parent,
+                            existing_model,
+                            publication,
+                            entries: vec![(directories, leaf, file.bytes)],
+                        }));
+                        groups.insert(key, unit);
+                    }
+                }
+            }
+        }
+        units.sort_by_key(Unit::first);
+        let mut staged = Vec::with_capacity(units.len());
+        for unit in units {
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
+            }
+            match unit {
+                Unit::Single { first, path, bytes } => {
+                    staged.push(aw_tools::filesystem::backend::CreateStage {
+                        first,
+                        inputs: vec![first],
+                        stage: self.stage_create(path, bytes, cancelled)?,
+                    });
+                }
+                Unit::Group(group) => staged.push(aw_tools::filesystem::backend::CreateStage {
+                    first: group.first,
+                    inputs: group.inputs,
+                    stage: self.stage_missing_group(
+                        group.parent,
+                        group.existing_model,
+                        group.publication,
+                        group.entries,
+                        cancelled,
+                    )?,
+                }),
+            }
+        }
+        Ok(staged)
+    }
+
     fn stage_with(
         &self,
         path: &str,
