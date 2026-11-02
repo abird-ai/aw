@@ -432,20 +432,21 @@ pub fn configure(
         .filter(|tool| *tool != aw_tools::filesystem::schema::Tool::Remove || durable_remove)
         .filter(|tool| selected.is_empty() || selected.contains(tool.name()))
         .collect::<Vec<_>>();
-    let selected_shell = options
+    let graph_shell_available = options
         .mode
         .access()
         .permits(aw_tools::filesystem::access::Action::Shell)
-        && selected.iter().any(|name| {
-            #[cfg(unix)]
-            {
-                *name == "bash"
-            }
-            #[cfg(windows)]
-            {
-                matches!(*name, "pwsh" | "powershell")
-            }
-        });
+        && (selected.is_empty()
+            || selected.iter().any(|name| {
+                #[cfg(unix)]
+                {
+                    *name == "bash"
+                }
+                #[cfg(windows)]
+                {
+                    matches!(*name, "pwsh" | "powershell")
+                }
+            }));
     if !selected.is_empty() && control_selected && !constructor_selected {
         return Err(Error::Denied(
             "selected Job controls require an explicitly selected batch, job_start or shell constructor",
@@ -454,7 +455,7 @@ pub fn configure(
     if !selected.is_empty()
         && constructor_selected
         && graph_native_tools.is_empty()
-        && !selected_shell
+        && !graph_shell_available
     {
         return Err(Error::Denied(
             "selected Job constructors require at least one explicitly selected, mode-permitted native or shell node",
@@ -466,12 +467,19 @@ pub fn configure(
     // to retain every node's exact result reservation; a narrower session spool
     // would turn valid later nodes into quota-driven `skip` outcomes.
     if wants_jobs {
-        let per_node_reservation = match (!graph_native_tools.is_empty(), selected_shell) {
-            (true, true) => limits.result_bytes.max(job_host::SHELL_RESULT_BYTES) as u64,
-            (true, false) => limits.result_bytes as u64,
-            (false, true) => job_host::SHELL_RESULT_BYTES as u64,
-            (false, false) => 0,
+        let native_reservation = if graph_native_tools.is_empty() {
+            0
+        } else {
+            limits.result_bytes as u64
         };
+        let shell_reservation = if graph_shell_available {
+            (job_host::SHELL_RESULT_BYTES as u64)
+                .checked_add(2 * limits.shell_stream_bytes as u64)
+                .ok_or_else(|| Error::Config("ShellNode spool reservation overflow".into()))?
+        } else {
+            0
+        };
+        let per_node_reservation = native_reservation.max(shell_reservation);
         let minimum_graph_spool = per_node_reservation
             .checked_mul(aw_tools::filesystem::batch::MAX_OPS as u64)
             .ok_or_else(|| Error::Config("Job Graph spool reservation overflow".into()))?;
