@@ -42,7 +42,7 @@ unsafe_op_in_unsafe_fn = "deny"
 
 
 [target.'cfg(unix)'.dependencies]
-libc = { version = "=0.2.177", optional = true }
+libc = { version = "=0.2.189", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", optional = true, features = [
