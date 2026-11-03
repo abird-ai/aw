@@ -177,47 +177,7 @@ fn portable_canonical(path: &Path) -> Result<String> {
 }
 
 fn fold_segment(value: &str) -> Result<Vec<u16>> {
-    use std::ptr;
-    use windows_sys::Win32::Globalization::{
-        LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT,
-    };
-    let source = value.encode_utf16().collect::<Vec<_>>();
-    let len =
-        i32::try_from(source.len()).map_err(|_| ScopedError::Limit("path segment too long"))?;
-    let needed = unsafe {
-        LCMapStringEx(
-            LOCALE_NAME_INVARIANT,
-            LCMAP_UPPERCASE,
-            source.as_ptr(),
-            len,
-            ptr::null_mut(),
-            0,
-            ptr::null(),
-            ptr::null(),
-            0,
-        )
-    };
-    if needed == 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let mut mapped = vec![0u16; needed as usize];
-    let written = unsafe {
-        LCMapStringEx(
-            LOCALE_NAME_INVARIANT,
-            LCMAP_UPPERCASE,
-            source.as_ptr(),
-            len,
-            mapped.as_mut_ptr(),
-            needed,
-            ptr::null(),
-            ptr::null(),
-            0,
-        )
-    };
-    if written != needed {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(mapped)
+    super::port::folded_component_units(value)
 }
 
 fn model_components(model: &str) -> Result<Vec<String>> {
@@ -241,6 +201,14 @@ fn model_components(model: &str) -> Result<Vec<String>> {
         .split('/')
         .map(str::to_owned)
         .collect())
+}
+
+fn scheduling_model(model: &str) -> Result<String> {
+    model_components(model)?
+        .iter()
+        .map(|part| super::port::folded_component_label(part))
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("/"))
 }
 
 fn exact_segments(model: &str) -> Result<Vec<String>> {
@@ -464,6 +432,54 @@ impl CapabilitySet {
         })
     }
 
+    fn relative_for_grant(grant: &Grant, absolute_model: &str) -> Result<Option<String>> {
+        let full = exact_segments(absolute_model)?;
+        if !exact_prefix(&grant.exact_segments, &full) {
+            return Ok(None);
+        }
+        let relative = full[grant.exact_segments.len()..].join("/");
+        if !relative.is_empty() {
+            super::validate_path(&relative)?;
+        }
+        Ok(Some(relative))
+    }
+
+    fn private_absolute(&self, absolute_model: &str) -> Result<bool> {
+        for grant in &self.grants {
+            let Some(relative) = Self::relative_for_grant(grant, absolute_model)? else {
+                continue;
+            };
+            if !relative.is_empty() && grant.root.is_private_path(&relative)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn private_subtree_overlap(&self, absolute_model: &str) -> Result<bool> {
+        let subtree = segments(absolute_model)?;
+        for grant in &self.grants {
+            let records = grant.root.private_artifacts().records().map_err(|_| {
+                ScopedError::Denied("private mutation artifact registry unavailable")
+            })?;
+            for record in records {
+                let relative = if record.parent_path.is_empty() {
+                    record.name.clone()
+                } else {
+                    format!("{}/{}", record.parent_path, record.name)
+                };
+                super::validate_path(&relative)?;
+                let candidate = join_model(&grant.model_path, &relative);
+                if segment_prefix(&subtree, &segments(&candidate)?)
+                    && grant.root.is_private_path(&relative)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub fn reconcile_private_artifacts(&self) -> Result<()> {
         for grant in &self.grants {
             grant.root.reconcile_private_artifacts()?;
@@ -567,6 +583,11 @@ impl CapabilitySet {
         if !relative.is_empty() {
             super::validate_path(&relative)?;
         }
+        if !matches!(need, Need::Coordination) && self.private_absolute(&absolute_model)? {
+            return Err(ScopedError::Denied(
+                "private mutation artifact is not externally addressable",
+            ));
+        }
         Ok(Routed {
             grant,
             index,
@@ -588,7 +609,9 @@ impl CapabilitySet {
                 join_model(model, suffix(&entry.path, &routed.relative))
             };
             let absolute = self.absolute_model(&model_path)?;
-            if self.excluded(&segments(&absolute)?, Need::Read) {
+            if self.excluded(&segments(&absolute)?, Need::Read)
+                || self.private_absolute(&absolute)?
+            {
                 continue;
             }
             entries.push(walk::WalkEntry {
@@ -731,12 +754,12 @@ impl walk::Backend for CapabilitySet {
         error_kind(error)
     }
     fn private_entry(&self, path: &str) -> Result<bool> {
-        let r = self.route(path, Need::Read)?;
-        if r.relative.is_empty() {
-            Ok(false)
-        } else {
-            r.grant.root.is_private_path(&r.relative)
+        let absolute = self.absolute_model(path)?;
+        if self.private_absolute(&absolute)? {
+            return Ok(true);
         }
+        let r = self.route(path, Need::Read)?;
+        Ok(!r.relative.is_empty() && r.grant.root.is_private_path(&r.relative)?)
     }
 }
 impl MetadataBackend for CapabilitySet {
@@ -746,6 +769,10 @@ impl MetadataBackend for CapabilitySet {
             return Err(ScopedError::Denied("metadata path must name an entry"));
         }
         Root::entry_meta(&r.grant.root, &r.relative)
+    }
+
+    fn scheduling_path(&self, path: &str) -> Result<String> {
+        scheduling_model(&self.absolute_model(path)?)
     }
 }
 impl ExplicitPathBackend for CapabilitySet {
@@ -783,12 +810,17 @@ impl SecuredFilesystem for CapabilitySet {
                 MutationAccess::ReadWrite => Need::Both,
             };
             let routed = self.route(path.path, need)?;
-            if path.extent == MutationExtent::Subtree
-                && self.overlaps_exclusion(&segments(&routed.absolute_model)?, need)
-            {
-                return Err(ScopedError::Denied(
-                    "mutation subtree overlaps a prepared capability exclusion",
-                ));
+            if path.extent == MutationExtent::Subtree {
+                if self.overlaps_exclusion(&segments(&routed.absolute_model)?, need) {
+                    return Err(ScopedError::Denied(
+                        "mutation subtree overlaps a prepared capability exclusion",
+                    ));
+                }
+                if self.private_subtree_overlap(&routed.absolute_model)? {
+                    return Err(ScopedError::Denied(
+                        "mutation subtree overlaps a private mutation artifact",
+                    ));
+                }
             }
         }
         Ok(())
@@ -989,6 +1021,13 @@ impl SecuredFilesystem for CapabilitySet {
                 "copy overlaps a prepared capability exclusion",
             ));
         }
+        if self.private_subtree_overlap(&s.absolute_model)?
+            || self.private_subtree_overlap(&d.absolute_model)?
+        {
+            return Err(ScopedError::Denied(
+                "copy overlaps a private mutation artifact",
+            ));
+        }
         let m = Root::entry_meta(&s.grant.root, &s.relative)?;
         Self::is_descendant(&s, &d, m.kind == Kind::Dir)?;
         port::lifecycle::copy_between(
@@ -1008,6 +1047,13 @@ impl SecuredFilesystem for CapabilitySet {
         {
             return Err(ScopedError::Denied(
                 "move overlaps a prepared capability exclusion",
+            ));
+        }
+        if self.private_subtree_overlap(&s.absolute_model)?
+            || self.private_subtree_overlap(&d.absolute_model)?
+        {
+            return Err(ScopedError::Denied(
+                "move overlaps a private mutation artifact",
             ));
         }
         let m = Root::entry_meta(&s.grant.root, &s.relative)?;
@@ -1030,13 +1076,17 @@ impl SecuredFilesystem for CapabilitySet {
             .iter()
             .map(|p| self.route(p, Need::Write))
             .collect::<Result<Vec<_>>>()?;
-        if routed.iter().any(|path| {
-            segments(&path.absolute_model)
-                .is_ok_and(|full| self.overlaps_exclusion(&full, Need::Write))
-        }) {
-            return Err(ScopedError::Denied(
-                "remove overlaps a prepared capability exclusion",
-            ));
+        for path in &routed {
+            if self.overlaps_exclusion(&segments(&path.absolute_model)?, Need::Write) {
+                return Err(ScopedError::Denied(
+                    "remove overlaps a prepared capability exclusion",
+                ));
+            }
+            if self.private_subtree_overlap(&path.absolute_model)? {
+                return Err(ScopedError::Denied(
+                    "remove overlaps a private mutation artifact",
+                ));
+            }
         }
         let refs = routed
             .iter()
@@ -1058,6 +1108,23 @@ impl SecuredFilesystem for CapabilitySet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scheduling_model_folds_case_but_preserves_hierarchy_and_namespace() {
+        assert_eq!(
+            scheduling_model("C:/Repo/Foo").unwrap(),
+            scheduling_model("c:/repo/foo").unwrap()
+        );
+        assert_ne!(
+            scheduling_model("C:/Repo/Foo").unwrap(),
+            scheduling_model("D:/Repo/Foo").unwrap()
+        );
+        let parent = scheduling_model("//Server/Share/Dir").unwrap();
+        let child = scheduling_model("//server/share/dir/File").unwrap();
+        assert!(child
+            .strip_prefix(&parent)
+            .is_some_and(|suffix| suffix.starts_with('/')));
+    }
+
     #[test]
     fn portable_canonical_maps_unc_to_model_namespace() {
         assert_eq!(

@@ -10,6 +10,13 @@ pub enum Error {
     Invalid,
 }
 
+pub const MAX_MODEL_PATH_BYTES: usize = 4096;
+/// Scheduler-only namespace keys may encode platform identity (for example
+/// invariant UTF-16 Windows folding) and can therefore be larger than the
+/// model spelling. Keep this independently bounded without narrowing a valid
+/// model path after authorization.
+pub const MAX_SCHEDULING_PATH_BYTES: usize = 64 * 1024;
+
 fn drive_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
@@ -42,8 +49,8 @@ pub fn is_root(path: &str) -> bool {
 /// POSIX `/a/b` and Windows-style `C:/a/b` absolute spellings are accepted so
 /// host adapters can prepare them against pinned grants without rewriting the
 /// user/model namespace.
-pub fn validate(path: &str) -> Result<(), Error> {
-    if path.is_empty() || path.len() > 4096 || path.contains(['\\', '\0']) {
+fn validate_bounded(path: &str, max_bytes: usize) -> Result<(), Error> {
+    if path.is_empty() || path.len() > max_bytes || path.contains(['\\', '\0']) {
         return Err(Error::Invalid);
     }
     if path == "." || path == "/" || (drive_absolute(path) && path.len() == 3) {
@@ -75,6 +82,18 @@ pub fn validate(path: &str) -> Result<(), Error> {
         return Err(Error::Invalid);
     }
     Ok(())
+}
+
+pub fn validate(path: &str) -> Result<(), Error> {
+    validate_bounded(path, MAX_MODEL_PATH_BYTES)
+}
+
+/// Validate an internal scheduler namespace key. It intentionally shares the
+/// model path's structural grammar while allowing bounded platform encodings to
+/// be longer than their already-validated source spelling. This is never an
+/// authorization or model-input validator.
+pub fn validate_scheduling(path: &str) -> Result<(), Error> {
+    validate_bounded(path, MAX_SCHEDULING_PATH_BYTES)
 }
 
 /// Secured single-root backends consume only relative paths after host
@@ -165,6 +184,16 @@ mod tests {
         }
         let long = "x".repeat(4091);
         assert_eq!(join(&long, "child"), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn scheduler_keys_have_an_independent_bounded_encoding_budget() {
+        let expanded = "x".repeat(MAX_MODEL_PATH_BYTES + 1);
+        assert_eq!(validate(&expanded), Err(Error::Invalid));
+        assert_eq!(validate_scheduling(&expanded), Ok(()));
+        let too_large = "x".repeat(MAX_SCHEDULING_PATH_BYTES + 1);
+        assert_eq!(validate_scheduling(&too_large), Err(Error::Invalid));
+        assert_eq!(validate_scheduling("a/../b"), Err(Error::Invalid));
     }
 
     #[test]

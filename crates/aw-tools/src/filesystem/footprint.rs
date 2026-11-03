@@ -45,16 +45,10 @@ impl Footprint {
         if scopes.len() > MAX_SCOPES {
             return Err(Error::TooManyScopes);
         }
-        if scopes.iter().any(|scope| {
-            scope.path.is_empty()
-                || scope.path.len() > 4096
-                || scope.path.contains('\\')
-                || scope.path.contains('\0')
-                || scope
-                    .path
-                    .split('/')
-                    .any(|part| part.is_empty() || part == "..")
-        }) {
+        if scopes
+            .iter()
+            .any(|scope| super::path::validate_scheduling(&scope.path).is_err())
+        {
             return Err(Error::InvalidPath);
         }
         scopes.sort();
@@ -135,11 +129,20 @@ impl Footprint {
 }
 
 fn under(path: &str, root: &str) -> bool {
-    path == root
-        || (root == ".")
-        || path
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    if path == root {
+        return true;
+    }
+    if root == "." {
+        return !super::path::is_absolute(path);
+    }
+    if root == "/" {
+        return path.starts_with('/') && !super::path::is_unc(path);
+    }
+    if root.len() == 3 && root.as_bytes()[1] == b':' && root.ends_with('/') {
+        return path.starts_with(root);
+    }
+    path.strip_prefix(root)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn scopes_overlap(left: &Scope, right: &Scope) -> bool {
@@ -214,6 +217,99 @@ mod tests {
         assert!(!read_unknown.conflicts(&read));
         assert!(read_unknown.conflicts(&write));
         assert!(write_unknown.conflicts(&read));
+    }
+
+    #[test]
+    fn absolute_and_unc_scopes_use_canonical_model_path_namespaces() {
+        let posix_root = Footprint::new(
+            vec![scope("/", Access::Write, Extent::Subtree)],
+            false,
+            false,
+        )
+        .unwrap();
+        let posix_child = Footprint::new(
+            vec![scope("/srv/repo/a", Access::Read, Extent::Exact)],
+            false,
+            false,
+        )
+        .unwrap();
+        let unc_child = Footprint::new(
+            vec![scope("//server/share/a", Access::Read, Extent::Exact)],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(posix_root.conflicts(&posix_child));
+        assert!(!posix_root.conflicts(&unc_child));
+
+        let drive_root = Footprint::new(
+            vec![scope("C:/", Access::Write, Extent::Subtree)],
+            false,
+            false,
+        )
+        .unwrap();
+        let drive_child = Footprint::new(
+            vec![scope("C:/repo/a", Access::Read, Extent::Exact)],
+            false,
+            false,
+        )
+        .unwrap();
+        let drive_sibling = Footprint::new(
+            vec![scope("D:/repo/a", Access::Read, Extent::Exact)],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(drive_root.conflicts(&drive_child));
+        assert!(!drive_root.conflicts(&drive_sibling));
+
+        let unc_root = Footprint::new(
+            vec![scope("//server/share", Access::Write, Extent::Subtree)],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(unc_root.conflicts(&unc_child));
+        assert!(!unc_root.conflicts(&posix_child));
+    }
+
+    #[test]
+    fn relative_root_does_not_alias_an_absolute_namespace() {
+        let relative = Footprint::new(
+            vec![scope(".", Access::Write, Extent::Subtree)],
+            false,
+            false,
+        )
+        .unwrap();
+        let child = Footprint::new(
+            vec![scope("src/a", Access::Read, Extent::Exact)],
+            false,
+            false,
+        )
+        .unwrap();
+        let absolute = Footprint::new(
+            vec![scope("/src/a", Access::Read, Extent::Exact)],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(relative.conflicts(&child));
+        assert!(!relative.conflicts(&absolute));
+    }
+
+    #[test]
+    fn encoded_scheduler_key_can_exceed_model_path_budget_without_becoming_unbounded() {
+        let encoded = format!(
+            "~{}",
+            "a".repeat(super::super::path::MAX_MODEL_PATH_BYTES + 8)
+        );
+        assert!(super::super::path::validate(&encoded).is_err());
+        assert!(Footprint::new(
+            vec![scope(&encoded, Access::Write, Extent::Exact)],
+            false,
+            false,
+        )
+        .is_ok());
     }
 
     #[test]

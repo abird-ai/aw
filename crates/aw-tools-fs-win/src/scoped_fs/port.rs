@@ -87,15 +87,13 @@ pub struct MutationGuard<'a> {
 /// Windows UTF-16 uppercase mapping, then SHA-256 over little-endian
 /// code units. Rust Unicode case-folding would choose different mutexes
 /// for case-equivalent NTFS names.
-pub(super) fn folded_namespace_key(path: &std::path::Path) -> Result<Vec<u8>> {
-    use std::{os::windows::ffi::OsStrExt, ptr};
+fn fold_invariant_utf16(source: &[u16], label: &'static str) -> Result<Vec<u16>> {
+    use std::ptr;
     use windows_sys::Win32::Globalization::{
         LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT,
     };
-    let source = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    let count = i32::try_from(source.len())
-        .map_err(|_| ScopedError::Limit("mutation path exceeds UTF-16 length"))?;
-    // SAFETY: fixed valid UTF-16 input; first call sizes destination.
+    let count = i32::try_from(source.len()).map_err(|_| ScopedError::Limit(label))?;
+    // SAFETY: fixed UTF-16 input; first call sizes destination.
     let required = unsafe {
         LCMapStringEx(
             LOCALE_NAME_INVARIANT,
@@ -130,11 +128,48 @@ pub(super) fn folded_namespace_key(path: &std::path::Path) -> Result<Vec<u8>> {
     if written != required {
         return Err(io::Error::last_os_error().into());
     }
+    Ok(mapped)
+}
+
+/// Match dotlink's Windows mutation name identity exactly: invariant Windows
+/// UTF-16 uppercase mapping encoded as little-endian bytes.
+pub(super) fn folded_namespace_key(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let source = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mapped = fold_invariant_utf16(&source, "mutation path exceeds UTF-16 length")?;
     let mut key = Vec::with_capacity(mapped.len() * 2);
     for unit in mapped {
         key.extend_from_slice(&unit.to_le_bytes());
     }
     Ok(key)
+}
+
+pub(super) fn folded_component_units(value: &str) -> Result<Vec<u16>> {
+    let source = value.encode_utf16().collect::<Vec<_>>();
+    fold_invariant_utf16(&source, "path segment too long")
+}
+
+pub(super) fn folded_component_label(value: &str) -> Result<String> {
+    let mapped = folded_component_units(value)?;
+    let mut label = String::with_capacity(1 + mapped.len() * 4);
+    label.push('~');
+    for unit in mapped {
+        use std::fmt::Write as _;
+        write!(&mut label, "{unit:04x}").expect("String writes cannot fail");
+    }
+    Ok(label)
+}
+
+pub(super) fn folded_model_path(model: &str) -> Result<String> {
+    super::validate_path(model)?;
+    if model == "." {
+        return Ok(".".into());
+    }
+    model
+        .split('/')
+        .map(folded_component_label)
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("/"))
 }
 
 fn named_lock_key(path: &std::path::Path, scope: &str) -> Result<String> {

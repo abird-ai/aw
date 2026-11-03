@@ -12,6 +12,14 @@ use std::fs::File;
 pub trait MetadataBackend: walk::Backend {
     /// Name-only lstat: never follows links or materializes host paths.
     fn entry_meta(&self, path: &str) -> Result<EntryMeta, Self::Error>;
+
+    /// Conservative scheduler-only namespace spelling. This never grants or
+    /// resolves authority: it only lets a platform map namespace aliases (for
+    /// example Windows case variants) to one hierarchical conflict key.
+    /// Backends whose namespace is byte/case exact may keep the model spelling.
+    fn scheduling_path(&self, path: &str) -> Result<String, Self::Error> {
+        Ok(path.to_owned())
+    }
 }
 
 /// Resolve only an explicitly requested final content symlink. Intermediate

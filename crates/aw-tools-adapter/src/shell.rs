@@ -184,6 +184,14 @@ impl NativeShell {
         let WriteHint::Known(paths) = &prepared.writes else {
             return Footprint::unknown(true, true);
         };
+        #[cfg(windows)]
+        if !paths.is_empty() {
+            // Native filesystem footprints use invariant Windows namespace
+            // folding. Shell write hints are advisory PathBuf values and do not
+            // carry that backend key, so serialize rather than risk a case-alias
+            // false negative against a native node.
+            return Footprint::unknown(true, true);
+        }
         let mut scopes = Vec::with_capacity(paths.len());
         for path in paths {
             let Ok(relative) = path.strip_prefix(&self.root) else {

@@ -351,6 +351,60 @@ impl CapabilitySet {
         })
     }
 
+    fn relative_for_grant(grant: &Grant, absolute: &Path) -> Result<Option<String>> {
+        let Ok(relative) = absolute.strip_prefix(&grant.path) else {
+            return Ok(None);
+        };
+        if relative.as_os_str().is_empty() {
+            return Ok(Some(String::new()));
+        }
+        let relative = relative
+            .to_str()
+            .ok_or(ScopedError::Denied("model path is not UTF-8"))?
+            .trim_start_matches('/')
+            .to_owned();
+        super::validate_path(&relative)?;
+        Ok(Some(relative))
+    }
+
+    /// Mutation-private ownership is a visibility union across overlapping
+    /// grants. Each grant keeps its own registry for correct root-relative
+    /// recovery, but no alternate grant may make the same owned object public.
+    fn private_absolute(&self, absolute: &Path) -> Result<bool> {
+        for grant in &self.grants {
+            let Some(relative) = Self::relative_for_grant(grant, absolute)? else {
+                continue;
+            };
+            if !relative.is_empty() && grant.root.is_private_path(&relative)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn private_subtree_overlap(&self, absolute: &Path) -> Result<bool> {
+        for grant in &self.grants {
+            let records = grant.root.private_artifacts().records().map_err(|_| {
+                ScopedError::Denied("private mutation artifact registry unavailable")
+            })?;
+            for record in records {
+                let relative = if record.parent_path.is_empty() {
+                    record.name.clone()
+                } else {
+                    format!("{}/{}", record.parent_path, record.name)
+                };
+                super::validate_path(&relative)?;
+                let candidate = grant.path.join(&relative);
+                if (candidate == absolute || candidate.starts_with(absolute))
+                    && grant.root.is_private_path(&relative)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub fn reconcile_private_artifacts(&self) -> Result<()> {
         for grant in &self.grants {
             grant.root.reconcile_private_artifacts()?;
@@ -463,6 +517,11 @@ impl CapabilitySet {
         if !relative.is_empty() {
             super::validate_path(&relative)?;
         }
+        if !matches!(need, Need::Coordination) && self.private_absolute(&absolute)? {
+            return Err(ScopedError::Denied(
+                "private mutation artifact is not externally addressable",
+            ));
+        }
         Ok(Routed {
             grant,
             index,
@@ -484,7 +543,7 @@ impl CapabilitySet {
         for entry in listing.entries {
             let model_path = join_model(model, suffix(&entry.path, &routed.relative));
             let absolute = self.absolute(&model_path)?;
-            if self.excluded(&absolute, Need::Read) {
+            if self.excluded(&absolute, Need::Read) || self.private_absolute(&absolute)? {
                 continue;
             }
             entries.push(walk::WalkEntry {
@@ -631,11 +690,12 @@ impl walk::Backend for CapabilitySet {
     }
 
     fn private_entry(&self, path: &str) -> Result<bool> {
-        let routed = self.route(path, Need::Read)?;
-        if routed.relative.is_empty() {
-            return Ok(false);
+        let absolute = self.absolute(path)?;
+        if self.private_absolute(&absolute)? {
+            return Ok(true);
         }
-        routed.grant.root.is_private_path(&routed.relative)
+        let routed = self.route(path, Need::Read)?;
+        Ok(!routed.relative.is_empty() && routed.grant.root.is_private_path(&routed.relative)?)
     }
 }
 
@@ -646,6 +706,14 @@ impl MetadataBackend for CapabilitySet {
             return Err(ScopedError::Denied("metadata path must name an entry"));
         }
         Root::entry_meta(&routed.grant.root, &routed.relative)
+    }
+
+    fn scheduling_path(&self, path: &str) -> Result<String> {
+        let absolute = self.absolute(path)?;
+        absolute
+            .to_str()
+            .map(str::to_owned)
+            .ok_or(ScopedError::Denied("scheduling path is not UTF-8"))
     }
 }
 
@@ -690,12 +758,17 @@ impl SecuredFilesystem for CapabilitySet {
                 MutationAccess::ReadWrite => Need::Both,
             };
             let routed = self.route(path.path, need)?;
-            if path.extent == MutationExtent::Subtree
-                && self.overlaps_exclusion(&routed.absolute, need)
-            {
-                return Err(ScopedError::Denied(
-                    "mutation subtree overlaps a prepared capability exclusion",
-                ));
+            if path.extent == MutationExtent::Subtree {
+                if self.overlaps_exclusion(&routed.absolute, need) {
+                    return Err(ScopedError::Denied(
+                        "mutation subtree overlaps a prepared capability exclusion",
+                    ));
+                }
+                if self.private_subtree_overlap(&routed.absolute)? {
+                    return Err(ScopedError::Denied(
+                        "mutation subtree overlaps a private mutation artifact",
+                    ));
+                }
             }
         }
         Ok(())
@@ -904,6 +977,13 @@ impl SecuredFilesystem for CapabilitySet {
                 "copy overlaps a prepared capability exclusion",
             ));
         }
+        if self.private_subtree_overlap(&source.absolute)?
+            || self.private_subtree_overlap(&destination.absolute)?
+        {
+            return Err(ScopedError::Denied(
+                "copy overlaps a private mutation artifact",
+            ));
+        }
         let meta = Root::entry_meta(&source.grant.root, &source.relative)?;
         Self::check_descendant(&source, &destination, meta.kind == Kind::Dir)?;
         port::lifecycle::copy_between(
@@ -924,6 +1004,13 @@ impl SecuredFilesystem for CapabilitySet {
         {
             return Err(ScopedError::Denied(
                 "move overlaps a prepared capability exclusion",
+            ));
+        }
+        if self.private_subtree_overlap(&source.absolute)?
+            || self.private_subtree_overlap(&destination.absolute)?
+        {
+            return Err(ScopedError::Denied(
+                "move overlaps a private mutation artifact",
             ));
         }
         let meta = Root::entry_meta(&source.grant.root, &source.relative)?;
@@ -947,13 +1034,17 @@ impl SecuredFilesystem for CapabilitySet {
             .iter()
             .map(|path| self.route(path, Need::Write))
             .collect::<Result<Vec<_>>>()?;
-        if routed
-            .iter()
-            .any(|path| self.overlaps_exclusion(&path.absolute, Need::Write))
-        {
-            return Err(ScopedError::Denied(
-                "remove overlaps a prepared capability exclusion",
-            ));
+        for path in &routed {
+            if self.overlaps_exclusion(&path.absolute, Need::Write) {
+                return Err(ScopedError::Denied(
+                    "remove overlaps a prepared capability exclusion",
+                ));
+            }
+            if self.private_subtree_overlap(&path.absolute)? {
+                return Err(ScopedError::Denied(
+                    "remove overlaps a private mutation artifact",
+                ));
+            }
         }
         let refs = routed
             .iter()
@@ -1285,6 +1376,57 @@ mod tests {
             .unwrap();
         assert_eq!(write_registry.records().unwrap().len(), 1);
         assert!(read_registry.records().unwrap().is_empty());
+        drop(staged);
+    }
+
+    #[test]
+    fn overlapping_grants_union_private_visibility_without_sharing_recovery_registry() {
+        use aw_tools::filesystem::{backend::SecuredFilesystem as _, private_artifact::Registry};
+        let f = Fixture::new();
+        let nested = f.write.join("nested");
+        let tree = nested.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("target.txt"), b"old").unwrap();
+        let write_registry = Registry::memory();
+        let read_registry = Registry::memory();
+        let other_registry = Registry::memory();
+        let set = CapabilitySet::open_prepared(
+            &f.base,
+            [
+                PreparedGrant::new(GrantSpec::write(&f.write), write_registry.clone()),
+                PreparedGrant::new(GrantSpec::read(&nested), read_registry.clone()),
+                PreparedGrant::new(GrantSpec::write(&f.other), other_registry),
+            ],
+        )
+        .unwrap();
+        let staged = set
+            .stage_update("write/nested/tree/target.txt", b"old", b"new", &|| false)
+            .unwrap();
+        let record = write_registry
+            .records()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(read_registry.records().unwrap().is_empty());
+        let private_model = format!("write/nested/tree/{}", record.name);
+        assert!(tree.join(&record.name).exists());
+
+        let listing = set.list("write/nested/tree", 64).unwrap();
+        assert!(!listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == private_model));
+        assert!(set.read_bytes(&private_model, 32).is_err());
+        assert!(
+            operations::copy_path(&set, "write/nested/tree", "other/copied", true, &|| false,)
+                .is_err()
+        );
+        assert!(!f.other.join("copied").exists());
+        assert!(set
+            .copy_exact("write/nested/tree", "other/copied-direct", &|| false,)
+            .is_err());
+        assert!(!f.other.join("copied-direct").exists());
         drop(staged);
     }
 

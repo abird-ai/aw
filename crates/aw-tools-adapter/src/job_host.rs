@@ -508,11 +508,17 @@ impl JobHost {
         Ok(task)
     }
 
+    fn scheduling_path(&self, path: &str) -> Result<String> {
+        let model = model_scope(path);
+        aw_tools::filesystem::backend::MetadataBackend::scheduling_path(self.root.as_ref(), &model)
+            .map_err(|error| crate::platform_fs::<()>(Err(error)).unwrap_err())
+    }
+
     fn footprint(&self, tool: CoreTool, arguments: &Value) -> Result<Footprint> {
         let exact = |path: String, access| {
             Footprint::new(
                 vec![Scope {
-                    path: model_scope(&path),
+                    path: self.scheduling_path(&path)?,
                     access,
                     extent: Extent::Exact,
                 }],
@@ -543,7 +549,7 @@ impl JobHost {
                 };
                 Footprint::new(
                     vec![Scope {
-                        path: model_scope(&backend),
+                        path: self.scheduling_path(&backend)?,
                         access: Access::Read,
                         extent: Extent::Subtree,
                     }],
@@ -557,7 +563,7 @@ impl JobHost {
                 if lexical == "." {
                     return Footprint::new(
                         vec![Scope {
-                            path: ".".into(),
+                            path: self.scheduling_path(".")?,
                             access: Access::Read,
                             extent: Extent::Subtree,
                         }],
@@ -585,7 +591,7 @@ impl JobHost {
                 };
                 Footprint::new(
                     vec![Scope {
-                        path: model_scope(&backend.0),
+                        path: self.scheduling_path(&backend.0)?,
                         access: Access::Read,
                         extent: backend.1,
                     }],
@@ -601,7 +607,7 @@ impl JobHost {
                 // read merely to improve scheduler precision. A subtree scope
                 // is conservative for files and exact for directory trees.
                 let mut scopes = vec![Scope {
-                    path: model_scope(&from),
+                    path: self.scheduling_path(&from)?,
                     access: if tool == CoreTool::Copy {
                         Access::Read
                     } else {
@@ -610,7 +616,7 @@ impl JobHost {
                     extent: Extent::Subtree,
                 }];
                 scopes.push(Scope {
-                    path: model_scope(&to),
+                    path: self.scheduling_path(&to)?,
                     access: Access::Write,
                     extent: Extent::Subtree,
                 });
@@ -628,7 +634,7 @@ impl JobHost {
                         .as_str()
                         .ok_or(Error::Denied("rm Job path is invalid"))?;
                     scopes.push(Scope {
-                        path: model_scope(path),
+                        path: self.scheduling_path(path)?,
                         access: Access::Write,
                         extent: Extent::Subtree,
                     });

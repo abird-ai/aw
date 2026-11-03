@@ -725,6 +725,10 @@ impl aw_tools::filesystem::backend::MetadataBackend for Root {
     fn entry_meta(&self, path: &str) -> Result<aw_tools::filesystem::EntryMeta> {
         Root::entry_meta(self, path)
     }
+
+    fn scheduling_path(&self, path: &str) -> Result<String> {
+        port::folded_model_path(path)
+    }
 }
 impl aw_tools::filesystem::backend::ExplicitPathBackend for Root {
     fn resolve_content_path(&self, path: &str, allow_missing: bool) -> Result<String> {

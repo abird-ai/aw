@@ -381,7 +381,9 @@ pub(in crate::scoped_fs) fn move_between(
 }
 
 struct PreparedRemoval {
-    parent: Parent,
+    // Keep the opened parent chain alive through tombstone reservation and
+    // namespace detach; the handle lifetime is the purpose of this field.
+    _parent: Parent,
     source: std::path::PathBuf,
     source_identity: (u32, u64),
     tombstone: std::path::PathBuf,
@@ -532,7 +534,7 @@ pub(in crate::scoped_fs) fn remove_between(
             }
         };
         prepared.push(PreparedRemoval {
-            parent,
+            _parent: parent,
             source,
             source_identity,
             tombstone,
