@@ -398,11 +398,6 @@ pub fn configure(
 ) -> Result<AgentBuilder> {
     let concurrency = options.concurrency.validate()?;
     let limits = options.limits.validate()?;
-    if concurrency.graph_width > limits.jobs.max_active_nodes {
-        return Err(Error::Config(
-            "Graph parallel ceiling exceeds configured Job active-node ceiling".into(),
-        ));
-    }
     let mut policy = builder.tool_policy_snapshot();
     if policy.execution_site != options.execution_site {
         let default_site = ToolPolicy::default().execution_site;
@@ -518,6 +513,11 @@ pub fn configure(
     // to retain every node's exact result reservation; a narrower session spool
     // would turn valid later nodes into quota-driven `skip` outcomes.
     if wants_jobs {
+        if concurrency.graph_width > limits.jobs.max_active_nodes {
+            return Err(Error::Config(
+                "Graph parallel ceiling exceeds configured Job active-node ceiling".into(),
+            ));
+        }
         let native_reservation = if graph_native_tools.is_empty() {
             0
         } else {

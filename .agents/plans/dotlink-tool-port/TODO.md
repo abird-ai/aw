@@ -493,12 +493,18 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
       The temporary reporter also keeps Graph/aggregate/marker vectors explicitly
       unverified, so schema parity alone can never turn the cutover gate green.
 - [x] Fresh AW product/config matrix passed after the pre-pin fixes: shared
-      219/219, Unix backend 30/30, AW adapter 177/177, Agent-core 78 active tests
+      238/238, Unix backend 35/35, AW adapter 182/182, Agent-core 78 active tests
       plus 1 intentional ignore, no-default/stateless and `minimal` all-target
-      checks, no_std+alloc kernel check, workspace all-target compile and strict
-      Clippy for the affected stack. The previous Windows GNU cross-stack passed
-      before the latest fixes; its cached Rust 1.98 compiler was garbage-collected,
-      so the current source is deliberately not claimed freshly cross-validated.
+      checks, no_std+alloc kernel check, bounded full-workspace package checks and
+      strict Clippy for the affected stack. The previous Windows GNU cross-stack
+      passed before the latest fixes; the current source is deliberately not
+      claimed freshly native-Windows validated.
+- [x] Fresh config-readiness review caught and fixed one narrow-only composition
+      regression: direct-only selections such as `read` were rejected when an
+      otherwise-unused Job `max_active_nodes` ceiling was below Graph width.
+      Job/Graph consistency is now checked only when a Job runtime is actually
+      instantiated, so disabled/unselected capabilities cannot constrain direct
+      tools while Job-producing configurations retain the same fail-fast bound.
 
 ### Shared convergence verification
 

@@ -919,6 +919,33 @@ fn serial_host_policy_configures_job_runtime_without_revalidation_drift() {
 }
 
 #[test]
+fn direct_only_configuration_ignores_uninstantiated_job_capacity() {
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::ReadOnly);
+    options.selected_tools = vec!["read".into()];
+    options.limits.jobs.max_active_nodes = 1;
+    // No batch/job_start/shell is selected, so Graph width is irrelevant.
+    assert!(configure(builder, actor, &options).is_ok());
+}
+
+#[test]
 fn configured_limits_narrow_advertised_schema_and_direct_validation() {
     let tree = Tree::new();
     let mut limits = crate::LocalToolLimits::default();
