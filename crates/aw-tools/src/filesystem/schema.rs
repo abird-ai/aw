@@ -57,6 +57,25 @@ impl Tool {
     pub const fn graph_eligible(self) -> bool {
         !matches!(self, Self::Bread)
     }
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "ls" => Self::Ls,
+            "find" => Self::Find,
+            "grep" => Self::Grep,
+            "read" => Self::Read,
+            "write" => Self::Write,
+            "edit" => Self::Edit,
+            "patch" => Self::Patch,
+            "cp" => Self::Copy,
+            "mv" => Self::Move,
+            "rm" => Self::Remove,
+            "bread" => Self::Bread,
+            "bwrite" => Self::Bwrite,
+            "bedit" => Self::Bedit,
+            _ => return None,
+        })
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Ls => "ls",
@@ -85,6 +104,10 @@ impl Tool {
         }
     }
 }
+/// Shortest valid canonical patch: `*** Begin Patch\n*** Add File: x\n*** End Patch`.
+/// A lower advertised maxLength would make the enabled patch tool unusable.
+pub const MIN_PATCH_BYTES: usize = 45;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaCaps {
     pub text_write_bytes: usize,
@@ -115,12 +138,13 @@ impl Default for SchemaCaps {
     }
 }
 impl SchemaCaps {
-    /// Validate shared engine-safety bounds only. Product adapters own their
-    /// defaults and may choose any tighter ceiling inside these maxima.
+    /// Validate shared engine safety bounds plus irreducible semantic minima.
+    /// Product adapters own their defaults and may choose any viable tighter
+    /// ceiling inside these bounds.
     pub fn validate(self) -> Result<Self, &'static str> {
         if self.text_write_bytes == 0
             || self.text_write_bytes > crate::MAX_MUTATION_PLAN_BYTES
-            || self.patch_bytes == 0
+            || self.patch_bytes < MIN_PATCH_BYTES
             || self.patch_bytes > crate::MAX_MUTATION_PLAN_BYTES
             || self.binary_data_bytes == 0
             || self.binary_data_bytes > crate::MAX_MUTATION_PLAN_BYTES
@@ -133,7 +157,7 @@ impl SchemaCaps {
             || self.read_line_limit == 0
             || self.read_line_limit > 65_536
         {
-            return Err("schema caps exceed shared engine safety bounds");
+            return Err("schema caps exceed shared engine safety/semantic bounds");
         }
         Ok(self)
     }
@@ -348,6 +372,21 @@ mod tests {
             schema["allOf"][0]["then"]["properties"]["limit"]["maximum"],
             caps.binary_encoded_read_bytes
         );
+    }
+
+    #[test]
+    fn patch_cap_cannot_advertise_an_impossible_schema() {
+        let invalid = SchemaCaps {
+            patch_bytes: MIN_PATCH_BYTES - 1,
+            ..SchemaCaps::default()
+        };
+        assert!(invalid.validate().is_err());
+        assert!(SchemaCaps {
+            patch_bytes: MIN_PATCH_BYTES,
+            ..SchemaCaps::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

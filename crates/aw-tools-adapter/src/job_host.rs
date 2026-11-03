@@ -252,17 +252,21 @@ fn canonical_tool(
     }
 }
 
-fn canonical_arguments(tool: &dyn AgentTool, arguments: &Value) -> bool {
-    if tool.validate(arguments).is_err() {
-        return false;
+fn canonical_arguments(
+    native: CoreTool,
+    arguments: &Value,
+    limits: crate::LocalToolLimits,
+) -> bool {
+    // `parallel` is AW scheduler metadata on read tools, not canonical
+    // filesystem semantics. Strip only that explicitly advertised adapter
+    // addition; every other field must pass the shared canonical parser.
+    let mut semantic = arguments.clone();
+    if native.action() == aw_tools::filesystem::access::Action::Read {
+        if let Some(object) = semantic.as_object_mut() {
+            object.remove("parallel");
+        }
     }
-    let spec = tool.spec();
-    let Some(properties) = spec.parameters.get("properties").and_then(Value::as_object) else {
-        return false;
-    };
-    arguments
-        .as_object()
-        .is_some_and(|object| object.keys().all(|key| properties.contains_key(key)))
+    aw_tools::filesystem::request::parse(native, &semantic, limits.request_limits()).is_ok()
 }
 
 fn arg_path(arguments: &Value, key: &str) -> Result<String> {
@@ -660,8 +664,7 @@ impl JobHost {
 
     fn validate_node(&self, node: NodeTool, arguments: &Value) -> bool {
         if let Some(native) = node.native() {
-            let adapter = canonical_tool(self.root.clone(), native, self.tool_limits);
-            return canonical_arguments(adapter.as_ref(), arguments);
+            return canonical_arguments(native, arguments, self.tool_limits);
         }
         self.shells
             .get(node)
@@ -677,8 +680,7 @@ impl JobHost {
                 .map_err(|_| ())?;
             let (footprint, runtime_binding, task_result_eligible, result_bytes) =
                 if let Some(native) = step.tool.native() {
-                    let adapter = canonical_tool(self.root.clone(), native, self.tool_limits);
-                    if !canonical_arguments(adapter.as_ref(), &step.arguments) {
+                    if !canonical_arguments(native, &step.arguments, self.tool_limits) {
                         return Err(());
                     }
                     (
@@ -2100,6 +2102,31 @@ mod tests {
         .tool(ExistingTool)
         .tool_policy(moved);
         assert!(configure(builder, actor, &options).is_err());
+    }
+
+    #[cfg(feature = "conformance")]
+    #[test]
+    fn aw_direct_adapter_accepts_every_shared_canonical_request_vector() {
+        let temp = Temp::new();
+        let root = Arc::new(aw_platform::scoped_fs::Root::open(&temp.workspace).unwrap());
+        let limits = crate::LocalToolLimits::default();
+        aw_tools::conformance::validate_with_limits(limits.request_limits()).unwrap();
+        for vector in aw_tools::conformance::requests() {
+            let native = CoreTool::from_name(&vector.tool)
+                .unwrap_or_else(|| panic!("unknown shared tool {}", vector.tool));
+            assert!(
+                canonical_arguments(native, &vector.arguments, limits),
+                "shared parser rejected {}",
+                vector.id
+            );
+            let adapter = canonical_tool(root.clone(), native, limits);
+            assert!(
+                adapter.validate(&vector.arguments).is_ok(),
+                "AW adapter rejected canonical request {} ({})",
+                vector.id,
+                vector.tool
+            );
+        }
     }
 
     #[test]

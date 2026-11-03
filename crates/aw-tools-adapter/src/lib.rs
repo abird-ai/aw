@@ -221,6 +221,13 @@ impl Default for LocalToolLimits {
     }
 }
 impl LocalToolLimits {
+    pub(crate) fn request_limits(self) -> aw_tools::filesystem::request::Limits {
+        aw_tools::filesystem::request::Limits {
+            schema: self.schema,
+            edit_text_bytes: self.edit_text_bytes,
+        }
+    }
+
     pub fn validate(self) -> Result<Self> {
         self.schema
             .validate()

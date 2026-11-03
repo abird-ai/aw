@@ -23,6 +23,8 @@ pub mod operations;
 pub mod path;
 pub mod private_artifact;
 pub mod progress;
+#[cfg(feature = "rw")]
+pub mod request;
 #[cfg(all(feature = "batch", feature = "durable"))]
 pub mod runner;
 pub mod schema;

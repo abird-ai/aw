@@ -130,7 +130,7 @@ dev/test dependency shape is:
 
 ```toml
 [dev-dependencies]
-aw-tools = { git = "https://github.com/abird-ai/aw", rev = "<PINNED_AW_REV>", default-features = false, features = ["read-only", "conformance"] }
+aw-tools = { git = "https://github.com/abird-ai/aw", rev = "<PINNED_AW_REV>", default-features = false, features = ["conformance"] }
 aw-tools-fs-unix = { git = "https://github.com/abird-ai/aw", rev = "<PINNED_AW_REV>" }
 ```
 
@@ -168,8 +168,9 @@ direct/Graph result budgets, shell stream retention, Job quotas and scheduler wi
 all come from one validated trusted runtime snapshot. Existing `ToolPolicy` scheduler
 ceilings compose narrow-only, dynamic Agent parallelism updates are transactional, and
 internal Graph scheduling can never bypass `--tools-parallel off` or a host's tighter
-read/shell ceiling. Product configuration may narrow these values but cannot widen the
-shared 64 MiB per-stream/read/mutation and 8 GiB aggregate Job-spool safety maxima.
+read/shell ceiling. Product configuration may narrow these values within the canonical semantic
+minima but cannot widen the shared 64 MiB per-stream/read/mutation and 8 GiB
+aggregate Job-spool safety maxima.
 
 Direct host presentation budgets are deliberately separate from NodePlan semantic
 budgets. A host adapter should render/page an ordinary direct call to the actual

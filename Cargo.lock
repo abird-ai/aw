@@ -694,6 +694,7 @@ name = "aw-tools"
 version = "0.15.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "globset",
  "ignore",

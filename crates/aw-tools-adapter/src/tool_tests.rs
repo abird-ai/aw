@@ -923,7 +923,7 @@ fn configured_limits_narrow_advertised_schema_and_direct_validation() {
     let tree = Tree::new();
     let mut limits = crate::LocalToolLimits::default();
     limits.schema.text_write_bytes = 4;
-    limits.schema.patch_bytes = 16;
+    limits.schema.patch_bytes = aw_tools::filesystem::schema::MIN_PATCH_BYTES;
     limits.schema.binary_data_bytes = 8;
     limits.schema.binary_edit_ranges = 1;
     limits.schema.read_line_limit = 2;
@@ -950,10 +950,10 @@ fn configured_limits_narrow_advertised_schema_and_direct_validation() {
     let patch = patch::Patch::with_limits(tree.root(), limits);
     assert_eq!(
         patch.spec().parameters["properties"]["patch"]["maxLength"],
-        16
+        aw_tools::filesystem::schema::MIN_PATCH_BYTES
     );
     assert!(patch
-        .validate(&serde_json::json!({"patch":"x".repeat(17)}))
+        .validate(&serde_json::json!({"patch":"x".repeat(aw_tools::filesystem::schema::MIN_PATCH_BYTES + 1)}))
         .is_err());
 
     let binary = binary::Binary::with_limits(tree.root(), binary::Operation::Write, limits);

@@ -5,6 +5,7 @@
 //! types. Consumers should enable the `conformance` feature only in tests.
 use crate::filesystem::{
     batch::{Graph, NodeTool, Status},
+    request,
     schema::{self, SchemaCaps, Tool},
     status::{self, Primary},
 };
@@ -93,18 +94,62 @@ pub fn schemas(caps: SchemaCaps) -> Vec<SchemaVector> {
 pub fn requests() -> Vec<RequestVector> {
     [
         ("ls-basic", "ls", json!({"path":".","limit":16})),
-        ("find-glob", "find", json!({"path":".","glob":"**/*.rs","limit":16})),
-        ("grep-content", "grep", json!({"path":".","pattern":"needle","mode":"content","limit":8})),
-        ("read-cursor", "read", json!({"path":"a.txt","line":1,"lines":4,"byte":0,"numbered":false})),
-        ("write-text", "write", json!({"path":"new.txt","content":"hello\n"})),
-        ("edit-snapshot", "edit", json!({"path":"a.txt","edits":[["old","new",false]]})),
-        ("patch-update", "patch", json!({"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch"})),
+        (
+            "find-glob",
+            "find",
+            json!({"path":".","glob":"**/*.rs","limit":16}),
+        ),
+        (
+            "grep-content",
+            "grep",
+            json!({"path":".","pattern":"needle","mode":"content","limit":8}),
+        ),
+        (
+            "read-cursor",
+            "read",
+            json!({"path":"a.txt","line":1,"lines":1,"byte":0,"numbered":false}),
+        ),
+        (
+            "write-text",
+            "write",
+            json!({"path":"new.txt","content":""}),
+        ),
+        (
+            "edit-snapshot",
+            "edit",
+            json!({"path":"a.txt","edits":[["x","",false]]}),
+        ),
+        (
+            "patch-add",
+            "patch",
+            json!({"patch":"*** Begin Patch\n*** Add File: x\n*** End Patch"}),
+        ),
         ("copy-exact", "cp", json!({"from":"a.txt","to":"copy.txt"})),
-        ("move-exact", "mv", json!({"from":"copy.txt","to":"moved.txt"})),
-        ("remove-exact", "rm", json!({"paths":["moved.txt"],"recursive":false})),
-        ("bread-window", "bread", json!({"path":"blob.bin","offset":0,"limit":16,"format":"hex"})),
-        ("bwrite-hex", "bwrite", json!({"path":"new.bin","data":"000102ff","encoding":"hex"})),
-        ("bedit-range", "bedit", json!({"path":"blob.bin","edits":[{"offset":1,"length":1,"data":"aa","encoding":"hex"}]})),
+        (
+            "move-exact",
+            "mv",
+            json!({"from":"copy.txt","to":"moved.txt"}),
+        ),
+        (
+            "remove-exact",
+            "rm",
+            json!({"paths":["moved.txt"],"recursive":false}),
+        ),
+        (
+            "bread-window",
+            "bread",
+            json!({"path":"blob.bin","offset":0,"limit":1,"format":"hex"}),
+        ),
+        (
+            "bwrite-hex",
+            "bwrite",
+            json!({"path":"new.bin","data":"","encoding":"hex"}),
+        ),
+        (
+            "bedit-range",
+            "bedit",
+            json!({"path":"blob.bin","edits":[{"offset":0,"length":0,"data":"","encoding":"hex"}]}),
+        ),
     ]
     .into_iter()
     .map(|(id, tool, arguments)| RequestVector {
@@ -257,7 +302,23 @@ pub fn fixture_json() -> Result<String, serde_json::Error> {
 /// Validate the fixture against this exact shared implementation revision.
 /// Differential consumers should run this first so a stale copied expectation
 /// cannot be mistaken for a product mismatch.
-pub fn validate() -> Result<(), String> {
+pub fn validate_with_limits(limits: request::Limits) -> Result<(), String> {
+    let limits = limits.validate().map_err(|error| error.to_string())?;
+
+    let mut request_tools = std::collections::BTreeSet::new();
+    for vector in requests() {
+        let tool = Tool::from_name(&vector.tool)
+            .ok_or_else(|| format!("request vector {} names an unknown tool", vector.id))?;
+        if !request_tools.insert(tool.name()) {
+            return Err(format!("duplicate request vector for {}", tool.name()));
+        }
+        request::parse(tool, &vector.arguments, limits)
+            .map_err(|error| format!("request vector {} rejected: {error}", vector.id))?;
+    }
+    if request_tools.len() != Tool::ALL.len() {
+        return Err("request vectors no longer cover every canonical tool".into());
+    }
+
     for vector in graphs() {
         let result = Graph::compile_with(
             &vector.graph,
@@ -268,7 +329,10 @@ pub fn validate() -> Result<(), String> {
                     .find(|tool| tool.name() == other)
                     .map(NodeTool::Native),
             },
-            |_, arguments| arguments.is_object(),
+            |node, arguments| match node.native() {
+                Some(tool) => request::parse(tool, arguments, limits).is_ok(),
+                None => arguments.is_object(),
+            },
         );
         if result.is_ok() != vector.accepted {
             return Err(format!("graph vector {} acceptance changed", vector.id));
@@ -294,7 +358,10 @@ pub fn validate() -> Result<(), String> {
                 .find(|tool| tool.name() == other)
                 .map(NodeTool::Native),
         },
-        |_, arguments| arguments.is_object(),
+        |node, arguments| match node.native() {
+            Some(tool) => request::parse(tool, arguments, limits).is_ok(),
+            None => arguments.is_object(),
+        },
     )
     .map_err(|_| "mixed graph no longer compiles".to_owned())?;
     let condition = &graph.steps()[1].when;
@@ -319,6 +386,17 @@ pub fn validate() -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_with_caps(caps: SchemaCaps) -> Result<(), String> {
+    validate_with_limits(request::Limits {
+        schema: caps,
+        edit_text_bytes: caps.text_write_bytes,
+    })
+}
+
+pub fn validate() -> Result<(), String> {
+    validate_with_caps(SchemaCaps::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +411,26 @@ mod tests {
             .map(|schema| schema.tool)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), Tool::ALL.len());
+    }
+
+    #[test]
+    fn host_caps_drive_fixture_request_validation_too() {
+        let caps = SchemaCaps {
+            text_write_bytes: 16,
+            patch_bytes: schema::MIN_PATCH_BYTES,
+            binary_data_bytes: 16,
+            binary_edit_ranges: 4,
+            binary_read_bytes: 64,
+            binary_encoded_read_bytes: 24,
+            read_line_limit: 8,
+            ..SchemaCaps::default()
+        };
+        validate_with_caps(caps).unwrap();
+        validate_with_limits(request::Limits {
+            schema: caps,
+            edit_text_bytes: 1,
+        })
+        .unwrap();
     }
 
     #[test]

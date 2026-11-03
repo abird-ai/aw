@@ -10,6 +10,8 @@ description = "AW-specific adapter for canonical aw-tools semantics and Process 
 [features]
 default = []
 pty = ["dep:aw-terminal"]
+# Verification-only shared canonical vectors; no production behavior or authority.
+conformance = ["aw-tools/conformance"]
 
 [dependencies]
 aw-tools = { path = "../aw-tools", version = "=0.15.0", default-features = false, features = ["rw", "async", "durable", "batch"] }
