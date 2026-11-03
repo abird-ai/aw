@@ -202,4 +202,14 @@ pub trait SecuredFilesystem: MetadataBackend {
         request: PageRequest,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Page, Self::Error>;
+    /// Bounded raw-byte window from an already-authorized regular file.
+    /// Offsets and continuation are raw source bytes, never encoded output
+    /// positions.
+    fn read_binary_window(
+        &self,
+        path: &str,
+        offset: u64,
+        limit: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<u8>, u64, bool), Self::Error>;
 }

@@ -2,7 +2,9 @@
 //! The existing outer AW ToolStarted journal intent authorizes the Graph before
 //! this host runs. Node lifecycle/results stay in the shared live manager; AW
 //! creates no second workflow database and never resurrects Jobs after restart.
-use crate::{binary, edit, lifecycle, patch, process, search, shell, text, Error, Result};
+#[cfg(all(test, feature = "conformance"))]
+use crate::{binary, edit, lifecycle, patch, search, text};
+use crate::{process, shell, Error, Result};
 use aw_agent_core::tool::{ToolBindingAuthority, ToolBindingSnapshot};
 use aw_agent_core::{CancellationToken, PrincipalId, Tool as AgentTool, ToolContext, ToolOutput};
 use aw_tools::{
@@ -190,6 +192,7 @@ fn new_job_id() -> Result<String> {
     ))
 }
 
+#[cfg(all(test, feature = "conformance"))]
 fn canonical_tool(
     root: Arc<aw_platform::scoped_fs::Root>,
     tool: CoreTool,
@@ -1607,33 +1610,22 @@ impl JobHost {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(error);
         }
-        // Construct every fallible execution input while the node is still only
-        // Claimed. Once Start commits, this runner must either enter the native
-        // tool or settle the node; no adapter lookup may strand Running state.
-        let task = match self.manager.task_binding(id) {
-            Ok(task) => task,
-            Err(_) => {
+        // Construct every fallible semantic input while the node is still only
+        // Claimed. Once Start commits, execution goes through the canonical
+        // shared direct engine; AW contributes only authority and projection.
+        if self.manager.task_binding(id).is_err() {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(Error::Protocol("Job Task binding unavailable"));
+        }
+        let request = match crate::canonical_request(native, plan.arguments(), self.tool_limits) {
+            Ok(request) => request,
+            Err(error) => {
                 self.settle_unlaunched(id, coordinate, claimed_sequence)?;
-                return Err(Error::Protocol("Job Task binding unavailable"));
+                return Err(error);
             }
         };
-        let identity = ctx.identity.clone();
-        let nested = ToolContext {
-            actor: ctx.actor.clone(),
-            turn_id: task.turn_id,
-            call_id: format!("job:{id}:{coordinate}"),
-            source: binding.source.clone(),
-            effect: binding.effect.clone(),
-            execution_site: binding.execution_site.clone(),
-            cancellation: cancellation.clone(),
-            result_budget_bytes: plan.budget().result_bytes,
-            identity,
-            scope: Some(aw_agent_core::InvocationScope {
-                session_id: self.session.clone(),
-                branch_id: self.branch.clone(),
-            }),
-        };
-        let tool = canonical_tool(self.root.clone(), native, self.tool_limits);
+        let direct_limits =
+            crate::canonical_direct_limits(self.tool_limits, plan.budget().result_bytes, &request);
         if let Err(error) = self.start(&ctx.actor, id, coordinate, claimed_sequence, true) {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(error);
@@ -1642,7 +1634,21 @@ impl JobHost {
             .manager
             .current_sequence(id)
             .map_err(|_| Error::Protocol("running Job sequence unavailable"))?;
-        let executed = tool.execute(nested, plan.arguments()).await;
+        let root = self.root.clone();
+        let token = cancellation.clone();
+        let executed = aw_tools::asynchronous::run_blocking(move || {
+            aw_tools::filesystem::direct::execute(root.as_ref(), request, direct_limits, &|| {
+                token.is_cancelled()
+            })
+        })
+        .await;
+        let executed = match executed {
+            Ok(Ok(output)) => crate::canonical_direct_output(output, plan.budget().result_bytes),
+            Ok(Err(error)) => Err(crate::canonical_direct_error(error)),
+            Err(_) => Err(Error::Protocol(
+                "canonical filesystem worker failed; inspect workspace before retrying",
+            )),
+        };
         let (output, status) = match executed {
             Ok(output) => {
                 let status = status_from_output(native, &output);

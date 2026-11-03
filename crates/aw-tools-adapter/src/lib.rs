@@ -46,6 +46,325 @@ fn core_spec(
         effect,
     }
 }
+fn canonical_semantic_value(
+    tool: aw_tools::filesystem::schema::Tool,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    let mut semantic = value.clone();
+    if tool.action() == aw_tools::filesystem::access::Action::Read {
+        if let Some(object) = semantic.as_object_mut() {
+            object.remove("parallel");
+        }
+    }
+    semantic
+}
+
+fn canonical_request(
+    tool: aw_tools::filesystem::schema::Tool,
+    value: &serde_json::Value,
+    limits: LocalToolLimits,
+) -> Result<aw_tools::filesystem::request::Request> {
+    aw_tools::filesystem::request::parse(
+        tool,
+        &canonical_semantic_value(tool, value),
+        limits.request_limits(),
+    )
+    .map_err(|_| Error::Denied("invalid canonical filesystem request"))
+}
+
+fn canonical_direct_limits(
+    limits: LocalToolLimits,
+    result_bytes: usize,
+    request: &aw_tools::filesystem::request::Request,
+) -> aw_tools::filesystem::direct::Limits {
+    let read_data_bytes = match request.kind() {
+        aw_tools::filesystem::request::RequestKind::Read(read) if read.numbered => {
+            result_bytes.saturating_sub(256)
+        }
+        aw_tools::filesystem::request::RequestKind::Read(_) => result_bytes / 2,
+        _ => result_bytes,
+    };
+    aw_tools::filesystem::direct::Limits {
+        request: limits.request_limits(),
+        result_bytes,
+        read_data_bytes,
+        text_file_bytes: 1024 * 1024,
+        binary_file_bytes: aw_tools::MAX_READ_WINDOW_BYTES,
+        binary_default_window: 24 * 1024,
+        grep: aw_tools::search::GrepLimits::default(),
+    }
+}
+
+fn media_resource_uri(path: &str) -> Result<String> {
+    let mut uri = url::Url::parse("abird://file/")
+        .map_err(|_| Error::Protocol("invalid binary resource URI base"))?;
+    uri.path_segments_mut()
+        .map_err(|_| Error::Protocol("invalid binary resource URI path"))?
+        .pop_if_empty()
+        .extend(path.split('/'));
+    Ok(uri.into())
+}
+
+fn canonical_direct_output(
+    output: aw_tools::filesystem::direct::Output,
+    result_bytes: usize,
+) -> Result<ToolOutput> {
+    use aw_tools::filesystem::direct::Body;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    let mut projected = match output.body {
+        Body::Text(content) => ToolOutput {
+            content,
+            is_error: output.is_error,
+            truncated: output.truncated,
+        },
+        Body::Read {
+            mut data,
+            status,
+            next,
+            numbered,
+        } => {
+            if let Some(status_line) = status {
+                if numbered {
+                    if !data.ends_with('\n') {
+                        data.push('\n');
+                    }
+                    data.push_str(&status_line);
+                    ToolOutput {
+                        content: data,
+                        is_error: output.is_error,
+                        truncated: true,
+                    }
+                } else {
+                    ToolOutput {
+                        content: serde_json::json!({
+                            "data":data,
+                            "status":if output.is_error{"mixed"}else{"more"},
+                            "next":next.map(|(line,byte)|serde_json::json!({
+                                "line":line,"byte":byte
+                            }))
+                        })
+                        .to_string(),
+                        is_error: output.is_error,
+                        truncated: true,
+                    }
+                }
+            } else {
+                ToolOutput {
+                    content: data,
+                    is_error: output.is_error,
+                    truncated: output.truncated,
+                }
+            }
+        }
+        Body::Media { path, packet } => {
+            let descriptor = packet.descriptor();
+            let kind = descriptor.kind.as_str();
+            ToolOutput::text(
+                serde_json::json!({
+                    "type":kind,
+                    "mime_type":descriptor.mime,
+                    "format":"mcp",
+                    "path":path,
+                    "data":BASE64.encode(packet.bytes()),
+                    "uri":if kind=="resource"{Some(media_resource_uri(&path)?)}else{None},
+                    "bytes":packet.bytes().len(),
+                    "sha256":descriptor.sha256_hex(),
+                    "mime_source":if descriptor.signature_identified{"signature"}else{"fallback"},
+                    "transport":"encoded_json"
+                })
+                .to_string(),
+            )
+        }
+    };
+    if projected.content.len() > result_bytes {
+        return Err(Error::Limit(
+            "canonical direct result exceeds configured result ceiling",
+        ));
+    }
+    projected.truncated |= output.truncated;
+    Ok(projected)
+}
+
+fn canonical_direct_error(
+    error: aw_tools::filesystem::direct::Error<aw_platform::scoped_fs::ScopedError>,
+) -> Error {
+    use aw_tools::filesystem::direct::Error as E;
+    match error {
+        E::Invalid(_) => Error::Denied("invalid canonical filesystem operation"),
+        E::Limit(reason) => Error::Limit(reason),
+        E::Cancelled => Error::Cancelled,
+        E::Backend(error) => platform_fs::<()>(Err(error)).unwrap_err(),
+        E::UnknownCommit(_) => {
+            Error::Protocol("unknown filesystem commit; do not retry; inspect workspace")
+        }
+        E::PartialCommit(_) => Error::Protocol(
+            "filesystem mutation partially/uncertainly committed; inspect workspace before retrying",
+        ),
+    }
+}
+
+fn legacy_filesystem_request(
+    tool: aw_tools::filesystem::schema::Tool,
+    value: &serde_json::Value,
+) -> bool {
+    use aw_tools::filesystem::schema::Tool as T;
+    let has = |key: &str| value.get(key).is_some();
+    match tool {
+        T::Read => has("offset") || has("limit"),
+        T::Write | T::Bwrite => has("create_only") || has("expected_sha256"),
+        T::Edit => {
+            let canonical = value
+                .get("edits")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|edits| edits.first())
+                .is_some_and(serde_json::Value::is_array);
+            !canonical
+                && (has("edits")
+                    || has("old")
+                    || has("new")
+                    || has("all")
+                    || has("old_text")
+                    || has("new_text")
+                    || has("replace_all"))
+        }
+        T::Patch => has("dir") || has("best_effort"),
+        T::Grep => has("before") || has("after") || has("output_mode"),
+        T::Copy => has("recursive"),
+        T::Ls | T::Find | T::Move | T::Remove | T::Bread | T::Bedit => false,
+    }
+}
+
+fn compatibility_filesystem_tool(
+    root: Arc<aw_platform::scoped_fs::Root>,
+    tool: aw_tools::filesystem::schema::Tool,
+    limits: LocalToolLimits,
+) -> Arc<dyn Tool> {
+    use aw_tools::filesystem::schema::Tool as T;
+    match tool {
+        T::Ls => Arc::new(search::Search::with_limits(
+            root,
+            search::Operation::Ls,
+            limits,
+        )),
+        T::Find => Arc::new(search::Search::with_limits(
+            root,
+            search::Operation::Find,
+            limits,
+        )),
+        T::Grep => Arc::new(search::Search::with_limits(
+            root,
+            search::Operation::Grep,
+            limits,
+        )),
+        T::Read => Arc::new(text::Text::with_limits(root, text::Operation::Read, limits)),
+        T::Write => Arc::new(text::Text::with_limits(
+            root,
+            text::Operation::Write,
+            limits,
+        )),
+        T::Edit => Arc::new(edit::Edit::with_limits(root, limits)),
+        T::Patch => Arc::new(patch::Patch::with_limits(root, limits)),
+        T::Copy => Arc::new(lifecycle::Lifecycle::with_limits(
+            root,
+            lifecycle::Operation::Copy,
+            limits,
+        )),
+        T::Move => Arc::new(lifecycle::Lifecycle::with_limits(
+            root,
+            lifecycle::Operation::Move,
+            limits,
+        )),
+        T::Remove => Arc::new(lifecycle::Lifecycle::with_limits(
+            root,
+            lifecycle::Operation::Remove,
+            limits,
+        )),
+        T::Bread => Arc::new(binary::Binary::with_limits(
+            root,
+            binary::Operation::Read,
+            limits,
+        )),
+        T::Bwrite => Arc::new(binary::Binary::with_limits(
+            root,
+            binary::Operation::Write,
+            limits,
+        )),
+        T::Bedit => Arc::new(binary::Binary::with_limits(
+            root,
+            binary::Operation::Edit,
+            limits,
+        )),
+    }
+}
+
+struct CanonicalFilesystemTool {
+    root: Arc<aw_platform::scoped_fs::Root>,
+    tool: aw_tools::filesystem::schema::Tool,
+    limits: LocalToolLimits,
+    compatibility: Arc<dyn Tool>,
+}
+impl CanonicalFilesystemTool {
+    fn new(
+        root: Arc<aw_platform::scoped_fs::Root>,
+        tool: aw_tools::filesystem::schema::Tool,
+        limits: LocalToolLimits,
+    ) -> Self {
+        let compatibility = compatibility_filesystem_tool(root.clone(), tool, limits);
+        Self {
+            root,
+            tool,
+            limits,
+            compatibility,
+        }
+    }
+}
+impl Tool for CanonicalFilesystemTool {
+    fn spec(&self) -> ToolSpec {
+        core_spec(self.tool, self.limits.schema)
+    }
+
+    fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+        if legacy_filesystem_request(self.tool, arguments) {
+            self.compatibility.validate(arguments)
+        } else {
+            canonical_request(self.tool, arguments, self.limits).map(|_| ())
+        }
+    }
+
+    fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        if legacy_filesystem_request(self.tool, arguments) {
+            return self.compatibility.execute(ctx, arguments);
+        }
+        Box::pin(async move {
+            let request = canonical_request(self.tool, arguments, self.limits)?;
+            let result_bytes = ctx.result_budget(self.limits.result_bytes)?;
+            let direct_limits = canonical_direct_limits(self.limits, result_bytes, &request);
+            let root = self.root.clone();
+            let cancellation = ctx.cancellation.clone();
+            let result = aw_tools::asynchronous::run_blocking(move || {
+                aw_tools::filesystem::direct::execute(
+                    root.as_ref(),
+                    request,
+                    direct_limits,
+                    &|| cancellation.is_cancelled(),
+                )
+            })
+            .await
+            .map_err(|_| {
+                Error::Protocol("canonical filesystem worker failed; inspect workspace")
+            })?;
+            let projected = match result {
+                Ok(output) => canonical_direct_output(output, result_bytes),
+                Err(error) => Err(canonical_direct_error(error)),
+            };
+            tool_failure(
+                projected,
+                self.tool.action() != aw_tools::filesystem::access::Action::Read,
+            )
+        })
+    }
+}
+
 /// Map shared-operation failures without creating a second tool-policy path.
 fn file_operation_error(
     error: aw_tools::filesystem::operations::Error<aw_platform::scoped_fs::ScopedError>,
@@ -589,99 +908,21 @@ pub fn configure(
         available.extend(JOB_TOOL_NAMES.iter().map(|name| (*name).to_owned()));
         None
     };
-    builder = offer(
-        builder,
-        text::Text::with_limits(root.clone(), text::Operation::Read, limits),
-        &selected,
-        &mut available,
-        &mut policy,
-        &actor,
-    )?;
-    for operation in [
-        search::Operation::Ls,
-        search::Operation::Find,
-        search::Operation::Grep,
-    ] {
-        builder = offer(
-            builder,
-            search::Search::with_limits(root.clone(), operation, limits),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-        )?;
-    }
-    builder = offer(
-        builder,
-        binary::Binary::with_limits(root.clone(), binary::Operation::Read, limits),
-        &selected,
-        &mut available,
-        &mut policy,
-        &actor,
-    )?;
-    if options
-        .mode
-        .access()
-        .permits(aw_tools::filesystem::access::Action::Write)
-    {
-        builder = offer(
-            builder,
-            text::Text::with_limits(root.clone(), text::Operation::Write, limits),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-        )?;
-        builder = offer(
-            builder,
-            edit::Edit::with_limits(root.clone(), limits),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-        )?;
-        builder = offer(
-            builder,
-            patch::Patch::with_limits(root.clone(), limits),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-        )?;
-        for operation in [lifecycle::Operation::Copy, lifecycle::Operation::Move] {
-            builder = offer(
-                builder,
-                lifecycle::Lifecycle::with_limits(root.clone(), operation, limits),
-                &selected,
-                &mut available,
-                &mut policy,
-                &actor,
-            )?;
+    for core in aw_tools::filesystem::schema::Tool::ALL {
+        if !options.mode.access().permits(core.action()) {
+            continue;
         }
-        if durable_remove {
-            builder = offer(
-                builder,
-                lifecycle::Lifecycle::with_limits(
-                    root.clone(),
-                    lifecycle::Operation::Remove,
-                    limits,
-                ),
-                &selected,
-                &mut available,
-                &mut policy,
-                &actor,
-            )?;
+        if core == aw_tools::filesystem::schema::Tool::Remove && !durable_remove {
+            continue;
         }
-        for operation in [binary::Operation::Write, binary::Operation::Edit] {
-            builder = offer(
-                builder,
-                binary::Binary::with_limits(root.clone(), operation, limits),
-                &selected,
-                &mut available,
-                &mut policy,
-                &actor,
-            )?;
-        }
+        builder = offer_shared(
+            builder,
+            Arc::new(CanonicalFilesystemTool::new(root.clone(), core, limits)),
+            &selected,
+            &mut available,
+            &mut policy,
+            &actor,
+        )?;
     }
     if options
         .mode

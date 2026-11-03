@@ -920,6 +920,15 @@ impl aw_tools::filesystem::backend::SecuredFilesystem for Root {
     ) -> Result<aw_tools::read::Page> {
         Root::read_page_with_cancel(self, path, request, cancel)
     }
+    fn read_binary_window(
+        &self,
+        path: &str,
+        offset: u64,
+        limit: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<u8>, u64, bool)> {
+        Root::read_binary_window_with_cancel(self, path, offset, limit, cancel)
+    }
 }
 
 #[cfg(test)]
@@ -927,6 +936,26 @@ mod namespace_identity_tests {
     use super::*;
     use aw_tools::filesystem::backend::SecuredFilesystem as _;
     use std::fs;
+
+    #[test]
+    fn binary_window_observes_cancellation_before_reading_payload() {
+        let base = std::env::temp_dir().join(format!(
+            "aw-binary-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("blob.bin"), vec![0x5a; 128 * 1024]).unwrap();
+        let root = Root::open(&base).unwrap();
+        assert!(matches!(
+            root.read_binary_window_with_cancel("blob.bin", 0, 128 * 1024, &|| true),
+            Err(ScopedError::Cancelled)
+        ));
+        let _ = fs::remove_dir_all(base);
+    }
 
     #[test]
     fn mutation_path_key_tracks_namespace_entry_across_overlapping_roots() {

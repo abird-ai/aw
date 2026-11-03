@@ -855,4 +855,13 @@ impl aw_tools::filesystem::backend::SecuredFilesystem for Root {
     ) -> Result<aw_tools::read::Page> {
         Root::read_page_with_cancel(self, path, request, cancel)
     }
+    fn read_binary_window(
+        &self,
+        path: &str,
+        offset: u64,
+        limit: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<u8>, u64, bool)> {
+        Root::read_binary_window_with_cancel(self, path, offset, limit, cancel)
+    }
 }

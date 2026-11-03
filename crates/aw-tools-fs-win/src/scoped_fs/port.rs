@@ -477,6 +477,16 @@ impl Root {
         offset: u64,
         limit: usize,
     ) -> Result<(Vec<u8>, u64, bool)> {
+        self.read_binary_window_with_cancel(path, offset, limit, &|| false)
+    }
+
+    pub fn read_binary_window_with_cancel(
+        &self,
+        path: &str,
+        offset: u64,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(Vec<u8>, u64, bool)> {
         self.ensure_public_path(path)?;
         if limit == 0 || limit > MAX_BATCH_FILE {
             return Err(ScopedError::Limit("invalid binary window limit"));
@@ -489,7 +499,22 @@ impl Root {
         }
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::with_capacity(limit.min(65536));
-        file.take(limit as u64).read_to_end(&mut bytes)?;
+        let mut remaining = limit;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining != 0 {
+            if cancelled() {
+                return Err(ScopedError::Cancelled);
+            }
+            let want = remaining.min(buffer.len());
+            let count = match file.read(&mut buffer[..want]) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
+            bytes.extend_from_slice(&buffer[..count]);
+            remaining -= count;
+        }
         let truncated = offset.saturating_add(bytes.len() as u64) < total;
         Ok((bytes, total, truncated))
     }

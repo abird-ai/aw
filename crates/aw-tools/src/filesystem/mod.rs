@@ -6,6 +6,8 @@ pub mod access;
 pub mod backend;
 #[cfg(feature = "batch")]
 pub mod batch;
+#[cfg(feature = "rw")]
+pub mod direct;
 #[cfg(feature = "read")]
 pub mod discovery;
 #[cfg(feature = "write")]

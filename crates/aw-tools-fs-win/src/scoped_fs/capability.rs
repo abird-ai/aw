@@ -1103,6 +1103,22 @@ impl SecuredFilesystem for CapabilitySet {
         let r = self.route(path, Need::Read)?;
         Root::read_page_with_cancel(&r.grant.root, &r.relative, request, cancel)
     }
+    fn read_binary_window(
+        &self,
+        path: &str,
+        offset: u64,
+        limit: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<u8>, u64, bool)> {
+        let routed = self.route(path, Need::Read)?;
+        Root::read_binary_window_with_cancel(
+            &routed.grant.root,
+            &routed.relative,
+            offset,
+            limit,
+            cancel,
+        )
+    }
 }
 
 #[cfg(test)]

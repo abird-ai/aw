@@ -370,7 +370,7 @@ struct WireBedit {
 }
 
 #[derive(Clone, Debug)]
-pub enum Request {
+pub enum RequestKind {
     Ls(Ls),
     Find(Find),
     Grep(Grep),
@@ -386,23 +386,41 @@ pub enum Request {
     Bedit(Bedit),
 }
 
+/// Executable canonical request. The inner typed representation is inspectable
+/// for footprint/budget planning, but only this module can mint the validated
+/// wrapper. Consumers cannot bypass parser/schema limits by constructing a
+/// `RequestKind` directly and handing it to the shared executor.
+#[derive(Clone, Debug)]
+pub struct Request {
+    kind: RequestKind,
+}
+impl Request {
+    pub fn kind(&self) -> &RequestKind {
+        &self.kind
+    }
+    pub(crate) fn into_kind(self) -> RequestKind {
+        self.kind
+    }
+}
+
 pub fn parse(tool: Tool, value: &Value, limits: Limits) -> Result<Request, Error> {
     let limits = limits.validate()?;
-    match tool {
-        Tool::Ls => parse_ls(value).map(Request::Ls),
-        Tool::Find => parse_find(value).map(Request::Find),
-        Tool::Grep => parse_grep(value).map(Request::Grep),
-        Tool::Read => parse_read(value, limits).map(Request::Read),
-        Tool::Write => parse_write(value, limits).map(Request::Write),
-        Tool::Edit => parse_edit(value, limits).map(Request::Edit),
-        Tool::Patch => parse_patch_request(value, limits).map(Request::Patch),
-        Tool::Copy => parse_copy(value).map(Request::Copy),
-        Tool::Move => parse_move(value).map(Request::Move),
-        Tool::Remove => parse_remove(value).map(Request::Remove),
-        Tool::Bread => parse_bread(value, limits).map(Request::Bread),
-        Tool::Bwrite => parse_bwrite(value, limits).map(Request::Bwrite),
-        Tool::Bedit => parse_bedit(value, limits).map(Request::Bedit),
-    }
+    let kind = match tool {
+        Tool::Ls => parse_ls(value).map(RequestKind::Ls),
+        Tool::Find => parse_find(value).map(RequestKind::Find),
+        Tool::Grep => parse_grep(value).map(RequestKind::Grep),
+        Tool::Read => parse_read(value, limits).map(RequestKind::Read),
+        Tool::Write => parse_write(value, limits).map(RequestKind::Write),
+        Tool::Edit => parse_edit(value, limits).map(RequestKind::Edit),
+        Tool::Patch => parse_patch_request(value, limits).map(RequestKind::Patch),
+        Tool::Copy => parse_copy(value).map(RequestKind::Copy),
+        Tool::Move => parse_move(value).map(RequestKind::Move),
+        Tool::Remove => parse_remove(value).map(RequestKind::Remove),
+        Tool::Bread => parse_bread(value, limits).map(RequestKind::Bread),
+        Tool::Bwrite => parse_bwrite(value, limits).map(RequestKind::Bwrite),
+        Tool::Bedit => parse_bedit(value, limits).map(RequestKind::Bedit),
+    }?;
+    Ok(Request { kind })
 }
 
 fn parse_ls(value: &Value) -> Result<Ls, Error> {
@@ -678,9 +696,8 @@ mod tests {
 
     #[test]
     fn canonical_defaults_and_unknown_fields_are_shared() {
-        let Request::Read(read) =
-            parse(Tool::Read, &json!({"path":"a.txt"}), Limits::default()).unwrap()
-        else {
+        let request = parse(Tool::Read, &json!({"path":"a.txt"}), Limits::default()).unwrap();
+        let RequestKind::Read(read) = request.kind() else {
             panic!("read request");
         };
         assert_eq!(
@@ -694,9 +711,8 @@ mod tests {
         )
         .is_err());
 
-        let Request::Grep(grep) =
-            parse(Tool::Grep, &json!({"pattern":"needle"}), Limits::default()).unwrap()
-        else {
+        let request = parse(Tool::Grep, &json!({"pattern":"needle"}), Limits::default()).unwrap();
+        let RequestKind::Grep(grep) = request.kind() else {
             panic!("grep request");
         };
         assert_eq!(grep.context, 0);
@@ -781,12 +797,13 @@ mod tests {
             },
             ..Limits::default()
         };
-        let Request::Bread(bread) = parse(
+        let request = parse(
             Tool::Bread,
             &json!({"path":"a.bin","format":"base64"}),
             limits,
         )
-        .unwrap() else {
+        .unwrap();
+        let RequestKind::Bread(bread) = request.kind() else {
             panic!("bread request");
         };
         assert_eq!(bread.limit, None);
@@ -797,22 +814,24 @@ mod tests {
         )
         .is_err());
 
-        let Request::Bwrite(write) = parse(
+        let request = parse(
             Tool::Bwrite,
             &json!({"path":"a.bin","data":"AQID","encoding":"base64"}),
             limits,
         )
-        .unwrap() else {
+        .unwrap();
+        let RequestKind::Bwrite(write) = request.kind() else {
             panic!("bwrite request");
         };
         assert_eq!(write.data, [1, 2, 3]);
 
-        let Request::Bedit(edit) = parse(
+        let request = parse(
             Tool::Bedit,
             &json!({"path":"a.bin","edits":[{"offset":0,"length":0,"data":"ff","encoding":"hex"}]}),
             limits,
         )
-        .unwrap() else {
+        .unwrap();
+        let RequestKind::Bedit(edit) = request.kind() else {
             panic!("bedit request");
         };
         assert_eq!(edit.edits[0].data, [0xff]);
@@ -827,8 +846,8 @@ mod tests {
             },
             ..Limits::default()
         };
-        let Request::Read(read) = parse(Tool::Read, &json!({"path":"a.txt"}), limits).unwrap()
-        else {
+        let request = parse(Tool::Read, &json!({"path":"a.txt"}), limits).unwrap();
+        let RequestKind::Read(read) = request.kind() else {
             panic!("read request");
         };
         assert_eq!(read.lines, 8);

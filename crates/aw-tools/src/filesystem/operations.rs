@@ -931,6 +931,15 @@ mod tests {
         fn read_page(&self, _: &str, _: PageRequest, _: &dyn Fn() -> bool) -> Result<Page, Fault> {
             Err(Fault::Denied)
         }
+        fn read_binary_window(
+            &self,
+            _: &str,
+            _: u64,
+            _: usize,
+            _: &dyn Fn() -> bool,
+        ) -> Result<(Vec<u8>, u64, bool), Fault> {
+            Err(Fault::Denied)
+        }
     }
     #[test]
     fn mutation_authority_preflight_runs_before_lock_admission() {
