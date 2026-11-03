@@ -991,6 +991,52 @@ fn local_tool_concurrency_graph_width_is_narrowing_only() {
 }
 
 #[test]
+fn configured_parallel_ceiling_cannot_be_widened_after_build() {
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::ReadOnly);
+    options.selected_tools = vec!["read".into()];
+    options.concurrency = crate::LocalToolConcurrency {
+        graph_width: 2,
+        parallelism: aw_agent_core::ToolParallelism {
+            max_parallel_reads: 2,
+            allow_parallel_shell: false,
+            max_parallel_shell: 1,
+        },
+    };
+    let mut agent = configure(builder, actor, &options)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(agent.tool_parallelism().max_parallel_reads, 2);
+    assert!(!agent.tool_parallelism().allow_parallel_shell);
+
+    assert!(agent.set_max_parallel_reads(3).is_err());
+    assert_eq!(agent.tool_parallelism().max_parallel_reads, 2);
+    assert!(agent.set_parallel_bash(true, 1).is_err());
+    assert!(!agent.tool_parallelism().allow_parallel_shell);
+
+    agent.set_max_parallel_reads(1).unwrap();
+    assert_eq!(agent.tool_parallelism().max_parallel_reads, 1);
+}
+
+#[test]
 fn local_tool_limits_reject_caller_owned_schema_capability_flags() {
     let mut limits = crate::LocalToolLimits::default();
     limits.schema.parallel_reads = false;

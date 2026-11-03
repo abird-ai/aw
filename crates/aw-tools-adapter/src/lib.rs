@@ -306,6 +306,32 @@ impl LocalToolOptions {
         }
     }
 }
+struct ParallelismCeiling {
+    ceiling: aw_agent_core::ToolParallelism,
+}
+impl InvocationScopeLifecycle for ParallelismCeiling {
+    fn replace_scope(
+        &self,
+        _previous: Option<&InvocationScope>,
+        _next: Option<&InvocationScope>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn validate_tool_parallelism(&self, next: aw_agent_core::ToolParallelism) -> Result<()> {
+        let ceiling = self.ceiling;
+        if next.max_parallel_reads > ceiling.max_parallel_reads
+            || next.max_parallel_shell > ceiling.max_parallel_shell
+            || (next.allow_parallel_shell && !ceiling.allow_parallel_shell)
+        {
+            return Err(Error::Config(
+                "tool parallel policy may only narrow the configured local-tool ceiling".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn offer<T: Tool + 'static>(
     builder: AgentBuilder,
     tool: T,
@@ -395,6 +421,9 @@ pub fn configure(
         graph_width: concurrency.graph_width,
         parallelism: policy.parallelism(),
     };
+    builder = builder.scope_lifecycle(Arc::new(ParallelismCeiling {
+        ceiling: effective_concurrency.parallelism,
+    }));
     if options.mode == ToolMode::Off {
         if !options.selected_tools.is_empty() {
             return Err(Error::Denied("tool selection needs an enabled mode"));

@@ -746,12 +746,13 @@ impl JobManager {
         Ok(())
     }
 
-    fn prune_one_released_terminal(state: &mut State) -> bool {
+    fn prune_one_released_terminal(state: &mut State, protected: Option<&str>) -> bool {
         let candidate = state
             .jobs
             .iter()
             .filter(|(id, managed)| {
-                managed.retention_releasable()
+                protected.is_none_or(|protected| id.as_str() != protected)
+                    && managed.retention_releasable()
                     && !state
                         .replays
                         .values()
@@ -778,14 +779,22 @@ impl JobManager {
         plans: Vec<NodePlan>,
         exposed: bool,
         task_binding: Option<TaskIdentity>,
+        protected: Option<&str>,
     ) -> Result<(), Error> {
         Self::validate_plans(&job, &plans)?;
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        if let Some(source_id) = protected {
+            let source = state.jobs.get(source_id).ok_or(Error::NotFound)?;
+            if source.job.lifecycle() != Lifecycle::Terminal || source.transition_inflight.is_some()
+            {
+                return Err(Error::RestartNotTerminal);
+            }
+        }
         if state.jobs.contains_key(id) {
             return Err(Error::DuplicateId);
         }
         if state.jobs.len() >= self.limits.max_retained_jobs
-            && !Self::prune_one_released_terminal(&mut state)
+            && !Self::prune_one_released_terminal(&mut state, protected)
         {
             return Err(Error::Capacity);
         }
@@ -829,7 +838,7 @@ impl JobManager {
             admission.admission_sequence,
             admission.width,
         )?;
-        self.insert(admission.id, job, plans, admission.exposed, None)
+        self.insert(admission.id, job, plans, admission.exposed, None, None)
     }
 
     pub fn admit_task(
@@ -851,6 +860,7 @@ impl JobManager {
             plans,
             admission.exposed,
             Some(admission.task.clone()),
+            None,
         )
     }
 
@@ -873,7 +883,7 @@ impl JobManager {
             admission.width,
             records,
         )?;
-        self.insert(admission.id, job, plans, admission.exposed, None)
+        self.insert(admission.id, job, plans, admission.exposed, None, None)
     }
 
     /// Task-scoped counterpart to `restore_runtime`; valid only under the
@@ -899,6 +909,7 @@ impl JobManager {
             plans,
             admission.exposed,
             Some(admission.task.clone()),
+            None,
         )
     }
 
@@ -1134,6 +1145,34 @@ impl JobManager {
         Ok(())
     }
 
+    /// Remove a provisional Job only while it is provably pre-effect: hidden,
+    /// all nodes Pending, no transition/output/process state, and no Ready
+    /// replay identity. Claimed/Unknown replay tombstones may outlive the local
+    /// provisional Job because they intentionally forbid a duplicate execution.
+    pub fn discard_unstarted(&self, id: &str) -> Result<(), Error> {
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let removable = {
+            let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+            !managed.exposed
+                && managed.job.lifecycle() == Lifecycle::Running
+                && managed.job.active() == 0
+                && managed.job.finished() == 0
+                && managed.transition_inflight.is_none()
+                && managed.outputs.is_empty()
+                && managed.process_terminals.is_empty()
+                && (1..=managed.job.total())
+                    .all(|coordinate| managed.job.state(coordinate) == Some(NodeState::Pending))
+        };
+        let ready_replay = state.replays.values().any(|entry| {
+            entry.record.job_id == id && entry.record.disposition == ReplayDisposition::Ready
+        });
+        if !removable || ready_replay {
+            return Err(Error::Busy);
+        }
+        state.jobs.remove(id);
+        Ok(())
+    }
+
     /// Remove only a terminal Job that was never exposed. Dropping its output
     /// owners releases any retained spool capacity. Historical exposed Jobs are
     /// never removed through this optimistic-completion path.
@@ -1353,6 +1392,45 @@ impl JobManager {
         OutputOwner::new(hash.finalize().into())
     }
 
+    fn replay_decision(
+        record: &ReplayRecord,
+        semantic_hash: [u8; 32],
+    ) -> Result<ReplayDecision, Error> {
+        if record.semantic_hash != semantic_hash {
+            return Err(Error::ReplayMismatch);
+        }
+        Ok(match record.disposition {
+            ReplayDisposition::Ready => ReplayDecision::Existing {
+                job_id: record.job_id.clone(),
+            },
+            ReplayDisposition::Claimed | ReplayDisposition::Unknown => ReplayDecision::Unknown,
+        })
+    }
+
+    /// Read-only fast path for a replay identity that is already known to this
+    /// live manager. `None` means the caller may proceed to bounded admission
+    /// before attempting the exclusive replay claim. The subsequent claim is
+    /// still authoritative because another caller can race this lookup.
+    pub fn lookup_replay(
+        &self,
+        namespace: &str,
+        request_id: &str,
+        semantic_hash: [u8; 32],
+    ) -> Result<Option<ReplayDecision>, Error> {
+        if semantic_hash == [0; 32] {
+            return Err(Error::InvalidPlans);
+        }
+        let key = replay_key(namespace, request_id)?;
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        if let Some(entry) = state.replays.get(&key) {
+            return Self::replay_decision(&entry.record, semantic_hash).map(Some);
+        }
+        if state.replay_inflight.contains(&key) {
+            return Err(Error::Busy);
+        }
+        Ok(None)
+    }
+
     /// Replay claim precedes root Job execution. A host that requires
     /// cross-process replay protection supplies an exclusive create-if-absent
     /// callback; a host whose outer session journal already forbids redispatch
@@ -1376,17 +1454,7 @@ impl JobManager {
         {
             let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
             if let Some(existing) = state.replays.get(&key) {
-                if existing.record.semantic_hash != semantic_hash {
-                    return Err(Error::ReplayMismatch);
-                }
-                return Ok(match existing.record.disposition {
-                    ReplayDisposition::Ready => ReplayDecision::Existing {
-                        job_id: existing.record.job_id.clone(),
-                    },
-                    ReplayDisposition::Claimed | ReplayDisposition::Unknown => {
-                        ReplayDecision::Unknown
-                    }
-                });
+                return Self::replay_decision(&existing.record, semantic_hash);
             }
             if state.replays.len() >= self.limits.max_hidden_replays {
                 return Err(Error::Capacity);
@@ -1427,14 +1495,7 @@ impl JobManager {
                         record: existing.clone(),
                     },
                 );
-                Ok(match existing.disposition {
-                    ReplayDisposition::Ready => ReplayDecision::Existing {
-                        job_id: existing.job_id,
-                    },
-                    ReplayDisposition::Claimed | ReplayDisposition::Unknown => {
-                        ReplayDecision::Unknown
-                    }
-                })
+                Self::replay_decision(&existing, semantic_hash)
             }
             Ok(Err(JournalError::RejectedBeforeEffect)) => Err(Error::ReplayRejected),
             Ok(Err(JournalError::OutcomeUnknown)) | Err(_) => {
@@ -1522,15 +1583,22 @@ impl JobManager {
         plans: Vec<NodePlan>,
         admission: RuntimeAdmission<'_>,
     ) -> Result<(), Error> {
-        {
-            let state = self.state.lock().map_err(|_| Error::Poisoned)?;
-            let source = state.jobs.get(source_id).ok_or(Error::NotFound)?;
-            if source.job.lifecycle() != Lifecycle::Terminal || source.transition_inflight.is_some()
-            {
-                return Err(Error::RestartNotTerminal);
-            }
-        }
-        self.admit_runtime(graph, plans, admission)
+        let job = Job::after_runtime_intent(
+            graph,
+            admission.runtime_session,
+            admission.id,
+            admission.epoch,
+            admission.admission_sequence,
+            admission.width,
+        )?;
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            admission.exposed,
+            None,
+            Some(source_id),
+        )
     }
 
     pub fn restart_task(
@@ -1540,15 +1608,21 @@ impl JobManager {
         plans: Vec<NodePlan>,
         admission: TaskAdmission<'_>,
     ) -> Result<(), Error> {
-        {
-            let state = self.state.lock().map_err(|_| Error::Poisoned)?;
-            let source = state.jobs.get(source_id).ok_or(Error::NotFound)?;
-            if source.job.lifecycle() != Lifecycle::Terminal || source.transition_inflight.is_some()
-            {
-                return Err(Error::RestartNotTerminal);
-            }
-        }
-        self.admit_task(graph, plans, admission)
+        let job = Job::after_task_intent(
+            graph,
+            admission.task,
+            admission.id,
+            admission.admission_sequence,
+            admission.width,
+        )?;
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            admission.exposed,
+            Some(admission.task.clone()),
+            Some(source_id),
+        )
     }
 
     fn output_handle(
@@ -3064,6 +3138,166 @@ mod tests {
         manager.mark_replay_ready(key, "live", |_| Ok(())).unwrap();
         assert_eq!(manager.expire_terminal("live"), Err(Error::Busy));
         assert!(manager.get("live").is_ok());
+    }
+
+    #[test]
+    fn provisional_unstarted_job_can_be_discarded_without_erasing_claim_tombstone() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 64,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        manager
+            .admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "provisional",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: false,
+                },
+            )
+            .unwrap();
+        let decision = manager
+            .claim_replay("ns", "request", [7; 32], "provisional", |_| {
+                Ok(ReplayPersist::Created)
+            })
+            .unwrap();
+        let ReplayDecision::New { key, .. } = decision else {
+            panic!("expected a new replay claim");
+        };
+        manager.discard_unstarted("provisional").unwrap();
+        assert!(matches!(
+            manager.runtime_snapshot("provisional"),
+            Err(Error::NotFound)
+        ));
+        assert_eq!(
+            manager.replay_record(key).unwrap().disposition,
+            ReplayDisposition::Claimed
+        );
+        assert_eq!(
+            manager.lookup_replay("ns", "request", [7; 32]).unwrap(),
+            Some(ReplayDecision::Unknown)
+        );
+    }
+
+    #[test]
+    fn ready_replay_prevents_discarding_its_provisional_job() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 64,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        manager
+            .admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "ready",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: false,
+                },
+            )
+            .unwrap();
+        let decision = manager
+            .claim_replay("ns", "ready-request", [8; 32], "ready", |_| {
+                Ok(ReplayPersist::Created)
+            })
+            .unwrap();
+        let ReplayDecision::New { key, .. } = decision else {
+            panic!("expected a new replay claim");
+        };
+        manager.mark_replay_ready(key, "ready", |_| Ok(())).unwrap();
+        assert_eq!(manager.discard_unstarted("ready"), Err(Error::Busy));
+        assert!(manager.runtime_snapshot("ready").is_ok());
+    }
+
+    #[test]
+    fn restart_never_prunes_source_job_to_make_capacity() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        terminal_no_output(&manager, "source");
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"b"}]]}), |_, _| true).unwrap();
+        let node_plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 64,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            manager.restart_runtime(
+                "source",
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "restart",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: false,
+                },
+            ),
+            Err(Error::Capacity)
+        );
+        assert!(manager.get("source").is_ok());
+        assert!(matches!(
+            manager.runtime_snapshot("restart"),
+            Err(Error::NotFound)
+        ));
     }
 
     #[test]

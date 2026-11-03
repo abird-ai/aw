@@ -11,9 +11,9 @@ use aw_tools::{
         footprint::{Access, Extent, Footprint, Scope},
         job::NodeState,
         job_manager::{
-            plan_graph, semantic_hash, JobManager, Limits, NodePlan, NodePolicy, OutputAck,
-            OutputOwner, OutputPage, OutputStream, ProcessSettlement, ReplayDecision,
-            ReplayPersist, SemanticBudget, StartRequest, TaskAdmission,
+            plan_graph, semantic_hash, Error as JobManagerError, JobManager, Limits, NodePlan,
+            NodePolicy, OutputAck, OutputOwner, OutputPage, OutputStream, ProcessSettlement,
+            ReplayDecision, ReplayPersist, SemanticBudget, StartRequest, TaskAdmission,
         },
         schema::Tool as CoreTool,
         status::Primary,
@@ -32,6 +32,31 @@ use std::sync::{
 
 const NODE_WORK_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const SHELL_RESULT_BYTES: usize = 4 * 1024;
+
+fn job_admission_error(error: JobManagerError) -> Error {
+    match error {
+        JobManagerError::Capacity => Error::Limit("live Job capacity exhausted"),
+        JobManagerError::Busy => Error::Conflict("live Job admission is busy"),
+        _ => Error::Protocol("live Job admission failed"),
+    }
+}
+
+fn replay_state_error(error: JobManagerError) -> Error {
+    match error {
+        JobManagerError::Capacity => Error::Limit("live replay identity capacity exhausted"),
+        JobManagerError::Busy => Error::Conflict("live replay identity is being claimed"),
+        JobManagerError::ReplayMismatch => {
+            Error::Denied("replay identity reused with different semantics")
+        }
+        JobManagerError::ReplayRejected => {
+            Error::Conflict("replay identity rejected before execution")
+        }
+        JobManagerError::ReplayUnknown => {
+            Error::Protocol("replay identity outcome unknown; do not retry automatically")
+        }
+        _ => Error::Protocol("live replay state failed"),
+    }
+}
 
 pub(crate) struct GraphParallelism {
     max_width: usize,
@@ -725,7 +750,7 @@ impl JobHost {
                     exposed: false,
                 },
             )
-            .map_err(|_| Error::Protocol("live Job admission failed"))
+            .map_err(job_admission_error)
     }
 
     pub fn admit(&self, prepared: PreparedJob) -> Result<String> {
@@ -743,37 +768,76 @@ impl JobHost {
         namespace: &str,
         request_id: &str,
     ) -> Result<AdmissionDecision> {
-        let proposed = new_job_id()?;
         let semantics = prepared.semantic_hash;
-        let decision = self
+        if let Some(existing) = self
             .manager
-            .claim_replay(namespace, request_id, semantics, &proposed, |_| {
-                Ok(ReplayPersist::Created)
-            })
-            .map_err(|_| Error::Denied("Job replay claim refused"))?;
+            .lookup_replay(namespace, request_id, semantics)
+            .map_err(replay_state_error)?
+        {
+            return Ok(match existing {
+                ReplayDecision::Existing { job_id }
+                    if self.manager.runtime_snapshot(&job_id).is_ok() =>
+                {
+                    AdmissionDecision::Existing(job_id)
+                }
+                ReplayDecision::Existing { .. } | ReplayDecision::Unknown => {
+                    AdmissionDecision::Unknown
+                }
+                ReplayDecision::New { .. } => unreachable!("lookup never creates replay work"),
+            });
+        }
+
+        let proposed = new_job_id()?;
+        // Reserve every bounded local Job slot before committing the replay
+        // identity. No runner exists yet, so a failed/duplicate claim can drop
+        // this provisional Job without any effect ambiguity.
+        self.admit_with_id(&proposed, prepared)?;
+        let decision =
+            match self
+                .manager
+                .claim_replay(namespace, request_id, semantics, &proposed, |_| {
+                    Ok(ReplayPersist::Created)
+                }) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.manager
+                        .discard_unstarted(&proposed)
+                        .map_err(|_| Error::Protocol("provisional Job cleanup failed"))?;
+                    return Err(replay_state_error(error));
+                }
+            };
         match decision {
             ReplayDecision::Existing { job_id } => {
+                self.manager
+                    .discard_unstarted(&proposed)
+                    .map_err(|_| Error::Protocol("duplicate provisional Job cleanup failed"))?;
                 if self.manager.runtime_snapshot(&job_id).is_ok() {
                     Ok(AdmissionDecision::Existing(job_id))
                 } else {
                     Ok(AdmissionDecision::Unknown)
                 }
             }
-            ReplayDecision::Unknown => Ok(AdmissionDecision::Unknown),
+            ReplayDecision::Unknown => {
+                self.manager
+                    .discard_unstarted(&proposed)
+                    .map_err(|_| Error::Protocol("unknown provisional Job cleanup failed"))?;
+                Ok(AdmissionDecision::Unknown)
+            }
             ReplayDecision::New { key, job_id } => {
                 if job_id != proposed {
+                    self.manager.discard_unstarted(&proposed).map_err(|_| {
+                        Error::Protocol("mismatched provisional Job cleanup failed")
+                    })?;
                     return Err(Error::Protocol(
                         "replay claim returned a different proposed Job",
                     ));
                 }
-                if self.admit_with_id(&job_id, prepared).is_err() {
-                    // The live replay entry intentionally remains Claimed. A
-                    // duplicate becomes Unknown rather than re-running work.
-                    return Err(Error::Protocol("Job admission failed after replay claim"));
+                if let Err(error) = self.manager.mark_replay_ready(key, &job_id, |_| Ok(())) {
+                    self.manager
+                        .discard_unstarted(&job_id)
+                        .map_err(|_| Error::Protocol("unready provisional Job cleanup failed"))?;
+                    return Err(replay_state_error(error));
                 }
-                self.manager
-                    .mark_replay_ready(key, &job_id, |_| Ok(()))
-                    .map_err(|_| Error::Protocol("Job replay ready transition failed"))?;
                 Ok(AdmissionDecision::New(job_id))
             }
         }
@@ -805,52 +869,89 @@ impl JobHost {
         let semantics = semantic_hash(&graph, &plans)
             .map_err(|_| Error::Denied("restart semantic identity failed"))?;
         let width = self.parallelism.width(&graph);
-        let proposed = new_job_id()?;
         let namespace = format!("restart:{}:{source_id}", self.session);
-        let decision = self
+        if let Some(existing) = self
             .manager
-            .claim_replay(&namespace, &ctx.call_id, semantics, &proposed, |_| {
-                Ok(ReplayPersist::Created)
-            })
-            .map_err(|_| Error::Denied("Job restart replay claim refused"))?;
+            .lookup_replay(&namespace, &ctx.call_id, semantics)
+            .map_err(replay_state_error)?
+        {
+            return Ok(match existing {
+                ReplayDecision::Existing { job_id }
+                    if self.manager.runtime_snapshot(&job_id).is_ok() =>
+                {
+                    AdmissionDecision::Existing(job_id)
+                }
+                ReplayDecision::Existing { .. } | ReplayDecision::Unknown => {
+                    AdmissionDecision::Unknown
+                }
+                ReplayDecision::New { .. } => unreachable!("lookup never creates replay work"),
+            });
+        }
+
+        let proposed = new_job_id()?;
+        self.manager
+            .restart_task(
+                source_id,
+                graph,
+                plans,
+                TaskAdmission {
+                    id: &proposed,
+                    task: &task,
+                    admission_sequence: 1,
+                    width,
+                    exposed: false,
+                },
+            )
+            .map_err(job_admission_error)?;
+        let decision =
+            match self
+                .manager
+                .claim_replay(&namespace, &ctx.call_id, semantics, &proposed, |_| {
+                    Ok(ReplayPersist::Created)
+                }) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.manager
+                        .discard_unstarted(&proposed)
+                        .map_err(|_| Error::Protocol("restart provisional cleanup failed"))?;
+                    return Err(replay_state_error(error));
+                }
+            };
         match decision {
             ReplayDecision::Existing { job_id } => {
+                self.manager
+                    .discard_unstarted(&proposed)
+                    .map_err(|_| Error::Protocol("duplicate restart provisional cleanup failed"))?;
                 if self.manager.runtime_snapshot(&job_id).is_ok() {
                     Ok(AdmissionDecision::Existing(job_id))
                 } else {
                     Ok(AdmissionDecision::Unknown)
                 }
             }
-            ReplayDecision::Unknown => Ok(AdmissionDecision::Unknown),
+            ReplayDecision::Unknown => {
+                self.manager
+                    .discard_unstarted(&proposed)
+                    .map_err(|_| Error::Protocol("unknown restart provisional cleanup failed"))?;
+                Ok(AdmissionDecision::Unknown)
+            }
             ReplayDecision::New { key, job_id } => {
                 if job_id != proposed {
+                    self.manager
+                        .discard_unstarted(&proposed)
+                        .map_err(|_| Error::Protocol("mismatched restart cleanup failed"))?;
                     return Err(Error::Protocol(
                         "restart replay claim changed proposed Job ID",
                     ));
                 }
-                if self
-                    .manager
-                    .restart_task(
-                        source_id,
-                        graph,
-                        plans,
-                        TaskAdmission {
-                            id: &job_id,
-                            task: &task,
-                            admission_sequence: 1,
-                            width,
-                            exposed: true,
-                        },
-                    )
-                    .is_err()
-                {
-                    return Err(Error::Protocol(
-                        "restart admission failed after replay claim",
-                    ));
+                if let Err(error) = self.manager.mark_replay_ready(key, &job_id, |_| Ok(())) {
+                    self.manager.discard_unstarted(&job_id).map_err(|_| {
+                        Error::Protocol("unready restart provisional cleanup failed")
+                    })?;
+                    return Err(replay_state_error(error));
                 }
                 self.manager
-                    .mark_replay_ready(key, &job_id, |_| Ok(()))
-                    .map_err(|_| Error::Protocol("restart replay ready transition failed"))?;
+                    .expose(&job_id)
+                    .map_err(|_| Error::Protocol("restarted Job exposure failed"))?;
                 Ok(AdmissionDecision::New(job_id))
             }
         }
@@ -2133,6 +2234,148 @@ mod tests {
         let b = new_job_id().unwrap();
         assert!(a.starts_with('j') && a.len() == 33);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn replay_capacity_failure_happens_before_identity_claim() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(
+            &temp,
+            &agent,
+            Limits {
+                max_retained_jobs: 1,
+                max_active_nodes: 1,
+                max_hidden_replays: 2,
+                max_spool_bytes: 1024 * 1024,
+            },
+        );
+        let occupied_ctx = context(&agent, actor.clone(), "occupied");
+        let occupied = host
+            .prepare(
+                &occupied_ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let _occupied_id = host.admit(occupied).unwrap();
+
+        let ctx = context(&agent, actor, "capacity-replay");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let semantics = prepared.semantic_hash();
+        assert!(matches!(
+            host.admit_replay(prepared, "session-a", &ctx.call_id),
+            Err(Error::Limit("live Job capacity exhausted"))
+        ));
+        assert_eq!(
+            host.manager()
+                .lookup_replay("session-a", &ctx.call_id, semantics)
+                .unwrap(),
+            None,
+            "known pre-effect capacity failure must not consume replay identity"
+        );
+    }
+
+    #[test]
+    fn duplicate_replay_resolves_existing_even_when_job_capacity_is_full() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(
+            &temp,
+            &agent,
+            Limits {
+                max_retained_jobs: 1,
+                max_active_nodes: 1,
+                max_hidden_replays: 2,
+                max_spool_bytes: 1024 * 1024,
+            },
+        );
+        let ctx = context(&agent, actor, "duplicate-replay");
+        let graph = serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]});
+        let first = match host
+            .admit_replay(
+                host.prepare(&ctx, &graph).unwrap(),
+                "session-a",
+                &ctx.call_id,
+            )
+            .unwrap()
+        {
+            AdmissionDecision::New(id) => id,
+            other => panic!("unexpected initial replay admission: {other:?}"),
+        };
+        let duplicate = host
+            .admit_replay(
+                host.prepare(&ctx, &graph).unwrap(),
+                "session-a",
+                &ctx.call_id,
+            )
+            .unwrap();
+        assert_eq!(duplicate, AdmissionDecision::Existing(first.clone()));
+        assert!(host.manager().runtime_snapshot(&first).is_ok());
+    }
+
+    #[tokio::test]
+    async fn restart_capacity_failure_preserves_source_and_does_not_claim_replay() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(
+            &temp,
+            &agent,
+            Limits {
+                max_retained_jobs: 1,
+                max_active_nodes: 1,
+                max_hidden_replays: 2,
+                max_spool_bytes: 1024 * 1024,
+            },
+        );
+        let source_ctx = context(&agent, actor.clone(), "source-call");
+        let source = host
+            .prepare(
+                &source_ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let source_id = host.admit(source).unwrap();
+        host.expose(&source_id).unwrap();
+        host.execute_native_node(
+            &source_ctx,
+            &source_id,
+            1,
+            aw_agent_core::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host.manager().get(&source_id).unwrap().lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        );
+
+        let restart_ctx = context(&agent, actor, "restart-capacity");
+        let graph = host.manager().graph(&source_id).unwrap();
+        let plans = host.plans_for_graph(&restart_ctx, &graph).unwrap();
+        let semantics = semantic_hash(&graph, &plans).unwrap();
+        let namespace = format!("restart:session-a:{source_id}");
+        assert!(matches!(
+            host.restart(&restart_ctx, &source_id),
+            Err(Error::Limit("live Job capacity exhausted"))
+        ));
+        assert!(host.manager().get(&source_id).is_ok());
+        assert_eq!(
+            host.manager()
+                .lookup_replay(&namespace, &restart_ctx.call_id, semantics)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
