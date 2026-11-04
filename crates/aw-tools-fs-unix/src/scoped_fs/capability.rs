@@ -699,11 +699,29 @@ impl walk::Backend for CapabilitySet {
     }
 }
 
+fn root_entry_meta(root: &Root) -> Result<EntryMeta> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = root.directory.metadata()?;
+    let time = |secs: i64, nanos: i64| {
+        u32::try_from(nanos)
+            .ok()
+            .and_then(|nanos| aw_tools::filesystem::system_time_from_unix(secs, nanos))
+    };
+    Ok(EntryMeta {
+        kind: aw_tools::filesystem::Kind::Dir,
+        size: None,
+        mtime: time(meta.mtime(), meta.mtime_nsec()),
+        ctime: time(meta.ctime(), meta.ctime_nsec()),
+        btime: meta.created().ok(),
+        mode: Some(meta.mode() & 0o7777),
+    })
+}
+
 impl MetadataBackend for CapabilitySet {
     fn entry_meta(&self, path: &str) -> Result<EntryMeta> {
         let routed = self.route(path, Need::Read)?;
         if routed.relative.is_empty() {
-            return Err(ScopedError::Denied("metadata path must name an entry"));
+            return root_entry_meta(&routed.grant.root);
         }
         Root::entry_meta(&routed.grant.root, &routed.relative)
     }
@@ -717,9 +735,8 @@ impl MetadataBackend for CapabilitySet {
     }
 }
 
-/// Final-symlink resolution initially preserves the same-root public contract.
-/// Cross-grant final-symlink authorization is performed by the host and will use
-/// the explicit prepared-path API added alongside the dotlink adapter cutover.
+/// Final-symlink resolution re-routes the resolved object through the same
+/// prepared capability set before any payload access.
 impl ExplicitPathBackend for CapabilitySet {
     fn resolve_content_path(&self, path: &str, allow_missing: bool) -> Result<String> {
         self.resolve_final(
@@ -1324,6 +1341,83 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, operations::Error::Backend(_)));
         assert_eq!(fs::read(f.write.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn direct_grep_accepts_exact_prepared_grant_root() {
+        use aw_tools::filesystem::{direct, request, schema};
+        use serde_json::json;
+
+        let f = Fixture::new();
+        fs::write(f.read.join("data.txt"), b"needle\n").unwrap();
+        let set = CapabilitySet::open(&f.base, [GrantSpec::read(&f.read)]).unwrap();
+        let request = request::parse(
+            schema::Tool::Grep,
+            &json!({"path":"read","pattern":"needle","limit":16}),
+            request::Limits::default(),
+        )
+        .unwrap();
+        let output = direct::execute(&set, request, direct::Limits::default(), &|| false).unwrap();
+        let direct::Body::Text(output) = output.body else {
+            panic!("grep must return text");
+        };
+        assert!(output.contains("read/data.txt:1:needle"), "{output}");
+    }
+
+    #[test]
+    fn direct_find_and_grep_preserve_final_directory_symlink_model_namespace() {
+        use aw_tools::filesystem::{direct, request, schema};
+        use serde_json::json;
+
+        let f = Fixture::new();
+        let aliases = f.base.join("aliases");
+        let targets = f.base.join("targets");
+        fs::create_dir(&aliases).unwrap();
+        fs::create_dir(&targets).unwrap();
+        fs::write(targets.join("data.txt"), b"needle\n").unwrap();
+        std::os::unix::fs::symlink("../targets", aliases.join("link")).unwrap();
+        let set = CapabilitySet::open(
+            &f.base,
+            [GrantSpec::read(&aliases), GrantSpec::read(&targets)],
+        )
+        .unwrap();
+        let request_limits = request::Limits::default();
+        let direct_limits = direct::Limits::default();
+
+        let find = request::parse(
+            schema::Tool::Find,
+            &json!({"path":"aliases/link","kind":"file","limit":16}),
+            request_limits,
+        )
+        .unwrap();
+        let found = direct::execute(&set, find, direct_limits, &|| false).unwrap();
+        let direct::Body::Text(found) = found.body else {
+            panic!("find must return text");
+        };
+        assert!(found.contains("aliases/link/data.txt"), "{found}");
+        assert!(
+            !found.contains(targets.to_string_lossy().as_ref()),
+            "{found}"
+        );
+
+        let grep = request::parse(
+            schema::Tool::Grep,
+            &json!({"path":"aliases/link","pattern":"needle","limit":16}),
+            request_limits,
+        )
+        .unwrap();
+        let searched = direct::execute(&set, grep, direct_limits, &|| false).unwrap();
+        let direct::Body::Text(searched) = searched.body else {
+            panic!("grep must return text");
+        };
+        assert!(
+            searched.contains("aliases/link/data.txt:1:needle"),
+            "{searched}"
+        );
+        assert!(
+            !searched.contains(targets.to_string_lossy().as_ref()),
+            "{searched}"
+        );
     }
 
     #[test]

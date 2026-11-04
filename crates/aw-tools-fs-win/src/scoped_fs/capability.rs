@@ -762,11 +762,26 @@ impl walk::Backend for CapabilitySet {
         Ok(!r.relative.is_empty() && r.grant.root.is_private_path(&r.relative)?)
     }
 }
+fn root_entry_meta(root: &Root) -> Result<EntryMeta> {
+    let handle = root._directories.last().ok_or(ScopedError::Denied(
+        "prepared capability root is not pinned",
+    ))?;
+    let meta = handle.metadata()?;
+    Ok(EntryMeta {
+        kind: aw_tools::filesystem::Kind::Dir,
+        size: None,
+        mtime: meta.modified().ok(),
+        ctime: None,
+        btime: meta.created().ok(),
+        mode: None,
+    })
+}
+
 impl MetadataBackend for CapabilitySet {
     fn entry_meta(&self, path: &str) -> Result<EntryMeta> {
         let r = self.route(path, Need::Read)?;
         if r.relative.is_empty() {
-            return Err(ScopedError::Denied("metadata path must name an entry"));
+            return root_entry_meta(&r.grant.root);
         }
         Root::entry_meta(&r.grant.root, &r.relative)
     }

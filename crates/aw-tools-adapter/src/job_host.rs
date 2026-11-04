@@ -276,6 +276,13 @@ fn canonical_arguments(
     aw_tools::filesystem::request::parse(native, &semantic, limits.request_limits()).is_ok()
 }
 
+fn graph_arguments_are_semantic(arguments: &Value) -> bool {
+    // `parallel` is an AW top-level scheduler hint. Graph dependency syntax
+    // already owns concurrency, so accepting it here would create ignored
+    // input that changes replay fingerprints without changing execution.
+    arguments.get("parallel").is_none()
+}
+
 fn arg_path(arguments: &Value, key: &str) -> Result<String> {
     arguments
         .get(key)
@@ -670,6 +677,9 @@ impl JobHost {
     }
 
     fn validate_node(&self, node: NodeTool, arguments: &Value) -> bool {
+        if !graph_arguments_are_semantic(arguments) {
+            return false;
+        }
         if let Some(native) = node.native() {
             return canonical_arguments(native, arguments, self.tool_limits);
         }
@@ -681,6 +691,9 @@ impl JobHost {
     fn plans_for_graph(&self, ctx: &ToolContext, graph: &Graph) -> Result<Vec<NodePlan>> {
         let one = graph.steps().len() == 1;
         plan_graph(graph, |_, step| {
+            if !graph_arguments_are_semantic(&step.arguments) {
+                return Err(());
+            }
             let binding = self
                 .authority
                 .permitted_binding(&ctx.actor, step.tool.name())
@@ -2137,6 +2150,32 @@ mod tests {
                 vector.tool
             );
         }
+    }
+
+    #[test]
+    fn graph_rejects_top_level_parallel_scheduler_hint() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(&temp, &agent, Limits::default());
+        let ctx = context(&agent, actor, "graph-parallel-hint");
+        assert!(host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["read",{
+                    "path":"a.txt","numbered":false,"parallel":true
+                }]]}),
+            )
+            .is_err());
+        assert!(host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["read",{
+                    "path":"a.txt","numbered":false
+                }]]}),
+            )
+            .is_ok());
     }
 
     #[test]
