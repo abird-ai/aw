@@ -25,12 +25,15 @@ use serde_json::json;
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub request: request::Limits,
-    /// Complete semantic result ceiling for canonical rendering.
+    /// Complete semantic result ceiling for discovery/grep/text-status rendering.
     pub result_bytes: usize,
-    /// Exact source-data bytes available to one `read` page before host
-    /// projection overhead. Hosts with a single text channel may choose a
-    /// tighter value than `result_bytes`.
+    /// Exact source-data bytes available to one `read` page. This is independent
+    /// of rendered-result bytes because adapters may project raw source data
+    /// through a separate transport budget.
     pub read_data_bytes: usize,
+    /// Complete encoded base64/hex result ceiling. Encoded binary expands
+    /// independently of both raw read bytes and ordinary text rendering.
+    pub binary_result_bytes: usize,
     /// Per-file UTF-8 preimage ceiling for edit/patch updates.
     pub text_read_bytes: usize,
     /// Per-file UTF-8 replacement/add-file ceiling for edit/patch.
@@ -50,6 +53,7 @@ impl Default for Limits {
             request: request::Limits::default(),
             result_bytes: 96 * 1024,
             read_data_bytes: 96 * 1024 - 256,
+            binary_result_bytes: 96 * 1024,
             text_read_bytes: 1024 * 1024,
             text_write_bytes: 1024 * 1024,
             binary_file_bytes: MAX_READ_WINDOW_BYTES,
@@ -64,7 +68,8 @@ impl Limits {
             .validate()
             .map_err(|error| Error::Invalid(error.to_string()))?;
         if !(512..=MAX_RENDER_BYTES).contains(&self.result_bytes)
-            || !(176..=self.result_bytes).contains(&self.read_data_bytes)
+            || !(1..=MAX_READ_WINDOW_BYTES).contains(&self.read_data_bytes)
+            || !(512..=MAX_RENDER_BYTES).contains(&self.binary_result_bytes)
             || self.text_read_bytes == 0
             || self.text_read_bytes > MAX_MUTATION_PLAN_BYTES
             || self.text_write_bytes == 0
@@ -679,7 +684,7 @@ where
                     args.format,
                     args.offset,
                     total,
-                    limits.result_bytes,
+                    limits.binary_result_bytes,
                 )
             }
         }
@@ -742,6 +747,9 @@ mod tests {
     fn direct_limits_are_narrow_only_against_engine_bounds() {
         assert!(Limits::default().validate().is_ok());
         let independent = Limits {
+            result_bytes: 4 * 1024,
+            read_data_bytes: 8 * 1024 * 1024,
+            binary_result_bytes: 16 * 1024 * 1024,
             text_read_bytes: 64 * 1024,
             text_write_bytes: 4 * 1024,
             grep: GrepLimits {
@@ -753,6 +761,18 @@ mod tests {
         assert!(independent.validate().is_ok());
         assert!(Limits {
             result_bytes: MAX_RENDER_BYTES + 1,
+            ..Limits::default()
+        }
+        .validate()
+        .is_err());
+        assert!(Limits {
+            binary_result_bytes: MAX_RENDER_BYTES + 1,
+            ..Limits::default()
+        }
+        .validate()
+        .is_err());
+        assert!(Limits {
+            read_data_bytes: MAX_READ_WINDOW_BYTES + 1,
             ..Limits::default()
         }
         .validate()

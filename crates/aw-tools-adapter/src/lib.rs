@@ -88,6 +88,7 @@ fn canonical_direct_limits(
         request: limits.request_limits(),
         result_bytes,
         read_data_bytes,
+        binary_result_bytes: result_bytes,
         text_read_bytes: 1024 * 1024,
         text_write_bytes: 1024 * 1024,
         binary_file_bytes: aw_tools::MAX_READ_WINDOW_BYTES,
