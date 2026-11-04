@@ -379,6 +379,25 @@ struct WireBedit {
     sha256: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Canonical path intent for host-side authority preparation/scheduling.
+/// This never grants access; it only describes what the already-validated
+/// request will ask the secured backend to authorize.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessPath {
+    pub path: String,
+    pub access: PathAccess,
+    /// Content/discovery tools may follow an explicitly named final symlink;
+    /// lifecycle operations act on the final namespace entry itself.
+    pub follow_final: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum RequestKind {
     Ls(Ls),
@@ -407,6 +426,80 @@ pub struct Request {
 impl Request {
     pub fn kind(&self) -> &RequestKind {
         &self.kind
+    }
+
+    pub fn access_paths(&self) -> Result<Vec<AccessPath>, Error> {
+        use PathAccess::{Read, ReadWrite, Write};
+        let one = |path: &str, access, follow_final| {
+            vec![AccessPath {
+                path: path.to_owned(),
+                access,
+                follow_final,
+            }]
+        };
+        Ok(match &self.kind {
+            RequestKind::Ls(args) => one(&args.path, Read, true),
+            RequestKind::Find(args) => one(&args.path, Read, true),
+            RequestKind::Grep(args) => one(&args.path, Read, true),
+            RequestKind::Read(args) => one(&args.path, Read, true),
+            RequestKind::Write(args) => one(&args.path, Write, true),
+            RequestKind::Edit(args) => one(&args.path, ReadWrite, true),
+            RequestKind::Patch(args) => {
+                let operations =
+                    parse_patch(&args.patch).map_err(|error| Error::Detail(error.to_string()))?;
+                operations
+                    .into_iter()
+                    .map(|operation| match operation {
+                        PatchOp::Update { path, .. } => AccessPath {
+                            path,
+                            access: ReadWrite,
+                            follow_final: true,
+                        },
+                        PatchOp::Add { path, .. } => AccessPath {
+                            path,
+                            access: Write,
+                            follow_final: false,
+                        },
+                    })
+                    .collect()
+            }
+            RequestKind::Copy(args) => vec![
+                AccessPath {
+                    path: args.from.clone(),
+                    access: Read,
+                    follow_final: false,
+                },
+                AccessPath {
+                    path: args.to.clone(),
+                    access: Write,
+                    follow_final: false,
+                },
+            ],
+            RequestKind::Move(args) => vec![
+                AccessPath {
+                    path: args.from.clone(),
+                    access: Write,
+                    follow_final: false,
+                },
+                AccessPath {
+                    path: args.to.clone(),
+                    access: Write,
+                    follow_final: false,
+                },
+            ],
+            RequestKind::Remove(args) => args
+                .paths
+                .iter()
+                .map(|path| AccessPath {
+                    path: path.clone(),
+                    access: Write,
+                    follow_final: false,
+                })
+                .collect(),
+            RequestKind::Bread(args) => one(&args.path, Read, true),
+            RequestKind::Bwrite(args) => one(&args.path, Write, true),
+            RequestKind::Bedit(args) => one(&args.path, ReadWrite, true),
+        })
     }
     pub(crate) fn into_kind(self) -> RequestKind {
         self.kind
@@ -717,6 +810,61 @@ impl Bedit {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn access_paths_single_source_final_symlink_and_lifecycle_intent() {
+        let read = parse(Tool::Read, &json!({"path":"a"}), Limits::default()).unwrap();
+        assert_eq!(
+            read.access_paths().unwrap(),
+            [AccessPath {
+                path: "a".into(),
+                access: PathAccess::Read,
+                follow_final: true,
+            }]
+        );
+        let copy = parse(
+            Tool::Copy,
+            &json!({"from":"src","to":"dst"}),
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            copy.access_paths().unwrap(),
+            [
+                AccessPath {
+                    path: "src".into(),
+                    access: PathAccess::Read,
+                    follow_final: false,
+                },
+                AccessPath {
+                    path: "dst".into(),
+                    access: PathAccess::Write,
+                    follow_final: false,
+                },
+            ]
+        );
+        let patch = parse(
+            Tool::Patch,
+            &json!({"patch":"*** Begin Patch\n*** Update File: old.txt\n@@\n-old\n+new\n*** Add File: new.txt\n+new\n*** End Patch\n"}),
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            patch.access_paths().unwrap(),
+            [
+                AccessPath {
+                    path: "old.txt".into(),
+                    access: PathAccess::ReadWrite,
+                    follow_final: true,
+                },
+                AccessPath {
+                    path: "new.txt".into(),
+                    access: PathAccess::Write,
+                    follow_final: false,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn canonical_defaults_and_unknown_fields_are_shared() {
