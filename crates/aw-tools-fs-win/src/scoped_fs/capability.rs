@@ -234,7 +234,9 @@ fn join_model(root: &str, suffix: &str) -> String {
     if suffix.is_empty() {
         return root.to_owned();
     }
-    if root.ends_with(":/") {
+    if root.is_empty() || root == "." {
+        suffix.to_owned()
+    } else if root.ends_with(":/") {
         format!("{root}{suffix}")
     } else {
         format!("{root}/{suffix}")
@@ -743,7 +745,8 @@ impl CapabilitySet {
 impl walk::Backend for CapabilitySet {
     type Error = ScopedError;
     fn list(&self, path: &str, max: usize) -> Result<walk::Listing> {
-        let r = self.route(path, Need::Read)?;
+        let authority_path = if path.is_empty() { "." } else { path };
+        let r = self.route(authority_path, Need::Read)?;
         self.map_listing(path, &r, max)
     }
     fn read_bytes(&self, path: &str, max: usize) -> Result<Vec<u8>> {
@@ -754,11 +757,12 @@ impl walk::Backend for CapabilitySet {
         error_kind(error)
     }
     fn private_entry(&self, path: &str) -> Result<bool> {
-        let absolute = self.absolute_model(path)?;
+        let authority_path = if path.is_empty() { "." } else { path };
+        let absolute = self.absolute_model(authority_path)?;
         if self.private_absolute(&absolute)? {
             return Ok(true);
         }
-        let r = self.route(path, Need::Read)?;
+        let r = self.route(authority_path, Need::Read)?;
         Ok(!r.relative.is_empty() && r.grant.root.is_private_path(&r.relative)?)
     }
 }
@@ -779,7 +783,8 @@ fn root_entry_meta(root: &Root) -> Result<EntryMeta> {
 
 impl MetadataBackend for CapabilitySet {
     fn entry_meta(&self, path: &str) -> Result<EntryMeta> {
-        let r = self.route(path, Need::Read)?;
+        let authority_path = if path.is_empty() { "." } else { path };
+        let r = self.route(authority_path, Need::Read)?;
         if r.relative.is_empty() {
             return root_entry_meta(&r.grant.root);
         }

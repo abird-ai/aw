@@ -153,7 +153,7 @@ fn join_model(root: &str, suffix: &str) -> String {
         return root.to_owned();
     }
     match root {
-        "." => suffix.to_owned(),
+        "" | "." => suffix.to_owned(),
         "/" => format!("/{suffix}"),
         _ if root.ends_with(":/") => format!("{root}{suffix}"),
         _ => format!("{root}/{suffix}"),
@@ -676,7 +676,8 @@ impl walk::Backend for CapabilitySet {
     type Error = ScopedError;
 
     fn list(&self, path: &str, max: usize) -> Result<walk::Listing> {
-        let routed = self.route(path, Need::Read)?;
+        let authority_path = if path.is_empty() { "." } else { path };
+        let routed = self.route(authority_path, Need::Read)?;
         self.map_listing(path, &routed, max)
     }
 
@@ -690,11 +691,12 @@ impl walk::Backend for CapabilitySet {
     }
 
     fn private_entry(&self, path: &str) -> Result<bool> {
-        let absolute = self.absolute(path)?;
+        let authority_path = if path.is_empty() { "." } else { path };
+        let absolute = self.absolute(authority_path)?;
         if self.private_absolute(&absolute)? {
             return Ok(true);
         }
-        let routed = self.route(path, Need::Read)?;
+        let routed = self.route(authority_path, Need::Read)?;
         Ok(!routed.relative.is_empty() && routed.grant.root.is_private_path(&routed.relative)?)
     }
 }
@@ -719,7 +721,8 @@ fn root_entry_meta(root: &Root) -> Result<EntryMeta> {
 
 impl MetadataBackend for CapabilitySet {
     fn entry_meta(&self, path: &str) -> Result<EntryMeta> {
-        let routed = self.route(path, Need::Read)?;
+        let authority_path = if path.is_empty() { "." } else { path };
+        let routed = self.route(authority_path, Need::Read)?;
         if routed.relative.is_empty() {
             return root_entry_meta(&routed.grant.root);
         }
@@ -1341,6 +1344,34 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, operations::Error::Backend(_)));
         assert_eq!(fs::read(f.write.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn direct_model_base_requires_an_explicit_base_grant() {
+        use aw_tools::filesystem::{direct, request, schema};
+        use serde_json::json;
+
+        let f = Fixture::new();
+        fs::write(f.base.join("root.txt"), b"root\n").unwrap();
+        let request = || {
+            request::parse(
+                schema::Tool::Ls,
+                &json!({"path":".","limit":16}),
+                request::Limits::default(),
+            )
+            .unwrap()
+        };
+
+        let base = CapabilitySet::open(&f.base, [GrantSpec::read(&f.base)]).unwrap();
+        let output =
+            direct::execute(&base, request(), direct::Limits::default(), &|| false).unwrap();
+        let direct::Body::Text(text) = output.body else {
+            panic!("ls text")
+        };
+        assert!(text.contains("root.txt"), "{text}");
+
+        let child = CapabilitySet::open(&f.base, [GrantSpec::read(&f.read)]).unwrap();
+        assert!(direct::execute(&child, request(), direct::Limits::default(), &|| false).is_err());
     }
 
     #[test]

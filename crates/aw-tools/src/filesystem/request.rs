@@ -28,12 +28,17 @@ pub struct Limits {
     pub schema: SchemaCaps,
     /// Aggregate old+new UTF-8 bytes accepted by one canonical edit request.
     pub edit_text_bytes: usize,
+    /// Aggregate decoded binary payload bytes accepted by one bwrite/bedit
+    /// request. `SchemaCaps::binary_data_bytes` independently bounds each
+    /// encoded JSON string before decoding.
+    pub binary_decoded_bytes: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
             schema: SchemaCaps::default(),
             edit_text_bytes: SchemaCaps::default().text_write_bytes,
+            binary_decoded_bytes: SchemaCaps::default().binary_data_bytes,
         }
     }
 }
@@ -43,6 +48,11 @@ impl Limits {
         if self.edit_text_bytes == 0 || self.edit_text_bytes > MAX_MUTATION_PLAN_BYTES {
             return Err(Error::Invalid(
                 "edit text ceiling exceeds shared engine safety bounds",
+            ));
+        }
+        if self.binary_decoded_bytes == 0 || self.binary_decoded_bytes > MAX_MUTATION_PLAN_BYTES {
+            return Err(Error::Invalid(
+                "decoded binary payload ceiling exceeds shared engine safety bounds",
             ));
         }
         Ok(self)
@@ -631,6 +641,11 @@ fn parse_bwrite(value: &Value, limits: Limits) -> Result<Bwrite, Error> {
         ));
     }
     let data = wire.encoding.decode(&wire.data)?;
+    if data.len() > limits.binary_decoded_bytes {
+        return Err(Error::Invalid(
+            "decoded binary payload exceeds configured byte ceiling",
+        ));
+    }
     Ok(Bwrite {
         path: wire.path,
         data,
@@ -653,6 +668,7 @@ fn parse_bedit(value: &Value, limits: Limits) -> Result<Bedit, Error> {
         }
     }
     let mut edits = Vec::with_capacity(wire.edits.len());
+    let mut decoded_total = 0usize;
     for edit in wire.edits {
         if edit.data.len() > limits.schema.binary_data_bytes {
             return Err(Error::Invalid(
@@ -660,6 +676,14 @@ fn parse_bedit(value: &Value, limits: Limits) -> Result<Bedit, Error> {
             ));
         }
         let data = edit.encoding.decode(&edit.data)?;
+        decoded_total = decoded_total
+            .checked_add(data.len())
+            .ok_or(Error::Invalid("decoded binary payload byte count overflow"))?;
+        if decoded_total > limits.binary_decoded_bytes {
+            return Err(Error::Invalid(
+                "decoded binary edit payload exceeds configured byte ceiling",
+            ));
+        }
         edits.push(BinaryEdit {
             offset: edit.offset,
             length: edit.length,
@@ -835,6 +859,48 @@ mod tests {
             panic!("bedit request");
         };
         assert_eq!(edit.edits[0].data, [0xff]);
+    }
+
+    #[test]
+    fn decoded_binary_payload_has_independent_aggregate_ceiling() {
+        let limits = Limits {
+            schema: SchemaCaps {
+                binary_data_bytes: 32,
+                ..SchemaCaps::default()
+            },
+            binary_decoded_bytes: 4,
+            ..Limits::default()
+        };
+        assert!(parse(
+            Tool::Bwrite,
+            &json!({"path":"a.bin","data":"01020304","encoding":"hex"}),
+            limits,
+        )
+        .is_ok());
+        assert!(parse(
+            Tool::Bwrite,
+            &json!({"path":"a.bin","data":"0102030405","encoding":"hex"}),
+            limits,
+        )
+        .is_err());
+        assert!(parse(
+            Tool::Bedit,
+            &json!({"path":"a.bin","edits":[
+                {"offset":0,"length":0,"data":"0102","encoding":"hex"},
+                {"offset":0,"length":0,"data":"0304","encoding":"hex"}
+            ]}),
+            limits,
+        )
+        .is_ok());
+        assert!(parse(
+            Tool::Bedit,
+            &json!({"path":"a.bin","edits":[
+                {"offset":0,"length":0,"data":"0102","encoding":"hex"},
+                {"offset":0,"length":0,"data":"030405","encoding":"hex"}
+            ]}),
+            limits,
+        )
+        .is_err());
     }
 
     #[test]

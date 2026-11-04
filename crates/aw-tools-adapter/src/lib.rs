@@ -582,6 +582,7 @@ impl LocalToolLimits {
         aw_tools::filesystem::request::Limits {
             schema: self.schema,
             edit_text_bytes: self.edit_text_bytes,
+            binary_decoded_bytes: self.schema.binary_data_bytes,
         }
     }
 

@@ -390,6 +390,7 @@ pub fn validate_with_caps(caps: SchemaCaps) -> Result<(), String> {
     validate_with_limits(request::Limits {
         schema: caps,
         edit_text_bytes: caps.text_write_bytes,
+        binary_decoded_bytes: caps.binary_data_bytes,
     })
 }
 
@@ -429,6 +430,7 @@ mod tests {
         validate_with_limits(request::Limits {
             schema: caps,
             edit_text_bytes: 1,
+            binary_decoded_bytes: caps.binary_data_bytes,
         })
         .unwrap();
     }
