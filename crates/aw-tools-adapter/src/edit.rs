@@ -212,7 +212,7 @@ impl Tool for Edit {
                         }
                     ).collect::<Vec<_>>();
                     return match aw_tools::filesystem::operations::edit_text(
-                        root.as_ref(),&path,&ops,MAX_FILE_BYTES,
+                        root.as_ref(),&path,&ops,MAX_FILE_BYTES,MAX_FILE_BYTES,
                         &||ctx.cancellation.is_cancelled()
                     ){
                         Ok(outcome)=>Ok(ToolOutput::text(outcome.as_str())),

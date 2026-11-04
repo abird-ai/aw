@@ -514,6 +514,20 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
       same-name replacements, and Windows Stage/Backup/Tombstone names are all
       OS-random. Existing-parent Windows directory copy now uses the same
       reserve-before-create protocol; the current Windows cross-stack is green.
+- [x] Final dotlink-consumer review split canonical text mutation preimage-read
+      and replacement-write file ceilings so hosts with asymmetric read/write
+      profiles never have to collapse authority to one size bound. Identity-only
+      exact edits remain `unchanged` even when the readable source exceeds the
+      write ceiling because they publish nothing; grep keeps its independent
+      read-only scan ceiling. Dotlink's historical binary edit source/result size
+      intentionally follows its write ceiling, so no artificial binary split was
+      added. The shared JobManager crosswalk also covers dotlink's required replay,
+      file-spool, ACK/paging, Task, restart, cancellation/revocation and terminal
+      expiry primitives; transport-attempt/session cleanup stays host-adapter work,
+      not a second semantic manager. Validation: `aw-tools` 242/242, Unix backend,
+      AW adapter 188/188 with `AW_BASH`, strict Clippy, full workspace all-target
+      compile, no-default/stateless, `minimal`, no_std+alloc, rustfmt/diff and the
+      Windows GNU shared/backend/platform/Agent/adapter cross-stack are green.
 
 ### Shared convergence verification
 

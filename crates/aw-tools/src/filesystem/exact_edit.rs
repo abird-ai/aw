@@ -78,6 +78,12 @@ pub fn apply(
             });
         }
     }
+    // Pure identity edits publish nothing. A host may intentionally permit
+    // inspection of a larger existing file than it permits writing, so an
+    // unchanged request must not consume the write ceiling.
+    if spans.is_empty() {
+        return Ok(source.to_owned());
+    }
     // Selected spans are non-overlapping. Enforce the FINAL resulting
     // length, not an intermediate source-order length: an early expansion
     // may be offset by a later independent contraction.
@@ -212,7 +218,7 @@ mod tests {
                 new: "abc",
                 all: true,
             }],
-            6,
+            3,
         )
         .unwrap();
         assert_eq!(no_op, "abcabc");

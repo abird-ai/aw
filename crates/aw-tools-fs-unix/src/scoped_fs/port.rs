@@ -1687,6 +1687,7 @@ mod publication_tests {
             &root,
             "*** Begin Patch\n*** Add File: new/a.txt\n+a\n*** Add File: new/deep/b.txt\n+b\n*** End Patch\n",
             1024 * 1024,
+            1024 * 1024,
             &|| false,
         )
         .unwrap();
@@ -1704,6 +1705,7 @@ mod publication_tests {
         let result = aw_tools::filesystem::operations::patch_text(
             &root,
             "*** Begin Patch\n*** Add File: new/a.txt\n+a\n*** Update File: existing.txt\n@@\n-not present\n+changed\n*** End Patch\n",
+            1024 * 1024,
             1024 * 1024,
             &|| false,
         );

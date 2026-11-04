@@ -31,8 +31,10 @@ pub struct Limits {
     /// projection overhead. Hosts with a single text channel may choose a
     /// tighter value than `result_bytes`.
     pub read_data_bytes: usize,
-    /// Per-file UTF-8 preimage/result ceiling for edit/patch and grep files.
-    pub text_file_bytes: usize,
+    /// Per-file UTF-8 preimage ceiling for edit/patch updates.
+    pub text_read_bytes: usize,
+    /// Per-file UTF-8 replacement/add-file ceiling for edit/patch.
+    pub text_write_bytes: usize,
     /// Per-file raw byte ceiling for bwrite/bedit.
     pub binary_file_bytes: usize,
     /// Omitted bread limit. Encoded windows are additionally capped by the
@@ -48,7 +50,8 @@ impl Default for Limits {
             request: request::Limits::default(),
             result_bytes: 96 * 1024,
             read_data_bytes: 96 * 1024 - 256,
-            text_file_bytes: 1024 * 1024,
+            text_read_bytes: 1024 * 1024,
+            text_write_bytes: 1024 * 1024,
             binary_file_bytes: MAX_READ_WINDOW_BYTES,
             binary_default_window: 24 * 1024,
             grep: GrepLimits::default(),
@@ -62,8 +65,10 @@ impl Limits {
             .map_err(|error| Error::Invalid(error.to_string()))?;
         if !(512..=MAX_RENDER_BYTES).contains(&self.result_bytes)
             || !(176..=self.result_bytes).contains(&self.read_data_bytes)
-            || self.text_file_bytes == 0
-            || self.text_file_bytes > MAX_MUTATION_PLAN_BYTES
+            || self.text_read_bytes == 0
+            || self.text_read_bytes > MAX_MUTATION_PLAN_BYTES
+            || self.text_write_bytes == 0
+            || self.text_write_bytes > MAX_MUTATION_PLAN_BYTES
             || self.binary_file_bytes == 0
             || self.binary_file_bytes > MAX_READ_WINDOW_BYTES
             || self.binary_default_window == 0
@@ -530,7 +535,7 @@ where
                     offset: args.offset,
                     limit: args.limit,
                     limits: GrepLimits {
-                        text_file_bytes: limits.text_file_bytes.min(limits.grep.text_file_bytes),
+                        text_file_bytes: limits.grep.text_file_bytes,
                         output_bytes: limits.result_bytes,
                         ..limits.grep
                     },
@@ -604,14 +609,16 @@ where
                 backend,
                 &path,
                 &replacements,
-                limits.text_file_bytes,
+                limits.text_read_bytes,
+                limits.text_write_bytes,
                 cancelled,
             ))
         }
         RequestKind::Patch(args) => operation_result(operations::patch_text(
             backend,
             &args.patch,
-            limits.text_file_bytes,
+            limits.text_read_bytes,
+            limits.text_write_bytes,
             cancelled,
         )),
         RequestKind::Copy(args) => operation_result(operations::copy_path(
@@ -734,6 +741,16 @@ mod tests {
     #[test]
     fn direct_limits_are_narrow_only_against_engine_bounds() {
         assert!(Limits::default().validate().is_ok());
+        let independent = Limits {
+            text_read_bytes: 64 * 1024,
+            text_write_bytes: 4 * 1024,
+            grep: GrepLimits {
+                text_file_bytes: 2 * 1024 * 1024,
+                ..GrepLimits::default()
+            },
+            ..Limits::default()
+        };
+        assert!(independent.validate().is_ok());
         assert!(Limits {
             result_bytes: MAX_RENDER_BYTES + 1,
             ..Limits::default()

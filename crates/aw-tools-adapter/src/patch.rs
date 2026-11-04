@@ -84,9 +84,13 @@ impl Tool for Patch {
                 let answer =
                     aw_tools::asynchronous::run_blocking(move || -> agent::Result<ToolOutput> {
                         use aw_tools::filesystem::operations::{self, Error as OperationError};
-                        match operations::patch_text(root.as_ref(), &patch, MAX_FILE_BYTES, &|| {
-                            ctx.cancellation.is_cancelled()
-                        }) {
+                        match operations::patch_text(
+                            root.as_ref(),
+                            &patch,
+                            MAX_FILE_BYTES,
+                            MAX_FILE_BYTES,
+                            &|| ctx.cancellation.is_cancelled(),
+                        ) {
                             Ok(primary) => Ok(ToolOutput::text(primary.as_str())),
                             Err(OperationError::Patch(message)) => Ok(ToolOutput::error(message)),
                             Err(error) => Err(crate::file_operation_error(error)),

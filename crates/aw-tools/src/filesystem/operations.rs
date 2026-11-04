@@ -118,7 +118,8 @@ pub fn edit_text<B: SecuredFilesystem>(
     backend: &B,
     path: &str,
     edits: &[Replacement<'_>],
-    max_file: usize,
+    max_read: usize,
+    max_write: usize,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Primary, Error<B::Error>> {
     admitted(path)?;
@@ -138,9 +139,9 @@ pub fn edit_text<B: SecuredFilesystem>(
     if cancel() {
         return Err(Error::Cancelled);
     }
-    let original = backend.read_bytes(path, max_file).map_err(Error::Backend)?;
+    let original = backend.read_bytes(path, max_read).map_err(Error::Backend)?;
     let source = crate::text::text_bytes(&original).ok_or(Error::InvalidText)?;
-    let replacement = exact_edit::apply(source, edits, max_file).map_err(Error::Edit)?;
+    let replacement = exact_edit::apply(source, edits, max_write).map_err(Error::Edit)?;
     if replacement.as_bytes() == original {
         return Ok(Primary::Unchanged);
     }
@@ -262,7 +263,8 @@ pub fn edit_binary<B: SecuredFilesystem>(
 pub fn patch_text<B: SecuredFilesystem + ExplicitPathBackend>(
     backend: &B,
     patch: &str,
-    max_file: usize,
+    max_read: usize,
+    max_write: usize,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Primary, Error<B::Error>> {
     use crate::{
@@ -355,7 +357,7 @@ pub fn patch_text<B: SecuredFilesystem + ExplicitPathBackend>(
         match op {
             PatchOp::Update { hunks, .. } => {
                 let cap = work
-                    .copy_read_limit(max_file)
+                    .copy_read_limit(max_read)
                     .map_err(|error| Error::Patch(error.to_string()))?;
                 let original = backend.read_bytes(&path, cap).map_err(Error::Backend)?;
                 let text = crate::text::text_bytes(&original).ok_or_else(|| {
@@ -364,7 +366,7 @@ pub fn patch_text<B: SecuredFilesystem + ExplicitPathBackend>(
                 let (replacement, _, _) =
                     apply_patch_hunks(text, &hunks, &path, first_hunk, total_hunks)
                         .map_err(|error| Error::Patch(error.to_string()))?;
-                if replacement.len() > max_file {
+                if replacement.len() > max_write {
                     return Err(Error::TooLarge);
                 }
                 if crate::text::has_binary_control(replacement.as_bytes()) {
@@ -381,7 +383,7 @@ pub fn patch_text<B: SecuredFilesystem + ExplicitPathBackend>(
             }
             PatchOp::Add { lines, .. } => {
                 let replacement = crate::patch::add_file_bytes(&lines);
-                if replacement.len() > max_file {
+                if replacement.len() > max_write {
                     return Err(Error::TooLarge);
                 }
                 if crate::text::has_binary_control(&replacement) {
@@ -979,6 +981,7 @@ mod tests {
                     all: false
                 }],
                 1024,
+                1024,
                 &|| false
             ),
             Ok(Primary::Unchanged)
@@ -991,6 +994,63 @@ mod tests {
             "only edit may read its original snapshot"
         );
     }
+    #[test]
+    fn text_mutation_read_and_write_ceilings_are_independent() {
+        let shared = Arc::new(Mutex::new(State {
+            bytes: Some(b"abcdefghij".to_vec()),
+            ..Default::default()
+        }));
+        let fs = Memory(shared.clone());
+        assert!(matches!(
+            edit_text(
+                &fs,
+                "f.txt",
+                &[Replacement {
+                    old: "abcdefghij",
+                    new: "abcdefghij",
+                    all: false,
+                }],
+                16,
+                4,
+                &|| false,
+            ),
+            Ok(Primary::Unchanged)
+        ));
+        assert_eq!(shared.lock().unwrap().commits, 0);
+        assert!(matches!(
+            edit_text(
+                &fs,
+                "f.txt",
+                &[Replacement {
+                    old: "ij",
+                    new: "IJ",
+                    all: false,
+                }],
+                16,
+                4,
+                &|| false,
+            ),
+            Err(Error::Edit(exact_edit::EditError::OutputLimit))
+        ));
+        assert_eq!(
+            shared.lock().unwrap().bytes.as_deref(),
+            Some(b"abcdefghij".as_slice())
+        );
+
+        shared.lock().unwrap().bytes = Some(b"abcdefghij\n".to_vec());
+        let result = patch_text(
+            &fs,
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n-abcdefghij\n+ABCDEFGHIJ\n*** End Patch\n",
+            32,
+            4,
+            &|| false,
+        );
+        assert!(matches!(result, Err(Error::TooLarge)));
+        let state = shared.lock().unwrap();
+        assert_eq!(state.bytes.as_deref(), Some(b"abcdefghij\n".as_slice()));
+        assert_eq!(state.commits, 0);
+    }
+
     #[test]
     fn canonical_text_and_binary_writes_never_read_existing_contents() {
         let state = Arc::new(Mutex::new(State {
@@ -1037,6 +1097,7 @@ mod tests {
                 new: "bye",
                 all: false,
             }],
+            4096,
             4096,
             &|| false,
         );
@@ -1093,6 +1154,7 @@ mod tests {
                     all: false
                 }],
                 1024,
+                1024,
                 &|| false
             ),
             Err(Error::Edit(exact_edit::EditError::Missing(1)))
@@ -1107,6 +1169,7 @@ mod tests {
                     new: "z",
                     all: false
                 }],
+                1024,
                 1024,
                 &|| false
             ),
@@ -1218,6 +1281,7 @@ mod tests {
         let result = patch_text(
             &fs,
             "*** Begin Patch\n*** Add File: a.txt\n+a\n*** Add File: b.txt\n+b\n*** End Patch\n",
+            1024,
             1024,
             &|| false,
         );
