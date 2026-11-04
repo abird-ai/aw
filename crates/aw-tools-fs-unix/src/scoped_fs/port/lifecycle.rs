@@ -125,13 +125,6 @@ pub(super) fn cleanup_stage_tree(parent: &File, temp: &str, expected: Option<(u6
     };
     let _ = remove_tree(&private, temp, true, &|| false);
 }
-fn unique_lifecycle_name() -> String {
-    format!(
-        ".aw-trash-{}-{:016x}.tmp",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
 fn list_checked(root: &Root, path: &str) -> Result<Vec<super::super::Entry>> {
     let listing = root.list_with_limit(path, 4096)?;
     if listing.incomplete {
@@ -171,7 +164,7 @@ fn preflight_tree(
                 .map_err(lifecycle_error)?;
         }
         libc::S_IFLNK => {}
-        _ => return Err(ScopedError::Denied("unsupported file type or hardlink")),
+        _ => return Err(ScopedError::Denied("unsupported file type")),
     }
     Ok(())
 }
@@ -519,30 +512,57 @@ pub(in crate::scoped_fs) fn copy_between(
             let _ = target_parent.sync_all();
         }
         libc::S_IFDIR => {
-            let temp = unique_lifecycle_name();
-            let name = cstring(&temp)?;
-            if unsafe { libc::mkdirat(target_parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            let dir = at(&target_parent, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            let meta = dir.metadata()?;
-            let identity = (meta.dev(), meta.ino());
-            let artifact = match destination_root.reserve_private_artifact(
+            let temp = super::private_stage_name()?;
+            let mut reservation = destination_root.reserve_private_name(
                 &target_parent,
                 super::parent_model_path(to).to_owned(),
                 &temp,
-                aw_tools::filesystem::private_artifact::ObjectIdentity {
-                    volume: identity.0,
-                    object: identity.1,
-                },
-                aw_tools::filesystem::private_artifact::Kind::Stage,
-            ) {
-                Ok(artifact) => artifact,
+            )?;
+            let name = cstring(&temp)?;
+            if unsafe { libc::mkdirat(target_parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let error = io::Error::last_os_error();
+                let _ = reservation.retire();
+                return Err(error.into());
+            }
+            let dir = match at(&target_parent, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(dir) => dir,
                 Err(error) => {
-                    cleanup_stage_tree(&target_parent, &temp, Some(identity));
+                    remove_empty_stage(&target_parent, &temp);
+                    if super::stat_leaf_missing(&target_parent, &temp) {
+                        let _ = reservation.retire();
+                    }
                     return Err(error);
                 }
             };
+            let meta = match dir.metadata() {
+                Ok(meta) => meta,
+                Err(error) => {
+                    drop(dir);
+                    remove_empty_stage(&target_parent, &temp);
+                    if super::stat_leaf_missing(&target_parent, &temp) {
+                        let _ = reservation.retire();
+                    }
+                    return Err(error.into());
+                }
+            };
+            let identity = (meta.dev(), meta.ino());
+            let artifact =
+                match reservation.finalize(aw_tools::filesystem::private_artifact::ObjectIdentity {
+                    volume: identity.0,
+                    object: identity.1,
+                }) {
+                    Ok(artifact) => artifact,
+                    Err(_) => {
+                        drop(dir);
+                        cleanup_stage_tree(&target_parent, &temp, Some(identity));
+                        if super::stat_leaf_missing(&target_parent, &temp) {
+                            let _ = reservation.retire();
+                        }
+                        return Err(ScopedError::Denied(
+                            "cannot durably finalize private mutation artifact",
+                        ));
+                    }
+                };
             let stage = (|| -> Result<()> {
                 let mut stage_budget = life::WorkBudget::default();
                 copy_dir_tree(source_root, from, &dir, cancel, 0, &mut stage_budget)?;
@@ -719,7 +739,13 @@ pub(in crate::scoped_fs) fn remove_between(
                 "remove target changed after lifecycle preflight",
             ));
         }
-        let private = unique_lifecycle_name();
+        let private = match super::private_tombstone_name() {
+            Ok(name) => name,
+            Err(error) => {
+                retire_unpublished_removals(&mut prepared);
+                return Err(error);
+            }
+        };
         let artifact = match root.reserve_private_artifact(
             &parent,
             super::parent_model_path(original).to_owned(),
@@ -835,39 +861,48 @@ impl Root {
         leaf: String,
         cancel: &dyn Fn() -> bool,
     ) -> Result<()> {
-        let temp = format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let ctemp = cstring(&temp)?;
-        if unsafe { libc::mkdirat(existing.as_raw_fd(), ctemp.as_ptr(), 0o700) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let identity = (|| -> Result<(u64, u64)> {
-            let pinned = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            let meta = pinned.metadata()?;
-            Ok((meta.dev(), meta.ino()))
-        })()
-        .inspect_err(|_| {
-            remove_empty_stage(&existing, &temp);
-        })?;
-        let artifact = match self.reserve_private_artifact(
+        let temp = super::private_stage_name()?;
+        let mut reservation = self.reserve_private_name(
             &existing,
             super::existing_parent_model_path(destination, missing.len()),
             &temp,
-            aw_tools::filesystem::private_artifact::ObjectIdentity {
-                volume: identity.0,
-                object: identity.1,
-            },
-            aw_tools::filesystem::private_artifact::Kind::Stage,
-        ) {
-            Ok(artifact) => artifact,
+        )?;
+        let ctemp = cstring(&temp)?;
+        if unsafe { libc::mkdirat(existing.as_raw_fd(), ctemp.as_ptr(), 0o700) } != 0 {
+            let error = io::Error::last_os_error();
+            let _ = reservation.retire();
+            return Err(error.into());
+        }
+        let identity = match (|| -> Result<(u64, u64)> {
+            let pinned = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let meta = pinned.metadata()?;
+            Ok((meta.dev(), meta.ino()))
+        })() {
+            Ok(identity) => identity,
             Err(error) => {
-                cleanup_stage_tree(&existing, &temp, Some(identity));
+                remove_empty_stage(&existing, &temp);
+                if stat_leaf_missing(&existing, &temp) {
+                    let _ = reservation.retire();
+                }
                 return Err(error);
             }
         };
+        let artifact =
+            match reservation.finalize(aw_tools::filesystem::private_artifact::ObjectIdentity {
+                volume: identity.0,
+                object: identity.1,
+            }) {
+                Ok(artifact) => artifact,
+                Err(_) => {
+                    cleanup_stage_tree(&existing, &temp, Some(identity));
+                    if stat_leaf_missing(&existing, &temp) {
+                        let _ = reservation.retire();
+                    }
+                    return Err(ScopedError::Denied(
+                        "cannot durably finalize private mutation artifact",
+                    ));
+                }
+            };
         let result = (|| -> Result<()> {
             let mut parent = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
             let mut pinned = vec![parent.try_clone()?];

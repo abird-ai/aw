@@ -105,6 +105,7 @@ pub struct AgentBuilder {
     tool_policy: ToolPolicy,
     binding_authority: crate::tool::ToolBindingAuthority,
     scope_lifecycles: Vec<Arc<dyn crate::InvocationScopeLifecycle>>,
+    tool_policy_lifecycles: Vec<Arc<dyn crate::ToolPolicyLifecycle>>,
     revision_policy: Option<Arc<dyn crate::tool::ToolRevisionPolicy>>,
     account: Option<(AccountDescriptor, PrincipalId, String)>,
     delegated_default: bool,
@@ -145,6 +146,12 @@ impl AgentBuilder {
     /// replacement at `load_history`.
     pub fn scope_lifecycle(mut self, lifecycle: Arc<dyn crate::InvocationScopeLifecycle>) -> Self {
         self.scope_lifecycles.push(lifecycle);
+        self
+    }
+    /// Register a host-owned listener for bounded tool resource-policy changes.
+    /// This is independent of Session scope replacement and cannot add grants.
+    pub fn tool_policy_lifecycle(mut self, lifecycle: Arc<dyn crate::ToolPolicyLifecycle>) -> Self {
+        self.tool_policy_lifecycles.push(lifecycle);
         self
     }
     /// Explicit trusted host authorization, never inferred from an external
@@ -242,6 +249,7 @@ impl AgentBuilder {
             tool_policy: self.tool_policy,
             binding_authority,
             scope_lifecycles: self.scope_lifecycles,
+            tool_policy_lifecycles: self.tool_policy_lifecycles,
             revision_policy: self.revision_policy,
             default_pool: pool,
             default_account: descriptor,
@@ -273,6 +281,7 @@ pub struct Agent {
     tool_policy: ToolPolicy,
     binding_authority: crate::tool::ToolBindingAuthority,
     scope_lifecycles: Vec<Arc<dyn crate::InvocationScopeLifecycle>>,
+    tool_policy_lifecycles: Vec<Arc<dyn crate::ToolPolicyLifecycle>>,
     revision_policy: Option<Arc<dyn crate::tool::ToolRevisionPolicy>>,
     default_pool: ProviderAccounts,
     default_account: AccountDescriptor,
@@ -296,6 +305,7 @@ impl Agent {
             tool_policy: ToolPolicy::default(),
             binding_authority: crate::tool::ToolBindingAuthority::default(),
             scope_lifecycles: Vec::new(),
+            tool_policy_lifecycles: Vec::new(),
             revision_policy: None,
             account: None,
             delegated_default: false,
@@ -319,6 +329,7 @@ impl Agent {
             tool_policy: ToolPolicy::default(),
             binding_authority: crate::tool::ToolBindingAuthority::default(),
             scope_lifecycles: Vec::new(),
+            tool_policy_lifecycles: Vec::new(),
             revision_policy: None,
             account: None,
             delegated_default: false,
@@ -359,12 +370,12 @@ impl Agent {
         let mut next = self.tool_policy.parallelism();
         next.max_parallel_reads = value;
         let next = next.validate()?;
-        for lifecycle in &self.scope_lifecycles {
-            lifecycle.validate_tool_parallelism(next)?;
+        for lifecycle in &self.tool_policy_lifecycles {
+            lifecycle.validate_parallelism(next)?;
         }
         self.tool_policy.set_parallelism(next);
-        for lifecycle in &self.scope_lifecycles {
-            lifecycle.apply_tool_parallelism(next);
+        for lifecycle in &self.tool_policy_lifecycles {
+            lifecycle.apply_parallelism(next);
         }
         Ok(())
     }
@@ -376,12 +387,12 @@ impl Agent {
         next.allow_parallel_shell = enabled;
         next.max_parallel_shell = limit;
         let next = next.validate()?;
-        for lifecycle in &self.scope_lifecycles {
-            lifecycle.validate_tool_parallelism(next)?;
+        for lifecycle in &self.tool_policy_lifecycles {
+            lifecycle.validate_parallelism(next)?;
         }
         self.tool_policy.set_parallelism(next);
-        for lifecycle in &self.scope_lifecycles {
-            lifecycle.apply_tool_parallelism(next);
+        for lifecycle in &self.tool_policy_lifecycles {
+            lifecycle.apply_parallelism(next);
         }
         Ok(())
     }
@@ -2605,20 +2616,13 @@ mod output_projection_tests {
         validations: std::sync::atomic::AtomicUsize,
         applies: std::sync::atomic::AtomicUsize,
     }
-    impl InvocationScopeLifecycle for RejectParallelism {
-        fn replace_scope(
-            &self,
-            _: Option<&InvocationScope>,
-            _: Option<&InvocationScope>,
-        ) -> Result<()> {
-            Ok(())
-        }
-        fn validate_tool_parallelism(&self, _: ToolParallelism) -> Result<()> {
+    impl ToolPolicyLifecycle for RejectParallelism {
+        fn validate_parallelism(&self, _: ToolParallelism) -> Result<()> {
             self.validations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(Error::Conflict("fixture rejects parallel policy"))
         }
-        fn apply_tool_parallelism(&self, _: ToolParallelism) {
+        fn apply_parallelism(&self, _: ToolParallelism) {
             self.applies
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -2680,7 +2684,7 @@ mod output_projection_tests {
             std::sync::Arc::new(ParallelPolicyProvider),
             AgentOptions::new("fixture", "model"),
         )
-        .scope_lifecycle(lifecycle.clone())
+        .tool_policy_lifecycle(lifecycle.clone())
         .build()
         .unwrap();
         let before = agent.tool_policy.parallelism();

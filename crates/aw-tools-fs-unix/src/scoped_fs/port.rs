@@ -3,6 +3,7 @@
 use super::{at, cstring, validate_path, Result, Root, ScopedError};
 use aw_tools::filesystem::private_artifact::{
     Kind as ArtifactKind, Lease as ArtifactLease, ObjectIdentity, Record,
+    Reservation as ArtifactReservation,
 };
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -15,7 +16,44 @@ use std::{
 };
 
 const MAX_BATCH_FILE: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn private_artifact_name(kind: &str) -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| ScopedError::Denied("OS randomness unavailable for private artifact name"))?;
+    let suffix = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(".aw-{kind}-{suffix}.tmp"))
+}
+
+pub(super) fn private_stage_name() -> Result<String> {
+    private_artifact_name("stage")
+}
+
+pub(super) fn private_tombstone_name() -> Result<String> {
+    private_artifact_name("trash")
+}
+
+fn provisional_stage_shape(stat: &libc::stat) -> bool {
+    // A provisional record exists only between private namespace creation and
+    // identity finalization. At that point AW has created an owner-only 0600
+    // regular file or 0700 directory and has not yet copied user metadata or
+    // payload. Treat any other same-name object as a replacement, never as ours.
+    // SAFETY: geteuid has no arguments.
+    let owner = unsafe { libc::geteuid() };
+    if stat.st_uid != owner || stat.st_mode & 0o077 != 0 || stat.st_mode & 0o7000 != 0 {
+        return false;
+    }
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => stat.st_nlink == 1,
+        libc::S_IFDIR => true,
+        _ => false,
+    }
+}
 
 fn regular(file: &File) -> Result<u64> {
     let meta = file.metadata()?;
@@ -89,9 +127,21 @@ impl Root {
                 parent_path,
                 parent,
                 name: name.to_owned(),
-                object,
+                object: Some(object),
             })
             .map_err(|_| ScopedError::Denied("cannot durably reserve private mutation artifact"))
+    }
+
+    fn reserve_private_name(
+        &self,
+        parent: &File,
+        parent_path: String,
+        name: &str,
+    ) -> Result<ArtifactReservation> {
+        let parent = Self::artifact_identity(&parent.metadata()?);
+        self.private
+            .reserve_name(ArtifactKind::Stage, parent_path, parent, name.to_owned())
+            .map_err(|_| ScopedError::Denied("cannot durably reserve private mutation name"))
     }
 }
 
@@ -307,7 +357,21 @@ impl Root {
                 volume: stat.st_dev as u64,
                 object: stat.st_ino as u64,
             };
-            if object != record.object {
+            if let Some(expected) = record.object {
+                if object != expected {
+                    self.private
+                        .retire_record(&record)
+                        .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                    continue;
+                }
+            } else if record.kind != ArtifactKind::Stage {
+                return Err(ScopedError::Denied(
+                    "only private Stage names may be provisionally reserved",
+                ));
+            } else if !provisional_stage_shape(&stat) {
+                // Without a finalized object identity, recovery may only clean
+                // the exact restrictive pre-finalization shape AW itself creates.
+                // A same-name ordinary replacement is user data and remains.
                 self.private
                     .retire_record(&record)
                     .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
@@ -813,37 +877,48 @@ impl Root {
         cancel: &dyn Fn() -> bool,
         writer: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<StagedWrite> {
-        let temp = format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let cname = cstring(&temp)?;
-        if unsafe { libc::mkdirat(existing.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let identity = (|| -> Result<(u64, u64)> {
-            let stage = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            let meta = stage.metadata()?;
-            Ok((meta.dev(), meta.ino()))
-        })()
-        .inspect_err(|_| {
-            lifecycle::remove_empty_stage(&existing, &temp);
-        })?;
-        let artifact = match self.reserve_private_artifact(
+        let temp = private_stage_name()?;
+        let mut reservation = self.reserve_private_name(
             &existing,
             existing_parent_model_path(path, missing.len()),
             &temp,
-            ObjectIdentity {
-                volume: identity.0,
-                object: identity.1,
-            },
-            ArtifactKind::Stage,
-        ) {
+        )?;
+        let cname = cstring(&temp)?;
+        if unsafe { libc::mkdirat(existing.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
+            let error = io::Error::last_os_error();
+            let _ = reservation.retire();
+            return Err(error.into());
+        }
+        let identity = match (|| -> Result<(u64, u64)> {
+            let stage = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let meta = stage.metadata()?;
+            Ok((meta.dev(), meta.ino()))
+        })() {
+            Ok(identity) => identity,
+            Err(error) => {
+                lifecycle::remove_empty_stage(&existing, &temp);
+                if stat_leaf_missing(&existing, &temp) {
+                    let _ = reservation.retire();
+                }
+                return Err(error);
+            }
+        };
+        let artifact = match reservation.finalize(ObjectIdentity {
+            volume: identity.0,
+            object: identity.1,
+        }) {
             Ok(artifact) => artifact,
             Err(error) => {
                 lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
-                return Err(error);
+                if stat_leaf_missing(&existing, &temp) {
+                    let _ = reservation.retire();
+                }
+                return Err(ScopedError::Denied(match error {
+                    aw_tools::filesystem::private_artifact::Error::Capacity => {
+                        "private mutation artifact capacity exhausted"
+                    }
+                    _ => "cannot durably finalize private mutation artifact",
+                }));
             }
         };
         let result = (|| -> Result<()> {
@@ -907,37 +982,41 @@ impl Root {
         entries: Vec<(Vec<String>, String, &[u8])>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<StagedWrite> {
-        let temp = format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
+        let temp = private_stage_name()?;
+        let mut reservation = self.reserve_private_name(&existing, existing_model, &temp)?;
         let cname = cstring(&temp)?;
         if unsafe { libc::mkdirat(existing.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
-            return Err(io::Error::last_os_error().into());
+            let error = io::Error::last_os_error();
+            let _ = reservation.retire();
+            return Err(error.into());
         }
-        let identity = (|| -> Result<(u64, u64)> {
+        let identity = match (|| -> Result<(u64, u64)> {
             let stage = at(&existing, &temp, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
             let meta = stage.metadata()?;
             Ok((meta.dev(), meta.ino()))
-        })()
-        .inspect_err(|_| {
-            lifecycle::remove_empty_stage(&existing, &temp);
-        })?;
-        let artifact = match self.reserve_private_artifact(
-            &existing,
-            existing_model,
-            &temp,
-            ObjectIdentity {
-                volume: identity.0,
-                object: identity.1,
-            },
-            ArtifactKind::Stage,
-        ) {
-            Ok(artifact) => artifact,
+        })() {
+            Ok(identity) => identity,
             Err(error) => {
-                lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
+                lifecycle::remove_empty_stage(&existing, &temp);
+                if stat_leaf_missing(&existing, &temp) {
+                    let _ = reservation.retire();
+                }
                 return Err(error);
+            }
+        };
+        let artifact = match reservation.finalize(ObjectIdentity {
+            volume: identity.0,
+            object: identity.1,
+        }) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                lifecycle::cleanup_stage_tree(&existing, &temp, Some(identity));
+                if stat_leaf_missing(&existing, &temp) {
+                    let _ = reservation.retire();
+                }
+                return Err(ScopedError::Denied(
+                    "cannot durably finalize private mutation artifact",
+                ));
             }
         };
         let result = (|| -> Result<()> {
@@ -1194,34 +1273,47 @@ impl Root {
                 _ => {}
             }
         }
-        let name = format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
+        let name = private_stage_name()?;
+        let mut reservation =
+            self.reserve_private_name(&parent, parent_model_path(path).to_owned(), &name)?;
         // Stage privately: source metadata is restored only after all bytes.
-        let mut out = at(
+        let mut out = match at(
             &parent,
             &name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
-        )?;
-        let stage_meta = out.metadata()?;
-        let artifact = match self.reserve_private_artifact(
-            &parent,
-            parent_model_path(path).to_owned(),
-            &name,
-            ObjectIdentity {
-                volume: stage_meta.dev(),
-                object: stage_meta.ino(),
-            },
-            ArtifactKind::Stage,
         ) {
-            Ok(artifact) => artifact,
+            Ok(file) => file,
+            Err(error) => {
+                let _ = reservation.retire();
+                return Err(error);
+            }
+        };
+        let stage_meta = match out.metadata() {
+            Ok(metadata) => metadata,
             Err(error) => {
                 drop(out);
                 unlink(&parent, &name);
-                return Err(error);
+                if stat_leaf_missing(&parent, &name) {
+                    let _ = reservation.retire();
+                }
+                return Err(error.into());
+            }
+        };
+        let artifact = match reservation.finalize(ObjectIdentity {
+            volume: stage_meta.dev(),
+            object: stage_meta.ino(),
+        }) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                drop(out);
+                unlink(&parent, &name);
+                if stat_leaf_missing(&parent, &name) {
+                    let _ = reservation.retire();
+                }
+                return Err(ScopedError::Denied(
+                    "cannot durably finalize private mutation artifact",
+                ));
             }
         };
         let written = (|| -> Result<()> {

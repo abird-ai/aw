@@ -10,6 +10,7 @@ description = "Reusable handle-pinned Windows filesystem backend for aw-tools"
 [dependencies]
 aw-tools = { path = "../aw-tools", version = "=0.15.0", default-features = false, features = ["rw"] }
 sha2 = "0.10.9"
+getrandom = "0.3.4"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation", "Win32_Globalization", "Win32_Security",
   "Win32_Security_Authorization", "Win32_System_Memory",

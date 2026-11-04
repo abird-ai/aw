@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    ffi::{OsStr, OsString},
+    ffi::{CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::{
@@ -243,6 +243,64 @@ pub fn sync_parent(path: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
     File::open(parent)?.sync_all()
+}
+
+/// Atomically move one already-created private file to a new name without ever
+/// replacing an existing destination. Both paths must name entries in the same
+/// filesystem; callers own file and parent durability barriers around this step.
+pub fn publish_private_new(from: &Path, to: &Path) -> io::Result<()> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: both C strings are NUL-terminated, AT_FDCWD selects the
+        // supplied absolute/relative pathnames, and RENAME_NOREPLACE prevents
+        // replacement of any pre-existing destination entry.
+        let status = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if status == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic no-replace rename unavailable on this filesystem",
+            ));
+        }
+        Err(error)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: both C strings are NUL-terminated and RENAME_EXCL requests
+        // no-replace publication in the same filesystem namespace.
+        let status = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if status == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace private publication unavailable on this Unix target",
+        ))
+    }
 }
 
 /// Open/create a stable advisory-lock file for non-secret user metadata.

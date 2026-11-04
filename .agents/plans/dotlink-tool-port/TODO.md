@@ -445,7 +445,7 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
 - [x] A5 shared JobManager owns raw-byte output paging/ACK/owners, exact pre-effect result reservation, replay claims, cancellation/revocation, Task projection, live-session restart and paged job listing.
 - [x] A6 bind JobManager to original AW authority without a second journal/database/executor. One live `JobRuntime` owns mixed native + ShellNode Graph execution; exact outer call/source/effect identity, per-grant live `ToolBindingAuthority` generations, Session/branch lifecycle rebinding, deterministic conflict scheduling, claim-before-effect, terminal-before-dependent, explicit cancellation/revocation, current-authority restart, interpreter object identity, post-spawn unknown fencing, and process stop proof all reuse AW's existing authority + `PipeProcess` custody. Internal Graph state is intentionally live-session-only: the outer AW `ToolStarted/ToolFinished` journal is the durable replay fence, so process loss leaves the invocation uncertain rather than reconstructing/replaying a persistent Graph database.
 - [x] A6 enable the canonical model-facing runtime surface: `batch`, `job_start`, `job_list`, `job_get`, `job_output`, `job_ack`, `job_cancel`, `job_restart`, plus direct `bash`/`pwsh`/`powershell` through the same one-ShellNode Job path. Oversized/abandoned optimistic calls hand off the same Job; explicit cancellation records Job cancellation first. Native exact results and ShellNode streams use bounded JobManager-owned retention with raw-byte paging/ACK; fixed process terminal metadata survives result-payload ACK.
-- [x] A7 produce one reviewed pinned shared-crate revision and reusable conformance fixture for dotlink. Exact external-consumer pin: `3cb3cea` (semantic convergence `75f6f00`; ShellNode spool correction `c0d8ee3`). `aw-tools`/secured backends have no AW Agent/adapter normal dependency; opt-in host-neutral `conformance` vectors cover canonical schemas/requests/Graph/status semantics; matching Unix/Windows `CapabilitySet` APIs cover multiple pinned read/write grants, absolute/base-relative model paths, write-only destinations, cross-root lifecycle, final-symlink target identity, lexical/resolved exclusions, durable host-owned private-artifact registries/reconciliation, and exact grant-object identities. An isolated standalone consumer executes generic shared cross-root operations with no AW Agent types, and a disposable exact-Git-revision consumer resolves `aw-tools` + `aw-tools-fs-unix` from `656ce69` and executes the v1 conformance fixture. Windows grant selection is exact/case-sensitive while namespace safety remains invariant-folded. The final review also fixed ShellNode maximum-Graph spool admission to reserve terminal result plus both retained streams, including empty-selection trusted mode. UNC/network-share model paths use canonical `//server/share/...` spellings in the shared grammar/router; native Windows execution CI remains a separate release verification item.
+- [x] A7 produce one reviewed pinned shared-crate revision and reusable conformance fixture for dotlink. Earlier external-consumer pin: `3cb3cea` (semantic convergence `75f6f00`; ShellNode spool correction `c0d8ee3`). Later shared direct-execution, runtime-admission and private-record durability hardening supersede that candidate locally; dotlink must pin the final reviewed AW revision after it is reachable from the remote, never a sibling path. `aw-tools`/secured backends have no AW Agent/adapter normal dependency; opt-in host-neutral `conformance` vectors cover canonical schemas/requests/Graph/status semantics; matching Unix/Windows `CapabilitySet` APIs cover multiple pinned read/write grants, absolute/base-relative model paths, write-only destinations, cross-root lifecycle, final-symlink target identity, lexical/resolved exclusions, durable host-owned private-artifact registries/reconciliation, and exact grant-object identities. An isolated standalone consumer executes generic shared cross-root operations with no AW Agent types, and a disposable exact-Git-revision consumer resolves `aw-tools` + `aw-tools-fs-unix` from `656ce69` and executes the v1 conformance fixture. Windows grant selection is exact/case-sensitive while namespace safety remains invariant-folded. The final review also fixed ShellNode maximum-Graph spool admission to reserve terminal result plus both retained streams, including empty-selection trusted mode. UNC/network-share model paths use canonical `//server/share/...` spellings in the shared grammar/router; native Windows execution CI remains a separate release verification item.
 - [ ] A8 support dotlink differential integration without importing dotlink transport/policy types into `aw-tools`. **Scaffolded:** dotlink now has a test-only fixture reporter consuming AW conformance JSON without a committed sibling path dependency. First explicit run reports the expected legacy gap: missing `find/cp/mv/rm`, schema drift for `ls/grep/read/write/edit/patch/bread/bwrite/bedit`, and four unreachable request vectors. Shared fixture generation accepts host `SchemaCaps` so configurable ceilings do not create false parity failures. Actual shared-engine execution remains gated on the exact pinned Git revision from A7.
 
 ### Fresh pre-pin cross-repo review — 2026-11-01
@@ -492,35 +492,44 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
       gap (missing find/cp/mv/rm, nine schema drifts, four unreachable vectors).
       The temporary reporter also keeps Graph/aggregate/marker vectors explicitly
       unverified, so schema parity alone can never turn the cutover gate green.
-- [x] Fresh AW product/config matrix passed after the pre-pin fixes: shared
-      238/238, Unix backend 35/35, AW adapter 182/182, Agent-core 78 active tests
-      plus 1 intentional ignore, no-default/stateless and `minimal` all-target
-      checks, no_std+alloc kernel check, bounded full-workspace package checks and
-      strict Clippy for the affected stack. The previous Windows GNU cross-stack
-      passed before the latest fixes; the current source is deliberately not
-      claimed freshly native-Windows validated.
-- [x] Fresh config-readiness review caught and fixed one narrow-only composition
-      regression: direct-only selections such as `read` were rejected when an
-      otherwise-unused Job `max_active_nodes` ceiling was below Graph width.
-      Job/Graph consistency is now checked only when a Job runtime is actually
-      instantiated, so disabled/unselected capabilities cannot constrain direct
-      tools while Job-producing configurations retain the same fail-fast bound.
+- [x] Fresh AW product/config matrix passed after the final pre-pin fixes:
+      shared `aw-tools` 241/241, Unix backend 38/38, AW adapter 188/188,
+      Agent-core all-target suites green (78 active lib tests + 1 intentional
+      ignore), AW library 226/226 active + 2 intentional ignores, and AW binary
+      384/384 active + 1 intentional ignore. No-default/stateless, `minimal`,
+      no_std+alloc kernel, full-workspace all-target compile, rustfmt/diff and
+      strict Clippy for shared/core/adapter/Unix are green. The current Windows
+      GNU shared/backend/platform/Agent/adapter stack also cross-compiles cleanly;
+      native Windows/macOS execution remains a separate release gate.
+- [x] Fresh config-readiness review caught and fixed narrow-only composition and
+      SDK/runtime seams: direct-only selections ignore uninstantiated Job quotas;
+      Graph parallelism cannot bypass the Agent scheduler; Session-scope and tool
+      policy lifecycles are separate; public JobRuntime construction and later
+      shell registration use the same maximum-Graph spool preflight as normal AW
+      configuration. Disabled/unselected capabilities therefore cannot constrain
+      direct tools, while every published Job producer retains fail-fast capacity.
+- [x] Final private-artifact review closes the remaining pre-finalization window:
+      Stage names are durably reserved before namespace creation, identity is
+      finalized before payload, Unix/Windows recovery refuses non-private/nonempty
+      same-name replacements, and Windows Stage/Backup/Tombstone names are all
+      OS-random. Existing-parent Windows directory copy now uses the same
+      reserve-before-create protocol; the current Windows cross-stack is green.
 
 ### Shared convergence verification
 
 - [ ] Pre/post mechanical-rename behavior/test matrix identical.
 - [ ] Final symlink lexical/resolved authorization matrix on native supported platforms.
-- [ ] User regular hardlink read/write/edit/cp/mv/rm tests and private-state single-link integrity tests.
-- [ ] UTF-8 quoted control-path + invalid-UTF8 path_encoding tests.
-- [ ] Exact private stage/backup/tombstone crash recovery and identity-mismatch tests.
-- [ ] Recursive lifecycle protected-descendant, mount/reparse and race tests.
+- [x] User regular hardlink read/write/edit/cp/mv/rm tests and private-state single-link integrity tests.
+- [x] UTF-8 quoted control-path + invalid-UTF8 path_encoding tests.
+- [x] Exact private stage/backup/tombstone crash recovery and identity-mismatch tests, including atomic no-replace durable record publication, OS-random exact-name Stage reservation before namespace creation, identity finalization before payload, restart reconciliation of provisional/final records, and reclamation of interrupted record-publication temporaries.
+- [x] Recursive lifecycle protected-descendant, native Unix no-cross-mount and Windows reparse/cross-target race coverage; native Windows/macOS runtime remains tracked separately below.
 - [x] Graph conflict scheduling deterministic across runner timing.
 - [x] Node results/dependent effects invariant across outer result/transport budgets; oversized aggregate presentation hands off the same completed Job without changing node modifiers.
 - [x] Outer-journal no-replay ambiguity, current-authority restart, explicit Job cancellation/revocation, ShellNode stop proof, post-spawn unknown fencing, and exact-grant live revocation tests.
 - [x] Raw output offsets, lossy/base64 projection, ACK idempotence, explicit multi-owner retention and pressure cleanup tests.
-- [ ] Native Windows/macOS runtime gates. Earlier Windows GNU cross-builds were
-      green, but the latest source has not been freshly cross-checked because the
-      cached matching Rust 1.98 toolchain was garbage-collected; do not substitute
-      the host Rust 1.95 compiler against the old Windows std sysroot. Native
-      platform execution CI remains required regardless.
+- [ ] Native Windows/macOS runtime gates. The latest Windows GNU
+      shared/backend/platform/Agent/adapter source cross-build is green with the
+      matching cached toolchain, including the final provisional/private-name
+      hardening. This is compile evidence only; native platform execution CI
+      remains required.
 - [x] Full AW workspace all-target test matrix passed with terminal results via bounded connector-safe partitions (including `aw-cli` lib/bin, core/tools/agent/platform, storage/client/surfaces, `aw-store` 201/201 in exhaustive partitions, and workspace/examples). A single monolithic command exceeds the connector response ceiling, so validation is partitioned without reducing target coverage.

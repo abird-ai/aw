@@ -326,6 +326,20 @@ impl ToolParallelism {
     }
 }
 
+/// Host-runtime listener for bounded tool-policy resource changes. This is
+/// coordination only: it cannot mint grants, change tool sources, or create
+/// invocation scope. Validation is two-phase so a rejected update leaves every
+/// runtime and the Agent policy unchanged.
+pub trait ToolPolicyLifecycle: Send + Sync {
+    fn validate_parallelism(&self, _next: ToolParallelism) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called only after every listener accepted the snapshot. Implementations
+    /// must make this a non-failing local publication.
+    fn apply_parallelism(&self, _next: ToolParallelism) {}
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolPolicy {
     pub execution_site: String,

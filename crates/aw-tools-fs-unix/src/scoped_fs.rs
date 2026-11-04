@@ -1,6 +1,7 @@
 //! Descriptor-relative scoped filesystem implementation for Unix.
-//! This preserves aw's no-follow/single-link invariants but is not a tenant
-//! sandbox against administrators, same-UID native code, mount changes, or
+//! This preserves aw's descriptor/no-follow invariants; ordinary user files may
+//! be hard-linked, while private control/recovery files enforce single-link identity.
+//! It is not a tenant sandbox against administrators, same-UID native code, mount changes, or
 //! non-cooperating writers.
 
 use std::{

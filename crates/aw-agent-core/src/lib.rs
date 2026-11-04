@@ -73,7 +73,8 @@ pub use reviewer::{ReviewExecutor, ReviewInput, ReviewJournal, ReviewResult};
 pub use routing::{RoutingExecutor, RoutingInput, RoutingJournal, RoutingResult};
 pub use tool::{
     Tool, ToolCall, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolParallelism, ToolPolicy,
-    ToolRecord, ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec, ToolStatus,
+    ToolPolicyLifecycle, ToolRecord, ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec,
+    ToolStatus,
 };
 
 /// Revalidate the complete provider-bound context after trusted extensions.

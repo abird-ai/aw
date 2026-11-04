@@ -125,10 +125,14 @@ advertised schemas, validators, direct execution, Graph NodePlans, retained
 native result reservations and shell stream limits from one host configuration.
 AW defaults remain deliberately smaller than the shared engine maxima; the
 shared maxima exist so another bounded host such as dotlink can reuse the same
-renderer/spool/Graph implementation without semantic narrowing. A configured
+renderer/spool/Graph implementation without semantic narrowing. Session scope
+replacement and tool resource policy are separate lifecycle interfaces:
+`InvocationScopeLifecycle` never becomes a generic policy hook, while
+`ToolPolicyLifecycle` validates/applies dynamic scheduler narrowing. A configured
 Job producer is admitted only when the aggregate spool can retain all exact
-result reservations for one maximum-size Graph, preventing quota configuration
-from changing valid later nodes into artificial `skip` outcomes.
+result reservations for one maximum-size Graph. The same preflight is applied by
+public JobRuntime construction and again before a shell interpreter is published,
+so no valid Graph later degrades into quota-driven `skip` outcomes.
 
 Filesystem semantics:
 
@@ -165,8 +169,10 @@ Filesystem semantics:
   protected/excluded descendants. `rm` is advertised only when the host supplies
   durable exact mutation-recovery storage; it durably reserves every requested
   tombstone before the first detach, revalidates identity before each rename and
-  retains published cleanup records for restart reconciliation. User files merely resembling an
-  internal prefix are ordinary visible files.
+  retains published cleanup records for restart reconciliation. Volatile custody
+  protects exact Stage/Backup names only for the live process and cannot promise
+  restart cleanup. Crash-clean staging therefore requires durable private state.
+  User files merely resembling an internal prefix remain ordinary visible files.
 - Unix cooperating writers use sorted descriptor-rooted mutation locking;
   Windows uses the matching invariant namespace/admission protocol. Concurrent
   reads do not take mutation locks. Opaque shell/external writers remain outside

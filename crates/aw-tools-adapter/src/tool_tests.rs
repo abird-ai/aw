@@ -35,6 +35,18 @@ impl aw_tools::filesystem::private_artifact::Store for DurableArtifactStore {
         self.0.lock().unwrap().push(record.clone());
         Ok(())
     }
+    fn finalize(
+        &self,
+        before: &aw_tools::filesystem::private_artifact::Record,
+        after: &aw_tools::filesystem::private_artifact::Record,
+    ) -> std::result::Result<(), aw_tools::filesystem::private_artifact::Error> {
+        let mut records = self.0.lock().unwrap();
+        let Some(at) = records.iter().position(|current| current == before) else {
+            return Err(aw_tools::filesystem::private_artifact::Error::Conflict);
+        };
+        records[at] = after.clone();
+        Ok(())
+    }
     fn retire(
         &self,
         record: &aw_tools::filesystem::private_artifact::Record,

@@ -115,11 +115,11 @@ impl JobRuntime {
         let native_tools = Arc::new(native_tools);
         let tool_limits = tool_limits.validate()?;
         let concurrency = concurrency.validate()?;
-        if concurrency.graph_width > tool_limits.jobs.max_active_nodes {
-            return Err(Error::Config(
-                "Graph parallel ceiling exceeds Job active-node ceiling".into(),
-            ));
-        }
+        tool_limits.validate_job_runtime_capacity(
+            concurrency.graph_width,
+            !native_tools.is_empty(),
+            false,
+        )?;
         let parallelism = Arc::new(GraphParallelism::new(concurrency)?);
         let host = Arc::new(JobHost::new_with_config(
             root.clone(),
@@ -165,6 +165,11 @@ impl JobRuntime {
     }
 
     pub(crate) fn register_shell(&self, shell: Arc<shell::NativeShell>) -> Result<()> {
+        self.tool_limits.validate_job_runtime_capacity(
+            self.parallelism.max_width(),
+            !self.native_tools.is_empty(),
+            true,
+        )?;
         self.shells.register(shell)
     }
 
@@ -429,8 +434,8 @@ impl JobRuntime {
     }
 }
 
-impl InvocationScopeLifecycle for JobRuntime {
-    fn validate_tool_parallelism(
+impl aw_agent_core::ToolPolicyLifecycle for JobRuntime {
+    fn validate_parallelism(
         &self,
         next: aw_agent_core::ToolParallelism,
     ) -> aw_agent_core::Result<()> {
@@ -453,10 +458,12 @@ impl InvocationScopeLifecycle for JobRuntime {
         Ok(())
     }
 
-    fn apply_tool_parallelism(&self, next: aw_agent_core::ToolParallelism) {
+    fn apply_parallelism(&self, next: aw_agent_core::ToolParallelism) {
         self.parallelism.apply(next);
     }
+}
 
+impl InvocationScopeLifecycle for JobRuntime {
     fn replace_scope(
         &self,
         previous: Option<&InvocationScope>,
@@ -890,6 +897,76 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_registration_rechecks_max_graph_spool_capacity_before_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "aw-job-runtime-shell-capacity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let builder = Agent::builder(
+            Arc::new(UnusedProvider),
+            AgentOptions::new("fixture", "model"),
+        );
+        let tools = LocalToolOptions::new(&root, ToolMode::ReadOnly);
+        let agent = configure(builder, actor, &tools).unwrap().build().unwrap();
+        // Native results need 6,291,456 bytes at the default 96 KiB/node;
+        // adding 48 KiB stdout+stderr shell retention raises the max-Graph
+        // requirement to 6,553,600 bytes.
+        let tool_limits = crate::LocalToolLimits {
+            jobs: Limits {
+                max_spool_bytes: 6_400_000,
+                ..Limits::default()
+            },
+            ..Default::default()
+        };
+        let runtime = JobRuntime::new_with_native_tools(
+            Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),
+            agent.tool_binding_authority(),
+            tool_limits,
+            crate::LocalToolConcurrency::default(),
+            aw_tools::filesystem::schema::Tool::GRAPH_NATIVE.to_vec(),
+        )
+        .unwrap();
+        let shell = Arc::new(shell::NativeShell::new(root.clone(), bash_executable()).unwrap());
+        assert!(matches!(
+            runtime.register_shell(shell),
+            Err(Error::Config(_))
+        ));
+        assert!(!runtime
+            .node_tools()
+            .contains(&aw_tools::filesystem::batch::NodeTool::Bash));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_runtime_constructor_rejects_spool_too_small_for_one_max_graph() {
+        let root =
+            std::env::temp_dir().join(format!("aw-job-runtime-small-spool-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let builder = Agent::builder(
+            Arc::new(UnusedProvider),
+            AgentOptions::new("fixture", "model"),
+        );
+        let tools = LocalToolOptions::new(&root, ToolMode::ReadOnly);
+        let agent = configure(builder, actor, &tools).unwrap().build().unwrap();
+        let result = JobRuntime::new(
+            Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),
+            agent.tool_binding_authority(),
+            Limits {
+                max_spool_bytes: 1024,
+                ..Limits::default()
+            },
+        );
+        assert!(matches!(result, Err(Error::Config(_))));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn live_job_runtime_refuses_parallel_policy_change_until_quiescent() {
         let root =
@@ -921,10 +998,10 @@ mod tests {
             allow_parallel_shell: false,
             max_parallel_shell: 1,
         };
-        assert!(runtime.validate_tool_parallelism(next).is_err());
+        assert!(aw_agent_core::ToolPolicyLifecycle::validate_parallelism(&*runtime, next).is_err());
         runtime.state.lock().unwrap().runners.remove("live");
-        assert!(runtime.validate_tool_parallelism(next).is_ok());
-        runtime.apply_tool_parallelism(next);
+        assert!(aw_agent_core::ToolPolicyLifecycle::validate_parallelism(&*runtime, next).is_ok());
+        aw_agent_core::ToolPolicyLifecycle::apply_parallelism(&*runtime, next);
         let _ = fs::remove_dir_all(root);
     }
 

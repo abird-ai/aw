@@ -77,6 +77,10 @@ impl GraphParallelism {
         })
     }
 
+    pub(crate) fn max_width(&self) -> usize {
+        self.max_width
+    }
+
     pub(crate) fn apply(&self, value: aw_agent_core::ToolParallelism) {
         self.max_reads
             .store(value.max_parallel_reads, Ordering::Release);

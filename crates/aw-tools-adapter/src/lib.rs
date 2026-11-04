@@ -540,6 +540,42 @@ impl Default for LocalToolLimits {
     }
 }
 impl LocalToolLimits {
+    pub(crate) fn validate_job_runtime_capacity(
+        self,
+        graph_width: usize,
+        native_nodes: bool,
+        shell_nodes: bool,
+    ) -> Result<()> {
+        if graph_width == 0 || graph_width > self.jobs.max_active_nodes {
+            return Err(Error::Config(
+                "Graph parallel ceiling exceeds configured Job active-node ceiling".into(),
+            ));
+        }
+        let native_reservation = if native_nodes {
+            self.result_bytes as u64
+        } else {
+            0
+        };
+        let shell_reservation = if shell_nodes {
+            (job_host::SHELL_RESULT_BYTES as u64)
+                .checked_add(2 * self.shell_stream_bytes as u64)
+                .ok_or_else(|| Error::Config("ShellNode spool reservation overflow".into()))?
+        } else {
+            0
+        };
+        let per_node = native_reservation.max(shell_reservation);
+        let minimum_graph_spool = per_node
+            .checked_mul(aw_tools::filesystem::batch::MAX_OPS as u64)
+            .ok_or_else(|| Error::Config("Job Graph spool reservation overflow".into()))?;
+        if minimum_graph_spool > 0 && self.jobs.max_spool_bytes < minimum_graph_spool {
+            return Err(Error::Config(
+                "Job spool ceiling cannot retain one maximum-size Graph's exact node results"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn request_limits(self) -> aw_tools::filesystem::request::Limits {
         aw_tools::filesystem::request::Limits {
             schema: self.schema,
@@ -635,16 +671,8 @@ impl LocalToolOptions {
 struct ParallelismCeiling {
     ceiling: aw_agent_core::ToolParallelism,
 }
-impl InvocationScopeLifecycle for ParallelismCeiling {
-    fn replace_scope(
-        &self,
-        _previous: Option<&InvocationScope>,
-        _next: Option<&InvocationScope>,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn validate_tool_parallelism(&self, next: aw_agent_core::ToolParallelism) -> Result<()> {
+impl ToolPolicyLifecycle for ParallelismCeiling {
+    fn validate_parallelism(&self, next: aw_agent_core::ToolParallelism) -> Result<()> {
         let ceiling = self.ceiling;
         if next.max_parallel_reads > ceiling.max_parallel_reads
             || next.max_parallel_shell > ceiling.max_parallel_shell
@@ -742,7 +770,7 @@ pub fn configure(
         graph_width: concurrency.graph_width,
         parallelism: policy.parallelism(),
     };
-    builder = builder.scope_lifecycle(Arc::new(ParallelismCeiling {
+    builder = builder.tool_policy_lifecycle(Arc::new(ParallelismCeiling {
         ceiling: effective_concurrency.parallelism,
     }));
     if options.mode == ToolMode::Off {
@@ -827,38 +855,15 @@ pub fn configure(
         ));
     }
     // Exact node results reserve their captured semantic capacity before an
-    // effect starts and remain retained until ACK/expiry. With an otherwise
-    // empty live Job namespace, one valid max-size Graph must therefore be able
-    // to retain every node's exact result reservation; a narrower session spool
-    // would turn valid later nodes into quota-driven `skip` outcomes.
+    // effect starts and remain retained until ACK/expiry. Every constructor uses
+    // the same capacity preflight so valid Graphs never degrade into quota-driven
+    // skips merely because the host chose an internally inconsistent limit set.
     if wants_jobs {
-        if concurrency.graph_width > limits.jobs.max_active_nodes {
-            return Err(Error::Config(
-                "Graph parallel ceiling exceeds configured Job active-node ceiling".into(),
-            ));
-        }
-        let native_reservation = if graph_native_tools.is_empty() {
-            0
-        } else {
-            limits.result_bytes as u64
-        };
-        let shell_reservation = if graph_shell_available {
-            (job_host::SHELL_RESULT_BYTES as u64)
-                .checked_add(2 * limits.shell_stream_bytes as u64)
-                .ok_or_else(|| Error::Config("ShellNode spool reservation overflow".into()))?
-        } else {
-            0
-        };
-        let per_node_reservation = native_reservation.max(shell_reservation);
-        let minimum_graph_spool = per_node_reservation
-            .checked_mul(aw_tools::filesystem::batch::MAX_OPS as u64)
-            .ok_or_else(|| Error::Config("Job Graph spool reservation overflow".into()))?;
-        if minimum_graph_spool > 0 && limits.jobs.max_spool_bytes < minimum_graph_spool {
-            return Err(Error::Config(
-                "Job spool ceiling cannot retain one maximum-size Graph's exact node results"
-                    .into(),
-            ));
-        }
+        limits.validate_job_runtime_capacity(
+            concurrency.graph_width,
+            !graph_native_tools.is_empty(),
+            graph_shell_available,
+        )?;
     }
     let job_runtime = if wants_jobs {
         let runtime = job_runtime::JobRuntime::new_with_native_tools(
@@ -868,7 +873,9 @@ pub fn configure(
             effective_concurrency,
             graph_native_tools,
         )?;
-        builder = builder.scope_lifecycle(runtime.clone());
+        builder = builder
+            .scope_lifecycle(runtime.clone())
+            .tool_policy_lifecycle(runtime.clone());
         builder = offer(
             builder,
             job_tools::Batch::new(runtime.clone()),

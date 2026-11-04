@@ -1124,6 +1124,18 @@ mod tests {
             self.records.lock().unwrap().push(record.clone());
             Ok(())
         }
+        fn finalize(
+            &self,
+            before: &Record,
+            after: &Record,
+        ) -> std::result::Result<(), ArtifactError> {
+            let mut records = self.records.lock().unwrap();
+            let Some(at) = records.iter().position(|current| current == before) else {
+                return Err(ArtifactError::Conflict);
+            };
+            records[at] = after.clone();
+            Ok(())
+        }
         fn retire(&self, record: &Record) -> std::result::Result<(), ArtifactError> {
             let mut records = self.records.lock().unwrap();
             let Some(at) = records.iter().position(|current| current == record) else {
@@ -1545,6 +1557,93 @@ mod tests {
         .unwrap();
         assert!(operations::remove_paths(&set, &["write/tree".into()], true, &|| false,).is_err());
         assert_eq!(fs::read(tree.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn provisional_stage_name_is_hidden_and_reconciled_without_touching_lookalike() {
+        use aw_tools::filesystem::private_artifact::{Kind, ObjectIdentity, Registry};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let f = Fixture::new();
+        let store = Arc::new(DurableTestStore::default());
+        let registry = Registry::open(store.clone()).unwrap();
+        let root = Root::open_with_private_artifacts(&f.write, registry.clone()).unwrap();
+        let parent = fs::metadata(&f.write).unwrap();
+        let owned = ".aw-stage-0123456789abcdef0123456789abcdef.tmp";
+        let lookalike = ".aw-stage-user-lookalike.tmp";
+        let reservation = registry
+            .reserve_name(
+                Kind::Stage,
+                "".into(),
+                ObjectIdentity {
+                    volume: parent.dev(),
+                    object: parent.ino(),
+                },
+                owned.into(),
+            )
+            .unwrap();
+        fs::create_dir(f.write.join(owned)).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(f.write.join(owned), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(f.write.join(lookalike), b"ordinary").unwrap();
+        assert!(root.is_private_path(owned).unwrap());
+        assert!(!root.is_private_path(lookalike).unwrap());
+
+        // Simulate process loss after namespace creation but before identity
+        // finalization. Dropping the reservation deliberately preserves the
+        // exact durable name claim for restart recovery.
+        drop(reservation);
+        drop(root);
+        drop(registry);
+
+        let recovered_registry = Registry::open(store).unwrap();
+        let recovered =
+            Root::open_with_private_artifacts(&f.write, recovered_registry.clone()).unwrap();
+        recovered.reconcile_private_artifacts().unwrap();
+        assert!(!f.write.join(owned).exists());
+        assert_eq!(fs::read(f.write.join(lookalike)).unwrap(), b"ordinary");
+        assert!(recovered_registry.records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn provisional_stage_record_never_deletes_same_name_ordinary_replacement() {
+        use aw_tools::filesystem::private_artifact::{Kind, ObjectIdentity, Registry};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let f = Fixture::new();
+        let store = Arc::new(DurableTestStore::default());
+        let registry = Registry::open(store.clone()).unwrap();
+        let root = Root::open_with_private_artifacts(&f.write, registry.clone()).unwrap();
+        let parent = fs::metadata(&f.write).unwrap();
+        let name = ".aw-stage-abcdef0123456789abcdef0123456789.tmp";
+        let reservation = registry
+            .reserve_name(
+                Kind::Stage,
+                "".into(),
+                ObjectIdentity {
+                    volume: parent.dev(),
+                    object: parent.ino(),
+                },
+                name.into(),
+            )
+            .unwrap();
+        fs::write(f.write.join(name), b"ordinary replacement").unwrap();
+        fs::set_permissions(f.write.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        drop(reservation);
+        drop(root);
+        drop(registry);
+
+        let recovered_registry = Registry::open(store).unwrap();
+        let recovered =
+            Root::open_with_private_artifacts(&f.write, recovered_registry.clone()).unwrap();
+        recovered.reconcile_private_artifacts().unwrap();
+        assert_eq!(
+            fs::read(f.write.join(name)).unwrap(),
+            b"ordinary replacement"
+        );
+        assert!(recovered_registry.records().unwrap().is_empty());
     }
 
     #[test]

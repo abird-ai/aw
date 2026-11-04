@@ -3,6 +3,7 @@
 use super::{is_reparse, pin_directory, validate_path, wide, Parent, Result, Root, ScopedError};
 use aw_tools::filesystem::private_artifact::{
     Kind as ArtifactKind, Lease as ArtifactLease, ObjectIdentity, Record,
+    Reservation as ArtifactReservation,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,7 +22,25 @@ use windows_sys::Win32::{
 };
 
 const MAX_BATCH_FILE: usize = 64 * 1024 * 1024;
-static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn private_artifact_name(kind: &str) -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| ScopedError::Denied("OS randomness unavailable for private artifact name"))?;
+    let suffix = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(".aw-{kind}-{suffix}.tmp"))
+}
+pub(super) fn private_stage_name() -> Result<String> {
+    private_artifact_name("stage")
+}
+pub(super) fn private_backup_name() -> Result<String> {
+    private_artifact_name("backup")
+}
+pub(super) fn private_tombstone_name() -> Result<String> {
+    private_artifact_name("trash")
+}
 fn regular(file: &File) -> Result<u64> {
     let meta = file.metadata()?;
     if !meta.is_file() || is_reparse(&meta) {
@@ -197,6 +216,20 @@ fn directory_identity(file: &File) -> Result<(u32, u64)> {
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     ))
 }
+fn provisional_stage_shape(path: &std::path::Path, opened: &File) -> Result<bool> {
+    let meta = opened.metadata()?;
+    if is_reparse(&meta) {
+        return Ok(false);
+    }
+    if meta.is_file() {
+        return Ok(meta.len() == 0);
+    }
+    if meta.is_dir() {
+        return Ok(fs::read_dir(path)?.next().is_none());
+    }
+    Ok(false)
+}
+
 fn parent_model_path(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
@@ -223,9 +256,21 @@ impl Root {
                 parent_path,
                 parent,
                 name: name.to_owned(),
-                object,
+                object: Some(object),
             })
             .map_err(|_| ScopedError::Denied("cannot durably reserve private mutation artifact"))
+    }
+
+    fn reserve_private_name(
+        &self,
+        parent: &Parent,
+        parent_path: String,
+        name: &str,
+    ) -> Result<ArtifactReservation> {
+        let parent = self.parent_artifact_identity(parent)?;
+        self.private
+            .reserve_name(ArtifactKind::Stage, parent_path, parent, name.to_owned())
+            .map_err(|_| ScopedError::Denied("cannot durably reserve private mutation name"))
     }
 }
 
@@ -289,11 +334,25 @@ impl Root {
                 Err(error) => return Err(error.into()),
             };
             let (volume, object) = super::super::file_identity(&opened)?;
-            if (ObjectIdentity {
+            let current = ObjectIdentity {
                 volume: u64::from(volume),
                 object,
-            }) != record.object
-            {
+            };
+            if let Some(expected) = record.object {
+                if current != expected {
+                    self.private
+                        .retire_record(&record)
+                        .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
+                    continue;
+                }
+            } else if record.kind != ArtifactKind::Stage {
+                return Err(ScopedError::Denied(
+                    "only private Stage names may be provisionally reserved",
+                ));
+            } else if !provisional_stage_shape(&target, &opened)? {
+                // Before identity finalization no Stage payload has been written.
+                // A nonempty/reparse/special same-name object is therefore not
+                // safely attributable to this provisional reservation.
                 self.private
                     .retire_record(&record)
                     .map_err(|_| ScopedError::Denied("cannot retire stale private artifact"))?;
@@ -690,31 +749,52 @@ impl Root {
         cancelled: &dyn Fn() -> bool,
         writer: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<StagedWrite> {
-        let temp = parent.path.join(format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir(&temp)?;
-        let opened = pin_directory(&temp)?;
-        let identity = directory_identity(&opened)?;
-        drop(opened);
-        let artifact = match self.reserve_private_artifact(
+        let temp_name = private_stage_name()?;
+        let mut reservation = self.reserve_private_name(
             &parent,
             existing_parent_model_path(path, missing.len()),
-            temp.file_name()
-                .and_then(|value| value.to_str())
-                .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
-            ObjectIdentity {
-                volume: u64::from(identity.0),
-                object: identity.1,
-            },
-            ArtifactKind::Stage,
-        ) {
-            Ok(artifact) => artifact,
+            &temp_name,
+        )?;
+        let temp = parent.path.join(&temp_name);
+        if let Err(error) = fs::create_dir(&temp) {
+            let _ = reservation.retire();
+            return Err(error.into());
+        }
+        let opened = match pin_directory(&temp) {
+            Ok(opened) => opened,
             Err(error) => {
-                lifecycle::cleanup_stage_tree(&temp, identity);
+                let _ = fs::remove_dir(&temp);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
                 return Err(error);
+            }
+        };
+        let identity = match directory_identity(&opened) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(opened);
+                let _ = fs::remove_dir(&temp);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(error);
+            }
+        };
+        drop(opened);
+        let artifact = match reservation.finalize(ObjectIdentity {
+            volume: u64::from(identity.0),
+            object: identity.1,
+        }) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                lifecycle::cleanup_stage_tree(&temp, identity);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(ScopedError::Denied(
+                    "cannot durably finalize private mutation artifact",
+                ));
             }
         };
         let result = (|| -> Result<()> {
@@ -775,31 +855,49 @@ impl Root {
         entries: Vec<(Vec<String>, String, &[u8])>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<StagedWrite> {
-        let temp = parent.path.join(format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir(&temp)?;
-        let opened = pin_directory(&temp)?;
-        let identity = directory_identity(&opened)?;
-        drop(opened);
-        let artifact = match self.reserve_private_artifact(
-            &parent,
-            existing_model.clone(),
-            temp.file_name()
-                .and_then(|value| value.to_str())
-                .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
-            ObjectIdentity {
-                volume: u64::from(identity.0),
-                object: identity.1,
-            },
-            ArtifactKind::Stage,
-        ) {
-            Ok(artifact) => artifact,
+        let temp_name = private_stage_name()?;
+        let mut reservation =
+            self.reserve_private_name(&parent, existing_model.clone(), &temp_name)?;
+        let temp = parent.path.join(&temp_name);
+        if let Err(error) = fs::create_dir(&temp) {
+            let _ = reservation.retire();
+            return Err(error.into());
+        }
+        let opened = match pin_directory(&temp) {
+            Ok(opened) => opened,
             Err(error) => {
-                lifecycle::cleanup_stage_tree(&temp, identity);
+                let _ = fs::remove_dir(&temp);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
                 return Err(error);
+            }
+        };
+        let identity = match directory_identity(&opened) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(opened);
+                let _ = fs::remove_dir(&temp);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(error);
+            }
+        };
+        drop(opened);
+        let artifact = match reservation.finalize(ObjectIdentity {
+            volume: u64::from(identity.0),
+            object: identity.1,
+        }) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                lifecycle::cleanup_stage_tree(&temp, identity);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(ScopedError::Denied(
+                    "cannot durably finalize private mutation artifact",
+                ));
             }
         };
         let result = (|| -> Result<()> {
@@ -1050,31 +1148,43 @@ impl Root {
             }
         }
         let dacl = old.as_ref().map(|_| file_dacl(&target)).transpose()?;
-        let temp = prepared.path().join(format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let mut out = secure_staging_file(&temp, dacl.as_deref())?;
-        let (stage_volume, stage_object) = super::super::file_identity(&out)?;
+        let temp_name = private_stage_name()?;
         let parent_ref = prepared.parent.as_ref().expect("prepared parent");
-        let artifact = match self.reserve_private_artifact(
-            parent_ref,
-            parent_model_path(path).to_owned(),
-            temp.file_name()
-                .and_then(|value| value.to_str())
-                .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
-            ObjectIdentity {
-                volume: u64::from(stage_volume),
-                object: stage_object,
-            },
-            ArtifactKind::Stage,
-        ) {
-            Ok(artifact) => artifact,
+        let mut reservation =
+            self.reserve_private_name(parent_ref, parent_model_path(path).to_owned(), &temp_name)?;
+        let temp = prepared.path().join(&temp_name);
+        let mut out = match secure_staging_file(&temp, dacl.as_deref()) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = reservation.retire();
+                return Err(error);
+            }
+        };
+        let (stage_volume, stage_object) = match super::super::file_identity(&out) {
+            Ok(identity) => identity,
             Err(error) => {
                 drop(out);
                 let _ = fs::remove_file(&temp);
-                return Err(error);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(error.into());
+            }
+        };
+        let artifact = match reservation.finalize(ObjectIdentity {
+            volume: u64::from(stage_volume),
+            object: stage_object,
+        }) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                drop(out);
+                let _ = fs::remove_file(&temp);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(ScopedError::Denied(
+                    "cannot durably finalize private mutation artifact",
+                ));
             }
         };
         let result = (|| -> Result<()> {
@@ -1205,11 +1315,7 @@ impl StagedWrite {
             }
             return Ok(());
         }
-        let backup = self.target.with_file_name(format!(
-            ".aw-backup-{}-{:016x}.tmp",
-            std::process::id(),
-            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ));
+        let backup = self.target.with_file_name(private_backup_name()?);
         let backup_name = backup
             .file_name()
             .and_then(|value| value.to_str())
@@ -1221,9 +1327,9 @@ impl StagedWrite {
                 parent_path: self.parent_model_path.clone(),
                 parent: self.parent_identity,
                 name: backup_name.to_owned(),
-                object: original_identity.ok_or(ScopedError::Denied(
+                object: Some(original_identity.ok_or(ScopedError::Denied(
                     "replacement target identity unavailable",
-                ))?,
+                ))?),
             })
             .map_err(|_| ScopedError::Denied("cannot durably reserve replacement backup"))?;
         let dst = wide(&self.target);

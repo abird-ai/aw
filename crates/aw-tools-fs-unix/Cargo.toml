@@ -11,6 +11,7 @@ description = "Reusable descriptor-rooted Unix filesystem backend for aw-tools"
 aw-tools = { path = "../aw-tools", version = "=0.15.0", default-features = false, features = ["rw"] }
 libc = "0.2.189"
 sha2 = "0.10.9"
+getrandom = "0.3.4"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

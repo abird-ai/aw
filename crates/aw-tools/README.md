@@ -179,10 +179,18 @@ nodes keep the semantic ceiling captured at Job preparation; later transport or
 context pressure may only page/hand off retained output.
 
 A `private_artifact::Store` that reports volatile custody may own transient
-stage/backup records, but `Registry::reserve` rejects `Tombstone` on such a store.
-Recursive/exact remove therefore requires a host-provided durable store. Backends
-reserve every requested tombstone before the first namespace detach and revalidate
-the source identity immediately before each rename.
+stage/backup records only for the current process; it cannot promise restart cleanup
+after process loss. Hosts that require crash-clean Stage/Backup recovery must supply
+a durable Store. `Registry::reserve` rejects `Tombstone` on a volatile store, so
+recursive/exact remove always requires durable custody. Durable Stage creation first
+reserves an OS-random exact name, then creates the restrictive namespace entry,
+finalizes its no-follow object identity, and only then writes payload bytes. Recovery
+cleans a provisional name only when its platform pre-finalization shape is still
+consistent with an empty private Stage; a same-name ordinary replacement is never
+silently treated as owned payload. Windows Stage/Backup/Tombstone namespaces use the
+same OS-random exact-name discipline. Backends reserve every requested tombstone
+before the first namespace detach and revalidate the source identity immediately
+before each rename.
 
 For hosts with wall-clock retention, `JobManager::expire_terminal(id)` deliberately
 contains no clock: the product owns the deadline and may expire a quiescent terminal

@@ -32,7 +32,10 @@ pub struct Record {
     pub parent_path: String,
     pub parent: ObjectIdentity,
     pub name: String,
-    pub object: ObjectIdentity,
+    /// `None` is a durable exact-name reservation made before a private stage
+    /// enters the filesystem namespace. It must be finalized with the observed
+    /// no-follow identity before any user payload is written.
+    pub object: Option<ObjectIdentity>,
 }
 impl Record {
     fn key(&self) -> (ObjectIdentity, String) {
@@ -71,6 +74,10 @@ pub trait Store: Send + Sync + 'static {
     }
     fn load(&self) -> Result<Vec<Record>, Error>;
     fn reserve(&self, record: &Record) -> Result<(), Error>;
+    /// Durably replace one provisional exact-name record with its finalized
+    /// object identity. Once the finalized record is durable, implementations
+    /// may leave the superseded provisional record for restart-time cleanup.
+    fn finalize(&self, before: &Record, after: &Record) -> Result<(), Error>;
     fn retire(&self, record: &Record) -> Result<(), Error>;
 }
 
@@ -84,6 +91,9 @@ impl Store for MemoryStore {
         Ok(Vec::new())
     }
     fn reserve(&self, _record: &Record) -> Result<(), Error> {
+        Ok(())
+    }
+    fn finalize(&self, _before: &Record, _after: &Record) -> Result<(), Error> {
         Ok(())
     }
     fn retire(&self, _record: &Record) -> Result<(), Error> {
@@ -124,10 +134,7 @@ impl Registry {
         self.store.durable()
     }
 
-    /// Reserve durable ownership before any user bytes are written to the
-    /// already-created restrictive artifact. A tombstone changes the public
-    /// namespace before cleanup, so a volatile registry may never authorize it.
-    pub fn reserve(self: &Arc<Self>, record: Record) -> Result<Lease, Error> {
+    fn reserve_inner(self: &Arc<Self>, record: Record) -> Result<(), Error> {
         if record.kind == Kind::Tombstone && !self.store.durable() {
             return Err(Error::Store(
                 "tombstone requires durable private-artifact storage".into(),
@@ -142,8 +149,46 @@ impl Registry {
             return Err(Error::Capacity);
         }
         self.store.reserve(&record)?;
-        records.insert(key, record.clone());
+        records.insert(key, record);
+        Ok(())
+    }
+
+    /// Reserve durable ownership for an already-existing private object. This
+    /// is used by tombstone/backup moves whose source identity is known before
+    /// the private destination name becomes visible.
+    pub fn reserve(self: &Arc<Self>, record: Record) -> Result<Lease, Error> {
+        if record.object.is_none() {
+            return Err(Error::Conflict);
+        }
+        self.reserve_inner(record.clone())?;
         Ok(Lease {
+            registry: self.clone(),
+            record: Some(record),
+        })
+    }
+
+    /// Durably reserve an exact Stage name before creating its namespace entry.
+    /// This closes the create-before-record crash window without treating a
+    /// filename pattern as ownership.
+    pub fn reserve_name(
+        self: &Arc<Self>,
+        kind: Kind,
+        parent_path: String,
+        parent: ObjectIdentity,
+        name: String,
+    ) -> Result<Reservation, Error> {
+        if kind != Kind::Stage {
+            return Err(Error::Conflict);
+        }
+        let record = Record {
+            kind,
+            parent_path,
+            parent,
+            name,
+            object: None,
+        };
+        self.reserve_inner(record.clone())?;
+        Ok(Reservation {
             registry: self.clone(),
             record: Some(record),
         })
@@ -160,7 +205,28 @@ impl Registry {
         let records = self.records.lock().map_err(|_| Error::Poisoned)?;
         Ok(records
             .get(&(parent, name.to_owned()))
-            .is_some_and(|record| record.object == object))
+            .is_some_and(|record| record.object.is_none() || record.object == Some(object)))
+    }
+
+    fn finalize(&self, before: &Record, after: &Record) -> Result<(), Error> {
+        if before.key() != after.key()
+            || before.kind != Kind::Stage
+            || before.object.is_some()
+            || after.object.is_none()
+        {
+            return Err(Error::Conflict);
+        }
+        let key = before.key();
+        let mut records = self.records.lock().map_err(|_| Error::Poisoned)?;
+        let Some(current) = records.get(&key) else {
+            return Err(Error::Conflict);
+        };
+        if current != before {
+            return Err(Error::Conflict);
+        }
+        self.store.finalize(before, after)?;
+        records.insert(key, after.clone());
+        Ok(())
     }
 
     pub fn records(&self) -> Result<Vec<Record>, Error> {
@@ -186,6 +252,45 @@ impl Registry {
         self.store.retire(record)?;
         records.remove(&key);
         Ok(())
+    }
+}
+
+/// A provisional exact-name claim. Drop deliberately preserves the claim for
+/// restart recovery. Call `retire` only when creation is known not to have
+/// happened; call `finalize` immediately after observing the created identity.
+pub struct Reservation {
+    registry: Arc<Registry>,
+    record: Option<Record>,
+}
+impl Reservation {
+    pub fn record(&self) -> &Record {
+        self.record
+            .as_ref()
+            .expect("live private artifact reservation")
+    }
+
+    pub fn finalize(&mut self, object: ObjectIdentity) -> Result<Lease, Error> {
+        let before = self
+            .record
+            .as_ref()
+            .expect("live private artifact reservation")
+            .clone();
+        let mut after = before.clone();
+        after.object = Some(object);
+        self.registry.finalize(&before, &after)?;
+        self.record = None;
+        Ok(Lease {
+            registry: self.registry.clone(),
+            record: Some(after),
+        })
+    }
+
+    pub fn retire(mut self) -> Result<(), Error> {
+        let record = self
+            .record
+            .take()
+            .expect("live private artifact reservation");
+        self.registry.retire(&record)
     }
 }
 
@@ -219,7 +324,7 @@ mod tests {
                 object: 2,
             },
             name: ".stage".into(),
-            object: ObjectIdentity { volume: 1, object },
+            object: Some(ObjectIdentity { volume: 1, object }),
         }
     }
     #[test]
@@ -254,6 +359,68 @@ mod tests {
             .unwrap());
         lease.retire().unwrap();
         assert!(registry.records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn provisional_name_is_owned_before_identity_and_finalizes_exactly() {
+        let registry = Registry::memory();
+        let mut reservation = registry
+            .reserve_name(
+                Kind::Stage,
+                "src".into(),
+                ObjectIdentity {
+                    volume: 1,
+                    object: 2,
+                },
+                ".stage".into(),
+            )
+            .unwrap();
+        assert!(registry
+            .owns(
+                ObjectIdentity {
+                    volume: 1,
+                    object: 2,
+                },
+                ".stage",
+                ObjectIdentity {
+                    volume: 9,
+                    object: 9,
+                },
+            )
+            .unwrap());
+        let lease = reservation
+            .finalize(ObjectIdentity {
+                volume: 1,
+                object: 3,
+            })
+            .unwrap();
+        assert!(!registry
+            .owns(
+                ObjectIdentity {
+                    volume: 1,
+                    object: 2,
+                },
+                ".stage",
+                ObjectIdentity {
+                    volume: 9,
+                    object: 9,
+                },
+            )
+            .unwrap());
+        assert!(registry
+            .owns(
+                ObjectIdentity {
+                    volume: 1,
+                    object: 2,
+                },
+                ".stage",
+                ObjectIdentity {
+                    volume: 1,
+                    object: 3,
+                },
+            )
+            .unwrap());
+        lease.retire().unwrap();
     }
 
     #[test]

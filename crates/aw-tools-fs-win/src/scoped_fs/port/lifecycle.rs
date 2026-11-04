@@ -32,13 +32,6 @@ fn no_replace(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     }
     Ok(())
 }
-fn private_name() -> String {
-    format!(
-        ".aw-trash-{}-{:016x}.tmp",
-        std::process::id(),
-        TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
 fn limited_children(root: &Root, path: &str) -> Result<Vec<super::super::Entry>> {
     let listing = root.list_with_limit(path, 4096)?;
     if listing.incomplete {
@@ -302,30 +295,56 @@ pub(in crate::scoped_fs) fn copy_between(
     let prepared = PreparedParent {
         parent: Some(existing),
     };
-    let temp = prepared.path().join(private_name());
-    fs::create_dir(&temp)?;
-    let opened = pin_directory(&temp)?;
-    let identity = directory_identity(&opened)?;
-    drop(opened);
+    let temp_name = super::private_stage_name()?;
     let parent_ref = prepared.parent.as_ref().expect("prepared parent");
-    let artifact = match destination_root.reserve_private_artifact(
+    let mut reservation = destination_root.reserve_private_name(
         parent_ref,
         super::parent_model_path(to).to_owned(),
-        temp.file_name()
-            .and_then(|value| value.to_str())
-            .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
-        aw_tools::filesystem::private_artifact::ObjectIdentity {
-            volume: u64::from(identity.0),
-            object: identity.1,
-        },
-        aw_tools::filesystem::private_artifact::Kind::Stage,
-    ) {
-        Ok(artifact) => artifact,
+        &temp_name,
+    )?;
+    let temp = prepared.path().join(&temp_name);
+    if let Err(error) = fs::create_dir(&temp) {
+        let _ = reservation.retire();
+        return Err(error.into());
+    }
+    let opened = match pin_directory(&temp) {
+        Ok(opened) => opened,
         Err(error) => {
-            cleanup_stage_tree(&temp, identity);
+            let _ = fs::remove_dir(&temp);
+            if !temp.exists() {
+                let _ = reservation.retire();
+            }
             return Err(error);
         }
     };
+    let identity = match directory_identity(&opened) {
+        Ok(identity) => identity,
+        Err(error) => {
+            drop(opened);
+            let _ = fs::remove_dir(&temp);
+            if !temp.exists() {
+                let _ = reservation.retire();
+            }
+            return Err(error);
+        }
+    };
+    drop(opened);
+    let artifact =
+        match reservation.finalize(aw_tools::filesystem::private_artifact::ObjectIdentity {
+            volume: u64::from(identity.0),
+            object: identity.1,
+        }) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                cleanup_stage_tree(&temp, identity);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(ScopedError::Denied(
+                    "cannot durably finalize private mutation artifact",
+                ));
+            }
+        };
     let build = (|| -> Result<()> {
         let mut stage_budget = life::WorkBudget::default();
         build_tree(source_root, from, &temp, cancelled, 0, &mut stage_budget)?;
@@ -507,7 +526,7 @@ pub(in crate::scoped_fs) fn remove_between(
             ));
         }
         drop(source_handle);
-        let tombstone = parent.path.join(private_name());
+        let tombstone = parent.path.join(super::private_tombstone_name()?);
         let tombstone_name = match tombstone.file_name().and_then(|value| value.to_str()) {
             Some(value) => value,
             None => {
@@ -646,33 +665,55 @@ impl Root {
         leaf: String,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<()> {
-        let temp = parent.path.join(format!(
-            ".aw-stage-{}-{:016x}.tmp",
-            std::process::id(),
-            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir(&temp)?;
-        let opened = pin_directory(&temp)?;
-        let identity = directory_identity(&opened)?;
-        drop(opened);
-        let artifact = match self.reserve_private_artifact(
+        let temp_name = super::private_stage_name()?;
+        let mut reservation = self.reserve_private_name(
             &parent,
             super::existing_parent_model_path(destination, missing.len()),
-            temp.file_name()
-                .and_then(|value| value.to_str())
-                .ok_or(ScopedError::Denied("private stage name is not reusable"))?,
-            aw_tools::filesystem::private_artifact::ObjectIdentity {
-                volume: u64::from(identity.0),
-                object: identity.1,
-            },
-            aw_tools::filesystem::private_artifact::Kind::Stage,
-        ) {
-            Ok(artifact) => artifact,
+            &temp_name,
+        )?;
+        let temp = parent.path.join(&temp_name);
+        if let Err(error) = fs::create_dir(&temp) {
+            let _ = reservation.retire();
+            return Err(error.into());
+        }
+        let opened = match pin_directory(&temp) {
+            Ok(opened) => opened,
             Err(error) => {
-                cleanup_stage_tree(&temp, identity);
+                let _ = fs::remove_dir(&temp);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
                 return Err(error);
             }
         };
+        let identity = match directory_identity(&opened) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(opened);
+                let _ = fs::remove_dir(&temp);
+                if !temp.exists() {
+                    let _ = reservation.retire();
+                }
+                return Err(error);
+            }
+        };
+        drop(opened);
+        let artifact =
+            match reservation.finalize(aw_tools::filesystem::private_artifact::ObjectIdentity {
+                volume: u64::from(identity.0),
+                object: identity.1,
+            }) {
+                Ok(artifact) => artifact,
+                Err(_) => {
+                    cleanup_stage_tree(&temp, identity);
+                    if !temp.exists() {
+                        let _ = reservation.retire();
+                    }
+                    return Err(ScopedError::Denied(
+                        "cannot durably finalize private mutation artifact",
+                    ));
+                }
+            };
         let result = (|| -> Result<()> {
             let mut path = temp.clone();
             let mut pins = Vec::with_capacity(missing.len());

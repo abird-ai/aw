@@ -17,8 +17,10 @@ tool schemas, direct execution, Graph NodePlans/result budgets, shell retention,
 quotas and job-control rendering. `LocalToolConcurrency` feeds both the Agent scheduler
 and nested Graph width; adapter composition is narrow-only against an existing host
 `ToolPolicy`, and dynamic Agent scheduler changes are transactional/refused while a
-live Job still depends on the previous policy. These are runtime/SDK authority inputs,
-not values restored from untrusted persisted application config.
+live Job still depends on the previous policy. Session replacement stays on
+`InvocationScopeLifecycle`; bounded scheduler updates use the separate
+`ToolPolicyLifecycle`, so neither hook becomes a second authority source. These are
+runtime/SDK authority inputs, not values restored from persisted application config.
 
 ## DL-150 AI-native filesystem surface (2026-10-31)
 
@@ -99,12 +101,15 @@ rw/full. Old recursive ls fields are no longer model-visible.
   read windows, 96 KiB semantic native results, 48 KiB per shell stream, and a
   512 MiB aggregate live-Job spool budget. Job-producing configurations must be
   large enough to retain one maximum-size Graph's exact result reservations; this
-  is checked before any Job can execute rather than surfacing later as `skip`.
+  is checked by normal configuration, public JobRuntime construction and shell
+  registration before the capability is published rather than surfacing later as
+  `skip`.
 
 ## Filesystem guarantees
 
-- Descriptor-pinned, component-by-component, no-follow reads/writes; only
-  singly linked regular files as content. Linux uses `openat2` with
+- Descriptor-pinned, component-by-component, no-follow reads/writes. Ordinary
+  user hard links are valid content; atomic replacement changes only the named
+  entry, while private control/recovery files keep single-link integrity. Linux uses `openat2` with
   `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`; no fallback that
   silently drops required resolution guarantees.
 - File content is validated as UTF-8 with no binary control bytes for
@@ -247,7 +252,10 @@ Canonical AW write/edit/copy/mv use aw-tools operations under
 the original Root's pinned filesystem locks and staged publication. `rm` uses the
 same shared operation only when the configured Root has a durable private-artifact
 Store; memory-only sessions and platforms without verified private mutation-state
-custody simply do not advertise `rm` rather than weakening crash recovery.
+custody simply do not advertise `rm` rather than weakening crash recovery. Volatile
+roots can still stage ordinary mutations safely during the live process, but cannot
+promise restart cleanup of an in-flight Stage/Backup after process death; callers
+requiring crash-clean mutation artifacts must provide durable private state.
 AW handles original Agent/ToolPolicy/TurnJournal, tool invocation,
 compatibility and provider-oriented error rendering.
 
