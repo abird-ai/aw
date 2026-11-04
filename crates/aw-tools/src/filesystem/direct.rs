@@ -664,8 +664,11 @@ where
                         "format=mcp complete object exceeds configured read ceiling; use base64/hex byte windows",
                     ));
                 }
-                let packet = MediaPacket::from_complete_bytes(bytes)
-                    .map_err(|_| Error::Invalid("unsupported or oversized typed media".into()))?;
+                let packet = MediaPacket::from_complete_bytes_with_limit(
+                    bytes,
+                    limits.request.schema.binary_read_bytes,
+                )
+                .map_err(|_| Error::Invalid("unsupported or oversized typed media".into()))?;
                 Ok(Output {
                     body: Body::Media {
                         path: args.path,

@@ -40,8 +40,11 @@ impl MediaDescriptor {
         self.sha256.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
-pub fn inspect_complete(bytes: &[u8]) -> Result<MediaDescriptor, MediaError> {
-    if bytes.len() > MAX_INLINE_MEDIA_BYTES {
+fn inspect_complete_with_limit(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<MediaDescriptor, MediaError> {
+    if max_bytes == 0 || max_bytes > crate::MAX_READ_WINDOW_BYTES || bytes.len() > max_bytes {
         return Err(MediaError::Oversized);
     }
     let (kind, mime, matched) = classify(bytes);
@@ -52,6 +55,11 @@ pub fn inspect_complete(bytes: &[u8]) -> Result<MediaDescriptor, MediaError> {
         sha256: Sha256::digest(bytes).into(),
         signature_identified: matched,
     })
+}
+
+/// Historical/convenience inline-media bound used by AW product defaults.
+pub fn inspect_complete(bytes: &[u8]) -> Result<MediaDescriptor, MediaError> {
+    inspect_complete_with_limit(bytes, MAX_INLINE_MEDIA_BYTES)
 }
 fn classify(data: &[u8]) -> (MediaKind, &'static str, bool) {
     let starts = |prefix: &[u8]| data.starts_with(prefix);
@@ -119,7 +127,17 @@ pub struct MediaReceipt {
 }
 impl MediaPacket {
     pub fn from_complete_bytes(bytes: Vec<u8>) -> Result<Self, MediaError> {
-        let descriptor = inspect_complete(&bytes)?;
+        Self::from_complete_bytes_with_limit(bytes, MAX_INLINE_MEDIA_BYTES)
+    }
+
+    /// Construct a complete packet under a host-selected ceiling. The host may
+    /// choose any positive bound up to the shared raw-read safety maximum; this
+    /// never authorizes transport/provider delivery by itself.
+    pub fn from_complete_bytes_with_limit(
+        bytes: Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<Self, MediaError> {
+        let descriptor = inspect_complete_with_limit(&bytes, max_bytes)?;
         Ok(Self { descriptor, bytes })
     }
     pub fn descriptor(&self) -> &MediaDescriptor {
@@ -131,7 +149,10 @@ impl MediaPacket {
     /// Validate again at the host boundary, even after a trusted Rust
     /// adapter has held the packet across async suspension.
     pub fn verify(&self) -> bool {
-        inspect_complete(&self.bytes).ok().as_ref() == Some(&self.descriptor)
+        inspect_complete_with_limit(&self.bytes, crate::MAX_READ_WINDOW_BYTES)
+            .ok()
+            .as_ref()
+            == Some(&self.descriptor)
     }
     /// Authoritatively declared MIME and byte ceilings are rechecked before
     /// the host attempts typed delivery. A failed host attachment may be an
@@ -146,7 +167,7 @@ impl MediaPacket {
         }
         let mime = self.descriptor.mime;
         if !self.descriptor.signature_identified
-            || self.bytes.len() > policy.max_bytes.min(MAX_INLINE_MEDIA_BYTES)
+            || self.bytes.len() > policy.max_bytes.min(crate::MAX_READ_WINDOW_BYTES)
             || !policy.accepted_mimes.contains(&mime)
         {
             return Err(MediaDeliveryError::NotAuthorized);
@@ -433,6 +454,24 @@ mod tests {
         );
         assert_eq!(host.delivered.get(), 1);
     }
+    #[test]
+    fn host_selected_packet_ceiling_can_exceed_aw_inline_default_without_widening_shared_max() {
+        let bytes = vec![b'x'; MAX_INLINE_MEDIA_BYTES + 1];
+        assert!(matches!(
+            MediaPacket::from_complete_bytes(bytes.clone()),
+            Err(MediaError::Oversized)
+        ));
+        let packet =
+            MediaPacket::from_complete_bytes_with_limit(bytes, MAX_INLINE_MEDIA_BYTES + 1).unwrap();
+        assert!(packet.verify());
+        assert_eq!(packet.descriptor().bytes, MAX_INLINE_MEDIA_BYTES + 1);
+        assert!(MediaPacket::from_complete_bytes_with_limit(
+            Vec::new(),
+            crate::MAX_READ_WINDOW_BYTES + 1,
+        )
+        .is_err());
+    }
+
     #[test]
     fn only_complete_bounded_bytes_pass() {
         assert_eq!(
