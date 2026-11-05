@@ -120,44 +120,20 @@ fn canonical_direct_output(
             truncated: output.truncated,
         },
         Body::Read {
-            mut data,
+            data,
             status,
             next,
             numbered,
-        } => {
-            if let Some(status_line) = status {
-                if numbered {
-                    if !data.ends_with('\n') {
-                        data.push('\n');
-                    }
-                    data.push_str(&status_line);
-                    ToolOutput {
-                        content: data,
-                        is_error: output.is_error,
-                        truncated: true,
-                    }
-                } else {
-                    ToolOutput {
-                        content: serde_json::json!({
-                            "data":data,
-                            "status":if output.is_error{"mixed"}else{"more"},
-                            "next":next.map(|(line,byte)|serde_json::json!({
-                                "line":line,"byte":byte
-                            }))
-                        })
-                        .to_string(),
-                        is_error: output.is_error,
-                        truncated: true,
-                    }
-                }
-            } else {
-                ToolOutput {
-                    content: data,
-                    is_error: output.is_error,
-                    truncated: output.truncated,
-                }
-            }
-        }
+        } => ToolOutput {
+            content: aw_tools::filesystem::direct::project_read_text(
+                data,
+                status.as_deref(),
+                next,
+                numbered,
+            ),
+            is_error: output.is_error,
+            truncated: output.truncated,
+        },
         Body::Media { path, packet } => {
             let descriptor = packet.descriptor();
             let kind = descriptor.kind.as_str();

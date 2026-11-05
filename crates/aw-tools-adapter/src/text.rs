@@ -229,35 +229,16 @@ impl Tool for Text {
                         .ok_or(Error::Protocol(
                             "partial read page has no continuation status",
                         ))?;
-                        if a.numbered {
-                            let mut data = page.data;
-                            if !data.ends_with('\n') {
-                                data.push('\n');
-                            }
-                            data.push_str(&status);
-                            Ok(ToolOutput {
-                                content: data,
-                                is_error: page.io_fault,
-                                truncated: true,
-                            })
-                        } else {
-                            // AW currently exposes one text ToolOutput,
-                            // not separate exact-data/status MCP blocks.
-                            // JSON preserves data bytes unambiguously on
-                            // partial pages; complete reads stay raw.
-                            Ok(ToolOutput {
-                                content: serde_json::json!({
-                                    "data":page.data,
-                                    "status":if page.io_fault{"mixed"}else{"more"},
-                                    "next":page.next.map(|c|serde_json::json!({
-                                        "line":c.line,"byte":c.byte
-                                    }))
-                                })
-                                .to_string(),
-                                is_error: page.io_fault,
-                                truncated: true,
-                            })
-                        }
+                        Ok(ToolOutput {
+                            content: aw_tools::filesystem::direct::project_read_text(
+                                page.data,
+                                Some(&status),
+                                page.next.map(|c| (c.line, c.byte)),
+                                a.numbered,
+                            ),
+                            is_error: page.io_fault,
+                            truncated: true,
+                        })
                     }
                     Operation::Write => {
                         let a: WriteArgs = parse(&value)?;

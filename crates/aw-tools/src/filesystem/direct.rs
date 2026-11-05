@@ -113,6 +113,40 @@ pub struct Output {
     pub is_error: bool,
     pub truncated: bool,
 }
+/// Canonical text projection for `Body::Read`.
+///
+/// Complete unnumbered reads remain the exact source bytes. Partial numbered
+/// reads append the canonical status line. Partial unnumbered reads keep the
+/// historical coarse status family while also exposing the exact canonical
+/// status in `detail`, so adapters never reconstruct or lose fault/cursor
+/// semantics independently.
+pub fn project_read_text(
+    mut data: String,
+    status: Option<&str>,
+    next: Option<(usize, usize)>,
+    numbered: bool,
+) -> String {
+    let Some(status) = status else {
+        return data;
+    };
+    if numbered {
+        if !data.ends_with('\n') {
+            data.push('\n');
+        }
+        data.push_str(status);
+        return data;
+    }
+    let detail = status.trim_end();
+    let family = detail.split_ascii_whitespace().next().unwrap_or("unknown");
+    json!({
+        "data": data,
+        "status": family,
+        "detail": detail,
+        "next": next.map(|(line, byte)| json!({"line":line,"byte":byte}))
+    })
+    .to_string()
+}
+
 impl Output {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
@@ -723,6 +757,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_text_projection_preserves_exact_status_detail() {
+        assert_eq!(
+            project_read_text("complete\n".into(), None, None, false),
+            "complete\n"
+        );
+        let partial = project_read_text(
+            "prefix\n".into(),
+            Some("more line=3 byte=0\n"),
+            Some((3, 0)),
+            false,
+        );
+        let partial: serde_json::Value = serde_json::from_str(&partial).unwrap();
+        assert_eq!(partial["status"], "more");
+        assert_eq!(partial["detail"], "more line=3 byte=0");
+        assert_eq!(partial["next"]["line"], 3);
+        let fault = project_read_text(
+            "prefix".into(),
+            Some("mixed ok=prefix fail=io more line=2 byte=7\n"),
+            Some((2, 7)),
+            false,
+        );
+        let fault: serde_json::Value = serde_json::from_str(&fault).unwrap();
+        assert_eq!(fault["status"], "mixed");
+        assert_eq!(
+            fault["detail"],
+            "mixed ok=prefix fail=io more line=2 byte=7"
+        );
+        assert_eq!(
+            project_read_text(
+                "1\tvalue".into(),
+                Some("more line=2 byte=0\n"),
+                Some((2, 0)),
+                true,
+            ),
+            "1\tvalue\nmore line=2 byte=0\n"
+        );
+    }
 
     #[test]
     fn encoded_window_fits_budget_and_advances_raw_offset() {
