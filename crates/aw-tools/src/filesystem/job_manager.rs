@@ -2066,6 +2066,44 @@ impl JobManager {
         })
     }
 
+    /// Shrink a finished retained stream to the exact prefix still required by
+    /// one owner. Every other owner must already have acknowledged the complete
+    /// current retained stream, so compaction can never discard bytes another
+    /// owner still depends on. Ownership and ACK watermarks are unchanged.
+    pub fn compact_output_for_owner(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        owner: OutputOwner,
+        keep: u64,
+    ) -> Result<u64, Error> {
+        let output = self.output_handle(id, coordinate, stream)?;
+        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
+        if output.released {
+            return Err(Error::OutputReleased);
+        }
+        if !output.writer_finished {
+            return Err(Error::Busy);
+        }
+        let retained = output.spool.retained_bytes();
+        if keep > retained || !output.owners.contains_key(&owner) {
+            return Err(Error::InvalidOutput);
+        }
+        if output.owners.iter().any(|(candidate, ack)| {
+            *candidate != owner && (!ack.acknowledged || ack.through < retained)
+        }) {
+            return Err(Error::Busy);
+        }
+        output.spool.compact_retained(keep)?;
+        let _ = output.maybe_release()?;
+        Ok(if output.released {
+            0
+        } else {
+            output.spool.retained_bytes()
+        })
+    }
+
     /// Effectful ACK is owner-specific and monotonic. Physical retained bytes
     /// are released only after the writer is finished and every exact owner has
     /// acknowledged through the complete retained prefix.
@@ -2086,15 +2124,19 @@ impl JobManager {
             });
         }
         let retained = output.spool.retained_bytes();
-        if through > retained {
-            return Err(Error::InvalidOutput);
-        }
         let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+        // Physical prefix compaction never rewrites an owner's logical ACK
+        // history. A lost response may therefore replay a watermark beyond the
+        // now-retained prefix, but only up to that exact owner's already-recorded
+        // high-water mark. New acknowledgements still cannot skip absent bytes.
         if current.acknowledged && through <= current.through {
             return Ok(OutputAck {
                 changed: false,
                 released: false,
             });
+        }
+        if through > retained {
+            return Err(Error::InvalidOutput);
         }
         current.through = current.through.max(through);
         current.acknowledged = true;
@@ -3797,6 +3839,112 @@ mod tests {
             manager.output_page("empty-output", 1, OutputStream::Stderr, 0, 1),
             Err(Error::OutputReleased)
         );
+    }
+
+    #[test]
+    fn owner_aware_compaction_requires_every_other_owner_to_release_the_tail() {
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 1024,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: true,
+            })
+        })
+        .unwrap();
+        let manager = manager(8);
+        manager
+            .admit_runtime(
+                graph,
+                plans,
+                RuntimeAdmission {
+                    id: "compact-owner",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        manager
+            .claim("compact-owner", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        let job_owner = manager.job_output_owner("compact-owner").unwrap();
+        let task_owner = manager.task_result_owner("compact-owner", 1).unwrap();
+        manager
+            .attach_output_memory(
+                "compact-owner",
+                1,
+                OutputStream::Stdout,
+                [job_owner, task_owner],
+            )
+            .unwrap();
+        manager
+            .append_output("compact-owner", 1, OutputStream::Stdout, b"abcdefgh")
+            .unwrap();
+        manager
+            .finish_output("compact-owner", 1, OutputStream::Stdout)
+            .unwrap();
+
+        assert_eq!(
+            manager.compact_output_for_owner(
+                "compact-owner",
+                1,
+                OutputStream::Stdout,
+                task_owner,
+                4,
+            ),
+            Err(Error::Busy),
+            "the Job owner still needs the historical tail"
+        );
+        assert!(
+            !manager
+                .acknowledge_output("compact-owner", 1, OutputStream::Stdout, job_owner, 8,)
+                .unwrap()
+                .released
+        );
+        assert_eq!(
+            manager
+                .compact_output_for_owner("compact-owner", 1, OutputStream::Stdout, task_owner, 4,)
+                .unwrap(),
+            4
+        );
+        let page = manager
+            .output_page("compact-owner", 1, OutputStream::Stdout, 0, 8)
+            .unwrap();
+        assert_eq!(page.bytes, b"abcd");
+        assert_eq!(page.retained_bytes, 4);
+        assert_eq!(page.total_bytes, 8);
+        assert_eq!(manager.spool_usage().unwrap().0, 4);
+        assert_eq!(
+            manager
+                .acknowledge_output("compact-owner", 1, OutputStream::Stdout, job_owner, 8,)
+                .unwrap(),
+            OutputAck {
+                changed: false,
+                released: false,
+            },
+            "lost ACK replay keeps its original logical high-water mark"
+        );
+        assert_eq!(
+            manager.acknowledge_output("compact-owner", 1, OutputStream::Stdout, task_owner, 5,),
+            Err(Error::InvalidOutput),
+            "an owner cannot newly acknowledge bytes removed by compaction"
+        );
+        assert!(
+            manager
+                .acknowledge_output("compact-owner", 1, OutputStream::Stdout, task_owner, 4,)
+                .unwrap()
+                .released
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
     }
 
     #[test]
