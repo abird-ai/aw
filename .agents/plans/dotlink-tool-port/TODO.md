@@ -557,6 +557,30 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
       through CapabilitySet composition; no duplicate scheduler workaround is
       required.
 
+### Cross-process private-artifact recovery fix — 2026-11-05
+
+- [x] Fresh dotlink stdio integration exposed a real multi-process race: a
+      newly opened durable registry could reconcile another process's live Stage
+      record between reserve/create/finalize, causing `cannot durably finalize
+      private mutation artifact` and losing an otherwise valid mutation.
+- [x] Recovery now acquires the native namespace mutation barrier for each exact
+      private record before cleanup, then revalidates that record against the
+      authoritative durable Store. A stale recovery snapshot cannot delete or
+      retire work another registry/process has already completed.
+- [x] Windows mutation locking now includes a separately namespaced,
+      invariant-folded ancestor overlap chain in addition to lexical admission
+      and exact-path mutexes. This gives Stage/tombstone recovery the same
+      parent/ancestor exclusion that Unix gets from nearest-parent flocks,
+      including overlapping prepared roots.
+- [x] Regression: shared durable-Store revalidation test; `aw-tools` 247/247,
+      Unix backend 41/41, strict shared/backend Clippy, full workspace all-target
+      check, Windows GNU shared/platform/adapter cross-stack, and dotlink
+      `independent_processes_do_not_lose_each_others_mutations` all pass.
+- [x] No broad private-name prefix hiding or retry-on-uncertain mutation was
+      introduced. Independent private-state roots remain independent recovery
+      authorities; the tested cross-process mutation protocol remains safe even
+      when their XDG roots differ.
+
 ### Shared convergence verification
 
 - [ ] Pre/post mechanical-rename behavior/test matrix identical.

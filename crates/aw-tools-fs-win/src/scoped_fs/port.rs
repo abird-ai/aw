@@ -297,6 +297,15 @@ impl Root {
             } else {
                 format!("{}/{}", record.parent_path, record.name)
             };
+            // The overlap namespace is shared with live mutations below. A
+            // recovery scan therefore cannot delete/finalize another process's
+            // active private Stage even when grants overlap at different roots.
+            let _recovery = self.lock_mutations(std::slice::from_ref(&path))?;
+            if !self.private.record_is_current(&record).map_err(|_| {
+                ScopedError::Denied("private mutation artifact registry unavailable")
+            })? {
+                continue;
+            }
             let (parent, target) = match self.parent(&path) {
                 Ok(value) => value,
                 Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -409,17 +418,31 @@ impl Root {
         // before canonical mutation locks. Use separate namespaces so one
         // request can own both without self-deadlocking.
         let mut admissions = BTreeSet::new();
+        let mut overlaps = BTreeSet::new();
         let mut targets = BTreeSet::new();
         for path in paths {
             validate_path(path)?;
             let lexical = self.root.join(path);
             admissions.insert(named_lock_key(&lexical, "admission")?);
             targets.insert(named_lock_key(&lexical, "path")?);
+
+            // Windows named mutexes have no shared/exclusive mode. Keep a
+            // separately namespaced conservative ancestor chain so mutations,
+            // subtree lifecycle work and startup recovery cannot cross in the
+            // same namespace. This mirrors Unix parent-flock safety while the
+            // exact path mutex still preserves stable leaf identity.
+            let mut ancestor = self.root.clone();
+            overlaps.insert(named_lock_key(&ancestor, "overlap")?);
+            let parts = path.split('/').collect::<Vec<_>>();
+            for part in parts.iter().take(parts.len().saturating_sub(1)) {
+                ancestor.push(part);
+                overlaps.insert(named_lock_key(&ancestor, "overlap")?);
+            }
         }
-        let mut locks = Vec::with_capacity(admissions.len() + targets.len());
-        // One absolute deadline applies to both tiers; cancellation is
-        // checked during every kernel mutex wait.
-        for key in admissions.into_iter().chain(targets) {
+        let mut locks = Vec::with_capacity(admissions.len() + overlaps.len() + targets.len());
+        // One absolute deadline applies to all tiers; separate namespaces and
+        // fixed tier/order acquisition avoid self-deadlock.
+        for key in admissions.into_iter().chain(overlaps).chain(targets) {
             let wide = key.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
             // SAFETY: NUL-terminated name and an initially unowned mutex.
             let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };

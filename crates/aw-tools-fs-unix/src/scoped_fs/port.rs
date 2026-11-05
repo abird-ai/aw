@@ -326,6 +326,15 @@ impl Root {
             } else {
                 format!("{}/{}", record.parent_path, record.name)
             };
+            // The active mutator that owns this Stage/tombstone holds the
+            // same nearest-existing-parent flock. Recovery waits for it to
+            // settle instead of mistaking live work for a crash orphan.
+            let _recovery = self.lock_mutations(std::slice::from_ref(&path))?;
+            if !self.private.record_is_current(&record).map_err(|_| {
+                ScopedError::Denied("private mutation artifact registry unavailable")
+            })? {
+                continue;
+            }
             let (parent, name) = match self.parent(&path) {
                 Ok(value) => value,
                 Err(ScopedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {

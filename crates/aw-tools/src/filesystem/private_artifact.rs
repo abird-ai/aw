@@ -234,6 +234,29 @@ impl Registry {
         Ok(records.values().cloned().collect())
     }
 
+    /// Revalidate one recovery candidate against the authoritative durable
+    /// store after the caller has acquired its namespace/mutation barrier.
+    /// Long-lived registries deliberately do not refresh every ordinary
+    /// ownership lookup: recovery is the bounded point that must distinguish a
+    /// crash orphan from work another process has since completed.
+    pub fn record_is_current(&self, record: &Record) -> Result<bool, Error> {
+        if !self.store.durable() {
+            let records = self.records.lock().map_err(|_| Error::Poisoned)?;
+            return Ok(records.get(&record.key()) == Some(record));
+        }
+        let loaded = self.store.load()?;
+        if loaded.len() > MAX_PRIVATE_ARTIFACTS {
+            return Err(Error::Capacity);
+        }
+        let mut exact = None;
+        for current in loaded {
+            if current.key() == record.key() && exact.replace(current).is_some() {
+                return Err(Error::Conflict);
+            }
+        }
+        Ok(exact.as_ref() == Some(record))
+    }
+
     pub fn retire_record(&self, record: &Record) -> Result<(), Error> {
         self.retire(record)
     }
@@ -431,6 +454,58 @@ mod tests {
         assert!(!registry.is_durable());
         assert!(matches!(registry.reserve(value), Err(Error::Store(_))));
         assert!(registry.records().unwrap().is_empty());
+    }
+
+    #[derive(Default)]
+    struct DurableTestStore(std::sync::Mutex<Vec<Record>>);
+    impl Store for DurableTestStore {
+        fn load(&self) -> Result<Vec<Record>, Error> {
+            Ok(self.0.lock().map_err(|_| Error::Poisoned)?.clone())
+        }
+        fn reserve(&self, record: &Record) -> Result<(), Error> {
+            let mut records = self.0.lock().map_err(|_| Error::Poisoned)?;
+            if records.iter().any(|current| current.key() == record.key()) {
+                return Err(Error::Conflict);
+            }
+            records.push(record.clone());
+            Ok(())
+        }
+        fn finalize(&self, before: &Record, after: &Record) -> Result<(), Error> {
+            let mut records = self.0.lock().map_err(|_| Error::Poisoned)?;
+            let Some(current) = records
+                .iter_mut()
+                .find(|current| current.key() == before.key())
+            else {
+                return Err(Error::Conflict);
+            };
+            if current != before {
+                return Err(Error::Conflict);
+            }
+            *current = after.clone();
+            Ok(())
+        }
+        fn retire(&self, record: &Record) -> Result<(), Error> {
+            let mut records = self.0.lock().map_err(|_| Error::Poisoned)?;
+            if let Some(index) = records.iter().position(|current| current == record) {
+                records.remove(index);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_rechecks_durable_state_across_registry_instances() {
+        let store = Arc::new(DurableTestStore::default());
+        let first = Registry::open(store.clone()).unwrap();
+        let value = record(7);
+        let lease = first.reserve(value.clone()).unwrap();
+        let second = Registry::open(store).unwrap();
+        assert!(second.record_is_current(&value).unwrap());
+        lease.retire().unwrap();
+        assert!(
+            !second.record_is_current(&value).unwrap(),
+            "a recovery snapshot must observe another process/registry retiring the record"
+        );
     }
 
     #[test]
