@@ -2034,12 +2034,10 @@ impl JobManager {
         }
         let output = self.output_handle(id, coordinate, stream)?;
         let mut output = output.lock().map_err(|_| Error::Poisoned)?;
-        if output.released || output.owners.len() >= 16 {
+        if output.released || output.owners.len() >= 16 || output.owners.contains_key(&owner) {
             return Err(Error::InvalidOutput);
         }
-        if output.owners.insert(owner, OwnerAck::default()).is_some() {
-            return Err(Error::InvalidOutput);
-        }
+        output.owners.insert(owner, OwnerAck::default());
         Ok(())
     }
 
@@ -4017,10 +4015,16 @@ mod tests {
                 .released
         );
         assert_eq!(
+            manager.add_output_owner("compact-owner", 1, OutputStream::Stdout, job_owner),
+            Err(Error::InvalidOutput),
+            "duplicate owner registration must be rejected without resetting its ACK"
+        );
+        assert_eq!(
             manager
                 .compact_output_for_owner("compact-owner", 1, OutputStream::Stdout, task_owner, 4,)
                 .unwrap(),
-            4
+            4,
+            "the original Job-owner ACK must survive the rejected duplicate add"
         );
         let page = manager
             .output_page("compact-owner", 1, OutputStream::Stdout, 0, 8)
