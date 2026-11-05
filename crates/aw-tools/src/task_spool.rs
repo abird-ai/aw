@@ -455,6 +455,7 @@ pub struct BoundedFileSpool {
     retained: RetainedCharge,
     prepaid: Option<RetainedCharge>,
     prepaid_remaining: u64,
+    limit: u64,
     gate: Arc<SpoolWriters>,
     lease: Option<SpoolWriterLease>,
     summary: StreamSummary,
@@ -464,10 +465,24 @@ pub struct BoundedFileSpool {
 }
 impl BoundedFileSpool {
     pub fn new(
-        mut file: File,
+        file: File,
         quota: Arc<Mutex<SessionQuota>>,
         gate: Arc<SpoolWriters>,
     ) -> Result<Self, SpoolError> {
+        Self::new_with_limit(file, quota, gate, MAX_SPOOL_PER_STREAM)
+    }
+
+    /// Create a streaming file-backed spool with a host-selected retained-prefix
+    /// ceiling. The host may only narrow the shared per-stream safety maximum.
+    pub fn new_with_limit(
+        mut file: File,
+        quota: Arc<Mutex<SessionQuota>>,
+        gate: Arc<SpoolWriters>,
+        limit: u64,
+    ) -> Result<Self, SpoolError> {
+        if limit == 0 || limit > MAX_SPOOL_PER_STREAM {
+            return Err(SpoolError::QuotaExhausted);
+        }
         let stat = file.metadata()?;
         if !stat.is_file() || stat.len() != 0 {
             return Err(SpoolError::NotEmptyOrRegular);
@@ -482,6 +497,7 @@ impl BoundedFileSpool {
             retained: RetainedCharge::new(quota.clone()),
             prepaid: None,
             prepaid_remaining: 0,
+            limit,
             quota,
             gate,
             lease: Some(lease),
@@ -491,6 +507,7 @@ impl BoundedFileSpool {
             delivery_prefix: 0,
         })
     }
+
     /// Create a spool whose retained capacity is reserved in full before
     /// any producer bytes are accepted. This is for exact native results that
     /// must not become lossy after an effect starts. Streaming stdout/stderr
@@ -524,6 +541,7 @@ impl BoundedFileSpool {
             retained: RetainedCharge::new(prepaid.quota.clone()),
             prepaid: Some(prepaid),
             prepaid_remaining: capacity,
+            limit: capacity,
             gate,
             lease: Some(lease),
             summary: StreamSummary::default(),
@@ -569,6 +587,9 @@ impl BoundedFileSpool {
             retained,
             prepaid: None,
             prepaid_remaining: 0,
+            limit: checkpoint
+                .effective_retained_limit()
+                .map_err(|_| SpoolError::RecoveryRejected)?,
             gate,
             lease: None,
             summary: checkpoint.stream,
@@ -588,7 +609,7 @@ impl BoundedFileSpool {
             self.summary.record_chunk(seen, 0)?;
             return Ok(true);
         }
-        let per_stream_full = self.summary.retained_bytes >= MAX_SPOOL_PER_STREAM;
+        let per_stream_full = self.summary.retained_bytes >= self.limit;
         let session_full = if self.prepaid.is_some() {
             self.prepaid_remaining == 0
         } else {
@@ -630,7 +651,7 @@ impl BoundedFileSpool {
             self.failed = true;
             return Err(SpoolError::Overflow);
         }
-        let available = MAX_SPOOL_PER_STREAM.saturating_sub(self.summary.retained_bytes);
+        let available = self.limit.saturating_sub(self.summary.retained_bytes);
         let prepaid_limit = self
             .prepaid
             .as_ref()
@@ -729,6 +750,9 @@ impl BoundedFileSpool {
     }
     pub fn retained_bytes(&self) -> u64 {
         self.summary.retained_bytes
+    }
+    pub(crate) fn retention_limit(&self) -> u64 {
+        self.limit
     }
     /// Only the host snapshot/recovery module may inspect this pinned file;
     /// no pathname is reconstructed and no external mutation is inferred.

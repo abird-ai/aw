@@ -479,14 +479,15 @@ impl OwnedOutput {
         Ok(owner_set)
     }
 
-    fn new(
+    fn new_with_limit(
         file: File,
         quota: Arc<Mutex<SessionQuota>>,
         owners: impl IntoIterator<Item = OutputOwner>,
+        limit: u64,
     ) -> Result<Self, Error> {
         let owner_set = Self::owners(owners)?;
         let gate = Arc::new(SpoolWriters::default());
-        let spool = BoundedFileSpool::new(file, quota, gate.clone())
+        let spool = BoundedFileSpool::new_with_limit(file, quota, gate.clone(), limit)
             .map(OutputStore::File)
             .map_err(|_| Error::OutputFailure)?;
         Ok(Self {
@@ -576,6 +577,12 @@ impl OwnedOutput {
 /// Host-side writer for one already-admitted Job output stream. It has no
 /// paging/ACK authority and cannot create streams; the JobManager remains the
 /// sole output owner while an adapter-specific drain worker feeds bytes.
+pub struct ShellOutputFiles {
+    pub stdout: File,
+    pub stderr: File,
+    pub stream_capacity: u64,
+}
+
 #[derive(Clone)]
 pub struct OutputWriter {
     output: Arc<Mutex<OwnedOutput>>,
@@ -1717,6 +1724,28 @@ impl JobManager {
             .ok_or(Error::OutputMissing)
     }
 
+    fn insert_output(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        output: Arc<Mutex<OwnedOutput>>,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
+        if !(1..=managed.job.total()).contains(&coordinate)
+            || !managed
+                .job
+                .state(coordinate)
+                .is_some_and(NodeState::in_flight)
+            || managed.outputs.contains_key(&(coordinate, stream))
+        {
+            return Err(Error::InvalidOutput);
+        }
+        managed.outputs.insert((coordinate, stream), output);
+        Ok(())
+    }
+
     /// Host supplies an empty secure spool file after node claim. The manager
     /// owns its byte accounting and all retained owners from this point onward.
     pub fn attach_output(
@@ -1727,29 +1756,38 @@ impl JobManager {
         file: File,
         owners: impl IntoIterator<Item = OutputOwner>,
     ) -> Result<(), Error> {
-        let output = Arc::new(Mutex::new(OwnedOutput::new(
+        self.attach_output_with_limit(
+            id,
+            coordinate,
+            stream,
+            file,
+            owners,
+            crate::task::MAX_SPOOL_PER_STREAM,
+        )
+    }
+
+    /// File-backed streaming output with a host-selected retained-prefix cap.
+    /// The cap is independent of the shared Session quota and may only narrow
+    /// the shared per-stream safety maximum.
+    pub fn attach_output_with_limit(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        file: File,
+        owners: impl IntoIterator<Item = OutputOwner>,
+        limit: u64,
+    ) -> Result<(), Error> {
+        if !(1..=crate::task::MAX_SPOOL_PER_STREAM).contains(&limit) {
+            return Err(Error::InvalidOutput);
+        }
+        let output = Arc::new(Mutex::new(OwnedOutput::new_with_limit(
             file,
             self.spool_quota.clone(),
             owners,
+            limit,
         )?));
-        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
-        if !(1..=managed.job.total()).contains(&coordinate)
-            || !managed
-                .job
-                .state(coordinate)
-                .is_some_and(NodeState::in_flight)
-        {
-            return Err(Error::InvalidOutput);
-        }
-        if managed
-            .outputs
-            .insert((coordinate, stream), output)
-            .is_some()
-        {
-            return Err(Error::InvalidOutput);
-        }
-        Ok(())
+        self.insert_output(id, coordinate, stream, output)
     }
 
     /// Atomically attach all three ShellNode retained streams while the node
@@ -1823,23 +1861,51 @@ impl JobManager {
         coordinate: usize,
         owner: OutputOwner,
         result_capacity: u64,
-        stdout_file: File,
-        stderr_file: File,
+        stdout: File,
+        stderr: File,
     ) -> Result<(OutputWriter, OutputWriter), Error> {
+        self.attach_shell_output_files_with_limit(
+            id,
+            coordinate,
+            owner,
+            result_capacity,
+            ShellOutputFiles {
+                stdout,
+                stderr,
+                stream_capacity: crate::task::MAX_SPOOL_PER_STREAM,
+            },
+        )
+    }
+
+    /// File-backed ShellNode outputs with an explicit retained-prefix ceiling
+    /// shared by stdout/stderr. The compact result remains exact/prepaid.
+    pub fn attach_shell_output_files_with_limit(
+        &self,
+        id: &str,
+        coordinate: usize,
+        owner: OutputOwner,
+        result_capacity: u64,
+        files: ShellOutputFiles,
+    ) -> Result<(OutputWriter, OutputWriter), Error> {
+        if !(1..=crate::task::MAX_SPOOL_PER_STREAM).contains(&files.stream_capacity) {
+            return Err(Error::InvalidOutput);
+        }
         let result = Arc::new(Mutex::new(OwnedOutput::new_reserved(
             self.spool_quota.clone(),
             [owner],
             result_capacity,
         )?));
-        let stdout = Arc::new(Mutex::new(OwnedOutput::new(
-            stdout_file,
+        let stdout = Arc::new(Mutex::new(OwnedOutput::new_with_limit(
+            files.stdout,
             self.spool_quota.clone(),
             [owner],
+            files.stream_capacity,
         )?));
-        let stderr = Arc::new(Mutex::new(OwnedOutput::new(
-            stderr_file,
+        let stderr = Arc::new(Mutex::new(OwnedOutput::new_with_limit(
+            files.stderr,
             self.spool_quota.clone(),
             [owner],
+            files.stream_capacity,
         )?));
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
@@ -1888,24 +1954,7 @@ impl JobManager {
             owners,
             crate::task::MAX_SPOOL_PER_STREAM,
         )?));
-        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
-        if !(1..=managed.job.total()).contains(&coordinate)
-            || !managed
-                .job
-                .state(coordinate)
-                .is_some_and(NodeState::in_flight)
-        {
-            return Err(Error::InvalidOutput);
-        }
-        if managed
-            .outputs
-            .insert((coordinate, stream), output)
-            .is_some()
-        {
-            return Err(Error::InvalidOutput);
-        }
-        Ok(())
+        self.insert_output(id, coordinate, stream, output)
     }
 
     /// Exact-result variant: reserves the full retained capacity before
@@ -1924,24 +1973,7 @@ impl JobManager {
             owners,
             capacity,
         )?));
-        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
-        if !(1..=managed.job.total()).contains(&coordinate)
-            || !managed
-                .job
-                .state(coordinate)
-                .is_some_and(NodeState::in_flight)
-        {
-            return Err(Error::InvalidOutput);
-        }
-        if managed
-            .outputs
-            .insert((coordinate, stream), output)
-            .is_some()
-        {
-            return Err(Error::InvalidOutput);
-        }
-        Ok(())
+        self.insert_output(id, coordinate, stream, output)
     }
 
     pub fn output_writer(
@@ -2685,6 +2717,50 @@ mod tests {
             .open(&path)
             .unwrap();
         (file, path)
+    }
+
+    fn claimed_output_job(id: &str, max_spool_bytes: u64) -> (JobManager, OutputOwner) {
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 16,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes,
+        })
+        .unwrap();
+        manager
+            .admit_runtime(
+                graph,
+                plans,
+                RuntimeAdmission {
+                    id,
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        manager.claim(id, 1, true, 2, |_, _| Ok(())).unwrap();
+        let owner = manager.job_output_owner(id).unwrap();
+        (manager, owner)
     }
 
     fn graph() -> Graph {
@@ -4252,6 +4328,245 @@ mod tests {
                 .unwrap()
                 .bytes,
             b"abc"
+        );
+        let _ = std::fs::remove_file(stdout_path);
+        let _ = std::fs::remove_file(stderr_path);
+    }
+
+    #[test]
+    fn duplicate_single_stream_attachment_never_replaces_original_output() {
+        // File-backed streaming output.
+        let (manager, owner) = claimed_output_job("dup-file", 64);
+        let (first_file, first_path) = output_file();
+        manager
+            .attach_output_with_limit("dup-file", 1, OutputStream::Stdout, first_file, [owner], 8)
+            .unwrap();
+        let writer = manager
+            .output_writer("dup-file", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(writer.append(b"abc").unwrap(), 3);
+        let (replacement, replacement_path) = output_file();
+        assert_eq!(
+            manager.attach_output_with_limit(
+                "dup-file",
+                1,
+                OutputStream::Stdout,
+                replacement,
+                [owner],
+                8,
+            ),
+            Err(Error::InvalidOutput)
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 3);
+        assert_eq!(writer.append(b"d").unwrap(), 1);
+        writer.finish().unwrap();
+        assert_eq!(
+            manager
+                .output_page("dup-file", 1, OutputStream::Stdout, 0, 8)
+                .unwrap()
+                .bytes,
+            b"abcd"
+        );
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(replacement_path);
+
+        // Incremental in-memory output.
+        let (manager, owner) = claimed_output_job("dup-memory", 64);
+        manager
+            .attach_output_memory("dup-memory", 1, OutputStream::Stdout, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("dup-memory", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(writer.append(b"abc").unwrap(), 3);
+        assert_eq!(
+            manager.attach_output_memory("dup-memory", 1, OutputStream::Stdout, [owner]),
+            Err(Error::InvalidOutput)
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 3);
+        assert_eq!(writer.append(b"d").unwrap(), 1);
+        writer.finish().unwrap();
+        assert_eq!(
+            manager
+                .output_page("dup-memory", 1, OutputStream::Stdout, 0, 8)
+                .unwrap()
+                .bytes,
+            b"abcd"
+        );
+
+        // Exact/prepaid result output. A rejected replacement must release its
+        // temporary reservation without disturbing the original reservation.
+        let (manager, owner) = claimed_output_job("dup-reserved", 32);
+        manager
+            .attach_output_reserved("dup-reserved", 1, OutputStream::Result, [owner], 8)
+            .unwrap();
+        assert_eq!(manager.spool_usage().unwrap().0, 8);
+        assert_eq!(
+            manager.attach_output_reserved("dup-reserved", 1, OutputStream::Result, [owner], 8,),
+            Err(Error::InvalidOutput)
+        );
+        assert_eq!(
+            manager.spool_usage().unwrap().0,
+            8,
+            "rejected replacement reservation must be returned"
+        );
+        let writer = manager
+            .output_writer("dup-reserved", 1, OutputStream::Result)
+            .unwrap();
+        assert_eq!(writer.append(b"abcd").unwrap(), 4);
+        writer.finish().unwrap();
+        assert_eq!(manager.spool_usage().unwrap().0, 4);
+        assert_eq!(
+            manager
+                .output_page("dup-reserved", 1, OutputStream::Result, 0, 8)
+                .unwrap()
+                .bytes,
+            b"abcd"
+        );
+    }
+
+    #[test]
+    fn invalid_file_stream_capacity_fails_before_publication_or_quota() {
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 16,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 64,
+        })
+        .unwrap();
+        manager
+            .admit_runtime(
+                graph,
+                plans,
+                RuntimeAdmission {
+                    id: "invalid-file-cap",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        manager
+            .claim("invalid-file-cap", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        let owner = manager.job_output_owner("invalid-file-cap").unwrap();
+        let (file, path) = output_file();
+        assert!(matches!(
+            manager.attach_output_with_limit(
+                "invalid-file-cap",
+                1,
+                OutputStream::Stdout,
+                file,
+                [owner],
+                0,
+            ),
+            Err(Error::InvalidOutput)
+        ));
+        assert!(matches!(
+            manager.output_summary("invalid-file-cap", 1, OutputStream::Stdout),
+            Err(Error::OutputMissing)
+        ));
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_shell_stream_capacity_is_a_real_retained_prefix_ceiling() {
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 16,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 64,
+        })
+        .unwrap();
+        manager
+            .admit_runtime(
+                graph,
+                plans,
+                RuntimeAdmission {
+                    id: "file-shell-cap",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        manager
+            .claim("file-shell-cap", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        let owner = manager.job_output_owner("file-shell-cap").unwrap();
+        let (stdout_file, stdout_path) = output_file();
+        let (stderr_file, stderr_path) = output_file();
+        let (stdout, stderr) = manager
+            .attach_shell_output_files_with_limit(
+                "file-shell-cap",
+                1,
+                owner,
+                8,
+                ShellOutputFiles {
+                    stdout: stdout_file,
+                    stderr: stderr_file,
+                    stream_capacity: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(stdout.append(b"abcdef").unwrap(), 3);
+        assert_eq!(stderr.append(b"uvwxyz").unwrap(), 3);
+        stdout.finish().unwrap();
+        stderr.finish().unwrap();
+        let out = manager
+            .output_page("file-shell-cap", 1, OutputStream::Stdout, 0, 8)
+            .unwrap();
+        let err = manager
+            .output_page("file-shell-cap", 1, OutputStream::Stderr, 0, 8)
+            .unwrap();
+        assert_eq!(out.bytes, b"abc");
+        assert_eq!(err.bytes, b"uvw");
+        assert_eq!(
+            (out.total_bytes, out.retained_bytes, out.truncated),
+            (6, 3, true)
+        );
+        assert_eq!(
+            (err.total_bytes, err.retained_bytes, err.truncated),
+            (6, 3, true)
         );
         let _ = std::fs::remove_file(stdout_path);
         let _ = std::fs::remove_file(stderr_path);

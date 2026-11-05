@@ -3,8 +3,8 @@
 //! released. The host's journal owns time, CAS and cleanup evidence.
 
 use crate::{
-    task::{TaskDisposition, MAX_SPOOL_PER_STREAM},
-    task_checkpoint::{SpoolCheckpoint, CHECKPOINT_VERSION},
+    task::TaskDisposition,
+    task_checkpoint::{supported_checkpoint_version, SpoolCheckpoint},
     task_fence::TaskIdentity,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,10 +63,13 @@ impl RetentionLease {
         {
             return Err(RetentionError::NotTerminal);
         }
-        if checkpoint.version != CHECKPOINT_VERSION
+        let retained_limit = checkpoint
+            .effective_retained_limit()
+            .map_err(|_| RetentionError::InvalidCheckpoint)?;
+        if !supported_checkpoint_version(checkpoint.version)
             || checkpoint.intent_sequence == 0
             || checkpoint.generation == 0
-            || checkpoint.retained_len > MAX_SPOOL_PER_STREAM
+            || checkpoint.retained_len > retained_limit
             || checkpoint.stream.retained_bytes != checkpoint.retained_len
             || checkpoint.stream.total_bytes < checkpoint.retained_len
             || checkpoint.stream.acknowledged > checkpoint.stream.delivered_high_water
@@ -144,6 +147,7 @@ impl CleanupAuthority<'_> {
 mod tests {
     use super::*;
     use crate::{task::StreamSummary, ToolEffect};
+    use crate::{task::MAX_SPOOL_PER_STREAM, task_checkpoint::CHECKPOINT_VERSION};
     fn input() -> (TaskIdentity, SpoolCheckpoint) {
         let identity = TaskIdentity {
             actor: "owner".into(),
@@ -168,6 +172,7 @@ mod tests {
             }))
             .unwrap(),
             retained_len: 20,
+            retained_limit: None,
             sha256: [1; 32],
             stream: StreamSummary {
                 total_bytes: 20,
@@ -267,6 +272,7 @@ mod tests {
             Some(RetentionError::InvalidCheckpoint)
         );
         cp.version = CHECKPOINT_VERSION;
+        cp.retained_limit = Some(MAX_SPOOL_PER_STREAM);
         cp.retained_len = MAX_SPOOL_PER_STREAM + 1;
         assert_eq!(
             RetentionLease::for_checkpoint(&cp, &identity, 100).err(),

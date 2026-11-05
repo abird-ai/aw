@@ -14,8 +14,13 @@ use std::{
     io::{self},
 };
 
-pub const CHECKPOINT_VERSION: u16 = 1;
+pub const CHECKPOINT_VERSION: u16 = 2;
+const LEGACY_CHECKPOINT_VERSION: u16 = 1;
 const CHUNK: usize = 64 * 1024;
+
+pub(crate) fn supported_checkpoint_version(version: u16) -> bool {
+    matches!(version, LEGACY_CHECKPOINT_VERSION | CHECKPOINT_VERSION)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpoolCheckpoint {
@@ -26,6 +31,10 @@ pub struct SpoolCheckpoint {
     pub disposition: TaskDisposition,
     pub file_identity: SpoolFileIdentity,
     pub retained_len: u64,
+    /// Exact retained-prefix ceiling used by this stream. Version 1 omitted
+    /// this field because the shared maximum was the only ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_limit: Option<u64>,
     pub sha256: [u8; 32],
     pub stream: StreamSummary,
     pub output_ok: bool,
@@ -76,11 +85,22 @@ impl SpoolCheckpoint {
             disposition: fence.state(),
             file_identity: spool_file_identity(file).map_err(|_| CheckpointError::ChangedFile)?,
             retained_len: length,
+            retained_limit: Some(spool.retention_limit()),
             sha256,
             stream: summary,
             output_ok: !spool.output_failed(),
         })
     }
+    pub(crate) fn effective_retained_limit(&self) -> Result<u64, CheckpointError> {
+        match (self.version, self.retained_limit) {
+            (LEGACY_CHECKPOINT_VERSION, None) => Ok(MAX_SPOOL_PER_STREAM),
+            (CHECKPOINT_VERSION, Some(limit)) if (1..=MAX_SPOOL_PER_STREAM).contains(&limit) => {
+                Ok(limit)
+            }
+            _ => Err(CheckpointError::InvalidSummary),
+        }
+    }
+
     pub fn validate(
         &self,
         file: &File,
@@ -88,7 +108,7 @@ impl SpoolCheckpoint {
         journal_sequence: u64,
         expected_generation: u64,
     ) -> Result<(), CheckpointError> {
-        if self.version != CHECKPOINT_VERSION {
+        if !supported_checkpoint_version(self.version) {
             return Err(CheckpointError::WrongVersion);
         }
         if self.task_binding != identity.fingerprint() || self.intent_sequence != journal_sequence {
@@ -100,9 +120,10 @@ impl SpoolCheckpoint {
         if !self.disposition.terminal() {
             return Err(CheckpointError::UnsettledTask);
         }
+        let retained_limit = self.effective_retained_limit()?;
         if (self.disposition == TaskDisposition::Completed && !self.output_ok)
             || self.stream.retained_bytes != self.retained_len
-            || self.stream.retained_bytes > MAX_SPOOL_PER_STREAM
+            || self.retained_len > retained_limit
             || self.stream.total_bytes < self.stream.retained_bytes
             || self.stream.acknowledged > self.stream.delivered_high_water
             || self.stream.delivered_high_water > self.stream.total_bytes
@@ -271,6 +292,18 @@ mod tests {
             Err(CheckpointError::InvalidSummary)
         ));
         changed = checkpoint.clone();
+        changed.retained_limit = Some(0);
+        assert!(matches!(
+            changed.validate(&handle, &identity, 3, 3),
+            Err(CheckpointError::InvalidSummary)
+        ));
+        changed = checkpoint.clone();
+        changed.retained_limit = Some(changed.retained_len.saturating_sub(1));
+        assert!(matches!(
+            changed.validate(&handle, &identity, 3, 3),
+            Err(CheckpointError::InvalidSummary)
+        ));
+        changed = checkpoint.clone();
         changed.stream.acknowledged = 999;
         assert!(matches!(
             changed.validate(&handle, &identity, 3, 3),
@@ -397,6 +430,58 @@ mod restore_tests {
         assert_eq!(quota.lock().unwrap().used(), 0);
         fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn recovery_preserves_narrow_retained_prefix_limit_and_old_v1_defaults() {
+        let (path, file, id, fence) = setup();
+        let quota = Arc::new(Mutex::new(SessionQuota::new(32)));
+        let gate = Arc::new(SpoolWriters::default());
+        let mut spool =
+            BoundedFileSpool::new_with_limit(file, quota.clone(), gate.clone(), 4).unwrap();
+        assert_eq!(spool.append(b"abcdefgh").unwrap(), 4);
+        spool.finish_writer().unwrap();
+        assert!(gate.seal_and_wait_idle(Duration::from_secs(1)));
+        let checkpoint = SpoolCheckpoint::from_spool(&spool, &fence).unwrap();
+        assert_eq!(checkpoint.retained_limit, Some(4));
+        assert_eq!(checkpoint.retained_len, 4);
+        assert!(checkpoint.stream.truncated);
+        let wire = serde_json::to_vec(&checkpoint).unwrap();
+        let decoded: SpoolCheckpoint = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded.retained_limit, Some(4));
+        drop(spool);
+        let handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let recovered =
+            BoundedFileSpool::restore_verified(handle, quota.clone(), &decoded, &id, 18, 3)
+                .unwrap();
+        assert_eq!(recovered.retention_limit(), 4);
+        drop(recovered);
+
+        let mut old = serde_json::to_value(&decoded).unwrap();
+        old["version"] = serde_json::json!(LEGACY_CHECKPOINT_VERSION);
+        old.as_object_mut().unwrap().remove("retained_limit");
+        let old: SpoolCheckpoint = serde_json::from_value(old).unwrap();
+        assert_eq!(old.retained_limit, None);
+        assert_eq!(
+            old.effective_retained_limit().unwrap(),
+            MAX_SPOOL_PER_STREAM
+        );
+        old.validate(
+            &OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+            &id,
+            18,
+            3,
+        )
+        .unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn recovery_refuses_unsettled_or_corrupt_and_insufficient_quota() {
         let (path, file, id, fence) = setup();
