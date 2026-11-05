@@ -147,6 +147,106 @@ pub fn project_read_text(
     .to_string()
 }
 
+#[cfg(feature = "batch")]
+fn receipt_primary(content: &str) -> Option<super::status::Primary> {
+    match content.split_whitespace().next()? {
+        "ok" => Some(super::status::Primary::Ok),
+        "unchanged" => Some(super::status::Primary::Unchanged),
+        "fail" => Some(super::status::Primary::Fail),
+        "mixed" => Some(super::status::Primary::Mixed),
+        "unknown" => Some(super::status::Primary::Unknown),
+        "skip" => Some(super::status::Primary::Skip),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "batch")]
+fn mutation_tool(tool: super::schema::Tool) -> bool {
+    use super::schema::Tool;
+    matches!(
+        tool,
+        Tool::Write
+            | Tool::Edit
+            | Tool::Patch
+            | Tool::Copy
+            | Tool::Move
+            | Tool::Remove
+            | Tool::Bwrite
+            | Tool::Bedit
+    )
+}
+
+/// Canonical Graph status for one completed direct-tool result. Product hosts
+/// must not infer this independently: dependency predicates depend on these
+/// exact primary/modifier semantics.
+#[cfg(feature = "batch")]
+pub fn graph_status(tool: super::schema::Tool, output: &Output) -> super::batch::Status {
+    let status_line = match &output.body {
+        Body::Read { status, .. } => status.clone(),
+        Body::Text(content) if output.truncated => content.lines().last().and_then(|line| {
+            let line = line.trim();
+            (line.starts_with("more ")
+                || line.starts_with("incomplete ")
+                || line.starts_with("mixed ")
+                || line.starts_with("… incomplete:"))
+            .then(|| line.to_owned())
+        }),
+        Body::Text(_) | Body::Media { .. } => None,
+    };
+    let content = match &output.body {
+        Body::Text(content) => Some(content.as_str()),
+        Body::Read { data, .. } => Some(data.as_str()),
+        Body::Media { .. } => None,
+    };
+    let mut primary = if mutation_tool(tool) {
+        content
+            .and_then(receipt_primary)
+            .unwrap_or(if output.is_error {
+                super::status::Primary::Fail
+            } else {
+                super::status::Primary::Ok
+            })
+    } else if output.is_error {
+        status_line
+            .as_deref()
+            .and_then(receipt_primary)
+            .unwrap_or(super::status::Primary::Fail)
+    } else {
+        super::status::Primary::Ok
+    };
+    if output.is_error && primary == super::status::Primary::Ok {
+        primary = super::status::Primary::Fail;
+    }
+    let detail = status_line.as_deref().unwrap_or_default();
+    super::batch::Status {
+        primary,
+        more: detail == "more" || detail.starts_with("more ") || detail.contains(" more "),
+        incomplete: detail.starts_with("incomplete ")
+            || detail.contains("incomplete=")
+            || detail.contains("incomplete:"),
+    }
+}
+
+/// Canonical text retained by Graph/native Job result streams. Typed media is
+/// direct-only and therefore has no Graph text projection.
+pub fn graph_text(output: &Output) -> Option<String> {
+    match &output.body {
+        Body::Text(content) => Some(content.clone()),
+        Body::Read {
+            data,
+            status,
+            next,
+            numbered,
+        } => Some(project_read_text(
+            data.clone(),
+            status.as_deref(),
+            *next,
+            *numbered,
+        )),
+        Body::Media { .. } => None,
+    }
+}
+
 impl Output {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
@@ -795,6 +895,42 @@ mod tests {
             ),
             "1\tvalue\nmore line=2 byte=0\n"
         );
+    }
+
+    #[cfg(feature = "batch")]
+    #[test]
+    fn graph_status_and_text_are_canonical_for_receipts_and_partial_reads() {
+        use super::super::{batch::Status, schema::Tool, status::Primary};
+        let mutation = Output::text("unchanged");
+        assert_eq!(
+            graph_status(Tool::Write, &mutation),
+            Status {
+                primary: Primary::Unchanged,
+                more: false,
+                incomplete: false,
+            }
+        );
+        assert_eq!(graph_text(&mutation).as_deref(), Some("unchanged"));
+
+        let read = Output {
+            body: Body::Read {
+                data: "a\n".into(),
+                status: Some("more line=2 byte=0".into()),
+                next: Some((2, 0)),
+                numbered: true,
+            },
+            is_error: false,
+            truncated: true,
+        };
+        assert_eq!(
+            graph_status(Tool::Read, &read),
+            Status {
+                primary: Primary::Ok,
+                more: true,
+                incomplete: false,
+            }
+        );
+        assert!(graph_text(&read).unwrap().contains("more line=2 byte=0"));
     }
 
     #[test]

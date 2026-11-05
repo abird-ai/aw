@@ -307,87 +307,9 @@ fn model_scope(path: &str) -> String {
     }
 }
 
-fn mutation_tool(tool: CoreTool) -> bool {
-    matches!(
-        tool,
-        CoreTool::Write
-            | CoreTool::Edit
-            | CoreTool::Patch
-            | CoreTool::Copy
-            | CoreTool::Move
-            | CoreTool::Remove
-            | CoreTool::Bwrite
-            | CoreTool::Bedit
-    )
-}
-
-fn receipt_primary(content: &str) -> Option<Primary> {
-    match content.split_whitespace().next()? {
-        "ok" => Some(Primary::Ok),
-        "unchanged" => Some(Primary::Unchanged),
-        "fail" => Some(Primary::Fail),
-        "mixed" => Some(Primary::Mixed),
-        "unknown" => Some(Primary::Unknown),
-        "skip" => Some(Primary::Skip),
-        _ => None,
-    }
-}
-
-fn canonical_tail_status(tool: CoreTool, output: &ToolOutput) -> Option<String> {
-    if !output.truncated {
-        return None;
-    }
-    if tool == CoreTool::Read {
-        if let Ok(value) = serde_json::from_str::<Value>(&output.content) {
-            if let Some(status) = value.get("status").and_then(Value::as_str) {
-                return Some(status.to_owned());
-            }
-        }
-    }
-    output.content.lines().last().and_then(|line| {
-        let line = line.trim();
-        (line.starts_with("more ")
-            || line.starts_with("incomplete ")
-            || line.starts_with("mixed ")
-            || line.starts_with("… incomplete:"))
-        .then(|| line.to_owned())
-    })
-}
-
-fn status_from_output(tool: CoreTool, output: &ToolOutput) -> Status {
-    let status_line = canonical_tail_status(tool, output);
-    let mut primary = if mutation_tool(tool) {
-        receipt_primary(&output.content).unwrap_or(if output.is_error {
-            Primary::Fail
-        } else {
-            Primary::Ok
-        })
-    } else if output.is_error {
-        status_line
-            .as_deref()
-            .and_then(receipt_primary)
-            .unwrap_or(Primary::Fail)
-    } else {
-        Primary::Ok
-    };
-    if output.is_error && primary == Primary::Ok {
-        primary = Primary::Fail;
-    }
-    let status = status_line.as_deref().unwrap_or_default();
-    let more = status == "more" || status.starts_with("more ") || status.contains(" more ");
-    let incomplete = status.starts_with("incomplete ")
-        || status.contains("incomplete=")
-        || status.contains("incomplete:");
-    Status {
-        primary,
-        more,
-        incomplete,
-    }
-}
-
 fn error_result(tool: CoreTool, error: Error) -> (ToolOutput, Status) {
     let detail = aw_tools::task::bounded_task_error(error.to_string());
-    let ambiguous = mutation_tool(tool)
+    let ambiguous = tool.action() != aw_tools::filesystem::access::Action::Read
         && matches!(
             error,
             Error::Io(_) | Error::Protocol(_) | Error::Cancelled | Error::Timeout
@@ -1659,19 +1581,31 @@ impl JobHost {
             })
         })
         .await;
-        let executed = match executed {
-            Ok(Ok(output)) => crate::canonical_direct_output(output, plan.budget().result_bytes),
-            Ok(Err(error)) => Err(crate::canonical_direct_error(error)),
-            Err(_) => Err(Error::Protocol(
-                "canonical filesystem worker failed; inspect workspace before retrying",
-            )),
-        };
         let (output, status) = match executed {
-            Ok(output) => {
-                let status = status_from_output(native, &output);
-                (output, status)
+            Ok(Ok(output)) => {
+                let status = aw_tools::filesystem::direct::graph_status(native, &output);
+                let content = aw_tools::filesystem::direct::graph_text(&output).ok_or(
+                    Error::Protocol("direct-only media result reached native Job execution"),
+                );
+                match content {
+                    Ok(content) => (
+                        ToolOutput {
+                            content,
+                            is_error: output.is_error,
+                            truncated: output.truncated,
+                        },
+                        status,
+                    ),
+                    Err(error) => error_result(native, error),
+                }
             }
-            Err(error) => error_result(native, error),
+            Ok(Err(error)) => error_result(native, crate::canonical_direct_error(error)),
+            Err(_) => error_result(
+                native,
+                Error::Protocol(
+                    "canonical filesystem worker failed; inspect workspace before retrying",
+                ),
+            ),
         };
         if output.content.len() > plan.budget().result_bytes {
             let _ = self
