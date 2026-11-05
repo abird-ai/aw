@@ -540,13 +540,18 @@ impl OwnedOutput {
         if self.writer_finished {
             return Ok(());
         }
-        self.spool.finish_writer()?;
+        // Closing the underlying writer lease is a lifetime transition even
+        // when the write itself failed. Publish quiescence independently from
+        // output success so retention/recovery never strands a terminal Job.
+        let spool_result = self.spool.finish_writer();
         self.gate.seal();
         if !self.gate.is_idle() {
             return Err(Error::OutputFailure);
         }
         self.writer_finished = true;
-        let _ = self.maybe_release()?;
+        let release_result = self.maybe_release();
+        spool_result?;
+        let _ = release_result?;
         Ok(())
     }
 
@@ -4343,6 +4348,78 @@ mod tests {
         assert_eq!(page.bytes, b"abc");
         assert!(page.writer_finished);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_output_writer_still_publishes_quiescence_for_retention() {
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 1024,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        let manager = manager(2);
+        manager
+            .admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "failed-writer",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        manager
+            .claim("failed-writer", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        let owner = manager.job_output_owner("failed-writer").unwrap();
+        manager
+            .attach_output_memory("failed-writer", 1, OutputStream::Stdout, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("failed-writer", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(writer.append(b"abc").unwrap(), 3);
+        writer.mark_failed().unwrap();
+        assert_eq!(writer.finish(), Err(Error::OutputFailure));
+        let (summary, finished) = manager
+            .output_summary("failed-writer", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(summary.retained_bytes, 3);
+        assert!(finished, "failed writer lifetime must still be quiescent");
+        drop(writer);
+
+        let sequence = manager.current_sequence("failed-writer").unwrap();
+        manager
+            .settle(
+                "failed-writer",
+                1,
+                NodeState::Claimed { sequence: 2 },
+                Status {
+                    primary: Primary::Unknown,
+                    more: false,
+                    incomplete: false,
+                },
+                sequence + 1,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager.expire_terminal("failed-writer").unwrap();
+        assert!(matches!(manager.get("failed-writer"), Err(Error::NotFound)));
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
     }
 
     #[test]
