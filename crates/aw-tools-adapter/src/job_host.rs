@@ -329,6 +329,18 @@ fn error_result(tool: CoreTool, error: Error) -> (ToolOutput, Status) {
     )
 }
 
+fn direct_error_result(
+    error: aw_tools::filesystem::direct::Error<aw_platform::scoped_fs::ScopedError>,
+) -> (ToolOutput, Status) {
+    let status = aw_tools::filesystem::direct::graph_error_status(&error);
+    let detail =
+        aw_tools::task::bounded_task_error(crate::canonical_direct_error(error).to_string());
+    (
+        ToolOutput::error(format!("{} {detail}", status.primary.as_str())),
+        status,
+    )
+}
+
 pub(crate) struct JobHostConfig {
     pub session: String,
     pub branch: String,
@@ -1599,7 +1611,7 @@ impl JobHost {
                     Err(error) => error_result(native, error),
                 }
             }
-            Ok(Err(error)) => error_result(native, crate::canonical_direct_error(error)),
+            Ok(Err(error)) => direct_error_result(error),
             Err(_) => error_result(
                 native,
                 Error::Protocol(
@@ -2242,6 +2254,18 @@ mod tests {
             read.plans[0].budget().result_bytes,
             aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES
         );
+    }
+
+    #[test]
+    fn direct_graph_error_classification_preserves_mixed_vs_unknown() {
+        use aw_tools::filesystem::direct::Error as DirectError;
+        use aw_tools::filesystem::status::Primary;
+        let (_, partial) = direct_error_result(DirectError::PartialCommit(None));
+        let (_, unknown) = direct_error_result(DirectError::UnknownCommit(
+            aw_platform::scoped_fs::ScopedError::Denied("fixture"),
+        ));
+        assert_eq!(partial.primary, Primary::Mixed);
+        assert_eq!(unknown.primary, Primary::Unknown);
     }
 
     #[test]

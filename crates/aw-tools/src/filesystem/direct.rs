@@ -286,6 +286,26 @@ pub enum Error<E> {
     PartialCommit(Option<E>),
 }
 
+/// Canonical Graph outcome for a direct-execution error. This classification is
+/// semantic, not product transport policy: known pre-effect failures are `fail`,
+/// an explicitly known partial publication is `mixed`, and an ambiguous commit
+/// is `unknown`. Adapters may choose their own human-facing error detail, but
+/// dependency predicates must consume this exact status.
+#[cfg(feature = "batch")]
+pub fn graph_error_status<E>(error: &Error<E>) -> super::batch::Status {
+    use super::{batch::Status, status::Primary};
+    let primary = match error {
+        Error::PartialCommit(_) => Primary::Mixed,
+        Error::UnknownCommit(_) => Primary::Unknown,
+        Error::Invalid(_) | Error::Limit(_) | Error::Cancelled | Error::Backend(_) => Primary::Fail,
+    };
+    Status {
+        primary,
+        more: false,
+        incomplete: false,
+    }
+}
+
 fn model_root(path: &str) -> &str {
     if path.is_empty() || path == "." {
         ""
@@ -894,6 +914,39 @@ mod tests {
                 true,
             ),
             "1\tvalue\nmore line=2 byte=0\n"
+        );
+    }
+
+    #[cfg(feature = "batch")]
+    #[test]
+    fn graph_error_status_preserves_partial_vs_unknown_commit() {
+        use super::super::{batch::Status, status::Primary};
+        let fail: Error<()> = Error::Limit("fixture");
+        let partial: Error<()> = Error::PartialCommit(None);
+        let unknown: Error<()> = Error::UnknownCommit(());
+        assert_eq!(
+            graph_error_status(&fail),
+            Status {
+                primary: Primary::Fail,
+                more: false,
+                incomplete: false
+            }
+        );
+        assert_eq!(
+            graph_error_status(&partial),
+            Status {
+                primary: Primary::Mixed,
+                more: false,
+                incomplete: false
+            }
+        );
+        assert_eq!(
+            graph_error_status(&unknown),
+            Status {
+                primary: Primary::Unknown,
+                more: false,
+                incomplete: false
+            }
         );
     }
 
