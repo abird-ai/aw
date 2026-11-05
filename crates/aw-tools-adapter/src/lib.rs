@@ -582,6 +582,8 @@ impl LocalToolLimits {
             || !(1..=defaults.shell_stream_bytes).contains(&self.shell_stream_bytes)
             || !(1..=defaults.edit_text_bytes).contains(&self.edit_text_bytes)
             || self.jobs.max_retained_jobs > defaults.jobs.max_retained_jobs
+            || self.jobs.max_exposed_jobs > defaults.jobs.max_exposed_jobs
+            || self.jobs.max_hidden_jobs > defaults.jobs.max_hidden_jobs
             || self.jobs.max_active_nodes > defaults.jobs.max_active_nodes
             || self.jobs.max_hidden_replays > defaults.jobs.max_hidden_replays
             || self.jobs.max_spool_bytes > defaults.jobs.max_spool_bytes

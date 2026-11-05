@@ -1862,6 +1862,8 @@ mod tests {
         let (root, agent, _runtime, ctx) = fixture();
         let mut tool_limits = crate::LocalToolLimits::default();
         tool_limits.jobs.max_retained_jobs = 4;
+        tool_limits.jobs.max_exposed_jobs = 4;
+        tool_limits.jobs.max_hidden_jobs = 4;
         tool_limits.jobs.max_active_nodes = tool_limits.jobs.max_active_nodes.min(4);
         let runtime = JobRuntime::new_with_native_tools(
             Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),

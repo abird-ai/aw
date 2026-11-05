@@ -1357,6 +1357,8 @@ mod tests {
         .unwrap();
         let manager = JobManager::new(Limits {
             max_retained_jobs: 4,
+            max_exposed_jobs: 4,
+            max_hidden_jobs: 4,
             max_active_nodes: 2,
             max_hidden_replays: 4,
             max_spool_bytes: 64 * 1024,

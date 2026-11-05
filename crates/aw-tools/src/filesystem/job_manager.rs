@@ -30,6 +30,9 @@ use std::{
 };
 
 pub const DEFAULT_MAX_RETAINED_JOBS: usize = 256;
+pub const DEFAULT_MAX_EXPOSED_JOBS: usize = DEFAULT_MAX_RETAINED_JOBS;
+pub const DEFAULT_MAX_HIDDEN_JOBS: usize = DEFAULT_MAX_RETAINED_JOBS;
+pub const MAX_RETAINED_JOBS: usize = 8_192;
 pub const DEFAULT_MAX_ACTIVE_NODES: usize = 32;
 pub const MAX_JOB_LIST_PAGE: usize = 256;
 /// Guaranteed upper bound for the complete compact `job_get`/`job_cancel`
@@ -166,7 +169,13 @@ pub fn plan_graph<E>(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
+    /// Aggregate live/retained Job metadata bound, including exposed and hidden Jobs.
     pub max_retained_jobs: usize,
+    /// User-visible Jobs addressable through `list`/`get` after exposure.
+    pub max_exposed_jobs: usize,
+    /// Unexposed Jobs owned by optimistic calls or a host transport delivery ledger.
+    /// This is independent of replay-identity tombstones.
+    pub max_hidden_jobs: usize,
     pub max_active_nodes: usize,
     pub max_hidden_replays: usize,
     pub max_spool_bytes: u64,
@@ -175,6 +184,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_retained_jobs: DEFAULT_MAX_RETAINED_JOBS,
+            max_exposed_jobs: DEFAULT_MAX_EXPOSED_JOBS,
+            max_hidden_jobs: DEFAULT_MAX_HIDDEN_JOBS,
             max_active_nodes: DEFAULT_MAX_ACTIVE_NODES,
             max_hidden_replays: MAX_HIDDEN_REQUEST_REPLAYS,
             max_spool_bytes: DEFAULT_SESSION_SPOOL,
@@ -184,7 +195,11 @@ impl Default for Limits {
 impl Limits {
     pub fn validate(self) -> Result<Self, Error> {
         if self.max_retained_jobs == 0
-            || self.max_retained_jobs > 4096
+            || self.max_retained_jobs > MAX_RETAINED_JOBS
+            || self.max_exposed_jobs == 0
+            || self.max_exposed_jobs > self.max_retained_jobs
+            || self.max_hidden_jobs == 0
+            || self.max_hidden_jobs > self.max_retained_jobs
             || self.max_active_nodes == 0
             || self.max_active_nodes > 1024
             || self.max_hidden_replays == 0
@@ -746,6 +761,49 @@ impl JobManager {
         Ok(())
     }
 
+    fn exposed_jobs(state: &State) -> usize {
+        state
+            .jobs
+            .values()
+            .filter(|managed| managed.exposed)
+            .count()
+    }
+
+    fn hidden_jobs(state: &State) -> usize {
+        state
+            .jobs
+            .values()
+            .filter(|managed| !managed.exposed)
+            .count()
+    }
+
+    fn ensure_exposed_capacity(
+        &self,
+        state: &mut State,
+        protected: Option<&str>,
+        additional: usize,
+    ) -> bool {
+        if additional == 0 {
+            return true;
+        }
+        loop {
+            let exposed_ok = Self::exposed_jobs(state)
+                .checked_add(additional)
+                .is_some_and(|count| count <= self.limits.max_exposed_jobs);
+            let aggregate_ok = state
+                .jobs
+                .len()
+                .checked_add(additional)
+                .is_some_and(|count| count <= self.limits.max_retained_jobs);
+            if exposed_ok && aggregate_ok {
+                return true;
+            }
+            if !Self::prune_one_released_terminal(state, protected) {
+                return false;
+            }
+        }
+    }
+
     fn prune_one_released_terminal(state: &mut State, protected: Option<&str>) -> bool {
         let candidate = state
             .jobs
@@ -793,12 +851,15 @@ impl JobManager {
         if state.jobs.contains_key(id) {
             return Err(Error::DuplicateId);
         }
-        if state.jobs.len() >= self.limits.max_retained_jobs
-            && !Self::prune_one_released_terminal(&mut state, protected)
+        if exposed {
+            if !self.ensure_exposed_capacity(&mut state, protected, 1) {
+                return Err(Error::Capacity);
+            }
+        } else if Self::hidden_jobs(&state) >= self.limits.max_hidden_jobs
+            || state.jobs.len() >= self.limits.max_retained_jobs
         {
-            return Err(Error::Capacity);
-        }
-        if state.jobs.len() >= self.limits.max_retained_jobs {
+            // Hidden host/transport work must never reclaim exposed history to admit
+            // itself. The host may explicitly expire/release state and retry.
             return Err(Error::Capacity);
         }
         let restored_active = job.active();
@@ -915,8 +976,16 @@ impl JobManager {
 
     pub fn expose(&self, id: &str) -> Result<(), Error> {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
-        managed.exposed = true;
+        let already_exposed = state.jobs.get(id).ok_or(Error::NotFound)?.exposed;
+        if already_exposed {
+            return Ok(());
+        }
+        while Self::exposed_jobs(&state) >= self.limits.max_exposed_jobs {
+            if !Self::prune_one_released_terminal(&mut state, Some(id)) {
+                return Err(Error::Capacity);
+            }
+        }
+        state.jobs.get_mut(id).ok_or(Error::NotFound)?.exposed = true;
         Ok(())
     }
 
@@ -1201,7 +1270,7 @@ impl JobManager {
     /// token; exposure/expiry between calls may shift later offsets.
     pub fn list(&self, offset: usize, limit: usize) -> Result<ListPage, Error> {
         if limit == 0
-            || limit > self.limits.max_retained_jobs.min(MAX_JOB_LIST_PAGE)
+            || limit > self.limits.max_exposed_jobs.min(MAX_JOB_LIST_PAGE)
             || offset.checked_add(limit).is_none()
         {
             return Err(Error::InvalidLimits);
@@ -2515,6 +2584,8 @@ mod tests {
     fn job_limits_use_shared_safety_maxima_not_one_hosts_defaults() {
         let limits = Limits {
             max_retained_jobs: DEFAULT_MAX_RETAINED_JOBS + 1,
+            max_exposed_jobs: DEFAULT_MAX_RETAINED_JOBS + 1,
+            max_hidden_jobs: DEFAULT_MAX_RETAINED_JOBS + 1,
             max_active_nodes: DEFAULT_MAX_ACTIVE_NODES + 1,
             max_hidden_replays: MAX_HIDDEN_REQUEST_REPLAYS + 1,
             max_spool_bytes: DEFAULT_SESSION_SPOOL + 1,
@@ -2525,6 +2596,20 @@ mod tests {
             ..Limits::default()
         };
         assert!(too_wide.validate().is_err());
+        assert!(Limits {
+            max_retained_jobs: 4,
+            max_exposed_jobs: 5,
+            ..Limits::default()
+        }
+        .validate()
+        .is_err());
+        assert!(Limits {
+            max_retained_jobs: 4,
+            max_hidden_jobs: 5,
+            ..Limits::default()
+        }
+        .validate()
+        .is_err());
     }
 
     use crate::{
@@ -2605,6 +2690,8 @@ mod tests {
     fn manager(active: usize) -> JobManager {
         JobManager::new(Limits {
             max_retained_jobs: 256,
+            max_exposed_jobs: 256,
+            max_hidden_jobs: 256,
             max_active_nodes: active,
             max_hidden_replays: 64,
             max_spool_bytes: 1024 * 1024,
@@ -2930,6 +3017,38 @@ mod tests {
         );
     }
 
+    fn admit_simple(manager: &JobManager, id: &str, exposed: bool) {
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 64,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        manager
+            .admit_runtime(
+                graph,
+                plans,
+                RuntimeAdmission {
+                    id,
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed,
+                },
+            )
+            .unwrap();
+    }
+
     fn terminal_no_output(manager: &JobManager, id: &str) {
         let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
         let plans = plan_graph(&graph, |_, _| {
@@ -3144,6 +3263,8 @@ mod tests {
     fn provisional_unstarted_job_can_be_discarded_without_erasing_claim_tombstone() {
         let manager = JobManager::new(Limits {
             max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
             max_active_nodes: 1,
             max_hidden_replays: 2,
             max_spool_bytes: 1024,
@@ -3205,6 +3326,8 @@ mod tests {
     fn ready_replay_prevents_discarding_its_provisional_job() {
         let manager = JobManager::new(Limits {
             max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
             max_active_nodes: 1,
             max_hidden_replays: 2,
             max_spool_bytes: 1024,
@@ -3256,6 +3379,8 @@ mod tests {
     fn restart_never_prunes_source_job_to_make_capacity() {
         let manager = JobManager::new(Limits {
             max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
             max_active_nodes: 1,
             max_hidden_replays: 2,
             max_spool_bytes: 1024,
@@ -3304,6 +3429,8 @@ mod tests {
     fn retained_capacity_expires_only_oldest_released_terminal_without_replay_owner() {
         let manager = JobManager::new(Limits {
             max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
             max_active_nodes: 2,
             max_hidden_replays: 4,
             max_spool_bytes: 1024,
@@ -3319,9 +3446,125 @@ mod tests {
     }
 
     #[test]
+    fn hidden_and_exposed_jobs_have_independent_class_quotas_under_aggregate_bound() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 5,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 4,
+            max_active_nodes: 8,
+            max_hidden_replays: 1,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        admit_simple(&manager, "visible", true);
+        for index in 0..4 {
+            admit_simple(&manager, &format!("hidden-{index}"), false);
+        }
+        assert_eq!(manager.list(0, 1).unwrap().jobs[0].id, "visible");
+
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"b"}]]}), |_, _| true).unwrap();
+        let node_plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 64,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [3; 32],
+                runtime_binding: [4; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            manager.admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "hidden-overflow",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: false,
+                },
+            ),
+            Err(Error::Capacity)
+        );
+    }
+
+    #[test]
+    fn exposing_hidden_job_never_evicts_unreleased_visible_state() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 3,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 2,
+            max_active_nodes: 3,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        admit_simple(&manager, "visible", true);
+        admit_simple(&manager, "hidden", false);
+        assert_eq!(manager.expose("hidden"), Err(Error::Capacity));
+        assert_eq!(manager.list(0, 1).unwrap().jobs[0].id, "visible");
+        assert!(manager.runtime_snapshot("hidden").is_ok());
+    }
+
+    #[test]
+    fn exposing_hidden_job_may_reclaim_only_safe_released_visible_terminal() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 3,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 2,
+            max_active_nodes: 3,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        terminal_no_output(&manager, "released");
+        admit_simple(&manager, "hidden", false);
+        manager.expose("hidden").unwrap();
+        assert!(matches!(manager.get("released"), Err(Error::NotFound)));
+        assert_eq!(manager.list(0, 1).unwrap().jobs[0].id, "hidden");
+    }
+
+    #[test]
+    fn hidden_job_capacity_is_independent_from_replay_identity_capacity() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 3,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 2,
+            max_active_nodes: 3,
+            max_hidden_replays: 1,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        admit_simple(&manager, "hidden-a", false);
+        admit_simple(&manager, "hidden-b", false);
+        assert!(matches!(
+            manager.claim_replay("ns", "one", [1; 32], "hidden-a", |_| {
+                Ok(ReplayPersist::Created)
+            }),
+            Ok(ReplayDecision::New { .. })
+        ));
+        assert_eq!(
+            manager.claim_replay("ns", "two", [2; 32], "hidden-b", |_| {
+                Ok(ReplayPersist::Created)
+            }),
+            Err(Error::Capacity)
+        );
+        assert!(manager.runtime_snapshot("hidden-a").is_ok());
+        assert!(manager.runtime_snapshot("hidden-b").is_ok());
+    }
+
+    #[test]
     fn replay_owned_terminal_is_not_pressure_evicted() {
         let manager = JobManager::new(Limits {
             max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
             max_active_nodes: 1,
             max_hidden_replays: 4,
             max_spool_bytes: 1024,
@@ -3765,6 +4008,8 @@ mod tests {
         .unwrap();
         let manager = JobManager::new(Limits {
             max_retained_jobs: 4,
+            max_exposed_jobs: 4,
+            max_hidden_jobs: 4,
             max_active_nodes: 2,
             max_hidden_replays: 4,
             max_spool_bytes: 4,
@@ -3812,6 +4057,8 @@ mod tests {
         .unwrap();
         let manager = JobManager::new(Limits {
             max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
             max_active_nodes: 2,
             max_hidden_replays: 2,
             max_spool_bytes: 32,
@@ -3934,6 +4181,8 @@ mod tests {
         .unwrap();
         let manager = JobManager::new(Limits {
             max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
             max_active_nodes: 2,
             max_hidden_replays: 2,
             max_spool_bytes: 32,
@@ -3996,6 +4245,8 @@ mod tests {
         .unwrap();
         let manager = JobManager::new(Limits {
             max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
             max_active_nodes: 2,
             max_hidden_replays: 2,
             max_spool_bytes: 5,
@@ -4113,6 +4364,8 @@ mod tests {
         .unwrap();
         let manager = JobManager::new(Limits {
             max_retained_jobs: 4,
+            max_exposed_jobs: 4,
+            max_hidden_jobs: 4,
             max_active_nodes: 2,
             max_hidden_replays: 4,
             max_spool_bytes: 3,
@@ -4212,6 +4465,8 @@ mod tests {
             .unwrap();
         let restored = JobManager::new(Limits {
             max_retained_jobs: 4,
+            max_exposed_jobs: 4,
+            max_hidden_jobs: 4,
             max_active_nodes: 1,
             max_hidden_replays: 4,
             max_spool_bytes: 1024,
@@ -4466,6 +4721,8 @@ mod tests {
     fn ambiguous_replay_claim_is_permanent_unknown_in_live_namespace() {
         let manager = JobManager::new(Limits {
             max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
             max_active_nodes: 1,
             max_hidden_replays: 1,
             max_spool_bytes: 1024,

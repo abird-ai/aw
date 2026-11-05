@@ -176,7 +176,7 @@ impl JobRuntime {
     pub(crate) fn job_list_limit(&self) -> usize {
         self.tool_limits
             .jobs
-            .max_retained_jobs
+            .max_exposed_jobs
             .min(aw_tools::filesystem::job_manager::MAX_JOB_LIST_PAGE)
     }
     pub(crate) fn result_limit(&self) -> usize {

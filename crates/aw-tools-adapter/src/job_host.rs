@@ -2287,6 +2287,8 @@ mod tests {
             &agent,
             Limits {
                 max_retained_jobs: 1,
+                max_exposed_jobs: 1,
+                max_hidden_jobs: 1,
                 max_active_nodes: 1,
                 max_hidden_replays: 2,
                 max_spool_bytes: 1024 * 1024,
@@ -2333,6 +2335,8 @@ mod tests {
             &agent,
             Limits {
                 max_retained_jobs: 1,
+                max_exposed_jobs: 1,
+                max_hidden_jobs: 1,
                 max_active_nodes: 1,
                 max_hidden_replays: 2,
                 max_spool_bytes: 1024 * 1024,
@@ -2373,6 +2377,8 @@ mod tests {
             &agent,
             Limits {
                 max_retained_jobs: 1,
+                max_exposed_jobs: 1,
+                max_hidden_jobs: 1,
                 max_active_nodes: 1,
                 max_hidden_replays: 2,
                 max_spool_bytes: 1024 * 1024,
@@ -2514,6 +2520,8 @@ mod tests {
             &agent,
             Limits {
                 max_retained_jobs: 4,
+                max_exposed_jobs: 4,
+                max_hidden_jobs: 4,
                 max_active_nodes: 2,
                 max_hidden_replays: 4,
                 max_spool_bytes: 4,
