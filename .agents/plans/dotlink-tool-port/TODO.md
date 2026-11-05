@@ -529,6 +529,34 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
       compile, no-default/stateless, `minimal`, no_std+alloc, rustfmt/diff and the
       Windows GNU shared/backend/platform/Agent/adapter cross-stack are green.
 
+### Fresh pre-commit convergence review — 2026-11-05
+
+- [x] Re-read live shared semantics, secured Unix/Windows capability routing,
+      AW adapter/Job runtime, minimal/full CLI and subagent composition against
+      AW's one-Agent/ToolPolicy/TurnJournal and narrow-only runtime-config goals.
+      No new authority, scheduler, path, recovery or direct-vs-Graph correctness
+      defect remained after the current local implementation series.
+- [x] Fresh native/shared gates: `aw-tools --all-features --lib` 246/246,
+      `aw-tools-fs-unix --lib` 41/41, `aw-tools-adapter --lib` 189/189 with
+      `AW_BASH`, `aw-agent-core --all-targets` all active tests green (one
+      explicit measurement test ignored), strict Clippy for shared/backend/
+      adapter/Agent, rustfmt/diff and full workspace all-target compilation.
+- [x] Fresh AW product/configuration gates: root no-default/stateless and
+      `minimal` checks, no_std+alloc `aw-agent-kernel`, CLI library 228/228
+      active tests and CLI binary 384/384 active tests. Tool authority remains
+      runtime-owned and off by default; child Agents inherit and may only narrow
+      the parent's shared limits/concurrency/tool set.
+- [x] Fresh Windows GNU cross-stack check passed for `aw-tools`,
+      `aw-tools-fs-win`, `aw-platform-win`, `aw-platform`, `aw-agent-core` and
+      `aw-tools-adapter`. This remains compile evidence; native Windows/macOS
+      execution stays an explicit release gate.
+- [x] Fresh dotlink-facing source review revalidated canonical request parsing,
+      direct execution, final-symlink path intent, multi-root CapabilitySet
+      locking/exclusions and private-artifact recovery. Missing-parent namespace
+      publication is serialized by the nearest existing parent lock, including
+      through CapabilitySet composition; no duplicate scheduler workaround is
+      required.
+
 ### Shared convergence verification
 
 - [ ] Pre/post mechanical-rename behavior/test matrix identical.
