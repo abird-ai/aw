@@ -1724,13 +1724,19 @@ impl JobManager {
             .ok_or(Error::OutputMissing)
     }
 
-    fn insert_output(
+    fn insert_outputs<const N: usize>(
         &self,
         id: &str,
         coordinate: usize,
-        stream: OutputStream,
-        output: Arc<Mutex<OwnedOutput>>,
+        outputs: [(OutputStream, Arc<Mutex<OwnedOutput>>); N],
     ) -> Result<(), Error> {
+        if N == 0 {
+            return Err(Error::InvalidOutput);
+        }
+        let mut requested = BTreeSet::new();
+        if outputs.iter().any(|(stream, _)| !requested.insert(*stream)) {
+            return Err(Error::InvalidOutput);
+        }
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
         if !(1..=managed.job.total()).contains(&coordinate)
@@ -1738,12 +1744,26 @@ impl JobManager {
                 .job
                 .state(coordinate)
                 .is_some_and(NodeState::in_flight)
-            || managed.outputs.contains_key(&(coordinate, stream))
+            || requested
+                .iter()
+                .any(|stream| managed.outputs.contains_key(&(coordinate, *stream)))
         {
             return Err(Error::InvalidOutput);
         }
-        managed.outputs.insert((coordinate, stream), output);
+        for (stream, output) in outputs {
+            managed.outputs.insert((coordinate, stream), output);
+        }
         Ok(())
+    }
+
+    fn insert_output(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        output: Arc<Mutex<OwnedOutput>>,
+    ) -> Result<(), Error> {
+        self.insert_outputs(id, coordinate, [(stream, output)])
     }
 
     /// Host supplies an empty secure spool file after node claim. The manager
@@ -1819,32 +1839,59 @@ impl JobManager {
             [owner],
             stream_capacity,
         )?));
-        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
-        if !(1..=managed.job.total()).contains(&coordinate)
-            || !managed
-                .job
-                .state(coordinate)
-                .is_some_and(NodeState::in_flight)
-            || [
-                OutputStream::Result,
-                OutputStream::Stdout,
-                OutputStream::Stderr,
-            ]
-            .into_iter()
-            .any(|stream| managed.outputs.contains_key(&(coordinate, stream)))
-        {
+        self.insert_outputs(
+            id,
+            coordinate,
+            [
+                (OutputStream::Result, result),
+                (OutputStream::Stdout, stdout.clone()),
+                (OutputStream::Stderr, stderr.clone()),
+            ],
+        )?;
+        Ok((
+            OutputWriter { output: stdout },
+            OutputWriter { output: stderr },
+        ))
+    }
+
+    /// Atomically attach file-backed process stdout/stderr before launch.
+    /// Multiple host projections may retain the same immutable stream without
+    /// adapter-side partial attachment or rollback. Result payload ownership is
+    /// intentionally separate because not every process host exposes one.
+    pub fn attach_process_output_files(
+        &self,
+        id: &str,
+        coordinate: usize,
+        owners: impl IntoIterator<Item = OutputOwner>,
+        files: ShellOutputFiles,
+    ) -> Result<(OutputWriter, OutputWriter), Error> {
+        if !(1..=crate::task::MAX_SPOOL_PER_STREAM).contains(&files.stream_capacity) {
             return Err(Error::InvalidOutput);
         }
-        managed
-            .outputs
-            .insert((coordinate, OutputStream::Result), result);
-        managed
-            .outputs
-            .insert((coordinate, OutputStream::Stdout), stdout.clone());
-        managed
-            .outputs
-            .insert((coordinate, OutputStream::Stderr), stderr.clone());
+        let owners = owners.into_iter().collect::<Vec<_>>();
+        // Validate once before constructing either spool so malformed owner sets
+        // cannot reserve quota or publish one side of the process output.
+        OwnedOutput::owners(owners.iter().copied())?;
+        let stdout = Arc::new(Mutex::new(OwnedOutput::new_with_limit(
+            files.stdout,
+            self.spool_quota.clone(),
+            owners.iter().copied(),
+            files.stream_capacity,
+        )?));
+        let stderr = Arc::new(Mutex::new(OwnedOutput::new_with_limit(
+            files.stderr,
+            self.spool_quota.clone(),
+            owners.iter().copied(),
+            files.stream_capacity,
+        )?));
+        self.insert_outputs(
+            id,
+            coordinate,
+            [
+                (OutputStream::Stdout, stdout.clone()),
+                (OutputStream::Stderr, stderr.clone()),
+            ],
+        )?;
         Ok((
             OutputWriter { output: stdout },
             OutputWriter { output: stderr },
@@ -1907,32 +1954,15 @@ impl JobManager {
             [owner],
             files.stream_capacity,
         )?));
-        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
-        if !(1..=managed.job.total()).contains(&coordinate)
-            || !managed
-                .job
-                .state(coordinate)
-                .is_some_and(NodeState::in_flight)
-            || [
-                OutputStream::Result,
-                OutputStream::Stdout,
-                OutputStream::Stderr,
-            ]
-            .into_iter()
-            .any(|stream| managed.outputs.contains_key(&(coordinate, stream)))
-        {
-            return Err(Error::InvalidOutput);
-        }
-        managed
-            .outputs
-            .insert((coordinate, OutputStream::Result), result);
-        managed
-            .outputs
-            .insert((coordinate, OutputStream::Stdout), stdout.clone());
-        managed
-            .outputs
-            .insert((coordinate, OutputStream::Stderr), stderr.clone());
+        self.insert_outputs(
+            id,
+            coordinate,
+            [
+                (OutputStream::Result, result),
+                (OutputStream::Stdout, stdout.clone()),
+                (OutputStream::Stderr, stderr.clone()),
+            ],
+        )?;
         Ok((
             OutputWriter { output: stdout },
             OutputWriter { output: stderr },
@@ -4487,6 +4517,118 @@ mod tests {
         ));
         assert_eq!(manager.spool_usage().unwrap().0, 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn process_file_streams_publish_atomically_with_multiple_owners() {
+        let (manager, job_owner) = claimed_output_job("process-multi-owner", 64);
+        let task_owner = OutputOwner::new([0x7A; 32]).unwrap();
+        let (stdout_file, stdout_path) = output_file();
+        let (stderr_file, stderr_path) = output_file();
+        let (stdout, stderr) = manager
+            .attach_process_output_files(
+                "process-multi-owner",
+                1,
+                [job_owner, task_owner],
+                ShellOutputFiles {
+                    stdout: stdout_file,
+                    stderr: stderr_file,
+                    stream_capacity: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(stdout.append(b"abcdef").unwrap(), 6);
+        assert_eq!(stderr.append(b"uvwxyz").unwrap(), 6);
+        stdout.finish().unwrap();
+        stderr.finish().unwrap();
+
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            let first = manager
+                .acknowledge_output("process-multi-owner", 1, stream, job_owner, 6)
+                .unwrap();
+            assert!(first.changed && !first.released);
+            assert_eq!(manager.spool_usage().unwrap().0, 12);
+        }
+        assert!(
+            manager
+                .acknowledge_output(
+                    "process-multi-owner",
+                    1,
+                    OutputStream::Stdout,
+                    task_owner,
+                    6,
+                )
+                .unwrap()
+                .released
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 6);
+        assert!(
+            manager
+                .acknowledge_output(
+                    "process-multi-owner",
+                    1,
+                    OutputStream::Stderr,
+                    task_owner,
+                    6,
+                )
+                .unwrap()
+                .released
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+        let _ = std::fs::remove_file(stdout_path);
+        let _ = std::fs::remove_file(stderr_path);
+    }
+
+    #[test]
+    fn process_file_stream_attachment_is_all_or_nothing() {
+        let (manager, owner) = claimed_output_job("process-atomic", 64);
+        let (existing_file, existing_path) = output_file();
+        manager
+            .attach_output_with_limit(
+                "process-atomic",
+                1,
+                OutputStream::Stdout,
+                existing_file,
+                [owner],
+                8,
+            )
+            .unwrap();
+        let writer = manager
+            .output_writer("process-atomic", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(writer.append(b"old").unwrap(), 3);
+
+        let (stdout_file, stdout_path) = output_file();
+        let (stderr_file, stderr_path) = output_file();
+        assert!(matches!(
+            manager.attach_process_output_files(
+                "process-atomic",
+                1,
+                [owner],
+                ShellOutputFiles {
+                    stdout: stdout_file,
+                    stderr: stderr_file,
+                    stream_capacity: 8,
+                },
+            ),
+            Err(Error::InvalidOutput)
+        ));
+        assert!(matches!(
+            manager.output_summary("process-atomic", 1, OutputStream::Stderr),
+            Err(Error::OutputMissing)
+        ));
+        assert_eq!(writer.append(b"!").unwrap(), 1);
+        writer.finish().unwrap();
+        assert_eq!(
+            manager
+                .output_page("process-atomic", 1, OutputStream::Stdout, 0, 8)
+                .unwrap()
+                .bytes,
+            b"old!"
+        );
+        let _ = std::fs::remove_file(existing_path);
+        let _ = std::fs::remove_file(stdout_path);
+        let _ = std::fs::remove_file(stderr_path);
     }
 
     #[test]
