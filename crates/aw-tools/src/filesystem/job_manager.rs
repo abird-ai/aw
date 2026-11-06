@@ -1101,6 +1101,27 @@ impl JobManager {
         )
     }
 
+    /// Atomically move an already-retained hidden Job into the reserved
+    /// exposed class without making it visible. This supports optimistic hosts
+    /// that begin hidden work and only later commit to a durable user-visible
+    /// representation. The Job already counts against aggregate retention, so
+    /// this transition reserves only exposed-class capacity.
+    pub fn reserve_exposed(&self, id: &str) -> Result<(), Error> {
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let visibility = state.jobs.get(id).ok_or(Error::NotFound)?.visibility;
+        match visibility {
+            Visibility::Exposed | Visibility::ReservedExposed => return Ok(()),
+            Visibility::Hidden => {}
+        }
+        while Self::exposed_jobs(&state) >= self.limits.max_exposed_jobs {
+            if !Self::prune_one_released_terminal(&mut state, Some(id)) {
+                return Err(Error::Capacity);
+            }
+        }
+        state.jobs.get_mut(id).ok_or(Error::NotFound)?.visibility = Visibility::ReservedExposed;
+        Ok(())
+    }
+
     pub fn expose(&self, id: &str) -> Result<(), Error> {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let visibility = state.jobs.get(id).ok_or(Error::NotFound)?.visibility;
@@ -3863,6 +3884,61 @@ mod tests {
         assert!(matches!(manager.get("old"), Err(Error::NotFound)));
         assert!(manager.get("newer").is_ok());
         assert!(manager.get("latest").is_ok());
+    }
+
+    #[test]
+    fn hidden_job_can_reserve_exposed_capacity_without_becoming_visible() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        admit_simple(&manager, "hidden", false);
+        manager.reserve_exposed("hidden").unwrap();
+        assert!(matches!(manager.get("hidden"), Err(Error::NotExposed)));
+        assert!(manager.list(0, 1).unwrap().jobs.is_empty());
+
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"b"}]]}), |_, _| true).unwrap();
+        let node_plans = plans(&graph);
+        assert_eq!(
+            manager.admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "other-visible",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            ),
+            Err(Error::Capacity)
+        );
+        manager.expose("hidden").unwrap();
+        assert_eq!(manager.get("hidden").unwrap().id, "hidden");
+    }
+
+    #[test]
+    fn failed_hidden_to_reserved_transition_leaves_job_hidden_and_retriable() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        admit_simple(&manager, "visible", true);
+        admit_simple(&manager, "hidden", false);
+        assert_eq!(manager.reserve_exposed("hidden"), Err(Error::Capacity));
+        assert!(matches!(manager.get("hidden"), Err(Error::NotExposed)));
+        assert_eq!(manager.get("visible").unwrap().id, "visible");
     }
 
     #[test]
