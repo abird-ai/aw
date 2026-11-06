@@ -142,18 +142,9 @@ impl WorkBudget {
         self.remaining_bytes
     }
 }
-/// Ordinary paths remain unchanged; ambiguous grammar characters are quoted.
+/// Grep content rows use the same reversible model-path grammar as discovery.
 pub fn content_path_label(path: &str) -> String {
-    if path.contains(':')
-        || path.contains('\n')
-        || path.contains('\r')
-        || path.contains('\\')
-        || path.contains('"')
-    {
-        serde_json::to_string(path).unwrap_or_else(|_| "<invalid-path>".into())
-    } else {
-        path.into()
-    }
+    filesystem::safe_label(path)
 }
 
 pub const MAX_GREP_HITS: usize = 200;
@@ -1102,8 +1093,24 @@ mod tests {
     }
 
     #[test]
+    fn content_grep_uses_canonical_reversible_path_labels() {
+        let fs = FakeFs {
+            dirs: std::collections::BTreeMap::from([(
+                "".into(),
+                vec![file("tab\tname.txt", "tab\tname.txt")],
+            )]),
+            files: std::collections::BTreeMap::from([("tab\tname.txt".into(), b"hit\n".to_vec())]),
+        };
+        let page = grep(&fs, options("hit"), &|| false).unwrap();
+        assert_eq!(page.content, "\"tab\\tname.txt\":1:hit\n");
+    }
+
+    #[test]
     fn escape_only_ambiguous_path_labels() {
         assert_eq!(content_path_label("src/file.rs"), "src/file.rs");
         assert_eq!(content_path_label("src/a:b.rs"), r#""src/a:b.rs""#);
+        assert_eq!(content_path_label("tab\tname"), r#""tab\tname""#);
+        assert_eq!(content_path_label(" leading"), r#"" leading""#);
+        assert_eq!(content_path_label("trailing "), r#""trailing ""#);
     }
 }

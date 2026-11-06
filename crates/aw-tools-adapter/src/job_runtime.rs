@@ -281,10 +281,11 @@ impl JobRuntime {
             {
                 return Err(Error::Denied("Job Session changed during Graph preflight"));
             }
-            let id = host.admit(prepared)?;
-            if expose {
-                host.expose(&id)?;
-            }
+            let id = if expose {
+                host.admit_exposed(prepared)?
+            } else {
+                host.admit(prepared)?
+            };
             if state.runners.insert(id.clone(), token.clone()).is_some() {
                 return Err(Error::Protocol("duplicate Job runner identity"));
             }
@@ -333,20 +334,18 @@ impl JobRuntime {
             {
                 return Err(Error::Denied("Job Session changed during Graph preflight"));
             }
-            host.admit_replay(prepared, &namespace, &ctx.call_id)?
+            if expose {
+                host.admit_replay_exposed(prepared, &namespace, &ctx.call_id)?
+            } else {
+                host.admit_replay(prepared, &namespace, &ctx.call_id)?
+            }
         };
         match decision {
             crate::job_host::AdmissionDecision::Unknown => Ok(StartDecision::Unknown),
             crate::job_host::AdmissionDecision::Existing(id) => {
-                if expose {
-                    host.expose(&id)?;
-                }
                 Ok(StartDecision::Existing { id, host })
             }
             crate::job_host::AdmissionDecision::New(id) => {
-                if expose {
-                    host.expose(&id)?;
-                }
                 let token = CancellationToken::new();
                 {
                     let mut state = self
@@ -540,6 +539,65 @@ mod tests {
         ) -> CompletionFuture<'a> {
             Box::pin(async { Err(Error::Protocol("provider unused")) })
         }
+    }
+
+    #[tokio::test]
+    async fn failed_immediate_exposure_does_not_leave_hidden_nonterminal_job() {
+        let root = std::env::temp_dir().join(format!(
+            "aw-job-runtime-exposure-capacity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let builder = Agent::builder(
+            Arc::new(UnusedProvider),
+            AgentOptions::new("fixture", "model"),
+        );
+        let tools = LocalToolOptions::new(&root, ToolMode::ReadOnly);
+        let agent = configure(builder, actor.clone(), &tools)
+            .unwrap()
+            .build()
+            .unwrap();
+        let runtime = JobRuntime::new(
+            Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),
+            agent.tool_binding_authority(),
+            Limits {
+                max_retained_jobs: 3,
+                max_exposed_jobs: 1,
+                max_hidden_jobs: 2,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let ctx = ToolContext {
+            actor,
+            turn_id: 1,
+            call_id: "exposure-capacity".into(),
+            source: ToolSource::trusted_host(),
+            effect: ToolEffect::Read,
+            execution_site: "local".into(),
+            cancellation: CancellationToken::new(),
+            identity: agent.default_identity().unwrap(),
+            scope: None,
+            result_budget_bytes: crate::LocalToolLimits::default().result_bytes,
+        };
+        let graph = serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]});
+        let host = runtime.host_for(&ctx).unwrap();
+        let first = host.prepare(&ctx, &graph).unwrap();
+        let first_id = host.admit(first).unwrap();
+        host.expose(&first_id).unwrap();
+
+        assert!(runtime.start_graph(&ctx, &graph, true).is_err());
+        host.run_graph(&ctx, &first_id, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            !host.manager().has_nonterminal_jobs().unwrap(),
+            "failed exposed admission must not leave an unreachable hidden Job"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

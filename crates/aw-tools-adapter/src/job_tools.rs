@@ -463,6 +463,100 @@ impl JobControl {
         Ok(selected.join("\n"))
     }
 
+    fn decimal_u64_len(mut value: u64) -> usize {
+        let mut digits = 1;
+        while value >= 10 {
+            value /= 10;
+            digits += 1;
+        }
+        digits
+    }
+
+    /// Largest raw-byte prefix whose UTF-8-lossy projection plus continuation
+    /// metadata fits `budget`. Only stable lossy token boundaries are
+    /// considered: a trailing partial UTF-8 sequence is never used as a size
+    /// oracle because completing it can make the rendered string *smaller*.
+    fn text_prefix_that_fits(
+        page: &aw_tools::filesystem::job_manager::OutputPage,
+        offset: u64,
+        budget: usize,
+    ) -> Result<usize> {
+        let rendered_len = |kept: usize, content_len: usize, ends_newline: bool| {
+            let next = offset
+                .checked_add(kept as u64)
+                .ok_or(Error::Limit("Job output continuation offset overflow"))?;
+            let has_more = next < page.retained_bytes;
+            let metadata_count = usize::from(has_more) + usize::from(page.truncated);
+            let mut total = content_len;
+            if metadata_count != 0 {
+                if content_len != 0 && !ends_newline {
+                    total = total.saturating_add(1);
+                }
+                if has_more {
+                    total = total
+                        .saturating_add("more offset=".len())
+                        .saturating_add(Self::decimal_u64_len(next));
+                }
+                if page.truncated {
+                    total = total
+                        .saturating_add("truncated retained=".len())
+                        .saturating_add(Self::decimal_u64_len(page.retained_bytes))
+                        .saturating_add(" total=".len())
+                        .saturating_add(Self::decimal_u64_len(page.total_bytes));
+                }
+                if metadata_count > 1 {
+                    total = total.saturating_add(metadata_count - 1);
+                }
+            }
+            Ok::<_, Error>(total)
+        };
+
+        let mut best = None;
+        if rendered_len(0, 0, false)? <= budget {
+            best = Some(0);
+        }
+        let bytes = page.bytes.as_slice();
+        let mut raw = 0usize;
+        let mut projected = 0usize;
+        while raw < bytes.len() {
+            let remaining = &bytes[raw..];
+            let error = match std::str::from_utf8(remaining) {
+                Ok(valid) => {
+                    for ch in valid.chars() {
+                        raw += ch.len_utf8();
+                        projected += ch.len_utf8();
+                        if rendered_len(raw, projected, ch == '\n')? <= budget {
+                            best = Some(raw);
+                        }
+                    }
+                    break;
+                }
+                Err(error) => error,
+            };
+            let valid_len = error.valid_up_to();
+            if valid_len != 0 {
+                let valid =
+                    std::str::from_utf8(&remaining[..valid_len]).expect("validated UTF-8 prefix");
+                for ch in valid.chars() {
+                    raw += ch.len_utf8();
+                    projected += ch.len_utf8();
+                    if rendered_len(raw, projected, ch == '\n')? <= budget {
+                        best = Some(raw);
+                    }
+                }
+            }
+            let invalid = error.error_len().unwrap_or(bytes.len() - raw);
+            raw = raw
+                .checked_add(invalid)
+                .ok_or(Error::Limit("Job output prefix overflow"))?;
+            projected = projected.saturating_add('\u{fffd}'.len_utf8());
+            if rendered_len(raw, projected, false)? <= budget {
+                best = Some(raw);
+            }
+        }
+        Ok(best.unwrap_or(0))
+    }
+
     fn render_output_page(
         page: &aw_tools::filesystem::job_manager::OutputPage,
         offset: u64,
@@ -506,29 +600,42 @@ impl JobControl {
                     "Job output metadata exceeds configured result ceiling",
                 ));
         }
-        let mut low = 0usize;
-        let mut high = page.bytes.len();
-        let mut best = None;
-        while low <= high {
-            let mid = low + (high - low) / 2;
-            let rendered = render(&page.bytes[..mid])?;
-            if rendered.len() <= budget {
-                best = Some((mid, rendered));
-                low = mid.saturating_add(1);
-            } else if mid == 0 {
-                break;
-            } else {
-                high = mid - 1;
-            }
+        // The final raw page can be smaller than an intermediate rendering
+        // because `more offset=N` disappears at EOF. Always test it first.
+        let full = render(&page.bytes)?;
+        if full.len() <= budget {
+            return Ok(full);
         }
-        let (kept, rendered) = best.ok_or(Error::Limit(
-            "Job output metadata exceeds configured result ceiling",
-        ))?;
+
+        let kept = if encoding == "text" {
+            Self::text_prefix_that_fits(page, offset, budget)?
+        } else {
+            // Base64 output size is monotonic while continuation metadata is
+            // present, so binary search remains exact after the full-page test.
+            let mut low = 0usize;
+            let mut high = page.bytes.len().saturating_sub(1);
+            let mut best = 0usize;
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let rendered = render(&page.bytes[..mid])?;
+                if rendered.len() <= budget {
+                    best = mid;
+                    low = mid.saturating_add(1);
+                } else if mid == 0 {
+                    break;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            best
+        };
         if kept == 0 {
             return Err(Error::Limit(
                 "one Job output byte cannot fit configured result ceiling",
             ));
         }
+        let rendered = render(&page.bytes[..kept])?;
+        debug_assert!(rendered.len() <= budget);
         Ok(rendered)
     }
 
@@ -1884,6 +1991,40 @@ mod tests {
         let output = tool.execute(ctx, &json!({})).await.unwrap();
         assert!(output.content.is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn base64_output_fitter_checks_complete_page_before_continuation_overhead() {
+        let page = aw_tools::filesystem::job_manager::OutputPage {
+            bytes: b"x".to_vec(),
+            next_offset: None,
+            writer_finished: true,
+            truncated: false,
+            total_bytes: 1,
+            retained_bytes: 1,
+        };
+        assert_eq!(
+            JobControl::render_output_page(&page, 0, "base64", 4).unwrap(),
+            "eA=="
+        );
+    }
+
+    #[test]
+    fn text_output_fitter_does_not_miss_complete_utf8_page_at_budget_boundary() {
+        let mut bytes = vec![b'a'; 510];
+        bytes.extend_from_slice("é".as_bytes());
+        let page = aw_tools::filesystem::job_manager::OutputPage {
+            bytes,
+            next_offset: None,
+            writer_finished: true,
+            truncated: false,
+            total_bytes: 512,
+            retained_bytes: 512,
+        };
+        let rendered = JobControl::render_output_page(&page, 0, "text", 512).unwrap();
+        assert_eq!(rendered.len(), 512, "{rendered:?}");
+        assert!(!rendered.contains("more offset="), "{rendered:?}");
+        assert!(rendered.ends_with('é'));
     }
 
     #[test]

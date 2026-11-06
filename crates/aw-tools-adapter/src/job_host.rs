@@ -15,7 +15,8 @@ use aw_tools::{
         job_manager::{
             plan_graph, semantic_hash, Error as JobManagerError, JobManager, Limits, NodePlan,
             NodePolicy, OutputAck, OutputOwner, OutputPage, OutputStream, ProcessSettlement,
-            ReplayDecision, ReplayPersist, SemanticBudget, StartRequest, TaskAdmission,
+            ReplayDecision, ReplayPersist, ReservedExposedTaskAdmission, SemanticBudget,
+            StartRequest, TaskAdmission,
         },
         schema::Tool as CoreTool,
         status::Primary,
@@ -715,9 +716,46 @@ impl JobHost {
             .map_err(job_admission_error)
     }
 
+    fn admit_exposed_with_id(&self, id: &str, prepared: PreparedJob) -> Result<()> {
+        self.manager
+            .admit_task(
+                prepared.graph,
+                prepared.plans,
+                TaskAdmission {
+                    id,
+                    task: &prepared.task,
+                    admission_sequence: 1,
+                    width: prepared.width,
+                    exposed: true,
+                },
+            )
+            .map_err(job_admission_error)
+    }
+
+    fn reserve_exposed_with_id(&self, id: &str, prepared: PreparedJob) -> Result<()> {
+        self.manager
+            .admit_reserved_exposed_task(
+                prepared.graph,
+                prepared.plans,
+                ReservedExposedTaskAdmission {
+                    id,
+                    task: &prepared.task,
+                    admission_sequence: 1,
+                    width: prepared.width,
+                },
+            )
+            .map_err(job_admission_error)
+    }
+
     pub fn admit(&self, prepared: PreparedJob) -> Result<String> {
         let id = new_job_id()?;
         self.admit_with_id(&id, prepared)?;
+        Ok(id)
+    }
+
+    pub fn admit_exposed(&self, prepared: PreparedJob) -> Result<String> {
+        let id = new_job_id()?;
+        self.admit_exposed_with_id(&id, prepared)?;
         Ok(id)
     }
 
@@ -730,6 +768,25 @@ impl JobHost {
         namespace: &str,
         request_id: &str,
     ) -> Result<AdmissionDecision> {
+        self.admit_replay_with_visibility(prepared, namespace, request_id, false)
+    }
+
+    pub fn admit_replay_exposed(
+        &self,
+        prepared: PreparedJob,
+        namespace: &str,
+        request_id: &str,
+    ) -> Result<AdmissionDecision> {
+        self.admit_replay_with_visibility(prepared, namespace, request_id, true)
+    }
+
+    fn admit_replay_with_visibility(
+        &self,
+        prepared: PreparedJob,
+        namespace: &str,
+        request_id: &str,
+        reserve_exposed: bool,
+    ) -> Result<AdmissionDecision> {
         let semantics = prepared.semantic_hash;
         if let Some(existing) = self
             .manager
@@ -740,6 +797,9 @@ impl JobHost {
                 ReplayDecision::Existing { job_id }
                     if self.manager.runtime_snapshot(&job_id).is_ok() =>
                 {
+                    if reserve_exposed {
+                        self.manager.expose(&job_id).map_err(job_admission_error)?;
+                    }
                     AdmissionDecision::Existing(job_id)
                 }
                 ReplayDecision::Existing { .. } | ReplayDecision::Unknown => {
@@ -753,7 +813,11 @@ impl JobHost {
         // Reserve every bounded local Job slot before committing the replay
         // identity. No runner exists yet, so a failed/duplicate claim can drop
         // this provisional Job without any effect ambiguity.
-        self.admit_with_id(&proposed, prepared)?;
+        if reserve_exposed {
+            self.reserve_exposed_with_id(&proposed, prepared)?;
+        } else {
+            self.admit_with_id(&proposed, prepared)?;
+        }
         let decision =
             match self
                 .manager
@@ -774,6 +838,9 @@ impl JobHost {
                     .discard_unstarted(&proposed)
                     .map_err(|_| Error::Protocol("duplicate provisional Job cleanup failed"))?;
                 if self.manager.runtime_snapshot(&job_id).is_ok() {
+                    if reserve_exposed {
+                        self.manager.expose(&job_id).map_err(job_admission_error)?;
+                    }
                     Ok(AdmissionDecision::Existing(job_id))
                 } else {
                     Ok(AdmissionDecision::Unknown)
@@ -799,6 +866,11 @@ impl JobHost {
                         .discard_unstarted(&job_id)
                         .map_err(|_| Error::Protocol("unready provisional Job cleanup failed"))?;
                     return Err(replay_state_error(error));
+                }
+                if reserve_exposed {
+                    self.manager
+                        .expose(&job_id)
+                        .map_err(|_| Error::Protocol("reserved Job exposure invariant failed"))?;
                 }
                 Ok(AdmissionDecision::New(job_id))
             }
@@ -852,16 +924,15 @@ impl JobHost {
 
         let proposed = new_job_id()?;
         self.manager
-            .restart_task(
+            .restart_reserved_exposed_task(
                 source_id,
                 graph,
                 plans,
-                TaskAdmission {
+                ReservedExposedTaskAdmission {
                     id: &proposed,
                     task: &task,
                     admission_sequence: 1,
                     width,
-                    exposed: false,
                 },
             )
             .map_err(job_admission_error)?;
@@ -913,7 +984,7 @@ impl JobHost {
                 }
                 self.manager
                     .expose(&job_id)
-                    .map_err(|_| Error::Protocol("restarted Job exposure failed"))?;
+                    .map_err(|_| Error::Protocol("reserved restart exposure invariant failed"))?;
                 Ok(AdmissionDecision::New(job_id))
             }
         }
@@ -2277,6 +2348,56 @@ mod tests {
     }
 
     #[test]
+    fn exposed_replay_capacity_failure_happens_before_identity_claim() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(
+            &temp,
+            &agent,
+            Limits {
+                max_retained_jobs: 2,
+                max_exposed_jobs: 1,
+                max_hidden_jobs: 1,
+                max_active_nodes: 2,
+                max_hidden_replays: 2,
+                max_spool_bytes: 1024 * 1024,
+            },
+        );
+        let occupied_ctx = context(&agent, actor.clone(), "occupied-visible");
+        let occupied = host
+            .prepare(
+                &occupied_ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let occupied_id = host.admit_exposed(occupied).unwrap();
+        assert!(host.manager().get(&occupied_id).is_ok());
+
+        let ctx = context(&agent, actor, "capacity-visible-replay");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let semantics = prepared.semantic_hash();
+        assert!(matches!(
+            host.admit_replay_exposed(prepared, "session-a", &ctx.call_id),
+            Err(Error::Limit("live Job capacity exhausted"))
+        ));
+        assert_eq!(
+            host.manager()
+                .lookup_replay("session-a", &ctx.call_id, semantics)
+                .unwrap(),
+            None,
+            "visible-capacity failure must happen before replay identity"
+        );
+        assert_eq!(host.manager().list(0, 1).unwrap().jobs.len(), 1);
+    }
+
+    #[test]
     fn replay_capacity_failure_happens_before_identity_claim() {
         let temp = Temp::new();
         fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
@@ -2322,6 +2443,33 @@ mod tests {
             None,
             "known pre-effect capacity failure must not consume replay identity"
         );
+    }
+
+    #[test]
+    fn exposed_duplicate_promotes_existing_hidden_replay_job() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(&temp, &agent, Limits::default());
+        let ctx = context(&agent, actor, "shared-replay");
+        let graph = serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]});
+        let first = host.prepare(&ctx, &graph).unwrap();
+        let id = match host.admit_replay(first, "session-a", &ctx.call_id).unwrap() {
+            AdmissionDecision::New(id) => id,
+            other => panic!("unexpected initial hidden replay: {other:?}"),
+        };
+        assert!(matches!(
+            host.manager().get(&id),
+            Err(aw_tools::filesystem::job_manager::Error::NotExposed)
+        ));
+        let duplicate = host.prepare(&ctx, &graph).unwrap();
+        assert_eq!(
+            host.admit_replay_exposed(duplicate, "session-a", &ctx.call_id)
+                .unwrap(),
+            AdmissionDecision::Existing(id.clone())
+        );
+        assert_eq!(host.manager().get(&id).unwrap().id, id);
     }
 
     #[test]
@@ -2462,6 +2610,60 @@ mod tests {
                 Ok(ReplayPersist::Created)
             })
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn restart_visible_capacity_failure_precedes_replay_claim_and_leaves_no_job() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(
+            &temp,
+            &agent,
+            Limits {
+                max_retained_jobs: 2,
+                max_exposed_jobs: 1,
+                max_hidden_jobs: 1,
+                max_active_nodes: 2,
+                max_hidden_replays: 2,
+                max_spool_bytes: 1024 * 1024,
+            },
+        );
+        let source_ctx = context(&agent, actor.clone(), "source");
+        let prepared = host
+            .prepare(
+                &source_ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let source = host.admit_exposed(prepared).unwrap();
+        host.run_graph(
+            &source_ctx,
+            &source,
+            aw_agent_core::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let restart_ctx = context(&agent, actor, "restart-capacity");
+        let graph = host.manager().graph(&source).unwrap();
+        let plans = host.plans_for_graph(&restart_ctx, &graph).unwrap();
+        let semantics = semantic_hash(&graph, &plans).unwrap();
+        assert!(matches!(
+            host.restart(&restart_ctx, &source),
+            Err(Error::Limit("live Job capacity exhausted"))
+        ));
+        let namespace = format!("restart:session-a:{source}");
+        assert_eq!(
+            host.manager()
+                .lookup_replay(&namespace, &restart_ctx.call_id, semantics)
+                .unwrap(),
+            None,
+            "restart capacity failure must not consume replay identity"
+        );
+        assert_eq!(host.manager().list(0, 1).unwrap().jobs[0].id, source);
+        assert!(!host.manager().has_nonterminal_jobs().unwrap());
     }
 
     #[tokio::test]

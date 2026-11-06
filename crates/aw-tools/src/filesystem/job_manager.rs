@@ -224,12 +224,29 @@ pub struct RuntimeAdmission<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct ReservedExposedRuntimeAdmission<'a> {
+    pub id: &'a str,
+    pub runtime_session: &'a str,
+    pub epoch: u64,
+    pub admission_sequence: u64,
+    pub width: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct TaskAdmission<'a> {
     pub id: &'a str,
     pub task: &'a TaskIdentity,
     pub admission_sequence: u64,
     pub width: usize,
     pub exposed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReservedExposedTaskAdmission<'a> {
+    pub id: &'a str,
+    pub task: &'a TaskIdentity,
+    pub admission_sequence: u64,
+    pub width: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -705,10 +722,25 @@ impl RunnerLoad {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Visibility {
+    Hidden,
+    ReservedExposed,
+    Exposed,
+}
+impl Visibility {
+    fn reserves_exposed(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+    fn is_exposed(self) -> bool {
+        matches!(self, Self::Exposed)
+    }
+}
+
 struct ManagedJob {
     job: Job,
     plans: Vec<NodePlan>,
-    exposed: bool,
+    visibility: Visibility,
     created_order: u64,
     transition_inflight: Option<Transition>,
     outputs: BTreeMap<(usize, OutputStream), Arc<Mutex<OwnedOutput>>>,
@@ -718,7 +750,7 @@ struct ManagedJob {
 
 impl ManagedJob {
     fn retention_releasable(&self) -> bool {
-        if !self.exposed
+        if !self.visibility.is_exposed()
             || self.job.lifecycle() != Lifecycle::Terminal
             || self.transition_inflight.is_some()
         {
@@ -777,7 +809,7 @@ impl JobManager {
         state
             .jobs
             .values()
-            .filter(|managed| managed.exposed)
+            .filter(|managed| managed.visibility.reserves_exposed())
             .count()
     }
 
@@ -785,7 +817,7 @@ impl JobManager {
         state
             .jobs
             .values()
-            .filter(|managed| !managed.exposed)
+            .filter(|managed| managed.visibility == Visibility::Hidden)
             .count()
     }
 
@@ -847,7 +879,7 @@ impl JobManager {
         id: &str,
         job: Job,
         plans: Vec<NodePlan>,
-        exposed: bool,
+        visibility: Visibility,
         task_binding: Option<TaskIdentity>,
         protected: Option<&str>,
     ) -> Result<(), Error> {
@@ -863,7 +895,7 @@ impl JobManager {
         if state.jobs.contains_key(id) {
             return Err(Error::DuplicateId);
         }
-        if exposed {
+        if visibility.reserves_exposed() {
             if !self.ensure_exposed_capacity(&mut state, protected, 1) {
                 return Err(Error::Capacity);
             }
@@ -885,7 +917,7 @@ impl JobManager {
             ManagedJob {
                 job,
                 plans,
-                exposed,
+                visibility,
                 created_order,
                 transition_inflight: None,
                 outputs: BTreeMap::new(),
@@ -911,7 +943,45 @@ impl JobManager {
             admission.admission_sequence,
             admission.width,
         )?;
-        self.insert(admission.id, job, plans, admission.exposed, None, None)
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            if admission.exposed {
+                Visibility::Exposed
+            } else {
+                Visibility::Hidden
+            },
+            None,
+            None,
+        )
+    }
+
+    /// Runtime-scoped counterpart to `admit_reserved_exposed_task`. The
+    /// provisional Job owns exposed-class capacity but remains absent from
+    /// `get`/`list` until the host commits its external admission/replay fence.
+    pub fn admit_reserved_exposed_runtime(
+        &self,
+        graph: Graph,
+        plans: Vec<NodePlan>,
+        admission: ReservedExposedRuntimeAdmission<'_>,
+    ) -> Result<(), Error> {
+        let job = Job::after_runtime_intent(
+            graph,
+            admission.runtime_session,
+            admission.id,
+            admission.epoch,
+            admission.admission_sequence,
+            admission.width,
+        )?;
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            Visibility::ReservedExposed,
+            None,
+            None,
+        )
     }
 
     pub fn admit_task(
@@ -931,7 +1001,37 @@ impl JobManager {
             admission.id,
             job,
             plans,
-            admission.exposed,
+            if admission.exposed {
+                Visibility::Exposed
+            } else {
+                Visibility::Hidden
+            },
+            Some(admission.task.clone()),
+            None,
+        )
+    }
+
+    /// Reserve an exposed-class slot while keeping the provisional Job out of
+    /// `get`/`list` until a host replay/admission fence is committed. Publishing
+    /// through `expose` is then infallible with respect to class capacity.
+    pub fn admit_reserved_exposed_task(
+        &self,
+        graph: Graph,
+        plans: Vec<NodePlan>,
+        admission: ReservedExposedTaskAdmission<'_>,
+    ) -> Result<(), Error> {
+        let job = Job::after_task_intent(
+            graph,
+            admission.task,
+            admission.id,
+            admission.admission_sequence,
+            admission.width,
+        )?;
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            Visibility::ReservedExposed,
             Some(admission.task.clone()),
             None,
         )
@@ -956,7 +1056,18 @@ impl JobManager {
             admission.width,
             records,
         )?;
-        self.insert(admission.id, job, plans, admission.exposed, None, None)
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            if admission.exposed {
+                Visibility::Exposed
+            } else {
+                Visibility::Hidden
+            },
+            None,
+            None,
+        )
     }
 
     /// Task-scoped counterpart to `restore_runtime`; valid only under the
@@ -980,7 +1091,11 @@ impl JobManager {
             admission.id,
             job,
             plans,
-            admission.exposed,
+            if admission.exposed {
+                Visibility::Exposed
+            } else {
+                Visibility::Hidden
+            },
             Some(admission.task.clone()),
             None,
         )
@@ -988,16 +1103,21 @@ impl JobManager {
 
     pub fn expose(&self, id: &str) -> Result<(), Error> {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        let already_exposed = state.jobs.get(id).ok_or(Error::NotFound)?.exposed;
-        if already_exposed {
-            return Ok(());
+        let visibility = state.jobs.get(id).ok_or(Error::NotFound)?.visibility;
+        match visibility {
+            Visibility::Exposed => return Ok(()),
+            Visibility::ReservedExposed => {
+                state.jobs.get_mut(id).ok_or(Error::NotFound)?.visibility = Visibility::Exposed;
+                return Ok(());
+            }
+            Visibility::Hidden => {}
         }
         while Self::exposed_jobs(&state) >= self.limits.max_exposed_jobs {
             if !Self::prune_one_released_terminal(&mut state, Some(id)) {
                 return Err(Error::Capacity);
             }
         }
-        state.jobs.get_mut(id).ok_or(Error::NotFound)?.exposed = true;
+        state.jobs.get_mut(id).ok_or(Error::NotFound)?.visibility = Visibility::Exposed;
         Ok(())
     }
 
@@ -1121,6 +1241,24 @@ impl JobManager {
             .ok_or(Error::InvalidPlans)
     }
 
+    /// Typed terminal process facts retained for one node. This is a
+    /// read-only host projection; lifecycle/status classification remains owned
+    /// by the shared manager. `None` means the valid node has no process
+    /// terminal record (for example a native filesystem node or work not yet
+    /// settled as a launched process).
+    pub fn process_terminal(
+        &self,
+        id: &str,
+        coordinate: usize,
+    ) -> Result<Option<ProcessTerminal>, Error> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+        if !(1..=managed.job.total()).contains(&coordinate) {
+            return Err(Error::InvalidPlans);
+        }
+        Ok(managed.process_terminals.get(&coordinate).copied())
+    }
+
     fn node_status_label(managed: &ManagedJob, coordinate: usize, state: NodeState) -> String {
         match state {
             NodeState::Pending => "pending".into(),
@@ -1145,7 +1283,7 @@ impl JobManager {
     pub fn render_job_status(&self, id: &str) -> Result<String, Error> {
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
-        if !managed.exposed {
+        if !managed.visibility.is_exposed() {
             return Err(Error::NotExposed);
         }
         let snapshot = Self::snapshot(id, managed);
@@ -1179,7 +1317,7 @@ impl JobManager {
     pub fn get(&self, id: &str) -> Result<Snapshot, Error> {
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
-        if !managed.exposed {
+        if !managed.visibility.is_exposed() {
             return Err(Error::NotExposed);
         }
         Ok(Self::snapshot(id, managed))
@@ -1234,7 +1372,7 @@ impl JobManager {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let removable = {
             let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
-            !managed.exposed
+            !managed.visibility.is_exposed()
                 && managed.job.lifecycle() == Lifecycle::Running
                 && managed.job.active() == 0
                 && managed.job.finished() == 0
@@ -1260,7 +1398,9 @@ impl JobManager {
     pub fn discard_unexposed_terminal(&self, id: &str) -> Result<(), Error> {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
-        if managed.exposed || managed.job.lifecycle() != Lifecycle::Terminal {
+        if managed.visibility != Visibility::Hidden
+            || managed.job.lifecycle() != Lifecycle::Terminal
+        {
             return Err(Error::Busy);
         }
         state.jobs.remove(id);
@@ -1291,7 +1431,7 @@ impl JobManager {
         let mut jobs = state
             .jobs
             .iter()
-            .filter(|(_, managed)| managed.exposed)
+            .filter(|(_, managed)| managed.visibility.is_exposed())
             .collect::<Vec<_>>();
         jobs.sort_by(|(id_a, a), (id_b, b)| {
             b.created_order
@@ -1676,7 +1816,36 @@ impl JobManager {
             admission.id,
             job,
             plans,
-            admission.exposed,
+            if admission.exposed {
+                Visibility::Exposed
+            } else {
+                Visibility::Hidden
+            },
+            None,
+            Some(source_id),
+        )
+    }
+
+    pub fn restart_reserved_exposed_runtime(
+        &self,
+        source_id: &str,
+        graph: Graph,
+        plans: Vec<NodePlan>,
+        admission: ReservedExposedRuntimeAdmission<'_>,
+    ) -> Result<(), Error> {
+        let job = Job::after_runtime_intent(
+            graph,
+            admission.runtime_session,
+            admission.id,
+            admission.epoch,
+            admission.admission_sequence,
+            admission.width,
+        )?;
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            Visibility::ReservedExposed,
             None,
             Some(source_id),
         )
@@ -1700,7 +1869,35 @@ impl JobManager {
             admission.id,
             job,
             plans,
-            admission.exposed,
+            if admission.exposed {
+                Visibility::Exposed
+            } else {
+                Visibility::Hidden
+            },
+            Some(admission.task.clone()),
+            Some(source_id),
+        )
+    }
+
+    pub fn restart_reserved_exposed_task(
+        &self,
+        source_id: &str,
+        graph: Graph,
+        plans: Vec<NodePlan>,
+        admission: ReservedExposedTaskAdmission<'_>,
+    ) -> Result<(), Error> {
+        let job = Job::after_task_intent(
+            graph,
+            admission.task,
+            admission.id,
+            admission.admission_sequence,
+            admission.width,
+        )?;
+        self.insert(
+            admission.id,
+            job,
+            plans,
+            Visibility::ReservedExposed,
             Some(admission.task.clone()),
             Some(source_id),
         )
@@ -3089,6 +3286,78 @@ mod tests {
     }
 
     #[test]
+    fn typed_process_terminal_projection_returns_only_settled_process_facts() {
+        use crate::filesystem::runner::{ProcessExit, ProcessOutputMeta};
+        let graph = Graph::compile_with(
+            &json!({"ops":[["bash",{"command":"true"}]]}),
+            |name| (name == "bash").then_some(NodeTool::Bash),
+            |node, arguments| node == NodeTool::Bash && arguments.is_object(),
+        )
+        .unwrap();
+        let node_plans = plans(&graph);
+        let manager = manager(1);
+        manager
+            .admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "terminal-facts",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(manager.process_terminal("terminal-facts", 1).unwrap(), None);
+        assert_eq!(
+            manager.process_terminal("terminal-facts", 2),
+            Err(Error::InvalidPlans)
+        );
+        manager
+            .claim("terminal-facts", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        manager
+            .start(
+                "terminal-facts",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let terminal = ProcessTerminal {
+            exit: ProcessExit::Code(7),
+            output: ProcessOutputMeta {
+                stdout_bytes: 11,
+                stderr_bytes: 3,
+                stdout_truncated: false,
+                stderr_truncated: true,
+                complete: true,
+            },
+        };
+        manager
+            .settle_process(
+                "terminal-facts",
+                1,
+                NodeState::Running { sequence: 3 },
+                terminal,
+                4,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.process_terminal("terminal-facts", 1).unwrap(),
+            Some(terminal)
+        );
+    }
+
+    #[test]
     fn compact_job_status_keeps_cancelled_lifecycle_separate_from_node_outcome() {
         let graph = Graph::compile(
             &json!({"ops":[
@@ -3594,6 +3863,250 @@ mod tests {
         assert!(matches!(manager.get("old"), Err(Error::NotFound)));
         assert!(manager.get("newer").is_ok());
         assert!(manager.get("latest").is_ok());
+    }
+
+    #[test]
+    fn reserved_exposed_runtime_job_is_invisible_and_publishes_without_second_capacity_check() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plans(&graph);
+        manager
+            .admit_reserved_exposed_runtime(
+                graph.clone(),
+                node_plans.clone(),
+                ReservedExposedRuntimeAdmission {
+                    id: "reserved-runtime",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.get("reserved-runtime"),
+            Err(Error::NotExposed)
+        ));
+        assert!(manager.list(0, 1).unwrap().jobs.is_empty());
+        assert_eq!(
+            manager.admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "visible-2",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            ),
+            Err(Error::Capacity)
+        );
+        manager.expose("reserved-runtime").unwrap();
+        assert_eq!(
+            manager.get("reserved-runtime").unwrap().id,
+            "reserved-runtime"
+        );
+    }
+
+    #[test]
+    fn reserved_exposed_runtime_restart_uses_fresh_plan_and_owns_visible_capacity() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        terminal_no_output(&manager, "source");
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"b"}]]}), |_, _| true).unwrap();
+        let fresh = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 2,
+                    result_bytes: 128,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 9,
+                authority_binding: [7; 32],
+                runtime_binding: [8; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        manager
+            .restart_reserved_exposed_runtime(
+                "source",
+                graph,
+                fresh.clone(),
+                ReservedExposedRuntimeAdmission {
+                    id: "restart-reserved",
+                    runtime_session: "s",
+                    epoch: 2,
+                    admission_sequence: 1,
+                    width: 1,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.get("restart-reserved"),
+            Err(Error::NotExposed)
+        ));
+        assert_eq!(
+            manager.plans("restart-reserved").unwrap()[0].registry_generation(),
+            9
+        );
+        manager.expose("restart-reserved").unwrap();
+        assert_eq!(
+            manager.get("restart-reserved").unwrap().id,
+            "restart-reserved"
+        );
+    }
+
+    #[test]
+    fn reserved_exposed_job_is_invisible_but_owns_visible_capacity_until_publish() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plans(&graph);
+        let task = TaskIdentity {
+            actor: "a".into(),
+            source_kind: "host".into(),
+            source_id: "source".into(),
+            source_epoch: 1,
+            execution_site: "local".into(),
+            session: "s".into(),
+            branch: "main".into(),
+            turn_id: 1,
+            call_id: "reserved".into(),
+            effect: ToolEffect::Read,
+        };
+        manager
+            .admit_reserved_exposed_task(
+                graph.clone(),
+                node_plans.clone(),
+                ReservedExposedTaskAdmission {
+                    id: "reserved",
+                    task: &task,
+                    admission_sequence: 1,
+                    width: 1,
+                },
+            )
+            .unwrap();
+        assert!(matches!(manager.get("reserved"), Err(Error::NotExposed)));
+        assert!(manager.list(0, 1).unwrap().jobs.is_empty());
+
+        // The reservation owns the only exposed slot, but not the hidden slot.
+        manager
+            .admit_runtime(
+                graph.clone(),
+                node_plans.clone(),
+                RuntimeAdmission {
+                    id: "hidden",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager.admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "visible-2",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            ),
+            Err(Error::Capacity)
+        );
+
+        // Publication needs no second capacity reservation.
+        manager.expose("reserved").unwrap();
+        assert_eq!(manager.get("reserved").unwrap().id, "reserved");
+        assert_eq!(manager.list(0, 1).unwrap().jobs[0].id, "reserved");
+    }
+
+    #[test]
+    fn reserved_exposed_job_can_be_discarded_while_still_pre_effect() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plans(&graph);
+        let task = TaskIdentity {
+            actor: "a".into(),
+            source_kind: "host".into(),
+            source_id: "source".into(),
+            source_epoch: 1,
+            execution_site: "local".into(),
+            session: "s".into(),
+            branch: "main".into(),
+            turn_id: 1,
+            call_id: "reserved-discard".into(),
+            effect: ToolEffect::Read,
+        };
+        manager
+            .admit_reserved_exposed_task(
+                graph.clone(),
+                node_plans.clone(),
+                ReservedExposedTaskAdmission {
+                    id: "reserved",
+                    task: &task,
+                    admission_sequence: 1,
+                    width: 1,
+                },
+            )
+            .unwrap();
+        manager.discard_unstarted("reserved").unwrap();
+        assert!(matches!(
+            manager.runtime_snapshot("reserved"),
+            Err(Error::NotFound)
+        ));
+        manager
+            .admit_runtime(
+                graph,
+                node_plans,
+                RuntimeAdmission {
+                    id: "visible",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
     }
 
     #[test]
