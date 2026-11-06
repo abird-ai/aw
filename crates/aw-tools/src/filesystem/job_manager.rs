@@ -400,6 +400,13 @@ pub struct OutputAck {
     pub released: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputOwnerState {
+    pub through: u64,
+    pub acknowledged: bool,
+    pub released: bool,
+}
+
 enum OutputStore {
     File(BoundedFileSpool),
     Memory(BoundedMemorySpool),
@@ -2379,6 +2386,26 @@ impl JobManager {
             0
         } else {
             output.spool.retained_bytes()
+        })
+    }
+
+    /// Pure owner-specific delivery/ACK projection. This is intentionally
+    /// separate from the physical spool summary: multiple transport/task owners
+    /// can have different logical watermarks over the same retained bytes.
+    pub fn output_owner_state(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        owner: OutputOwner,
+    ) -> Result<OutputOwnerState, Error> {
+        let output = self.output_handle(id, coordinate, stream)?;
+        let output = output.lock().map_err(|_| Error::Poisoned)?;
+        let ack = output.owners.get(&owner).ok_or(Error::InvalidOutput)?;
+        Ok(OutputOwnerState {
+            through: ack.through,
+            acknowledged: ack.acknowledged,
+            released: output.released,
         })
     }
 
@@ -5110,6 +5137,81 @@ mod tests {
         ));
         assert_eq!(manager.spool_usage().unwrap().0, 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn owner_state_is_exact_and_independent_for_shared_output() {
+        let (manager, job_owner) = claimed_output_job("owner-state", 64);
+        let task_owner = OutputOwner::new([0x6B; 32]).unwrap();
+        let (stdout_file, stdout_path) = output_file();
+        manager
+            .attach_output_with_limit(
+                "owner-state",
+                1,
+                OutputStream::Stdout,
+                stdout_file,
+                [job_owner, task_owner],
+                8,
+            )
+            .unwrap();
+        let writer = manager
+            .output_writer("owner-state", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(writer.append(b"abcdef").unwrap(), 6);
+        writer.finish().unwrap();
+        assert_eq!(
+            manager
+                .output_owner_state("owner-state", 1, OutputStream::Stdout, job_owner)
+                .unwrap(),
+            OutputOwnerState {
+                through: 0,
+                acknowledged: false,
+                released: false,
+            }
+        );
+        manager
+            .acknowledge_output("owner-state", 1, OutputStream::Stdout, job_owner, 4)
+            .unwrap();
+        assert_eq!(
+            manager
+                .output_owner_state("owner-state", 1, OutputStream::Stdout, job_owner)
+                .unwrap(),
+            OutputOwnerState {
+                through: 4,
+                acknowledged: true,
+                released: false,
+            }
+        );
+        assert_eq!(
+            manager
+                .output_owner_state("owner-state", 1, OutputStream::Stdout, task_owner)
+                .unwrap(),
+            OutputOwnerState {
+                through: 0,
+                acknowledged: false,
+                released: false,
+            }
+        );
+        manager
+            .acknowledge_output("owner-state", 1, OutputStream::Stdout, job_owner, 6)
+            .unwrap();
+        assert!(
+            manager
+                .acknowledge_output("owner-state", 1, OutputStream::Stdout, task_owner, 6)
+                .unwrap()
+                .released
+        );
+        assert_eq!(
+            manager
+                .output_owner_state("owner-state", 1, OutputStream::Stdout, job_owner)
+                .unwrap(),
+            OutputOwnerState {
+                through: 6,
+                acknowledged: true,
+                released: true,
+            }
+        );
+        let _ = std::fs::remove_file(stdout_path);
     }
 
     #[test]
