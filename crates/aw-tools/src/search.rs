@@ -336,74 +336,165 @@ fn hidden_path(path: &str) -> bool {
     path.split('/').any(|part| part.starts_with('.'))
 }
 
-fn line(path: &str, number: usize, text: &str, primary: bool) -> String {
-    let label = content_path_label(path);
-    if primary {
-        format!("{label}:{number}:{text}\n")
-    } else {
-        format!("{label}-{number}-{text}\n")
-    }
-}
-
 struct ContextGroup {
     text: String,
     primaries: usize,
 }
 
-fn context_groups(
-    path: &str,
-    lines: &[&str],
-    all_hits: &[usize],
-    selected_hits: &[usize],
-    before: usize,
-    after: usize,
-) -> Vec<ContextGroup> {
-    if selected_hits.is_empty() {
-        return Vec::new();
+#[derive(Debug)]
+struct HitSelection {
+    matched: usize,
+    selected: Vec<usize>,
+    more: bool,
+}
+
+/// Scan the complete admitted text file but retain only the current logical
+/// page's primary line numbers. Memory is O(page size), never O(total matches).
+fn select_content_hits(text: &str, regex: &Regex, skip: usize, take: usize) -> HitSelection {
+    let mut matched = 0usize;
+    let mut selected = Vec::with_capacity(take.min(MAX_GREP_HITS));
+    let mut more = false;
+    for (row, source) in text.lines().enumerate() {
+        if !regex.is_match(source) {
+            continue;
+        }
+        matched += 1;
+        if matched <= skip {
+            continue;
+        }
+        if selected.len() < take {
+            selected.push(row);
+        } else {
+            more = true;
+        }
     }
-    let selected = selected_hits.iter().copied().collect::<BTreeSet<_>>();
-    let all = all_hits.iter().copied().collect::<BTreeSet<_>>();
-    let mut intervals = Vec::<(usize, usize)>::new();
+    HitSelection {
+        matched,
+        selected,
+        more,
+    }
+}
+
+fn context_intervals(selected_hits: &[usize], before: usize, after: usize) -> Vec<(usize, usize)> {
+    let mut intervals = Vec::<(usize, usize)>::with_capacity(selected_hits.len());
+    let context_enabled = before != 0 || after != 0;
     for &hit in selected_hits {
         let start = hit.saturating_sub(before);
-        let end = (hit + after + 1).min(lines.len());
+        let end = hit.saturating_add(after).saturating_add(1);
         if let Some(last) = intervals.last_mut() {
-            if start <= last.1 {
+            let overlaps = start < last.1;
+            let touches_with_context = context_enabled && start == last.1;
+            if overlaps || touches_with_context {
                 last.1 = last.1.max(end);
                 continue;
             }
         }
         intervals.push((start, end));
     }
-
-    let context_enabled = before != 0 || after != 0;
     intervals
-        .into_iter()
-        .map(|(start, end)| {
-            let mut text = String::new();
-            let mut previous_visible = None;
-            let mut primaries = 0usize;
-            for (row, source) in lines.iter().enumerate().take(end).skip(start) {
-                // A matching line outside this logical page is not allowed to
-                // leak in as free context. Its omission creates a real gap.
-                if all.contains(&row) && !selected.contains(&row) {
-                    previous_visible = None;
-                    continue;
-                }
-                if context_enabled
-                    && previous_visible.is_some_and(|previous| row != previous + 1)
-                    && !text.is_empty()
-                {
-                    text.push_str("--\n");
-                }
-                let primary = selected.contains(&row);
-                primaries += usize::from(primary);
-                text.push_str(&line(path, row + 1, source, primary));
-                previous_visible = Some(row);
+}
+
+fn decimal_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn push_context_line(
+    out: &mut String,
+    label: &str,
+    row: usize,
+    source: &str,
+    primary: bool,
+    limit: usize,
+) -> bool {
+    let number = row.saturating_add(1);
+    let needed = label
+        .len()
+        .saturating_add(decimal_len(number))
+        .saturating_add(source.len())
+        .saturating_add(3);
+    if out.len().saturating_add(needed) > limit {
+        return false;
+    }
+    use std::fmt::Write as _;
+    let separator = if primary { ':' } else { '-' };
+    writeln!(out, "{label}{separator}{number}{separator}{source}")
+        .expect("String formatting is infallible");
+    true
+}
+
+/// Render bounded merged context groups with one sequential line iterator.
+/// Matching lines outside the selected logical page are clipped, creating a
+/// real gap instead of leaking a free primary as context.
+fn visit_context_groups(
+    path: &str,
+    text: &str,
+    regex: &Regex,
+    selected_hits: &[usize],
+    context: (usize, usize),
+    max_group_bytes: usize,
+    mut visit: impl FnMut(ContextGroup) -> bool,
+) -> Result<(), ()> {
+    if selected_hits.is_empty() {
+        return Ok(());
+    }
+    let (before, after) = context;
+    let selected = selected_hits.iter().copied().collect::<BTreeSet<_>>();
+    let intervals = context_intervals(selected_hits, before, after);
+    let context_enabled = before != 0 || after != 0;
+    let label = content_path_label(path);
+    let mut lines = text.lines().enumerate().peekable();
+
+    for (start, end) in intervals {
+        while lines.peek().is_some_and(|(row, _)| *row < start) {
+            lines.next();
+        }
+        let mut group = ContextGroup {
+            text: String::new(),
+            primaries: 0,
+        };
+        let mut previous_visible = None;
+        let mut gap_pending = false;
+        while lines.peek().is_some_and(|(row, _)| *row < end) {
+            let (row, source) = lines.next().expect("peeked line");
+            let primary = selected.contains(&row);
+            if !primary && regex.is_match(source) {
+                gap_pending |= !group.text.is_empty();
+                previous_visible = None;
+                continue;
             }
-            ContextGroup { text, primaries }
-        })
-        .collect()
+            if context_enabled
+                && (gap_pending || previous_visible.is_some_and(|previous| row != previous + 1))
+                && !group.text.is_empty()
+            {
+                if group.text.len().saturating_add(3) > max_group_bytes {
+                    return Err(());
+                }
+                group.text.push_str("--\n");
+            }
+            gap_pending = false;
+            if !push_context_line(
+                &mut group.text,
+                &label,
+                row,
+                source,
+                primary,
+                max_group_bytes,
+            ) {
+                return Err(());
+            }
+            group.primaries += usize::from(primary);
+            previous_visible = Some(row);
+        }
+        if !visit(group) {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 fn progress_flags(progress: walk::Progress) -> Incomplete {
@@ -586,19 +677,17 @@ pub fn grep<B: MetadataBackend>(
             // not incomplete coverage.
             continue;
         };
-        let lines = text.lines().collect::<Vec<_>>();
-        let hits = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| query.regex.is_match(line).then_some(index))
-            .collect::<Vec<_>>();
-        if hits.is_empty() {
-            continue;
-        }
         let display_file = model_path_for(&file, backend_root, options.path);
 
         match options.mode {
             GrepMode::Files | GrepMode::Count => {
+                let hits = text
+                    .lines()
+                    .filter(|source| query.regex.is_match(source))
+                    .count();
+                if hits == 0 {
+                    continue;
+                }
                 if logical_seen < options.offset {
                     logical_seen += 1;
                     continue;
@@ -609,51 +698,56 @@ pub fn grep<B: MetadataBackend>(
                 }
                 logical_seen += 1;
                 selected_total += 1;
-                file_rows.push((display_file, hits.len()));
+                file_rows.push((display_file, hits));
             }
             GrepMode::Content => {
-                let mut selected = Vec::new();
-                for hit in hits.iter().copied() {
-                    if logical_seen < options.offset {
-                        logical_seen += 1;
-                        continue;
-                    }
-                    if selected_total >= options.limit {
-                        more = true;
-                        break;
-                    }
-                    logical_seen += 1;
-                    selected_total += 1;
-                    selected.push(hit);
+                let skip = options.offset.saturating_sub(logical_seen);
+                let take = options.limit.saturating_sub(selected_total);
+                let selection = select_content_hits(text, &query.regex, skip, take);
+                if selection.matched == 0 {
+                    continue;
                 }
-                for group in context_groups(
+                let skipped = selection.matched.min(skip);
+                logical_seen = logical_seen.saturating_add(skipped);
+                logical_seen = logical_seen.saturating_add(selection.selected.len());
+                selected_total = selected_total.saturating_add(selection.selected.len());
+
+                let group_limit = options.limits.output_bytes.saturating_sub(reserve);
+                let context_enabled = options.before != 0 || options.after != 0;
+                let render = visit_context_groups(
                     &display_file,
-                    &lines,
-                    &hits,
-                    &selected,
-                    options.before,
-                    options.after,
-                ) {
-                    let separator = (options.before != 0 || options.after != 0) && !out.is_empty();
-                    let needed = group.text.len() + if separator { 3 } else { 0 };
-                    if out.len().saturating_add(needed).saturating_add(reserve)
-                        > options.limits.output_bytes
-                    {
-                        if out.is_empty() {
-                            return Err(GrepError::ResultLimit(
-                                "grep hit/context exceeds result ceiling; use context=0, read, or narrow path",
-                            ));
+                    text,
+                    &query.regex,
+                    &selection.selected,
+                    (options.before, options.after),
+                    group_limit,
+                    |group| {
+                        let separator = context_enabled && !out.is_empty();
+                        let needed = group.text.len() + if separator { 3 } else { 0 };
+                        if out.len().saturating_add(needed).saturating_add(reserve)
+                            > options.limits.output_bytes
+                        {
+                            return false;
                         }
-                        more = true;
-                        break 'files;
+                        if separator {
+                            out.push_str("--\n");
+                        }
+                        out.push_str(&group.text);
+                        emitted += group.primaries;
+                        true
+                    },
+                );
+                if render.is_err() {
+                    if out.is_empty() {
+                        return Err(GrepError::ResultLimit(
+                            "grep hit/context exceeds result ceiling; use context=0, read, or narrow path",
+                        ));
                     }
-                    if separator {
-                        out.push_str("--\n");
-                    }
-                    out.push_str(&group.text);
-                    emitted += group.primaries;
+                    more = true;
+                    break 'files;
                 }
-                if more {
+                if emitted < selected_total || selection.more {
+                    more = true;
                     break;
                 }
             }
@@ -872,6 +966,139 @@ mod tests {
             grep(&fs, query, &|| false),
             Err(GrepError::ResultLimit(_))
         ));
+    }
+
+    #[test]
+    fn content_result_budget_resume_does_not_skip_unrendered_primary() {
+        let mut fs = FakeFs::default();
+        fs.files.insert(
+            "f.txt".into(),
+            b"hit first\nhit second\nhit third\n".to_vec(),
+        );
+        let page = |offset, output_bytes| {
+            grep(
+                &fs,
+                GrepOptions {
+                    pattern: "hit",
+                    path: "f.txt",
+                    backend_path: None,
+                    glob: None,
+                    depth: 1,
+                    literal: true,
+                    ignore_case: false,
+                    mode: GrepMode::Content,
+                    before: 0,
+                    after: 0,
+                    hidden: true,
+                    gitignore: false,
+                    offset,
+                    limit: 3,
+                    limits: GrepLimits {
+                        output_bytes,
+                        ..Default::default()
+                    },
+                },
+                &|| false,
+            )
+            .unwrap()
+        };
+
+        let first = page(0, 160);
+        assert!(first.content.contains("f.txt:1:hit first"));
+        assert!(first.truncated);
+        let marker = first
+            .content
+            .lines()
+            .find(|line| line.starts_with("more offset="))
+            .expect("continuation marker");
+        let offset = marker
+            .strip_prefix("more offset=")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!((1..3).contains(&offset), "{offset}: {}", first.content);
+
+        let resumed = page(offset, 4096);
+        let expected = match offset {
+            1 => "f.txt:2:hit second",
+            2 => "f.txt:3:hit third",
+            _ => unreachable!(),
+        };
+        assert!(resumed.content.contains(expected), "{}", resumed.content);
+        assert!(!resumed.content.contains("f.txt:1:hit first"));
+    }
+
+    #[test]
+    fn content_hit_selection_scans_deep_pages_with_bounded_retention() {
+        let text = (0..10_000)
+            .map(|index| format!("hit {index}\n"))
+            .collect::<String>();
+        let regex = Regex::new("hit").unwrap();
+        let selected = select_content_hits(&text, &regex, 9_000, 3);
+        assert_eq!(selected.matched, 10_000);
+        assert_eq!(selected.selected, [9_000, 9_001, 9_002]);
+        assert_eq!(selected.selected.len(), 3);
+        assert!(selected.more);
+    }
+
+    #[test]
+    fn touching_context_intervals_remain_one_group_without_false_separator() {
+        let regex = Regex::new("hit").unwrap();
+        let mut groups = Vec::new();
+        visit_context_groups(
+            "f",
+            "hit\nctx\nhit\n",
+            &regex,
+            &[0, 2],
+            (0, 1),
+            4096,
+            |group| {
+                groups.push(group.text);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(groups, ["f:1:hit\nf-2-ctx\nf:3:hit\n"]);
+    }
+
+    #[test]
+    fn clipped_out_of_page_match_keeps_context_gap_explicit() {
+        let regex = Regex::new("hit").unwrap();
+        let mut groups = Vec::new();
+        visit_context_groups(
+            "f",
+            "hit selected\nhit next-page\ntail\n",
+            &regex,
+            &[0],
+            (0, 2),
+            4096,
+            |group| {
+                groups.push(group.text);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(groups, ["f:1:hit selected\n--\nf-3-tail\n"]);
+    }
+
+    #[test]
+    fn streaming_context_clips_unselected_matching_lines() {
+        let regex = Regex::new("hit").unwrap();
+        let mut groups = Vec::new();
+        visit_context_groups(
+            "f",
+            "hit\nhit\ntail\n",
+            &regex,
+            &[1],
+            (1, 1),
+            4096,
+            |group| {
+                groups.push(group.text);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(groups, ["f:2:hit\nf-3-tail\n"]);
     }
 
     #[test]

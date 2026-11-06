@@ -501,6 +501,10 @@ pub struct LocalToolLimits {
     /// Aggregate old+new text admitted by one edit request. Per-file and total
     /// mutation work remain fixed shared safety bounds below this adapter.
     pub edit_text_bytes: usize,
+    /// Aggregate decoded bytes admitted by one bwrite/bedit request. This is
+    /// independent from `schema.binary_data_bytes`, which bounds each encoded
+    /// JSON string before decoding.
+    pub binary_decoded_bytes: usize,
     pub jobs: aw_tools::filesystem::job_manager::Limits,
 }
 impl Default for LocalToolLimits {
@@ -513,6 +517,7 @@ impl Default for LocalToolLimits {
             result_bytes: DEFAULT_LOCAL_RESULT_BYTES,
             shell_stream_bytes: 48 * 1024,
             edit_text_bytes: 48 * 1024,
+            binary_decoded_bytes: 48 * 1024,
             jobs: aw_tools::filesystem::job_manager::Limits::default(),
         }
     }
@@ -558,7 +563,7 @@ impl LocalToolLimits {
         aw_tools::filesystem::request::Limits {
             schema: self.schema,
             edit_text_bytes: self.edit_text_bytes,
-            binary_decoded_bytes: self.schema.binary_data_bytes,
+            binary_decoded_bytes: self.binary_decoded_bytes,
         }
     }
 
@@ -581,6 +586,7 @@ impl LocalToolLimits {
             || !(MIN_LOCAL_RESULT_BYTES..=defaults.result_bytes).contains(&self.result_bytes)
             || !(1..=defaults.shell_stream_bytes).contains(&self.shell_stream_bytes)
             || !(1..=defaults.edit_text_bytes).contains(&self.edit_text_bytes)
+            || !(1..=defaults.binary_decoded_bytes).contains(&self.binary_decoded_bytes)
             || self.jobs.max_retained_jobs > defaults.jobs.max_retained_jobs
             || self.jobs.max_exposed_jobs > defaults.jobs.max_exposed_jobs
             || self.jobs.max_hidden_jobs > defaults.jobs.max_hidden_jobs

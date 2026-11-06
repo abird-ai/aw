@@ -1113,6 +1113,55 @@ async fn mcp_binary_read_is_complete_object_only_under_tight_result_budget() {
 }
 
 #[tokio::test]
+async fn encoded_and_decoded_binary_limits_are_independently_narrowable() {
+    let tree = Tree::new();
+    let mut limits = crate::LocalToolLimits::default();
+    limits.schema.binary_data_bytes = 32;
+    limits.binary_decoded_bytes = 4;
+    let limits = limits.validate().unwrap();
+    let tool = binary::Binary::with_limits(tree.root(), binary::Operation::Write, limits);
+
+    let accepted = tool
+        .execute(
+            context(),
+            &serde_json::json!({
+                "path":"ok.bin","data":"01020304","encoding":"hex"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!accepted.is_error, "{}", accepted.content);
+    assert_eq!(fs::read(tree.path("ok.bin")).unwrap(), [1, 2, 3, 4]);
+
+    assert!(tool
+        .execute(
+            context(),
+            &serde_json::json!({
+                "path":"too-large.bin","data":"0102030405","encoding":"hex"
+            }),
+        )
+        .await
+        .is_err());
+    assert!(!tree.path("too-large.bin").exists());
+
+    let mut encoded = crate::LocalToolLimits::default();
+    encoded.schema.binary_data_bytes = 4;
+    encoded.binary_decoded_bytes = 16;
+    let encoded = encoded.validate().unwrap();
+    let tool = binary::Binary::with_limits(tree.root(), binary::Operation::Write, encoded);
+    assert!(tool
+        .execute(
+            context(),
+            &serde_json::json!({
+                "path":"wire-too-large.bin","data":"010203","encoding":"hex"
+            }),
+        )
+        .await
+        .is_err());
+    assert!(!tree.path("wire-too-large.bin").exists());
+}
+
+#[tokio::test]
 async fn narrowed_read_defaults_remain_valid_and_use_host_ceilings() {
     let tree = Tree::new();
     fs::write(tree.path("lines.txt"), "a\nb\nc\n").unwrap();

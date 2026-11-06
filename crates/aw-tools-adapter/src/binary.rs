@@ -65,6 +65,20 @@ impl Encoding {
         Ok(bytes)
     }
 }
+fn decode_payload(
+    encoding: Encoding,
+    data: &str,
+    limits: crate::LocalToolLimits,
+) -> Result<Vec<u8>> {
+    let bytes = encoding.decode_with_limit(data, limits.schema.binary_data_bytes)?;
+    if bytes.len() > limits.binary_decoded_bytes {
+        return Err(Error::Limit(
+            "decoded binary payload exceeds configured tool ceiling",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn parse<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
     serde_json::from_value(value.clone())
         .map_err(|_| Error::Denied("invalid, missing or unknown binary arguments"))
@@ -262,20 +276,31 @@ fn binary_plan_error(error: aw_tools::binary::PlanError) -> Error {
 
 /// Decode only the transport encoding here; ordering/overlap/output-size
 /// semantics and filesystem execution remain canonical aw-tools behavior.
-fn decode_ranges_with_limit(
+fn decode_ranges_with_limits(
     ranges: Vec<Range>,
-    max_data: usize,
+    limits: crate::LocalToolLimits,
 ) -> Result<Vec<aw_tools::binary::RequestedSplice>> {
-    ranges
-        .into_iter()
-        .map(|range| {
-            Ok(aw_tools::binary::RequestedSplice {
-                offset: range.offset,
-                length: range.length,
-                data: range.encoding.decode_with_limit(&range.data, max_data)?,
-            })
-        })
-        .collect()
+    let mut decoded_total = 0usize;
+    let mut requested = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let data = range
+            .encoding
+            .decode_with_limit(&range.data, limits.schema.binary_data_bytes)?;
+        decoded_total = decoded_total
+            .checked_add(data.len())
+            .ok_or(Error::Limit("decoded binary payload byte count overflow"))?;
+        if decoded_total > limits.binary_decoded_bytes {
+            return Err(Error::Limit(
+                "decoded binary edit payload exceeds configured tool ceiling",
+            ));
+        }
+        requested.push(aw_tools::binary::RequestedSplice {
+            offset: range.offset,
+            length: range.length,
+            data,
+        });
+    }
+    Ok(requested)
 }
 
 fn parse_sha256(value: &str) -> Result<[u8; 32]> {
@@ -294,10 +319,7 @@ fn parse_sha256(value: &str) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 fn prepare_ranges(ranges: Vec<Range>, source_size: usize) -> Result<aw_tools::binary::SplicePlan> {
-    let requested = decode_ranges_with_limit(
-        ranges,
-        aw_tools::filesystem::schema::SchemaCaps::default().binary_data_bytes,
-    )?;
+    let requested = decode_ranges_with_limits(ranges, crate::LocalToolLimits::default())?;
     aw_tools::binary::plan_splices(requested, source_size, MAX_FILE_BYTES)
         .map_err(binary_plan_error)
 }
@@ -338,8 +360,7 @@ impl Tool for Binary {
             Operation::Write => {
                 let a: BwriteArgs = parse(value)?;
                 crate::model_path(&a.path)?;
-                a.encoding
-                    .decode_with_limit(&a.data, self.limits.schema.binary_data_bytes)?;
+                decode_payload(a.encoding, &a.data, self.limits)?;
                 crate::mutate::validate_digest(a.expected_sha256.as_deref())?;
             }
             Operation::Edit => {
@@ -348,9 +369,18 @@ impl Tool for Binary {
                 if a.edits.is_empty() || a.edits.len() > self.limits.schema.binary_edit_ranges {
                     return Err(Error::Limit("too many binary edits"));
                 }
-                for r in &a.edits {
-                    if r.data.len() > self.limits.schema.binary_data_bytes {
-                        return Err(Error::Limit("encoded binary data too large"));
+                let mut decoded_total = 0usize;
+                for range in &a.edits {
+                    let data = range
+                        .encoding
+                        .decode_with_limit(&range.data, self.limits.schema.binary_data_bytes)?;
+                    decoded_total = decoded_total
+                        .checked_add(data.len())
+                        .ok_or(Error::Limit("decoded binary payload byte count overflow"))?;
+                    if decoded_total > self.limits.binary_decoded_bytes {
+                        return Err(Error::Limit(
+                            "decoded binary edit payload exceeds configured tool ceiling",
+                        ));
                     }
                 }
                 if let Some(hash) = a.sha256 {
@@ -419,9 +449,7 @@ impl Tool for Binary {
                     }
                     Operation::Write => {
                         let a: BwriteArgs = parse(&value)?;
-                        let bytes = a
-                            .encoding
-                            .decode_with_limit(&a.data, limits.schema.binary_data_bytes)?;
+                        let bytes = decode_payload(a.encoding, &a.data, limits)?;
                         if !a.create_only && a.expected_sha256.is_none(){
                             let content_path = crate::content_path(&root, &a.path, true)?;
                             let result=aw_tools::filesystem::operations::write_bytes(
@@ -451,10 +479,7 @@ impl Tool for Binary {
                         use aw_tools::filesystem::operations::{self, Error as OperationError};
                         let a: BeditArgs = parse(&value)?;
                         let content_path = crate::content_path(&root, &a.path, false)?;
-                        let requested = decode_ranges_with_limit(
-                            a.edits,
-                            limits.schema.binary_data_bytes,
-                        )?;
+                        let requested = decode_ranges_with_limits(a.edits, limits)?;
                         let expected = a.sha256.as_deref().map(parse_sha256).transpose()?;
                         match operations::edit_binary(
                             root.as_ref(),
