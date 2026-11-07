@@ -730,6 +730,12 @@ pub fn configure(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<AgentBuilder> {
+    if options.mode == ToolMode::Off {
+        if !options.selected_tools.is_empty() {
+            return Err(Error::Denied("tool selection needs an enabled mode"));
+        }
+        return Ok(builder);
+    }
     let concurrency = options.concurrency.validate()?;
     let limits = options.limits.validate()?;
     let mut policy = builder.tool_policy_snapshot();
@@ -760,12 +766,6 @@ pub fn configure(
     builder = builder.tool_policy_lifecycle(Arc::new(ParallelismCeiling {
         ceiling: effective_concurrency.parallelism,
     }));
-    if options.mode == ToolMode::Off {
-        if !options.selected_tools.is_empty() {
-            return Err(Error::Denied("tool selection needs an enabled mode"));
-        }
-        return Ok(builder.tool_policy(policy));
-    }
     let root = Arc::new(private_artifacts::open_root(
         &options.root,
         options.private_state_dir.as_deref(),

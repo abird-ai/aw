@@ -2119,10 +2119,23 @@ mod tests {
             Arc::new(UnusedProvider),
             AgentOptions::new("fixture", "model"),
         )
+        .tool_policy(deliberate_site.clone());
+        let preserved = configure(builder, actor.clone(), &options)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(preserved.tool_execution_site(), "other-site");
+        assert!(preserved.tool_specs().is_empty());
+
+        let builder = Agent::builder(
+            Arc::new(UnusedProvider),
+            AgentOptions::new("fixture", "model"),
+        )
         .tool_policy(deliberate_site);
+        let enabled = LocalToolOptions::new(&temp.workspace, ToolMode::ReadOnly);
         assert!(
-            configure(builder, actor.clone(), &options).is_err(),
-            "adapter must not retarget a deliberate non-default host site even before grants"
+            configure(builder, actor.clone(), &enabled).is_err(),
+            "enabled local tools must not retarget a deliberate non-default host site"
         );
 
         let mut moved = aw_agent_core::ToolPolicy {
@@ -2140,8 +2153,24 @@ mod tests {
             AgentOptions::new("fixture", "model"),
         )
         .tool(ExistingTool)
+        .tool_policy(moved.clone());
+        let preserved = configure(builder, actor.clone(), &options)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(preserved.tool_execution_site(), "other-site");
+        assert!(preserved
+            .tool_specs()
+            .iter()
+            .any(|spec| spec.name == "existing"));
+
+        let builder = Agent::builder(
+            Arc::new(UnusedProvider),
+            AgentOptions::new("fixture", "model"),
+        )
+        .tool(ExistingTool)
         .tool_policy(moved);
-        assert!(configure(builder, actor, &options).is_err());
+        assert!(configure(builder, actor, &enabled).is_err());
     }
 
     #[cfg(feature = "conformance")]

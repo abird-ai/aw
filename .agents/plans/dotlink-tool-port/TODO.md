@@ -508,6 +508,17 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
       shell registration use the same maximum-Graph spool preflight as normal AW
       configuration. Disabled/unselected capabilities therefore cannot constrain
       direct tools, while every published Job producer retains fail-fast capacity.
+- [x] Final host-composition review separates global Agent execution policy from
+      the reusable local-tool adapter: `ToolMode::Off` is a true adapter no-op that
+      preserves an embedding host's existing site/grants/scheduler and ignores
+      inactive local limits, while stock AW applies its configured execution site
+      and `--tools-parallel*` ceilings globally before local-tool composition so
+      later MCP/extensions cannot bypass them. Enabled local tools remain
+      narrow-only and reject execution-site retargeting. Final current gates:
+      `aw-tools` 275/275, Unix backend 41/41, AW adapter 198/198, Agent core 78
+      active + 1 ignored, AW library 227 active + 2 ignored, AW binary 384 active
+      + 1 ignored, full workspace/minimal/no_std checks and fresh Windows GNU
+      shared/backend/platform/Agent/adapter cross-stack all green.
 - [x] Final private-artifact review closes the remaining pre-finalization window:
       Stage names are durably reserved before namespace creation, identity is
       finalized before payload, Unix/Windows recovery refuses non-private/nonempty

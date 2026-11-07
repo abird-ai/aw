@@ -263,6 +263,31 @@ impl Provider for OAuthStoreHttpProvider {
     }
 }
 
+/// Apply stock-AW Agent-wide execution policy before composing any local-tool
+/// adapter. `ToolMode` governs only built-in local capabilities; execution site
+/// and scheduler ceilings also govern later MCP/extension registrations.
+fn execution_policy(
+    builder: AgentBuilder,
+    tool_options: &LocalToolOptions,
+) -> Result<AgentBuilder> {
+    let concurrency = tool_options.concurrency.validate()?;
+    let mut policy = builder.tool_policy_snapshot();
+    if policy.execution_site != tool_options.execution_site {
+        let default_site = ToolPolicy::default().execution_site;
+        if policy.execution_site == default_site && !policy.has_grants() {
+            policy.execution_site = tool_options.execution_site.clone();
+        } else {
+            return Err(Error::Config(
+                "execution policy cannot retarget an existing tool execution site".into(),
+            ));
+        }
+    }
+    policy.max_parallel_reads = concurrency.parallelism.max_parallel_reads;
+    policy.allow_parallel_bash = concurrency.parallelism.allow_parallel_shell;
+    policy.max_parallel_bash = concurrency.parallelism.max_parallel_shell;
+    Ok(builder.tool_policy(policy))
+}
+
 /// Build a same-user local execution for a SecretStore-backed Sign in with
 /// ChatGPT connection. Construction reads only local metadata; OAuth refresh or
 /// inference network I/O is deferred until the first admitted request.
@@ -317,6 +342,7 @@ pub fn configured_oauth_execution(
         settings.profile.effective_models(),
     );
     let builder = Agent::builder(provider, options).account(account, actor.clone(), "local");
+    let builder = execution_policy(builder, tool_options)?;
     aw_tools_adapter::configure(builder, actor, tool_options)?.build()
 }
 
@@ -408,6 +434,7 @@ pub fn unconfigured_execution(
         actor.clone(),
         "local",
     );
+    let builder = execution_policy(builder, tool_options)?;
     let agent = aw_tools_adapter::configure(builder, actor, tool_options)?.build()?;
     agent.provider_accounts().revoke("__unconfigured")?;
     Ok(agent)
@@ -476,6 +503,7 @@ pub fn configured_execution(
         )
     };
     builder = builder.account(account, actor.clone(), "local");
+    builder = execution_policy(builder, tool_options)?;
     aw_tools_adapter::configure(builder, actor, tool_options)?.build()
 }
 
@@ -572,3 +600,44 @@ pub use aw_inference as inference;
 /// Optional stable internal participant directory; no authentication by naming.
 #[cfg(feature = "team")]
 pub use aw_identity as identity;
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    #[test]
+    fn tools_off_keeps_local_adapter_noop_but_stock_execution_policy_is_global() {
+        let mut options = LocalToolOptions::new(".", ToolMode::Off);
+        options.execution_site = "fixture-site".into();
+        options.concurrency = LocalToolConcurrency {
+            graph_width: 1,
+            parallelism: aw_agent_core::ToolParallelism {
+                max_parallel_reads: 1,
+                allow_parallel_shell: false,
+                max_parallel_shell: 1,
+            },
+        };
+        // Local-only limits are deliberately irrelevant while local tools are off.
+        options.limits.result_bytes = 1;
+        let builder = Agent::builder(
+            Arc::new(UnconfiguredProvider),
+            AgentOptions::new("fixture", "model"),
+        );
+        let builder = execution_policy(builder, &options).unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = aw_tools_adapter::configure(builder, actor, &options)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(agent.tool_execution_site(), "fixture-site");
+        assert_eq!(
+            agent.tool_parallelism(),
+            aw_agent_core::ToolParallelism {
+                max_parallel_reads: 1,
+                allow_parallel_shell: false,
+                max_parallel_shell: 1,
+            }
+        );
+        assert!(agent.tool_specs().is_empty());
+    }
+}

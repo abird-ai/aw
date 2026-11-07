@@ -1030,6 +1030,48 @@ fn local_tool_concurrency_graph_width_is_narrowing_only() {
 }
 
 #[test]
+fn local_tools_off_preserves_embedding_host_tool_policy_and_ignores_local_limits() {
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let policy = ToolPolicy {
+        max_parallel_reads: 64,
+        max_parallel_bash: 32,
+        allow_parallel_bash: true,
+        ..Default::default()
+    };
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    )
+    .tool_policy(policy);
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::Off);
+    // Disabled local tools must not validate or publish unrelated local runtime
+    // ceilings into the embedding host's global ToolPolicy.
+    options.concurrency.graph_width = usize::MAX;
+    options.limits.result_bytes = 1;
+    let mut agent = configure(builder, actor, &options)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(agent.tool_parallelism().max_parallel_reads, 64);
+    assert_eq!(agent.tool_parallelism().max_parallel_shell, 32);
+    agent.set_max_parallel_reads(128).unwrap();
+    assert_eq!(agent.tool_parallelism().max_parallel_reads, 128);
+}
+
+#[test]
 fn configured_parallel_ceiling_cannot_be_widened_after_build() {
     struct ProviderFixture;
     impl Provider for ProviderFixture {
