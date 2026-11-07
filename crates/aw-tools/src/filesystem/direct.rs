@@ -113,33 +113,55 @@ pub struct Output {
     pub is_error: bool,
     pub truncated: bool,
 }
-/// Canonical text projection for `Body::Read`.
+/// Canonical read projection for transports that can keep exact source data and
+/// control/status separate. `numbered=false` never changes `data`; any partial
+/// continuation/fault marker remains an orthogonal status part. Numbered output
+/// is already a presentation format, so its status line may be appended to that
+/// rendered text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadTextParts {
+    pub data: String,
+    pub status: Option<String>,
+}
+
+pub fn project_read_parts(mut data: String, status: Option<&str>, numbered: bool) -> ReadTextParts {
+    if numbered {
+        if let Some(status) = status {
+            if !data.ends_with('\n') {
+                data.push('\n');
+            }
+            data.push_str(status);
+        }
+        ReadTextParts { data, status: None }
+    } else {
+        ReadTextParts {
+            data,
+            status: status.map(str::to_owned),
+        }
+    }
+}
+
+/// Single-text fallback for hosts whose tool-result channel cannot represent
+/// separate content blocks. Block-capable transports must prefer
+/// [`project_read_parts`] so an unnumbered source fragment stays byte-exact.
 ///
-/// Complete unnumbered reads remain the exact source bytes. Partial numbered
-/// reads append the canonical status line. Partial unnumbered reads keep the
-/// historical coarse status family while also exposing the exact canonical
-/// status in `detail`, so adapters never reconstruct or lose fault/cursor
-/// semantics independently.
+/// Complete unnumbered reads remain the exact source bytes. Partial unnumbered
+/// reads use a JSON envelope only in this fallback representation; the canonical
+/// structured `Body::Read` and `project_read_parts` keep data/status separate.
 pub fn project_read_text(
-    mut data: String,
+    data: String,
     status: Option<&str>,
     next: Option<(usize, usize)>,
     numbered: bool,
 ) -> String {
-    let Some(status) = status else {
-        return data;
+    let projected = project_read_parts(data, status, numbered);
+    let Some(status) = projected.status else {
+        return projected.data;
     };
-    if numbered {
-        if !data.ends_with('\n') {
-            data.push('\n');
-        }
-        data.push_str(status);
-        return data;
-    }
     let detail = status.trim_end();
     let family = detail.split_ascii_whitespace().next().unwrap_or("unknown");
     json!({
-        "data": data,
+        "data": projected.data,
         "status": family,
         "detail": detail,
         "next": next.map(|(line, byte)| json!({"line":line,"byte":byte}))
@@ -877,6 +899,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_parts_preserve_exact_unnumbered_data_and_separate_status() {
+        let exact = "quote=\" slash=\\\r\nnext\n";
+        let projected = project_read_parts(exact.to_owned(), Some("more line=3 byte=0\n"), false);
+        assert_eq!(projected.data.as_bytes(), exact.as_bytes());
+        assert_eq!(projected.status.as_deref(), Some("more line=3 byte=0\n"));
+
+        let complete = project_read_parts(exact.to_owned(), None, false);
+        assert_eq!(complete.data.as_bytes(), exact.as_bytes());
+        assert!(complete.status.is_none());
+
+        let numbered = project_read_parts("2\tvalue".into(), Some("more line=3 byte=0\n"), true);
+        assert_eq!(numbered.data, "2\tvalue\nmore line=3 byte=0\n");
+        assert!(numbered.status.is_none());
+    }
 
     #[test]
     fn read_text_projection_preserves_exact_status_detail() {
