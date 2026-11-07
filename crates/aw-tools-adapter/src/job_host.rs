@@ -10,7 +10,6 @@ use aw_agent_core::{CancellationToken, PrincipalId, Tool as AgentTool, ToolConte
 use aw_tools::{
     filesystem::{
         batch::{Graph, NodeTool, Status},
-        footprint::{Access, Extent, Footprint, Scope},
         job::NodeState,
         job_manager::{
             plan_graph, semantic_hash, Error as JobManagerError, JobManager, Limits, NodePlan,
@@ -20,7 +19,6 @@ use aw_tools::{
         },
         schema::Tool as CoreTool,
         status::Primary,
-        Kind,
     },
     task_fence::TaskIdentity,
     ToolEffect as CoreEffect,
@@ -260,11 +258,11 @@ fn canonical_tool(
     }
 }
 
-fn canonical_arguments(
+fn canonical_request(
     native: CoreTool,
     arguments: &Value,
     limits: crate::LocalToolLimits,
-) -> bool {
+) -> Option<aw_tools::filesystem::request::Request> {
     // `parallel` is AW scheduler metadata on read tools, not canonical
     // filesystem semantics. Strip only that explicitly advertised adapter
     // addition; every other field must pass the shared canonical parser.
@@ -274,7 +272,15 @@ fn canonical_arguments(
             object.remove("parallel");
         }
     }
-    aw_tools::filesystem::request::parse(native, &semantic, limits.request_limits()).is_ok()
+    aw_tools::filesystem::request::parse(native, &semantic, limits.request_limits()).ok()
+}
+
+fn canonical_arguments(
+    native: CoreTool,
+    arguments: &Value,
+    limits: crate::LocalToolLimits,
+) -> bool {
+    canonical_request(native, arguments, limits).is_some()
 }
 
 fn graph_arguments_are_semantic(arguments: &Value) -> bool {
@@ -282,30 +288,6 @@ fn graph_arguments_are_semantic(arguments: &Value) -> bool {
     // already owns concurrency, so accepting it here would create ignored
     // input that changes replay fingerprints without changing execution.
     arguments.get("parallel").is_none()
-}
-
-fn arg_path(arguments: &Value, key: &str) -> Result<String> {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or(Error::Denied("canonical Job node path is missing"))
-}
-
-fn search_path(arguments: &Value) -> String {
-    arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or(".")
-        .to_owned()
-}
-
-fn model_scope(path: &str) -> String {
-    if path.is_empty() {
-        ".".into()
-    } else {
-        path.into()
-    }
 }
 
 fn error_result(tool: CoreTool, error: Error) -> (ToolOutput, Status) {
@@ -461,144 +443,6 @@ impl JobHost {
         Ok(task)
     }
 
-    fn scheduling_path(&self, path: &str) -> Result<String> {
-        let model = model_scope(path);
-        aw_tools::filesystem::backend::MetadataBackend::scheduling_path(self.root.as_ref(), &model)
-            .map_err(|error| crate::platform_fs::<()>(Err(error)).unwrap_err())
-    }
-
-    fn footprint(&self, tool: CoreTool, arguments: &Value) -> Result<Footprint> {
-        let exact = |path: String, access| {
-            Footprint::new(
-                vec![Scope {
-                    path: self.scheduling_path(&path)?,
-                    access,
-                    extent: Extent::Exact,
-                }],
-                false,
-                false,
-            )
-            .map_err(|_| Error::Denied("invalid Job footprint"))
-        };
-        match tool {
-            CoreTool::Read | CoreTool::Bread => {
-                let path = crate::content_path(&self.root, &arg_path(arguments, "path")?, false)?;
-                exact(path, Access::Read)
-            }
-            CoreTool::Write | CoreTool::Bwrite => {
-                let path = crate::content_path(&self.root, &arg_path(arguments, "path")?, true)?;
-                exact(path, Access::Write)
-            }
-            CoreTool::Edit | CoreTool::Bedit => {
-                let path = crate::content_path(&self.root, &arg_path(arguments, "path")?, false)?;
-                exact(path, Access::Write)
-            }
-            CoreTool::Ls | CoreTool::Find => {
-                let lexical = search_path(arguments);
-                let backend = if lexical == "." {
-                    String::new()
-                } else {
-                    crate::directory_path(&self.root, &lexical)?
-                };
-                Footprint::new(
-                    vec![Scope {
-                        path: self.scheduling_path(&backend)?,
-                        access: Access::Read,
-                        extent: Extent::Subtree,
-                    }],
-                    false,
-                    false,
-                )
-                .map_err(|_| Error::Denied("invalid Job footprint"))
-            }
-            CoreTool::Grep => {
-                let lexical = search_path(arguments);
-                if lexical == "." {
-                    return Footprint::new(
-                        vec![Scope {
-                            path: self.scheduling_path(".")?,
-                            access: Access::Read,
-                            extent: Extent::Subtree,
-                        }],
-                        false,
-                        false,
-                    )
-                    .map_err(|_| Error::Denied("invalid Job footprint"));
-                }
-                let backend = match crate::platform_fs(self.root.entry_meta(&lexical))?.kind {
-                    Kind::File => (
-                        crate::content_path(&self.root, &lexical, false)?,
-                        Extent::Exact,
-                    ),
-                    Kind::Dir => (
-                        crate::directory_path(&self.root, &lexical)?,
-                        Extent::Subtree,
-                    ),
-                    Kind::Symlink => crate::directory_path(&self.root, &lexical)
-                        .map(|path| (path, Extent::Subtree))
-                        .or_else(|_| {
-                            crate::content_path(&self.root, &lexical, false)
-                                .map(|path| (path, Extent::Exact))
-                        })?,
-                    _ => return Err(Error::Denied("grep Job path is not text-searchable")),
-                };
-                Footprint::new(
-                    vec![Scope {
-                        path: self.scheduling_path(&backend.0)?,
-                        access: Access::Read,
-                        extent: backend.1,
-                    }],
-                    false,
-                    false,
-                )
-                .map_err(|_| Error::Denied("invalid Job footprint"))
-            }
-            CoreTool::Copy | CoreTool::Move => {
-                let from = arg_path(arguments, "from")?;
-                let to = arg_path(arguments, "to")?;
-                // Lifecycle node planning must not require an extra metadata
-                // read merely to improve scheduler precision. A subtree scope
-                // is conservative for files and exact for directory trees.
-                let mut scopes = vec![Scope {
-                    path: self.scheduling_path(&from)?,
-                    access: if tool == CoreTool::Copy {
-                        Access::Read
-                    } else {
-                        Access::Write
-                    },
-                    extent: Extent::Subtree,
-                }];
-                scopes.push(Scope {
-                    path: self.scheduling_path(&to)?,
-                    access: Access::Write,
-                    extent: Extent::Subtree,
-                });
-                Footprint::new(scopes, false, false)
-                    .map_err(|_| Error::Denied("invalid Job footprint"))
-            }
-            CoreTool::Remove => {
-                let paths = arguments
-                    .get("paths")
-                    .and_then(Value::as_array)
-                    .ok_or(Error::Denied("rm Job paths are missing"))?;
-                let mut scopes = Vec::with_capacity(paths.len());
-                for path in paths {
-                    let path = path
-                        .as_str()
-                        .ok_or(Error::Denied("rm Job path is invalid"))?;
-                    scopes.push(Scope {
-                        path: self.scheduling_path(path)?,
-                        access: Access::Write,
-                        extent: Extent::Subtree,
-                    });
-                }
-                Footprint::new(scopes, false, false)
-                    .map_err(|_| Error::Denied("invalid Job footprint"))
-            }
-            CoreTool::Patch => Ok(Footprint::unknown(true, true)),
-        }
-    }
-
     fn resolve_node(&self, name: &str) -> Option<NodeTool> {
         if let Some(native) = self
             .native_tools
@@ -635,11 +479,10 @@ impl JobHost {
                 .map_err(|_| ())?;
             let (footprint, runtime_binding, task_result_eligible, result_bytes) =
                 if let Some(native) = step.tool.native() {
-                    if !canonical_arguments(native, &step.arguments, self.tool_limits) {
-                        return Err(());
-                    }
+                    let request =
+                        canonical_request(native, &step.arguments, self.tool_limits).ok_or(())?;
                     (
-                        self.footprint(native, &step.arguments).map_err(|_| ())?,
+                        request.footprint(self.root.as_ref()).map_err(|_| ())?,
                         self.root_binding,
                         one,
                         self.tool_limits.result_bytes,

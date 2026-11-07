@@ -5,6 +5,11 @@
 //! presentation budgets, transport projection and filesystem effects remain
 //! host-owned.
 
+#[cfg(feature = "batch")]
+use super::{
+    backend::ExplicitPathBackend,
+    footprint::{Access as FootprintAccess, Extent, Footprint, Scope},
+};
 use super::{lifecycle, path, Filter, Kind, MetaKey, Selection, Sort, TimeRange, MAX_WALK_DEPTH};
 use crate::{
     binary::{RequestedSplice, MAX_EDIT_RANGES},
@@ -398,6 +403,13 @@ pub struct AccessPath {
     pub follow_final: bool,
 }
 
+#[cfg(feature = "batch")]
+#[derive(Debug)]
+pub enum FootprintError<E> {
+    Backend(E),
+    Invalid(super::footprint::Error),
+}
+
 #[derive(Clone, Debug)]
 pub enum RequestKind {
     Ls(Ls),
@@ -501,6 +513,177 @@ impl Request {
             RequestKind::Bedit(args) => one(&args.path, ReadWrite, true),
         })
     }
+    #[cfg(feature = "batch")]
+    pub fn footprint<B>(&self, backend: &B) -> Result<Footprint, FootprintError<B::Error>>
+    where
+        B: ExplicitPathBackend,
+    {
+        use FootprintAccess::{Read, Write};
+
+        fn scope<B: ExplicitPathBackend>(
+            backend: &B,
+            path: &str,
+            access: FootprintAccess,
+            extent: Extent,
+        ) -> Result<Scope, FootprintError<B::Error>> {
+            let path = if path.is_empty() { "." } else { path };
+            Ok(Scope {
+                path: backend
+                    .scheduling_path(path)
+                    .map_err(FootprintError::Backend)?,
+                access,
+                extent,
+            })
+        }
+        fn one<B: ExplicitPathBackend>(
+            backend: &B,
+            path: &str,
+            access: FootprintAccess,
+            extent: Extent,
+        ) -> Result<Footprint, FootprintError<B::Error>> {
+            Footprint::new(vec![scope(backend, path, access, extent)?], false, false)
+                .map_err(FootprintError::Invalid)
+        }
+        fn content<B: ExplicitPathBackend>(
+            backend: &B,
+            path: &str,
+            allow_missing: bool,
+        ) -> Result<String, FootprintError<B::Error>> {
+            backend
+                .resolve_content_path(path, allow_missing)
+                .map_err(FootprintError::Backend)
+        }
+        fn directory<B: ExplicitPathBackend>(
+            backend: &B,
+            path: &str,
+        ) -> Result<String, FootprintError<B::Error>> {
+            if path == "." {
+                Ok(".".to_owned())
+            } else {
+                backend
+                    .resolve_directory_path(path)
+                    .map_err(FootprintError::Backend)
+            }
+        }
+
+        match &self.kind {
+            RequestKind::Read(args) => one(
+                backend,
+                &content(backend, &args.path, false)?,
+                Read,
+                Extent::Exact,
+            ),
+            RequestKind::Bread(args) => one(
+                backend,
+                &content(backend, &args.path, false)?,
+                Read,
+                Extent::Exact,
+            ),
+            RequestKind::Write(args) => one(
+                backend,
+                &content(backend, &args.path, true)?,
+                Write,
+                Extent::Exact,
+            ),
+            RequestKind::Bwrite(args) => one(
+                backend,
+                &content(backend, &args.path, true)?,
+                Write,
+                Extent::Exact,
+            ),
+            RequestKind::Edit(args) => one(
+                backend,
+                &content(backend, &args.path, false)?,
+                Write,
+                Extent::Exact,
+            ),
+            RequestKind::Bedit(args) => one(
+                backend,
+                &content(backend, &args.path, false)?,
+                Write,
+                Extent::Exact,
+            ),
+            RequestKind::Ls(args) => one(
+                backend,
+                &directory(backend, &args.path)?,
+                Read,
+                Extent::Subtree,
+            ),
+            RequestKind::Find(args) => one(
+                backend,
+                &directory(backend, &args.path)?,
+                Read,
+                Extent::Subtree,
+            ),
+            RequestKind::Grep(args) => {
+                if args.path == "." {
+                    return one(backend, ".", Read, Extent::Subtree);
+                }
+                let meta = backend
+                    .entry_meta(&args.path)
+                    .map_err(FootprintError::Backend)?;
+                match meta.kind {
+                    Kind::File => one(
+                        backend,
+                        &content(backend, &args.path, false)?,
+                        Read,
+                        Extent::Exact,
+                    ),
+                    Kind::Dir => one(
+                        backend,
+                        &directory(backend, &args.path)?,
+                        Read,
+                        Extent::Subtree,
+                    ),
+                    Kind::Symlink => match backend.resolve_directory_path(&args.path) {
+                        Ok(path) => one(backend, &path, Read, Extent::Subtree),
+                        Err(_) => one(
+                            backend,
+                            &content(backend, &args.path, false)?,
+                            Read,
+                            Extent::Exact,
+                        ),
+                    },
+                    _ => Err(FootprintError::Invalid(
+                        super::footprint::Error::InvalidPath,
+                    )),
+                }
+            }
+            RequestKind::Copy(args) => Footprint::new(
+                vec![
+                    scope(backend, &args.from, Read, Extent::Subtree)?,
+                    scope(backend, &args.to, Write, Extent::Subtree)?,
+                ],
+                false,
+                false,
+            )
+            .map_err(FootprintError::Invalid),
+            RequestKind::Move(args) => Footprint::new(
+                vec![
+                    scope(backend, &args.from, Write, Extent::Subtree)?,
+                    scope(backend, &args.to, Write, Extent::Subtree)?,
+                ],
+                false,
+                false,
+            )
+            .map_err(FootprintError::Invalid),
+            RequestKind::Remove(args) => Footprint::new(
+                args.paths
+                    .iter()
+                    .map(|path| scope(backend, path, Write, Extent::Subtree))
+                    .collect::<Result<Vec<_>, FootprintError<B::Error>>>()?,
+                false,
+                false,
+            )
+            .map_err(FootprintError::Invalid),
+            // Patch can combine updates and additions beneath missing-parent
+            // publication roots. Until the canonical patch planner exports the
+            // exact namespace publication plan, serialize conservatively rather
+            // than under-approximate read/write conflicts.
+            RequestKind::Patch(_) => Ok(Footprint::unknown(true, true)),
+        }
+    }
+
     pub(crate) fn into_kind(self) -> RequestKind {
         self.kind
     }
@@ -810,6 +993,123 @@ impl Bedit {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(feature = "batch")]
+    struct FootprintBackend;
+    #[cfg(feature = "batch")]
+    impl super::super::walk::Backend for FootprintBackend {
+        type Error = &'static str;
+        fn list(&self, _: &str, _: usize) -> Result<super::super::walk::Listing, Self::Error> {
+            Err("unused")
+        }
+        fn read_bytes(&self, _: &str, _: usize) -> Result<Vec<u8>, Self::Error> {
+            Err("unused")
+        }
+        fn classify(&self, _: &Self::Error) -> super::super::walk::BackendErrorKind {
+            super::super::walk::BackendErrorKind::Other
+        }
+    }
+    #[cfg(feature = "batch")]
+    impl super::super::backend::MetadataBackend for FootprintBackend {
+        fn entry_meta(&self, path: &str) -> Result<super::super::EntryMeta, Self::Error> {
+            let kind = match path {
+                "dir" => Kind::Dir,
+                "dir-link" | "file-link" => Kind::Symlink,
+                _ => Kind::File,
+            };
+            Ok(super::super::EntryMeta {
+                kind,
+                ..Default::default()
+            })
+        }
+        fn scheduling_path(&self, path: &str) -> Result<String, Self::Error> {
+            Ok(format!("sched/{path}"))
+        }
+    }
+    #[cfg(feature = "batch")]
+    impl super::super::backend::ExplicitPathBackend for FootprintBackend {
+        fn resolve_content_path(&self, path: &str, _: bool) -> Result<String, Self::Error> {
+            Ok(match path {
+                "file-link" => "resolved/file".into(),
+                other => other.into(),
+            })
+        }
+        fn resolve_directory_path(&self, path: &str) -> Result<String, Self::Error> {
+            match path {
+                "dir-link" => Ok("resolved/dir".into()),
+                "file-link" => Err("not a directory"),
+                other => Ok(other.into()),
+            }
+        }
+    }
+
+    #[cfg(feature = "batch")]
+    #[test]
+    fn graph_footprints_are_shared_resolved_and_conservative() {
+        use super::super::footprint::{Access, Extent};
+        let backend = FootprintBackend;
+
+        let read = parse(Tool::Read, &json!({"path":"file-link"}), Limits::default())
+            .unwrap()
+            .footprint(&backend)
+            .unwrap();
+        assert_eq!(read.scopes().len(), 1);
+        assert_eq!(read.scopes()[0].path, "sched/resolved/file");
+        assert_eq!(read.scopes()[0].access, Access::Read);
+        assert_eq!(read.scopes()[0].extent, Extent::Exact);
+
+        let find = parse(Tool::Find, &json!({"path":"dir-link"}), Limits::default())
+            .unwrap()
+            .footprint(&backend)
+            .unwrap();
+        assert_eq!(find.scopes()[0].path, "sched/resolved/dir");
+        assert_eq!(find.scopes()[0].extent, Extent::Subtree);
+
+        let grep = parse(
+            Tool::Grep,
+            &json!({"path":"file-link","pattern":"x"}),
+            Limits::default(),
+        )
+        .unwrap()
+        .footprint(&backend)
+        .unwrap();
+        assert_eq!(grep.scopes()[0].path, "sched/resolved/file");
+        assert_eq!(grep.scopes()[0].extent, Extent::Exact);
+
+        let copy = parse(
+            Tool::Copy,
+            &json!({"from":"dir","to":"copy"}),
+            Limits::default(),
+        )
+        .unwrap()
+        .footprint(&backend)
+        .unwrap();
+        assert_eq!(copy.scopes().len(), 2);
+        assert!(copy
+            .scopes()
+            .iter()
+            .all(|scope| scope.extent == Extent::Subtree));
+        assert!(copy
+            .scopes()
+            .iter()
+            .any(|scope| scope.path == "sched/dir" && scope.access == Access::Read));
+        assert!(copy
+            .scopes()
+            .iter()
+            .any(|scope| scope.path == "sched/copy" && scope.access == Access::Write));
+
+        let patch = parse(
+            Tool::Patch,
+            &json!({"patch":"*** Begin Patch\n*** Add File: new.txt\n+x\n*** End Patch\n"}),
+            Limits::default(),
+        )
+        .unwrap()
+        .footprint(&backend)
+        .unwrap();
+        assert!(patch.unknown_read());
+        assert!(patch.unknown_write());
+        assert!(patch.scopes().is_empty());
+    }
 
     #[test]
     fn access_paths_single_source_final_symlink_and_lifecycle_intent() {
