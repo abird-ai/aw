@@ -138,26 +138,52 @@ impl Default for SchemaCaps {
     }
 }
 impl SchemaCaps {
-    /// Validate shared engine safety bounds plus irreducible semantic minima.
-    /// Product adapters own their defaults and may choose any viable tighter
-    /// ceiling inside these bounds.
-    pub fn validate(self) -> Result<Self, &'static str> {
-        if self.text_write_bytes == 0
-            || self.text_write_bytes > crate::MAX_MUTATION_PLAN_BYTES
-            || self.patch_bytes < MIN_PATCH_BYTES
-            || self.patch_bytes > crate::MAX_MUTATION_PLAN_BYTES
-            || self.binary_data_bytes == 0
-            || self.binary_data_bytes > crate::MAX_MUTATION_PLAN_BYTES
-            || self.binary_edit_ranges == 0
-            || self.binary_edit_ranges > crate::MAX_BINARY_EDIT_RANGES
-            || self.binary_read_bytes == 0
-            || self.binary_read_bytes > crate::MAX_READ_WINDOW_BYTES
-            || self.binary_encoded_read_bytes == 0
-            || self.binary_encoded_read_bytes > self.binary_read_bytes
-            || self.read_line_limit == 0
-            || self.read_line_limit > 65_536
-        {
+    /// Validate only the schema ceilings consumed by one enabled tool. An
+    /// unrelated disabled capability must not make this tool unusable.
+    pub fn validate_for(self, tool: Tool) -> Result<Self, &'static str> {
+        let invalid = match tool {
+            Tool::Read => self.read_line_limit == 0 || self.read_line_limit > 65_536,
+            Tool::Write => {
+                self.text_write_bytes == 0 || self.text_write_bytes > crate::MAX_MUTATION_PLAN_BYTES
+            }
+            Tool::Patch => {
+                self.patch_bytes < MIN_PATCH_BYTES
+                    || self.patch_bytes > crate::MAX_MUTATION_PLAN_BYTES
+            }
+            Tool::Bread => {
+                self.binary_read_bytes == 0
+                    || self.binary_read_bytes > crate::MAX_READ_WINDOW_BYTES
+                    || self.binary_encoded_read_bytes == 0
+                    || self.binary_encoded_read_bytes > self.binary_read_bytes
+            }
+            Tool::Bwrite => {
+                self.binary_data_bytes == 0
+                    || self.binary_data_bytes > crate::MAX_MUTATION_PLAN_BYTES
+            }
+            Tool::Bedit => {
+                self.binary_data_bytes == 0
+                    || self.binary_data_bytes > crate::MAX_MUTATION_PLAN_BYTES
+                    || self.binary_edit_ranges == 0
+                    || self.binary_edit_ranges > crate::MAX_BINARY_EDIT_RANGES
+            }
+            Tool::Ls
+            | Tool::Find
+            | Tool::Grep
+            | Tool::Edit
+            | Tool::Copy
+            | Tool::Move
+            | Tool::Remove => false,
+        };
+        if invalid {
             return Err("schema caps exceed shared engine safety/semantic bounds");
+        }
+        Ok(self)
+    }
+
+    /// Validate a complete all-tools profile.
+    pub fn validate(self) -> Result<Self, &'static str> {
+        for tool in Tool::ALL {
+            self.validate_for(tool)?;
         }
         Ok(self)
     }
@@ -330,6 +356,20 @@ mod tests {
         assert_eq!(names.len(), 13);
         assert!(bytes < 12 * 1024, "schema budget {bytes}");
     }
+    #[test]
+    fn tool_scoped_schema_validation_ignores_disabled_capabilities() {
+        let caps = SchemaCaps {
+            patch_bytes: 0,
+            binary_read_bytes: 0,
+            binary_encoded_read_bytes: 0,
+            ..SchemaCaps::default()
+        };
+        assert!(caps.validate_for(Tool::Read).is_ok());
+        assert!(caps.validate_for(Tool::Patch).is_err());
+        assert!(caps.validate_for(Tool::Bread).is_err());
+        assert!(caps.validate().is_err());
+    }
+
     #[test]
     fn schema_caps_use_shared_safety_maxima_not_one_hosts_defaults() {
         let caps = SchemaCaps {

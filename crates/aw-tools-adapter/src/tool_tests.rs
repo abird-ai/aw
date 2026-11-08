@@ -952,9 +952,131 @@ fn direct_only_configuration_ignores_uninstantiated_job_capacity() {
     );
     let mut options = LocalToolOptions::new(&tree.0, ToolMode::ReadOnly);
     options.selected_tools = vec!["read".into()];
-    options.limits.jobs.max_active_nodes = 1;
-    // No batch/job_start/shell is selected, so Graph width is irrelevant.
+    options.limits.jobs.max_active_nodes = 0;
+    options.limits.jobs.max_spool_bytes = 0;
+    // No batch/job_start/shell is selected, so even an otherwise-invalid Job
+    // configuration is inert and cannot constrain direct read.
     assert!(configure(builder, actor, &options).is_ok());
+}
+
+#[test]
+fn selected_tool_limits_ignore_dormant_capabilities_but_validate_when_enabled() {
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::Workspace);
+    options.selected_tools = vec!["read".into()];
+    options.limits.schema.patch_bytes = 0;
+    options.limits.schema.binary_data_bytes = 0;
+    options.limits.schema.binary_read_bytes = 0;
+    options.limits.schema.binary_encoded_read_bytes = 0;
+    options.limits.edit_text_bytes = 0;
+    options.limits.binary_decoded_bytes = 0;
+    options.limits.shell_stream_bytes = 0;
+    options.limits.jobs.max_active_nodes = 0;
+    options.limits.jobs.max_spool_bytes = 0;
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    assert!(configure(builder, actor.clone(), &options).is_ok());
+
+    for enabled in ["patch", "bwrite", "edit"] {
+        let mut enabled_options = options.clone();
+        enabled_options.selected_tools = vec![enabled.into()];
+        let builder = Agent::builder(
+            Arc::new(ProviderFixture),
+            AgentOptions::new("fixture", "model"),
+        );
+        assert!(
+            configure(builder, actor.clone(), &enabled_options).is_err(),
+            "enabling {enabled} must validate its own dormant limits"
+        );
+    }
+}
+
+#[test]
+fn selected_graph_native_limits_ignore_unregistered_node_capabilities() {
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::Workspace);
+    options.selected_tools = vec!["read".into(), "batch".into()];
+    options.limits.schema.patch_bytes = 0;
+    options.limits.schema.binary_data_bytes = 0;
+    options.limits.shell_stream_bytes = 0;
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    assert!(configure(builder, actor.clone(), &options).is_ok());
+
+    options.selected_tools = vec!["patch".into(), "batch".into()];
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    assert!(configure(builder, actor, &options).is_err());
+}
+
+#[test]
+fn direct_only_result_budget_can_be_below_job_status_minimum() {
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let mut direct = LocalToolOptions::new(&tree.0, ToolMode::ReadOnly);
+    direct.selected_tools = vec!["read".into()];
+    direct.limits.result_bytes = 512;
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    assert!(configure(builder, actor.clone(), &direct).is_ok());
+
+    let mut jobs = direct;
+    jobs.selected_tools = vec!["read".into(), "batch".into()];
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    let error = match configure(builder, actor, &jobs) {
+        Ok(_) => panic!("Job-producing config with a 512-byte result ceiling must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("compact Job status"), "{error}");
 }
 
 #[test]

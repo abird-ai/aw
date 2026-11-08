@@ -132,7 +132,7 @@ impl JobRuntime {
         let scope = LiveScope::memory()?;
         let shells = shell::ShellRegistry::default();
         let native_tools = Arc::new(native_tools);
-        let tool_limits = tool_limits.validate()?;
+        let tool_limits = tool_limits.validate_for_core_tools(&native_tools, false, true)?;
         let mut concurrency = concurrency.validate()?;
         concurrency.graph_width = concurrency.graph_width.min(max_graph_nodes);
         tool_limits.validate_job_runtime_capacity(
@@ -189,6 +189,8 @@ impl JobRuntime {
     }
 
     pub(crate) fn register_shell(&self, shell: Arc<shell::NativeShell>) -> Result<()> {
+        self.tool_limits
+            .validate_for_core_tools(self.native_tools.as_ref(), true, true)?;
         self.tool_limits.validate_job_runtime_capacity(
             self.parallelism.max_width().min(self.max_graph_nodes),
             self.max_graph_nodes,

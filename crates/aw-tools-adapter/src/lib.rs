@@ -485,8 +485,8 @@ impl std::fmt::Display for ToolMode {
         })
     }
 }
-const MIN_LOCAL_RESULT_BYTES: usize =
-    aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES;
+const MIN_LOCAL_RESULT_BYTES: usize = 512;
+const MIN_JOB_RESULT_BYTES: usize = aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES;
 const DEFAULT_LOCAL_RESULT_BYTES: usize = 96 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,6 +535,12 @@ impl LocalToolLimits {
                 "Graph parallel ceiling exceeds configured Job active-node ceiling".into(),
             ));
         }
+        if self.result_bytes < MIN_JOB_RESULT_BYTES {
+            return Err(Error::Config(
+                "Job controls require enough result budget for one complete compact Job status"
+                    .into(),
+            ));
+        }
         if !(1..=aw_tools::filesystem::batch::MAX_OPS).contains(&max_graph_nodes) {
             return Err(Error::Config(
                 "Job Graph node ceiling exceeds the shared safety maximum".into(),
@@ -573,38 +579,115 @@ impl LocalToolLimits {
         }
     }
 
-    pub fn validate(self) -> Result<Self> {
-        self.schema
-            .validate()
-            .map_err(|message| Error::Config(message.into()))?;
-        self.jobs
-            .validate()
-            .map_err(|_| Error::Config("invalid shared JobManager limits".into()))?;
+    fn validate_for_core_tools(
+        self,
+        tools: &[aw_tools::filesystem::schema::Tool],
+        shell: bool,
+        jobs: bool,
+    ) -> Result<Self> {
+        use aw_tools::filesystem::schema::Tool as T;
         let defaults = Self::default();
-        if self.schema.text_write_bytes > defaults.schema.text_write_bytes
-            || self.schema.patch_bytes > defaults.schema.patch_bytes
-            || self.schema.binary_data_bytes > defaults.schema.binary_data_bytes
-            || self.schema.binary_edit_ranges > defaults.schema.binary_edit_ranges
-            || self.schema.binary_read_bytes > defaults.schema.binary_read_bytes
-            || self.schema.binary_encoded_read_bytes > defaults.schema.binary_encoded_read_bytes
-            || self.schema.read_line_limit > defaults.schema.read_line_limit
-            || self.schema.typed_media
-            || !(MIN_LOCAL_RESULT_BYTES..=defaults.result_bytes).contains(&self.result_bytes)
-            || !(1..=defaults.shell_stream_bytes).contains(&self.shell_stream_bytes)
-            || !(1..=defaults.edit_text_bytes).contains(&self.edit_text_bytes)
-            || !(1..=defaults.binary_decoded_bytes).contains(&self.binary_decoded_bytes)
-            || self.jobs.max_retained_jobs > defaults.jobs.max_retained_jobs
-            || self.jobs.max_exposed_jobs > defaults.jobs.max_exposed_jobs
-            || self.jobs.max_hidden_jobs > defaults.jobs.max_hidden_jobs
-            || self.jobs.max_active_nodes > defaults.jobs.max_active_nodes
-            || self.jobs.max_hidden_replays > defaults.jobs.max_hidden_replays
-            || self.jobs.max_spool_bytes > defaults.jobs.max_spool_bytes
+        let request_limits = self.request_limits();
+        for tool in tools {
+            request_limits
+                .validate_for(*tool)
+                .map_err(|error| Error::Config(error.to_string()))?;
+            let widened = match tool {
+                T::Read => self.schema.read_line_limit > defaults.schema.read_line_limit,
+                T::Write => self.schema.text_write_bytes > defaults.schema.text_write_bytes,
+                T::Patch => self.schema.patch_bytes > defaults.schema.patch_bytes,
+                T::Bread => {
+                    self.schema.binary_read_bytes > defaults.schema.binary_read_bytes
+                        || self.schema.binary_encoded_read_bytes
+                            > defaults.schema.binary_encoded_read_bytes
+                        || self.schema.typed_media
+                }
+                T::Bwrite => self.schema.binary_data_bytes > defaults.schema.binary_data_bytes,
+                T::Bedit => {
+                    self.schema.binary_data_bytes > defaults.schema.binary_data_bytes
+                        || self.schema.binary_edit_ranges > defaults.schema.binary_edit_ranges
+                }
+                T::Ls | T::Find | T::Grep | T::Edit | T::Copy | T::Move | T::Remove => false,
+            };
+            if widened {
+                return Err(Error::Config(
+                    "enabled local-tool schema limits may only narrow AW built-in defaults; typed media is host-owned"
+                        .into(),
+                ));
+            }
+        }
+
+        if (!tools.is_empty() || shell || jobs)
+            && !(MIN_LOCAL_RESULT_BYTES..=defaults.result_bytes).contains(&self.result_bytes)
         {
             return Err(Error::Config(
-                "local AW tool limits may only narrow built-in numeric defaults; typed-media capability is host-owned".into(),
+                "enabled local-tool result limit must stay within AW built-in bounds".into(),
             ));
         }
+        if shell && !(1..=defaults.shell_stream_bytes).contains(&self.shell_stream_bytes) {
+            return Err(Error::Config(
+                "enabled shell stream limit must stay within AW built-in bounds".into(),
+            ));
+        }
+        if tools.contains(&T::Edit)
+            && !(1..=defaults.edit_text_bytes).contains(&self.edit_text_bytes)
+        {
+            return Err(Error::Config(
+                "enabled edit text limit must stay within AW built-in bounds".into(),
+            ));
+        }
+        if tools
+            .iter()
+            .any(|tool| matches!(tool, T::Bwrite | T::Bedit))
+            && !(1..=defaults.binary_decoded_bytes).contains(&self.binary_decoded_bytes)
+        {
+            return Err(Error::Config(
+                "enabled decoded binary limit must stay within AW built-in bounds".into(),
+            ));
+        }
+        if jobs {
+            self.jobs
+                .validate()
+                .map_err(|_| Error::Config("invalid shared JobManager limits".into()))?;
+            if self.jobs.max_retained_jobs > defaults.jobs.max_retained_jobs
+                || self.jobs.max_exposed_jobs > defaults.jobs.max_exposed_jobs
+                || self.jobs.max_hidden_jobs > defaults.jobs.max_hidden_jobs
+                || self.jobs.max_active_nodes > defaults.jobs.max_active_nodes
+                || self.jobs.max_hidden_replays > defaults.jobs.max_hidden_replays
+                || self.jobs.max_spool_bytes > defaults.jobs.max_spool_bytes
+            {
+                return Err(Error::Config(
+                    "enabled local AW Job limits may only narrow built-in numeric defaults".into(),
+                ));
+            }
+        }
         Ok(self)
+    }
+
+    /// Host-facing validation for a named enabled filesystem subset. Unknown
+    /// names are rejected; shell and Job surfaces are explicit orthogonal flags.
+    pub fn validate_for_names(self, names: &[&str], shell: bool, jobs: bool) -> Result<Self> {
+        let mut tools = Vec::with_capacity(names.len());
+        for name in names {
+            let tool = aw_tools::filesystem::schema::Tool::from_name(name).ok_or_else(|| {
+                Error::Config("unknown local filesystem tool in limits profile".into())
+            })?;
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        }
+        self.validate_for_core_tools(&tools, shell, jobs)
+    }
+
+    /// Validate the complete direct local surface, including shell but excluding
+    /// JobManager quotas.
+    pub fn validate_direct(self) -> Result<Self> {
+        self.validate_for_core_tools(&aw_tools::filesystem::schema::Tool::ALL, true, false)
+    }
+
+    /// Validate the complete built-in local surface including Jobs.
+    pub fn validate(self) -> Result<Self> {
+        self.validate_for_core_tools(&aw_tools::filesystem::schema::Tool::ALL, true, true)
     }
 }
 
@@ -743,7 +826,60 @@ pub fn configure(
         return Ok(builder);
     }
     let concurrency = options.concurrency.validate()?;
-    let limits = options.limits.validate()?;
+    let selected = options
+        .selected_tools
+        .iter()
+        // Input-only legacy selection alias. The registered model tool
+        // advertises the sealed DL-150 pwsh identity on Windows.
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    const JOB_TOOL_NAMES: &[&str] = &[
+        "batch",
+        "job_start",
+        "job_list",
+        "job_get",
+        "job_output",
+        "job_ack",
+        "job_cancel",
+        "job_restart",
+    ];
+    let constructor_selected = selected.iter().any(|name| {
+        matches!(
+            *name,
+            "batch" | "job_start" | "bash" | "pwsh" | "powershell"
+        )
+    });
+    let control_selected = selected.iter().any(|name| {
+        matches!(
+            *name,
+            "job_list" | "job_get" | "job_output" | "job_ack" | "job_cancel" | "job_restart"
+        )
+    });
+    let wants_jobs = selected.is_empty() || constructor_selected || control_selected;
+    let active_tools = aw_tools::filesystem::schema::Tool::ALL
+        .into_iter()
+        .filter(|tool| options.mode.access().permits(tool.action()))
+        .filter(|tool| selected.is_empty() || selected.contains(tool.name()))
+        .collect::<Vec<_>>();
+    let shell_enabled = options
+        .mode
+        .access()
+        .permits(aw_tools::filesystem::access::Action::Shell)
+        && (selected.is_empty()
+            || selected.iter().any(|name| {
+                #[cfg(unix)]
+                {
+                    *name == "bash"
+                }
+                #[cfg(windows)]
+                {
+                    matches!(*name, "pwsh" | "powershell")
+                }
+            }));
+    let limits =
+        options
+            .limits
+            .validate_for_core_tools(&active_tools, shell_enabled, wants_jobs)?;
     let mut policy = builder.tool_policy_snapshot();
     if policy.execution_site != options.execution_site {
         let default_site = ToolPolicy::default().execution_site;
@@ -777,41 +913,7 @@ pub fn configure(
         options.private_state_dir.as_deref(),
     )?);
     let durable_remove = root.private_artifacts().is_durable();
-    let selected = options
-        .selected_tools
-        .iter()
-        // Input-only legacy selection alias. The registered model tool
-        // advertises the sealed DL-150 pwsh identity on Windows.
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
     let mut available = BTreeSet::new();
-    // One live Job runtime is shared by batch and every job_* projection.
-    // All Job projections share this one live runtime. V2 ShellNodes are now
-    // prepared through the same direct-shell interpreter objects, so job_start
-    // can advertise the final Graph constructor without an intermediate schema.
-    const JOB_TOOL_NAMES: &[&str] = &[
-        "batch",
-        "job_start",
-        "job_list",
-        "job_get",
-        "job_output",
-        "job_ack",
-        "job_cancel",
-        "job_restart",
-    ];
-    let constructor_selected = selected.iter().any(|name| {
-        matches!(
-            *name,
-            "batch" | "job_start" | "bash" | "pwsh" | "powershell"
-        )
-    });
-    let control_selected = selected.iter().any(|name| {
-        matches!(
-            *name,
-            "job_list" | "job_get" | "job_output" | "job_ack" | "job_cancel" | "job_restart"
-        )
-    });
-    let wants_jobs = selected.is_empty() || constructor_selected || control_selected;
     let multi_node_constructor =
         selected.is_empty() || selected.contains("batch") || selected.contains("job_start");
     let max_graph_nodes = if multi_node_constructor {
@@ -825,21 +927,7 @@ pub fn configure(
         .filter(|tool| *tool != aw_tools::filesystem::schema::Tool::Remove || durable_remove)
         .filter(|tool| selected.is_empty() || selected.contains(tool.name()))
         .collect::<Vec<_>>();
-    let graph_shell_available = options
-        .mode
-        .access()
-        .permits(aw_tools::filesystem::access::Action::Shell)
-        && (selected.is_empty()
-            || selected.iter().any(|name| {
-                #[cfg(unix)]
-                {
-                    *name == "bash"
-                }
-                #[cfg(windows)]
-                {
-                    matches!(*name, "pwsh" | "powershell")
-                }
-            }));
+    let graph_shell_available = shell_enabled;
     if !selected.is_empty() && control_selected && !constructor_selected {
         return Err(Error::Denied(
             "selected Job controls require an explicitly selected batch, job_start or shell constructor",

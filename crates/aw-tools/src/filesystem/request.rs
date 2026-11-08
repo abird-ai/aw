@@ -48,17 +48,29 @@ impl Default for Limits {
     }
 }
 impl Limits {
-    pub fn validate(self) -> Result<Self, Error> {
-        self.schema.validate().map_err(Error::Invalid)?;
-        if self.edit_text_bytes == 0 || self.edit_text_bytes > MAX_MUTATION_PLAN_BYTES {
+    pub fn validate_for(self, tool: Tool) -> Result<Self, Error> {
+        self.schema.validate_for(tool).map_err(Error::Invalid)?;
+        if tool == Tool::Edit
+            && (self.edit_text_bytes == 0 || self.edit_text_bytes > MAX_MUTATION_PLAN_BYTES)
+        {
             return Err(Error::Invalid(
                 "edit text ceiling exceeds shared engine safety bounds",
             ));
         }
-        if self.binary_decoded_bytes == 0 || self.binary_decoded_bytes > MAX_MUTATION_PLAN_BYTES {
+        if matches!(tool, Tool::Bwrite | Tool::Bedit)
+            && (self.binary_decoded_bytes == 0
+                || self.binary_decoded_bytes > MAX_MUTATION_PLAN_BYTES)
+        {
             return Err(Error::Invalid(
                 "decoded binary payload ceiling exceeds shared engine safety bounds",
             ));
+        }
+        Ok(self)
+    }
+
+    pub fn validate(self) -> Result<Self, Error> {
+        for tool in Tool::ALL {
+            self.validate_for(tool)?;
         }
         Ok(self)
     }
@@ -440,6 +452,24 @@ impl Request {
         &self.kind
     }
 
+    pub fn tool(&self) -> Tool {
+        match self.kind {
+            RequestKind::Ls(_) => Tool::Ls,
+            RequestKind::Find(_) => Tool::Find,
+            RequestKind::Grep(_) => Tool::Grep,
+            RequestKind::Read(_) => Tool::Read,
+            RequestKind::Write(_) => Tool::Write,
+            RequestKind::Edit(_) => Tool::Edit,
+            RequestKind::Patch(_) => Tool::Patch,
+            RequestKind::Copy(_) => Tool::Copy,
+            RequestKind::Move(_) => Tool::Move,
+            RequestKind::Remove(_) => Tool::Remove,
+            RequestKind::Bread(_) => Tool::Bread,
+            RequestKind::Bwrite(_) => Tool::Bwrite,
+            RequestKind::Bedit(_) => Tool::Bedit,
+        }
+    }
+
     pub fn access_paths(&self) -> Result<Vec<AccessPath>, Error> {
         use PathAccess::{Read, ReadWrite, Write};
         let one = |path: &str, access, follow_final| {
@@ -690,7 +720,7 @@ impl Request {
 }
 
 pub fn parse(tool: Tool, value: &Value, limits: Limits) -> Result<Request, Error> {
-    let limits = limits.validate()?;
+    let limits = limits.validate_for(tool)?;
     let kind = match tool {
         Tool::Ls => parse_ls(value).map(RequestKind::Ls),
         Tool::Find => parse_find(value).map(RequestKind::Find),
@@ -1249,13 +1279,20 @@ mod tests {
     fn grep_validation_is_independent_of_binary_read_ceiling() {
         let limits = Limits {
             schema: SchemaCaps {
-                binary_read_bytes: 1,
-                binary_encoded_read_bytes: 1,
+                binary_read_bytes: 0,
+                binary_encoded_read_bytes: 0,
                 ..SchemaCaps::default()
             },
             ..Limits::default()
         };
         assert!(parse(Tool::Grep, &json!({"pattern":"needle","limit":200}), limits,).is_ok());
+        assert!(parse(
+            Tool::Bread,
+            &json!({"path":"a.bin","format":"base64"}),
+            limits,
+        )
+        .is_err());
+        assert!(limits.validate().is_err());
     }
 
     #[test]

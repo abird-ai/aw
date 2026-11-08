@@ -150,13 +150,19 @@ impl ServiceConfig {
         concurrency: LocalToolConcurrency,
         limits: LocalToolLimits,
     ) -> Result<Self> {
-        self.child_tool_concurrency = concurrency.validate()?;
-        self.child_tool_limits = limits.validate()?;
-        if self.child_tool_concurrency.graph_width > self.child_tool_limits.jobs.max_active_nodes {
-            return Err(Error::Config(
-                "child Graph parallel ceiling exceeds child Job active-node ceiling".into(),
-            ));
+        if self.child_tool_mode == ToolMode::Off {
+            self.child_tool_concurrency = concurrency;
+            self.child_tool_limits = limits;
+            return Ok(self);
         }
+        self.child_tool_concurrency = concurrency.validate()?;
+        let names: &[&str] = match self.child_tool_mode {
+            ToolMode::ReadOnly => &["read"],
+            ToolMode::Workspace => &["read", "write", "edit"],
+            ToolMode::Off => unreachable!("handled above"),
+            ToolMode::Trusted => &["read", "write", "edit"],
+        };
+        self.child_tool_limits = limits.validate_for_names(names, false, false)?;
         Ok(self)
     }
     /// Explicit host-only opt-in to Actor metadata/control for existing
@@ -2100,7 +2106,15 @@ mod tests {
             None,
         )
         .with_child_tool_runtime(concurrency, widened)
-        .is_err());
+        .is_ok(), "read-only child must ignore dormant write limits");
+        assert!(ServiceConfig::new(
+            ToolMode::Workspace,
+            BudgetConfig::default(),
+            PathBuf::from("/tmp"),
+            None,
+        )
+        .with_child_tool_runtime(concurrency, widened)
+        .is_err(), "workspace child exposes write and must reject widening");
     }
 
     fn settings() -> Settings {

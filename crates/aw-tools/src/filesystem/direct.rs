@@ -63,28 +63,57 @@ impl Default for Limits {
     }
 }
 impl Limits {
-    pub fn validate(self) -> Result<Self, Error<std::convert::Infallible>> {
+    pub fn validate_for(
+        self,
+        tool: super::schema::Tool,
+    ) -> Result<Self, Error<std::convert::Infallible>> {
         self.request
-            .validate()
+            .validate_for(tool)
             .map_err(|error| Error::Invalid(error.to_string()))?;
-        if !(512..=MAX_RENDER_BYTES).contains(&self.result_bytes)
-            || !(1..=MAX_READ_WINDOW_BYTES).contains(&self.read_data_bytes)
-            || !(512..=MAX_RENDER_BYTES).contains(&self.binary_result_bytes)
-            || self.text_read_bytes == 0
-            || self.text_read_bytes > MAX_MUTATION_PLAN_BYTES
-            || self.text_write_bytes == 0
-            || self.text_write_bytes > MAX_MUTATION_PLAN_BYTES
-            || self.binary_file_bytes == 0
-            || self.binary_file_bytes > MAX_READ_WINDOW_BYTES
-            || self.binary_default_window == 0
-            || self.binary_default_window > self.request.schema.binary_read_bytes
-            || self.grep.candidates == 0
-            || self.grep.scan_bytes == 0
-            || self.grep.scan_files == 0
-            || self.grep.text_file_bytes == 0
-            || self.grep.duration.is_zero()
-        {
+        if !(512..=MAX_RENDER_BYTES).contains(&self.result_bytes) {
             return Err(Error::Limit("invalid canonical direct-execution ceilings"));
+        }
+        let invalid = match tool {
+            super::schema::Tool::Read => {
+                !(1..=MAX_READ_WINDOW_BYTES).contains(&self.read_data_bytes)
+            }
+            super::schema::Tool::Bread => {
+                !(512..=MAX_RENDER_BYTES).contains(&self.binary_result_bytes)
+                    || self.binary_default_window == 0
+                    || self.binary_default_window > self.request.schema.binary_read_bytes
+            }
+            super::schema::Tool::Edit | super::schema::Tool::Patch => {
+                self.text_read_bytes == 0
+                    || self.text_read_bytes > MAX_MUTATION_PLAN_BYTES
+                    || self.text_write_bytes == 0
+                    || self.text_write_bytes > MAX_MUTATION_PLAN_BYTES
+            }
+            super::schema::Tool::Bwrite | super::schema::Tool::Bedit => {
+                self.binary_file_bytes == 0 || self.binary_file_bytes > MAX_READ_WINDOW_BYTES
+            }
+            super::schema::Tool::Grep => {
+                self.grep.candidates == 0
+                    || self.grep.scan_bytes == 0
+                    || self.grep.scan_files == 0
+                    || self.grep.text_file_bytes == 0
+                    || self.grep.duration.is_zero()
+            }
+            super::schema::Tool::Ls
+            | super::schema::Tool::Find
+            | super::schema::Tool::Write
+            | super::schema::Tool::Copy
+            | super::schema::Tool::Move
+            | super::schema::Tool::Remove => false,
+        };
+        if invalid {
+            return Err(Error::Limit("invalid canonical direct-execution ceilings"));
+        }
+        Ok(self)
+    }
+
+    pub fn validate(self) -> Result<Self, Error<std::convert::Infallible>> {
+        for tool in super::schema::Tool::ALL {
+            self.validate_for(tool)?;
         }
         Ok(self)
     }
@@ -637,11 +666,13 @@ pub fn execute<B>(
 where
     B: SecuredFilesystem + ExplicitPathBackend,
 {
-    let limits = limits.validate().map_err(|error| match error {
-        Error::Invalid(reason) => Error::Invalid(reason),
-        Error::Limit(reason) => Error::Limit(reason),
-        _ => unreachable!("limit validation has no backend"),
-    })?;
+    let limits = limits
+        .validate_for(request.tool())
+        .map_err(|error| match error {
+            Error::Invalid(reason) => Error::Invalid(reason),
+            Error::Limit(reason) => Error::Limit(reason),
+            _ => unreachable!("limit validation has no backend"),
+        })?;
     if cancelled() {
         return Err(Error::Cancelled);
     }
