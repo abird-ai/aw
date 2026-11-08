@@ -592,6 +592,14 @@ Job persistence boundary: shared Jobs are live-session durable only. AW relies o
       authorities; the tested cross-process mutation protocol remains safe even
       when their XDG roots differ.
 
+### Fresh AW configuration/runtime review — 2026-11-08
+
+- [x] Revalidated the live AW refactor against the larger Agent/Workspace goals: one original Agent/ToolPolicy/TurnJournal, narrow-only runtime configuration, stateless/minimal/no_std boundaries, child-tool inheritance, direct/shared request execution and Windows cross-build.
+- [x] Fixed shell-only local-tool configuration over-reserving Job spool for an unexposed 64-node Graph. Runtime admission now carries the maximum Graph node count the actually advertised constructors can create: direct shell-only is exactly one node; `batch`/`job_start` and empty/full selections retain the shared `MAX_OPS` ceiling.
+- [x] Bound `JobHost` validation/preparation/restart to the same exposed-node ceiling and clamp Graph width to it, so hidden/unadvertised Graph capability cannot constrain or misdescribe a direct-only runtime.
+- [x] Regression coverage proves one-node shell capacity succeeds exactly at one ShellNode reservation, full Graph surfaces still require maximum-Graph capacity, and a bounded JobHost rejects a Graph above its configured node ceiling.
+- [x] Fresh gates after the fix: `aw-tools` 277/277; Unix secured backend 41/41; AW adapter 199/199; Agent core all-target suites green; AW CLI library 227/227 active (2 intentional ignores); AW CLI binary 384/384 active (1 intentional benchmark ignore); Unix platform 10/10; strict affected-crate Clippy; workspace all-target check; stateless/no-default, `minimal`, no_std+alloc; Windows GNU cross-stack all-target check.
+
 ### Shared convergence verification
 
 - [ ] Pre/post mechanical-rename behavior/test matrix identical.

@@ -147,6 +147,7 @@ pub struct JobHost {
     native_tools: Arc<Vec<CoreTool>>,
     parallelism: Arc<GraphParallelism>,
     tool_limits: crate::LocalToolLimits,
+    max_graph_nodes: usize,
 }
 
 fn core_effect(effect: &aw_agent_core::ToolEffect) -> CoreEffect {
@@ -331,6 +332,7 @@ pub(crate) struct JobHostConfig {
     pub shells: shell::ShellRegistry,
     pub native_tools: Arc<Vec<CoreTool>>,
     pub parallelism: Arc<GraphParallelism>,
+    pub max_graph_nodes: usize,
 }
 
 impl JobHost {
@@ -356,6 +358,7 @@ impl JobHost {
                 parallelism: Arc::new(GraphParallelism::new(
                     crate::LocalToolConcurrency::default(),
                 )?),
+                max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
             },
         )
     }
@@ -372,11 +375,17 @@ impl JobHost {
             shells,
             native_tools,
             parallelism,
+            max_graph_nodes,
         } = config;
         for value in [&session, &branch] {
             if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
                 return Err(Error::Config("invalid Job Session/branch identity".into()));
             }
+        }
+        if !(1..=aw_tools::filesystem::batch::MAX_OPS).contains(&max_graph_nodes) {
+            return Err(Error::Config(
+                "Job Graph node ceiling exceeds the shared safety maximum".into(),
+            ));
         }
         if native_tools.iter().any(|tool| !tool.graph_eligible()) {
             return Err(Error::Config(
@@ -405,6 +414,7 @@ impl JobHost {
             native_tools,
             parallelism,
             tool_limits,
+            max_graph_nodes,
         })
     }
 
@@ -512,24 +522,28 @@ impl JobHost {
         .map_err(|_| Error::Denied("Job node preparation failed"))
     }
 
-    pub fn validate_graph(&self, graph_input: &Value) -> Result<()> {
-        Graph::compile_with(
-            graph_input,
-            |name| self.resolve_node(name),
-            |node, arguments| self.validate_node(node, arguments),
-        )
-        .map(|_| ())
-        .map_err(|_| Error::Denied("invalid canonical Job graph"))
-    }
-
-    pub fn prepare(&self, ctx: &ToolContext, graph_input: &Value) -> Result<PreparedJob> {
-        let task = self.task_identity(ctx)?;
+    fn compile_graph(&self, graph_input: &Value) -> Result<Graph> {
         let graph = Graph::compile_with(
             graph_input,
             |name| self.resolve_node(name),
             |node, arguments| self.validate_node(node, arguments),
         )
         .map_err(|_| Error::Denied("invalid canonical Job graph"))?;
+        if graph.steps().len() > self.max_graph_nodes {
+            return Err(Error::Limit(
+                "Job Graph exceeds the configured node ceiling",
+            ));
+        }
+        Ok(graph)
+    }
+
+    pub fn validate_graph(&self, graph_input: &Value) -> Result<()> {
+        self.compile_graph(graph_input).map(|_| ())
+    }
+
+    pub fn prepare(&self, ctx: &ToolContext, graph_input: &Value) -> Result<PreparedJob> {
+        let task = self.task_identity(ctx)?;
+        let graph = self.compile_graph(graph_input)?;
         let plans = self.plans_for_graph(ctx, &graph)?;
         let semantic_hash = semantic_hash(&graph, &plans)
             .map_err(|_| Error::Denied("Job semantic identity failed"))?;
@@ -741,6 +755,11 @@ impl JobHost {
             .manager
             .graph(source_id)
             .map_err(|_| Error::Protocol("restart source Graph unavailable"))?;
+        if graph.steps().len() > self.max_graph_nodes {
+            return Err(Error::Limit(
+                "restart source Graph exceeds the configured node ceiling",
+            ));
+        }
         let plans = self.plans_for_graph(ctx, &graph)?;
         let task = self.task_identity(ctx)?;
         let semantics = semantic_hash(&graph, &plans)
@@ -2118,6 +2137,39 @@ mod tests {
     }
 
     #[test]
+    fn bounded_job_host_rejects_graph_above_exposed_node_ceiling() {
+        let temp = Temp::new();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = JobHost::new_with_config(
+            Arc::new(aw_platform::scoped_fs::Root::open(&temp.workspace).unwrap()),
+            agent.tool_binding_authority(),
+            JobHostConfig {
+                session: "session-a".into(),
+                branch: "main".into(),
+                tool_limits: crate::LocalToolLimits::default(),
+                shells: shell::ShellRegistry::default(),
+                native_tools: Arc::new(vec![CoreTool::Read]),
+                parallelism: Arc::new(
+                    GraphParallelism::new(crate::LocalToolConcurrency::default()).unwrap(),
+                ),
+                max_graph_nodes: 1,
+            },
+        )
+        .unwrap();
+        let ctx = context(&agent, actor, "bounded-graph");
+        assert!(host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[
+                    ["read",{"path":"a.txt"},"*"],
+                    ["read",{"path":"b.txt"},"*"]
+                ]}),
+            )
+            .is_err());
+    }
+
+    #[test]
     fn job_host_rejects_direct_only_native_registry_entries() {
         let temp = Temp::new();
         let actor = PrincipalId::new("local").unwrap();
@@ -2134,6 +2186,7 @@ mod tests {
                 parallelism: Arc::new(
                     GraphParallelism::new(crate::LocalToolConcurrency::default()).unwrap(),
                 ),
+                max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
             },
         );
         assert!(matches!(result, Err(Error::Config(message)) if message.contains("direct-only")));
@@ -2165,6 +2218,7 @@ mod tests {
                 parallelism: Arc::new(
                     GraphParallelism::new(crate::LocalToolConcurrency::default()).unwrap(),
                 ),
+                max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
             },
         )
         .unwrap();

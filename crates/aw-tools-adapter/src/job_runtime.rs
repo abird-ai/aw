@@ -83,6 +83,7 @@ pub struct JobRuntime {
     shells: shell::ShellRegistry,
     native_tools: Arc<Vec<aw_tools::filesystem::schema::Tool>>,
     parallelism: Arc<GraphParallelism>,
+    max_graph_nodes: usize,
     state: Mutex<State>,
 }
 impl JobRuntime {
@@ -110,13 +111,33 @@ impl JobRuntime {
         concurrency: crate::LocalToolConcurrency,
         native_tools: Vec<aw_tools::filesystem::schema::Tool>,
     ) -> Result<Arc<Self>> {
+        Self::new_with_native_tools_bounded(
+            root,
+            authority,
+            tool_limits,
+            concurrency,
+            aw_tools::filesystem::batch::MAX_OPS,
+            native_tools,
+        )
+    }
+
+    pub(crate) fn new_with_native_tools_bounded(
+        root: Arc<aw_platform::scoped_fs::Root>,
+        authority: ToolBindingAuthority,
+        tool_limits: crate::LocalToolLimits,
+        concurrency: crate::LocalToolConcurrency,
+        max_graph_nodes: usize,
+        native_tools: Vec<aw_tools::filesystem::schema::Tool>,
+    ) -> Result<Arc<Self>> {
         let scope = LiveScope::memory()?;
         let shells = shell::ShellRegistry::default();
         let native_tools = Arc::new(native_tools);
         let tool_limits = tool_limits.validate()?;
-        let concurrency = concurrency.validate()?;
+        let mut concurrency = concurrency.validate()?;
+        concurrency.graph_width = concurrency.graph_width.min(max_graph_nodes);
         tool_limits.validate_job_runtime_capacity(
             concurrency.graph_width,
+            max_graph_nodes,
             !native_tools.is_empty(),
             false,
         )?;
@@ -131,6 +152,7 @@ impl JobRuntime {
                 shells: shells.clone(),
                 native_tools: native_tools.clone(),
                 parallelism: parallelism.clone(),
+                max_graph_nodes,
             },
         )?);
         Ok(Arc::new(Self {
@@ -140,6 +162,7 @@ impl JobRuntime {
             shells,
             native_tools,
             parallelism,
+            max_graph_nodes,
             state: Mutex::new(State {
                 generation: 1,
                 scope,
@@ -160,13 +183,15 @@ impl JobRuntime {
                 shells: self.shells.clone(),
                 native_tools: self.native_tools.clone(),
                 parallelism: self.parallelism.clone(),
+                max_graph_nodes: self.max_graph_nodes,
             },
         )?))
     }
 
     pub(crate) fn register_shell(&self, shell: Arc<shell::NativeShell>) -> Result<()> {
         self.tool_limits.validate_job_runtime_capacity(
-            self.parallelism.max_width(),
+            self.parallelism.max_width().min(self.max_graph_nodes),
+            self.max_graph_nodes,
             !self.native_tools.is_empty(),
             true,
         )?;

@@ -526,12 +526,18 @@ impl LocalToolLimits {
     pub(crate) fn validate_job_runtime_capacity(
         self,
         graph_width: usize,
+        max_graph_nodes: usize,
         native_nodes: bool,
         shell_nodes: bool,
     ) -> Result<()> {
         if graph_width == 0 || graph_width > self.jobs.max_active_nodes {
             return Err(Error::Config(
                 "Graph parallel ceiling exceeds configured Job active-node ceiling".into(),
+            ));
+        }
+        if !(1..=aw_tools::filesystem::batch::MAX_OPS).contains(&max_graph_nodes) {
+            return Err(Error::Config(
+                "Job Graph node ceiling exceeds the shared safety maximum".into(),
             ));
         }
         let native_reservation = if native_nodes {
@@ -548,11 +554,11 @@ impl LocalToolLimits {
         };
         let per_node = native_reservation.max(shell_reservation);
         let minimum_graph_spool = per_node
-            .checked_mul(aw_tools::filesystem::batch::MAX_OPS as u64)
+            .checked_mul(max_graph_nodes as u64)
             .ok_or_else(|| Error::Config("Job Graph spool reservation overflow".into()))?;
         if minimum_graph_spool > 0 && self.jobs.max_spool_bytes < minimum_graph_spool {
             return Err(Error::Config(
-                "Job spool ceiling cannot retain one maximum-size Graph's exact node results"
+                "Job spool ceiling cannot retain one maximum constructible Graph's exact node results"
                     .into(),
             ));
         }
@@ -806,6 +812,13 @@ pub fn configure(
         )
     });
     let wants_jobs = selected.is_empty() || constructor_selected || control_selected;
+    let multi_node_constructor =
+        selected.is_empty() || selected.contains("batch") || selected.contains("job_start");
+    let max_graph_nodes = if multi_node_constructor {
+        aw_tools::filesystem::batch::MAX_OPS
+    } else {
+        1
+    };
     let graph_native_tools = aw_tools::filesystem::schema::Tool::GRAPH_NATIVE
         .into_iter()
         .filter(|tool| options.mode.access().permits(tool.action()))
@@ -847,17 +860,19 @@ pub fn configure(
     // skips merely because the host chose an internally inconsistent limit set.
     if wants_jobs {
         limits.validate_job_runtime_capacity(
-            concurrency.graph_width,
+            concurrency.graph_width.min(max_graph_nodes),
+            max_graph_nodes,
             !graph_native_tools.is_empty(),
             graph_shell_available,
         )?;
     }
     let job_runtime = if wants_jobs {
-        let runtime = job_runtime::JobRuntime::new_with_native_tools(
+        let runtime = job_runtime::JobRuntime::new_with_native_tools_bounded(
             root.clone(),
             builder.tool_binding_authority(),
             limits,
             effective_concurrency,
+            max_graph_nodes,
             graph_native_tools,
         )?;
         builder = builder

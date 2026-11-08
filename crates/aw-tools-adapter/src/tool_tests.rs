@@ -785,7 +785,7 @@ fn job_runtime_config_rejects_spool_that_cannot_retain_one_maximum_graph() {
     options.limits.jobs.max_spool_bytes = 8192;
     assert!(matches!(
         crate::configure(builder, actor, &options),
-        Err(Error::Config(message)) if message.contains("maximum-size Graph")
+        Err(Error::Config(message)) if message.contains("maximum constructible Graph")
     ));
 
     // The same tiny Job quota is irrelevant to a direct-only selection: no
@@ -801,7 +801,7 @@ fn job_runtime_config_rejects_spool_that_cannot_retain_one_maximum_graph() {
 
 #[cfg(unix)]
 #[test]
-fn shell_graph_spool_preflight_counts_terminal_and_both_streams() {
+fn shell_only_selection_reserves_one_node_not_an_unexposed_max_graph() {
     struct ProviderFixture;
     impl Provider for ProviderFixture {
         fn stream<'a>(
@@ -814,34 +814,34 @@ fn shell_graph_spool_preflight_counts_terminal_and_both_streams() {
         }
     }
     let tree = Tree::new();
-    let actor = PrincipalId::new("local").unwrap();
-    let builder = Agent::builder(
-        Arc::new(ProviderFixture),
-        AgentOptions::new("fixture", "model"),
-    );
-    let mut options = crate::LocalToolOptions::new(&tree.0, crate::ToolMode::Trusted);
-    options.bash = Some(
-        std::env::var_os("AW_BASH")
-            .map(PathBuf::from)
-            .or_else(|| {
-                ["/bin/bash", "/usr/bin/bash"]
-                    .iter()
-                    .map(PathBuf::from)
-                    .find(|p| p.is_file())
-            })
-            .expect("shell fixture needs bash"),
-    );
-    options.selected_tools = vec!["bash".into()];
-    let shell_per_node =
-        (crate::job_host::SHELL_RESULT_BYTES + 2 * options.limits.shell_stream_bytes) as u64;
-    options.limits.jobs.max_spool_bytes = shell_per_node
-        .checked_mul(aw_tools::filesystem::batch::MAX_OPS as u64)
-        .unwrap()
-        - 1;
-    assert!(matches!(
-        crate::configure(builder, actor, &options),
-        Err(Error::Config(message)) if message.contains("maximum-size Graph")
-    ));
+    let shell = std::env::var_os("AW_BASH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            ["/bin/bash", "/usr/bin/bash"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| p.is_file())
+        })
+        .expect("shell fixture needs bash");
+    let shell_per_node = (crate::job_host::SHELL_RESULT_BYTES
+        + 2 * crate::LocalToolLimits::default().shell_stream_bytes) as u64;
+
+    for (spool, should_pass) in [(shell_per_node - 1, false), (shell_per_node, true)] {
+        let actor = PrincipalId::new("local").unwrap();
+        let builder = Agent::builder(
+            Arc::new(ProviderFixture),
+            AgentOptions::new("fixture", "model"),
+        );
+        let mut options = crate::LocalToolOptions::new(&tree.0, crate::ToolMode::Trusted);
+        options.bash = Some(shell.clone());
+        options.selected_tools = vec!["bash".into()];
+        options.limits.jobs.max_spool_bytes = spool;
+        assert_eq!(
+            crate::configure(builder, actor, &options).is_ok(),
+            should_pass,
+            "shell-only Job capacity must reflect one constructible node"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -885,7 +885,7 @@ fn empty_trusted_selection_includes_shell_in_graph_spool_preflight() {
     assert!(options.selected_tools.is_empty());
     assert!(matches!(
         crate::configure(builder, actor, &options),
-        Err(Error::Config(message)) if message.contains("maximum-size Graph")
+        Err(Error::Config(message)) if message.contains("maximum constructible Graph")
     ));
 }
 
