@@ -364,11 +364,10 @@ impl Agent {
         self.options.retry = RetryPolicy::new(retries)?;
         Ok(())
     }
-    /// Explicit host resource ceiling. 16 by default; no read permission is
-    /// created by this setting, even at the maximum supported 128.
-    pub fn set_max_parallel_reads(&mut self, value: usize) -> Result<()> {
-        let mut next = self.tool_policy.parallelism();
-        next.max_parallel_reads = value;
+    /// Atomically replace the host-owned tool scheduling ceilings. No tool
+    /// permission is created by this setting. Every registered runtime first
+    /// validates the complete snapshot; publication happens only if all accept.
+    pub fn set_tool_parallelism(&mut self, next: crate::ToolParallelism) -> Result<()> {
         let next = next.validate()?;
         for lifecycle in &self.tool_policy_lifecycles {
             lifecycle.validate_parallelism(next)?;
@@ -379,6 +378,14 @@ impl Agent {
         }
         Ok(())
     }
+
+    /// Explicit host resource ceiling. 16 by default; no read permission is
+    /// created by this setting, even at the maximum supported 128.
+    pub fn set_max_parallel_reads(&mut self, value: usize) -> Result<()> {
+        let mut next = self.tool_policy.parallelism();
+        next.max_parallel_reads = value;
+        self.set_tool_parallelism(next)
+    }
     /// The host permits concurrent TRUSTED Bash only when explicitly enabled.
     /// The model must additionally mark each command parallel=true; this does
     /// not change Process/Unknown journal and reconciliation semantics.
@@ -386,15 +393,7 @@ impl Agent {
         let mut next = self.tool_policy.parallelism();
         next.allow_parallel_shell = enabled;
         next.max_parallel_shell = limit;
-        let next = next.validate()?;
-        for lifecycle in &self.tool_policy_lifecycles {
-            lifecycle.validate_parallelism(next)?;
-        }
-        self.tool_policy.set_parallelism(next);
-        for lifecycle in &self.tool_policy_lifecycles {
-            lifecycle.apply_parallelism(next);
-        }
-        Ok(())
+        self.set_tool_parallelism(next)
     }
     /// The most recent actual hosted turn's portable transition decisions.
     /// For std/embedded parity inspection only; not a persisted replay plan.
