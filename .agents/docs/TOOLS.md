@@ -93,7 +93,7 @@ process supervisor.
 | `rw` (`workspace` accepted as input compatibility) | read-only + `write`, `edit`, `patch`, `cp`, `mv`, `rm`, `bwrite`, `bedit` |
 | `full` (`trusted` accepted as input compatibility) | rw + explicitly prepared trusted `bash` (Unix) or `pwsh`/Windows PowerShell identity (Windows) |
 
-`--tools-allow` only narrows that set. Native subagents retain their existing
+`--tools-allow` only narrows that set. A selected Job-backed producer may also expose the bounded `job_*` controls required to observe/cancel/restart that same execution; this does not add another node/tool capability. Native subagents retain their existing
 narrower host-selected subsets; no saved Session can widen current host tool
 policy. Canonical filesystem arguments are the shared schemas below; AW may
 accept explicitly documented legacy fields only at its adapter/deserialization

@@ -154,7 +154,8 @@ struct Cli {
     #[arg(long = "tools-parallel-bash-limit", value_parser = clap::value_parser!(u32).range(1..=128))]
     #[arg(help_heading = "Tools & execution")]
     tools_parallel_bash_limit: Option<u32>,
-    /// Optional exact subset of tools already permitted by --tools-mode.
+    /// Optional subset of tools already permitted by --tools-mode. Job-backed
+    /// producers also expose only the required controls for that same execution.
 
     #[arg(long = "tools-allow", value_delimiter = ',')]
     #[arg(help_heading = "Tools & execution")]

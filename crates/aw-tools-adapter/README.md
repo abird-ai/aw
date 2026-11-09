@@ -85,7 +85,7 @@ rw/full. Old recursive ls fields are no longer model-visible.
   patch, cp, mv, rm, bwrite, bedit.
 - full (trusted accepted for compatibility): rw plus an explicitly selected
   UNSANDBOXED host native bash or PowerShell.
-- `--tools-allow` intersects, never widens, those tool sets. Child agents
+- `--tools-allow` intersects, never widens, those tool sets. A selected Job-backed producer may also expose the bounded `job_*` controls required to observe/cancel/restart that same execution; this does not add another node/tool capability. Child agents
   retain their original narrower read/read-write-edit subsets.
 - AW's TurnMachine admits concurrent calls **only** for adjacent, explicitly
   model-selected `parallel:true` reads or already-granted trusted Process

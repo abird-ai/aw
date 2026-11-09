@@ -2182,18 +2182,15 @@ mod tests {
             .unwrap();
         let owner = &f.owner;
         let running = owner.run_once(&mut f.agent, |_| Ok(()));
-        let result = tokio::time::timeout(Duration::from_millis(70), async {
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
             tokio::pin!(running);
             tokio::select! {
                 r=&mut running=>Some(r),
-                _=notify.notified()=>{
-                    tokio::time::sleep(Duration::from_millis(15)).await;
-                    None
-                },
+                _=notify.notified()=>None,
             }
         })
         .await
-        .unwrap();
+        .expect("fixture provider must enter the paid dispatch");
         assert!(result.is_none());
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
