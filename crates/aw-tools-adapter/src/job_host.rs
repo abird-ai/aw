@@ -1508,6 +1508,21 @@ impl JobHost {
                 return Err(error);
             }
         };
+        let current_footprint = match request.footprint(self.root.as_ref()) {
+            Ok(footprint) => footprint,
+            Err(_) => {
+                self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                return Err(Error::Denied(
+                    "filesystem topology changed after Job preflight; restart the Graph",
+                ));
+            }
+        };
+        if current_footprint != *plan.footprint() {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(Error::Denied(
+                "filesystem topology changed after Job preflight; restart the Graph",
+            ));
+        }
         let direct_limits =
             crate::canonical_direct_limits(self.tool_limits, plan.budget().result_bytes, &request);
         if let Err(error) = self.start(&ctx.actor, id, coordinate, claimed_sequence, true) {
@@ -2635,6 +2650,55 @@ mod tests {
                 .released
         );
         assert_eq!(host.manager().spool_usage().unwrap().0, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_graph_rejects_final_symlink_retarget_before_effect() {
+        use std::os::unix::fs::symlink;
+
+        let temp = Temp::new();
+        let first = temp.workspace.join("first.txt");
+        let second = temp.workspace.join("second.txt");
+        let alias = temp.workspace.join("alias.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        symlink("first.txt", &alias).unwrap();
+
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::Workspace);
+        let host = host(&temp, &agent, Limits::default());
+        let ctx = context(&agent, actor, "retarget-before-effect");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["write",{
+                    "path":"alias.txt","content":"changed"
+                }]]}),
+            )
+            .unwrap();
+        let id = host.admit(prepared).unwrap();
+        host.expose(&id).unwrap();
+
+        fs::remove_file(&alias).unwrap();
+        symlink("second.txt", &alias).unwrap();
+
+        assert!(host
+            .execute_native_node(&ctx, &id, 1, aw_agent_core::CancellationToken::new(),)
+            .await
+            .is_err());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert!(matches!(
+            host.manager().node_state(&id, 1).unwrap(),
+            NodeState::Terminal {
+                status: Status {
+                    primary: Primary::Skip,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
