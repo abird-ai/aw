@@ -673,21 +673,32 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn lifecycle_label(&self) -> &'static str {
+    /// Canonical user-facing Job status. Terminal uncertainty dominates a
+    /// cancellation/revocation request because intent is not proof that an
+    /// already-launched external effect stopped.
+    pub fn status_label(&self) -> &'static str {
         match self.lifecycle {
             Lifecycle::Running => "running",
             Lifecycle::Cancelling => "cancelling",
             Lifecycle::Revoking => "revoking",
-            Lifecycle::Terminal => match self.stop_reason {
-                Some(StopReason::Cancelled) => "cancelled",
-                Some(StopReason::Revoked) => "revoked",
-                None => self.summary.map_or("unknown", |summary| summary.0.as_str()),
-            },
+            Lifecycle::Terminal => {
+                let Some((primary, _, _)) = self.summary else {
+                    return "unknown";
+                };
+                if primary == Primary::Unknown {
+                    return "unknown";
+                }
+                match self.stop_reason {
+                    Some(StopReason::Cancelled) => "cancelled",
+                    Some(StopReason::Revoked) => "revoked",
+                    None => primary.as_str(),
+                }
+            }
         }
     }
 
     pub fn list_row(&self) -> String {
-        let mut row = format!("{} {} {}", self.id, self.label, self.lifecycle_label());
+        let mut row = format!("{} {} {}", self.id, self.label, self.status_label());
         if self.total > 1 && self.lifecycle != Lifecycle::Terminal {
             row.push_str(&format!(" {}/{}", self.finished, self.total));
         }
@@ -699,7 +710,7 @@ impl Snapshot {
     }
 
     pub fn header(&self) -> String {
-        let mut header = format!("{} {}", self.lifecycle_label(), self.label);
+        let mut header = format!("{} {}", self.status_label(), self.label);
         if self.total > 1 {
             header.push_str(&format!(" {}/{}", self.finished, self.total));
         }
@@ -1220,16 +1231,18 @@ impl JobManager {
                     }
                 }
                 Lifecycle::Terminal => {
-                    if managed.job.stop_reason().is_some() {
+                    let Some((primary, _, _)) = managed.job.summary() else {
+                        return Err(Error::InvalidOutput);
+                    };
+                    if primary == Primary::Unknown {
+                        TaskDisposition::Uncertain
+                    } else if managed.job.stop_reason().is_some() {
                         TaskDisposition::Cancelled
                     } else {
-                        let Some((primary, _, _)) = managed.job.summary() else {
-                            return Err(Error::InvalidOutput);
-                        };
                         match primary {
                             Primary::Ok | Primary::Unchanged => TaskDisposition::Completed,
                             Primary::Fail | Primary::Mixed => TaskDisposition::Failed,
-                            Primary::Unknown => TaskDisposition::Uncertain,
+                            Primary::Unknown => unreachable!("handled above"),
                             Primary::Skip => TaskDisposition::Cancelled,
                         }
                     }
@@ -5941,6 +5954,100 @@ mod tests {
             manager.task_projection("graph-task", true),
             Err(Error::InvalidOutput)
         ));
+    }
+
+    #[test]
+    fn cancelled_terminal_unknown_stays_unknown_and_task_uncertain() {
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 1024,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: true,
+            })
+        })
+        .unwrap();
+        let task = TaskIdentity {
+            actor: "a".into(),
+            source_kind: "host".into(),
+            source_id: "source".into(),
+            source_epoch: 2,
+            execution_site: "local".into(),
+            session: "s".into(),
+            branch: "main".into(),
+            turn_id: 1,
+            call_id: "cancel-unknown".into(),
+            effect: ToolEffect::Process,
+        };
+        let manager = manager(8);
+        manager
+            .admit_task(
+                graph,
+                node_plans,
+                TaskAdmission {
+                    id: "cancel-unknown",
+                    task: &task,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        manager
+            .claim("cancel-unknown", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        manager
+            .start(
+                "cancel-unknown",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager.cancel("cancel-unknown", 4, |_, _| Ok(())).unwrap();
+        manager
+            .settle(
+                "cancel-unknown",
+                1,
+                NodeState::Running { sequence: 3 },
+                Status {
+                    primary: Primary::Unknown,
+                    more: false,
+                    incomplete: false,
+                },
+                5,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+
+        let snapshot = manager.get("cancel-unknown").unwrap();
+        assert_eq!(snapshot.stop_reason, Some(StopReason::Cancelled));
+        assert_eq!(snapshot.summary, Some((Primary::Unknown, false, false)));
+        assert_eq!(snapshot.status_label(), "unknown");
+        assert_eq!(snapshot.list_row(), "cancel-unknown read unknown");
+        assert_eq!(
+            manager.render_job_status("cancel-unknown").unwrap(),
+            "unknown read"
+        );
+        assert_eq!(
+            manager
+                .task_projection("cancel-unknown", true)
+                .unwrap()
+                .info
+                .state,
+            TaskDisposition::Uncertain
+        );
     }
 
     #[test]
