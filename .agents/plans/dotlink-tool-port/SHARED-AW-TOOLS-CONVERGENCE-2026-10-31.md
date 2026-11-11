@@ -399,6 +399,18 @@ Canonical schemas from `aw-tools` never advertise these fields.
 Remove a compatibility path only after live AW callers/tests have migrated; do
 not let compatibility shape shared canonical semantics.
 
+## Final convergence checkpoint — 2026-11-09
+
+This checkpoint supersedes dated/local-only pin language inside A6/A7/A8 below
+while preserving those sections as implementation history. The final canonical
+AW revision is `4a23e92a8f516971bb232b98e4fc000554bcc4ba`, verified on GitHub
+`main`. Dotlink consumes that exact remote revision and its production cutover is
+committed at `b31683c79a8ffd7c5540ac9388e607d8af6c7ffa`. A1–A8 shared-engine
+convergence is implemented. Remaining work is native Windows/macOS/Bubblewrap
+acceptance plus separate typed-media/sandbox capabilities. See the 2026-11-09
+comprehensive cross-repo handoff from the sibling dotlink repo for the complete
+chronology and current continuation contract.
+
 ## AW implementation phases
 
 ### A0 — record and seal

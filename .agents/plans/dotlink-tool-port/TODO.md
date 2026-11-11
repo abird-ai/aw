@@ -4,6 +4,39 @@ Base AW: `53206b2`; dotlink: `fc53fc9` plus uncommitted tool-hardening tree.
 
 Design/decisions: [README.md](README.md).
 
+## Current convergence status — 2026-11-09
+
+The current source and this status block supersede unchecked boxes in older
+dated subsections below when later A5/A6/A7/A8 work completed those items. Keep
+the old boxes as historical provenance; do **not** reimplement completed shared
+Job/Graph/runtime work merely because an older checklist was not mechanically
+reconciled.
+
+Canonical cross-repo continuation handoff:
+[NEXT-AGENT-HANDOFF-2026-11-09.md](NEXT-AGENT-HANDOFF-2026-11-09.md).
+It points to the full dotlink-owned handoff.
+
+- [x] Final reviewed/pushed AW shared baseline:
+  `4a23e92a8f516971bb232b98e4fc000554bcc4ba`. GitHub `abird-ai/aw` `main` was
+  directly verified at this revision; a stale local `origin/main` tracking ref
+  is not evidence that the push is missing.
+- [x] `aw-tools` is the canonical filesystem/Graph/Job runtime;
+  `aw-tools-adapter` is AW authority/process/projection glue; secured Unix/Windows
+  backends are independently consumable.
+- [x] One shared `JobManager`, one original AW Agent/ToolPolicy/TurnJournal/
+  Process authority path, narrowing-only `LocalToolLimits`, and unified
+  Agent/Graph concurrency policy are implemented and reviewed.
+- [x] dotlink production cutover is committed at
+  `b31683c79a8ffd7c5540ac9388e607d8af6c7ffa` and consumes exact remote AW
+  `4a23e92...`; A8 integration is therefore implemented.
+- [x] Final AW Linux/minimal/stateless/no-std and affected strict-Clippy gates
+  recorded in the handoff are green.
+- [!] Fresh Windows cross verification is environment-blocked before AW source
+  by a dangling cached Windows std sysroot; native Windows/macOS remain release
+  gates.
+- [ ] Typed provider/MCP media and separately authorized sandbox runtime remain
+  separate features, not blockers for shared filesystem convergence.
+
 ## Committed
 
 ### `7ce39d9` — native dotlink-style tooling under original AW authority

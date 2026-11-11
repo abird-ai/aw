@@ -6,6 +6,10 @@ Co-authors: ChatGPT GPT-6
 
 Owner: @pvl
 
+Current continuation handoff (2026-11-09): read the AW-local pointer
+[NEXT-AGENT-HANDOFF-2026-11-09.md](NEXT-AGENT-HANDOFF-2026-11-09.md).
+It points to the canonical full cross-repo handoff in the sibling dotlink repo.
+
 ## Current convergence target — 2026-10-31
 
 The next implementation target supersedes older architecture notes in this historical plan where they conflict: [SHARED-AW-TOOLS-CONVERGENCE-2026-10-31.md](SHARED-AW-TOOLS-CONVERGENCE-2026-10-31.md). The final package direction is `aw-tools-core -> aw-tools`, current `aw-tools -> aw-tools-adapter`, with the canonical shared JobManager also living in `aw-tools`. Dotlink consumes the same shared implementation through a thin product adapter. The sealed DL-150 model-facing semantics remain authoritative.
