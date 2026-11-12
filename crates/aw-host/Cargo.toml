@@ -1,0 +1,21 @@
+[package]
+name = "aw-host"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Thin reusable host composition: policy, Agent and original tool executors"
+
+[features]
+default = []
+sessions = ["dep:aw-session"]
+
+[dependencies]
+aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
+aw-tools-adapter = { path = "../aw-tools-adapter", version = "=0.15.0" }
+aw-policy = { path = "../aw-policy", version = "=0.15.0" }
+aw-session = { path = "../aw-session", version = "=0.15.0", optional = true }
+
+[lints.rust]
+unsafe_code = "forbid"

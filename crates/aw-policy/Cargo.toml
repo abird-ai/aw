@@ -1,0 +1,14 @@
+[package]
+name = "aw-policy"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Pure scoped policy constraints and execution preferences; no authority issuer"
+
+[features]
+default = []
+
+[lints.rust]
+unsafe_code = "forbid"

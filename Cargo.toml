@@ -4,6 +4,7 @@ members = [
     "crates/aw-agent-kernel", "examples/sdk-kernel", "crates/aw-embedded", "examples/sdk-embedded",
     "crates/aw-embedded-ffi", "examples/sdk-embedded-ffi-staticlib",
     "crates/aw-tools", "crates/aw-tools-fs-unix", "crates/aw-tools-fs-win",
+    "crates/aw-policy", "crates/aw-session", "crates/aw-host",
     "crates/aw-mcp", "crates/aw-extensions", "examples/process-extension-rust",
     "crates/aw-editor", "crates/aw-ui-extension", "crates/aw-collab", "crates/aw-pipeline", "crates/aw-routing",
     "crates/aw-platform", "crates/aw-platform-unix", "crates/aw-platform-win",
@@ -86,6 +87,7 @@ aw-inference = { version = "=0.15.0", path = "crates/aw-inference", optional = t
 aw-client = { version = "=0.15.0", path = "crates/aw-client", optional = true }
 aw-surfaces = { version = "=0.15.0", path = "crates/aw-surfaces", optional = true }
 aw-agent-core = { version = "=0.15.0", path = "crates/aw-agent-core" }
+aw-host = { version = "=0.15.0", path = "crates/aw-host" }
 aw-agent-kernel = { version = "=0.15.0", path = "crates/aw-agent-kernel" }
 aw-mcp = { version = "=0.15.0", path = "crates/aw-mcp" }
 aw-extensions = { version = "=0.15.0", path = "crates/aw-extensions" }

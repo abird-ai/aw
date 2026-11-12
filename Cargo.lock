@@ -240,6 +240,7 @@ dependencies = [
  "aw-editor",
  "aw-extensions",
  "aw-git",
+ "aw-host",
  "aw-identity",
  "aw-inference",
  "aw-mcp",
@@ -395,6 +396,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-host"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "aw-policy",
+ "aw-session",
+ "aw-tools-adapter",
+]
+
+[[package]]
 name = "aw-identity"
 version = "0.15.0"
 dependencies = [
@@ -520,6 +531,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-policy"
+version = "0.15.0"
+
+[[package]]
 name = "aw-process-extension-rust-example"
 version = "0.15.0"
 dependencies = [
@@ -576,6 +591,14 @@ dependencies = [
  "aw-agent-core",
  "aw-example-extension",
  "tokio",
+]
+
+[[package]]
+name = "aw-session"
+version = "0.15.0"
+dependencies = [
+ "aw-agent-core",
+ "aw-store-api",
 ]
 
 [[package]]

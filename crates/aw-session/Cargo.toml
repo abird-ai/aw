@@ -1,0 +1,18 @@
+[package]
+name = "aw-session"
+version = "0.15.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Reusable Session access and coordinator-binding contracts over authoritative stores"
+
+[features]
+default = []
+
+[dependencies]
+aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
+aw-store-api = { path = "../aw-store-api", version = "=0.15.0" }
+
+[lints.rust]
+unsafe_code = "forbid"
