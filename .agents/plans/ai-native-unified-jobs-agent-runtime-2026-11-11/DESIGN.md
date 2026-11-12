@@ -183,7 +183,13 @@ Graph uses the same flat model leaf name as direct invocation, so the model lear
 
 The Graph admission resolver immediately maps the flat leaf name through the same mechanical mapping as direct provider calls (read -> fs.read, etc.) before policy/preparation/journaling. SDK/internal code may continue to use canonical semantic IDs such as fs.read.
 
-Keep DL-150's **compact coordinate, implicit sequencing and `when` grammar**. Immutable Graph topology and deterministic native semantics stay the normal model-facing behavior; no natural-language Graph DSL, uncontrolled dynamic node insertion, unbounded recursion or implicit dataflow. **Graph-node eligibility is an independently authorized host/adapter capability, not a hard-coded operation-class prohibition in aw-tools.** Shared primitives support any registered semantic leaf, including native tools, Process tools, `batch`, `agent` and `jobs.*`, when an adapter supplies its exact prepared-operation/effect/result/owner contract. AW's ordinary provider-facing Graph may retain its conservative DL-150 eligible set; advanced host/SDK pipelines can opt into bounded nested Graph/Job-control leaves with explicit maximum depth, aggregate nodes/work/output budget, owner/ref checks, replay and conflict/cycle prevention. A nested `batch` remains a separately owned child Graph Job under the original manager; parent node outcome derives only from its fully settled aggregate result. A `jobs.*` Graph leaf cannot self-cancel/steer an unresolved ancestor or bypass its own current Control/disclosure grant. This is **host configurability and primitive composability**, not a new default model tool vocabulary, scheduler, or mutable original Graph.
+Keep DL-150's **compact coordinate, implicit sequencing and `when` grammar**. Immutable Graph topology and deterministic native semantics stay the normal model-facing behavior; no natural-language Graph DSL, uncontrolled dynamic node insertion, unbounded recursion or implicit dataflow.
+
+**The provider/model-facing `batch` Graph MUST retain the sealed conservative DL-150 leaf set plus only deliberately measured simple AW leaves explicitly promoted into that surface.** Nested `batch`, `jobs.*` controls and other advanced orchestration leaves are **not** automatically model-visible merely because the shared runtime can execute them.
+
+At the reusable primitive layer, Graph-node eligibility is an independently authorized host/adapter capability rather than a hard-coded operation-class prohibition. Typed SDK/host builders may opt into any registered semantic leaf, including nested `batch`, `agent` and `jobs.*`, only when an adapter supplies its exact prepared-operation/effect/result/owner contract plus explicit maximum nesting depth, aggregate nodes/work/output budget, owner/ref checks, replay and control-cycle prevention. A nested `batch` remains a separately owned child Graph Job under the original manager; parent node outcome derives only from its fully settled aggregate result. A `jobs.*` Graph leaf cannot self-cancel/steer/send to an unresolved ancestor or otherwise create a wait/control dependency cycle, and cannot bypass current Control/disclosure authority.
+
+This split is normative: **simple model language, composable typed host/SDK runtime**. Shared capability does not imply provider-schema exposure.
 
 ### 2.5 ExecutionStrategy as composable primitives — AW host policy, not core restrictions
 
@@ -222,11 +228,15 @@ The original provider ToolCall name/ID/proposed arguments and its resolved seman
 In particular:
 - Filesystem `read/write/edit/patch/cp/mv/rm/bread/bwrite/bedit/ls/find/grep`: original native path, atomicity and result adapter; delegated additional calls are **separate** ToolCalls with their own grants/receipts, never silently fused into the requested operation.
 - Process `bash/pwsh/powershell`: the original launcher owns the unique Process Job, interpreter identity, sandbox, stdin, stdout/stderr, timeout, cancellation, replay and ACK. A delegate may coordinate it but cannot reproduce its outcome from text.
-- `jobs.list/get/read/ack/send/cancel/subscribe`: original resolved ref/owner and disclosure/Control/replay policy remain authoritative; an Agent cannot alter target identity, bypass current Process input permissions, publish a fabricated event or release another owner's output.
+- `jobs.list/get/read/ack/send/cancel/subscribe`: original resolved ref/owner and disclosure/Control/replay policy remain authoritative; an Agent cannot alter target identity, bypass current Process input permissions, publish a fabricated event or release another owner's output. Transparent DelegateAgent is **ineligible** when the resolved control target is the parent ToolCall's own active Turn/Agent, any unresolved ownership/wait ancestor, or any resource whose requested control cannot settle until the waiting parent Step/Graph node itself settles. This wait/control-cycle check is mechanical over canonical refs plus current ownership/wait edges and runs before delegate admission. Use Local when allowed or an independently controlled/handoff Agent/Job instead; never create a transparent self/ancestor control cycle.
 - `agent`: the original constructor allocates **one canonical intended Agent Job/first Turn** under its own replay claim. An optional coordinating delegate is an independently identified helper, not a replacement second Agent creation; its presence cannot duplicate or retarget the constructor.
 - `batch`: the original Graph Job/JobManager owns coordinates, `when`, conflicts, native node receipts, retention, cancellation and settlement even when a delegate coordinates the complete Graph. There is no second Agent-managed copy of Graph execution.
 
-A delegated Agent's effective operation authority is the **intersection of the caller's original effective actor/resource/source/site/payer grant and the delegate's current tool/provider/payer/Session bounds**. Its otherwise broader personal/team/workspace grants cannot substitute for a missing original operation grant. An Agent may additionally perform explicitly caller-approved auxiliary operations only under a **separate bounded, independently authorized** delegation/tool envelope, each with its own factual receipt, cost, conflict and causal accounting. Such work cannot claim a different original semantic effect was committed. This permits advanced multi-step pipelines without silent privilege expansion. Delegate context is a bounded, host-authored authorized projection; private system/provider/credential/transcript data is never inherited by default.
+A delegated Agent's effective operation authority is the **intersection of the caller's original effective actor/resource/source/site/payer grant and the delegate's current tool/provider/payer/Session bounds**. Its otherwise broader personal/team/workspace grants cannot substitute for a missing original operation grant. An Agent may additionally perform explicitly caller-approved auxiliary operations only under a **separate bounded, independently authorized** delegation/tool envelope, each with its own factual receipt, cost, conflict and causal accounting. Such work cannot claim a different original semantic effect was committed.
+
+**Execution authority and disclosure authority are separate gates.** Delegate context is a bounded, host-authored projection containing only fields/results that the selected delegate Agent **and provider/model** are currently permitted to observe. Exact prepared arguments, commands, secret-derived values, prior node outputs, private transcript/provider context, credentials and unrelated branch state remain sealed inside the trusted executor unless disclosure policy explicitly permits that exact field/category. A delegate may be authorized to request execution of an opaque prepared operation without seeing its secret-bearing payload. If a guardian/router needs protected content to decide, that route/model requires explicit disclosure authority or is unavailable; execution permission never implies model disclosure.
+
+This permits advanced multi-step pipelines without silent privilege or disclosure expansion.
 
 #### Graph delegation shape: whole Graph or dynamic per node
 
@@ -237,8 +247,8 @@ These are **two execution granularities**, not new Graph syntax or Job kinds:
       DelegateAgent(Graph)    # default when Graph delegation is selected
       DelegateAgent(Node)       # advanced, independently routed nodes
 
-- **`Graph` (delegated default):** one ordinary Agent/Turn receives one bounded projection of the fully admitted immutable Graph and coordinates its execution **as one delegated Graph scope**. It may use multiple model Steps *inside that one Turn* when real tool receipts/dependencies require feedback; "one shot" means one Graph-scoped delegate, not an impossible guarantee of one provider inference for sequential dynamic results. It uses the shared Graph manager to dispatch only original prepared nodes, honor `when`, handle results and enforce deterministic conflicts. No new planned nodes/branches/loops, model-controlled bypass of dependencies, reinterpretation of skipped nodes or fake completions. It may perform a graph-wide guardian/routing decision in one separate optional bounded invocation, but **one-pass decision and whole-Graph delegated execution are distinct options**.
-- **`Node` (advanced):** the shared Graph runner schedules the immutable nodes normally; each **activated** eligible node may execute Local or via its own authorized Agent/Turn. A node's route may be chosen dynamically at activation after its `when` condition becomes true, based on already committed permitted results and current host policy. Skipped nodes require **no runtime routing inference or child Agent**. The same Graph Job still owns all node statuses/outputs.
+- **`Graph` (delegated default):** one ordinary Agent/Turn receives one bounded **delegate-visible projection** of the fully admitted immutable Graph and coordinates its execution **as one delegated Graph scope**. Exact prepared node arguments/results remain sealed in the trusted Graph owner unless disclosure policy explicitly permits them; the coordinator can operate on coordinates, operation/category metadata, readiness/status and sanitized permitted fields and ask the owner to execute opaque prepared nodes. It may use multiple model Steps *inside that one Turn* when real tool receipts/dependencies require feedback; "one shot" means one Graph-scoped delegate, not an impossible guarantee of one provider inference for sequential dynamic results. It uses the shared Graph manager to dispatch only original prepared nodes, honor `when`, handle results and enforce deterministic conflicts. No new planned nodes/branches/loops, model-controlled bypass of dependencies, reinterpretation of skipped nodes or fake completions. It may perform a graph-wide guardian/routing decision in one separate optional bounded invocation, but **one-pass decision and whole-Graph delegated execution are distinct options**.
+- **`Node` (advanced):** the shared Graph runner schedules the immutable nodes normally; each activated eligible node may execute Local or via its own authorized Agent/Turn. A node's route may be chosen dynamically only after its `when` condition becomes true. The route/guardian input is a deterministic **GraphActivationContext**: immutable Graph metadata plus canonical coordinate-ordered public receipts from that node's dependency closure, including explicit `when` references **and DL-150's implicit previous-success sequencing edge when `when` is omitted**. Results from unrelated nodes—even if already completed—are invisible. Skipped nodes require no routing inference/child Agent. The same Graph Job owns all statuses/outputs. The shared representation should be a borrowed/slice view over existing Graph receipts where practical, not a copied per-node transcript.
 - **`Local`:** the original shared Graph scheduler dispatches local executors. An advanced host policy may enable a **mixed** Graph with selected nodes delegated even if the overall coordinator is Local; this is the `Node` execution shape. One full Graph does not acquire a new user-visible identity or duplicate scheduler simply because routing varies.
 
 Host-side policy may pick the execution shape and stages (deterministic decision, optional whole-Graph guardian, whole-Graph delegate, activation-time per-node guardian/delegate, or a bounded composition of these). Default for AW is **Local**; when the host/user chooses **Graph DelegateAgent**, default granularity is **Graph**. Per-node dynamic is explicitly available, including the ability to choose Local for particular nodes. Do not hard-code a class-based restriction in shared code or advertise this policy as a new model-facing argument.
@@ -258,7 +268,11 @@ Native exact-operation result authority, existing Job custody and DL-150 Graph o
 
 **Whole-Graph decision validation:** one host-private, bounded, typed map keyed by the original 1-based coordinates with `allow | deny | ask | narrow` and optional routing hints/allowed-candidate subsets. Trusted policy validates completeness of required guardian verdicts, provenance, exact per-node authority, narrowing and results; malformed, duplicate, missing required, or unauthorized entries fail closed. Ineligible *actual permissions* fail, but **no operation is ineligible merely due to its kind**. Node omissions from optional route recommendations retain the host's configured default route. Any authorized narrowing is semantically revalidated on the same fixed topology. Guardian decisions do not become node outcomes; paid preparation is factual model usage, not a Graph effect.
 
-**Dynamic per-node admission:** no advance paid routing on branches that skip when `Node` is selected; routing at activation may use a deterministic host policy, a bounded per-node guardian/model, or a shared previously committed whole-Graph suggestion. Each admitted route decision is journaled exactly once under (Graph Job identity, node coordinate, attempt identity, policy/registry epoch); duplicate dispatch/replay never selects a new delegate or re-executes an already started effect. Any changed/revoked current authority denies before node start; after ambiguous start no silent fallback or double execution. Host caps per-node and aggregate router invocations/tokens/latency and model/child budgets; a policy can select Local without paying for inference.
+**Dynamic per-node admission:** no advance paid routing on branches that skip when `Node` is selected; routing at activation may use a deterministic host policy, a bounded per-node guardian/model, or a shared previously committed whole-Graph suggestion. The shared Graph owner constructs the canonical GraphActivationContext from the node's declared dependency/when closure; the host cannot add incidental scheduler-visible results. This preserves deterministic routing input independent of completion timing for unrelated parallel nodes.
+
+Before any activation-time guardian/router/Ask runs, the shared scheduler claims the node's deterministic conflict-admission position using the preflight **union footprint**. While that decision is pending, conflicting later nodes that would follow it in DL-150's deterministic conflict order cannot leapfrog; unrelated non-conflicting work may continue. If the decision denies/expires, release the reservation. If it selects a narrower actual route, safely release only conflicts proven unnecessary by that admitted route before execution. Router/model/approval latency therefore cannot change conflicting effect order.
+
+Each admitted route decision is journaled exactly once under (Graph Job identity, node coordinate, attempt identity, policy/registry epoch); duplicate dispatch/replay never selects a new delegate or re-executes an already started effect. Any changed/revoked current authority denies before node start; after ambiguous start no silent fallback or double execution. Host caps per-node and aggregate router invocations/tokens/latency and model/child budgets; a policy can select Local without paying for inference.
 
 **Graph delegation:** create/reserve the one coordinating Agent/Turn before any delegated model step or external tool effect; bind it to the existing Graph Job and replay claim, not a second Graph runtime. Child tool proposals are checked as exact immutable prepared node submissions to the original Graph owner (or independent separately authorized auxiliary ToolCalls); the manager decides `when` eligibility and returns the factual node receipt. A coordinator may not submit the same node twice, execute a future node early, or substitute its response for tool effects. If its coordination stops/fails, outstanding work settles truthfully and the original Graph may remain blocked/unknown instead of inventing completion.
 
@@ -309,8 +323,8 @@ The above are **intersecting policy dimensions**, not a false tree. A user may b
 Conceptual **one host-side policy configuration**, not a new mandatory wire schema:
 
     Policy {
-      tools?: { grants?, deny?, allowed_sources?, effects?, sites?, resources? },
-               # grants require a trusted issuer; not session/model preference
+      tools?: { deny?, allowed_sources?, effects?, sites?, resources? },
+      # positive grants are NOT ordinary Policy fields at runtime; see GrantPath below
       decision?: { guardian?: None | Deterministic | Model,
                    scope?: Graph | Node,
                    rules?, approval? },           # host rules, not a fabricated Allow
@@ -326,9 +340,21 @@ Conceptual **one host-side policy configuration**, not a new mandatory wire sche
       disclosure?: { allowed_views?, redaction?, retention? }
     }
 
+    AuthenticatedGrantPath {                  # host/store evidence, not user preference
+      issuer: PrincipalRef,
+      issuer_authority_epoch: Revision,
+      grant_scope: canonical scope/resource,
+      tool_binding_or_grant_ref: opaque stable proof,
+      restrictions: bounded exact source/effect/site/resource ceilings
+    }
+
 All fields are optional at each scope. Defaults are **no new grants**, no model guardian, `Local` execution, and bounded original DL-150 resources. The same field semantics work at host/domain/identity/team/workspace/session/Graph/Node: no different "workspace policy language" or "session policy language". Implement a minimal typed interface rather than a generic arbitrary-expression/JSON policy DSL; only add concrete fields backed by real enforcement.
 
-**Policy publication authority:** the host controls root ceilings and source registrations; an authorized domain administrator may issue scoped domain/team-role/workspace grants **only within host ceilings**; a team administrator may manage team constraints/preferences and issue role grants only if explicit domain authority delegates issuance; a workspace owner may issue access/resource policy **only for that workspace** within domain boundaries; an identity may set its own permissible preferences or narrow itself, not self-issue a new workspace/Process grant; Session/Agent/Graph/Node callers can choose/narrow effective preferences within current authority, never mint grants. Every policy update authenticates both **policy resource and issuing principal** and advances the relevant generation; identity/team membership and workspace ownership changes invalidate affected future grants. Reuse existing host configuration and authoritative Session/resource stores for persistence, with no independent PolicyStore/database or new model tool.
+**Policy publication authority:** the host controls root ceilings and source registrations; an authorized domain administrator may issue scoped domain/team-role/workspace grants **only within host ceilings**; a team administrator may issue role grants only if explicit domain authority delegates issuance; a workspace owner may issue access/resource grants **only for that workspace** within domain boundaries; an identity may set its own permissible preferences or narrow itself, not self-issue a new workspace/Process grant; Session/Agent/Graph/Node callers can choose/narrow effective preferences within current authority, never mint grants.
+
+Publication of a positive grant is a separate authenticated host/store operation that emits an `AuthenticatedGrantPath` (or equivalent sealed host evidence) tied to issuer, issuer-authority epoch, resource scope and the existing ToolPolicy/ToolBindingAuthority grant. **The pure `aw-policy` crate does not create, authenticate or infer positive grants from `PolicyLayer` data.** It composes constraints/preferences/routes/limits only. At admission, AW resolves currently valid authenticated grant paths from authoritative stores, then intersects them with pure policy constraints and materializes the exact ToolPolicy/Envelope. A preference/Session/Graph/Node policy object can therefore never be deserialized or constructed as a grant merely because it contains similarly named fields.
+
+Every policy/grant update authenticates both policy resource and issuing principal and advances the relevant generation; identity/team membership and workspace ownership changes invalidate affected future grant paths. Reuse existing host configuration and authoritative Session/resource stores for persistence, with no independent PolicyStore/database or new model tool.
 
 **Authority resolution (mandatory, never last-writer-wins):**
 - Source-bound tool permissions, static `Envelope` and ToolPolicy grants, exact principal/site/epoch, filesystem/process/network/OS sandbox, data disclosure and payer/provider authority are mandatory **conjunctions** of applicable ceilings and verified grant paths. **Any explicit deny from any applicable host/domain/identity/active-team/workspace/Session/Graph/Node scope wins**; a missing source grant is not `Allow`. Empty intersection is denied.
@@ -365,7 +391,50 @@ One `PolicyDecision` is evaluated for the original prepared operation (or one bo
     Allow | Deny | Ask | Narrow
     + permitted execution route / target / site / payer preference
 
-A guardian/decision model is **advisory evidence**. `Allow` means the decision stage passed, **not** that a missing grant was created. `Deny` blocks execution. `Ask` uses the existing authenticated approval path with exact scope/revision/issuer/expiry; no work begins on a guessed approval. `Narrow` produces one explicit revised candidate that re-runs semantic/schema/revision/ToolPolicy/Envelope/resource checks and is admitted only if the trusted host proves semantic narrowing; it cannot mutate the original provider ToolCall, grow ceilings or silently start a new policy loop. In a Graph-wide guardian pass, a required missing verdict/deny/ask blocks roots; in a Node activation pass, an ask/deny blocks **that node** and its dependents safely without retroactively falsifying already committed independent node results.
+A guardian/decision model is **advisory evidence**. `Allow` means the decision stage passed, **not** that a missing grant was created. `Deny` blocks execution. `Ask` creates one replay-stable **admission wait** bound to exact invocation/Graph/node identity, policy revision, approval scope, authorized approver set and expiry; it never executes on a guessed approval or starts a second policy loop. `Narrow` for direct calls or admission-time Graph decisions produces one explicit revised candidate that re-runs semantic/schema/revision/ToolPolicy/Envelope/resource checks and is admitted only if the trusted host proves semantic narrowing; it cannot mutate the original provider ToolCall or grow ceilings.
+
+For an already admitted/running Graph, activation-time Node decisions are stricter: `Allow | Deny | Ask` plus route/resource/provider/payer/limit narrowing only. **Node-time `Narrow` cannot revise prepared node arguments or semantic identity.** In a Graph-wide admission pass, a required deny/ask blocks roots; in a Node activation pass, deny/ask blocks that node and dependents without falsifying already committed independent results.
+
+**`Ask` liveness and settlement:** approval waiting reuses the existing owner/Job/Turn wait machinery; it is not a new Job kind, event bus or policy engine. The authoritative owner records immutable pending-decision evidence under the original admission/replay identity.
+
+For a single direct/Node decision:
+
+    PendingApproval {
+      approval_id,                         # deterministic from owner/admission/target
+      target: Direct | Node(n),
+      policy_decision_revision,
+      approval_scope,
+      authorized_approver_set,
+      expiry,
+      state: Pending | Approved | Denied | Expired
+    }
+
+A whole-Graph guardian may return **multiple coordinate-level Ask verdicts**. The existing Graph Job owns one bounded canonical set, not another approval service:
+
+    PendingApprovalSet {
+      graph_ref,
+      admission_identity,
+      guardian_decision_revision,
+      entries: [PendingApproval ...]       # canonical target/coordinate order
+    }
+
+Rules:
+- one entry per target/coordinate; duplicates are invalid;
+- each entry has an immutable deterministic approval_id and resolves idempotently exactly once;
+- matching replay returns the same pending set and current entry states; it never reruns the guardian or allocates another set;
+- approvals may arrive independently/in any order, but Graph admission resumes only when **every required Ask** is Approved;
+- any required Denied/Expired entry, invalid current authority, or stale approval scope makes the Graph admission fail without roots;
+- the set is bounded by the existing Graph node limit and retained in the Graph owner's admission state, not a new database.
+
+Direct ToolCall/SDK Ask: no effect starts; owning ToolCall/Step waits on its single approval entry. If synchronous response disposition cannot service the approver without blocking the sole controller, hand off/expose the same owner first.
+
+Graph admission Ask: reserve/expose the same Graph Job/replay identity, mark it waiting, start **zero roots**, and retain the canonical PendingApprovalSet. When all required approvals are satisfied, resume the same root-free preflight under current authority.
+
+Activation-time Node Ask: only that exact node attempt waits on one approval entry; already committed independent results remain factual, dependents cannot start, and approval resumes the same attempt/route envelope.
+
+Current authority is revalidated at approval consumption. Approval is not a bearer grant, cannot outlive scope/expiry/revision, cannot widen arguments/routes/resources, and cannot revive revoked base authority. If servicing Ask would require the synchronously blocked requester/model itself to run another Step, proactively hand off the same owner or reject foreground rather than deadlock.
+
+Tiny host-neutral pending/wait value types may be shared where Process/Graph/Agent owners all need them; approver identity, membership and authorization remain AW-host policy concerns.
 
 There is **one policy pipeline** for provider, typed SDK, Agent internal calls, host actions, direct tools, Graph admission and Graph node activation:
 
@@ -388,7 +457,7 @@ There is **one policy pipeline** for provider, typed SDK, Agent internal calls, 
 
 - At Graph admission, authorize **all** immutable nodes' semantic/effect ceiling using the same effective scoped policy; prepare an envelope of **every allowed candidate route** and conservative **union of execution footprints**, even if Node routing will be delayed. The host may perform **one optional whole-Graph guardian decision** for every node. A proposal cannot add a grant or a Graph node, change original `when` or increase result ceilings.
 - `DelegateAgent(Graph)` (default when Graph delegation is chosen) uses **one coordinating Agent/Turn** for the Graph; its provider/role/site/payer remain bounded by the captured effective policy. `DelegateAgent(Node)` chooses Local or Agent at node activation after `when` and current-policy recheck; skipped nodes pay no routing inference. The one-shot guardian choice (`Graph`) is independent of execution choice (`Graph` or `Node`).
-- Dynamic Node routing/guardian may use newly committed **authorized public** prior-node results and current policy, but can choose only within **captured permitted candidate routes** and cannot widen preflight's union conflict footprint/limits. An activation-time `Narrow` is checked with the same trusted revision mechanism; a policy change that would require a wider authority or changed Graph topology fails rather than replanning during effects.
+- Dynamic Node routing/guardian may use only the canonical GraphActivationContext: authorized public receipts in the node's declared dependency/when closure plus current policy. It can choose only within **captured permitted candidate routes** and cannot widen preflight's union conflict footprint/limits. **Prepared Graph node arguments are immutable after admission.** Admission-time Graph guardian may `Narrow` arguments before the Graph is sealed and before any root starts; activation-time Node policy may only Allow/Deny/Ask or narrow route/resource/provider/payer/limit ceilings. It may not revise node arguments, operation identity, dependencies, `when`, topology or semantic work/result ceilings. A policy change requiring any such mutation fails rather than replanning during effects.
 - A Graph coordinator or Node delegate cannot approve its own denied tool, mint a new payer or bypass an existing `Ask`. It may submit eligible node/tool requests only through the original trusted prepared executor and exact JobManager receipts.
 - Routing the operation through an AW host to dotlink changes the **execution site** only when explicitly granted. `Local` means direct execution by the selected original owner, **not necessarily the same physical machine**; `DelegateAgent` means model coordination, **not** an automatic site transfer. Domain/workspace permissions decide which sites are allowed; dotlink's launcher/sandbox must recheck its concrete target resource authority.
 
@@ -418,7 +487,7 @@ Four independent identities/relationships must not be conflated:
 - **Coordinator:** one **authoritative Agent binding for each executable Session/branch** with one current Turn writer. Multiple participants submit to **this same Agent Input queue**, not independent Agent copies.
 - **Coordination parent:** optional authorized Agent parent (`^`), distinct from owner, creator and actor; a relation never grants permission or cancellation authority.
 
-The reserved `a:0` is **one stable root/default Agent per d/i/p project**, not one per participant, Session, team or domain. Section 7.1 binds each Agent to **exactly one existing Session + branch + writer**. The first/main Session may lazily bind `a:0`; if more independently executable Sessions/branches need Agents, allocate stable `a:<handle>` only as needed and optionally give them a currently authorized coordination parent pointing to `a:0`. **Never attach the same a:0 concurrently to two branches.** A viewer, inactive branch, unused project or a domain policy does not require a running or paid coordinator.
+The reserved `a:0` is **one stable root/default Agent identity per d/i/p project**, not one per participant, Session, team or domain. Section 7.1 binds each Agent to **exactly one existing Session + branch + writer for that Agent identity's entire lifetime**. The first/main executable Session may lazily bind `a:0` **once**. That binding is never reused or rebound, even sequentially after the Session/branch closes or is retired. Closing/retiring that primary Session closes/retires `a:0`; any later independently executable Session/branch gets a fresh stable `a:<handle>` and may optionally use the still-historical `a:0` only as provenance, never as a live coordinator. If the product later needs a permanent project object independent of Session lifetime, add a distinct project resource rather than overloading Agent identity. A viewer, inactive branch, unused project or domain policy requires no running/paid coordinator.
 
 | Case | Owner | Coordinator | Additional identity/Agent on share |
 | --- | --- | --- | --- |
@@ -433,19 +502,62 @@ A domain and team are **policy/resource scopes**, not always-on master Agents. F
 
 Conceptual host/store evidence (not new model tools, and do not mandate these exact Rust struct names):
 
+    WriterFence =                       # tiny portable aw-agent-kernel primitive
+      NotApplicable
+      | Epoch(NonZeroRevision)
+
     SessionCoordinatorBinding {
       session: SessionId,
       branch: BranchId,
       agent: AgentRef,                   # immutable a:<handle>
       owner: CanonicalResourceOwner,
-      agent_writer_epoch: Revision,      # exact Session/branch Actor/Turn writer binding
-      workspace_writer_epoch: Revision,  # separate authoritative Workspace writer fence
-      binding_revision: Revision
+      agent_writer_fence: WriterFence,   # exact Session/branch Actor/Turn writer binding
+      workspace_writer_fence: WriterFence, # independent Workspace writer fence
+      binding_revision: NonZeroRevision
     }
 
-It is **an extension of existing SessionStore/Agent binding evidence**, not a second Agent identity/Session state database. **Keep Agent/branch writer identity and Workspace writer epoch as separate fences**; they cannot be substituted for each other or silently collapsed into one stale integer. Bind the exact Agent/branch and both applicable writer generations **before any paid inference**. Share membership changes leave this binding and existing canonical identity unchanged. At most one Turn writer per executable branch; different branches may have independent coordinator bindings when activated. Changing the coordinator is a **separate explicit host-authorized fenced operation**, not part of a share invitation. If a replacement Agent is required, it has a new immutable identity, and previous ToolCalls/Session ownership are not silently renamed.
+It is **an extension of existing SessionStore/Agent binding evidence**, not a second Agent identity/Session state database. `NotApplicable` means the authoritative backend genuinely has no such multi-writer fence; it never means "required fence missing/unknown." Durable or multi-writer backends must require `Epoch`, while a single-owner local backend may explicitly use `NotApplicable`. Keep Agent/branch and Workspace writer fences distinct; they cannot substitute for each other or collapse into one stale integer. Bind the exact Agent/branch and all required fences **before any paid inference**. The Agent↔Session/branch binding itself is immutable once established; changing coordinator means allocating/binding a **new Agent identity**, never rebinding the old one. Share membership changes leave existing canonical binding identity unchanged.
 
 Every ordinary shared submission is admitted into the **existing single Agent Input queue**, retaining durable order and exactly one active Turn/branch writer. Submitting while another human's Turn runs defaults to **queue**, not implicit steer/interrupt. `steer`, `interrupt` and `cancel` require independent current Control authority, exact Turn ref/rev and an authorized requestor; merely being able to submit does not give one participant control over another's running work. Existing Graph/child Jobs may run independently within their exact granted authority and conflict plan, never as another concurrent model writer on the same branch.
+
+**Every model Step belongs to exactly one immutable authority segment.** An authority segment begins at one authenticated external/host Input or accepted explicit Control Input and persists across every causally following model Step in that Turn—including Steps triggered by tool receipts—until another authenticated Input/control event establishes a new segment or the Turn terminates.
+
+The TurnJournal stores one compact segment record and Steps reference it rather than copying a full policy object repeatedly:
+
+    AuthoritySegment {
+      segment_id: AuthoritySegmentId,        # internal stable id / request-derived identity
+      origin_input: InvocationId,
+      actor: PrincipalRef,
+      payer: AuthorizedPayerRef,
+      causal_root: InvocationId,
+      membership_epoch: Revision,
+      audience_epoch: Revision,
+      provider_model_ceiling_ref: opaque stable policy/evidence ref,
+      tool_envelope_ref: opaque stable ToolPolicy/Envelope evidence ref,
+      disclosure_projection_ref: opaque stable projection/evidence ref,
+      context_fingerprint: Digest
+    }
+
+    StepAuthorityContext = reference to one AuthoritySegment
+                          + current narrowed revisions/ceilings required for this Step
+
+All ToolCalls proposed by a Step are authorized from that Step's segment/current StepAuthorityContext, never from Session owner, an older Step actor or participant union. A queued Input starts a new Turn with a new segment. A same-Turn `steer`/`interrupt` starts a **new authority segment** from the controller Input; every subsequent Step/tool-receipt continuation remains in that segment until another authenticated control/input boundary replaces it. It never silently reverts to the Turn's original actor.
+
+Before a new segment begins, AW proves that the continuation context can be safely projected for its actor. If actor/disclosure changes, provider input is rebuilt from the authorized public Session/Turn projection; provider-private continuation/cache/state from the previous segment is never reused across that boundary. If required context is not disclosable, reject steer/interrupt and require queued/new Turn or approved-context Session. Control redirects execution; it never borrows another participant's secrets, payer or tool grants.
+
+Provider/account `InvocationIdentity` remains the existing provider credential/account identity. **Do not overload it with Session/Turn authorization.** Instead each paid/model attempt has a lightweight immutable admission record:
+
+    ModelInvocationAdmission {
+      agent_ref,
+      turn_ref,
+      step_ordinal,
+      authority_segment_id,
+      authority_context_fingerprint,
+      invocation_identity,                 # existing provider/account/model identity
+      host_invocation_id
+    }
+
+Replay/retry may reuse a paid/provider attempt only when this complete admission identity matches. A different authority segment/fingerprint is a different admission even if Turn, model, text or provider account are otherwise identical.
 
     ParticipantInput {                    # host-owned immutable provenance
       actor: PrincipalRef,                # authenticated human / requesting service
@@ -543,7 +655,7 @@ Implement only the host-neutral parts actually consumed by multiple callers, thr
 6. Bob's submitted tool attempts intersect Bob's current grant with Session/coordinator and workspace/domain denies. Alice's higher permissions or team colleagues' combined grants are unavailable; explicit service principal uses only its own authorized unattended policy.
 7. Membership/revocation during queued/active Input, unknown Process effects and history pagination: future starts/ToolCalls/pages fail under current epochs; committed effects remain truthful, no blind retry or erased audit.
 8. Multiple authorized team participants in a team-owned workspace: one project root Agent for the primary Session, no per-person coordinator, one writer per active Session branch; distinct authorship/payer.
-9. Multiple Sessions/branches in one project: `a:0` binds only the primary executable Session/branch; other active branches have distinct Agent refs. Never reuse `a:0` concurrently across multiple Session/branch writer bindings.
+9. Multiple Sessions/branches in one project: `a:0` binds its first primary executable Session/branch once; other active or later branches have distinct Agent refs. Never reuse `a:0` concurrently **or sequentially** for another Session/branch after retirement.
 10. Explicit team ownership transfer preserves original private Session/ref identities; destination project has its own root and selectively imported context, never implicit promotion on share.
 11. Cross-host follower/stale Workspace writer epoch cannot commit a second Agent Turn, change audience or double-pay provider; original owner can recover or truthfully report blocked/unknown.
 12. Implementation reuse test: one original `aw-tools` Graph/Job runtime, one AW SessionStore/Actor queue, one ToolPolicy/Envelope pipeline, no new collaboration-specific public tool or duplicate team Agent engine. Same-user fast path must retain default no extra queue hop, policy network call or paid model Step.
@@ -1254,7 +1366,7 @@ Examples:
 
 a:0 is the reserved root/default Agent for every d/i/p namespace. Additional agent(...) calls allocate another immutable Agent handle in the current d/i/p namespace rather than nesting the Agent under the creator Turn.
 
-Internally each Agent ref binds exactly one existing AW owned Session + branch + Actor/writer identity. There is no second public Agent ID and no separate Agent mapping database. **Shared-session rule (Section 2.5.2):** a project root `a:0` may lazily bind one primary executable Session/branch; other independently executable Sessions/branches need distinct `a:<handle>` bindings. Sharing a bound Session adds authenticated participants to that **same coordinator and existing input queue**, never another Agent writer or a new team identity. Coordinating multiple Sessions through authorized parent relations does not rebind the root Agent to multiple Session branches.
+Internally each Agent ref binds exactly one existing AW owned Session + branch + Actor/writer identity **once for the lifetime of that Agent identity**. There is no second public Agent ID and no separate Agent mapping database. A project root `a:0` may lazily bind its first primary executable Session/branch once; closing/retiring that Session retires that Agent binding rather than freeing `a:0` for reuse. Other independently executable or later Sessions/branches need distinct `a:<handle>` bindings. Sharing a bound Session adds authenticated participants to that same coordinator/input queue, never another Agent writer/team identity. Coordinating multiple Sessions through authorized parent relations never rebinds an existing Agent.
 
 A model-facing agent(...) call from current Agent /d:abird/i:pvl/p:zg/a:0:
 - allocates another stable Agent handle in the same d/i/p namespace, for example /d:abird/i:pvl/p:zg/a:2;
@@ -1438,11 +1550,13 @@ The active Turn's natural send behavior is:
 
     auto -> steer
 
+Every model Step, including one resumed by steer/interrupt or by tool receipts, references the Turn's current immutable AuthoritySegment and a StepAuthorityContext narrowed from it immediately before provider dispatch. A same-actor continuation naturally stays in the current segment. A cross-participant controller Input establishes a **new authority segment**; that segment governs the next Step **and every causally following tool-result/model Step** until another authenticated Input/control boundary replaces it or the Turn terminates. The Turn never silently reverts to its original actor. If required continuation context cannot be safely projected for the new segment, reject steer/interrupt before provider dispatch and require a queued/new Turn or approved-context Session.
+
 steer means:
 - target the exact active Turn;
 - preserve and settle the current indivisible model/tool receipt Step **including all proposed ToolCall receipts**, never equate BeforeToolBatch with StepEnd;
 - append a new **separately identified immutable controller-input receipt** to that same Turn, with issuer, source, request identity, admission revision and causal order; the original user prompt/provider-signed context remains untouched;
-- compose this authorized additional Input only for the next model Step of that same Turn after current writer/model/provider/payer/tool/budget revalidation;
+- create a new AuthoritySegment from that controller Input after current writer/model/provider/payer/tool/budget/disclosure revalidation; every subsequent causally derived Step in that Turn remains in this segment until another authenticated Input/control boundary replaces it;
 - never mutate provider-signed evidence, invent a replacement Turn or invoke a second paid Agent loop.
 
 Example:
@@ -2477,7 +2591,7 @@ This ledger supersedes **only** the old conceptual Job surface, restart and iden
 
 | Crate | Owns (stable public/reusable responsibility) | Explicitly excludes |
 | --- | --- | --- |
-| **`aw-agent-kernel`** | Small portable Actor/Turn/Envelope/capability invariants; existing no_std+alloc cut | Provider, Session store, policy configuration, filesystem, host |
+| **`aw-agent-kernel`** | Small portable Actor/Turn/Envelope/capability invariants plus tiny generic coordination value types such as `WriterFence = NotApplicable | Epoch(NonZeroRevision)`; existing no_std+alloc cut | Provider, Session store, policy configuration, filesystem, host |
 | **`aw-tools`** | Prepared operations, native filesystem, immutable Graph/finite Job algorithms, owner/route/receipt/fence *primitives* | AW user/team/Session/member/payer/provider decisions |
 | **`aw-policy` (new)** | **Pure policy composition:** typed trusted scope/provenance inputs, deny precedence, candidate-route intersections, bounded ceilings, explicit preferences/decision shapes; no_std-capable, no I/O | Actual source grants, issuer authentication, policy DB, provider/guardian calls, Actor, Session, fs |
 | **`aw-agent-core`** | **The one hosted Agent/Actor/Turn engine**, existing ToolPolicy/ToolBindingAuthority, original per-effect grant enforcement | A second hosted Agent runner or team/session policy database |
@@ -2495,7 +2609,7 @@ This ledger supersedes **only** the old conceptual Job surface, restart and iden
 
 **First real implementation (already scaffolded, intentionally thin):**
 - `aw-policy` is `no_std`, allocation-free for simple policy slices, and resolves deterministic Local routing, explicit denies, required-route precedence, same-scope preference ambiguity, route intersection and tightest model-round ceilings. **`EffectivePolicy::narrow` cannot retarget or widen a previously selected route/limit.** Every revision remains host-validated evidence, not a trusted membership/issuer grant; future domain/team resolution stays above the pure crate.
-- `aw-session` supplies a generic `Sessions<'_, B: SessionBackend + ?Sized>` wrapper, **statically dispatched for a concrete backend and dynamically dispatched only if chosen**, and an **evidence-only** `CoordinatorBinding` comparing exact owner, Session/branch, Agent ref, binding revision and separate optional Agent/Workspace writer epochs. Local backends need not fabricate Workspace epochs; durable multi-writer sites must require their real epochs at the authoritative store. Once the shared canonical `ResolvedExecutionRef` exists, replace its raw Agent ref input with the typed form rather than writing another string parser. Durable binding uniqueness/sharing/audience remain implementation work in SessionStore.
+- `aw-session` supplies a generic `Sessions<'_, B: SessionBackend + ?Sized>` wrapper, statically dispatched for a concrete backend and dynamically dispatched only if chosen, plus evidence-only `CoordinatorBinding` comparing exact owner, Session/branch, Agent ref, binding revision and two portable `WriterFence` values. The current skeleton's optional integer representation is temporary: local single-writer backends explicitly use `NotApplicable`; durable/multi-writer sites require real `Epoch` fences at the authoritative store. Once shared `ResolvedExecutionRef` exists, replace raw Agent-ref input with the typed form rather than another parser. Durable binding uniqueness/sharing/audience remain SessionStore work.
 - `aw-host::LocalHost` now owns **the one stock-AW local execution-site/scheduler selection and bounded model rounds**, then delegates to the original `aw-tools-adapter::configure`, which independently narrows/enforces its exact native resource ceilings. Root `src/lib.rs` no longer has a duplicate local `execution_policy` function. Pre-granted embedding host tool scheduler limits may **only narrow**, and an already granted execution Site cannot be changed. Reapplying an additional scoped policy to the same LocalHost cannot restore a previous ceiling. `DelegateAgent` remains explicitly denied until real Agent/payer/executor admission exists; never report fake success or implicit fallback.
 - The root AW library has a small composition seam through `aw-host::configure_local` for its existing local Agent construction. This path does not open a Session DB, create a team/actor service, perform a policy network call, invoke a guardian or add a model Step. The real local runtime still runs through the original Agent/adapter/ToolPolicy.
 - `aw-host`'s `sessions` feature imports `aw-session` only for hosts that need backend Session access. The minimal/userless path works without it, with the existing host-authenticated local principal serving as an exact grant identity—not a fake multi-user login.
@@ -2508,7 +2622,8 @@ This ledger supersedes **only** the old conceptual Job surface, restart and iden
 
 Own reusable, host-neutral:
 - canonical fs operation IDs/schemas/requests;
-- host-neutral prepared-operation/effective-policy **constraint/decision-result** types, routing/executor hooks and, where real consumers need them, opaque **request-origin, writer/admission-generation, coordinator-scope, receipt and replay/cancel extension contracts**; **no domain/team/workspace membership, Session ACL/history or policy-issuer authority engine**;
+- host-neutral prepared-operation/effective-policy constraint/decision-result types, routing/executor hooks and, where real consumers need them, opaque request-origin/coordinator-scope/receipt/replay-cancel contracts;
+- small reusable zero-cost/bounded coordination primitives used by tool/Graph owners: borrowed deterministic `GraphActivationContext` over dependency-closure receipts, wait/control ancestry query inputs, and pending-decision wait identity/receipt shapes; consume/re-export the tiny portable `aw-agent-kernel::WriterFence` rather than defining another fence type; **no domain/team/workspace membership, Session ACL/history or policy-issuer authority engine**;
 - Graph grammar/planning/status/footprints;
 - finite Graph Job state/result retention where already shared;
 - common hierarchical ExecutionRef/ResolvedExecutionRef, Revision, Job kind/read/control request/result types where genuinely generic;
@@ -2669,11 +2784,11 @@ Any material schema/token regression must be justified by measured reliability/c
 - uncertain Turn blocks automatic later Turn.
 
 ### Unified scoped policy/decisions/strategy
-- one host-side Policy schema resolves mandatory tools/permissions/denies, guarded decisions, execution/provider/site/payer preferences, resource limits and disclosure for **host/domain/identity/verified team/workspace/Session/Agent/Graph/Node**; no separate competing policy engines or duplicate grant database;
+- one host-side Policy shape resolves constraints/denies, guarded decisions, execution/provider/site/payer preferences, limits and disclosure for host/domain/identity/verified team/workspace/Session/Agent/Graph/Node. Positive authority is separate authenticated `AuthenticatedGrantPath` evidence from existing ToolPolicy/ToolBindingAuthority/resource stores; pure `aw-policy` never issues/infers grants and no preference layer can be constructed as grant authority;
 - exact actor principal is distinct from canonical resource owner, active team is verified membership (not a Turn or a free grant), and cross-domain work satisfies both source and target authority; `i:0` is never remapped to the authenticated caller;
 - a direct/identity or verified team role grant path is required for the exact source/effect/site/resource, and all applicable host/domain/workspace restrictions and explicit denies apply. No multi-team path laundering, denied resource via delegate, missing grants from guardian `Allow` or permission widening via Session/Node preferences;
 - limits and allowed routes/providers/sites are bounded by the tightest applicable mandatory ceiling; non-authoritative preferences resolve **Node/ToolCall > Graph > Session > Workspace > active Team > Identity > Domain > Host**, with no accidental preference from unrelated teams;
-- original ToolPolicy and Envelope remain exact/narrow-only enforcers; ToolRevisionPolicy proves semantic `Narrow` on revised arguments. `PolicyDecision` is typed Allow/Deny/Ask/Narrow plus separately permitted execution selection; `Ask` cannot execute before scoped approval, `Deny` cannot be overridden by model text, `Narrow` rechecks all exact authorization;
+- original ToolPolicy and Envelope remain exact/narrow-only enforcers; ToolRevisionPolicy proves admission-time semantic argument `Narrow` before direct execution/Graph seal. Activation-time Node decisions cannot mutate prepared args/OperationId/dependencies/when/topology/semantic ceilings and may only Allow/Deny/Ask or narrow route/resource/provider/payer/limits. Direct/Node Ask uses one replay-stable PendingApproval. A coordinate-keyed whole-Graph guardian may produce several Ask entries; the existing Graph Job owns one bounded canonical PendingApprovalSet with unique deterministic per-target approval identities. Graph roots remain zero until every required Ask is Approved; any required Denied/Expired/stale-scope/current-authority failure settles admission without effects, and matching replay returns the same set/state without rerunning guardian;
 - optional guardian **Graph or Node** scope is independent of DelegateAgent **Graph or Node** scope; default Local uses zero model guardian/route calls, and Graph preflight retains union route/footprint bounds for dynamic Node routing;
 - one coherent effective-policy epoch/vector fences host/domain/team/identity/workspace/session/registry/source/owner; revocation rechecks every new effect/ToolCall/Turn, Agent/wake and current data read, without broadening already admitted work. Fail closed on unknown remote owner/membership revision;
 - user-selected provider/model/execution site and payer are independently authorized, never implied by delegate strategy. One causal payer budget is reserved/debited once and cannot reset at team/Session/Graph boundaries;
@@ -2688,27 +2803,27 @@ Any material schema/token regression must be justified by measured reliability/c
 ### ExecutionStrategy / transparent delegation
 - ExecutionStrategy is an AW-host policy selecting Local or DelegateAgent **for every admitted operation**; shared aw-tools provides host-neutral route/Graph execution primitives, without AW Agent/provider dependencies or operation-class bans; no new model schema, OperationId, ToolEffect or Job kind;
 - original ToolCall identity, canonical operation, admitted args, semantic ToolEffect, semantic ceilings and factual result/effect contract remain unchanged by strategy;
-- guardian/routing inference can recommend a route but cannot grant route/inference/payer/tool/resource authority. **AW defaults Local with no paid invocation**; an opt-in guardian can examine the whole Graph once, separate from **one DelegateAgent Graph coordinator Turn (delegated default)** or **runtime Node dynamic routing for runnable nodes**;
+- guardian/routing inference can recommend a route but cannot grant route/inference/payer/tool/resource authority. AW defaults Local with no paid invocation. Dynamic Node guardian/router input is the canonical dependency-closed GraphActivationContext only; unrelated parallel node completions cannot affect the decision. An opt-in guardian can examine the whole Graph once, separate from one DelegateAgent Graph coordinator Turn or runtime Node routing;
 - DelegateAgent requires independent exact Agent/provider/account/model/payer/causal-work/tool/resource authority; a semantic Read grant cannot implicitly authorize paid inference;
 - additional execution mechanisms may consume separately authorized inference/private-scratch/process resources, but delegated user-visible/persistent semantic side effects stay within the trusted operation implementation contract; semantic Read never becomes filesystem Write merely because it is delegated;
 - Graph strategy *possibilities* and conservative union footprint are captured before scheduling; **Graph** coordinator choice is frozen at Graph admission, **Node** actual Local/Agent choice freezes at eligible node activation under current grants/replay and never widens admitted ceilings. Optional whole-Graph guardian is one bounded/journaled auxiliary invocation with a coordinate-keyed map; duplicate invocation/dispatch reuses factual decisions. No fallback or duplicate effects after an ambiguous started node;
 - scheduler uses a separate captured execution footprint; semantic Read through opaque delegation does not join a Read wave;
 - parent model remains idle while delegated Turn executes; child may use a different authorized model/provider/tool set without mutating parent Agent/Turn/model identity;
-- delegate receives bounded explicit context only, not parent transcript/provider-private context/credentials by default;
+- execution authority and delegate disclosure are independent. Delegate/provider receives only a bounded disclosure-authorized projection; exact secret-bearing args/commands/results, private transcript/provider context and credentials remain sealed in the trusted executor unless explicitly permitted. A delegate may request execution of an opaque prepared operation without seeing its payload;
 - delegate returns the original **prepared semantic executor's** typed factual result/owner receipt for native FS, shell/Process, Job controls, batch and Agent constructors; free-form Agent text never fabricates effect success. Graph coordinator submits only admitted prepared nodes to the original shared Graph manager; visible-result transformation never changes factual evidence;
 - completion-only is the transparent default; a delegate cannot block waiting on its synchronously blocked parent model without an independent controller/explicit Agent-Job handoff path;
 - parent cancellation propagates only while exact delegated ownership remains; committed/unknown child effects stay factual;
 - DelegateAgent consumes the same finite authenticated causal-work/payer allowance as explicit child Agent/Graph work;
 - every semantic operation may use Local or DelegateAgent through the original exact prepared native/Process/Job/constructor executor and one replay identity, without hard-coded class restrictions;
 - Graph uses one coordinating Agent/Turn rather than a second Graph runner, and Node is an activation-time Local/Agent selector with no per-node inference for skipped branches;
-- host-neutral primitives support adapter-authorized Graph leaves including bounded nested batch/Job controls, without unbounded recursion, ancestor control cycles or mutable topology;
+- provider/model-facing batch keeps the conservative DL-150 leaf surface; advanced nested batch/Job controls are typed SDK/host-only unless deliberately promoted later. Host-neutral primitives support those advanced leaves with bounded nesting and mechanical canonical-ref/ownership wait-cycle checks; transparent DelegateAgent is ineligible for self/ancestor controls or any control whose completion depends on its waiting parent;
 
 ### Shared Session and layered coordination
 
 - Sharing a personal Session **does not** change its d/i/p owner, branch, bound Agent ref, Writer/Session/Turn identity, execution source or payer and never creates a synthetic team user, team master or second Agent loop.
-- One executable Session/branch has **one Agent coordinator binding and one Turn writer**. `a:0` is one project root lazily bound to one primary Session/branch, not a coordinator reused concurrently across many branches; additional Session/branch Agents are allocated only when executed.
+- One executable Session/branch has one Agent coordinator binding and one Turn writer. Agent↔Session/branch binding is immutable for the Agent identity lifetime: `a:0` may bind its first primary executable Session/branch once and is never sequentially rebound after retirement; later executable Sessions/branches get fresh Agent refs. Writer fences use portable `aw-agent-kernel::WriterFence = NotApplicable | Epoch(nonzero)`; durable/multi-writer backends require real Epoch fences.
 - Existing member/read-append access, sealed draft Submit and shared CRDT audience remain distinct from View/Contribute/Submit/Control/Manage predicates. A viewer cannot trigger inference; an input submitter cannot steer/cancel the other participant's Turn without separate current Control.
-- Multiple users submitting concurrently use **one** durable existing Agent Input queue, exact per-user authenticated provenance/replay identity and current audience/branch writer epochs; normal shared input queues rather than implicit interruption.
+- Multiple users submit through one durable existing Agent Input queue. Every authenticated Input/control boundary establishes one immutable AuthoritySegment in the existing TurnJournal; every model Step references exactly one segment plus current narrowed StepAuthorityContext. Tool-result/model continuation Steps inherit the current segment until another authenticated boundary replaces it or Turn ends. Cross-participant steer/interrupt starts a new controller segment and never later reverts to the prior actor. If actor/disclosure changes, provider input is rebuilt from authorized public projection and previous segment's provider-private continuation/cache/state is not reused; if safe projection is impossible, control rejects and requires queue/new Turn or approved-context Session. Every paid/provider attempt is replay-bound to the exact authority segment/context fingerprint.
 - A **full-history share** requires current disclosure of all relevant Session/context dependencies; an **approved-context share** uses a separately authorized sanitized Session/Agent binding. A mere fork of a private Session branch cannot be claimed to hide private Session history.
 - Every submitted ToolCall requires the initiating actor's currently valid grant path **intersected** with Session participation, coordinator, workspace/domain/source/site/provider/payer policy; no union of Alice/Bob permissions and no automatic use of owner/private credentials. Unattended work requires an explicitly authorized real resource/service principal and payer, not a fake human.
 - A membership revocation changes the audience generation and invalidates new Inputs/ToolCalls/read pages and sharing notifications, while preserving accepted/auditable receipts and truthful unknown effects. Shared-draft audience changes rotate its epoch rather than retaining old disclosure.
@@ -2720,6 +2835,8 @@ Any material schema/token regression must be justified by measured reliability/c
 
 ### Steps/tool calls
 - complete tool batch receipt belongs to Step;
+- every Step references exactly one current AuthoritySegment; tool-result/model continuation Steps inherit that segment until another authenticated Input/control boundary replaces it or Turn ends;
+- every paid/provider Step has one immutable ModelInvocationAdmission binding Agent/Turn/Step + authority_segment_id + authority_context_fingerprint + existing provider/account InvocationIdentity + host invocation ID; replay under a different segment/fingerprint is a new admission and never reuses the old paid attempt/private continuation;
 - started external effects retain factual outcome;
 - child Job correlation exact;
 - no Job explosion for atomic fs calls.
@@ -2728,7 +2845,8 @@ Any material schema/token regression must be justified by measured reliability/c
 - waiting consumes no model invocation;
 - cancellation remains serviceable;
 - no held global runtime lock;
-- condition completion resumes only if owning Turn is still current.
+- condition completion resumes only if owning Turn is still current;
+- Policy Ask reuses the same owner wait machinery/replay identity. Direct/Node Ask uses one immutable PendingApproval. Whole-Graph admission may hold one bounded canonical PendingApprovalSet with independent idempotent coordinate approvals; roots remain zero until every required entry is Approved, while any required Denied/Expired/stale-current-authority entry settles admission without effects. Matching replay returns the same set/current states. If the only approver/controller would itself be synchronously blocked, proactively hand off/expose the same owner or reject foreground rather than deadlock.
 
 ### Events
 - advertised event enum is result|settled|attention and resolved kind validates support; AW Graph exposes attention iff admitted topology contains an attention-capable Agent node. Completion-only is the default; parent-blocking attention exists only when immutable captured host delegation explicitly permits that request/response path;
@@ -2758,7 +2876,7 @@ Any material schema/token regression must be justified by measured reliability/c
 
 ### Graph
 - Agent footprint conservatively covers complete delegated authority (native FS, Process reach, external/network/extension effects, child delegation);
-- Graph preflight is root-free: every leaf passes semantic/schema/ToolPolicy/topology/when/ceiling validation; prepare all possible Local/DelegateAgent routes plus **conservative union footprint** and optionally one guardian decision; then conflict plan and roots. DelegateAgent(Graph) defaults to **one coordinating Agent/Turn for the full Graph**, possibly multiple model Steps; Node dynamically selects Local/Agent only at runnable `when`-eligible node activation and skipped nodes pay no route inference. Guardian routing cost is preparation evidence, not a leaf effect/result;
+- Graph preflight is root-free: every leaf passes semantic/schema/ToolPolicy/topology/when/ceiling validation and all admission-time argument narrowing before Graph seal; prepare all possible Local/DelegateAgent routes plus conservative union footprint and optional guardian; then conflict plan and roots. Node activation receives only deterministic GraphActivationContext from dependency closure including implicit previous-success sequencing and cannot revise prepared args. Before activation-time guardian/router/Ask, scheduler claims the node's deterministic union-footprint conflict position; conflicting successors cannot overtake while decision waits, though non-conflicting work may continue. DelegateAgent(Graph) uses one coordinator Turn; skipped nodes pay no route inference. Guardian routing cost is preparation evidence, not leaf effect/result;
 - DelegateAgent keeps original coordinate/semantic operation/outcome/when/more/incomplete/ceilings while scheduling uses its captured delegated footprint;
 - opaque Process/network/provider/external effects **conflict with interacting Graph nodes** by default; conflict plan uses the conservative union of all admissible routes, and later per-node selection never widens it. Explicit Graph dependencies give additional ordering but no outside transaction guarantees;
 - the same captured attention-capable Agent predicate drives proactive handoff: if such a child would otherwise depend on the synchronously blocked sole controller, the same Graph Job is handed off before roots run;
