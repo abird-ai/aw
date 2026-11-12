@@ -214,13 +214,6 @@ impl NativeShell {
         Footprint::new(scopes, true, false).unwrap_or_else(|_| Footprint::unknown(true, true))
     }
 
-    pub(crate) fn output_capacity(&self, v: &Value) -> Result<usize> {
-        self.validate(v)?;
-        let args: Args = serde_json::from_value(v.clone())
-            .map_err(|_| Error::Denied("invalid shell arguments"))?;
-        Ok(args.max_output_bytes.unwrap_or(self.max_output_bytes))
-    }
-
     pub(crate) fn prepare(&self, v: &Value) -> Result<PreparedShell> {
         self.revalidate()?;
         self.validate(v)?;

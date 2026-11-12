@@ -852,29 +852,54 @@ impl JobHost {
         }
     }
 
-    fn node_live(&self, actor: &PrincipalId, id: &str, coordinate: usize) -> bool {
-        let Ok(plans) = self.manager.plans(id) else {
-            return false;
-        };
-        let Some(plan) = plans.get(coordinate.saturating_sub(1)) else {
-            return false;
-        };
-        let Ok(binding) = self.authority.permitted_binding(actor, plan.tool().name()) else {
-            return false;
-        };
+    fn current_binding(&self, actor: &PrincipalId, plan: &NodePlan) -> Option<ToolBindingSnapshot> {
+        let binding = self
+            .authority
+            .permitted_binding(actor, plan.tool().name())
+            .ok()?;
         let runtime_live = if plan.tool().native().is_some() {
             plan.runtime_binding() == self.root_binding
         } else {
             self.shells.get(plan.tool()).is_some_and(|shell| {
                 shell
                     .runtime_binding()
-                    .is_ok_and(|binding| binding == plan.runtime_binding())
+                    .is_ok_and(|runtime| runtime == plan.runtime_binding())
                     && shell.revalidate().is_ok()
             })
         };
-        binding.registry_revision == plan.registry_generation()
+        (binding.registry_revision == plan.registry_generation()
             && binding_hash(actor, &binding) == plan.authority_binding()
-            && runtime_live
+            && runtime_live)
+            .then_some(binding)
+    }
+
+    fn node_live(&self, actor: &PrincipalId, id: &str, coordinate: usize) -> bool {
+        self.manager
+            .plans(id)
+            .ok()
+            .and_then(|plans| plans.get(coordinate.saturating_sub(1)).cloned())
+            .and_then(|plan| self.current_binding(actor, &plan))
+            .is_some()
+    }
+
+    /// Revalidate a node after Claim but before Start. Any authority/runtime
+    /// loss in this narrow window is still a proven no-launch outcome, so close
+    /// the Claim instead of returning with a live permit stranded.
+    fn claimed_binding(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        coordinate: usize,
+        claimed_sequence: u64,
+        plan: &NodePlan,
+    ) -> Result<ToolBindingSnapshot> {
+        if let Some(binding) = self.current_binding(actor, plan) {
+            return Ok(binding);
+        }
+        self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+        Err(Error::Denied(
+            "Job node binding changed or was revoked before execution",
+        ))
     }
 
     /// Payload authority is stricter than status/control authority: every
@@ -884,25 +909,9 @@ impl JobHost {
         let Ok(plans) = self.manager.plans(id) else {
             return false;
         };
-        plans.iter().all(|plan| {
-            self.authority
-                .permitted_binding(actor, plan.tool().name())
-                .is_ok_and(|binding| {
-                    let runtime_live = if plan.tool().native().is_some() {
-                        plan.runtime_binding() == self.root_binding
-                    } else {
-                        self.shells.get(plan.tool()).is_some_and(|shell| {
-                            shell
-                                .runtime_binding()
-                                .is_ok_and(|runtime| runtime == plan.runtime_binding())
-                                && shell.revalidate().is_ok()
-                        })
-                    };
-                    binding.registry_revision == plan.registry_generation()
-                        && binding_hash(actor, &binding) == plan.authority_binding()
-                        && runtime_live
-                })
-        })
+        plans
+            .iter()
+            .all(|plan| self.current_binding(actor, plan).is_some())
     }
 
     fn transition_sequence(&self, id: &str) -> Result<u64> {
@@ -913,26 +922,37 @@ impl JobHost {
             .ok_or(Error::Limit("Job transition sequence exhausted"))
     }
 
-    pub fn claim(&self, actor: &PrincipalId, id: &str, coordinate: usize) -> Result<[u8; 32]> {
+    fn claim_exact(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        coordinate: usize,
+    ) -> Result<([u8; 32], u64)> {
         let _gate = self
             .transition_gate
             .lock()
             .map_err(|_| Error::Protocol("Job transition gate poisoned"))?;
         let sequence = self.transition_sequence(id)?;
         let live = self.node_live(actor, id, coordinate);
-        self.manager
+        let key = self
+            .manager
             .claim(id, coordinate, live, sequence, |_, _| Ok(()))
-            .map_err(|_| Error::Denied("Job node claim refused"))
+            .map_err(|_| Error::Denied("Job node claim refused"))?;
+        Ok((key, sequence))
     }
 
-    pub fn start(
+    pub fn claim(&self, actor: &PrincipalId, id: &str, coordinate: usize) -> Result<[u8; 32]> {
+        self.claim_exact(actor, id, coordinate).map(|(key, _)| key)
+    }
+
+    fn start_exact(
         &self,
         actor: &PrincipalId,
         id: &str,
         coordinate: usize,
         claimed_sequence: u64,
         launch_authorized: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _gate = self
             .transition_gate
             .lock()
@@ -951,7 +971,20 @@ impl JobHost {
                 },
                 |_, _| Ok(()),
             )
-            .map_err(|_| Error::Denied("Job node start refused"))
+            .map_err(|_| Error::Denied("Job node start refused"))?;
+        Ok(sequence)
+    }
+
+    pub fn start(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        coordinate: usize,
+        claimed_sequence: u64,
+        launch_authorized: bool,
+    ) -> Result<()> {
+        self.start_exact(actor, id, coordinate, claimed_sequence, launch_authorized)
+            .map(|_| ())
     }
 
     pub fn settle(
@@ -1199,38 +1232,34 @@ impl JobHost {
             .shells
             .get(plan.tool())
             .ok_or(Error::Denied("prepared shell interpreter is unavailable"))?;
-        let _node_key = self.claim(&ctx.actor, id, coordinate)?;
-        let claimed_sequence = self
-            .manager
-            .current_sequence(id)
-            .map_err(|_| Error::Protocol("claimed ShellNode sequence unavailable"))?;
+        let (_node_key, claimed_sequence) = self.claim_exact(&ctx.actor, id, coordinate)?;
         if cancellation.is_cancelled() {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(Error::Cancelled);
         }
-        let binding = self
-            .authority
-            .permitted_binding(&ctx.actor, plan.tool().name())
-            .map_err(|_| Error::Denied("ShellNode binding was revoked before execution"))?;
-        if binding.registry_revision != plan.registry_generation()
-            || binding_hash(&ctx.actor, &binding) != plan.authority_binding()
-            || shell.runtime_binding()? != plan.runtime_binding()
-        {
-            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
-            return Err(Error::Denied("ShellNode binding changed before execution"));
-        }
-        shell.revalidate()?;
-        let stream_capacity = match shell.output_capacity(plan.arguments()) {
-            Ok(capacity) => capacity as u64,
+        let binding = self.claimed_binding(&ctx.actor, id, coordinate, claimed_sequence, &plan)?;
+        // Finish every fallible, side-effect-free launch preparation while the
+        // node is still only Claimed. `Start` is the final canonical checkpoint
+        // immediately before handing the prepared spec to the OS process host.
+        let prepared = match shell.prepare(plan.arguments()) {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.settle_unlaunched(id, coordinate, claimed_sequence)?;
                 return Err(error);
             }
         };
-        let owner = self
-            .manager
-            .job_output_owner(id)
-            .map_err(|_| Error::Protocol("ShellNode output owner unavailable"))?;
+        if let Err(error) = prepared.spec.validate() {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(error);
+        }
+        let stream_capacity = prepared.max_output_bytes as u64;
+        let owner = match self.manager.job_output_owner(id) {
+            Ok(owner) => owner,
+            Err(_) => {
+                self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                return Err(Error::Protocol("ShellNode output owner unavailable"));
+            }
+        };
         let (stdout, stderr) = match self.manager.attach_shell_outputs(
             id,
             coordinate,
@@ -1248,73 +1277,18 @@ impl JobHost {
                 return Err(Error::Protocol("ShellNode output attachment failed"));
             }
         };
-        if let Err(error) = self.start(&ctx.actor, id, coordinate, claimed_sequence, true) {
-            let _ = stdout.finish();
-            let _ = stderr.finish();
-            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
-            return Err(error);
-        }
-        let running_sequence = self
-            .manager
-            .current_sequence(id)
-            .map_err(|_| Error::Protocol("running ShellNode sequence unavailable"))?;
-
-        let prepared = match shell.prepare(plan.arguments()) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = stdout.finish();
-                let _ = stderr.finish();
-                let detail = aw_tools::task::bounded_task_error(error.to_string());
-                return self.settle_shell_result(
-                    id,
-                    coordinate,
-                    running_sequence,
-                    format!("fail prepare={detail}"),
-                    None,
-                    Status {
-                        primary: Primary::Fail,
-                        more: false,
-                        incomplete: false,
-                    },
-                );
-            }
-        };
         if cancellation.is_cancelled() {
-            let _ = stdout.finish();
-            let _ = stderr.finish();
-            return self.settle_shell_result(
-                id,
-                coordinate,
-                running_sequence,
-                "fail cancelled_before_launch".into(),
-                None,
-                Status {
-                    primary: Primary::Fail,
-                    more: false,
-                    incomplete: false,
-                },
-            );
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(Error::Cancelled);
         }
-        if self.authority.revalidate(&ctx.actor, &binding).is_err()
-            || shell.revalidate().is_err()
-            || shell.runtime_binding()? != plan.runtime_binding()
-        {
-            let _ = self.revoke(id);
-            let _ = stdout.finish();
-            let _ = stderr.finish();
-            return self.settle_shell_result(
-                id,
-                coordinate,
-                running_sequence,
-                "fail revoked_before_launch".into(),
-                None,
-                Status {
-                    primary: Primary::Fail,
-                    more: false,
-                    incomplete: false,
-                },
-            );
-        }
+        let running_sequence =
+            match self.start_exact(&ctx.actor, id, coordinate, claimed_sequence, true) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                    return Err(error);
+                }
+            };
 
         let mut process =
             match process::PipeProcess::spawn_with_job_outputs(prepared.spec, stdout, stderr).await
@@ -1470,26 +1444,12 @@ impl JobHost {
             .tool()
             .native()
             .ok_or(Error::Denied("Job node is not a native filesystem node"))?;
-        let _node_key = self.claim(&ctx.actor, id, coordinate)?;
-        let claimed_sequence = self
-            .manager
-            .current_sequence(id)
-            .map_err(|_| Error::Protocol("claimed Job sequence unavailable"))?;
+        let (_node_key, claimed_sequence) = self.claim_exact(&ctx.actor, id, coordinate)?;
         if cancellation.is_cancelled() {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(Error::Cancelled);
         }
-        let binding = self
-            .authority
-            .permitted_binding(&ctx.actor, plan.tool().name())
-            .map_err(|_| Error::Denied("Job tool binding was revoked before execution"))?;
-        if binding.registry_revision != plan.registry_generation()
-            || binding_hash(&ctx.actor, &binding) != plan.authority_binding()
-            || plan.runtime_binding() != self.root_binding
-        {
-            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
-            return Err(Error::Denied("Job tool binding changed before execution"));
-        }
+        let _binding = self.claimed_binding(&ctx.actor, id, coordinate, claimed_sequence, &plan)?;
         if let Err(error) = self.attach_exact_result(id, coordinate, plan.budget().result_bytes) {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(error);
@@ -1525,14 +1485,14 @@ impl JobHost {
         }
         let direct_limits =
             crate::canonical_direct_limits(self.tool_limits, plan.budget().result_bytes, &request);
-        if let Err(error) = self.start(&ctx.actor, id, coordinate, claimed_sequence, true) {
-            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
-            return Err(error);
-        }
-        let running_sequence = self
-            .manager
-            .current_sequence(id)
-            .map_err(|_| Error::Protocol("running Job sequence unavailable"))?;
+        let running_sequence =
+            match self.start_exact(&ctx.actor, id, coordinate, claimed_sequence, true) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                    return Err(error);
+                }
+            };
         let root = self.root.clone();
         let token = cancellation.clone();
         let executed = aw_tools::asynchronous::run_blocking(move || {
@@ -1765,6 +1725,7 @@ impl JobHost {
                     )
                 });
             }
+            let mut fatal = None;
             while let Some((coordinate, outcome)) = wave.next().await {
                 if let Err(error) = outcome {
                     let state = self
@@ -1785,12 +1746,18 @@ impl JobHost {
                         tokio::task::yield_now().await;
                         continue;
                     }
-                    // Authority disappeared or a host invariant failed before
-                    // this node reached a terminal checkpoint. Freeze all new
-                    // work and preserve already-terminal sibling outcomes.
-                    self.revoke(id)?;
-                    let _ = error;
+                    // Internal runner failure is not an ordinary Graph result.
+                    // Stop admitting/effecting new work, but keep polling every
+                    // already-started sibling until its process/output custody
+                    // has quiesced before authoritative abort settlement.
+                    fatal = Some(error);
+                    cancellation.cancel();
+                    let _ = self.revoke(id);
                 }
+            }
+            if let Some(error) = fatal {
+                self.settle_runner_abort(id)?;
+                return Err(error);
             }
         }
     }
@@ -2650,6 +2617,106 @@ mod tests {
                 .released
         );
         assert_eq!(host.manager().spool_usage().unwrap().0, 0);
+    }
+
+    #[test]
+    fn exact_transition_receipts_survive_sibling_sequence_advances() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "a\n").unwrap();
+        fs::write(temp.workspace.join("b.txt"), "b\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(&temp, &agent, Limits::default());
+        let ctx = context(&agent, actor.clone(), "exact-transition-receipts");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[
+                    ["read",{"path":"a.txt","numbered":false},"*"],
+                    ["read",{"path":"b.txt","numbered":false},"*"]
+                ]}),
+            )
+            .unwrap();
+        let id = host.admit_exposed(prepared).unwrap();
+
+        let (_, claimed_one) = host.claim_exact(&actor, &id, 1).unwrap();
+        let (_, claimed_two) = host.claim_exact(&actor, &id, 2).unwrap();
+        assert!(claimed_two > claimed_one);
+
+        let running_one = host.start_exact(&actor, &id, 1, claimed_one, true).unwrap();
+        let running_two = host.start_exact(&actor, &id, 2, claimed_two, true).unwrap();
+        assert!(running_two > running_one);
+
+        let ok = Status {
+            primary: Primary::Ok,
+            more: false,
+            incomplete: false,
+        };
+        host.settle(
+            &id,
+            1,
+            NodeState::Running {
+                sequence: running_one,
+            },
+            ok,
+        )
+        .unwrap();
+        host.settle(
+            &id,
+            2,
+            NodeState::Running {
+                sequence: running_two,
+            },
+            ok,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.manager().runtime_snapshot(&id).unwrap().lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        ));
+    }
+
+    #[tokio::test]
+    async fn authority_loss_after_claim_settles_proven_unlaunched_node() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let mut agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(&temp, &agent, Limits::default());
+        let ctx = context(&agent, actor.clone(), "claim-revocation");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let id = host.admit_exposed(prepared).unwrap();
+        let plan = host.manager().plans(&id).unwrap()[0].clone();
+
+        let (_, claimed_sequence) = host.claim_exact(&actor, &id, 1).unwrap();
+        assert_eq!(host.manager().runner_load(&id).unwrap().job_active, 1);
+
+        agent
+            .revoke_registered_source_tool(&actor, "read", &ToolSource::trusted_host())
+            .unwrap();
+
+        assert!(host
+            .claimed_binding(&actor, &id, 1, claimed_sequence, &plan)
+            .is_err());
+        assert!(matches!(
+            host.manager().node_state(&id, 1).unwrap(),
+            NodeState::Terminal {
+                status: Status {
+                    primary: Primary::Skip,
+                    ..
+                },
+                ..
+            }
+        ));
+        let load = host.manager().runner_load(&id).unwrap();
+        assert_eq!(load.job_active, 0);
+        assert_eq!(load.global_active, 0);
+        assert!(!host.manager().has_nonterminal_jobs().unwrap());
     }
 
     #[cfg(unix)]

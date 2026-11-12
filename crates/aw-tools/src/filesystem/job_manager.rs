@@ -580,6 +580,18 @@ impl OwnedOutput {
         Ok(())
     }
 
+    /// A node proven never launched cannot produce further bytes. Output
+    /// payload failure is therefore not a reason to keep its execution permit
+    /// live: once the writer lifetime is closed, terminal Skip may proceed and
+    /// the failed payload remains independently unreadable.
+    fn finish_unlaunched(&mut self) -> Result<(), Error> {
+        match self.finish_writer() {
+            Ok(()) => Ok(()),
+            Err(Error::OutputFailure) if self.writer_finished => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn maybe_release(&mut self) -> Result<bool, Error> {
         if self.released || !self.writer_finished {
             return Ok(false);
@@ -1978,6 +1990,9 @@ impl JobManager {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
         if !(1..=managed.job.total()).contains(&coordinate)
+            || managed
+                .transition_inflight
+                .is_some_and(|transition| transition.node == Some(coordinate))
             || !managed
                 .job
                 .state(coordinate)
@@ -2861,6 +2876,43 @@ impl JobManager {
                 Ok(Ok(())) => unreachable!(),
             };
         }
+
+        // A proven-unlaunched node can no longer produce output. Seal every
+        // stream attached during preflight before publishing the terminal Skip,
+        // so adapters cannot strand terminal Jobs by forgetting one output
+        // writer on a pre-Start failure.
+        let seal = (|| -> Result<(), Error> {
+            let outputs = {
+                let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+                let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+                if managed.transition_inflight != Some(proposal) {
+                    return Err(Error::Job(JobError::JournalUnknown));
+                }
+                managed
+                    .outputs
+                    .iter()
+                    .filter(|((node, _), _)| *node == coordinate)
+                    .map(|(_, output)| output.clone())
+                    .collect::<Vec<_>>()
+            };
+            for output in outputs {
+                output
+                    .lock()
+                    .map_err(|_| Error::Poisoned)?
+                    .finish_unlaunched()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = seal {
+            let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+            if let Some(managed) = state.jobs.get_mut(id) {
+                if managed.transition_inflight == Some(proposal) {
+                    managed.transition_inflight = None;
+                }
+            }
+            return Err(error);
+        }
+
         self.commit_transition(id, proposal, false, true, persist)
     }
 
@@ -3047,6 +3099,135 @@ mod tests {
         manager.claim(id, 1, true, 2, |_, _| Ok(())).unwrap();
         let owner = manager.job_output_owner(id).unwrap();
         (manager, owner)
+    }
+
+    #[test]
+    fn settle_unlaunched_seals_preattached_output_before_terminal_expiry() {
+        let (manager, owner) = claimed_output_job("unlaunched-output", 1024);
+        manager
+            .attach_output_reserved("unlaunched-output", 1, OutputStream::Result, [owner], 16)
+            .unwrap();
+
+        manager
+            .settle_unlaunched(
+                "unlaunched-output",
+                1,
+                2,
+                3,
+                |_, observed_claim| {
+                    assert_eq!(observed_claim, 2);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.node_state("unlaunched-output", 1).unwrap(),
+            NodeState::Terminal {
+                status: Status {
+                    primary: Primary::Skip,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            manager
+                .output_page("unlaunched-output", 1, OutputStream::Result, 0, 1)
+                .unwrap()
+                .writer_finished
+        );
+        manager.expire_terminal("unlaunched-output").unwrap();
+        assert!(matches!(
+            manager.runtime_snapshot("unlaunched-output"),
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[test]
+    fn output_attachment_is_fenced_while_unlaunched_settlement_is_inflight() {
+        let (manager, owner) = claimed_output_job("unlaunched-attach-race", 1024);
+        manager
+            .settle_unlaunched(
+                "unlaunched-attach-race",
+                1,
+                2,
+                3,
+                |_, observed_claim| {
+                    assert_eq!(observed_claim, 2);
+                    Ok(())
+                },
+                |_, _| {
+                    assert!(matches!(
+                        manager.attach_output_reserved(
+                            "unlaunched-attach-race",
+                            1,
+                            OutputStream::Result,
+                            [owner],
+                            16,
+                        ),
+                        Err(Error::InvalidOutput)
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.output_page("unlaunched-attach-race", 1, OutputStream::Result, 0, 1,),
+            Err(Error::OutputMissing)
+        ));
+        manager.expire_terminal("unlaunched-attach-race").unwrap();
+    }
+
+    #[test]
+    fn settle_unlaunched_does_not_strand_claim_when_preattached_output_failed() {
+        let (manager, owner) = claimed_output_job("unlaunched-failed-output", 1024);
+        manager
+            .attach_output_reserved(
+                "unlaunched-failed-output",
+                1,
+                OutputStream::Result,
+                [owner],
+                16,
+            )
+            .unwrap();
+        manager
+            .mark_output_failed("unlaunched-failed-output", 1, OutputStream::Result, 0)
+            .unwrap();
+
+        manager
+            .settle_unlaunched(
+                "unlaunched-failed-output",
+                1,
+                2,
+                3,
+                |_, observed_claim| {
+                    assert_eq!(observed_claim, 2);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.node_state("unlaunched-failed-output", 1).unwrap(),
+            NodeState::Terminal {
+                status: Status {
+                    primary: Primary::Skip,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            manager
+                .runner_load("unlaunched-failed-output")
+                .unwrap()
+                .job_active,
+            0
+        );
+        manager.expire_terminal("unlaunched-failed-output").unwrap();
     }
 
     fn graph() -> Graph {

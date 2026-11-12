@@ -270,7 +270,11 @@ impl JobRuntime {
                 .catch_unwind()
                 .await;
             let result = match run {
-                Ok(result) => result,
+                Ok(Ok(snapshot)) => Ok(snapshot),
+                Ok(Err(error)) => {
+                    let _ = host_for_task.settle_runner_abort(&runner_id);
+                    Err(error)
+                }
                 Err(_) => {
                     let _ = host_for_task.settle_runner_abort(&runner_id);
                     Err(Error::Protocol(
