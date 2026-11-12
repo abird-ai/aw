@@ -4,7 +4,7 @@ Author: Prasanna Loganathar
 Co-authors: ChatGPT GPT-5.6 Sol
 Owner: @pvl
 
-Status: **vNext DESIGN + minimal crate scaffolding** (2026-11-12). `aw-policy`, `aw-session`, `aw-host` have thin working local contracts, while full scoped Policy, shared Sessions, dynamic delegation and public Jobs cutover remain unchecked implementation work.
+Status: **implementation-ready consolidated vNext plan** (2026-11-12). `DESIGN.md` is the semantic authority; `TODO.md` is the checkpointed implementation program. `aw-policy`, `aw-session`, `aw-host` have thin working local contracts, while full scoped Policy, shared Sessions, delegation and public Jobs cutover remain implementation work.
 
 This is a new successor plan. It does not edit or rewrite the sealed DL-150 plan, the 2026-11-10 Jobs/wake plan, or the 2026-11-10 operations/Agents/Jobs/transcript plan. Those remain historical design records. This plan intentionally replaces their proposed vNext public/API choices where they conflict with the design below.
 
@@ -463,4 +463,4 @@ Do not add:
 - cross-process live Job resurrection without a separate design;
 - a compatibility layer for the superseded vNext drafts.
 
-The goal is a **single unified policy-and-execution pipeline** built from simple core primitives, not a broader framework surface or separate competing ToolPolicy/ExecutionPolicy engines. Model-efficiency gates compare **deterministic Local**, opt-in **one-shot whole-Graph guardian/router with per-node routes**, and optional separately decided routes for eligible nodes; include schema tokens, one versus N guardian invocations, paid preflight for skipped branches, total parent/guardian/delegate/transformer provider tokens, cost and latency, alongside Agent history, handoff, helper retention, causal budgets and original DL-150 semantics.
+The implementation cadence is deliberately **checkpointed rather than micro-qualified**: develop a vertical phase with targeted checks, then validate its user-visible happy paths and failure boundaries together. Carry forward passed unchanged primitives and re-run them only when their owner/API/dependency/authority semantics change. The goal is a **single unified policy-and-execution pipeline** built from simple core primitives, not a broader framework surface or separate competing ToolPolicy/ExecutionPolicy engines. Model-efficiency gates compare deterministic Local, opt-in whole-Graph guardian/router, and bounded Node routing only at the relevant checkpoint.
