@@ -4,14 +4,15 @@ Author: Prasanna Loganathar
 Co-authors: ChatGPT GPT-5.6 Sol
 Owner: @pvl
 
-Status: **implementation-ready consolidated plan, 2026-11-12**.
+Status: **design under review, implementation head start permitted only on stable agreed foundations (2026-11-12)**. Concurrent implementation does not freeze the public contract; when an interface differs from this canonical design, reconcile the plan first and do not count the checkpoint complete.
 
 ## Goal
 
-Implement the complete unified Jobs + Agent runtime in AW, then integrate dotlink thinly.
-Do not redesign the architecture during implementation unless live source proves a real
-contradiction. The detailed semantic authority is `DESIGN.md`; the execution order and
-checkpoint gates are `TODO.md`.
+Implement the unified Jobs + Agent runtime through reviewed vertical checkpoints in AW, with
+standalone dotlink finite Jobs allowed after the shared A/B contracts and the authenticated
+bridge after E. Preserve design freedom while contracts are under review: do not treat
+partially implemented APIs as semantic authority or alter this spec to match incidental code.
+`DESIGN.md` owns proposed semantics, `TODO.md` owns the provisional order and gates.
 
 Repositories:
 - AW: `/home/pvl/spaces/abird/src/aw`
@@ -54,8 +55,10 @@ Re-run a previous checkpoint/lane only if later work changes:
 
 Do not create giant evidence bundles or a checklist entry per unit test.
 
-After AW Checkpoint E, pin one reviewed AW/shared revision in dotlink and execute the
-dotlink D1 → D3 checkpoints. Finish with AW Checkpoint G.
+After AW Checkpoints A/B, dotlink D1 standalone finite Jobs may start on a reviewed exact
+AW shared revision. After AW Checkpoint E (including relevant D policy/Start authority), do dotlink D2
+bridge and D3 final gate. Finish with AW Checkpoint G. Never copy shared code or maintain
+an unreviewed sibling path dependency.
 
 ## Non-negotiable architecture
 
@@ -66,9 +69,11 @@ dotlink D1 → D3 checkpoints. Finish with AW Checkpoint G.
   - `jobs_list/get/read/ack/send/cancel/subscribe`.
 - Direct tools and model-facing Graph use the same flat names (`read`, `edit`, ...).
   SDK/internal semantic IDs use `fs.*` / `jobs.*`.
-- Provider/model-facing `batch` stays the conservative DL-150 leaf surface.
-  Advanced nested `batch`/`jobs.*` composition is typed SDK/host-only unless later
-  deliberately promoted from measurements.
+- AW provider/model-facing `batch` allows reviewed DL-150 Graph-eligible native/shell leaves
+  **plus `agent`**, with exact Agent/Turn/owned-effect receipts. Standalone dotlink has no
+  Agent leaf. **Nested `batch` is disallowed on model, SDK and host Graphs** in initial vNext.
+  `agent` may create bounded child Agents; typed SDK/host `jobs.*` leaves require individually
+  qualified owner, Control and cycle contracts and are never implicitly model-visible.
 - No public `agents.*`, grouped op API, `subagent`, `team`, `plan`, `review_release`,
   `job_start`, `job_restart`, or compatibility aliases.
 
@@ -88,14 +93,22 @@ dotlink D1 → D3 checkpoints. Finish with AW Checkpoint G.
 - Graph `n:<coordinate>` is its direct 1-based coordinate.
 - Agent binds one Session+branch **once for its identity lifetime**; `a:0` may bind its first
   primary executable Session once and is never sequentially rebound.
+- AW SDK Job constructors outside an Agent Turn must explicitly select an **existing,
+  bound, authorized Agent owner**; contextless `:0` parsing never creates an Agent/grant.
 
 ### Jobs/data/control
 - Process natural read = stdout; Graph = result; Agent = latest committed result.
+- One AW project-scoped exposure/routing index provides comparable list order across
+  SessionStore-backed Agents and JobManager finite Jobs; it stores only refs/owner/position,
+  not duplicate lifecycle/history. Recoverability capacity is reserved before effects;
+  standalone dotlink retains its own local finite-Job exposure order.
 - `jobs.read` is pure and never ACKs; Agent durable history is never ACK-consumed.
 - `jobs.ack` uses exact ref/view/raw offset and no rev.
 - `jobs.send/cancel/subscribe` compare-and-act when rev supplied; `jobs.get` uses rev as
   conditional observation token.
-- Effectful control is replay-safe before effect.
+- Effectful control **and any paid guardian/router stage** are replay-claimed before the
+  external attempt. The original request/source/ref ID is the lookup key; accepted route,
+  revised args and policy generations are evidence on that claim, never a new replay key.
 - No model-visible restart; rerun = fresh explicit constructor under current authority.
 
 ### Policy/authority
@@ -104,7 +117,9 @@ dotlink D1 → D3 checkpoints. Finish with AW Checkpoint G.
   existing ToolPolicy/ToolBindingAuthority/resource stores.
 - `Control` is a first-class effect, neither Read nor Write.
 - Guardian/model decisions are advisory evidence, never authority.
-- Admission guardian may `Allow|Deny|Ask|Narrow`.
+- Admission guardian may `Allow|Deny|Ask|Narrow`; **claim original replay identity and
+  reserve decision/paid budget before any guardian inference**. Ambiguous paid attempts
+  stay pending/unknown and never automatically rerun after a crash.
 - After Graph seal, Node policy cannot change prepared args/topology/`when`/semantic ceilings;
   only Allow/Deny/Ask or route/resource/provider/payer/limit narrowing.
 - `Ask` reuses existing owner wait state. Whole-Graph multiple Ask entries live in one bounded
@@ -121,6 +136,10 @@ dotlink D1 → D3 checkpoints. Finish with AW Checkpoint G.
 - Transparent delegated `jobs.*` control rejects self/ancestor/wait cycles mechanically.
 - Parent model remains idle while transparent delegate works.
 - Same causal-work/payer budget applies to delegated/model-origin autonomous work.
+- Bridged AW→dotlink new effects require an AW-owner **single-use source-fenced Start
+  authorization** on the original attempt, linearized with current revocation/writer
+  authority. Dotlink separately checks its own launcher/sandbox. Revoke-before-Start
+  denies; Start-before-revoke remains factual/unknown; unreachable owner blocks new starts.
 
 ### Graph determinism
 - Immutable topology/args after admission.
@@ -153,7 +172,9 @@ dotlink D1 → D3 checkpoints. Finish with AW Checkpoint G.
 - `aw-policy`: pure/no_std constraints/preferences compiler.
 - `aw-session`: backend-neutral Session/coordinator façade over existing store contracts.
 - `aw-tools`: existing host-neutral FS/Graph/Job core; borrowed `GraphActivationContext`,
-  ancestry/pending-approval value types where genuinely shared.
+  ancestry/pending-approval value types where genuinely shared. **No `aw-agent-kernel`
+  dependency**: opaque host generation tokens/callbacks suffice for shared Job admission;
+  real typed `WriterFence` stays in AW Agent/Session owner.
 - `aw-tools-adapter`: concrete AW/native/Process/Job executor bridge only.
 - `aw-host`: thin composition/routing/policy/Session/Agent host.
 - dotlink: concrete remote Process/Graph/native executor only; no AW Agent/Session/Policy engine.
@@ -189,8 +210,10 @@ Do **not** push, version, tag, release or deploy unless separately authorized in
 
 ## Starting instruction
 
-Implement the plan end-to-end now. Start with Phase 0 reconciliation, then execute each
-vertical phase and its checkpoint. Do not ask for confirmation between normal phases; make
-the best safe implementation decision consistent with DESIGN and live source. If a checkpoint
-finds a real design contradiction, stop that slice, record the exact contradiction, resolve it
-at the owning layer, then continue. Do not broaden scope into unrelated refactors.
+Proceed through coherent implementation slices, starting with Phase 0 source/ownership
+reconciliation. Stable primitives may advance while design review continues. **Before a
+public/API/authority checkpoint is accepted, re-read the current approved DESIGN and test
+its contracts rather than freezing a competing partial implementation.** Resolve genuine
+contradictions in the owning plan first; keep independent work unblocked. Do not broaden
+into unrelated refactors, create extra management layers, or assume plan text authorizes
+commits, pushes or releases.
