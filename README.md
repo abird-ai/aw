@@ -75,21 +75,34 @@ aw cli schema
 
 ## Architecture
 
+<picture>
+  <source media="(prefers-color-scheme: dark)"
+          srcset="docs/diagrams/aw-runtime-architecture-dark.svg">
+  <img src="docs/diagrams/aw-runtime-architecture-light.svg"
+       alt="AW surfaces feed one Agent runtime; ToolPolicy governs the embeddable aw-tools native filesystem, Graph and Job core, with independent inference and durable history.">
+</picture>
+
+<details>
+<summary>Architecture as Mermaid</summary>
+
 ```mermaid
 flowchart TB
-    UI["CLI · Terminal workspace · Web · RPC · Rust SDK"]
-    RT["Runtime: Actors + Messages + Envelopes"]
-    A["One Agent · One TurnMachine"]
-    P["Selected provider / inference device"]
-    T["ToolRegistry + ToolPolicy → exact granted effects"]
-    G["aw-tools: native tools + Graph / Job runtime"]
-    J["Immutable TurnJournal → SQLite / JSONL / host storage"]
+    UI["CLI · Workspace · Web · RPC · Rust SDK"]
+    AG["One Agent · TurnMachine"]
+    P["Provider / inference"]
+    TP["ToolRegistry + ToolPolicy"]
+    AD["aw-tools-adapter"]
+    CORE["aw-tools · native filesystem / Graph / Job"]
+    J["TurnJournal"]
+    ST["SQLite · JSONL · host storage"]
 
-    UI --> RT --> A
-    A <--> P
-    A --> T --> G
-    A --> J
+    UI --> AG
+    AG <--> P
+    AG --> TP --> AD --> CORE
+    AG --> J --> ST
 ```
+
+</details>
 
 **Exactly four Runtime primitives:**
 
@@ -107,6 +120,36 @@ continuation. Queues, approvals, routing and child Sessions compose over these.
 dependencies; preflight checks grants and resource conflicts, then schedules
 ready nodes in parallel where safe. Per-node outcomes, output paging and
 cancellation remain factual. No additional Agent engine is created per Graph.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)"
+          srcset="docs/diagrams/aw-graph-execution-dark.svg">
+  <img src="docs/diagrams/aw-graph-execution-light.svg"
+       alt="One batch invocation becomes a bounded Graph Job; read and grep nodes can execute together, edit waits for reads, tests depend on the edit, and each node retains factual outcomes and paged output.">
+</picture>
+
+<details>
+<summary>Graph execution as Mermaid</summary>
+
+```mermaid
+flowchart TB
+    B["batch: one tool invocation"] --> P["Static preflight: schema, grants, limits"]
+    P --> G["One immutable Graph Job"]
+    G --> S["Conflict-aware ready-node scheduling"]
+    S --> N1["N1: read config"]
+    S --> N2["N2: read source"]
+    S --> N3["N3: grep imports"]
+    N1 --> E["N4: exact edit · when 1&2"]
+    N2 --> E
+    E --> T["N5: bash tests · when 4.ok"]
+    N1 --> R["Factual per-node receipts · bounded output paging"]
+    N2 --> R
+    N3 --> R
+    E --> R
+    T --> R
+```
+
+</details>
 
 **Embeddable core:** `aw-tools` provides typed filesystem operations and
 bounded Graph/Job semantics with read-only, rw and batch feature sets.
