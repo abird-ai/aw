@@ -77,43 +77,27 @@ aw cli schema
 
 ```mermaid
 flowchart LR
-    UI["CLI · Workspace · Web · RPC · SDK"]
+    UI["CLI / Workspace / Web / RPC / SDK"] --> AGENT["Agent / TurnMachine"]
+    AGENT <--> MODEL["Model provider"]
+    AGENT --> POLICY["ToolRegistry + ToolPolicy"]
+    POLICY --> ADAPTER["aw-tools-adapter"]
+    ADAPTER --> CORE["aw-tools · filesystem / Graph / Jobs"]
+    AGENT --> JOURNAL[("TurnJournal")]
+    JOURNAL --> STORE[("SQLite / JSONL / host storage")]
+```
 
-    subgraph AW["aw · one Agent runtime"]
-        direction TB
-        PRIM["Runtime · Actor · Message · Envelope"]
-        AGENT["Agent / TurnMachine"]
-        POLICY["ToolRegistry / ToolPolicy"]
-        JOURNAL[("TurnJournal · immutable receipts")]
-        PRIM --> AGENT
-        AGENT --> POLICY
-        AGENT --> JOURNAL
-    end
+**Crate boundaries** (optional components noted):
 
-    subgraph SHARED["aw-tools · embeddable execution core"]
-        direction TB
-        FS["13 native filesystem tools"]
-        GRAPH["Immutable Graph / Job runtime"]
-        OUTPUT["Bounded output · truthful status"]
-        GRAPH --> FS
-        GRAPH --> OUTPUT
-    end
-
-    MODEL["Inference · local / hosted / device"]
-    STORE[("SQLite / JSONL / host storage")]
-    ADAPTER["aw-tools-adapter"]
-
-    UI --> AGENT
-    AGENT <--> MODEL
-    POLICY --> ADAPTER
-    ADAPTER --> FS
-    ADAPTER --> GRAPH
-    JOURNAL --> STORE
-
-    classDef engine stroke:#0d9488,stroke-width:2px
-    classDef durable stroke:#64748b,stroke-dasharray:4 3
-    class AGENT,GRAPH engine
-    class JOURNAL,STORE,OUTPUT durable
+```text
+aw-cli / Web / SDK
+  └─ aw-host                 host composition
+      ├─ aw-agent-core       Agent / TurnMachine / ToolPolicy
+      │   └─ aw-agent-kernel Runtime / Actor / Message / Envelope (no_std + alloc)
+      ├─ aw-policy           pure constraint resolution (no_std)
+      ├─ aw-session          SessionBackend facade (optional)
+      │   └─ aw-store-api    persistence contract
+      └─ aw-tools-adapter    native / Process host integration
+          └─ aw-tools        filesystem / Graph / Job semantics
 ```
 
 **Exactly four Runtime primitives:**
@@ -128,42 +112,70 @@ flowchart LR
 **Two Hook verbs:** `Next` continues/replaces/consumes; `Defer` parks a bounded
 continuation. Queues, approvals, routing and child Sessions compose over these.
 
-**Graph-native execution:** `batch` compiles fixed native-tool nodes and `when`
-dependencies; preflight checks grants and resource conflicts, then schedules
-ready nodes in parallel where safe. Per-node outcomes, output paging and
-cancellation remain factual. No additional Agent engine is created per Graph.
+**Graph execution:** A single `batch` call composes native tools using
+`ops:[[tool,args,when?],...]`. Independent nodes run concurrently when safe;
+dependencies gate mutations and tests. Each node retains its grants and results.
 
 ```mermaid
 flowchart TB
-    INPUT["batch · one tool call"] --> PRE["Preflight · schemas / grants / limits"]
-    PRE --> JOB["One immutable Graph Job"]
-    JOB --> SCHED["Ready-node scheduler · dependencies + conflicts"]
+    B["batch · 8 operations / one call"]
 
-    subgraph WAVE["Independent ready nodes · parallel when safe"]
+    subgraph INSPECT["Inspect in parallel"]
         direction LR
-        N1["1 · read config"]
-        N2["2 · read source"]
-        N3["3 · grep imports"]
+        R["1 · read Cargo.toml"]
+        S["2 · grep API usages · *"]
+        T["3 · grep API tests · *"]
     end
 
-    SCHED --> N1
-    SCHED --> N2
-    SCHED --> N3
-    N1 -->|"1.complete"| N4["4 · exact edit · when 1&2"]
-    N2 -->|"2.complete"| N4
-    N4 -->|"4.ok"| N5["5 · bash tests · when 4.ok"]
+    B --> R
+    B --> S
+    B --> T
 
-    JOB -.-> RECEIPTS[("Per-node receipts · bounded paging / factual status")]
+    R --> E["4 · edit Cargo.toml · 1.complete"]
+    S --> P["5 · patch src/api.rs · 2.complete"]
+    T --> X["6 · edit tests/api.rs · 3.complete"]
 
-    classDef engine stroke:#0d9488,stroke-width:2px
-    classDef durable stroke:#64748b,stroke-dasharray:4 3
-    class JOB,N4,N5 engine
-    class RECEIPTS durable
+    E --> F["7 · cargo fmt --check · 4.ok&5.ok&6.ok"]
+    P --> F
+    X --> F
+    F --> V["8 · cargo test · 7.ok"]
 ```
 
-**Embeddable core:** `aw-tools` provides typed filesystem operations and
-bounded Graph/Job semantics with read-only, rw and batch feature sets.
-It needs no AW Session, provider, UI or Agent loop and is reused by dotlink.
+All node arguments are fixed at admission; nodes do not generate later edits.
+Unmet conditions skip work. Results and output remain independently inspectable.
+
+**Why `aw-tools`:** One compact, typed tool vocabulary. Direct calls and
+`batch` share the same schemas and native operations, without duplicating
+tool definitions for each Graph node.
+
+```mermaid
+flowchart LR
+    subgraph API["Model-facing tools"]
+        direction TB
+        READ["Inspect · ls / find / grep / read / bread"]
+        EDIT["Mutate · write / edit / patch / cp / mv / rm / bwrite / bedit"]
+        BATCH["Compose · batch(ops)"]
+    end
+
+    subgraph LIB["aw-tools · embeddable Rust library"]
+        direction TB
+        SPEC["Canonical schemas + bounded validation"]
+        FS["Native filesystem operations"]
+        GRAPH["Graph dependencies + conflict checks"]
+        RESULT["Paged results + factual status"]
+        SPEC --> FS --> RESULT
+        GRAPH --> SPEC
+        GRAPH --> RESULT
+    end
+
+    READ --> SPEC
+    EDIT --> SPEC
+    BATCH --> GRAPH
+```
+
+13 direct native tools (12 Graph-eligible); reusable Graph/Job semantics for AW
+and dotlink. The host supplies grants, OS filesystem access, Process custody
+and durable journaling.
 
 ### Key decisions
 
