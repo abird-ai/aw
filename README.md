@@ -75,34 +75,46 @@ aw cli schema
 
 ## Architecture
 
-<picture>
-  <source media="(prefers-color-scheme: dark)"
-          srcset="docs/diagrams/aw-runtime-architecture-dark.svg">
-  <img src="docs/diagrams/aw-runtime-architecture-light.svg"
-       alt="AW surfaces feed one Agent runtime; ToolPolicy governs the embeddable aw-tools native filesystem, Graph and Job core, with independent inference and durable history.">
-</picture>
-
-<details>
-<summary>Architecture as Mermaid</summary>
-
 ```mermaid
-flowchart TB
-    UI["CLI · Workspace · Web · RPC · Rust SDK"]
-    AG["One Agent · TurnMachine"]
-    P["Provider / inference"]
-    TP["ToolRegistry + ToolPolicy"]
-    AD["aw-tools-adapter"]
-    CORE["aw-tools · native filesystem / Graph / Job"]
-    J["TurnJournal"]
-    ST["SQLite · JSONL · host storage"]
+flowchart LR
+    UI["CLI · Workspace · Web · RPC · SDK"]
 
-    UI --> AG
-    AG <--> P
-    AG --> TP --> AD --> CORE
-    AG --> J --> ST
+    subgraph AW["aw · one Agent runtime"]
+        direction TB
+        PRIM["Runtime · Actor · Message · Envelope"]
+        AGENT["Agent / TurnMachine"]
+        POLICY["ToolRegistry / ToolPolicy"]
+        JOURNAL[("TurnJournal · immutable receipts")]
+        PRIM --> AGENT
+        AGENT --> POLICY
+        AGENT --> JOURNAL
+    end
+
+    subgraph SHARED["aw-tools · embeddable execution core"]
+        direction TB
+        FS["13 native filesystem tools"]
+        GRAPH["Immutable Graph / Job runtime"]
+        OUTPUT["Bounded output · truthful status"]
+        GRAPH --> FS
+        GRAPH --> OUTPUT
+    end
+
+    MODEL["Inference · local / hosted / device"]
+    STORE[("SQLite / JSONL / host storage")]
+    ADAPTER["aw-tools-adapter"]
+
+    UI --> AGENT
+    AGENT <--> MODEL
+    POLICY --> ADAPTER
+    ADAPTER --> FS
+    ADAPTER --> GRAPH
+    JOURNAL --> STORE
+
+    classDef engine stroke:#0d9488,stroke-width:2px
+    classDef durable stroke:#64748b,stroke-dasharray:4 3
+    class AGENT,GRAPH engine
+    class JOURNAL,STORE,OUTPUT durable
 ```
-
-</details>
 
 **Exactly four Runtime primitives:**
 
@@ -121,35 +133,33 @@ dependencies; preflight checks grants and resource conflicts, then schedules
 ready nodes in parallel where safe. Per-node outcomes, output paging and
 cancellation remain factual. No additional Agent engine is created per Graph.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)"
-          srcset="docs/diagrams/aw-graph-execution-dark.svg">
-  <img src="docs/diagrams/aw-graph-execution-light.svg"
-       alt="One batch invocation becomes a bounded Graph Job; read and grep nodes can execute together, edit waits for reads, tests depend on the edit, and each node retains factual outcomes and paged output.">
-</picture>
-
-<details>
-<summary>Graph execution as Mermaid</summary>
-
 ```mermaid
 flowchart TB
-    B["batch: one tool invocation"] --> P["Static preflight: schema, grants, limits"]
-    P --> G["One immutable Graph Job"]
-    G --> S["Conflict-aware ready-node scheduling"]
-    S --> N1["N1: read config"]
-    S --> N2["N2: read source"]
-    S --> N3["N3: grep imports"]
-    N1 --> E["N4: exact edit · when 1&2"]
-    N2 --> E
-    E --> T["N5: bash tests · when 4.ok"]
-    N1 --> R["Factual per-node receipts · bounded output paging"]
-    N2 --> R
-    N3 --> R
-    E --> R
-    T --> R
-```
+    INPUT["batch · one tool call"] --> PRE["Preflight · schemas / grants / limits"]
+    PRE --> JOB["One immutable Graph Job"]
+    JOB --> SCHED["Ready-node scheduler · dependencies + conflicts"]
 
-</details>
+    subgraph WAVE["Independent ready nodes · parallel when safe"]
+        direction LR
+        N1["1 · read config"]
+        N2["2 · read source"]
+        N3["3 · grep imports"]
+    end
+
+    SCHED --> N1
+    SCHED --> N2
+    SCHED --> N3
+    N1 -->|"1.complete"| N4["4 · exact edit · when 1&2"]
+    N2 -->|"2.complete"| N4
+    N4 -->|"4.ok"| N5["5 · bash tests · when 4.ok"]
+
+    JOB -.-> RECEIPTS[("Per-node receipts · bounded paging / factual status")]
+
+    classDef engine stroke:#0d9488,stroke-width:2px
+    classDef durable stroke:#64748b,stroke-dasharray:4 3
+    class JOB,N4,N5 engine
+    class RECEIPTS durable
+```
 
 **Embeddable core:** `aw-tools` provides typed filesystem operations and
 bounded Graph/Job semantics with read-only, rw and batch feature sets.
