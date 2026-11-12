@@ -1,14 +1,15 @@
 # aw
 
-**A durable AI workspace. One Rust binary, one Agent engine, composable everywhere.**
+**The durable graph-native agent runtime and workspace. One Rust binary, one Agent engine, composable everywhere.**
 
 ## Intro
 
+- **Graph-native execution:** bounded, immutable tool Graphs with dependencies, conflict-aware parallelism and factual per-node results.
+- **AI-native tools:** compact direct filesystem and Process tools that compose as Graph nodes, backed by the embeddable `aw-tools` Rust library.
+- **Durable work:** Sessions, branches, context imports, Job output and immutable model/tool receipts.
 - **Interactive or automated:** terminal chat, Files/Git/terminal workspace, web UI, JSONL and typed RPC.
-- **Durable work:** Sessions, branches, context imports and immutable model/tool receipts.
 - **Independent inference:** local models, hosted APIs and paired devices; credentials stay with their configured executor.
-- **Composable execution:** child Agents, processes, queues, hooks, reviews and pipelines; explicit authority throughout.
-- **One shared engine:** Rust SDK, full/minimal CLI, portable `no_std + alloc` Agent and C ABI.
+- **One Agent engine:** shared runtime semantics across the Rust SDK, full/minimal CLI, portable `no_std + alloc` Agent and C ABI; hosted execution composes child Agents, Processes, hooks and pipelines.
 
 [Quick start](#quick-start) · [Architecture](#architecture) · [FAQ](#faq) · [Roadmap](#implementation-status-and-roadmap)
 
@@ -57,6 +58,7 @@ aw --workspace-directory /path/to/project \
 ```
 
 Tools are **off by default**. Instructions and skills grant no tools.
+When authorized, `batch` composes native operations into a bounded Graph without widening their individual grants.
 aw connects to inference servers; it does not download model weights.
 
 ### Integrate
@@ -79,12 +81,13 @@ flowchart TB
     RT["Runtime: Actors + Messages + Envelopes"]
     A["One Agent · One TurnMachine"]
     P["Selected provider / inference device"]
-    T["ToolRegistry + ToolPolicy → granted effects"]
+    T["ToolRegistry + ToolPolicy → exact granted effects"]
+    G["aw-tools: native tools + Graph / Job runtime"]
     J["Immutable TurnJournal → SQLite / JSONL / host storage"]
 
     UI --> RT --> A
     A <--> P
-    A --> T
+    A --> T --> G
     A --> J
 ```
 
@@ -100,13 +103,24 @@ flowchart TB
 **Two Hook verbs:** `Next` continues/replaces/consumes; `Defer` parks a bounded
 continuation. Queues, approvals, routing and child Sessions compose over these.
 
+**Graph-native execution:** `batch` compiles fixed native-tool nodes and `when`
+dependencies; preflight checks grants and resource conflicts, then schedules
+ready nodes in parallel where safe. Per-node outcomes, output paging and
+cancellation remain factual. No additional Agent engine is created per Graph.
+
+**Embeddable core:** `aw-tools` provides typed filesystem operations and
+bounded Graph/Job semantics with read-only, rw and batch feature sets.
+It needs no AW Session, provider, UI or Agent loop and is reused by dotlink.
+
 ### Key decisions
 
-- **One execution path:** original Agent, TurnMachine, ToolRegistry, ToolPolicy and TurnJournal across surfaces.
-- **Explicit authority:** exact actor/source/site grants; prompts, plugins and peer pairing confer none.
-- **Intent before effect:** journal before dispatch; preserve uncertainty; never automatically replay unknown charges or effects.
+- **One Agent engine:** original TurnMachine, ToolRegistry, ToolPolicy and TurnJournal across surfaces; Graph/Job execution uses shared `aw-tools`.
+- **Model-first tool language:** short, typed native operations and compact Graph tuples; avoid repeated model turns for independent work.
+- **Deterministic Graphs:** immutable dependencies, conservative conflict scheduling, bounded outputs and truthful `ok`/`fail`/`unknown` results.
+- **Explicit authority:** exact actor/source/site grants per operation and Graph leaf; prompts, plugins and peer pairing confer none.
+- **Intent before effect:** journal before dispatch; preserve uncertainty; never blindly replay unknown charges or effects.
 - **Separate custody:** account, payer, credentials, inference host and tool host remain distinct.
-- **Small portable core:** no UI, network, OS-process or database dependencies in the kernel.
+- **Portable core:** the Agent kernel needs no UI, network, OS process or database; `aw-tools` is independently embeddable.
 
 **Domain → Workspace → Session.** Sessions hold branches and immutable history;
 Machines/Fleets identify targets. Views cannot retarget running work.
@@ -114,6 +128,9 @@ Machines/Fleets identify targets. Views cannot retarget running work.
 ## Engineering
 
 - [Runtime](.agents/docs/RUNTIME-FOUR-PRIMITIVES-AND-SERVICES-2026-10-11.md)
+- [AI-native tools and DL-150 Graph/Job semantics](.agents/docs/TOOLS.md)
+- [Embeddable `aw-tools` library](crates/aw-tools/README.md)
+- [Unified Jobs + Agent runtime (vNext design)](.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/README.md)
 - [Hook/trust policies](.agents/docs/RUNTIME-HOOKS-TRUST-AND-POLICY-2026-10-11.md)
 - [SDK](.agents/docs/SDK.md)
 - [C ABI](crates/aw-embedded-ffi/README.md)
@@ -152,6 +169,7 @@ Source **0.15.0** · SQLite **v33** · JSONL **v1**.
 | Implemented | Next / deferred |
 | --- | --- |
 | Agent, terminal/web workspace, unified palette/focus, JSONL/RPC, Rust SDK | Further UX v1.5 viewer/layout convergence |
+| Embeddable `aw-tools` native filesystem, bounded Graph/Job execution and output paging | Unified Jobs/Agent controls and Graph/Node delegation (vNext design, not yet shipped) |
 | Runtime primitives, hooks, queues, processes, bounded delegation/reviews | Further integrations within existing boundaries |
 | Durable history, branches, context flow, quarantined backup inspection | Runnable restoration: fresh human authority, cross-host exclusivity, reconciled effects; activation disabled |
 | Domain/Workspace/Machine/Fleet, pairing, bounded remote/team/account services | Broader distributed workflows; independent security qualification |
@@ -179,6 +197,13 @@ Gemini and explicit OpenAI-compatible endpoints. [Provider guide](crates/aw-prov
 
 **Without SQLite or a UI?** Minimal uses JSONL; stateless uses memory. Rust/C hosts
 can embed the engine without terminal, HTTP or SQLite dependencies.
+
+**What does graph-native mean?** `batch` runs a bounded Graph of native operations
+with explicit dependencies (`when`), safe concurrent scheduling and per-node
+results. Graph execution uses the same ToolPolicy and Job semantics as direct tools.
+
+**Can I embed just the tools?** Yes. `aw-tools` exposes the reusable Rust filesystem,
+Graph and Job core without an AW Agent, Session, model provider or UI.
 
 **Are extensions sandboxed?** Process extensions are explicitly started trusted
 programs. MCP discovery grants nothing; tool access requires exact host approval.
