@@ -227,33 +227,26 @@ The helper requires Linux atomic directory exchange (`renameat2`); unsupported
 filesystems fail before replacing output. Existing nonempty output must contain
 the complete flat release-file set, with no symlinks or unrelated entries.
 
-## Implementation status and roadmap
+## Status / TODO
 
-Source **0.15.0** · SQLite **v33** · JSONL **v1**.
+`0.15.0` · SQLite v33 · JSONL v1
 
-| Implemented | Next / deferred |
-| --- | --- |
-| Agent, terminal/web workspace, unified palette/focus, JSONL/RPC, Rust SDK | Further UX v1.5 viewer/layout convergence |
-| Embeddable `aw-tools` native filesystem, bounded Graph/Job execution and output paging | Unified Jobs/Agent controls and Graph/Node delegation (vNext design, not yet shipped) |
-| Runtime primitives, hooks, queues, processes, bounded delegation/reviews | Further integrations within existing boundaries |
-| Durable history, branches, context flow, quarantined backup inspection | Runnable restoration: fresh human authority, cross-host exclusivity, reconciled effects; activation disabled |
-| Domain/Workspace/Machine/Fleet, pairing, bounded remote/team/account services | Broader distributed workflows; independent security qualification |
-| Portable Agent, executed WASM/Linux libc-free host, tested C ABI | Native multi-platform release qualification; firmware parked |
+**Working**
+- [x] Agent runtime, terminal/web workspace, CLI, RPC and Rust SDK.
+- [x] `aw-tools`: native filesystem tools, `batch` Graph/Job execution, bounded output.
+- [x] Durable Sessions/branches, history and context imports.
+- [x] Local/hosted inference, Processes, child Agents and exact tool grants.
+- [x] Portable `no_std + alloc` Agent and C ABI.
 
-Evidence covers local Linux, mock providers and specified embedded hosts—not
-production billing or every platform. Indexing and LSP are intentionally excluded.
-See the concise [plan index](.agents/plans/TODO.md) and [accepted checkpoint](.agents/plans/accepted-history/TODO.md).
+**Open**
+- [ ] [Unified Jobs/Agent API](.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/README.md): Graph/Node delegation, policy and shared Sessions.
+- [ ] [Workspace views](.agents/plans/workspace-views/TODO.md): Files/Git navigation and layout.
+- [ ] [Native release checks](.agents/plans/release-readiness/TODO.md): macOS, Windows and Linux ARM64 execution, signing/notarization.
+- [ ] [Runnable restore](.agents/plans/restored-state-authority/TODO.md): reauthorize and reconcile persisted work before execution.
+- [ ] [Live-provider/billing tests and independent security review](.agents/plans/release-readiness/TODO.md).
 
-The hosted account catalog uses [left-right 0.11.8](https://github.com/jonhoo/left-right)
-with task-owned readers and fresh grant checks. Measured fit keeps streaming projections and bounded resource
-owners simple. Future publication changes require measured read-heavy fit and
-retain the existing authority/resource owners.
-
-The unified palette/focus slice
-uses `F1` or `Ctrl+Shift+P` (browser also `Ctrl/Cmd+K`) with the same seven
-resource prefixes. Native and browser interaction, focus and visual checks are
-verified locally. Further UX v1.5 viewers, compound Files/Git views, docks and
-breakouts remain in the [workspace views plan](.agents/plans/workspace-views/TODO.md).
+Validated locally on Linux and selected embedded hosts. Cross-builds are not native
+host qualification. Indexing/LSP and firmware are out of scope.
 
 ## FAQ
 
