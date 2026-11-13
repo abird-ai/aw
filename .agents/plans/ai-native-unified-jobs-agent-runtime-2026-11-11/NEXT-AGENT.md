@@ -46,7 +46,9 @@ At the phase checkpoint:
 - run the grouped user-visible flows + failure boundaries listed there;
 - fix the slice until the checkpoint passes as a whole;
 - record concise commands/results in the TODO;
-- carry the passed checkpoint forward.
+- carry the passed checkpoint forward. **Reported C/D checkmarks from parallel work are
+  not accepted gates until 0/A/B predecessors and the new affected invariants pass.**
+  Preserve those reports and requalify only changed contracts, not unchanged primitives.
 
 Re-run a previous checkpoint/lane only if later work changes:
 - its owning code/crate/API/schema;
@@ -98,17 +100,20 @@ an unreviewed sibling path dependency.
 
 ### Jobs/data/control
 - Process natural read = stdout; Graph = result; Agent = latest committed result.
-- One AW project-scoped exposure/routing index provides comparable list order across
-  SessionStore-backed Agents and JobManager finite Jobs; it stores only refs/owner/position,
-  not duplicate lifecycle/history. Recoverability capacity is reserved before effects;
-  standalone dotlink retains its own local finite-Job exposure order.
+- One small host-neutral exposure-order contract: **durable project/SessionStore-backed**
+  for mixed Agent/finite lists or **in-memory generation-scoped** for sessionless Local AW;
+  no mandatory Session DB, copied Job lifecycle or second manager. Reserve capacity before
+  effects, publish once, reject stale runtime cursors/handles and prevent `j:` reuse across
+  runtime generations. Standalone dotlink retains its own local finite index.
 - `jobs.read` is pure and never ACKs; Agent durable history is never ACK-consumed.
 - `jobs.ack` uses exact ref/view/raw offset and no rev.
 - `jobs.send/cancel/subscribe` compare-and-act when rev supplied; `jobs.get` uses rev as
   conditional observation token.
-- Effectful control **and any paid guardian/router stage** are replay-claimed before the
-  external attempt. The original request/source/ref ID is the lookup key; accepted route,
-  revised args and policy generations are evidence on that claim, never a new replay key.
+- **Replay lookup before contextual-ref resolution**: authenticate original source/call
+  identity, find an admitted claim, compare literal original request/args and reuse its
+  stored canonical target even after `^` reparenting. Only **new** invocation IDs resolve
+  current context and claim once before paid guardian/native effect. Accepted route/revised
+  args/policy are evidence inside that claim, never a new retry key.
 - No model-visible restart; rerun = fresh explicit constructor under current authority.
 
 ### Policy/authority
@@ -136,10 +141,13 @@ an unreviewed sibling path dependency.
 - Transparent delegated `jobs.*` control rejects self/ancestor/wait cycles mechanically.
 - Parent model remains idle while transparent delegate works.
 - Same causal-work/payer budget applies to delegated/model-origin autonomous work.
-- Bridged AW→dotlink new effects require an AW-owner **single-use source-fenced Start
-  authorization** on the original attempt, linearized with current revocation/writer
-  authority. Dotlink separately checks its own launcher/sandbox. Revoke-before-Start
-  denies; Start-before-revoke remains factual/unknown; unreachable owner blocks new starts.
+- Bridged AW→dotlink effects require **one AW-authorized Start per original attempt**,
+  bound to target host/profile, exact operation, dotlink **live generation**, expiry and
+  existing replay identity. Dotlink consumes it once through its existing owner ledger;
+  duplicates in that generation recover the same receipt, older generations never restart.
+  AW offline blocks **new grants**, not an already committed unexpired same-generation
+  dispatch. Uncertain Starts never acquire a replacement proof by retry; revoke-before-
+  authorization denies and revoke-after preserves factual/unknown effects.
 
 ### Graph determinism
 - Immutable topology/args after admission.
@@ -150,6 +158,18 @@ an unreviewed sibling path dependency.
 - Before activation-time router/Ask, node claims deterministic union-footprint conflict position;
   conflicting successors cannot overtake while decision waits.
 - Router/guardian/approval latency must not change effect order.
+- Graph-owned Agents propagate one bounded causal/ownership scope across initial Turns,
+  child Agents and queued effectful work; no Agent-mediated nested `batch`. Graph success
+  and conflict release wait for *all* scoped effects to quiesce. Later independent Turns
+  get fresh rights/causal budgets, never the old Graph's footprint or replay claim.
+
+### AW wake / subscriptions
+- The source owner serializes registration/replacement with event commit under its Job
+  revision; the receiving Agent owner independently authorizes and idempotently admits
+  the wake Input. Constructor `wake` registers **before** first effect. No second event
+  bus, polling approximation or dotlink-owned remote wake promise.
+- AW Phase B adds shared source-event primitives; C wires Agent recipient and
+  `jobs.subscribe`; D validates Agent-Graph attention; E checks share revocation.
 
 ### Shared Sessions / multi-user
 - One existing Agent input queue and one Turn writer.
