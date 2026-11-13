@@ -1,239 +1,141 @@
-# Next-agent handoff — implement unified Jobs + Agent runtime
+# Next agent — unified Jobs + Agent runtime, Phase 6 D2
 
-Author: Prasanna Loganathar
-Co-authors: ChatGPT GPT-5.6 Sol
-Owner: @pvl
+Use `dotlink---l5` only.
 
-Status: **design under review, implementation head start permitted only on stable agreed foundations (2026-11-12)**. Concurrent implementation does not freeze the public contract; when an interface differs from this canonical design, reconcile the plan first and do not count the checkpoint complete.
+Work only in:
 
-## Goal
-
-Implement the unified Jobs + Agent runtime through reviewed vertical checkpoints in AW, with
-standalone dotlink finite Jobs allowed after the shared A/B contracts and the authenticated
-bridge after E. Preserve design freedom while contracts are under review: do not treat
-partially implemented APIs as semantic authority or alter this spec to match incidental code.
-`DESIGN.md` owns proposed semantics, `TODO.md` owns the provisional order and gates.
-
-Repositories:
 - AW: `/home/pvl/spaces/abird/src/aw`
 - dotlink: `/home/pvl/spaces/abird/src/dotlink`
 
-Authoritative plan:
-- AW `.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/`
-- dotlink companion with the same directory name
+Do not use A1. Do not create another worktree. Never inspect or touch AW
+`.agents/plans/ux/**`. Preserve unrelated work, especially dotlink
+`docs/CHATGPT_PLUGIN.md` and the separate `dotlink-016-fixes` release worktree.
+Do not commit, push, tag, release, or deploy unless the user separately authorizes
+that future checkpoint.
 
-## Read first
+## Authority and pushed checkpoints
 
-1. AW and dotlink `AGENTS.md`.
-2. Each repo's `.agents/plans/README.md` and current queue; do not edit coordinator-owned
-   indexes unless explicitly authorized.
-3. AW plan `README.md`, `DESIGN.md`, then the checkpointed `TODO.md`.
-4. dotlink companion `README.md` + `TODO.md` before bridge work.
-5. Sealed DL-150 reference for filesystem/Graph/result/replay invariants.
-6. Live source/tests and current dirty state. Source/executed tests outrank prose.
-7. Never inspect or touch AW `.agents/plans/ux/`.
+Normative design authority remains AW:
 
-## Implementation cadence
+`890e9a383fe2edc3e0bd0aa34a2b217f2724475c`
 
-Follow AW `TODO.md` phases **0 → 7** in order.
+Reviewed/pushed implementation checkpoints:
 
-Within a phase:
-- make the coherent vertical change;
-- use targeted compile/tests only as needed to develop touched code;
-- do not repeatedly rerun unchanged primitive/native suites.
+- AW code: `9e9ab043410241c3f797f760d93a1cfd9126fdd2`
+  (`Implement unified Jobs and Agent runtime checkpoint`)
+- dotlink D1: `3f59bb16b0262f6157351fd28b13167cc1b3e5db`
+  (`Cut over standalone Jobs to shared AW runtime`)
+- dotlink pins `aw-tools`, `aw-tools-fs-unix`, and `aw-tools-fs-win` exactly to
+  AW `9e9ab043410241c3f797f760d93a1cfd9126fdd2`.
 
-At the phase checkpoint:
-- run the grouped user-visible flows + failure boundaries listed there;
-- fix the slice until the checkpoint passes as a whole;
-- record concise commands/results in the TODO;
-- carry the passed checkpoint forward. **Reported C/D checkmarks from parallel work are
-  not accepted gates until 0/A/B predecessors and the new affected invariants pass.**
-  Preserve those reports and requalify only changed contracts, not unchanged primitives.
+Read in order:
 
-Re-run a previous checkpoint/lane only if later work changes:
-- its owning code/crate/API/schema;
-- a dependency boundary it relies on;
-- authority/replay/concurrency semantics it relies on.
+1. both repos' `AGENTS.md`, `.agents/plans/README.md`, `.agents/plans/TODO.md`;
+2. AW `.agents/docs/CURRENT_HANDOFF.md` in full;
+3. AW unified plan README, DESIGN.md, TODO.md;
+4. dotlink companion README, TODO.md, CURRENT_HANDOFF.md;
+5. live source/tests/current Git status. Source and executed tests outrank prose.
 
-Do not create giant evidence bundles or a checklist entry per unit test.
+## What is complete
 
-After AW Checkpoints A/B, dotlink D1 standalone finite Jobs may start on a reviewed exact
-AW shared revision. After AW Checkpoint E (including relevant D policy/Start authority), do dotlink D2
-bridge and D3 final gate. Finish with AW Checkpoint G. Never copy shared code or maintain
-an unreviewed sibling path dependency.
+AW Phases 1–5 implementation is committed and pushed. Its shared layer exports
+`OperationId`, typed `ExecutionRef`, coordination/event primitives and the
+host-neutral remote-Start contract.
 
-## Non-negotiable architecture
+AW-side D2 authorization is implemented:
 
-### Model/API surface
-- Maximum model-facing core remains 25 flat tools:
-  - 13 filesystem;
-  - `bash`, `pwsh`, `powershell`, `batch`, `agent`;
-  - `jobs_list/get/read/ack/send/cancel/subscribe`.
-- Direct tools and model-facing Graph use the same flat names (`read`, `edit`, ...).
-  SDK/internal semantic IDs use `fs.*` / `jobs.*`.
-- AW provider/model-facing `batch` allows reviewed DL-150 Graph-eligible native/shell leaves
-  **plus `agent`**, with exact Agent/Turn/owned-effect receipts. Standalone dotlink has no
-  Agent leaf. **Nested `batch` is disallowed on model, SDK and host Graphs** in initial vNext.
-  `agent` may create bounded child Agents; typed SDK/host `jobs.*` leaves require individually
-  qualified owner, Control and cycle contracts and are never implicitly model-visible.
-- No public `agents.*`, grouped op API, `subagent`, `team`, `plan`, `review_release`,
-  `job_start`, `job_restart`, or compatibility aliases.
+- one durable source-fenced Start authorization per original effect attempt;
+- replay lookup occurs before current reauthorization;
+- exact operation/ref/args/request/target-generation binding;
+- actor/source/site/resource/grant/policy/Session/writer/membership provenance;
+- bounded target-clock lease;
+- ToolBinding read fence serializes Start commit against source/grant/site
+  revocation;
+- revoke-before-Start denies;
+- Start-before-revoke preserves exactly the committed attempt;
+- changed intent under the same attempt cannot mint a replacement Start.
 
-### One owner for every state
-- One Agent/Actor/TurnMachine/TurnJournal runtime.
-- One SessionStore authority.
-- One JobManager/Graph runner.
-- One Process/output/ACK owner.
-- No second PolicyStore, Agent runner, Graph scheduler, collaboration queue, approval engine,
-  replay engine or transcript database.
+dotlink D1 is complete and pushed:
 
-### Refs/identity
-- Typed canonical `d/i/p/a/t/j/n`.
-- Fully resolved slash refs; contextual non-slash overlays.
-- Fixed canonical `:0` defaults; never caller-relative aliases.
-- Handles never retarget/reuse.
-- Graph `n:<coordinate>` is its direct 1-based coordinate.
-- Agent binds one Session+branch **once for its identity lifetime**; `a:0` may bind its first
-  primary executable Session once and is never sequentially rebound.
-- AW SDK Job constructors outside an Agent Turn must explicitly select an **existing,
-  bound, authorized Agent owner**; contextless `:0` parsing never creates an Agent/grant.
+- exact reviewed shared AW pin;
+- shared `OperationId` and `ExecutionRef` consumed mechanically;
+- model surface is flat `jobs_list/get/read/ack/send/cancel`;
+- shell and `batch(..., background:true)` are constructors;
+- no `job_start`, `job_restart`, old `job_*`, Agent, subscribe/wake or nested
+  batch;
+- standalone refs remain only `j:<handle>[/n:<coordinate>]`;
+- fresh live runtime generation per startup; stale refs/cursors cannot resurrect;
+- same-Job handoff/replay, ACK ownership, stdin current-authority checks,
+  cancel/unknown and sandbox/protected-path behavior are preserved.
 
-### Jobs/data/control
-- Process natural read = stdout; Graph = result; Agent = latest committed result.
-- One small host-neutral exposure-order contract: **durable project/SessionStore-backed**
-  for mixed Agent/finite lists or **in-memory generation-scoped** for sessionless Local AW;
-  no mandatory Session DB, copied Job lifecycle or second manager. Reserve capacity before
-  effects, publish once, reject stale runtime cursors/handles and prevent `j:` reuse across
-  runtime generations. Standalone dotlink retains its own local finite index.
-- `jobs.read` is pure and never ACKs; Agent durable history is never ACK-consumed.
-- `jobs.ack` uses exact ref/view/raw offset and no rev.
-- `jobs.send/cancel/subscribe` compare-and-act when rev supplied; `jobs.get` uses rev as
-  conditional observation token.
-- **Replay lookup before contextual-ref resolution**: authenticate original source/call
-  identity, find an admitted claim, compare literal original request/args and reuse its
-  stored canonical target even after `^` reparenting. Only **new** invocation IDs resolve
-  current context and claim once before paid guardian/native effect. Accepted route/revised
-  args/policy are evidence inside that claim, never a new retry key.
-- No model-visible restart; rerun = fresh explicit constructor under current authority.
+Latest dotlink qualification against AW `9e9ab04`:
 
-### Policy/authority
-- `aw-policy` is pure constraints/denies/routes/preferences/limits. It **never issues grants**.
-- Positive authority comes from authenticated `AuthenticatedGrantPath` evidence backed by
-  existing ToolPolicy/ToolBindingAuthority/resource stores.
-- `Control` is a first-class effect, neither Read nor Write.
-- Guardian/model decisions are advisory evidence, never authority.
-- Admission guardian may `Allow|Deny|Ask|Narrow`; **claim original replay identity and
-  reserve decision/paid budget before any guardian inference**. Ambiguous paid attempts
-  stay pending/unknown and never automatically rerun after a crash.
-- After Graph seal, Node policy cannot change prepared args/topology/`when`/semantic ceilings;
-  only Allow/Deny/Ask or route/resource/provider/payer/limit narrowing.
-- `Ask` reuses existing owner wait state. Whole-Graph multiple Ask entries live in one bounded
-  canonical `PendingApprovalSet` owned by the Graph Job; roots stay zero until all required
-  approvals succeed.
+- `cargo fmt --all -- --check` green;
+- `cargo test --offline --locked --all-features` green:
+  main suite 637 passed / 1 intentionally ignored, all integration suites green;
+- `cargo clippy --offline --locked --all-targets --all-features -- -D warnings`
+  green.
 
-### ExecutionStrategy
-- AW host owns `Local | DelegateAgent`; it is not a model field, ToolEffect, Job kind or
-  `aw-tools` Agent concept.
-- Delegation always uses an ordinary Agent/Turn plus the **original trusted semantic executor**
-  and factual receipt.
-- Execution authority and disclosure authority are separate.
-- Delegation cannot widen the original semantic side effects.
-- Transparent delegated `jobs.*` control rejects self/ancestor/wait cycles mechanically.
-- Parent model remains idle while transparent delegate works.
-- Same causal-work/payer budget applies to delegated/model-origin autonomous work.
-- Bridged AW→dotlink effects require **one AW-authorized Start per original attempt**,
-  bound to target host/profile, exact operation, dotlink **live generation**, expiry and
-  existing replay identity. Dotlink consumes it once through its existing owner ledger;
-  duplicates in that generation recover the same receipt, older generations never restart.
-  AW offline blocks **new grants**, not an already committed unexpired same-generation
-  dispatch. Uncertain Starts never acquire a replacement proof by retry; revoke-before-
-  authorization denies and revoke-after preserves factual/unknown effects.
+## Exact next boundary: D2 remote consume/dispatch
 
-### Graph determinism
-- Immutable topology/args after admission.
-- `GraphActivationContext` contains only immutable metadata + authorized receipts in the
-  target node's declared dependency closure, including DL-150 implicit previous-success edge.
-- Unrelated parallel completions are invisible to dynamic routing.
-- Preflight captures union candidate footprints before roots.
-- Before activation-time router/Ask, node claims deterministic union-footprint conflict position;
-  conflicting successors cannot overtake while decision waits.
-- Router/guardian/approval latency must not change effect order.
-- Graph-owned Agents propagate one bounded causal/ownership scope across initial Turns,
-  child Agents and queued effectful work; no Agent-mediated nested `batch`. Graph success
-  and conflict release wait for *all* scoped effects to quiesce. Later independent Turns
-  get fresh rights/causal budgets, never the old Graph's footprint or replay claim.
+Do not redo D1 or the shared pin.
 
-### AW wake / subscriptions
-- The source owner serializes registration/replacement with event commit under its Job
-  revision; the receiving Agent owner independently authorizes and idempotently admits
-  the wake Input. Constructor `wake` registers **before** first effect. No second event
-  bus, polling approximation or dotlink-owned remote wake promise.
-- AW Phase B adds shared source-event primitives; C wires Agent recipient and
-  `jobs.subscribe`; D validates Agent-Graph attention; E checks share revocation.
+Implement the dotlink half of the authenticated AW→dotlink Start bridge.
 
-### Shared Sessions / multi-user
-- One existing Agent input queue and one Turn writer.
-- No participant privilege union.
-- Every authenticated Input/control boundary creates one immutable TurnJournal `AuthoritySegment`.
-- Every causally following model/tool-receipt Step inherits that segment until another
-  authenticated boundary or Turn end.
-- Cross-participant steer starts a new controller segment and never later reverts to prior actor.
-- Each paid Step has `ModelInvocationAdmission` binding Agent/Turn/Step +
-  authority-segment/context fingerprint + existing provider/account `InvocationIdentity` +
-  host invocation ID.
-- Provider retries cannot cross authority segments.
-- When actor/disclosure changes, rebuild provider input from authorized public projection and
-  discard prior segment provider-private continuation/cache.
-- Portable writer fence lives in `aw-agent-kernel`:
-  `NotApplicable | Epoch(nonzero)`; durable/multi-writer sites require real Epoch.
+For each original remote effect or Process stdin delivery, dotlink must receive
+one AW-committed authorization bound to:
 
-### Layering
-- `aw-agent-kernel`: portable Actor/Envelope invariants + tiny `WriterFence`.
-- `aw-policy`: pure/no_std constraints/preferences compiler.
-- `aw-session`: backend-neutral Session/coordinator façade over existing store contracts.
-- `aw-tools`: existing host-neutral FS/Graph/Job core; borrowed `GraphActivationContext`,
-  ancestry/pending-approval value types where genuinely shared. **No `aw-agent-kernel`
-  dependency**: opaque host generation tokens/callbacks suffice for shared Job admission;
-  real typed `WriterFence` stays in AW Agent/Session owner.
-- `aw-tools-adapter`: concrete AW/native/Process/Job executor bridge only.
-- `aw-host`: thin composition/routing/policy/Session/Agent host.
-- dotlink: concrete remote Process/Graph/native executor only; no AW Agent/Session/Policy engine.
+- AW origin + original authenticated invocation/replay identity;
+- exact effect-attempt ID;
+- canonical `OperationId` / resolved finite ref;
+- exact arguments/request digest;
+- target dotlink host/profile;
+- authenticated dotlink live runtime generation;
+- actor/source/site/resource/grant/policy/writer/membership provenance;
+- bounded target-issued lease.
 
-## Performance discipline
+Required ordering:
 
-Prefer static/borrowed/value types and existing owner callbacks.
-Keep Local/single-user fast path free of:
-- collaboration allocations;
-- team/membership network lookup;
-- guardian/router inference;
-- extra Agent queue/mailbox;
-- generic plugin registry;
-- extra per-tool heap allocation where avoidable.
+1. authenticate/validate the Start envelope and exact target generation;
+2. claim the exact attempt through dotlink's existing replay/owner ledger before
+   any external effect — do not add a second replay database;
+3. independently recheck current dotlink launcher/sandbox/source/site/resource
+   authority;
+4. execute at most once;
+5. return/replay the same factual Process/Graph receipt or pending/unknown state.
 
-Do not introduce abstraction layers just to make the architecture look generalized.
-Share a primitive only when two real owners consume the same invariant.
+Same-generation exact duplicate delivery returns the same receipt and never a
+second effect. Expired/old-generation proofs never launch. After restart,
+ambiguous old effects stay unknown; AW must not issue a replacement Start for
+the same original attempt. A deliberate fresh invocation is new intent.
 
-## Cutover
+AW offline before authorization means no new Start. An already committed,
+same-generation, unexpired Start may finish after AW disconnects.
 
-This is pre-1.0:
-- hard source/API cutover;
-- delete obsolete routes/decoders/helpers after replacement flows work;
-- no migration, dual schema, compatibility runner or old replay interpreter;
-- transient old dev/test state can be reset only through the DESIGN quiescence gate.
+Initial D2 must reject wake/subscription for dotlink-owned remote Process/Graph
+sources. Agent/Session/Policy/history remain entirely AW-owned. Standalone
+dotlink remains finite/native only.
 
-## Git / work hygiene
+The existing `JobManager::runtime_generation_fingerprint()` is intentionally
+retained for D2. Reuse current request-key/replay ownership, shell claim,
+generation fencing and local authority paths rather than building parallel
+machinery.
 
-Preserve unrelated work and other owners' files.
-Do not touch `.agents/plans/ux/`.
-Use coherent checkpoint commits only when the current user authorization permits commits.
-Do **not** push, version, tag, release or deploy unless separately authorized in that run.
+## Validation/checkpoint
 
-## Starting instruction
+Use targeted tests while implementing. Once the vertical D2 slice is coherent,
+run dotlink Checkpoint 2 / AW Checkpoint F as one grouped matrix, covering at
+least:
 
-Proceed through coherent implementation slices, starting with Phase 0 source/ownership
-reconciliation. Stable primitives may advance while design review continues. **Before a
-public/API/authority checkpoint is accepted, re-read the current approved DESIGN and test
-its contracts rather than freezing a competing partial implementation.** Resolve genuine
-contradictions in the owning plan first; keep independent work unblocked. Do not broaden
-into unrelated refactors, create extra management layers, or assume plan text authorizes
-commits, pushes or releases.
+- remote Process and Graph Start/read/control;
+- exact duplicate Start and lost reply;
+- source/site/writer/membership revocation ordering;
+- proof expiry and live-generation restart;
+- ambiguous original effect/no replacement launch;
+- local launcher/sandbox denial;
+- Process stdin per-attempt Start;
+- explicit remote wake/subscribe rejection;
+- standalone D1 surface unchanged.
+
+Record concise evidence in the live TODOs and pause before D3. Keep one model
+turn near ~30 minutes and checkpoint at the next coherent boundary.
