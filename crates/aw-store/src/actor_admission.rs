@@ -5,7 +5,7 @@
 use crate::{
     audit, branch_in, db, principal_is_session_owner, session_in, workspace_writer, SessionStore,
 };
-use aw_agent_core::{Error, PrincipalId, Result};
+use aw_agent_core::{AuthoritySegmentEvidence, Error, InvocationIdentity, PrincipalId, Result};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,66 @@ impl InputAdmissionState {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ParticipantInputAdmission {
+    pub actor: PrincipalId,
+    pub identity: InvocationIdentity,
+    pub membership_epoch: u64,
+    pub audience_epoch: u64,
+    pub causal_root: String,
+    pub payer_ref: String,
+    pub provider_model_ceiling_ref: String,
+    pub tool_envelope_ref: String,
+    pub disclosure_projection_ref: String,
+    pub context_fingerprint: [u8; 32],
+}
+
+impl ParticipantInputAdmission {
+    pub fn authority_segment_evidence(&self) -> Result<AuthoritySegmentEvidence> {
+        self.validate()?;
+        Ok(AuthoritySegmentEvidence {
+            actor: self.actor.clone(),
+            identity: Some(self.identity.clone()),
+            payer_ref: self.payer_ref.clone(),
+            causal_root: self.causal_root.clone(),
+            membership_epoch: self.membership_epoch,
+            audience_epoch: self.audience_epoch,
+            provider_model_ceiling_ref: self.provider_model_ceiling_ref.clone(),
+            tool_envelope_ref: self.tool_envelope_ref.clone(),
+            disclosure_projection_ref: self.disclosure_projection_ref.clone(),
+            context_fingerprint: self.context_fingerprint,
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let bounded = |value: &str, max: usize| {
+            !value.is_empty()
+                && value.len() <= max
+                && value.is_ascii()
+                && !value.chars().any(char::is_control)
+        };
+        if self.identity.actor != self.actor
+            || self.membership_epoch == 0
+            || self.audience_epoch == 0
+            || !bounded(&self.causal_root, 256)
+            || !bounded(&self.payer_ref, 256)
+            || !bounded(&self.provider_model_ceiling_ref, 512)
+            || !bounded(&self.tool_envelope_ref, 512)
+            || !bounded(&self.disclosure_projection_ref, 512)
+            || self.context_fingerprint == [0; 32]
+            || AuthoritySegmentEvidence::payer_ref(&self.identity)? != self.payer_ref
+            || AuthoritySegmentEvidence::provider_model_ceiling_ref(&self.identity)?
+                != self.provider_model_ceiling_ref
+        {
+            return Err(Error::Denied(
+                "invalid immutable participant Input admission",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActorInputAdmission {
     pub request_id: String,
     pub session_id: String,
@@ -46,6 +106,8 @@ pub struct ActorInputAdmission {
     pub message_id: u64,
     pub payload_sha256: String,
     pub priority: i8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<ParticipantInputAdmission>,
 }
 impl ActorInputAdmission {
     pub fn validate(&self) -> Result<()> {
@@ -69,6 +131,9 @@ impl ActorInputAdmission {
             || !self.payload_sha256.bytes().all(|c| c.is_ascii_hexdigit())
         {
             return Err(Error::Denied("invalid immutable Actor Input admission"));
+        }
+        if let Some(participant) = &self.participant {
+            participant.validate()?;
         }
         Ok(())
     }
@@ -151,6 +216,41 @@ fn writer_guard(
         return Err(Error::Conflict(
             "Actor Input Session/branch/Turn CAS changed",
         ));
+    }
+    if require_branch_anchor {
+        if let Some(participant) = &admission.participant {
+            if participant.actor == *actor {
+                return Err(Error::Denied(
+                    "owner Input must use the legacy owner admission path",
+                ));
+            }
+            let current = crate::session_participation::authorize_in(
+                c,
+                &participant.actor,
+                &admission.session_id,
+                crate::SessionParticipationAction::Submit,
+            )?;
+            if current.membership_epoch != participant.membership_epoch
+                || current.audience_epoch != participant.audience_epoch
+                || current.owner
+            {
+                return Err(Error::Denied(
+                    "participant Submit/audience authority changed after admission",
+                ));
+            }
+            crate::context::authorize_node(
+                c,
+                &admission.session_id,
+                &branch.head,
+                &participant.actor,
+            )?;
+            crate::context::authorize_model_context(
+                c,
+                &admission.session_id,
+                &branch,
+                &participant.identity,
+            )?;
+        }
     }
     Ok(())
 }
@@ -486,6 +586,7 @@ mod tests {
             message_id: 1,
             payload_sha256: "e".repeat(64),
             priority: 0,
+            participant: None,
         };
         (store, admission)
     }
@@ -542,6 +643,7 @@ mod tests {
                 &principal,
                 ActorInputAdmission {
                     request_id: "another".into(),
+                    participant: None,
                     ..request.clone()
                 }
             )
@@ -574,6 +676,7 @@ mod tests {
                 &PrincipalId::new("another").unwrap(),
                 ActorInputAdmission {
                     request_id: "other".into(),
+                    participant: None,
                     ..request.clone()
                 }
             )
@@ -591,6 +694,7 @@ mod tests {
                 &principal,
                 ActorInputAdmission {
                     request_id: "another".into(),
+                    participant: None,
                     ..request.clone()
                 }
             )
@@ -606,6 +710,7 @@ mod tests {
             .unwrap();
         let next = ActorInputAdmission {
             request_id: "new-explicit-user-request".into(),
+            participant: None,
             ..request.clone()
         };
         store.actor_input_prepare(&principal, next).unwrap();
@@ -625,34 +730,42 @@ mod tests {
         for modified in [
             ActorInputAdmission {
                 writer_epoch: request.writer_epoch + 1,
+                participant: None,
                 ..request.clone()
             },
             ActorInputAdmission {
                 branch_revision: request.branch_revision + 1,
+                participant: None,
                 ..request.clone()
             },
             ActorInputAdmission {
                 branch_head: "not_current".into(),
+                participant: None,
                 ..request.clone()
             },
             ActorInputAdmission {
                 turn_id: request.turn_id + 1,
+                participant: None,
                 ..request.clone()
             },
             ActorInputAdmission {
                 request_id: "".into(),
+                participant: None,
                 ..request.clone()
             },
             ActorInputAdmission {
                 priority: 20,
+                participant: None,
                 ..request.clone()
             },
             ActorInputAdmission {
                 payload_sha256: "aaa".into(),
+                participant: None,
                 ..request.clone()
             },
             ActorInputAdmission {
                 sender: "bad source with spaces".into(),
+                participant: None,
                 ..request.clone()
             },
         ] {

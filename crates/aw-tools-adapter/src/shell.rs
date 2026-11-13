@@ -273,9 +273,10 @@ impl NativeShell {
                 program: self.executable.clone(),
                 args: shell_args,
                 env: environment,
-                stdin_open: args.stdin.is_some(),
+                stdin_open: args.stdin.is_some() || args.interactive,
             },
             stdin: args.stdin.map(String::into_bytes),
+            interactive: args.interactive,
             timeout: Duration::from_secs(args.timeout_secs.unwrap_or(600)),
             max_output_bytes: args.max_output_bytes.unwrap_or(self.max_output_bytes),
             writes,
@@ -285,6 +286,7 @@ impl NativeShell {
 pub(crate) struct PreparedShell {
     pub spec: PipeSpec,
     pub stdin: Option<Vec<u8>>,
+    pub interactive: bool,
     pub timeout: Duration,
     pub max_output_bytes: usize,
     pub writes: aw_tools::filesystem::write_hint::WriteHint,
@@ -300,6 +302,8 @@ struct Args {
     #[serde(default = "dot")]
     dir: String,
     stdin: Option<String>,
+    #[serde(default)]
+    interactive: bool,
     timeout_secs: Option<u64>,
     max_output_bytes: Option<usize>,
     writes: Option<Vec<String>>,
@@ -311,11 +315,12 @@ impl Tool for NativeShell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name:self.tool_name.into(),
-            description:"Run explicitly granted trusted native shell with the OS user's rights (NOT a sandbox). Supports a workspace-relative dir, stdin, timeout_secs and per-stream max_output_bytes under host ceilings. Parallel waves require parallel=true and non-overlapping explicit writes scopes on every command. Writes are advisory scheduling hints, never permissions, sandboxing, or coordination guarantees.".into(),
+            description:"Run explicitly granted trusted native shell with the OS user's rights (NOT a sandbox). Supports a workspace-relative dir, bounded stdin, interactive input through jobs_send, timeout_secs and per-stream max_output_bytes under host ceilings. Parallel waves require parallel=true and non-overlapping explicit writes scopes on every command. Writes are advisory scheduling hints, never permissions, sandboxing, or coordination guarantees.".into(),
             parameters:json!({"type":"object","properties":{
                 "command":{"type":"string"},
                 "dir":{"type":"string","description":"Working directory under the host-selected root, default ."},
                 "stdin":{"type":"string","maxLength":16384},
+                "interactive":{"type":"boolean","default":false},
                 "timeout_secs":{"type":"integer","minimum":1,"maximum":600},
                 "max_output_bytes":{"type":"integer","minimum":1,"maximum":self.max_output_bytes},
                 "parallel":{"type":"boolean"},
@@ -473,6 +478,8 @@ mod tests {
                 grant_revision: 1,
             },
             scope: None,
+            execution_owner: None,
+            execution_scope: None,
         }
     }
     #[test]

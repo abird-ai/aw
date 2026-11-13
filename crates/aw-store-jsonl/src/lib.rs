@@ -11,9 +11,9 @@ use aw_agent_core::{
     SummaryResult, Turn, TurnJournal, TurnStart,
 };
 use aw_store_api::{
-    BranchInfo, PortableSession, PortableSessionSource, SessionBackend, SessionBinding,
-    SessionCursor, SessionInfo, SessionView, StoreBackend, StoreCapabilities, StoreCapability as C,
-    StoreDescriptor, StoreKind,
+    AgentBindingInfo, BranchInfo, PortableSession, PortableSessionSource, SessionBackend,
+    SessionBinding, SessionCursor, SessionInfo, SessionView, StoreBackend, StoreCapabilities,
+    StoreCapability as C, StoreDescriptor, StoreKind,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -877,6 +877,125 @@ impl SessionBackend for JsonlStore {
         Ok(vec![loaded.header.branch])
     }
 
+    fn agent_binding(
+        &self,
+        owner: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<AgentBindingInfo> {
+        if branch != MAIN_BRANCH {
+            return Err(Error::Denied(
+                "JSONL Agent binding requires the existing main branch",
+            ));
+        }
+        let _gate = self.gate()?;
+        let loaded = self.load(session)?;
+        if &loaded.header.session.owner != owner {
+            return Err(Error::Denied(
+                "JSONL session belongs to another local principal",
+            ));
+        }
+        let mut earliest: Option<(i64, String)> = None;
+        for entry in fs::read_dir(&self.inner.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_id(id).is_err() {
+                continue;
+            }
+            let candidate = self.load(id)?;
+            if &candidate.header.session.owner != owner {
+                continue;
+            }
+            let key = (
+                candidate.header.session.created_at,
+                candidate.header.session.id.clone(),
+            );
+            if earliest.as_ref().is_none_or(|current| key < *current) {
+                earliest = Some(key);
+            }
+        }
+        let primary = earliest.ok_or(Error::Storage(
+            "JSONL Agent namespace has no primary Session",
+        ))?;
+        let agent_handle = if primary.1 == loaded.header.session.id {
+            "0".to_owned()
+        } else {
+            loaded.header.session.id.clone()
+        };
+        Ok(AgentBindingInfo {
+            session_id: loaded.header.session.id,
+            branch_id: loaded.header.branch.id,
+            domain_handle: "0".into(),
+            identity_handle: "0".into(),
+            project_handle: "0".into(),
+            agent_handle,
+            session_created_at: loaded.header.session.created_at,
+            branch_created_at: loaded.header.session.created_at,
+        })
+    }
+
+    fn agent_bindings(&self, owner: &PrincipalId) -> Result<Vec<AgentBindingInfo>> {
+        let _gate = self.gate()?;
+        let mut loaded = Vec::new();
+        for entry in fs::read_dir(&self.inner.root)? {
+            if loaded.len() >= MAX_SESSIONS {
+                return Err(Error::Limit("too many JSONL sessions"));
+            }
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_id(id).is_err() {
+                continue;
+            }
+            let session = self.load(id)?;
+            if &session.header.session.owner == owner {
+                loaded.push(session);
+            }
+        }
+        loaded.sort_by(|a, b| {
+            a.header
+                .session
+                .created_at
+                .cmp(&b.header.session.created_at)
+                .then_with(|| a.header.session.id.cmp(&b.header.session.id))
+        });
+        let primary = loaded
+            .first()
+            .map(|entry| entry.header.session.id.clone())
+            .ok_or(Error::Denied("no JSONL Agent Sessions available"))?;
+        Ok(loaded
+            .into_iter()
+            .map(|entry| {
+                let session = entry.header.session;
+                AgentBindingInfo {
+                    agent_handle: if session.id == primary {
+                        "0".into()
+                    } else {
+                        session.id.clone()
+                    },
+                    session_id: session.id,
+                    branch_id: entry.header.branch.id,
+                    domain_handle: "0".into(),
+                    identity_handle: "0".into(),
+                    project_handle: "0".into(),
+                    session_created_at: session.created_at,
+                    branch_created_at: session.created_at,
+                }
+            })
+            .collect())
+    }
+
     fn fork(
         &self,
         owner: &PrincipalId,
@@ -1183,9 +1302,167 @@ impl TurnJournal for JsonlCursor {
                 return Err(Error::Conflict("JSONL journal turn changed"));
             }
             match &entry {
+                JournalEntry::AuthoritySegmentStarted { segment } => {
+                    segment.validate()?;
+                    let unfinished_provider = pending.entries.iter().any(|entry| match entry {
+                        JournalEntry::InvocationStarted { ordinal, identity } => {
+                            !pending.entries.iter().any(|finished| {
+                                matches!(
+                                    finished,
+                                    JournalEntry::InvocationFinished { record }
+                                        if record.ordinal == *ordinal
+                                            && &record.identity == identity
+                                )
+                            })
+                        }
+                        _ => false,
+                    });
+                    let mut open_tools = std::collections::BTreeSet::<String>::new();
+                    for event in &pending.entries {
+                        match event {
+                            JournalEntry::ToolStarted { record, .. } => {
+                                open_tools.insert(record.call.id.clone());
+                            }
+                            JournalEntry::ToolFinished { record } => {
+                                open_tools.remove(&record.call.id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if unfinished_provider || !open_tools.is_empty() {
+                        return Err(Error::Conflict(
+                            "AuthoritySegment may advance only at a settled provider/tool boundary",
+                        ));
+                    }
+                    let prior = pending.entries.iter().filter_map(|entry| match entry {
+                        JournalEntry::AuthoritySegmentStarted { segment } => Some(segment),
+                        _ => None,
+                    });
+                    let mut last = 0u32;
+                    for existing in prior {
+                        if existing.boundary_id == segment.boundary_id
+                            || existing.fingerprint == segment.fingerprint
+                        {
+                            return Err(Error::Denied(
+                                "AuthoritySegment boundary was already journaled",
+                            ));
+                        }
+                        last = last.max(existing.ordinal);
+                    }
+                    if segment.ordinal != last.saturating_add(1) {
+                        return Err(Error::Denied(
+                            "AuthoritySegment ordinal must advance exactly once",
+                        ));
+                    }
+                }
+                JournalEntry::ModelInvocationAdmitted { admission } => {
+                    admission.validate()?;
+                    if admission.identity.actor != this.owner {
+                        return Err(Error::Denied(
+                            "ModelInvocationAdmission actor differs from Session owner",
+                        ));
+                    }
+                    let latest = pending
+                        .entries
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            JournalEntry::AuthoritySegmentStarted { segment } => Some(segment),
+                            _ => None,
+                        })
+                        .ok_or(Error::Denied(
+                            "ModelInvocationAdmission requires an AuthoritySegment",
+                        ))?;
+                    if admission.authority_segment != latest.ordinal
+                        || admission.authority_fingerprint != latest.fingerprint
+                    {
+                        return Err(Error::Denied(
+                            "ModelInvocationAdmission is not bound to current AuthoritySegment",
+                        ));
+                    }
+                    if pending.entries.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            JournalEntry::ModelInvocationAdmitted { admission: prior }
+                                if prior.ordinal == admission.ordinal
+                                    || prior.invocation_id == admission.invocation_id
+                        )
+                    }) {
+                        return Err(Error::Denied(
+                            "ModelInvocationAdmission identity already used",
+                        ));
+                    }
+                    let last_started = pending
+                        .entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            JournalEntry::InvocationStarted { ordinal, .. } => Some(*ordinal),
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let unfinished = pending.entries.iter().any(|entry| match entry {
+                        JournalEntry::InvocationStarted { ordinal, identity } => {
+                            !pending.entries.iter().any(|finished| {
+                                matches!(
+                                    finished,
+                                    JournalEntry::InvocationFinished { record }
+                                        if record.ordinal == *ordinal
+                                            && &record.identity == identity
+                                )
+                            })
+                        }
+                        _ => false,
+                    });
+                    if unfinished || admission.ordinal != last_started.saturating_add(1) {
+                        return Err(Error::Denied(
+                            "ModelInvocationAdmission overlaps or skips a provider attempt",
+                        ));
+                    }
+                }
                 JournalEntry::InvocationStarted { ordinal, identity } => {
                     if identity.actor != this.owner || *ordinal == 0 || *ordinal > 32 {
                         return Err(Error::Denied("invalid JSONL invocation identity/ordinal"));
+                    }
+                    if pending
+                        .entries
+                        .iter()
+                        .any(|entry| matches!(entry, JournalEntry::AuthoritySegmentStarted { .. }))
+                    {
+                        let admission = pending
+                            .entries
+                            .iter()
+                            .rev()
+                            .find_map(|entry| match entry {
+                                JournalEntry::ModelInvocationAdmitted { admission }
+                                    if admission.ordinal == *ordinal =>
+                                {
+                                    Some(admission)
+                                }
+                                _ => None,
+                            })
+                            .ok_or(Error::Denied(
+                                "segmented JSONL invocation lacks ModelInvocationAdmission",
+                            ))?;
+                        let segment = pending
+                            .entries
+                            .iter()
+                            .rev()
+                            .find_map(|entry| match entry {
+                                JournalEntry::AuthoritySegmentStarted { segment } => Some(segment),
+                                _ => None,
+                            })
+                            .ok_or(Error::Denied(
+                                "segmented JSONL invocation lacks current AuthoritySegment",
+                            ))?;
+                        if &admission.identity != identity
+                            || admission.authority_segment != segment.ordinal
+                            || admission.authority_fingerprint != segment.fingerprint
+                        {
+                            return Err(Error::Denied(
+                                "JSONL invocation differs from its segment-bound admission",
+                            ));
+                        }
                     }
                 }
                 JournalEntry::InvocationFinished { record } => {
@@ -1211,19 +1488,40 @@ impl TurnJournal for JsonlCursor {
                 }
                 JournalEntry::ToolDenied { record } => {
                     aw_agent_core::journal::validate_denial(record)?;
-                    if !pending.entries.iter().any(|prior| {
-                        matches!(
-                            prior,JournalEntry::Assistant {message}
-                            if message.tool_calls.iter().any(|call|call==&record.call)
-                        )
-                    }) || pending.entries.iter().any(|prior| match prior {
-                        JournalEntry::ToolStarted { record: old, .. }
-                        | JournalEntry::ToolDenied { record: old } => old.call.id == record.call.id,
-                        JournalEntry::ToolRevised { original, .. } => original.id == record.call.id,
-                        _ => false,
-                    }) {
+                    let revision = pending.entries.iter().find_map(|prior| match prior {
+                        JournalEntry::ToolRevised {
+                            original, revised, ..
+                        } if original.id == record.call.id => Some((original, revised)),
+                        _ => None,
+                    });
+                    let matches_proposal = match revision {
+                        Some((original, revised)) => {
+                            revised == &record.call && pending.entries.iter().any(|prior| {
+                                matches!(
+                                    prior, JournalEntry::Assistant { message }
+                                        if message.tool_calls.iter().any(|call| call == original)
+                                )
+                            })
+                        }
+                        None => pending.entries.iter().any(|prior| {
+                            matches!(
+                                prior, JournalEntry::Assistant { message }
+                                    if message.tool_calls.iter().any(|call| call == &record.call)
+                            )
+                        }),
+                    };
+                    let already_effect_or_denial =
+                        pending.entries.iter().any(|prior| match prior {
+                            JournalEntry::ToolStarted { record: old, .. }
+                            | JournalEntry::ToolFinished { record: old }
+                            | JournalEntry::ToolDenied { record: old } => {
+                                old.call.id == record.call.id
+                            }
+                            _ => false,
+                        });
+                    if !matches_proposal || already_effect_or_denial {
                         return Err(Error::Denied(
-                            "no-effect denial requires one unstarted original assistant call",
+                            "no-effect denial requires one unstarted original or approved revised assistant call",
                         ));
                     }
                 }

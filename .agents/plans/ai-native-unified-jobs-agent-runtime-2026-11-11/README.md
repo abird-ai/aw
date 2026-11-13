@@ -8,9 +8,10 @@ Status: **vNext design under review; checkpointed implementation may proceed on 
 
 This is a new successor plan. It does not edit or rewrite the sealed DL-150 plan, the 2026-11-10 Jobs/wake plan, or the 2026-11-10 operations/Agents/Jobs/transcript plan. Those remain historical design records. This plan intentionally replaces their proposed vNext public/API choices where they conflict with the design below.
 
+Current cross-repo handoff: [../../docs/CURRENT_HANDOFF.md](../../docs/CURRENT_HANDOFF.md)
 Normative design: [DESIGN.md](DESIGN.md)
 Implementation phases and gates: [TODO.md](TODO.md)
-Next-agent handoff: [NEXT-AGENT.md](NEXT-AGENT.md)
+Next-agent launcher: [NEXT-AGENT.md](NEXT-AGENT.md)
 
 Dotlink has a thin integration-only companion at:
 ../dotlink/.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/

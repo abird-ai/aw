@@ -114,6 +114,136 @@ fn setup() -> (
     a.load_history(v.history, Some(Arc::new(h))).unwrap();
     (store, s, b, a, c)
 }
+
+#[test]
+fn mixed_job_exposure_positions_interleave_agents_and_finite_jobs_without_duplicate_lifecycle() {
+    use aw_store_api::SessionBackend as _;
+
+    let (store, first_session, first_branch, agent, _) = setup();
+    let actor = agent.actor().clone();
+    let first = store
+        .agent_binding(&actor, &first_session.id, &first_branch.id)
+        .unwrap();
+    let first_agent_ref = format!(
+        "/d:{}/i:{}/p:{}/a:{}",
+        first.domain_handle, first.identity_handle, first.project_handle, first.agent_handle
+    );
+    let first_position = store.agent_job_exposure_position(&actor, &first).unwrap();
+
+    let finite_ref = format!("{first_agent_ref}/t:1/j:finite-one");
+    let reserved = store
+        .finite_job_exposure_reserve(&actor, &first, "generation-a", &finite_ref, 8)
+        .unwrap();
+    assert_eq!(reserved.state, FiniteExposureState::Reserved);
+    assert!(reserved.position > first_position);
+    assert!(
+        store
+            .finite_job_exposures(&actor, &first, "generation-a", 8)
+            .unwrap()
+            .is_empty(),
+        "reserved finite Job must not be discoverable before publish"
+    );
+
+    let (second_session, second_branch) = store.create(&actor, "second Agent", binding()).unwrap();
+    let second = store
+        .agent_binding(&actor, &second_session.id, &second_branch.id)
+        .unwrap();
+    assert_eq!(second.domain_handle, first.domain_handle);
+    assert_eq!(second.identity_handle, first.identity_handle);
+    assert_eq!(second.project_handle, first.project_handle);
+    let second_position = store.agent_job_exposure_position(&actor, &second).unwrap();
+    assert!(second_position > reserved.position);
+
+    let published = store
+        .finite_job_exposure_publish(&actor, &first, "generation-a", &finite_ref)
+        .unwrap();
+    assert_eq!(published.state, FiniteExposureState::Published);
+    assert_eq!(
+        published.position, reserved.position,
+        "publication must retain its pre-effect reservation position"
+    );
+
+    let finite = store
+        .finite_job_exposures(&actor, &first, "generation-a", 8)
+        .unwrap();
+    assert_eq!(finite.len(), 1);
+    assert_eq!(finite[0].canonical_ref, finite_ref);
+    assert_eq!(finite[0].position, reserved.position);
+
+    let mut combined = vec![
+        (first_position, first_agent_ref),
+        (
+            second_position,
+            format!(
+                "/d:{}/i:{}/p:{}/a:{}",
+                second.domain_handle,
+                second.identity_handle,
+                second.project_handle,
+                second.agent_handle
+            ),
+        ),
+        (published.position, published.canonical_ref.clone()),
+    ];
+    combined
+        .sort_by(|(pos_a, ref_a), (pos_b, ref_b)| pos_b.cmp(pos_a).then_with(|| ref_a.cmp(ref_b)));
+    assert_eq!(combined[0].0, second_position);
+    assert_eq!(combined[1].0, reserved.position);
+    assert_eq!(combined[2].0, first_position);
+
+    assert!(
+        store
+            .finite_job_exposures(&actor, &first, "generation-b", 8)
+            .unwrap()
+            .is_empty(),
+        "old finite runtime generations must never resurrect into a new list"
+    );
+}
+
+#[test]
+fn hidden_finite_exposure_release_frees_capacity_without_reusing_position() {
+    use aw_store_api::SessionBackend as _;
+
+    let (store, session, branch, agent, _) = setup();
+    let actor = agent.actor().clone();
+    let binding = store
+        .agent_binding(&actor, &session.id, &branch.id)
+        .unwrap();
+    let root = format!(
+        "/d:{}/i:{}/p:{}/a:{}",
+        binding.domain_handle,
+        binding.identity_handle,
+        binding.project_handle,
+        binding.agent_handle
+    );
+    let first_ref = format!("{root}/t:1/j:hidden-one");
+    let second_ref = format!("{root}/t:1/j:hidden-two");
+
+    let first = store
+        .finite_job_exposure_reserve(&actor, &binding, "generation-cap", &first_ref, 1)
+        .unwrap();
+    assert!(
+        store
+            .finite_job_exposure_reserve(&actor, &binding, "generation-cap", &second_ref, 1)
+            .is_err(),
+        "unpublished reservations must consume bounded recoverability capacity"
+    );
+
+    store
+        .finite_job_exposure_release_unpublished(&actor, &binding, "generation-cap", &first_ref)
+        .unwrap();
+    let second = store
+        .finite_job_exposure_reserve(&actor, &binding, "generation-cap", &second_ref, 1)
+        .unwrap();
+    assert!(
+        second.position > first.position,
+        "released exposure positions are immutable gaps and are never reused"
+    );
+    assert!(store
+        .finite_job_exposures(&actor, &binding, "generation-cap", 8)
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn creation_and_view_are_inference_free() {
     let (store, s, _, a, c) = setup();
@@ -2010,6 +2140,258 @@ impl Drop for Temp {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced() {
+    use aw_policy::{Decision, PolicyDecision, Strategy};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let temp = Temp::new();
+    let (mut agent, calls, _) = agent();
+    let actor = agent.actor().clone();
+    let store = SessionStore::open(&temp.0).unwrap();
+    let (session, branch) = store.create(&actor, "policy admission", binding()).unwrap();
+    let (view, handle) = store.activate(&actor, &session.id, &branch.id).unwrap();
+    agent
+        .load_history(view.history, Some(Arc::new(handle.clone())))
+        .unwrap();
+    let identity = agent.default_identity().unwrap();
+    handle
+        .begin(TurnStart {
+            turn_id: 1,
+            prompt: "policy gated operation".into(),
+            identity: identity.clone(),
+        })
+        .await
+        .unwrap();
+    let writer_epoch = store
+        .workspace_writer(&actor, None, &session.workspace_id)
+        .unwrap()
+        .writer_epoch;
+    let expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros()
+        .saturating_add(60_000_000) as i64;
+
+    let request = |call_id: &str, request_sha: char, policy_sha: char| PolicyAdmissionRequest {
+        session_id: session.id.clone(),
+        branch_id: branch.id.clone(),
+        writer_epoch,
+        turn_id: 1,
+        call_id: call_id.into(),
+        canonical_target: "/d:0/i:0/p:0/a:0/t:1/j:policy-target".into(),
+        request_sha256: request_sha.to_string().repeat(64),
+        policy_revision_sha256: policy_sha.to_string().repeat(64),
+        authority_sha256: "c".repeat(64),
+        candidate_local: true,
+        candidate_delegate_agent: true,
+        guardian_required: true,
+        guardian_identity: Some(identity.clone()),
+        guardian_site: Some(identity.inference_executor.clone()),
+        approval_scope: Some("/d:0/i:0/p:0".into()),
+        authorized_approvers: vec![actor.as_str().into()],
+        approval_expires_at: Some(expiry),
+    };
+
+    let first = store
+        .policy_admission_claim(&actor, request("guardian-unknown", 'a', 'b'))
+        .unwrap();
+    assert_eq!(first.state, PolicyAdmissionState::Claimed);
+    assert_eq!(
+        store
+            .policy_admission_claim(&actor, request("guardian-unknown", 'a', 'b'))
+            .unwrap(),
+        first,
+        "exact redelivery must recover the original replay claim"
+    );
+
+    assert!(matches!(
+        store.policy_admission_claim(&actor, request("guardian-unknown", 'd', 'b')),
+        Err(Error::Conflict(_))
+    ));
+    assert!(matches!(
+        store.policy_admission_claim(&actor, request("guardian-unknown", 'a', 'e')),
+        Err(Error::Conflict(_))
+    ));
+
+    let started = store
+        .policy_admission_start_guardian(&actor, &session.id, &first.id, &"3".repeat(64))
+        .unwrap();
+    assert_eq!(started.state, PolicyAdmissionState::GuardianStarted);
+    assert!(matches!(
+        store.policy_admission_start_guardian(&actor, &session.id, &first.id, &"3".repeat(64)),
+        Err(Error::Conflict(_))
+    ));
+
+    let unknown = store
+        .policy_admission_mark_guardian_unknown(
+            &actor,
+            &session.id,
+            &first.id,
+            "provider acceptance may have occurred; never retry automatically",
+        )
+        .unwrap();
+    assert_eq!(unknown.state, PolicyAdmissionState::GuardianUnknown);
+    assert_eq!(
+        store
+            .policy_admission_claim(&actor, request("guardian-unknown", 'a', 'b'))
+            .unwrap()
+            .state,
+        PolicyAdmissionState::GuardianUnknown
+    );
+    assert!(matches!(
+        store.policy_admission_start_guardian(&actor, &session.id, &first.id, &"3".repeat(64)),
+        Err(Error::Conflict(_))
+    ));
+
+    let ask = store
+        .policy_admission_claim(&actor, request("guardian-ask", 'f', '1'))
+        .unwrap();
+    store
+        .policy_admission_start_guardian(&actor, &session.id, &ask.id, &"4".repeat(64))
+        .unwrap();
+    let guardian_text = r#"{"decision":"ask","scope":"/d:0/i:0/p:0"}"#;
+    let guardian_digest = format!("{:x}", Sha256::digest(guardian_text.as_bytes()));
+    let settled = store
+        .policy_admission_finish_guardian(
+            &actor,
+            &session.id,
+            &ask.id,
+            &AuxiliaryResult {
+                operation_id: ask.id.clone(),
+                kind: AuxiliaryKind::Side,
+                outcome: Outcome::Completed,
+                text: guardian_text.into(),
+                meta: Some(CompletionMeta {
+                    finish_reason: "stop".into(),
+                    usage: Usage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(5),
+                    },
+                }),
+                error: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(settled.state, PolicyAdmissionState::GuardianSettled);
+    assert_eq!(
+        settled.guardian_result_sha256.as_deref(),
+        Some(guardian_digest.as_str())
+    );
+    let waiting = store
+        .policy_admission_record_decision(
+            &actor,
+            &session.id,
+            &ask.id,
+            PolicyDecision {
+                decision: Decision::Ask,
+                revision: 9,
+                route: Some(Strategy::Local),
+                approval_scope: Some("/d:0/i:0/p:0"),
+                narrow_ref: None,
+            },
+            &guardian_digest,
+        )
+        .unwrap();
+    assert_eq!(waiting.state, PolicyAdmissionState::AskPending);
+
+    let approved = store
+        .policy_admission_decide(&actor, &session.id, &ask.id, true)
+        .unwrap();
+    assert_eq!(approved.state, PolicyAdmissionState::AskApproved);
+    assert_eq!(
+        store
+            .policy_admission_decide(&actor, &session.id, &ask.id, true)
+            .unwrap(),
+        approved,
+        "same approval decision is idempotent"
+    );
+    assert!(matches!(
+        store.policy_admission_consume(
+            &actor,
+            &session.id,
+            &ask.id,
+            &"9".repeat(64),
+            &"c".repeat(64),
+            Some(Strategy::Local),
+            None,
+        ),
+        Err(Error::Conflict(_))
+    ));
+    let consumed = store
+        .policy_admission_consume(
+            &actor,
+            &session.id,
+            &ask.id,
+            &"1".repeat(64),
+            &"c".repeat(64),
+            Some(Strategy::Local),
+            None,
+        )
+        .unwrap();
+    assert_eq!(consumed.state, PolicyAdmissionState::Consumed);
+    assert_eq!(
+        store
+            .policy_admission_consume(
+                &actor,
+                &session.id,
+                &ask.id,
+                &"1".repeat(64),
+                &"c".repeat(64),
+                Some(Strategy::Local),
+                None,
+            )
+            .unwrap(),
+        consumed
+    );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "policy admission bookkeeping never invokes a provider"
+    );
+
+    let selected = agent
+        .provider_accounts()
+        .select(&actor, &identity.account_id, &identity.model)
+        .unwrap();
+    let messages = agent
+        .auxiliary_messages(&selected, "Return one bounded policy decision.")
+        .await
+        .unwrap();
+    let input = AuxiliaryInput {
+        kind: AuxiliaryKind::Side,
+        messages,
+        max_output_bytes: 1024,
+        timeout: Duration::from_secs(5),
+    };
+    let executor_claim = store
+        .policy_admission_claim(&actor, request("guardian-executor", '6', '7'))
+        .unwrap();
+    let journal = PolicyGuardianJournal::new(
+        store.clone(),
+        actor.clone(),
+        session.id.clone(),
+        executor_claim.id.clone(),
+    );
+    let result = AuxiliaryExecutor
+        .execute(&selected, &input, &journal, pending::<()>())
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, Outcome::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let settled = store
+        .policy_admission_fact(&actor, &session.id, &executor_claim.id)
+        .unwrap();
+    assert_eq!(settled.state, PolicyAdmissionState::GuardianSettled);
+    assert_eq!(
+        settled.guardian_result_sha256.as_deref(),
+        Some(format!("{:x}", Sha256::digest(result.text.as_bytes())).as_str())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exclusive_owner_lock_refuses_second_process_handle() {
@@ -2898,6 +3280,263 @@ async fn aw_p6_10h_original_provider_invocation_ordinals_are_sequential_and_seri
         .recovery_hints(&owner, Some(&session.id))
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn authority_segments_and_paid_admissions_are_strictly_ordered_and_fenced() {
+    let (store, session, branch, agent, calls) = setup();
+    let owner = agent.actor().clone();
+    let identity = agent.default_identity().unwrap();
+    let (_, journal) = store.activate(&owner, &session.id, &branch.id).unwrap();
+    journal
+        .begin(TurnStart {
+            turn_id: 1,
+            prompt: "segment ordering".into(),
+            identity: identity.clone(),
+        })
+        .await
+        .unwrap();
+
+    let first = AuthoritySegment {
+        ordinal: 1,
+        boundary: AuthorityBoundaryKind::Input,
+        boundary_id: "input:1".into(),
+        fingerprint: [1; 32],
+        evidence: None,
+    };
+    journal
+        .append(
+            1,
+            JournalEntry::AuthoritySegmentStarted {
+                segment: first.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::AuthoritySegmentStarted {
+                    segment: first.clone(),
+                },
+            )
+            .await
+            .is_err(),
+        "duplicate AuthoritySegment boundary/fingerprint must fail"
+    );
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::InvocationStarted {
+                    ordinal: 1,
+                    identity: identity.clone(),
+                },
+            )
+            .await
+            .is_err(),
+        "segmented paid invocation requires ModelInvocationAdmission first"
+    );
+
+    let wrong_first = ModelInvocationAdmission {
+        ordinal: 1,
+        invocation_id: "mi_wrong_one".into(),
+        authority_segment: 2,
+        authority_fingerprint: [2; 32],
+        identity: identity.clone(),
+    };
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::ModelInvocationAdmitted {
+                    admission: wrong_first,
+                },
+            )
+            .await
+            .is_err(),
+        "admission cannot bind a future/non-current segment"
+    );
+
+    let admitted_first = ModelInvocationAdmission {
+        ordinal: 1,
+        invocation_id: "mi_one".into(),
+        authority_segment: 1,
+        authority_fingerprint: first.fingerprint,
+        identity: identity.clone(),
+    };
+    journal
+        .append(
+            1,
+            JournalEntry::ModelInvocationAdmitted {
+                admission: admitted_first.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::ModelInvocationAdmitted {
+                    admission: admitted_first,
+                },
+            )
+            .await
+            .is_err(),
+        "paid admission ordinal/id is single-use"
+    );
+    journal
+        .append(
+            1,
+            JournalEntry::InvocationStarted {
+                ordinal: 1,
+                identity: identity.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = AuthoritySegment {
+        ordinal: 2,
+        boundary: AuthorityBoundaryKind::Steer,
+        boundary_id: "steer:2".into(),
+        fingerprint: [2; 32],
+        evidence: None,
+    };
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::AuthoritySegmentStarted {
+                    segment: second.clone(),
+                },
+            )
+            .await
+            .is_err(),
+        "segment cannot advance while a provider attempt is unsettled"
+    );
+
+    journal
+        .append(
+            1,
+            JournalEntry::InvocationFinished {
+                record: InvocationRecord {
+                    ordinal: 1,
+                    identity: identity.clone(),
+                    meta: Some(CompletionMeta {
+                        finish_reason: "stop".into(),
+                        ..Default::default()
+                    }),
+                    outcome: "response_received".into(),
+                    usage_verified: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let skipped = AuthoritySegment {
+        ordinal: 3,
+        boundary: AuthorityBoundaryKind::Steer,
+        boundary_id: "steer:3".into(),
+        fingerprint: [3; 32],
+        evidence: None,
+    };
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::AuthoritySegmentStarted { segment: skipped },
+            )
+            .await
+            .is_err(),
+        "AuthoritySegment ordinals cannot skip"
+    );
+    journal
+        .append(
+            1,
+            JournalEntry::AuthoritySegmentStarted {
+                segment: second.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let reused_prior_identity = ModelInvocationAdmission {
+        ordinal: 2,
+        invocation_id: "mi_one".into(),
+        authority_segment: second.ordinal,
+        authority_fingerprint: second.fingerprint,
+        identity: identity.clone(),
+    };
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::ModelInvocationAdmitted {
+                    admission: reused_prior_identity,
+                },
+            )
+            .await
+            .is_err(),
+        "changed AuthoritySegment requires a fresh paid invocation admission identity"
+    );
+
+    let wrong_second = ModelInvocationAdmission {
+        ordinal: 2,
+        invocation_id: "mi_wrong_two".into(),
+        authority_segment: second.ordinal,
+        authority_fingerprint: [9; 32],
+        identity: identity.clone(),
+    };
+    assert!(
+        journal
+            .append(
+                1,
+                JournalEntry::ModelInvocationAdmitted {
+                    admission: wrong_second,
+                },
+            )
+            .await
+            .is_err(),
+        "paid admission cannot use a stale/wrong segment fingerprint"
+    );
+
+    let admitted_second = ModelInvocationAdmission {
+        ordinal: 2,
+        invocation_id: "mi_two".into(),
+        authority_segment: second.ordinal,
+        authority_fingerprint: second.fingerprint,
+        identity: identity.clone(),
+    };
+    journal
+        .append(
+            1,
+            JournalEntry::ModelInvocationAdmitted {
+                admission: admitted_second,
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            1,
+            JournalEntry::InvocationStarted {
+                ordinal: 2,
+                identity,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "journal admission checks never invoke a model"
+    );
 }
 
 #[cfg(unix)]
@@ -4960,6 +5599,7 @@ fn sqlite_v33_actor_input_admission_survives_owner_restart_without_replay() {
             message_id: 1,
             payload_sha256: format!("{:x}", Sha256::digest(b"accepted not paid")),
             priority: 0,
+            participant: None,
         };
         store.actor_input_prepare(&actor, original.clone()).unwrap();
         store
@@ -4991,6 +5631,7 @@ fn sqlite_v33_actor_input_admission_survives_owner_restart_without_replay() {
         );
         let followup = ActorInputAdmission {
             request_id: "new_req_without_inspection".into(),
+            participant: None,
             ..original.clone()
         };
         assert!(
@@ -5065,6 +5706,7 @@ async fn sqlite_control_intent_survives_restart_but_cannot_claim_applied_or_repl
             message_id: 1,
             payload_sha256: "f".repeat(64),
             priority: 0,
+            participant: None,
         };
         store.actor_input_prepare(&actor, input.clone()).unwrap();
         store
@@ -5376,6 +6018,7 @@ fn aw_p6_9b2_queue_encrypted_pending_restarts_with_claim_barrier_and_writer_cas(
                 message_id: claim.message_id,
                 payload_sha256: next.fact.payload_sha256.clone(),
                 priority: next.fact.request.priority,
+                participant: None,
             },
         )
         .unwrap();
@@ -6960,6 +7603,7 @@ async fn aw_p6_9d2b_seed_actual_prior_model_turn(
         message_id: 1,
         payload_sha256: "f".repeat(64),
         priority: 0,
+        participant: None,
     };
     store.actor_input_prepare(owner, prior.clone()).unwrap();
     store
@@ -7246,6 +7890,7 @@ fn aw_p6_9d2b_current_disposition_input(
         message_id,
         payload_sha256: "a".repeat(64),
         priority: 0,
+        participant: None,
     };
     store.actor_input_prepare(owner, original.clone()).unwrap();
     store
@@ -7925,6 +8570,7 @@ fn aw_p6_9d2b2a_running_model_process_input(
         message_id: 1,
         payload_sha256: "f".repeat(64),
         priority: 0,
+        participant: None,
     };
     store.actor_input_prepare(principal, input.clone()).unwrap();
     store
@@ -8395,6 +9041,7 @@ async fn aw_p6_9d2b2b2_model_agent_future_pause_is_writer_atomic_and_owner_relea
         message_id: 1,
         payload_sha256: "c".repeat(64),
         priority: 0,
+        participant: None,
     };
     store.actor_input_prepare(&actor, active.clone()).unwrap();
     store
@@ -8587,6 +9234,7 @@ async fn aw_p6_9d2b2b2_model_agent_future_pause_is_writer_atomic_and_owner_relea
         message_id: 3,
         branch_head: changed.head,
         branch_revision: changed.revision,
+        participant: None,
         ..active.clone()
     };
     assert!(
@@ -8724,6 +9372,7 @@ async fn aw_p6_9d2b2b2_model_agent_pause_survives_crash_and_unknown_turn_cannot_
             message_id: 1,
             payload_sha256: "a".repeat(64),
             priority: 0,
+            participant: None,
         };
         store.actor_input_prepare(&actor, input.clone()).unwrap();
         store
@@ -8835,6 +9484,7 @@ async fn aw_p6_9d2b2b2_model_agent_settled_future_pause_persists_restart_until_e
             message_id: 1,
             payload_sha256: "a".repeat(64),
             priority: 0,
+            participant: None,
         };
         store.actor_input_prepare(&owner, original.clone()).unwrap();
         store
@@ -8926,6 +9576,7 @@ async fn aw_p6_9d2b2b2_model_agent_settled_future_pause_persists_restart_until_e
         message_id: 2,
         branch_head: branch.head.clone(),
         branch_revision: branch.revision,
+        participant: None,
         ..original
     };
     assert!(

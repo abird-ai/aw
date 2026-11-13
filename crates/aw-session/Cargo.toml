@@ -12,6 +12,7 @@ default = []
 
 [dependencies]
 aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
+aw-agent-kernel = { path = "../aw-agent-kernel", version = "=0.15.0" }
 aw-store-api = { path = "../aw-store-api", version = "=0.15.0" }
 
 [lints.rust]

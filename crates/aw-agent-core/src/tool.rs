@@ -9,7 +9,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 pub const MAX_TOOL_CALLS_PER_ROUND: usize = aw_agent_kernel::turn::MAX_BATCH;
@@ -23,6 +26,9 @@ pub enum ToolEffect {
     Read,
     Write,
     Process,
+    /// Lifecycle/input/subscription authority. This never inherits filesystem
+    /// Read/Write permission and remains independently source/site granted.
+    Control,
     /// Conservative default for effects whose safety is not established by
     /// the trusted host. Untrusted tool hints never downgrade Unknown to Read.
     Unknown,
@@ -95,7 +101,7 @@ impl ToolCall {
         Ok(())
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
@@ -134,7 +140,11 @@ pub(crate) fn envelope_permits_tool(
 ) -> bool {
     use aw_agent_kernel::envelope::{Access, ExactGrant};
     let effect = kernel_effect(effect);
-    if (envelope.spec().access == Access::ReadOnly && effect != Effect::Read)
+    // Filesystem access and execution Control are orthogonal. ReadOnly blocks
+    // filesystem mutation, not an independently exact-granted lifecycle/input
+    // capability. Unknown remains conservative and Process keeps its own gate.
+    if (envelope.spec().access == Access::ReadOnly
+        && matches!(effect, Effect::Write | Effect::Unknown))
         || ((effect == Effect::Process || effect == Effect::Unknown) && !envelope.spec().process)
     {
         return false;
@@ -147,6 +157,137 @@ pub(crate) fn envelope_permits_tool(
         effect,
     })
 }
+struct ExecutionOwnershipState {
+    active: AtomicUsize,
+    unresolved: AtomicBool,
+    notify: tokio::sync::Notify,
+    cancellation: CancellationToken,
+}
+
+/// Ephemeral host-issued ownership of one causal execution scope. This is
+/// factual live coordination evidence only: it grants no tool, provider,
+/// resource or Job authority and is never a durable Agent identity.
+#[derive(Clone)]
+pub struct ExecutionOwnershipScope {
+    owner_ref: String,
+    state: Arc<ExecutionOwnershipState>,
+}
+
+impl std::fmt::Debug for ExecutionOwnershipScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionOwnershipScope")
+            .field("owner_ref", &self.owner_ref)
+            .field("active", &self.active())
+            .field("unresolved", &self.is_unresolved())
+            .finish()
+    }
+}
+
+impl ExecutionOwnershipScope {
+    pub fn from_trusted_host(
+        owner_ref: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> Result<Self> {
+        let owner_ref = owner_ref.into();
+        if !owner_ref.starts_with('/')
+            || owner_ref.len() > 2048
+            || !owner_ref.is_ascii()
+            || owner_ref.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid execution ownership ref"));
+        }
+        Ok(Self {
+            owner_ref,
+            state: Arc::new(ExecutionOwnershipState {
+                active: AtomicUsize::new(0),
+                unresolved: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+                cancellation,
+            }),
+        })
+    }
+
+    pub fn owner_ref(&self) -> &str {
+        &self.owner_ref
+    }
+
+    pub fn same_instance(&self, other: &Self) -> bool {
+        self.owner_ref == other.owner_ref && Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    pub fn acquire(&self) -> Result<ExecutionOwnershipLease> {
+        self.state
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| Error::Limit("execution ownership work counter exhausted"))?;
+        Ok(ExecutionOwnershipLease {
+            state: self.state.clone(),
+            released: false,
+        })
+    }
+
+    pub fn active(&self) -> usize {
+        self.state.active.load(Ordering::Acquire)
+    }
+
+    pub fn mark_unresolved(&self) {
+        self.state.unresolved.store(true, Ordering::Release);
+        self.state.notify.notify_waiters();
+    }
+
+    pub fn is_unresolved(&self) -> bool {
+        self.state.unresolved.load(Ordering::Acquire)
+    }
+
+    pub fn cancellation(&self) -> CancellationToken {
+        self.state.cancellation.clone()
+    }
+
+    pub async fn wait_quiescent(&self) {
+        loop {
+            if self.active() == 0 {
+                return;
+            }
+            let notified = self.state.notify.notified();
+            if self.active() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+pub struct ExecutionOwnershipLease {
+    state: Arc<ExecutionOwnershipState>,
+    released: bool,
+}
+
+impl ExecutionOwnershipLease {
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let previous = self.state.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "execution ownership lease underflow");
+        if previous <= 1 {
+            self.state.notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ExecutionOwnershipLease {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub actor: PrincipalId,
@@ -171,6 +312,13 @@ pub struct ToolContext {
     /// Exact durable Session/branch scope when the parent invocation is
     /// journaled. Memory-only callers remain unscoped.
     pub scope: Option<InvocationScope>,
+    /// Stable Session-derived Agent owner. Factual routing evidence only; this
+    /// does not grant access to the referenced Agent or any Job below it.
+    pub execution_owner: Option<crate::AgentExecutionBinding>,
+    /// Optional live causal owner (for example one active Graph node). Unlike
+    /// the stable Agent execution owner, this is temporary work ownership and
+    /// must not survive into a later independently admitted Turn.
+    pub execution_scope: Option<ExecutionOwnershipScope>,
 }
 impl ToolContext {
     pub fn result_budget(&self, ceiling: usize) -> Result<usize> {
@@ -271,6 +419,7 @@ fn kernel_effect(effect: &ToolEffect) -> Effect {
         ToolEffect::Read => Effect::Read,
         ToolEffect::Write => Effect::Write,
         ToolEffect::Process => Effect::Process,
+        ToolEffect::Control => Effect::Control,
         ToolEffect::Unknown => Effect::Unknown,
     }
 }
@@ -610,7 +759,8 @@ fn binding_effect_key(effect: &ToolEffect) -> u8 {
         ToolEffect::Read => 0,
         ToolEffect::Write => 1,
         ToolEffect::Process => 2,
-        ToolEffect::Unknown => 3,
+        ToolEffect::Control => 3,
+        ToolEffect::Unknown => 4,
     }
 }
 fn binding_source_key(kind: SourceKind) -> u8 {
@@ -636,6 +786,30 @@ fn binding_key(
         effect: binding_effect_key(effect),
         site: site.to_owned(),
     }
+}
+
+fn revalidate_binding_view(
+    view: &BindingView,
+    actor: &PrincipalId,
+    binding: &ToolBindingSnapshot,
+) -> Result<()> {
+    let key = binding_key(
+        actor,
+        &binding.name,
+        &binding.source,
+        &binding.effect,
+        &binding.execution_site,
+    );
+    if view.registry.binding_revision(&binding.name) != Some(binding.registry_revision)
+        || view.generations.get(&key).copied() != Some(binding.authority_revision)
+        || binding.execution_site != view.policy.execution_site
+        || view.registry.source_of(&binding.name) != Some(&binding.source)
+        || view.registry.effect_of(&binding.name) != Some(&binding.effect)
+        || !view.registry.allows(actor, &view.policy, &binding.name)
+    {
+        return Err(Error::Denied("captured tool binding is no longer live"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -688,6 +862,7 @@ impl ToolBindingAuthority {
                             Effect::Read => &ToolEffect::Read,
                             Effect::Write => &ToolEffect::Write,
                             Effect::Process => &ToolEffect::Process,
+                            Effect::Control => &ToolEffect::Control,
                             Effect::Unknown => &ToolEffect::Unknown,
                         },
                         &grant.site,
@@ -721,6 +896,47 @@ impl ToolBindingAuthority {
         drop(view);
         self.inner.changes.send_replace(revision);
         Ok(())
+    }
+
+    pub fn permitted_bindings(&self, actor: &PrincipalId) -> Result<Vec<ToolBindingSnapshot>> {
+        let view = self
+            .inner
+            .view
+            .read()
+            .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
+        let mut out = Vec::new();
+        for name in view.registry.tools.keys() {
+            if !view.registry.allows(actor, &view.policy, name) {
+                continue;
+            }
+            let source = view
+                .registry
+                .source_of(name)
+                .ok_or(Error::Denied("tool source unavailable"))?
+                .clone();
+            let effect = view
+                .registry
+                .effect_of(name)
+                .ok_or(Error::Denied("tool effect unavailable"))?
+                .clone();
+            let key = binding_key(actor, name, &source, &effect, &view.policy.execution_site);
+            let authority_revision = *view
+                .generations
+                .get(&key)
+                .ok_or(Error::Denied("tool grant generation unavailable"))?;
+            out.push(ToolBindingSnapshot {
+                name: name.clone(),
+                registry_revision: view
+                    .registry
+                    .binding_revision(name)
+                    .ok_or(Error::Denied("tool registry binding unavailable"))?,
+                authority_revision,
+                source,
+                effect,
+                execution_site: view.policy.execution_site.clone(),
+            });
+        }
+        Ok(out)
     }
 
     pub fn permitted_binding(
@@ -764,6 +980,34 @@ impl ToolBindingAuthority {
         })
     }
 
+    /// Check one exact current capability that is intentionally not a
+    /// registered model tool (for example live Process stdin authority).
+    /// This never advertises or registers a tool and never infers authority
+    /// from the capability name.
+    pub fn permits_capability(
+        &self,
+        actor: &PrincipalId,
+        name: &str,
+        source: &ToolSource,
+        effect: &ToolEffect,
+    ) -> Result<()> {
+        let view = self
+            .inner
+            .view
+            .read()
+            .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
+        let descriptor = Capability::new(name, source.as_kernel()?, kernel_effect(effect))
+            .map_err(|_| Error::Denied("invalid exact capability"))?;
+        let permitted = view.policy.source_grants.get(actor).is_some_and(|grants| {
+            grants.iter().any(|grant| {
+                grant.permits(actor.as_str(), &view.policy.execution_site, &descriptor)
+            })
+        });
+        permitted
+            .then_some(())
+            .ok_or(Error::Denied("exact capability is not currently granted"))
+    }
+
     /// Wait until this exact captured binding is no longer live. Unrelated
     /// publications merely wake and revalidate; they never revoke this binding.
     /// A poisoned/unavailable authority fails closed as not-live.
@@ -785,23 +1029,27 @@ impl ToolBindingAuthority {
             .view
             .read()
             .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
-        let key = binding_key(
-            actor,
-            &binding.name,
-            &binding.source,
-            &binding.effect,
-            &binding.execution_site,
-        );
-        if view.registry.binding_revision(&binding.name) != Some(binding.registry_revision)
-            || view.generations.get(&key).copied() != Some(binding.authority_revision)
-            || binding.execution_site != view.policy.execution_site
-            || view.registry.source_of(&binding.name) != Some(&binding.source)
-            || view.registry.effect_of(&binding.name) != Some(&binding.effect)
-            || !view.registry.allows(actor, &view.policy, &binding.name)
-        {
-            return Err(Error::Denied("captured tool binding is no longer live"));
-        }
-        Ok(())
+        revalidate_binding_view(&view, actor, binding)
+    }
+
+    /// Serialize one durable authorization commit against ToolBinding
+    /// publication/revocation. Revocation needs the write guard: if it commits
+    /// first this revalidation denies, while a caller holding this read guard
+    /// may durably commit exactly one already-authorized attempt before the
+    /// revocation publication can proceed.
+    pub fn with_revalidated_binding<T>(
+        &self,
+        actor: &PrincipalId,
+        binding: &ToolBindingSnapshot,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let view = self
+            .inner
+            .view
+            .read()
+            .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
+        revalidate_binding_view(&view, actor, binding)?;
+        commit()
     }
 }
 
@@ -907,6 +1155,62 @@ mod binding_authority_tests {
     }
 
     #[test]
+    fn durable_commit_guard_serializes_exact_revocation_publication() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let actor = PrincipalId::new("a").unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(Arc::new(ReadTool("one"))).unwrap();
+        let mut policy = ToolPolicy::default();
+        policy
+            .permit_host(actor.clone(), "one", &ToolEffect::Read)
+            .unwrap();
+        let authority = ToolBindingAuthority::default();
+        authority.publish(&registry, &policy).unwrap();
+        let binding = authority.permitted_binding(&actor, "one").unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let guarded = {
+            let authority = authority.clone();
+            let actor = actor.clone();
+            let binding = binding.clone();
+            thread::spawn(move || {
+                authority
+                    .with_revalidated_binding(&actor, &binding, || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        policy.revoke_source(&actor, "one", &ToolSource::trusted_host());
+        let (published_tx, published_rx) = mpsc::channel();
+        let publisher = {
+            let authority = authority.clone();
+            thread::spawn(move || {
+                authority.publish(&registry, &policy).unwrap();
+                published_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            published_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "revocation publication crossed a live durable-commit read guard"
+        );
+
+        release_tx.send(()).unwrap();
+        guarded.join().unwrap();
+        published_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        publisher.join().unwrap();
+        assert!(authority.revalidate(&actor, &binding).is_err());
+    }
+
+    #[test]
     fn revoke_then_regrant_mints_new_exact_grant_generation() {
         let actor = PrincipalId::new("a").unwrap();
         let mut registry = ToolRegistry::default();
@@ -931,6 +1235,98 @@ mod binding_authority_tests {
         assert!(current.authority_revision > original.authority_revision);
         assert!(authority.revalidate(&actor, &original).is_err());
         authority.revalidate(&actor, &current).unwrap();
+    }
+
+    #[test]
+    fn hidden_process_input_capability_is_current_but_never_provider_visible() {
+        let actor = PrincipalId::new("a").unwrap();
+        let registry = ToolRegistry::default();
+        let mut policy = ToolPolicy::default();
+        policy
+            .permit_host(actor.clone(), "process.input", &ToolEffect::Control)
+            .unwrap();
+        let authority = ToolBindingAuthority::default();
+        authority.publish(&registry, &policy).unwrap();
+
+        assert!(registry.visible(&actor, &policy).is_empty());
+        authority
+            .permits_capability(
+                &actor,
+                "process.input",
+                &ToolSource::trusted_host(),
+                &ToolEffect::Control,
+            )
+            .unwrap();
+
+        policy.revoke_source(&actor, "process.input", &ToolSource::trusted_host());
+        authority.publish(&registry, &policy).unwrap();
+        assert!(authority
+            .permits_capability(
+                &actor,
+                "process.input",
+                &ToolSource::trusted_host(),
+                &ToolEffect::Control,
+            )
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod execution_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ownership_scope_waits_for_every_lease_and_shares_cancellation() {
+        let cancellation = CancellationToken::new();
+        let scope = ExecutionOwnershipScope::from_trusted_host(
+            "/d:0/i:0/p:0/a:0/t:1/j:g/n:1",
+            cancellation.clone(),
+        )
+        .unwrap();
+        let first = scope.acquire().unwrap();
+        let second = scope.acquire().unwrap();
+        assert_eq!(scope.active(), 2);
+
+        let waiter = {
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                scope.wait_quiescent().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        drop(first);
+        tokio::task::yield_now().await;
+        assert_eq!(scope.active(), 1);
+        assert!(!waiter.is_finished());
+
+        scope.cancellation().cancel();
+        cancellation.cancelled().await;
+        assert!(cancellation.is_cancelled());
+
+        drop(second);
+        waiter.await.unwrap();
+        assert_eq!(scope.active(), 0);
+        scope.mark_unresolved();
+        assert!(scope.is_unresolved());
+    }
+
+    #[test]
+    fn ownership_scope_identity_is_instance_exact() {
+        let one = ExecutionOwnershipScope::from_trusted_host(
+            "/d:0/i:0/p:0/a:0/t:1/j:g/n:1",
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let clone = one.clone();
+        let other = ExecutionOwnershipScope::from_trusted_host(
+            "/d:0/i:0/p:0/a:0/t:1/j:g/n:1",
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(one.same_instance(&clone));
+        assert!(!one.same_instance(&other));
     }
 }
 
@@ -961,5 +1357,63 @@ mod parallel_hint_tests {
     fn panicking_scheduling_hint_is_serial_barrier() {
         let value = serde_json::json!({"parallel":true,"writes":[]});
         assert!(!guarded_parallel_hint(&PanickingHostTool, &value, &value));
+    }
+}
+
+#[cfg(test)]
+mod control_effect_tests {
+    use super::*;
+    use aw_agent_kernel::{
+        capability::{Effect, SourceKind},
+        envelope::{Access, Budget, Envelope, EnvelopeSpec, ExactGrant, Network},
+    };
+
+    #[test]
+    fn filesystem_readonly_is_orthogonal_to_exact_control_grant() {
+        let source = ToolSource::trusted_host();
+        let envelope = Envelope::new(EnvelopeSpec {
+            actor: "actor".into(),
+            site: "local".into(),
+            revision: 1,
+            access: Access::ReadOnly,
+            network: Network::Deny,
+            process: false,
+            tty: false,
+            microphone: false,
+            speaker: false,
+            budget: Budget {
+                max_model_rounds: 1,
+                max_tool_calls: 1,
+                max_children: 0,
+                max_depth: 0,
+                max_output_bytes: 1024,
+            },
+            grants: vec![ExactGrant {
+                name: "jobs_cancel".into(),
+                kind: SourceKind::Host,
+                source: source.id.clone(),
+                source_epoch: source.epoch,
+                effect: Effect::Control,
+            }],
+        })
+        .unwrap();
+        assert!(envelope_permits_tool(
+            &envelope,
+            "jobs_cancel",
+            &source,
+            &ToolEffect::Control
+        ));
+        assert!(!envelope_permits_tool(
+            &envelope,
+            "jobs_cancel",
+            &source,
+            &ToolEffect::Write
+        ));
+        assert!(!envelope_permits_tool(
+            &envelope,
+            "other",
+            &source,
+            &ToolEffect::Control
+        ));
     }
 }

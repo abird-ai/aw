@@ -134,6 +134,59 @@ fn append(c: &rusqlite::Connection, actor: &PrincipalId, fact: &ActorControlFact
     )
 }
 impl SessionStore {
+    /// Read-only next sender sequence for one current Actor owner. The caller
+    /// still has to pass the returned value through actor_control_prepare,
+    /// which performs the final BEGIN IMMEDIATE stale/reuse check before any
+    /// Runtime control effect.
+    pub fn actor_control_next_message_id(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        writer_epoch: u64,
+        sender: &str,
+    ) -> Result<u64> {
+        if sender.is_empty()
+            || sender.len() > MAX_LABEL
+            || !sender
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-:.@".contains(&byte))
+        {
+            return Err(Error::Denied("invalid Actor Control sender"));
+        }
+        let c = self.connection()?;
+        verify_writer(&c, actor, session, writer_epoch)?;
+        let mut max = 0u64;
+        for input in actor_admission::events(&c, session)? {
+            if input.admission.sender == sender {
+                max = max.max(input.admission.message_id);
+            }
+        }
+        for control in events(&c, session)? {
+            if control.admission.sender == sender {
+                max = max.max(control.admission.message_id);
+            }
+        }
+        for notice in crate::actor_notice::events(&c, session)? {
+            if notice.request.sender == sender {
+                max = max.max(notice.request.message_id);
+            }
+        }
+        for queued in crate::actor_queue::events(&c, session)? {
+            if queued.request.sender == sender {
+                max = max.max(queued.request.message_id);
+            }
+            if queued
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.recipient_actor == sender)
+            {
+                max = max.max(queued.claim.as_ref().map_or(0, |claim| claim.message_id));
+            }
+        }
+        max.checked_add(1)
+            .ok_or(Error::Limit("Actor Control sender sequence exhausted"))
+    }
+
     /// Durable *intent* for an ALREADY-ACTIVE exact Actor Turn. This can only
     /// be submitted by the original owner with an active branch/model run and
     /// matching immutable Actor Input Dispatching evidence. RPC must not call

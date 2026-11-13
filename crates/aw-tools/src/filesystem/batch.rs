@@ -3,6 +3,7 @@
 //! A host must supply its own original-journal subcall replay ledger before
 //! mutation-capable execution may be exposed.
 use super::{schema::Tool, status::Primary};
+use crate::operation::OperationId;
 use serde_json::Value;
 use std::io;
 
@@ -12,29 +13,60 @@ pub enum NodeTool {
     Bash,
     Pwsh,
     Powershell,
+    /// AW-hosted Agent constructor. This variant is never returned by the
+    /// conservative provider resolver; an embedding host must opt it in.
+    Agent,
 }
 impl NodeTool {
+    pub fn from_operation(operation: OperationId) -> Option<Self> {
+        if !operation.provider_graph_eligible() {
+            return None;
+        }
+        Some(match operation {
+            OperationId::Fs(tool) => Self::Native(tool),
+            OperationId::Bash => Self::Bash,
+            OperationId::Pwsh => Self::Pwsh,
+            OperationId::Powershell => Self::Powershell,
+            // Agent stays host-qualified. OperationId::provider_graph_eligible
+            // deliberately remains false so standalone/model-default Graphs
+            // cannot acquire it merely by knowing the name.
+            OperationId::Agent | _ => return None,
+        })
+    }
+    pub fn operation(self) -> OperationId {
+        match self {
+            Self::Native(tool) => OperationId::Fs(tool),
+            Self::Bash => OperationId::Bash,
+            Self::Pwsh => OperationId::Pwsh,
+            Self::Powershell => OperationId::Powershell,
+            Self::Agent => OperationId::Agent,
+        }
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::Native(tool) => tool.name(),
             Self::Bash => "bash",
             Self::Pwsh => "pwsh",
             Self::Powershell => "powershell",
+            Self::Agent => "agent",
         }
     }
     pub fn native(self) -> Option<Tool> {
         match self {
             Self::Native(tool) => Some(tool),
-            Self::Bash | Self::Pwsh | Self::Powershell => None,
+            Self::Bash | Self::Pwsh | Self::Powershell | Self::Agent => None,
         }
     }
-    pub fn is_shell(self) -> bool {
-        self.native().is_none()
+    pub const fn is_shell(self) -> bool {
+        matches!(self, Self::Bash | Self::Pwsh | Self::Powershell)
+    }
+    pub const fn is_agent(self) -> bool {
+        matches!(self, Self::Agent)
     }
     pub const fn graph_eligible(self) -> bool {
         match self {
             Self::Native(tool) => tool.graph_eligible(),
-            Self::Bash | Self::Pwsh | Self::Powershell => true,
+            Self::Bash | Self::Pwsh | Self::Powershell | Self::Agent => true,
         }
     }
 }
@@ -211,6 +243,26 @@ impl Expr {
             Self::Or(a, b) => a.test(states) || b.test(states),
         }
     }
+    /// Sorted, deduplicated direct dependency coordinates referenced by this
+    /// immutable activation expression. Coordinates are one-based.
+    pub fn dependencies(&self) -> Vec<usize> {
+        fn collect(expr: &Expr, out: &mut Vec<usize>) {
+            match expr {
+                Expr::Root => {}
+                Expr::Atom { step, .. } => out.push(*step),
+                Expr::And(a, b) | Expr::Or(a, b) => {
+                    collect(a, out);
+                    collect(b, out);
+                }
+            }
+        }
+        let mut dependencies = Vec::new();
+        collect(self, &mut dependencies);
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        dependencies
+    }
+
     /// None means the referenced terminal outcomes are not all known yet.
     /// A ready false expression becomes skip condition, with no effects.
     pub fn evaluate(&self, states: &[Option<Status>]) -> Option<bool> {
@@ -236,9 +288,9 @@ impl Graph {
         hash.update(b"aw-tools-core-graph-v1");
         hash.update((self.steps.len() as u64).to_le_bytes());
         for step in &self.steps {
-            let name = step.tool.name();
-            hash.update((name.len() as u64).to_le_bytes());
-            hash.update(name.as_bytes());
+            let semantic = step.tool.operation().semantic_name();
+            hash.update((semantic.len() as u64).to_le_bytes());
+            hash.update(semantic.as_bytes());
             let args = serde_json::to_vec(&step.arguments).expect("validated, finite JSON");
             hash.update((args.len() as u64).to_le_bytes());
             hash.update(&args);
@@ -257,10 +309,9 @@ impl Graph {
         Self::compile_with(
             input,
             |name| {
-                Tool::GRAPH_NATIVE
-                    .into_iter()
-                    .find(|tool| tool.name() == name)
-                    .map(NodeTool::Native)
+                OperationId::from_model_name(name)
+                    .and_then(NodeTool::from_operation)
+                    .filter(|tool| tool.native().is_some())
             },
             |tool, arguments| {
                 tool.native()

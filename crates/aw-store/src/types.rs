@@ -1,7 +1,9 @@
 use aw_agent_core::{HistoryState, PrincipalId, Turn};
 use serde::{Deserialize, Serialize};
 
-pub use aw_store_api::{BranchInfo, ContextInfo, SessionBinding, SessionInfo, SessionView};
+pub use aw_store_api::{
+    AgentBindingInfo, BranchInfo, ContextInfo, SessionBinding, SessionInfo, SessionView,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

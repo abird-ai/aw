@@ -76,6 +76,18 @@ impl Footprint {
         &self.scopes
     }
 
+    /// Conservative union for execution-route planning. This can only add
+    /// scopes/unknown hazards; it never removes semantic footprint evidence.
+    pub fn union(&self, other: &Self) -> Result<Self, Error> {
+        let mut scopes = self.scopes.clone();
+        scopes.extend(other.scopes.iter().cloned());
+        Self::new(
+            scopes,
+            self.unknown_read || other.unknown_read,
+            self.unknown_write || other.unknown_write,
+        )
+    }
+
     pub fn unknown_read(&self) -> bool {
         self.unknown_read
     }

@@ -6,12 +6,13 @@ use crate::{
     context::ExecutionContext,
     LocalToolOptions,
 };
-use aw_agent_core::{Agent, Error, PrincipalId, Result};
+use aw_agent_core::{Agent, AgentExecutionBinding, Error, PrincipalId, Result};
 use aw_store::{
     BranchInfo, ContextInfo, SessionBinding, SessionHandle, SessionInfo, SessionStore, SessionView,
 };
 #[cfg(feature = "jsonl")]
-use aw_store_api::{SessionBackend, SessionCursor};
+use aw_store_api::SessionCursor;
+use aw_store_api::{AgentBindingInfo, SessionBackend};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -52,6 +53,18 @@ pub fn jsonl_store(directory: &Path) -> Result<aw_store_jsonl::JsonlStore> {
     }
     aw_store_jsonl::JsonlStore::open(directory.join("sessions-jsonl"))
 }
+fn execution_owner(info: AgentBindingInfo) -> Result<AgentExecutionBinding> {
+    let canonical_ref = format!(
+        "/d:{}/i:{}/p:{}/a:{}",
+        info.domain_handle, info.identity_handle, info.project_handle, info.agent_handle
+    );
+    AgentExecutionBinding::from_trusted_host(canonical_ref, info.session_id, info.branch_id)
+}
+
+fn bind_execution_owner(agent: &mut Agent, info: AgentBindingInfo) -> Result<()> {
+    agent.bind_execution_owner(execution_owner(info)?)
+}
+
 pub fn destination_fingerprint(profile: &Profile) -> Result<String> {
     crate::config::destination_fingerprint(profile)
 }
@@ -150,7 +163,18 @@ impl PersistentSession {
     }
     pub fn apply(&self, agent: &mut Agent) -> Result<()> {
         let view = self.view()?;
-        agent.load_history(view.history, Some(Arc::new(self.handle.clone())))
+        let binding = self
+            .store
+            .agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
+        let target = execution_owner(binding)?;
+        if agent
+            .execution_binding()
+            .is_some_and(|current| current != &target)
+        {
+            *agent = agent.fresh_execution_identity()?;
+        }
+        agent.load_history(view.history, Some(Arc::new(self.handle.clone())))?;
+        agent.bind_execution_owner(target)
     }
     pub fn new_session(&self, title: &str) -> Result<Self> {
         let info = self.store.session(&self.actor, self.handle.session_id())?;
@@ -345,7 +369,11 @@ impl JsonlPersistentSession {
 
     pub fn apply(&self, agent: &mut Agent) -> Result<()> {
         let view = self.view()?;
-        agent.load_history(view.history, Some(self.cursor.journal()))
+        let binding = self
+            .store
+            .agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
+        agent.load_history(view.history, Some(self.cursor.journal()))?;
+        bind_execution_owner(agent, binding)
     }
 
     pub fn session_id(&self) -> &str {
@@ -452,6 +480,59 @@ mod phase48_tests {
             model_hint: "fixture-model".into(),
             destination_fingerprint: "0".repeat(64),
         }
+    }
+
+    struct NoopProvider;
+    impl aw_agent_core::Provider for NoopProvider {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [aw_agent_core::Message],
+            _model: &'a str,
+            _sink: &'a mut aw_agent_core::DeltaSink<'_>,
+        ) -> aw_agent_core::CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+
+    #[test]
+    fn durable_session_and_branch_change_allocate_fresh_agent_identity() {
+        let root = temp_root("fresh-agent");
+        let actor = PrincipalId::new("local:fresh-agent").unwrap();
+        let store = SessionStore::in_memory().unwrap();
+        let current =
+            PersistentSession::create(store, actor.clone(), binding(&root, "profile-a"), "A")
+                .unwrap();
+        let mut agent = Agent::builder(
+            Arc::new(NoopProvider),
+            aw_agent_core::AgentOptions::new("profile-a", "fixture-model"),
+        )
+        .account(
+            aw_agent_core::AccountDescriptor::personal(
+                "profile-a",
+                actor.clone(),
+                "local",
+                ["fixture-model".to_owned()],
+            ),
+            actor,
+            "local",
+        )
+        .build()
+        .unwrap();
+        current.apply(&mut agent).unwrap();
+        let first = agent.execution_binding().unwrap().clone();
+
+        let next = current.new_session("B").unwrap();
+        next.apply(&mut agent).unwrap();
+        let second = agent.execution_binding().unwrap().clone();
+        assert_ne!(first, second);
+
+        let fork = next.fork("alternative", None).unwrap();
+        fork.apply(&mut agent).unwrap();
+        let third = agent.execution_binding().unwrap().clone();
+        assert_ne!(second, third);
+        assert_eq!(third.session_id(), next.handle.session_id());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

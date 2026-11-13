@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use aw_agent_core::{Error, PrincipalId, Result};
+use aw_agent_kernel::WriterFence;
 use aw_store_api::{BranchInfo, SessionBackend, SessionBinding, SessionCursor, SessionInfo};
 use std::{num::NonZeroU64, sync::Arc};
 
@@ -45,8 +46,8 @@ pub struct CoordinatorBinding {
     owner: PrincipalId,
     agent_ref: String,
     binding_revision: NonZeroU64,
-    agent_writer_epoch: Option<NonZeroU64>,
-    workspace_writer_epoch: Option<NonZeroU64>,
+    agent_writer_fence: WriterFence,
+    workspace_writer_fence: WriterFence,
 }
 
 impl CoordinatorBinding {
@@ -56,8 +57,8 @@ impl CoordinatorBinding {
         branch: &BranchInfo,
         agent_ref: impl Into<String>,
         binding_revision: NonZeroU64,
-        agent_writer_epoch: Option<NonZeroU64>,
-        workspace_writer_epoch: Option<NonZeroU64>,
+        agent_writer_fence: WriterFence,
+        workspace_writer_fence: WriterFence,
     ) -> Result<Self> {
         let agent_ref = agent_ref.into();
         if session.id != branch.session_id
@@ -73,8 +74,8 @@ impl CoordinatorBinding {
             owner: session.owner.clone(),
             agent_ref,
             binding_revision,
-            agent_writer_epoch,
-            workspace_writer_epoch,
+            agent_writer_fence,
+            workspace_writer_fence,
         })
     }
 
@@ -143,8 +144,12 @@ mod tests {
                     &branch,
                     agent,
                     nonzero(binding_revision),
-                    writer.map(nonzero),
-                    workspace.map(nonzero),
+                    writer.map_or(WriterFence::NotApplicable, |value| {
+                        WriterFence::epoch(nonzero(value))
+                    }),
+                    workspace.map_or(WriterFence::NotApplicable, |value| {
+                        WriterFence::epoch(nonzero(value))
+                    }),
                 )
                 .unwrap()
             };

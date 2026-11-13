@@ -6,11 +6,14 @@ use crate::{
     shell, Error, Result,
 };
 use aw_agent_core::{Tool, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSpec};
-use aw_tools::filesystem::{
-    batch::{self},
-    job::Lifecycle,
-    job_manager::{OutputStream, MAX_JOB_LIST_PAGE},
-    status::Primary,
+use aw_tools::{
+    filesystem::{
+        batch::{self},
+        job::Lifecycle,
+        job_manager::{FiniteJobKind, OutputStream, MAX_JOB_LIST_PAGE},
+        status::Primary,
+    },
+    job_event::EventRuleSet,
 };
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -52,22 +55,122 @@ fn graph_error(primary: Primary) -> bool {
     matches!(primary, Primary::Fail | Primary::Mixed | Primary::Unknown)
 }
 
-fn handoff_receipt(id: &str, snapshot: &aw_tools::filesystem::job_manager::Snapshot) -> ToolOutput {
-    let content = if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal {
-        let primary = snapshot
-            .summary
-            .map_or(Primary::Unknown, |summary| summary.0);
-        format!("{} {id} result=job_output", primary.as_str())
-    } else {
-        format!("running {id} {}/{}", snapshot.finished, snapshot.total)
+fn handoff_receipt(
+    host: &crate::job_host::JobHost,
+    id: &str,
+    snapshot: &aw_tools::filesystem::job_manager::Snapshot,
+) -> Result<ToolOutput> {
+    let reference = host.execution_ref(id, None)?.canonical();
+    let state = match snapshot.lifecycle {
+        aw_tools::filesystem::job::Lifecycle::Running => "running",
+        aw_tools::filesystem::job::Lifecycle::Cancelling
+        | aw_tools::filesystem::job::Lifecycle::Revoking => "cancelling",
+        aw_tools::filesystem::job::Lifecycle::Terminal if snapshot.stop_reason.is_some() => {
+            "cancelled"
+        }
+        aw_tools::filesystem::job::Lifecycle::Terminal => "settled",
     };
-    ToolOutput {
+    let mut content = format!(
+        "{reference} {} {state} rev={}",
+        snapshot.label, snapshot.sequence
+    );
+    if snapshot.lifecycle != aw_tools::filesystem::job::Lifecycle::Terminal && snapshot.total > 1 {
+        content.push_str(&format!(" {}/{}", snapshot.finished, snapshot.total));
+    }
+    if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal {
+        let outcome = snapshot
+            .summary
+            .map_or("unknown", |summary| summary.0.as_str());
+        content.push_str(&format!(" outcome={outcome}"));
+    }
+    Ok(ToolOutput {
         content,
         is_error: snapshot
             .summary
             .is_some_and(|summary| graph_error(summary.0)),
         truncated: false,
+    })
+}
+
+fn background(arguments: &Value) -> Result<bool> {
+    match arguments.get("background") {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err(Error::Denied("background must be a boolean")),
     }
+}
+
+fn constructor_event_rules_schema() -> Value {
+    json!({
+        "type":"array",
+        "maxItems":aw_tools::job_event::MAX_EVENT_RULES,
+        "items":{
+            "type":"array",
+            "minItems":1,
+            "maxItems":2,
+            "prefixItems":[
+                {"type":"string","enum":["result","settled"]},
+                {"type":"string","enum":["auto","queue"]}
+            ]
+        }
+    })
+}
+
+fn constructor_wake_rules(arguments: &Value, runtime: &JobRuntime) -> Result<Option<EventRuleSet>> {
+    let Some(value) = arguments.get("wake") else {
+        return Ok(None);
+    };
+    if !runtime.wake_capable() {
+        return Err(Error::Denied(
+            "constructor wake is unavailable for this Agent/host",
+        ));
+    }
+    let rules = crate::jobs_tools::parse_event_rules(value)?;
+    for rule in rules.as_slice() {
+        if !matches!(
+            (rule.event, rule.mode),
+            (
+                aw_tools::job_event::JobEventKind::Result
+                    | aw_tools::job_event::JobEventKind::Settled,
+                aw_tools::job_event::JobWakeMode::Auto | aw_tools::job_event::JobWakeMode::Queue
+            )
+        ) {
+            return Err(Error::Denied(
+                "finite constructor wake supports only result/settled with auto/queue",
+            ));
+        }
+    }
+    Ok(Some(rules))
+}
+
+fn semantic_constructor_arguments(arguments: &Value) -> Result<Value> {
+    let mut semantic = arguments.clone();
+    let object = semantic
+        .as_object_mut()
+        .ok_or(Error::Denied("constructor arguments must be an object"))?;
+    object.remove("background");
+    object.remove("wake");
+    Ok(semantic)
+}
+
+fn batch_parameters_with_background(
+    tools: Vec<aw_tools::filesystem::batch::NodeTool>,
+    wake_capable: bool,
+) -> Value {
+    let mut parameters = batch::parameters_for(tools);
+    if let Some(properties) = parameters
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "background".into(),
+            json!({"type":"boolean","default":false}),
+        );
+        if wake_capable {
+            properties.insert("wake".into(), constructor_event_rules_schema());
+        }
+    }
+    parameters
 }
 
 #[derive(Clone)]
@@ -102,11 +205,42 @@ impl JobShell {
 }
 impl Tool for JobShell {
     fn spec(&self) -> ToolSpec {
-        self.shell.spec()
+        let mut spec = self.shell.spec();
+        if let Some(properties) = spec
+            .parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.insert(
+                "background".into(),
+                json!({"type":"boolean","default":false}),
+            );
+            if self.runtime.wake_capable() {
+                properties.insert("wake".into(), constructor_event_rules_schema());
+            }
+        }
+        spec.description.push_str(
+            " Set background=true to return the same Process Job immediately; interactive=true requires background=true.",
+        );
+        spec
     }
 
     fn validate(&self, arguments: &Value) -> Result<()> {
-        self.shell.validate(arguments)
+        let run_background = background(arguments)?;
+        let _ = constructor_wake_rules(arguments, &self.runtime)?;
+        let semantic = semantic_constructor_arguments(arguments)?;
+        self.shell.validate(&semantic)?;
+        if semantic
+            .get("interactive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && !run_background
+        {
+            return Err(Error::Denied(
+                "interactive shell requires background=true so jobs_send can control stdin",
+            ));
+        }
+        Ok(())
     }
 
     fn can_run_parallel(&self, first: &Value, second: &Value) -> bool {
@@ -116,17 +250,42 @@ impl Tool for JobShell {
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
             self.validate(arguments)?;
+            let run_background = background(arguments)?;
+            let wake = match constructor_wake_rules(arguments, &self.runtime)? {
+                Some(rules) => self.runtime.prepare_initial_wake(&ctx, rules)?,
+                None => None,
+            };
+            let semantic = semantic_constructor_arguments(arguments)?;
             let direct_budget = ctx.result_budget(self.runtime.result_limit())?;
-            let graph = json!({"ops":[[self.shell.spec().name, arguments.clone()]]});
-            let mut started = match self.runtime.start_replay(&ctx, &graph, false)? {
-                StartDecision::New(started) => started,
+            let graph = json!({"ops":[[self.shell.spec().name, semantic]]});
+            let decision = match wake {
+                Some(wake) => self.runtime.start_replay_with_initial_wake(
+                    &ctx,
+                    &graph,
+                    run_background,
+                    wake,
+                )?,
+                None => self.runtime.start_replay(&ctx, &graph, run_background)?,
+            };
+            let mut started = match decision {
+                StartDecision::New(started) => {
+                    started
+                        .host
+                        .manager()
+                        .set_finite_kind(&started.id, FiniteJobKind::Process)
+                        .map_err(|_| Error::Protocol("cannot bind Process Job projection"))?;
+                    started
+                }
                 StartDecision::Existing { id, host } => {
+                    host.manager()
+                        .set_finite_kind(&id, FiniteJobKind::Process)
+                        .map_err(|_| Error::Denied("replayed Job kind changed"))?;
                     host.expose(&id)?;
                     let snapshot = host
                         .manager()
                         .runtime_snapshot(&id)
                         .map_err(|_| Error::Protocol("replayed shell Job is unavailable"))?;
-                    return Ok(handoff_receipt(&id, &snapshot));
+                    return handoff_receipt(&host, &id, &snapshot);
                 }
                 StartDecision::Unknown => {
                     return Ok(ToolOutput::error(
@@ -135,6 +294,16 @@ impl Tool for JobShell {
                 }
             };
             let mut handoff = HandoffGuard::new(started.host.clone(), started.id.clone());
+            if run_background {
+                handoff.expose()?;
+                let snapshot = started
+                    .host
+                    .manager()
+                    .runtime_snapshot(&started.id)
+                    .map_err(|_| Error::Protocol("new Process Job status unavailable"))?;
+                drop(started.task);
+                return handoff_receipt(&started.host, &started.id, &snapshot);
+            }
             let completed = tokio::select! {
                 result = &mut started.task => result,
                 _ = ctx.cancellation.cancelled() => {
@@ -183,18 +352,14 @@ impl Tool for JobShell {
                 }
                 _ if direct.content.len() > direct_budget => {
                     handoff.expose()?;
-                    let output = handoff_receipt(&started.id, &snapshot);
+                    let output = handoff_receipt(&started.host, &started.id, &snapshot)?;
                     output.validate()?;
                     Ok(output)
                 }
                 _ => {
                     direct.validate()?;
                     handoff.disarm();
-                    started
-                        .host
-                        .manager()
-                        .discard_unexposed_terminal(&started.id)
-                        .map_err(|_| Error::Protocol("cannot retire completed hidden shell Job"))?;
+                    started.host.discard_unexposed_terminal(&started.id)?;
                     Ok(direct)
                 }
             }
@@ -215,31 +380,75 @@ impl Tool for Batch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "batch".into(),
-            description: "Run a bounded Graph with compact [tool,args,when?] nodes. Eligible native tools and prepared shell interpreters share one Job; node authority is rechecked individually. Results are coordinate-keyed and long/oversized execution hands off the same Job to job_* controls.".into(),
-            parameters: batch::parameters_for(self.runtime.node_tools()),
-            // Composite outer effect: the wrapper may contain reads or writes.
-            // Node effects are independently source/effect/grant checked.
-            effect: ToolEffect::Unknown,
+            description: "Run a bounded Graph with compact [tool,args,when?] nodes. Eligible native tools and prepared shell interpreters share one Job; node authority is rechecked individually. Results are coordinate-keyed. Set background=true to return the same Graph Job immediately.".into(),
+            parameters: batch_parameters_with_background(
+                self.runtime.node_tools(),
+                self.runtime.wake_capable(),
+            ),
+            // Construction/lifecycle is Control; every node independently keeps
+            // its original semantic effect and exact current authority.
+            effect: ToolEffect::Control,
         }
     }
 
     fn validate(&self, arguments: &Value) -> Result<()> {
-        self.runtime.validate_graph(arguments)
+        let _ = background(arguments)?;
+        let _ = constructor_wake_rules(arguments, &self.runtime)?;
+        let semantic = semantic_constructor_arguments(arguments)?;
+        self.runtime.validate_graph(&semantic)
     }
 
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
+            if ctx.execution_scope.is_some() {
+                return Err(Error::Denied(
+                    "batch cannot start while this work is owned by an active Graph node",
+                ));
+            }
             self.validate(arguments)?;
+            let run_background = background(arguments)?;
+            let wake = match constructor_wake_rules(arguments, &self.runtime)? {
+                Some(rules) => self.runtime.prepare_initial_wake(&ctx, rules)?,
+                None => None,
+            };
+            let semantic = semantic_constructor_arguments(arguments)?;
             let direct_budget = ctx.result_budget(self.runtime.result_limit())?;
-            let mut started = match self.runtime.start_replay(&ctx, arguments, false)? {
-                StartDecision::New(started) => started,
+            let decision = match wake {
+                Some(wake) => {
+                    self.runtime
+                        .start_replay_presealed_with_initial_wake(
+                            &ctx,
+                            &semantic,
+                            run_background,
+                            Some(wake),
+                        )
+                        .await?
+                }
+                None => {
+                    self.runtime
+                        .start_replay_presealed(&ctx, &semantic, run_background)
+                        .await?
+                }
+            };
+            let mut started = match decision {
+                StartDecision::New(started) => {
+                    started
+                        .host
+                        .manager()
+                        .set_finite_kind(&started.id, FiniteJobKind::Graph)
+                        .map_err(|_| Error::Protocol("cannot bind Graph Job projection"))?;
+                    started
+                }
                 StartDecision::Existing { id, host } => {
+                    host.manager()
+                        .set_finite_kind(&id, FiniteJobKind::Graph)
+                        .map_err(|_| Error::Denied("replayed Job kind changed"))?;
                     host.expose(&id)?;
                     let snapshot = host
                         .manager()
                         .runtime_snapshot(&id)
                         .map_err(|_| Error::Protocol("replayed batch Job is unavailable"))?;
-                    return Ok(handoff_receipt(&id, &snapshot));
+                    return handoff_receipt(&host, &id, &snapshot);
                 }
                 StartDecision::Unknown => {
                     return Ok(ToolOutput::error(
@@ -248,6 +457,16 @@ impl Tool for Batch {
                 }
             };
             let mut handoff = HandoffGuard::new(started.host.clone(), started.id.clone());
+            if run_background {
+                handoff.expose()?;
+                let snapshot = started
+                    .host
+                    .manager()
+                    .runtime_snapshot(&started.id)
+                    .map_err(|_| Error::Protocol("new Graph Job status unavailable"))?;
+                drop(started.task);
+                return handoff_receipt(&started.host, &started.id, &snapshot);
+            }
             let completed = tokio::select! {
                 result = &mut started.task => result,
                 _ = ctx.cancellation.cancelled() => {
@@ -286,15 +505,11 @@ impl Tool for Batch {
                 };
                 output.validate()?;
                 handoff.disarm();
-                started
-                    .host
-                    .manager()
-                    .discard_unexposed_terminal(&started.id)
-                    .map_err(|_| Error::Protocol("cannot retire completed hidden batch Job"))?;
+                started.host.discard_unexposed_terminal(&started.id)?;
                 return Ok(output);
             }
             handoff.expose()?;
-            let output = handoff_receipt(&started.id, &snapshot);
+            let output = handoff_receipt(&started.host, &started.id, &snapshot)?;
             output.validate()?;
             Ok(output)
         })
@@ -657,7 +872,7 @@ impl Tool for JobControl {
                 "job_start",
                 "Start the same bounded Graph as batch and expose its live Job id immediately. Eligible native tools and prepared shell interpreters use the same Job runtime.",
                 batch::parameters_for(self.runtime.node_tools()),
-                ToolEffect::Unknown,
+                ToolEffect::Control,
             ),
             JobToolKind::List => (
                 "job_list",
@@ -681,19 +896,19 @@ impl Tool for JobControl {
                 "job_ack",
                 "Acknowledge a raw retained-byte offset after safe receipt. Cleanup occurs only after every owner releases that prefix.",
                 job_ack_parameters(),
-                ToolEffect::Write,
+                ToolEffect::Control,
             ),
             JobToolKind::Cancel => (
                 "job_cancel",
                 "Idempotently request cancellation of one exposed live Job. Pending nodes skip; already-started native effects settle safely.",
                 job_id_parameters(),
-                ToolEffect::Write,
+                ToolEffect::Control,
             ),
             JobToolKind::Restart => (
                 "job_restart",
                 "Explicitly create a fresh Job from one retained terminal Graph after full current schema/authority revalidation. This may repeat side effects.",
                 job_id_parameters(),
-                ToolEffect::Write,
+                ToolEffect::Control,
             ),
         };
         ToolSpec {
@@ -1073,6 +1288,17 @@ mod tests {
         assert_eq!(schema["properties"]["max_output_bytes"]["maximum"], 4096);
     }
 
+    fn handoff_job_id(content: &str) -> &str {
+        let reference = content
+            .split_whitespace()
+            .next()
+            .expect("handoff receipt needs canonical ref");
+        reference
+            .rsplit_once("/j:")
+            .map(|(_, id)| id)
+            .expect("handoff receipt needs finite Job segment")
+    }
+
     struct UnusedProvider;
     impl Provider for UnusedProvider {
         fn stream<'a>(
@@ -1112,6 +1338,7 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
+        let (runtime_session, runtime_branch) = runtime.test_scope_identity();
         let ctx = ToolContext {
             actor: actor.clone(),
             turn_id: 1,
@@ -1123,6 +1350,15 @@ mod tests {
             result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: agent.default_identity().unwrap(),
             scope: None,
+            execution_owner: Some(
+                aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                    "/d:0/i:0/p:0/a:0",
+                    runtime_session,
+                    runtime_branch,
+                )
+                .unwrap(),
+            ),
+            execution_scope: None,
         };
         (root, agent, runtime, ctx)
     }
@@ -1170,6 +1406,7 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
+        let (runtime_session, runtime_branch) = runtime.test_scope_identity();
         let shell = Arc::new(shell::NativeShell::new(root.clone(), bash).unwrap());
         runtime.register_shell(shell.clone()).unwrap();
         let ctx = ToolContext {
@@ -1183,8 +1420,75 @@ mod tests {
             result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: agent.default_identity().unwrap(),
             scope: None,
+            execution_owner: Some(
+                aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                    "/d:0/i:0/p:0/a:0",
+                    runtime_session,
+                    runtime_branch,
+                )
+                .unwrap(),
+            ),
+            execution_scope: None,
         };
         (root, agent, runtime, ctx, shell)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_owned_background_process_holds_scope_until_terminal() {
+        let (root, _agent, runtime, mut ctx, shell) = shell_fixture();
+        let invocation_scope = aw_agent_core::InvocationScope {
+            session_id: "fixture-session".into(),
+            branch_id: "main".into(),
+        };
+        aw_agent_core::InvocationScopeLifecycle::replace_scope(
+            runtime.as_ref(),
+            None,
+            Some(&invocation_scope),
+        )
+        .unwrap();
+        ctx.scope = Some(invocation_scope.clone());
+        ctx.execution_owner = Some(
+            aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:0",
+                invocation_scope.session_id.clone(),
+                invocation_scope.branch_id.clone(),
+            )
+            .unwrap(),
+        );
+        let scope = aw_agent_core::ExecutionOwnershipScope::from_trusted_host(
+            "/d:0/i:0/p:0/a:0/t:1/j:outer/n:1",
+            CancellationToken::new(),
+        )
+        .unwrap();
+        ctx.execution_scope = Some(scope.clone());
+        ctx.call_id = "scoped-background-process".into();
+        let tool = JobShell::new(runtime.clone(), shell);
+        let receipt = tool
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "command":"sleep 0.2; printf done",
+                    "background":true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!receipt.is_error, "{}", receipt.content);
+        assert_eq!(
+            scope.active(),
+            1,
+            "background Process must keep the owning Graph-node scope live after handoff"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while scope.active() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!scope.is_unresolved());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -1373,7 +1677,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn direct_job_shell_hands_off_when_fast_result_exceeds_host_result_ceiling() {
-        let (root, agent, _runtime, ctx, shell) = shell_fixture();
+        let (root, agent, _runtime, mut ctx, shell) = shell_fixture();
         let tool_limits = crate::LocalToolLimits {
             result_bytes: 8 * 1024,
             ..Default::default()
@@ -1387,6 +1691,15 @@ mod tests {
             aw_tools::filesystem::schema::Tool::GRAPH_NATIVE.to_vec(),
         )
         .unwrap();
+        let (runtime_session, runtime_branch) = runtime.test_scope_identity();
+        ctx.execution_owner = Some(
+            aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:0",
+                runtime_session,
+                runtime_branch,
+            )
+            .unwrap(),
+        );
         runtime.register_shell(shell.clone()).unwrap();
         let tool = JobShell::new(runtime.clone(), shell);
         let output = tool
@@ -1396,10 +1709,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(output.content.starts_with("ok j"), "{}", output.content);
-        assert!(output.content.ends_with("result=job_output"));
+        assert!(
+            output.content.starts_with("/d:") && output.content.contains(" bash settled "),
+            "{}",
+            output.content
+        );
         assert!(output.content.len() <= tool_limits.result_bytes);
-        let id = output.content.split_whitespace().nth(1).unwrap().to_owned();
+        let id = handoff_job_id(&output.content).to_owned();
         let stdout = JobControl::new(runtime.clone(), JobToolKind::Output)
             .execute(ctx.clone(), &json!({"id":id,"stream":"stdout"}))
             .await
@@ -1424,6 +1740,39 @@ mod tests {
             .unwrap();
         assert!(output.is_error);
         assert!(output.content.starts_with("exit: 7\nstdout:\nnope"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn graph_owned_direct_batch_rejects_before_job_admission() {
+        let (root, _agent, runtime, mut ctx) = fixture();
+        ctx.execution_scope = Some(
+            aw_agent_core::ExecutionOwnershipScope::from_trusted_host(
+                "/d:0/i:0/p:0/a:0/t:1/j:outer/n:1",
+                CancellationToken::new(),
+            )
+            .unwrap(),
+        );
+        let tool = Batch::new(runtime.clone());
+        let arguments = json!({"ops":[["read",{"path":"a.txt","numbered":false}]]});
+        let result = tool.execute(ctx.clone(), &arguments).await;
+        assert!(matches!(
+            result,
+            Err(Error::Denied(
+                "batch cannot start while this work is owned by an active Graph node"
+            ))
+        ));
+        assert!(
+            runtime
+                .host_for(&ctx)
+                .unwrap()
+                .manager()
+                .list(0, 64)
+                .unwrap()
+                .jobs
+                .is_empty(),
+            "nested batch denial must happen before Job admission"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1456,7 +1805,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_batch_result_ceiling_hands_off_instead_of_using_global_limit() {
-        let (root, agent, _runtime, ctx) = fixture();
+        let (root, agent, _runtime, mut ctx) = fixture();
         fs::write(root.join("a.txt"), "A".repeat(3_000)).unwrap();
         fs::write(root.join("b.txt"), "B".repeat(3_000)).unwrap();
         fs::write(root.join("c.txt"), "C".repeat(3_000)).unwrap();
@@ -1472,6 +1821,15 @@ mod tests {
             aw_tools::filesystem::schema::Tool::GRAPH_NATIVE.to_vec(),
         )
         .unwrap();
+        let (runtime_session, runtime_branch) = runtime.test_scope_identity();
+        ctx.execution_owner = Some(
+            aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:0",
+                runtime_session,
+                runtime_branch,
+            )
+            .unwrap(),
+        );
         let batch = Batch::new(runtime.clone());
         let receipt = batch
             .execute(
@@ -1485,11 +1843,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            receipt.content.ends_with("result=job_output"),
+            receipt.content.starts_with("/d:") && receipt.content.contains(" settled "),
             "{}",
             receipt.content
         );
-        let id = receipt.content.split_whitespace().nth(1).unwrap();
+        let id = handoff_job_id(&receipt.content);
         assert!(runtime.host_for(&ctx).unwrap().manager().get(id).is_ok());
         let _ = fs::remove_dir_all(root);
     }
@@ -1523,14 +1881,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(receipt.content.starts_with("ok j"), "{}", receipt.content);
-        assert!(receipt.content.ends_with("result=job_output"));
-        let id = receipt
-            .content
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .to_owned();
+        assert!(
+            receipt.content.starts_with("/d:") && receipt.content.contains(" graph settled "),
+            "{}",
+            receipt.content
+        );
+        let id = handoff_job_id(&receipt.content).to_owned();
         let host = runtime.host_for(&ctx).unwrap();
         let status = host.manager().get(&id).unwrap();
         assert_eq!(status.summary, Some((Primary::Ok, false, false)));
@@ -1564,16 +1920,11 @@ mod tests {
             .unwrap();
         assert!(receipt.content.len() <= ctx.result_budget_bytes);
         assert!(
-            receipt.content.ends_with("result=job_output"),
+            receipt.content.starts_with("/d:") && receipt.content.contains(" settled "),
             "{}",
             receipt.content
         );
-        let id = receipt
-            .content
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .to_owned();
+        let id = handoff_job_id(&receipt.content).to_owned();
         let host = runtime.host_for(&ctx).unwrap();
         let retained = host
             .manager()
@@ -1680,6 +2031,7 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
+        let (runtime_session, runtime_branch) = runtime.test_scope_identity();
         let ctx = ToolContext {
             actor: actor.clone(),
             turn_id: 1,
@@ -1691,6 +2043,15 @@ mod tests {
             result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: agent.default_identity().unwrap(),
             scope: None,
+            execution_owner: Some(
+                aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                    "/d:0/i:0/p:0/a:0",
+                    runtime_session,
+                    runtime_branch,
+                )
+                .unwrap(),
+            ),
+            execution_scope: None,
         };
         let batch = Batch::new(runtime);
         let args = json!({"ops":[["edit",{
@@ -2032,7 +2393,16 @@ mod tests {
         let (_root, _agent, runtime, _ctx) = fixture();
         let spec = Batch::new(runtime).spec();
         assert_eq!(spec.name, "batch");
-        assert_eq!(spec.parameters, batch::parameters());
+        assert_eq!(
+            spec.parameters,
+            batch_parameters_with_background(
+                aw_tools::filesystem::schema::Tool::GRAPH_NATIVE
+                    .into_iter()
+                    .map(aw_tools::filesystem::batch::NodeTool::Native)
+                    .collect(),
+                false,
+            )
+        );
         assert!(serde_json::to_vec(&spec).unwrap().len() < 2048);
         assert_eq!(job_list_parameters()["properties"]["limit"]["default"], 64);
         assert_eq!(job_id_parameters()["required"][0], "id");

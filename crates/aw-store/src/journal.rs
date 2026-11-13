@@ -1,7 +1,7 @@
 use super::*;
 use aw_agent_core::{
-    InvocationRecord, JournalEntry, JournalFuture, ToolEffect, ToolRecord, ToolStatus, Turn,
-    TurnJournal, TurnStart,
+    AuthorityBoundaryKind, AuthoritySegment, InvocationRecord, JournalEntry, JournalFuture,
+    ToolEffect, ToolRecord, ToolStatus, Turn, TurnJournal, TurnStart,
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -33,7 +33,17 @@ fn authorize_append_or_shared_request(
     }
     #[cfg(not(feature = "multiplayer"))]
     let _ = (request, branch);
-    authorize(c, session, actor, true).map(|()| None)
+    match authorize(c, session, actor, true) {
+        Ok(()) => Ok(None),
+        Err(Error::Denied(_)) => crate::session_participation::authorize_in(
+            c,
+            actor,
+            session,
+            crate::SessionParticipationAction::Submit,
+        )
+        .map(|_| None),
+        Err(error) => Err(error),
+    }
 }
 
 fn authorize_append_or_shared_receipt(
@@ -54,7 +64,17 @@ fn authorize_append_or_shared_receipt(
     }
     #[cfg(not(feature = "multiplayer"))]
     let _ = (receipt, branch, prompt);
-    authorize(c, session, actor, true).map(|()| None)
+    match authorize(c, session, actor, true) {
+        Ok(()) => Ok(None),
+        Err(Error::Denied(_)) => crate::session_participation::authorize_in(
+            c,
+            actor,
+            session,
+            crate::SessionParticipationAction::Submit,
+        )
+        .map(|_| None),
+        Err(error) => Err(error),
+    }
 }
 
 fn authorize_append_or_current_shared_submit(
@@ -65,6 +85,16 @@ fn authorize_append_or_current_shared_submit(
     match authorize(c, session, actor, true) {
         Ok(()) => Ok(()),
         Err(Error::Denied(_)) => {
+            if crate::session_participation::authorize_in(
+                c,
+                actor,
+                session,
+                crate::SessionParticipationAction::Submit,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
             #[cfg(feature = "multiplayer")]
             if crate::multiplayer::draft_submit_authorized_in(c, session, actor)? {
                 return Ok(());
@@ -89,7 +119,17 @@ fn authorize_append_or_shared_run(
     }
     #[cfg(not(feature = "multiplayer"))]
     let _ = run;
-    authorize(c, session, actor, true)
+    match authorize(c, session, actor, true) {
+        Ok(()) => Ok(()),
+        Err(Error::Denied(_)) => crate::session_participation::authorize_in(
+            c,
+            actor,
+            session,
+            crate::SessionParticipationAction::Submit,
+        )
+        .map(|_| ()),
+        Err(error) => Err(error),
+    }
 }
 fn same_retry_destination(
     previous: &aw_agent_core::InvocationIdentity,
@@ -535,7 +575,9 @@ impl SessionHandle {
         // journalable for explicit inspection, never discarded/replayed.
         if matches!(
             &entry,
-            JournalEntry::InvocationStarted { .. }
+            JournalEntry::AuthoritySegmentStarted { .. }
+                | JournalEntry::ModelInvocationAdmitted { .. }
+                | JournalEntry::InvocationStarted { .. }
                 | JournalEntry::ToolStarted { .. }
                 | JournalEntry::ToolRevised { .. }
         ) {
@@ -613,14 +655,18 @@ impl SessionHandle {
                 })
             };
             match &entry {
-                JournalEntry::ToolDenied { record }
-                    if !proposed(&record.call)
-                        || already(&record.call.id)
-                        || revision(&record.call.id).is_some() =>
-                {
-                    return Err(Error::Denied(
-                        "denial must match one unstarted original assistant tool",
-                    ));
+                JournalEntry::ToolDenied { record } => {
+                    let matches_proposal = match revision(&record.call.id) {
+                        Some((original, revised, ..)) => {
+                            proposed(original) && revised == &record.call
+                        }
+                        None => proposed(&record.call),
+                    };
+                    if !matches_proposal || already(&record.call.id) {
+                        return Err(Error::Denied(
+                            "denial must match one unstarted original or approved revised assistant tool",
+                        ));
+                    }
                 }
                 JournalEntry::ToolRevised { original, .. }
                     if !proposed(original)
@@ -683,11 +729,224 @@ impl SessionHandle {
             }
         }
         let kind = match &entry {
+            JournalEntry::AuthoritySegmentStarted { segment } => {
+                segment.validate()?;
+                let mut q =
+                    db(tx.prepare("SELECT payload FROM run_events WHERE run_id=?1 ORDER BY seq"))?;
+                let prior = db(q.query_map([&run], |row| row.get::<_, String>(0)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|_| Error::Storage("cannot load prior AuthoritySegments"))?
+                    .into_iter()
+                    .map(|encoded| decode::<JournalEntry>(&encoded))
+                    .collect::<Result<Vec<_>>>()?;
+                let pending_provider: u32 = db(tx.query_row(
+                    "SELECT COUNT(*) - COUNT(CASE WHEN state='received' THEN 1 END)
+                     FROM invocation_receipts WHERE run_id=?1",
+                    [&run],
+                    |row| row.get(0),
+                ))?;
+                let mut open_tools = std::collections::BTreeSet::<String>::new();
+                for event in &prior {
+                    match event {
+                        JournalEntry::ToolStarted { record, .. } => {
+                            open_tools.insert(record.call.id.clone());
+                        }
+                        JournalEntry::ToolFinished { record } => {
+                            open_tools.remove(&record.call.id);
+                        }
+                        _ => {}
+                    }
+                }
+                if pending_provider != 0 || !open_tools.is_empty() {
+                    return Err(Error::Conflict(
+                        "AuthoritySegment may advance only at a settled provider/tool boundary",
+                    ));
+                }
+                let mut last = 0u32;
+                for existing in prior.iter().filter_map(|entry| match entry {
+                    JournalEntry::AuthoritySegmentStarted { segment } => Some(segment),
+                    _ => None,
+                }) {
+                    if existing.boundary_id == segment.boundary_id
+                        || existing.fingerprint == segment.fingerprint
+                    {
+                        return Err(Error::Denied(
+                            "AuthoritySegment boundary was already journaled",
+                        ));
+                    }
+                    last = last.max(existing.ordinal);
+                }
+                if segment.ordinal != last.saturating_add(1) {
+                    return Err(Error::Denied(
+                        "AuthoritySegment ordinal must advance exactly once",
+                    ));
+                }
+                "authority_segment_started"
+            }
+            JournalEntry::ModelInvocationAdmitted { admission } => {
+                admission.validate()?;
+                let mut q =
+                    db(tx.prepare("SELECT payload FROM run_events WHERE run_id=?1 ORDER BY seq"))?;
+                let prior = db(q.query_map([&run], |row| row.get::<_, String>(0)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|_| Error::Storage("cannot load prior model admissions"))?
+                    .into_iter()
+                    .map(|encoded| decode::<JournalEntry>(&encoded))
+                    .collect::<Result<Vec<_>>>()?;
+                let latest = prior
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        JournalEntry::AuthoritySegmentStarted { segment } => Some(segment),
+                        _ => None,
+                    })
+                    .ok_or(Error::Denied(
+                        "ModelInvocationAdmission requires an AuthoritySegment",
+                    ))?;
+                if admission.authority_segment != latest.ordinal
+                    || admission.authority_fingerprint != latest.fingerprint
+                {
+                    return Err(Error::Denied(
+                        "ModelInvocationAdmission is not bound to current AuthoritySegment",
+                    ));
+                }
+                if let Some(evidence) = latest.evidence.as_ref() {
+                    evidence.validate()?;
+                    evidence.validate_identity(&admission.identity)?;
+                    if evidence.actor != admission.identity.actor {
+                        return Err(Error::Denied(
+                            "ModelInvocationAdmission actor differs from AuthoritySegment actor",
+                        ));
+                    }
+                    let action = match latest.boundary {
+                        AuthorityBoundaryKind::Input => crate::SessionParticipationAction::Submit,
+                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
+                            crate::SessionParticipationAction::Control
+                        }
+                    };
+                    context::authorize_model_context_for_participation(
+                        &tx,
+                        &self.session,
+                        &branch,
+                        &admission.identity,
+                        action,
+                    )?;
+                } else {
+                    if admission.identity.actor != actor {
+                        return Err(Error::Denied(
+                            "legacy ModelInvocationAdmission actor differs from active run",
+                        ));
+                    }
+                    context::authorize_model_context(
+                        &tx,
+                        &self.session,
+                        &branch,
+                        &admission.identity,
+                    )?;
+                }
+                if prior.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        JournalEntry::ModelInvocationAdmitted { admission: old }
+                            if old.ordinal == admission.ordinal
+                                || old.invocation_id == admission.invocation_id
+                    )
+                }) {
+                    return Err(Error::Denied(
+                        "ModelInvocationAdmission identity already used",
+                    ));
+                }
+                let (last_ordinal, pending): (u32, u32) = db(tx.query_row(
+                    "SELECT COALESCE(MAX(ordinal),0),
+                            COUNT(*) - COUNT(CASE WHEN state='received' THEN 1 END)
+                     FROM invocation_receipts WHERE run_id=?1",
+                    [&run],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ))?;
+                if pending != 0 || last_ordinal.saturating_add(1) != admission.ordinal {
+                    return Err(Error::Denied(
+                        "ModelInvocationAdmission overlaps or skips a paid attempt",
+                    ));
+                }
+                "model_invocation_admitted"
+            }
             JournalEntry::InvocationStarted { ordinal, identity } => {
-                if identity.actor != actor || *ordinal == 0 || *ordinal > 32 {
+                if *ordinal == 0 || *ordinal > 32 {
                     return Err(Error::Denied("invocation identity/ordinal mismatch"));
                 }
-                context::authorize_model_context(&tx, &self.session, &branch, identity)?;
+                let mut q =
+                    db(tx.prepare("SELECT payload FROM run_events WHERE run_id=?1 ORDER BY seq"))?;
+                let prior = db(q.query_map([&run], |row| row.get::<_, String>(0)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|_| Error::Storage("cannot load prior invocation admission"))?
+                    .into_iter()
+                    .map(|encoded| decode::<JournalEntry>(&encoded))
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(segment) = prior.iter().rev().find_map(|event| match event {
+                    JournalEntry::AuthoritySegmentStarted { segment } => Some(segment),
+                    _ => None,
+                }) {
+                    let admission = prior
+                        .iter()
+                        .rev()
+                        .find_map(|event| match event {
+                            JournalEntry::ModelInvocationAdmitted { admission }
+                                if admission.ordinal == *ordinal =>
+                            {
+                                Some(admission)
+                            }
+                            _ => None,
+                        })
+                        .ok_or(Error::Denied(
+                            "segmented provider invocation lacks ModelInvocationAdmission",
+                        ))?;
+                    if &admission.identity != identity
+                        || admission.authority_segment != segment.ordinal
+                        || admission.authority_fingerprint != segment.fingerprint
+                    {
+                        return Err(Error::Denied(
+                            "provider invocation differs from its current AuthoritySegment admission",
+                        ));
+                    }
+                    if let Some(evidence) = segment.evidence.as_ref() {
+                        evidence.validate()?;
+                        evidence.validate_identity(identity)?;
+                        if evidence.actor != identity.actor {
+                            return Err(Error::Denied(
+                                "provider invocation actor differs from AuthoritySegment actor",
+                            ));
+                        }
+                        let action = match segment.boundary {
+                            AuthorityBoundaryKind::Input => {
+                                crate::SessionParticipationAction::Submit
+                            }
+                            AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
+                                crate::SessionParticipationAction::Control
+                            }
+                        };
+                        context::authorize_model_context_for_participation(
+                            &tx,
+                            &self.session,
+                            &branch,
+                            identity,
+                            action,
+                        )?;
+                    } else {
+                        if identity.actor != actor {
+                            return Err(Error::Denied(
+                                "legacy provider invocation actor differs from active run",
+                            ));
+                        }
+                        context::authorize_model_context(&tx, &self.session, &branch, identity)?;
+                    }
+                } else {
+                    if identity.actor != actor {
+                        return Err(Error::Denied(
+                            "unsegmented provider invocation actor differs from active run",
+                        ));
+                    }
+                    context::authorize_model_context(&tx, &self.session, &branch, identity)?;
+                }
                 // AW-P6-10H: original paid provider invocations are SERIAL
                 // and strictly ordinal. The primary key (run_id,ordinal)
                 // already bounds these rows to the immutable max 32 provider
@@ -932,11 +1191,16 @@ impl TurnJournal for SessionHandle {
         let identity = identity.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let c = this.store.connection()?;
                 if identity.actor != this.actor {
-                    return Err(Error::Denied("context caller differs from journal actor"));
+                    crate::session_participation::authorize_in(
+                        &c,
+                        &identity.actor,
+                        &this.session,
+                        crate::SessionParticipationAction::Submit,
+                    )?;
                 }
                 let expected = this.branch()?;
-                let c = this.store.connection()?;
                 let b = branch_in(&c, &this.session, &expected.id)?;
                 if b.head != expected.head || b.revision != expected.revision {
                     return Err(Error::Conflict(
@@ -949,6 +1213,80 @@ impl TurnJournal for SessionHandle {
             .map_err(|_| Error::Storage("context destination gate worker failed"))?
         })
     }
+    fn validate_context_for_segment<'a>(
+        &'a self,
+        identity: &'a aw_agent_core::InvocationIdentity,
+        segment: Option<&'a aw_agent_core::AuthoritySegment>,
+    ) -> JournalFuture<'a, ()> {
+        let this = self.clone();
+        let identity = identity.clone();
+        let segment = segment.cloned();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let c = this.store.connection()?;
+                if identity.actor != this.actor {
+                    let segment = segment.as_ref().ok_or(Error::Denied(
+                        "shared participant provider/effect requires an AuthoritySegment",
+                    ))?;
+                    let evidence = segment.evidence.as_ref().ok_or(Error::Denied(
+                        "shared participant AuthoritySegment lacks immutable evidence",
+                    ))?;
+                    evidence.validate()?;
+                    evidence.validate_identity(&identity)?;
+                    let action = match segment.boundary {
+                        AuthorityBoundaryKind::Input => crate::SessionParticipationAction::Submit,
+                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
+                            crate::SessionParticipationAction::Control
+                        }
+                    };
+                    let current = crate::session_participation::authorize_in(
+                        &c,
+                        &identity.actor,
+                        &this.session,
+                        action,
+                    )?;
+                    if current.membership_epoch != evidence.membership_epoch
+                        || current.audience_epoch != evidence.audience_epoch
+                        || current.owner
+                    {
+                        return Err(Error::Denied(
+                            "shared participant authority/audience changed after segment admission",
+                        ));
+                    }
+                }
+                let expected = this.branch()?;
+                let b = branch_in(&c, &this.session, &expected.id)?;
+                if b.head != expected.head || b.revision != expected.revision {
+                    return Err(Error::Conflict(
+                        "stored context changed; reload before inference",
+                    ));
+                }
+                if identity.actor != this.actor {
+                    let segment = segment.as_ref().ok_or(Error::Denied(
+                        "shared participant provider/effect requires an AuthoritySegment",
+                    ))?;
+                    let action = match segment.boundary {
+                        AuthorityBoundaryKind::Input => crate::SessionParticipationAction::Submit,
+                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
+                            crate::SessionParticipationAction::Control
+                        }
+                    };
+                    context::authorize_model_context_for_participation(
+                        &c,
+                        &this.session,
+                        &b,
+                        &identity,
+                        action,
+                    )
+                } else {
+                    context::authorize_model_context(&c, &this.session, &b, &identity)
+                }
+            })
+            .await
+            .map_err(|_| Error::Storage("segment context gate worker failed"))?
+        })
+    }
+
     fn additional_context(&self) -> JournalFuture<'_, Vec<aw_agent_core::ContextBlock>> {
         let this = self.clone();
         Box::pin(async move {
@@ -961,6 +1299,85 @@ impl TurnJournal for SessionHandle {
             .map_err(|_| Error::Storage("attachment worker failed"))?
         })
     }
+
+    fn additional_context_as<'a>(
+        &'a self,
+        identity: &'a aw_agent_core::InvocationIdentity,
+    ) -> JournalFuture<'a, Vec<aw_agent_core::ContextBlock>> {
+        let this = self.clone();
+        let identity = identity.clone();
+        let actor = identity.actor.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let c = this.store.connection()?;
+                let b = branch_in(&c, &this.session, &this.branch()?.id)?;
+                context::authorize_model_context(&c, &this.session, &b, &identity)?;
+                context::apply::pending_context(&c, &actor, &this.session, &b)
+            })
+            .await
+            .map_err(|_| Error::Storage("identity-aware attachment worker failed"))?
+        })
+    }
+
+    fn additional_context_for_segment<'a>(
+        &'a self,
+        identity: &'a aw_agent_core::InvocationIdentity,
+        segment: Option<&'a aw_agent_core::AuthoritySegment>,
+    ) -> JournalFuture<'a, Vec<aw_agent_core::ContextBlock>> {
+        let this = self.clone();
+        let identity = identity.clone();
+        let segment = segment.cloned();
+        let actor = identity.actor.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let c = this.store.connection()?;
+                let b = branch_in(&c, &this.session, &this.branch()?.id)?;
+                if identity.actor != this.actor {
+                    let segment = segment.as_ref().ok_or(Error::Denied(
+                        "shared participant attachment projection requires an AuthoritySegment",
+                    ))?;
+                    let evidence = segment.evidence.as_ref().ok_or(Error::Denied(
+                        "shared participant attachment projection lacks segment evidence",
+                    ))?;
+                    evidence.validate()?;
+                    evidence.validate_identity(&identity)?;
+                    let action = match segment.boundary {
+                        AuthorityBoundaryKind::Input => crate::SessionParticipationAction::Submit,
+                        AuthorityBoundaryKind::Steer | AuthorityBoundaryKind::Interrupt => {
+                            crate::SessionParticipationAction::Control
+                        }
+                    };
+                    let current = crate::session_participation::authorize_in(
+                        &c,
+                        &identity.actor,
+                        &this.session,
+                        action,
+                    )?;
+                    if current.membership_epoch != evidence.membership_epoch
+                        || current.audience_epoch != evidence.audience_epoch
+                        || current.owner
+                    {
+                        return Err(Error::Denied(
+                            "shared participant attachment authority/audience changed",
+                        ));
+                    }
+                    context::authorize_model_context_for_participation(
+                        &c,
+                        &this.session,
+                        &b,
+                        &identity,
+                        action,
+                    )?;
+                } else {
+                    context::authorize_model_context(&c, &this.session, &b, &identity)?;
+                }
+                context::apply::pending_context(&c, &actor, &this.session, &b)
+            })
+            .await
+            .map_err(|_| Error::Storage("segment-aware attachment worker failed"))?
+        })
+    }
+
     fn requires_output_gate(&self) -> JournalFuture<'_, bool> {
         let this = self.clone();
         Box::pin(async move {
@@ -1052,6 +1469,7 @@ fn phase34_after_result_commit_crash_hook() {}
 struct OriginalRunReceipts {
     invocations: Vec<InvocationRecord>,
     tool_records: Vec<ToolRecord>,
+    authority_segments: Vec<AuthoritySegment>,
     /// Actual provider Assistant messages stored in the SAME immutable run.
     /// A Turn's provider-bound context cannot invent System instructions,
     /// ToolCall proposals or assistant outcomes not found in this source.
@@ -1064,6 +1482,7 @@ fn original_run_receipts(c: &Connection, run: &str) -> Result<OriginalRunReceipt
     let mut tools = BTreeMap::<String, (usize, ToolRecord)>::new();
     let mut text = String::new();
     let mut assistants = Vec::new();
+    let mut authority_segments = Vec::new();
     let mut unfinished = false;
     let mut q =
         db(c.prepare("SELECT payload FROM run_events WHERE run_id=?1 ORDER BY seq LIMIT 513"))?;
@@ -1076,6 +1495,13 @@ fn original_run_receipts(c: &Connection, run: &str) -> Result<OriginalRunReceipt
         }
         let event: JournalEntry = decode(&db(row)?)?;
         match event {
+            JournalEntry::AuthoritySegmentStarted { segment } => {
+                authority_segments.push(segment);
+            }
+            JournalEntry::ModelInvocationAdmitted { .. } => {
+                // Admission evidence constrains paid dispatch but is not itself
+                // a provider result or Tool effect.
+            }
             JournalEntry::InvocationStarted { ordinal, identity } => {
                 invocations.insert(
                     ordinal,
@@ -1138,6 +1564,7 @@ fn original_run_receipts(c: &Connection, run: &str) -> Result<OriginalRunReceipt
     Ok(OriginalRunReceipts {
         invocations: invocations.into_values().collect(),
         tool_records,
+        authority_segments,
         assistants,
         assistant_text: text,
         has_unfinished_effect: unfinished,
@@ -1154,7 +1581,13 @@ fn original_run_receipts(c: &Connection, run: &str) -> Result<OriginalRunReceipt
 /// streaming `Turn.answer` may differ from the durable Assistant fragments.
 /// Thus we check the original roles/call names and complete immutable
 /// Assistant proposals, NEVER the optional Hook-visible Tool-result text.
-fn validate_original_context_projection(turn: &Turn, original: &OriginalRunReceipts) -> Result<()> {
+fn validate_original_context_projection(
+    c: &Connection,
+    session: &str,
+    branch: &str,
+    turn: &Turn,
+    original: &OriginalRunReceipts,
+) -> Result<()> {
     let Some((user, rest)) = turn.context_messages.split_first() else {
         // Historical empty traces and failed/recovered Turns have no retained
         // provider-bound context, and may still be kept as factual history.
@@ -1172,6 +1605,17 @@ fn validate_original_context_projection(turn: &Turn, original: &OriginalRunRecei
             "final Turn context must begin with original User prompt",
         ));
     }
+    let steer_segments = original
+        .authority_segments
+        .iter()
+        .filter(|segment| segment.boundary != AuthorityBoundaryKind::Input)
+        .collect::<Vec<_>>();
+    let steer_events = crate::actor_authority_steer::events(c, session)?;
+    let mut steer_facts = BTreeMap::<String, crate::AuthoritySteerFact>::new();
+    for fact in steer_events {
+        steer_facts.insert(fact.request.request_id.clone(), fact);
+    }
+    let mut next_steer = 0usize;
     let mut next_assistant = 0usize;
     for message in rest {
         match message.role {
@@ -1230,16 +1674,56 @@ fn validate_original_context_projection(turn: &Turn, original: &OriginalRunRecei
                     ));
                 }
             }
-            Role::System | Role::User => {
+            Role::System => {
                 return Err(Error::Denied(
-                    "final Turn cannot invent System or additional User context authority",
+                    "final Turn cannot invent System context authority",
                 ));
+            }
+            Role::User => {
+                if !message.tool_calls.is_empty()
+                    || message.tool_call_id.is_some()
+                    || message.name.is_some()
+                    || message.provider_context.is_some()
+                {
+                    return Err(Error::Denied(
+                        "same-Turn steering User context contains assistant/tool-only fields",
+                    ));
+                }
+                let segment = steer_segments.get(next_steer).ok_or(Error::Denied(
+                    "additional User context lacks immutable AuthoritySegment",
+                ))?;
+                let fact = steer_facts.get(&segment.boundary_id).ok_or(Error::Denied(
+                    "additional User context lacks encrypted steer custody",
+                ))?;
+                let payload_sha256 =
+                    format!("{:x}", sha2::Sha256::digest(message.content.as_bytes()));
+                if fact.request.session_id != session
+                    || fact.request.branch_id != branch
+                    || fact.request.turn_id != turn.id
+                    || !matches!(
+                        fact.state,
+                        crate::AuthoritySteerState::Accepted | crate::AuthoritySteerState::Applied
+                    )
+                    || fact.payload_sha256 != payload_sha256
+                    || fact.segment_ordinal != Some(segment.ordinal)
+                    || fact.segment_fingerprint != Some(segment.fingerprint)
+                {
+                    return Err(Error::Denied(
+                        "same-Turn User context differs from steer custody/segment evidence",
+                    ));
+                }
+                next_steer += 1;
             }
         }
     }
     if turn.outcome == Outcome::Completed && next_assistant != original.assistants.len() {
         return Err(Error::Denied(
             "completed Turn context omits original immutable provider Assistant messages",
+        ));
+    }
+    if turn.outcome == Outcome::Completed && next_steer != steer_segments.len() {
+        return Err(Error::Denied(
+            "completed Turn context omits an admitted same-Turn steering boundary",
         ));
     }
     Ok(())
@@ -1258,7 +1742,7 @@ fn persist_finish_in(c: &Connection, run: &str, mut turn: Turn, recovered: bool)
         return Err(Error::Storage("final turn differs from admitted intent"));
     }
     let original = original_run_receipts(c, run)?;
-    validate_original_context_projection(&turn, &original)?;
+    validate_original_context_projection(c, &session, &branch, &turn, &original)?;
     // The Turn is a PRESENTATION/REPLAY PROJECTION, not a writable source of
     // paid usage, provider identity or Tool outcome. Compare complete bounded
     // records to the immutable original started/finished/denied receipts.

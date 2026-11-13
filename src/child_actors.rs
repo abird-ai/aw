@@ -319,6 +319,46 @@ impl Service {
         task: &str,
         next_turn: u64,
     ) -> Result<ChildLease> {
+        self.attach_inner(durable, agent, selected, task, next_turn, None)
+    }
+
+    pub fn attach_delegated(
+        &self,
+        durable: &SubagentInfo,
+        agent: &Agent,
+        selected: &ProviderSelection,
+        task: &str,
+        next_turn: u64,
+        gate_name: &str,
+        gate_effect: Effect,
+    ) -> Result<ChildLease> {
+        if gate_name.is_empty()
+            || gate_name.len() > 128
+            || !gate_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))
+        {
+            return Err(Error::Denied("invalid delegated operation gate name"));
+        }
+        self.attach_inner(
+            durable,
+            agent,
+            selected,
+            task,
+            next_turn,
+            Some((gate_name, gate_effect)),
+        )
+    }
+
+    fn attach_inner(
+        &self,
+        durable: &SubagentInfo,
+        agent: &Agent,
+        selected: &ProviderSelection,
+        task: &str,
+        next_turn: u64,
+        delegated_gate: Option<(&str, Effect)>,
+    ) -> Result<ChildLease> {
         selected.revalidate()?;
         let info = self.inner.store.subagent(&self.inner.owner, &durable.id)?;
         if info.id != durable.id
@@ -415,7 +455,21 @@ impl Service {
         // container. Pin to the *existing, audited* subagent tool taxonomy;
         // a registered host/MCP extension cannot smuggle remote I/O into a
         // narrower Network::Deny Envelope merely by claiming Effect::Read.
-        if grants.iter().any(|grant| {
+        if let Some((gate_name, gate_effect)) = delegated_gate {
+            if grants.len() != 1
+                || grants.iter().any(|grant| {
+                    grant.kind != SourceKind::Host
+                        || grant.source != "trusted-host"
+                        || grant.source_epoch != 1
+                        || grant.name != gate_name
+                        || grant.effect != gate_effect
+                })
+            {
+                return Err(Error::Denied(
+                    "policy delegate Actor permits exactly one mapped original operation gate",
+                ));
+            }
+        } else if grants.iter().any(|grant| {
             grant.kind != SourceKind::Host
                 || grant.source != "trusted-host"
                 || grant.source_epoch != 1

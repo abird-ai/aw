@@ -4,31 +4,48 @@
 //! creates no second workflow database and never resurrects Jobs after restart.
 #[cfg(all(test, feature = "conformance"))]
 use crate::{binary, edit, lifecycle, patch, search, text};
-use crate::{process, shell, Error, Result};
+use crate::{
+    exposure::{ExposureCursor, ExposureIndex, ExposureOwner},
+    process, shell, Error, Result,
+};
 use aw_agent_core::tool::{ToolBindingAuthority, ToolBindingSnapshot};
-use aw_agent_core::{CancellationToken, PrincipalId, Tool as AgentTool, ToolContext, ToolOutput};
+use aw_agent_core::{
+    CancellationToken, ExecutionOwnershipScope, PrincipalId, Tool as AgentTool, ToolContext,
+    ToolOutput,
+};
 use aw_tools::{
+    execution_ref::{
+        AgentRef, ExecutionRef, ExecutionSegment, Handle, NodeCoordinate, ResolvedExecutionRef,
+    },
     filesystem::{
         batch::{Graph, NodeTool, Status},
         job::NodeState,
         job_manager::{
             plan_graph, semantic_hash, Error as JobManagerError, JobManager, Limits, NodePlan,
             NodePolicy, OutputAck, OutputOwner, OutputPage, OutputStream, ProcessSettlement,
-            ReplayDecision, ReplayPersist, ReservedExposedTaskAdmission, SemanticBudget,
+            ReplayDecision, ReplayPersist, ReservedExposedTaskAdmission, SemanticBudget, Snapshot,
             StartRequest, TaskAdmission,
         },
         schema::Tool as CoreTool,
         status::Primary,
     },
+    job_event::{
+        EventRuleSet, JobEventDelivery, JobEventKind, JobWakeMode, SourceEventBook,
+        SubscriptionUpdate,
+    },
     task_fence::TaskIdentity,
     ToolEffect as CoreEffect,
 };
+use base64::Engine as _;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 const NODE_WORK_BYTES: u64 = 64 * 1024 * 1024;
@@ -95,10 +112,7 @@ impl GraphParallelism {
                 .native()
                 .is_some_and(|tool| tool.action() == aw_tools::filesystem::access::Action::Read)
         });
-        let has_shell = graph
-            .steps()
-            .iter()
-            .any(|step| step.tool.native().is_none());
+        let has_shell = graph.steps().iter().any(|step| step.tool.is_shell());
         let mut width = self.max_width;
         if has_read {
             width = width.min(self.max_reads.load(Ordering::Acquire));
@@ -126,6 +140,47 @@ impl PreparedJob {
     pub fn semantic_hash(&self) -> [u8; 32] {
         self.semantic_hash
     }
+
+    fn replay_semantic_hash(&self, initial_wake: Option<(&str, &str, &EventRuleSet)>) -> [u8; 32] {
+        let Some((recipient, authority_ref, rules)) = initial_wake else {
+            return self.semantic_hash;
+        };
+        let mut hash = Sha256::new();
+        hash.update(b"aw-job-constructor-semantic-v2\0");
+        hash.update(self.semantic_hash);
+        hash.update((recipient.len() as u64).to_le_bytes());
+        hash.update(recipient.as_bytes());
+        hash.update((authority_ref.len() as u64).to_le_bytes());
+        hash.update(authority_ref.as_bytes());
+        for rule in rules.as_slice() {
+            let event = rule.event.as_str();
+            let mode = rule.mode.as_str();
+            hash.update((event.len() as u64).to_le_bytes());
+            hash.update(event.as_bytes());
+            hash.update((mode.len() as u64).to_le_bytes());
+            hash.update(mode.as_bytes());
+        }
+        hash.finalize().into()
+    }
+
+    pub(crate) fn node_count(&self) -> usize {
+        self.graph.steps().len()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GraphAdmissionReservation {
+    id: String,
+    task: TaskIdentity,
+    exposure_owner: crate::agent_jobs::FiniteExposureOwner,
+    exposure_ref: String,
+    exposed: bool,
+}
+
+impl GraphAdmissionReservation {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,14 +190,28 @@ pub enum AdmissionDecision {
     Unknown,
 }
 
+#[derive(Default)]
+struct JobEventState {
+    sources: HashMap<String, SourceEventBook>,
+    terminal_committed: HashSet<String>,
+}
+
 pub struct JobHost {
     manager: Arc<JobManager>,
+    exposure: Arc<ExposureIndex>,
+    agent_jobs: Arc<crate::agent_jobs::AgentJobRouterSlot>,
+    graph_policy: Arc<crate::operation_router::GraphPolicyRouterSlot>,
+    graph_host_tools: Arc<crate::operation_router::GraphHostToolSlot>,
     authority: ToolBindingAuthority,
     root: Arc<aw_platform::scoped_fs::Root>,
     session: String,
     branch: String,
     root_binding: [u8; 32],
+    agent_ref: Mutex<Option<AgentRef>>,
     transition_gate: Mutex<()>,
+    control_gate: tokio::sync::Mutex<()>,
+    events: Mutex<JobEventState>,
+    process_inputs: Mutex<HashMap<(String, usize), process::ProcessInput>>,
     shells: shell::ShellRegistry,
     native_tools: Arc<Vec<CoreTool>>,
     parallelism: Arc<GraphParallelism>,
@@ -150,11 +219,35 @@ pub struct JobHost {
     max_graph_nodes: usize,
 }
 
+struct PreparedGraphNodeExecutor {
+    host: Arc<JobHost>,
+    ctx: ToolContext,
+    id: String,
+    coordinate: usize,
+    cancellation: CancellationToken,
+}
+
+impl crate::operation_router::GraphNodeOriginalExecutor for PreparedGraphNodeExecutor {
+    fn execute<'a>(&'a self) -> crate::operation_router::GraphNodeExecutionFuture<'a> {
+        Box::pin(async move {
+            self.host
+                .execute_node_local(
+                    &self.ctx,
+                    &self.id,
+                    self.coordinate,
+                    self.cancellation.clone(),
+                )
+                .await
+        })
+    }
+}
+
 fn core_effect(effect: &aw_agent_core::ToolEffect) -> CoreEffect {
     match effect {
         aw_agent_core::ToolEffect::Read => CoreEffect::Read,
         aw_agent_core::ToolEffect::Write => CoreEffect::Write,
         aw_agent_core::ToolEffect::Process => CoreEffect::Process,
+        aw_agent_core::ToolEffect::Control => CoreEffect::Control,
         aw_agent_core::ToolEffect::Unknown => CoreEffect::Unknown,
     }
 }
@@ -179,7 +272,8 @@ fn binding_hash(actor: &PrincipalId, binding: &ToolBindingSnapshot) -> [u8; 32] 
         aw_agent_core::ToolEffect::Read => 0,
         aw_agent_core::ToolEffect::Write => 1,
         aw_agent_core::ToolEffect::Process => 2,
-        aw_agent_core::ToolEffect::Unknown => 3,
+        aw_agent_core::ToolEffect::Control => 3,
+        aw_agent_core::ToolEffect::Unknown => 4,
     }]);
     hash.finalize().into()
 }
@@ -332,6 +426,10 @@ pub(crate) struct JobHostConfig {
     pub shells: shell::ShellRegistry,
     pub native_tools: Arc<Vec<CoreTool>>,
     pub parallelism: Arc<GraphParallelism>,
+    pub exposure: Arc<ExposureIndex>,
+    pub agent_jobs: Arc<crate::agent_jobs::AgentJobRouterSlot>,
+    pub graph_policy: Arc<crate::operation_router::GraphPolicyRouterSlot>,
+    pub graph_host_tools: Arc<crate::operation_router::GraphHostToolSlot>,
     pub max_graph_nodes: usize,
 }
 
@@ -358,6 +456,10 @@ impl JobHost {
                 parallelism: Arc::new(GraphParallelism::new(
                     crate::LocalToolConcurrency::default(),
                 )?),
+                exposure: Arc::new(ExposureIndex::new(limits.max_retained_jobs)?),
+                agent_jobs: Arc::new(crate::agent_jobs::AgentJobRouterSlot::default()),
+                graph_policy: Arc::new(crate::operation_router::GraphPolicyRouterSlot::default()),
+                graph_host_tools: Arc::new(crate::operation_router::GraphHostToolSlot::default()),
                 max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
             },
         )
@@ -375,6 +477,10 @@ impl JobHost {
             shells,
             native_tools,
             parallelism,
+            exposure,
+            agent_jobs,
+            graph_policy,
+            graph_host_tools,
             max_graph_nodes,
         } = config;
         for value in [&session, &branch] {
@@ -404,12 +510,20 @@ impl JobHost {
                 JobManager::new(tool_limits.jobs)
                     .map_err(|_| Error::Config("invalid shared JobManager limits".into()))?,
             ),
+            exposure,
+            agent_jobs,
+            graph_policy,
+            graph_host_tools,
             authority,
             root,
             session,
             branch,
             root_binding,
+            agent_ref: Mutex::new(None),
             transition_gate: Mutex::new(()),
+            control_gate: tokio::sync::Mutex::new(()),
+            events: Mutex::new(JobEventState::default()),
+            process_inputs: Mutex::new(HashMap::new()),
             shells,
             native_tools,
             parallelism,
@@ -422,7 +536,504 @@ impl JobHost {
         &self.manager
     }
 
+    fn finite_terminal_mode(mode: JobWakeMode) -> Result<JobWakeMode> {
+        match mode {
+            JobWakeMode::Auto | JobWakeMode::Queue => Ok(JobWakeMode::Queue),
+            JobWakeMode::Steer | JobWakeMode::Interrupt => Err(Error::Denied(
+                "finite result/settled wake supports only auto or queue until attention-capable control is captured",
+            )),
+        }
+    }
+
+    pub(crate) fn subscribe_finite(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        node: Option<usize>,
+        expected_revision: Option<u64>,
+        recipient_ref: &str,
+        recipient_authority_ref: &str,
+        rules: EventRuleSet,
+    ) -> Result<(String, SubscriptionUpdate)> {
+        let _transition = self
+            .transition_gate
+            .lock()
+            .map_err(|_| Error::Protocol("Job transition gate poisoned"))?;
+        if node.is_some() {
+            return Err(Error::Denied(
+                "initial finite jobs_subscribe targets a Process/Graph Job root",
+            ));
+        }
+        if !self.payload_authorized(actor, id) {
+            return Err(Error::Denied("Job subscription source is not authorized"));
+        }
+        let snapshot = self
+            .manager
+            .runtime_snapshot(id)
+            .map_err(|_| Error::Denied("Job subscription source is unavailable"))?;
+        if expected_revision.is_some_and(|revision| revision != snapshot.sequence) {
+            return Err(Error::Conflict("stale Job revision"));
+        }
+        for rule in rules.as_slice() {
+            match rule.event {
+                JobEventKind::Result | JobEventKind::Settled => {
+                    Self::finite_terminal_mode(rule.mode)?;
+                }
+                JobEventKind::Attention => {
+                    return Err(Error::Denied(
+                        "finite Job source does not expose attention events",
+                    ))
+                }
+            }
+        }
+        if let (Some(result), Some(settled)) = (
+            rules.get(JobEventKind::Result),
+            rules.get(JobEventKind::Settled),
+        ) {
+            if Self::finite_terminal_mode(result)? != Self::finite_terminal_mode(settled)? {
+                return Err(Error::Denied(
+                    "same terminal checkpoint cannot request incompatible wake modes",
+                ));
+            }
+        }
+        let canonical = self.execution_ref(id, None)?.canonical();
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| Error::Protocol("Job event source state poisoned"))?;
+        let update = events
+            .sources
+            .entry(canonical.clone())
+            .or_default()
+            .replace(recipient_ref, recipient_authority_ref, rules)
+            .map_err(Error::Denied)?;
+        Ok((canonical, update))
+    }
+
+    pub(crate) fn commit_finite_terminal_events(&self, id: &str) -> Result<Vec<JobEventDelivery>> {
+        let _transition = self
+            .transition_gate
+            .lock()
+            .map_err(|_| Error::Protocol("Job transition gate poisoned"))?;
+        let snapshot = self
+            .manager
+            .runtime_snapshot(id)
+            .map_err(|_| Error::Denied("Job event source is unavailable"))?;
+        if snapshot.lifecycle != aw_tools::filesystem::job::Lifecycle::Terminal {
+            return Ok(Vec::new());
+        }
+        let canonical = self.execution_ref(id, None)?.canonical();
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| Error::Protocol("Job event source state poisoned"))?;
+        if !events.terminal_committed.insert(canonical.clone()) {
+            return Ok(Vec::new());
+        }
+        let deliveries = events
+            .sources
+            .entry(canonical.clone())
+            .or_default()
+            .commit(&canonical, &[JobEventKind::Result, JobEventKind::Settled])
+            .map_err(Error::Denied)?;
+        events.sources.remove(&canonical);
+        Ok(deliveries)
+    }
+
+    pub(crate) async fn deliver_finite_terminal_events(&self, id: &str) {
+        let deliveries = match self.commit_finite_terminal_events(id) {
+            Ok(deliveries) => deliveries,
+            Err(_) => return,
+        };
+        if deliveries.is_empty() {
+            return;
+        }
+        let Ok(Some(router)) = self.agent_jobs.current() else {
+            return;
+        };
+        for delivery in deliveries {
+            // Source commitment is already factual. Receiver revocation or
+            // admission failure suppresses future work without rewriting it.
+            let _ = router.admit_event(delivery).await;
+        }
+    }
+
+    pub(crate) fn bind_execution_owner(&self, ctx: &ToolContext) -> Result<AgentRef> {
+        let binding = ctx
+            .execution_owner
+            .as_ref()
+            .ok_or(Error::Denied("Job execution requires a bound Agent owner"))?;
+        if ctx.scope.is_some()
+            && (binding.session_id() != self.session || binding.branch_id() != self.branch)
+        {
+            return Err(Error::Denied(
+                "Job execution owner differs from the bound Session/branch",
+            ));
+        }
+        let parsed = ExecutionRef::parse(binding.canonical_ref())
+            .map_err(|_| Error::Denied("invalid canonical Agent execution owner"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent execution owner"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied("Job execution owner must be an Agent root"));
+        }
+        let owner = resolved.agent_ref().clone();
+        let mut current = self
+            .agent_ref
+            .lock()
+            .map_err(|_| Error::Protocol("Job Agent owner binding poisoned"))?;
+        match current.as_ref() {
+            None => *current = Some(owner.clone()),
+            Some(bound) if bound == &owner => {}
+            Some(_) => {
+                return Err(Error::Conflict(
+                    "live Job namespace cannot be rebound to another Agent",
+                ))
+            }
+        }
+        Ok(owner)
+    }
+
+    fn bound_agent_ref(&self) -> Result<AgentRef> {
+        self.agent_ref
+            .lock()
+            .map_err(|_| Error::Protocol("Job Agent owner binding poisoned"))?
+            .clone()
+            .ok_or(Error::Denied("Job namespace has no bound Agent owner"))
+    }
+
+    fn finite_exposure_identity(
+        &self,
+        id: &str,
+        task: &TaskIdentity,
+    ) -> Result<(crate::agent_jobs::FiniteExposureOwner, String)> {
+        let agent = self.bound_agent_ref()?;
+        if task.session != self.session || task.branch != self.branch {
+            return Err(Error::Denied(
+                "finite Job exposure task differs from bound Session",
+            ));
+        }
+        let owner = crate::agent_jobs::FiniteExposureOwner {
+            canonical_agent_ref: agent.canonical(),
+            actor: task.actor.clone(),
+            session_id: task.session.clone(),
+            branch_id: task.branch.clone(),
+        };
+        let reference = ResolvedExecutionRef::new(
+            agent,
+            vec![
+                ExecutionSegment::Turn(
+                    Handle::new(task.turn_id.to_string())
+                        .map_err(|_| Error::Protocol("invalid Job Turn handle"))?,
+                ),
+                ExecutionSegment::Job(
+                    Handle::new(id.to_owned())
+                        .map_err(|_| Error::Protocol("invalid Job handle"))?,
+                ),
+            ],
+        )
+        .map_err(|_| Error::Protocol("cannot construct finite Job exposure ref"))?
+        .canonical();
+        Ok((owner, reference))
+    }
+
+    fn finite_exposure_for_id(
+        &self,
+        id: &str,
+    ) -> Result<(crate::agent_jobs::FiniteExposureOwner, String)> {
+        let task = self
+            .manager
+            .task_binding(id)
+            .map_err(|_| Error::Denied("Job routing identity is unavailable"))?;
+        self.finite_exposure_identity(id, &task)
+    }
+
+    fn reserve_finite_exposure(
+        &self,
+        id: &str,
+        task: &TaskIdentity,
+    ) -> Result<(crate::agent_jobs::FiniteExposureOwner, String)> {
+        self.exposure.reserve_finite(id)?;
+        let identity = self.finite_exposure_identity(id, task)?;
+        if let Some(router) = self.agent_jobs.current()? {
+            if let Err(error) = router.reserve_finite(
+                &identity.0,
+                &identity.1,
+                self.tool_limits.jobs.max_retained_jobs,
+            ) {
+                let _ = self.exposure.release_unpublished_finite(id);
+                return Err(error);
+            }
+        }
+        Ok(identity)
+    }
+
+    fn publish_finite_exposure(&self, id: &str) -> Result<()> {
+        let (owner, reference) = self.finite_exposure_for_id(id)?;
+        if let Some(router) = self.agent_jobs.current()? {
+            router.publish_finite(&owner, &reference)?;
+        }
+        self.exposure.publish_finite(id)?;
+        Ok(())
+    }
+
+    fn release_unpublished_finite_exposure(
+        &self,
+        id: &str,
+        owner: &crate::agent_jobs::FiniteExposureOwner,
+        reference: &str,
+    ) -> Result<()> {
+        self.exposure.release_unpublished_finite(id)?;
+        if let Some(router) = self.agent_jobs.current()? {
+            router.release_unpublished_finite(owner, reference)?;
+        }
+        Ok(())
+    }
+
+    fn discard_unstarted_with_exposure(&self, id: &str) -> Result<()> {
+        let (owner, reference) = self.finite_exposure_for_id(id)?;
+        if let Ok(mut events) = self.events.lock() {
+            events.sources.remove(&reference);
+            events.terminal_committed.remove(&reference);
+        }
+        self.manager
+            .discard_unstarted(id)
+            .map_err(|_| Error::Protocol("provisional Job cleanup failed"))?;
+        self.release_unpublished_finite_exposure(id, &owner, &reference)
+    }
+
+    pub fn jobs_list_authority_fingerprint(&self, actor: &PrincipalId) -> Result<[u8; 32]> {
+        let binding = self
+            .authority
+            .permitted_binding(actor, "jobs_list")
+            .map_err(|_| Error::Denied("jobs_list authority is not live"))?;
+        Ok(binding_hash(actor, &binding))
+    }
+
+    pub fn execution_ref(&self, id: &str, node: Option<usize>) -> Result<ResolvedExecutionRef> {
+        let task = self
+            .manager
+            .task_binding(id)
+            .map_err(|_| Error::Denied("Job routing identity is unavailable"))?;
+        let mut suffix = vec![
+            ExecutionSegment::Turn(
+                Handle::new(task.turn_id.to_string())
+                    .map_err(|_| Error::Protocol("invalid Job Turn handle"))?,
+            ),
+            ExecutionSegment::Job(
+                Handle::new(id.to_owned()).map_err(|_| Error::Protocol("invalid Job handle"))?,
+            ),
+        ];
+        if let Some(node) = node {
+            let node = u32::try_from(node)
+                .ok()
+                .and_then(|value| NodeCoordinate::new(value).ok())
+                .ok_or(Error::Denied("Job node coordinate is invalid"))?;
+            suffix.push(ExecutionSegment::Node(node));
+        }
+        ResolvedExecutionRef::new(self.bound_agent_ref()?, suffix)
+            .map_err(|_| Error::Protocol("cannot construct canonical Job ref"))
+    }
+
+    pub fn resolve_job_ref(&self, requested: &str) -> Result<(String, Option<usize>)> {
+        let parsed =
+            ExecutionRef::parse(requested).map_err(|_| Error::Denied("invalid execution ref"))?;
+        let owner = self.bound_agent_ref()?;
+        let resolved = parsed
+            .resolve(Some(&owner), None)
+            .map_err(|_| Error::Denied("execution ref needs unavailable context"))?;
+        if resolved.agent_ref() != &owner {
+            return Err(Error::Denied("Job ref is outside the current Agent"));
+        }
+        let suffix = resolved.suffix();
+        let (turn, job, node) = match suffix {
+            [ExecutionSegment::Turn(turn), ExecutionSegment::Job(job)] => (turn, job, None),
+            [ExecutionSegment::Turn(turn), ExecutionSegment::Job(job), ExecutionSegment::Node(node)] => {
+                (turn, job, Some(node.get() as usize))
+            }
+            _ => {
+                return Err(Error::Denied(
+                    "finite Job ref must be t:<turn>/j:<job>[/n:<coordinate>]",
+                ))
+            }
+        };
+        let id = job.as_str().to_owned();
+        let task = self
+            .manager
+            .task_binding(&id)
+            .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
+        if turn.as_str() != task.turn_id.to_string() {
+            return Err(Error::Denied("Job ref Turn does not match retained Job"));
+        }
+        self.manager
+            .get(&id)
+            .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
+        Ok((id, node))
+    }
+
+    fn cursor_mac(&self, actor: &PrincipalId, payload: &[u8]) -> Result<[u8; 32]> {
+        let binding = self
+            .authority
+            .permitted_binding(actor, "jobs_list")
+            .map_err(|_| Error::Denied("jobs_list authority is not live"))?;
+        let mut hash = Sha256::new();
+        hash.update(b"aw-jobs-list-cursor-v2\0");
+        hash.update(self.root_binding);
+        hash.update(binding_hash(actor, &binding));
+        hash.update(payload);
+        Ok(hash.finalize().into())
+    }
+
+    fn encode_list_cursor(&self, actor: &PrincipalId, cursor: &ExposureCursor) -> Result<String> {
+        let key = cursor.owner_key.as_bytes();
+        let mut payload = Vec::with_capacity(10 + key.len() + 32);
+        payload.extend_from_slice(&cursor.position.to_le_bytes());
+        payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        payload.extend_from_slice(key);
+        let mac = self.cursor_mac(actor, &payload)?;
+        payload.extend_from_slice(&mac);
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
+    }
+
+    fn decode_list_cursor(&self, actor: &PrincipalId, encoded: &str) -> Result<ExposureCursor> {
+        if encoded.is_empty() || encoded.len() > 512 {
+            return Err(Error::Denied("invalid jobs_list cursor"));
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| Error::Denied("invalid jobs_list cursor"))?;
+        if bytes.len() < 42 {
+            return Err(Error::Denied("invalid jobs_list cursor"));
+        }
+        let payload_len = bytes.len() - 32;
+        let (payload, supplied_mac) = bytes.split_at(payload_len);
+        if self.cursor_mac(actor, payload)?.as_slice() != supplied_mac {
+            return Err(Error::Denied("jobs_list cursor is stale or unauthorized"));
+        }
+        let position = u64::from_le_bytes(
+            payload[0..8]
+                .try_into()
+                .map_err(|_| Error::Denied("invalid jobs_list cursor"))?,
+        );
+        let key_len = u16::from_le_bytes(
+            payload[8..10]
+                .try_into()
+                .map_err(|_| Error::Denied("invalid jobs_list cursor"))?,
+        ) as usize;
+        if position == 0 || payload.len() != 10 + key_len {
+            return Err(Error::Denied("invalid jobs_list cursor"));
+        }
+        let owner_key = std::str::from_utf8(&payload[10..])
+            .map_err(|_| Error::Denied("invalid jobs_list cursor"))?
+            .to_owned();
+        if owner_key.is_empty() || owner_key.len() > 2048 || owner_key.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid jobs_list cursor"));
+        }
+        Ok(ExposureCursor {
+            position,
+            owner_key,
+        })
+    }
+
+    pub fn list_jobs(
+        &self,
+        actor: &PrincipalId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Snapshot>, Option<String>)> {
+        let cursor = cursor
+            .map(|value| self.decode_list_cursor(actor, value))
+            .transpose()?;
+        let (items, next_cursor) = self.exposure.list(cursor.as_ref(), limit)?;
+        let mut jobs = Vec::with_capacity(items.len());
+        for item in items {
+            match item.owner {
+                ExposureOwner::Finite(id) => {
+                    let snapshot = self.manager.get(&id).map_err(|_| {
+                        Error::Protocol("published finite Job owner is unavailable")
+                    })?;
+                    jobs.push(snapshot);
+                }
+                ExposureOwner::Agent(_) => {
+                    return Err(Error::Protocol(
+                        "Agent exposure reached finite Job projection before Agent routing was installed",
+                    ));
+                }
+            }
+        }
+        let next = next_cursor
+            .as_ref()
+            .map(|cursor| self.encode_list_cursor(actor, cursor))
+            .transpose()?;
+        Ok((jobs, next))
+    }
+
+    pub async fn send_process_input(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        coordinate: usize,
+        expected_revision: Option<u64>,
+        bytes: Option<Vec<u8>>,
+        close: bool,
+    ) -> Result<()> {
+        if bytes.is_some() == close {
+            return Err(Error::Denied(
+                "process input requires exactly one of bytes or close",
+            ));
+        }
+        let _control = self.control_gate.lock().await;
+        let snapshot = self
+            .manager
+            .get(id)
+            .map_err(|_| Error::Denied("Process Job is not exposed or missing"))?;
+        if snapshot.lifecycle != aw_tools::filesystem::job::Lifecycle::Running {
+            return Err(Error::Denied("Process Job is not running"));
+        }
+        // jobs_send's own Control grant is checked by Agent dispatch. Process
+        // input is a separate non-model host capability and remains revocable
+        // independently from the original shell launch binding.
+        self.authority
+            .permits_capability(
+                actor,
+                "process.input",
+                &aw_agent_core::ToolSource::trusted_host(),
+                &aw_agent_core::ToolEffect::Control,
+            )
+            .map_err(|_| Error::Denied("process.input authority is not live"))?;
+        if !self.node_live(actor, id, coordinate) {
+            return Err(Error::Denied(
+                "Process input authority is not live for this shell node",
+            ));
+        }
+        let input = self
+            .process_inputs
+            .lock()
+            .map_err(|_| Error::Protocol("Process input registry poisoned"))?
+            .get(&(id.to_owned(), coordinate))
+            .cloned()
+            .ok_or(Error::Denied("Process stdin is not open"))?;
+        // Authorization/target existence failures above are no-effect and do
+        // not advance public state. Compare-and-act linearizes immediately
+        // before bytes/EOF are handed to the sole Process owner.
+        self.manager
+            .compare_and_bump_revision(id, expected_revision)
+            .map_err(|_| Error::Conflict("stale Job revision"))?;
+        if let Some(bytes) = bytes {
+            input.write(bytes).await
+        } else {
+            input.close().await
+        }
+    }
+
     fn task_identity(&self, ctx: &ToolContext) -> Result<TaskIdentity> {
+        self.bind_execution_owner(ctx)?;
+        let binding = ctx
+            .execution_owner
+            .as_ref()
+            .ok_or(Error::Denied("Job execution requires a bound Agent owner"))?;
         let (session, branch) = if let Some(scope) = ctx.scope.as_ref() {
             if scope.session_id != self.session || scope.branch_id != self.branch {
                 return Err(Error::Denied(
@@ -431,10 +1042,12 @@ impl JobHost {
             }
             (scope.session_id.clone(), scope.branch_id.clone())
         } else {
-            // Explicit memory-only Agent execution has no durable journal scope.
-            // The JobRuntime supplies one host-minted live-process namespace;
-            // model arguments never choose these values.
-            (self.session.clone(), self.branch.clone())
+            // Contextless SDK/host calls must explicitly select an existing
+            // authorized Agent owner; the parser/runtime never creates a:0.
+            (
+                binding.session_id().to_owned(),
+                binding.branch_id().to_owned(),
+            )
         };
         let task = TaskIdentity {
             actor: ctx.actor.as_str().to_owned(),
@@ -454,15 +1067,23 @@ impl JobHost {
     }
 
     fn resolve_node(&self, name: &str) -> Option<NodeTool> {
-        if let Some(native) = self
-            .native_tools
-            .iter()
-            .copied()
-            .find(|tool| tool.name() == name)
-        {
-            return Some(NodeTool::Native(native));
+        let operation = aw_tools::OperationId::from_model_name(name)?;
+        if operation == aw_tools::OperationId::Agent {
+            return self
+                .graph_host_tools
+                .binding(operation)
+                .ok()
+                .flatten()
+                .map(|_| NodeTool::Agent);
         }
-        self.shells.resolve(name)
+        let node = NodeTool::from_operation(operation)?;
+        if let Some(native) = node.native() {
+            return self
+                .native_tools
+                .contains(&native)
+                .then_some(NodeTool::Native(native));
+        }
+        self.shells.resolve(operation.model_name())
     }
 
     fn validate_node(&self, node: NodeTool, arguments: &Value) -> bool {
@@ -472,14 +1093,38 @@ impl JobHost {
         if let Some(native) = node.native() {
             return canonical_arguments(native, arguments, self.tool_limits);
         }
-        self.shells
-            .get(node)
-            .is_some_and(|shell| shell.validate(arguments).is_ok())
+        if node.is_shell() {
+            return self
+                .shells
+                .get(node)
+                .is_some_and(|shell| shell.validate(arguments).is_ok());
+        }
+        if node.is_agent() {
+            return self
+                .graph_host_tools
+                .binding(aw_tools::OperationId::Agent)
+                .ok()
+                .flatten()
+                .is_some_and(|binding| {
+                    let tool = binding.tool();
+                    tool.is_available() && tool.validate(arguments).is_ok()
+                });
+        }
+        false
     }
 
     fn plans_for_graph(&self, ctx: &ToolContext, graph: &Graph) -> Result<Vec<NodePlan>> {
+        self.plans_for_graph_with_overrides(ctx, graph, &BTreeMap::new())
+    }
+
+    fn plans_for_graph_with_overrides(
+        &self,
+        ctx: &ToolContext,
+        graph: &Graph,
+        overrides: &BTreeMap<u32, aw_tools::filesystem::footprint::Footprint>,
+    ) -> Result<Vec<NodePlan>> {
         let one = graph.steps().len() == 1;
-        plan_graph(graph, |_, step| {
+        plan_graph(graph, |coordinate, step| {
             if !graph_arguments_are_semantic(&step.arguments) {
                 return Err(());
             }
@@ -497,7 +1142,7 @@ impl JobHost {
                         one,
                         self.tool_limits.result_bytes,
                     )
-                } else {
+                } else if step.tool.is_shell() {
                     let shell = self.shells.get(step.tool).ok_or(())?;
                     let prepared = shell.prepare(&step.arguments).map_err(|_| ())?;
                     (
@@ -506,7 +1151,30 @@ impl JobHost {
                         false,
                         SHELL_RESULT_BYTES,
                     )
+                } else if step.tool.is_agent() {
+                    let host = self
+                        .graph_host_tools
+                        .binding(aw_tools::OperationId::Agent)
+                        .map_err(|_| ())?
+                        .ok_or(())?;
+                    let tool = host.tool();
+                    if !tool.is_available() || tool.validate(&step.arguments).is_err() {
+                        return Err(());
+                    }
+                    (
+                        aw_tools::filesystem::footprint::Footprint::unknown(true, true),
+                        host.runtime_binding(),
+                        one,
+                        self.tool_limits.result_bytes,
+                    )
+                } else {
+                    return Err(());
                 };
+            let footprint = if let Some(override_footprint) = overrides.get(&(coordinate as u32)) {
+                footprint.union(override_footprint).map_err(|_| ())?
+            } else {
+                footprint
+            };
             Ok::<_, ()>(NodePolicy {
                 budget: SemanticBudget {
                     work_bytes: NODE_WORK_BYTES,
@@ -542,9 +1210,18 @@ impl JobHost {
     }
 
     pub fn prepare(&self, ctx: &ToolContext, graph_input: &Value) -> Result<PreparedJob> {
+        self.prepare_with_footprints(ctx, graph_input, &BTreeMap::new())
+    }
+
+    pub(crate) fn prepare_with_footprints(
+        &self,
+        ctx: &ToolContext,
+        graph_input: &Value,
+        overrides: &BTreeMap<u32, aw_tools::filesystem::footprint::Footprint>,
+    ) -> Result<PreparedJob> {
         let task = self.task_identity(ctx)?;
         let graph = self.compile_graph(graph_input)?;
-        let plans = self.plans_for_graph(ctx, &graph)?;
+        let plans = self.plans_for_graph_with_overrides(ctx, &graph, overrides)?;
         let semantic_hash = semantic_hash(&graph, &plans)
             .map_err(|_| Error::Denied("Job semantic identity failed"))?;
         let width = self.parallelism.width(&graph);
@@ -573,22 +1250,6 @@ impl JobHost {
             .map_err(job_admission_error)
     }
 
-    fn admit_exposed_with_id(&self, id: &str, prepared: PreparedJob) -> Result<()> {
-        self.manager
-            .admit_task(
-                prepared.graph,
-                prepared.plans,
-                TaskAdmission {
-                    id,
-                    task: &prepared.task,
-                    admission_sequence: 1,
-                    width: prepared.width,
-                    exposed: true,
-                },
-            )
-            .map_err(job_admission_error)
-    }
-
     fn reserve_exposed_with_id(&self, id: &str, prepared: PreparedJob) -> Result<()> {
         self.manager
             .admit_reserved_exposed_task(
@@ -604,15 +1265,140 @@ impl JobHost {
             .map_err(job_admission_error)
     }
 
+    pub(crate) fn reserve_graph_admission(
+        &self,
+        ctx: &ToolContext,
+        exposed: bool,
+    ) -> Result<GraphAdmissionReservation> {
+        let task = self.task_identity(ctx)?;
+        let id = new_job_id()?;
+        self.manager
+            .reserve_task_admission(&id, exposed)
+            .map_err(job_admission_error)?;
+        let (exposure_owner, exposure_ref) = match self.reserve_finite_exposure(&id, &task) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.manager.release_task_admission(&id);
+                return Err(error);
+            }
+        };
+        Ok(GraphAdmissionReservation {
+            id,
+            task,
+            exposure_owner,
+            exposure_ref,
+            exposed,
+        })
+    }
+
+    pub(crate) fn release_graph_admission(
+        &self,
+        reservation: &GraphAdmissionReservation,
+    ) -> Result<()> {
+        let manager = self.manager.release_task_admission(&reservation.id);
+        let exposure = self.release_unpublished_finite_exposure(
+            &reservation.id,
+            &reservation.exposure_owner,
+            &reservation.exposure_ref,
+        );
+        manager.map_err(job_admission_error)?;
+        exposure
+    }
+
+    pub(crate) fn admit_graph_reservation(
+        &self,
+        reservation: GraphAdmissionReservation,
+        prepared: PreparedJob,
+    ) -> Result<String> {
+        self.admit_graph_reservation_with_wake(reservation, prepared, None, None)
+    }
+
+    pub(crate) fn admit_graph_reservation_with_wake(
+        &self,
+        reservation: GraphAdmissionReservation,
+        prepared: PreparedJob,
+        actor: Option<&PrincipalId>,
+        initial_wake: Option<(&str, &str, EventRuleSet)>,
+    ) -> Result<String> {
+        if prepared.task != reservation.task {
+            let _ = self.release_graph_admission(&reservation);
+            return Err(Error::Denied(
+                "pre-seal Graph policy changed the owning Task identity",
+            ));
+        }
+        let admission = self.manager.admit_pre_reserved_task(
+            prepared.graph,
+            prepared.plans,
+            TaskAdmission {
+                id: &reservation.id,
+                task: &reservation.task,
+                admission_sequence: 1,
+                width: prepared.width,
+                exposed: reservation.exposed,
+            },
+        );
+        if let Err(error) = admission {
+            let _ = self.manager.release_task_admission(&reservation.id);
+            let _ = self.release_unpublished_finite_exposure(
+                &reservation.id,
+                &reservation.exposure_owner,
+                &reservation.exposure_ref,
+            );
+            return Err(job_admission_error(error));
+        }
+        if let Some((recipient, authority_ref, rules)) = initial_wake {
+            let actor = actor.ok_or(Error::Protocol(
+                "initial Graph wake registration lacks authenticated actor",
+            ))?;
+            if let Err(error) = self.subscribe_finite(
+                actor,
+                &reservation.id,
+                None,
+                None,
+                recipient,
+                authority_ref,
+                rules,
+            ) {
+                let _ = self.discard_unstarted_with_exposure(&reservation.id);
+                return Err(error);
+            }
+        }
+        if reservation.exposed {
+            if let Err(error) = self.publish_finite_exposure(&reservation.id) {
+                let _ = self.discard_unstarted_with_exposure(&reservation.id);
+                return Err(error);
+            }
+            self.manager
+                .expose(&reservation.id)
+                .map_err(|_| Error::Protocol("reserved Graph exposure invariant failed"))?;
+        }
+        Ok(reservation.id)
+    }
+
     pub fn admit(&self, prepared: PreparedJob) -> Result<String> {
         let id = new_job_id()?;
-        self.admit_with_id(&id, prepared)?;
+        let (owner, reference) = self.reserve_finite_exposure(&id, &prepared.task)?;
+        if let Err(error) = self.admit_with_id(&id, prepared) {
+            let _ = self.release_unpublished_finite_exposure(&id, &owner, &reference);
+            return Err(error);
+        }
         Ok(id)
     }
 
     pub fn admit_exposed(&self, prepared: PreparedJob) -> Result<String> {
         let id = new_job_id()?;
-        self.admit_exposed_with_id(&id, prepared)?;
+        let (owner, reference) = self.reserve_finite_exposure(&id, &prepared.task)?;
+        if let Err(error) = self.reserve_exposed_with_id(&id, prepared) {
+            let _ = self.release_unpublished_finite_exposure(&id, &owner, &reference);
+            return Err(error);
+        }
+        if let Err(error) = self.publish_finite_exposure(&id) {
+            let _ = self.discard_unstarted_with_exposure(&id);
+            return Err(error);
+        }
+        self.manager
+            .expose(&id)
+            .map_err(|_| Error::Protocol("reserved Job exposure invariant failed"))?;
         Ok(id)
     }
 
@@ -625,7 +1411,7 @@ impl JobHost {
         namespace: &str,
         request_id: &str,
     ) -> Result<AdmissionDecision> {
-        self.admit_replay_with_visibility(prepared, namespace, request_id, false)
+        self.admit_replay_with_visibility(prepared, namespace, request_id, false, None, None)
     }
 
     pub fn admit_replay_exposed(
@@ -634,7 +1420,28 @@ impl JobHost {
         namespace: &str,
         request_id: &str,
     ) -> Result<AdmissionDecision> {
-        self.admit_replay_with_visibility(prepared, namespace, request_id, true)
+        self.admit_replay_with_visibility(prepared, namespace, request_id, true, None, None)
+    }
+
+    pub(crate) fn admit_replay_with_initial_wake(
+        &self,
+        prepared: PreparedJob,
+        namespace: &str,
+        request_id: &str,
+        reserve_exposed: bool,
+        actor: &PrincipalId,
+        recipient_ref: &str,
+        recipient_authority_ref: &str,
+        rules: EventRuleSet,
+    ) -> Result<AdmissionDecision> {
+        self.admit_replay_with_visibility(
+            prepared,
+            namespace,
+            request_id,
+            reserve_exposed,
+            Some(actor),
+            Some((recipient_ref, recipient_authority_ref, rules)),
+        )
     }
 
     fn admit_replay_with_visibility(
@@ -643,8 +1450,14 @@ impl JobHost {
         namespace: &str,
         request_id: &str,
         reserve_exposed: bool,
+        actor: Option<&PrincipalId>,
+        initial_wake: Option<(&str, &str, EventRuleSet)>,
     ) -> Result<AdmissionDecision> {
-        let semantics = prepared.semantic_hash;
+        let semantics = prepared.replay_semantic_hash(
+            initial_wake
+                .as_ref()
+                .map(|(recipient, authority_ref, rules)| (*recipient, *authority_ref, rules)),
+        );
         if let Some(existing) = self
             .manager
             .lookup_replay(namespace, request_id, semantics)
@@ -655,7 +1468,7 @@ impl JobHost {
                     if self.manager.runtime_snapshot(&job_id).is_ok() =>
                 {
                     if reserve_exposed {
-                        self.manager.expose(&job_id).map_err(job_admission_error)?;
+                        self.expose(&job_id)?;
                     }
                     AdmissionDecision::Existing(job_id)
                 }
@@ -667,13 +1480,19 @@ impl JobHost {
         }
 
         let proposed = new_job_id()?;
-        // Reserve every bounded local Job slot before committing the replay
-        // identity. No runner exists yet, so a failed/duplicate claim can drop
-        // this provisional Job without any effect ambiguity.
-        if reserve_exposed {
-            self.reserve_exposed_with_id(&proposed, prepared)?;
+        // Reserve both finite-owner metadata and the host/project exposure slot
+        // before committing replay identity or starting any root.
+        let (exposure_owner, exposure_ref) =
+            self.reserve_finite_exposure(&proposed, &prepared.task)?;
+        let admission = if reserve_exposed {
+            self.reserve_exposed_with_id(&proposed, prepared)
         } else {
-            self.admit_with_id(&proposed, prepared)?;
+            self.admit_with_id(&proposed, prepared)
+        };
+        if let Err(error) = admission {
+            let _ =
+                self.release_unpublished_finite_exposure(&proposed, &exposure_owner, &exposure_ref);
+            return Err(error);
         }
         let decision =
             match self
@@ -683,20 +1502,16 @@ impl JobHost {
                 }) {
                 Ok(decision) => decision,
                 Err(error) => {
-                    self.manager
-                        .discard_unstarted(&proposed)
-                        .map_err(|_| Error::Protocol("provisional Job cleanup failed"))?;
+                    self.discard_unstarted_with_exposure(&proposed)?;
                     return Err(replay_state_error(error));
                 }
             };
         match decision {
             ReplayDecision::Existing { job_id } => {
-                self.manager
-                    .discard_unstarted(&proposed)
-                    .map_err(|_| Error::Protocol("duplicate provisional Job cleanup failed"))?;
+                self.discard_unstarted_with_exposure(&proposed)?;
                 if self.manager.runtime_snapshot(&job_id).is_ok() {
                     if reserve_exposed {
-                        self.manager.expose(&job_id).map_err(job_admission_error)?;
+                        self.expose(&job_id)?;
                     }
                     Ok(AdmissionDecision::Existing(job_id))
                 } else {
@@ -704,30 +1519,39 @@ impl JobHost {
                 }
             }
             ReplayDecision::Unknown => {
-                self.manager
-                    .discard_unstarted(&proposed)
-                    .map_err(|_| Error::Protocol("unknown provisional Job cleanup failed"))?;
+                self.discard_unstarted_with_exposure(&proposed)?;
                 Ok(AdmissionDecision::Unknown)
             }
             ReplayDecision::New { key, job_id } => {
                 if job_id != proposed {
-                    self.manager.discard_unstarted(&proposed).map_err(|_| {
-                        Error::Protocol("mismatched provisional Job cleanup failed")
-                    })?;
+                    self.discard_unstarted_with_exposure(&proposed)?;
                     return Err(Error::Protocol(
                         "replay claim returned a different proposed Job",
                     ));
                 }
+                if let Some((recipient, authority_ref, rules)) = initial_wake.as_ref() {
+                    let actor = actor.ok_or(Error::Protocol(
+                        "initial replay wake registration lacks authenticated actor",
+                    ))?;
+                    if let Err(error) = self.subscribe_finite(
+                        actor,
+                        &job_id,
+                        None,
+                        None,
+                        recipient,
+                        authority_ref,
+                        rules.clone(),
+                    ) {
+                        self.discard_unstarted_with_exposure(&job_id)?;
+                        return Err(error);
+                    }
+                }
                 if let Err(error) = self.manager.mark_replay_ready(key, &job_id, |_| Ok(())) {
-                    self.manager
-                        .discard_unstarted(&job_id)
-                        .map_err(|_| Error::Protocol("unready provisional Job cleanup failed"))?;
+                    self.discard_unstarted_with_exposure(&job_id)?;
                     return Err(replay_state_error(error));
                 }
                 if reserve_exposed {
-                    self.manager
-                        .expose(&job_id)
-                        .map_err(|_| Error::Protocol("reserved Job exposure invariant failed"))?;
+                    self.expose(&job_id)?;
                 }
                 Ok(AdmissionDecision::New(job_id))
             }
@@ -736,8 +1560,25 @@ impl JobHost {
 
     pub fn expose(&self, id: &str) -> Result<()> {
         self.manager
+            .reserve_exposed(id)
+            .map_err(job_admission_error)?;
+        self.publish_finite_exposure(id)?;
+        self.manager
             .expose(id)
-            .map_err(|_| Error::Protocol("Job exposure failed"))
+            .map_err(|_| Error::Protocol("reserved Job exposure invariant failed"))?;
+        Ok(())
+    }
+
+    pub fn discard_unexposed_terminal(&self, id: &str) -> Result<()> {
+        let (owner, reference) = self.finite_exposure_for_id(id)?;
+        if let Ok(mut events) = self.events.lock() {
+            events.sources.remove(&reference);
+            events.terminal_committed.remove(&reference);
+        }
+        self.manager
+            .discard_unexposed_terminal(id)
+            .map_err(|_| Error::Protocol("cannot retire completed hidden Job"))?;
+        self.release_unpublished_finite_exposure(id, &owner, &reference)
     }
 
     /// Revalidate and create a fresh execution from one retained terminal Graph.
@@ -859,13 +1700,23 @@ impl JobHost {
             .ok()?;
         let runtime_live = if plan.tool().native().is_some() {
             plan.runtime_binding() == self.root_binding
-        } else {
+        } else if plan.tool().is_shell() {
             self.shells.get(plan.tool()).is_some_and(|shell| {
                 shell
                     .runtime_binding()
                     .is_ok_and(|runtime| runtime == plan.runtime_binding())
                     && shell.revalidate().is_ok()
             })
+        } else if plan.tool().is_agent() {
+            self.graph_host_tools
+                .binding(aw_tools::OperationId::Agent)
+                .ok()
+                .flatten()
+                .is_some_and(|host| {
+                    host.runtime_binding() == plan.runtime_binding() && host.tool().is_available()
+                })
+        } else {
+            false
         };
         (binding.registry_revision == plan.registry_generation()
             && binding_hash(actor, &binding) == plan.authority_binding()
@@ -1364,6 +2215,8 @@ impl JobHost {
                     },
                 );
             }
+        }
+        if !prepared.interactive {
             process.close_stdin();
         }
         let authority = self.authority.clone();
@@ -1379,7 +2232,28 @@ impl JobHost {
                 _ = revoke_on_authority_loss => {},
             }
         };
-        let receipt = process.wait(stop_signal, prepared.timeout).await;
+        let receipt = if prepared.interactive {
+            let (input, receiver) = process::process_input_channel();
+            let key = (id.to_owned(), coordinate);
+            let replaced = self
+                .process_inputs
+                .lock()
+                .map_err(|_| Error::Protocol("Process input registry poisoned"))?
+                .insert(key.clone(), input);
+            if replaced.is_some() {
+                return Err(Error::Protocol("duplicate Process input owner"));
+            }
+            let receipt = process
+                .wait_interactive(stop_signal, prepared.timeout, receiver)
+                .await;
+            self.process_inputs
+                .lock()
+                .map_err(|_| Error::Protocol("Process input registry poisoned"))?
+                .remove(&key);
+            receipt
+        } else {
+            process.wait(stop_signal, prepared.timeout).await
+        };
         let observed = receipt.runner_terminal();
         let terminal = self.retained_process_terminal(
             id,
@@ -1398,7 +2272,190 @@ impl JobHost {
         )
     }
 
+    pub(crate) fn graph_preseal_request(
+        &self,
+        id: &str,
+        original_graph: &Value,
+        prepared: &PreparedJob,
+    ) -> Result<crate::operation_router::GraphPresealRequest> {
+        if prepared.plans.len() != prepared.graph.steps().len() {
+            return Err(Error::Protocol(
+                "Graph pre-seal plan/topology length changed",
+            ));
+        }
+        let mut nodes = Vec::with_capacity(prepared.plans.len());
+        for (step, plan) in prepared.graph.steps().iter().zip(prepared.plans.iter()) {
+            let coordinate = u32::try_from(plan.coordinate())
+                .map_err(|_| Error::Protocol("Graph pre-seal coordinate overflow"))?;
+            let dependencies = step
+                .when
+                .dependencies()
+                .into_iter()
+                .map(|dependency| {
+                    u32::try_from(dependency)
+                        .map_err(|_| Error::Protocol("Graph dependency coordinate overflow"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            nodes.push(crate::operation_router::GraphPresealNode {
+                coordinate,
+                operation: plan.tool().operation(),
+                arguments: step.arguments.clone(),
+                replay_identity: plan.replay_identity(),
+                footprint: plan.footprint().clone(),
+                dependencies,
+            });
+        }
+        Ok(crate::operation_router::GraphPresealRequest {
+            job_id: id.to_owned(),
+            original_graph: original_graph.clone(),
+            graph_fingerprint: prepared.graph.fingerprint(),
+            nodes,
+        })
+    }
+
+    fn graph_policy_request(
+        &self,
+        id: &str,
+    ) -> Result<crate::operation_router::GraphPolicyRequest> {
+        let graph = self
+            .manager
+            .graph(id)
+            .map_err(|_| Error::Denied("Graph policy cannot read sealed Graph"))?;
+        let plans = self
+            .manager
+            .plans(id)
+            .map_err(|_| Error::Denied("Graph policy cannot read sealed NodePlans"))?;
+        if plans.len() != graph.steps().len() {
+            return Err(Error::Protocol("Graph policy plan/topology length changed"));
+        }
+        let mut nodes = Vec::with_capacity(plans.len());
+        for (step, plan) in graph.steps().iter().zip(plans.iter()) {
+            let coordinate = u32::try_from(plan.coordinate())
+                .map_err(|_| Error::Protocol("Graph policy coordinate overflow"))?;
+            let dependencies = step
+                .when
+                .dependencies()
+                .into_iter()
+                .map(|dependency| {
+                    u32::try_from(dependency)
+                        .map_err(|_| Error::Protocol("Graph dependency coordinate overflow"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            nodes.push(crate::operation_router::GraphPolicyNode {
+                coordinate,
+                operation: plan.tool().operation(),
+                replay_identity: plan.replay_identity(),
+                footprint_fingerprint: plan.footprint().fingerprint(),
+                dependencies,
+            });
+        }
+        Ok(crate::operation_router::GraphPolicyRequest {
+            job_id: id.to_owned(),
+            graph_fingerprint: graph.fingerprint(),
+            nodes,
+        })
+    }
+
+    pub(crate) async fn before_graph_run(&self, ctx: &ToolContext, id: &str) -> Result<()> {
+        let Some(router) = self.graph_policy.current()? else {
+            return Ok(());
+        };
+        router.before_run(ctx, self.graph_policy_request(id)?).await
+    }
+
+    fn graph_node_policy_request(
+        &self,
+        id: &str,
+        coordinate: usize,
+    ) -> Result<crate::operation_router::GraphNodePolicyRequest> {
+        let graph = self
+            .manager
+            .graph(id)
+            .map_err(|_| Error::Denied("Graph activation cannot read sealed Graph"))?;
+        let plans = self
+            .manager
+            .plans(id)
+            .map_err(|_| Error::Denied("Graph activation cannot read NodePlans"))?;
+        let step = graph
+            .steps()
+            .get(coordinate.saturating_sub(1))
+            .ok_or(Error::Denied("Graph activation coordinate is invalid"))?;
+        let plan = plans
+            .get(coordinate.saturating_sub(1))
+            .ok_or(Error::Denied("Graph activation NodePlan is unavailable"))?;
+        let node_coordinate = NodeCoordinate::new(
+            u32::try_from(coordinate)
+                .map_err(|_| Error::Protocol("Graph activation coordinate overflow"))?,
+        )
+        .map_err(|_| Error::Protocol("Graph activation coordinate is invalid"))?;
+        let graph_fingerprint = graph.fingerprint();
+        let mut dependency_receipts = Vec::new();
+        let mut activation_receipts = Vec::new();
+        for dependency in step.when.dependencies() {
+            let status = self
+                .manager
+                .node_state(id, dependency)
+                .map_err(|_| Error::Protocol("Graph dependency state is unavailable"))?
+                .result()
+                .ok_or(Error::Protocol(
+                    "Graph policy activation requires settled declared dependencies",
+                ))?;
+            let coordinate = NodeCoordinate::new(
+                u32::try_from(dependency)
+                    .map_err(|_| Error::Protocol("Graph dependency coordinate overflow"))?,
+            )
+            .map_err(|_| Error::Protocol("Graph dependency coordinate is invalid"))?;
+            dependency_receipts.push(crate::operation_router::GraphDependencyReceipt {
+                coordinate: coordinate.get(),
+                status,
+            });
+            activation_receipts.push(aw_tools::coordination::ActivationReceipt {
+                coordinate,
+                outcome: status.primary,
+                public_result: None,
+            });
+        }
+        aw_tools::coordination::GraphActivationContext::new(
+            &graph_fingerprint,
+            node_coordinate,
+            &activation_receipts,
+        )
+        .map_err(|_| Error::Protocol("Graph activation context is not dependency-closed"))?;
+        Ok(crate::operation_router::GraphNodePolicyRequest {
+            job_id: id.to_owned(),
+            graph_fingerprint,
+            coordinate: node_coordinate.get(),
+            operation: plan.tool().operation(),
+            replay_identity: plan.replay_identity(),
+            dependency_receipts,
+        })
+    }
+
     async fn execute_node(
+        self: &Arc<Self>,
+        ctx: &ToolContext,
+        id: &str,
+        coordinate: usize,
+        cancellation: CancellationToken,
+    ) -> Result<Status> {
+        let Some(router) = self.graph_policy.current()? else {
+            return self
+                .execute_node_local(ctx, id, coordinate, cancellation)
+                .await;
+        };
+        let request = self.graph_node_policy_request(id, coordinate)?;
+        let original: Arc<dyn crate::operation_router::GraphNodeOriginalExecutor> =
+            Arc::new(PreparedGraphNodeExecutor {
+                host: self.clone(),
+                ctx: ctx.clone(),
+                id: id.to_owned(),
+                coordinate,
+                cancellation,
+            });
+        router.execute_node(ctx, request, original).await
+    }
+
+    async fn execute_node_local(
         &self,
         ctx: &ToolContext,
         id: &str,
@@ -1415,10 +2472,207 @@ impl JobHost {
         if tool.is_shell() {
             self.execute_shell_node(ctx, id, coordinate, cancellation)
                 .await
+        } else if tool.is_agent() {
+            self.execute_host_tool_node(ctx, id, coordinate, cancellation)
+                .await
         } else {
             self.execute_native_node(ctx, id, coordinate, cancellation)
                 .await
         }
+    }
+
+    async fn execute_host_tool_node(
+        &self,
+        ctx: &ToolContext,
+        id: &str,
+        coordinate: usize,
+        cancellation: CancellationToken,
+    ) -> Result<Status> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let plan = self
+            .manager
+            .plans(id)
+            .map_err(|_| Error::Denied("Job plan is unavailable"))?
+            .get(coordinate.saturating_sub(1))
+            .cloned()
+            .ok_or(Error::Denied("Job coordinate is invalid"))?;
+        if !plan.tool().is_agent() {
+            return Err(Error::Denied("Job node is not a host Agent node"));
+        }
+
+        let (_node_key, claimed_sequence) = self.claim_exact(&ctx.actor, id, coordinate)?;
+        if cancellation.is_cancelled() {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(Error::Cancelled);
+        }
+        let binding = self.claimed_binding(&ctx.actor, id, coordinate, claimed_sequence, &plan)?;
+        let host = self
+            .graph_host_tools
+            .binding(aw_tools::OperationId::Agent)?
+            .ok_or(Error::Denied(
+                "prepared Agent Graph executor is unavailable",
+            ))?;
+        if host.runtime_binding() != plan.runtime_binding() {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(Error::Denied(
+                "prepared Agent Graph executor generation changed before execution",
+            ));
+        }
+        let tool = host.tool();
+        if !tool.is_available() || tool.validate(plan.arguments()).is_err() {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(Error::Denied(
+                "prepared Agent Graph arguments/executor are no longer valid",
+            ));
+        }
+        if let Err(error) = self.attach_exact_result(id, coordinate, plan.budget().result_bytes) {
+            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+            return Err(error);
+        }
+
+        let running_sequence =
+            match self.start_exact(&ctx.actor, id, coordinate, claimed_sequence, true) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    self.settle_unlaunched(id, coordinate, claimed_sequence)?;
+                    return Err(error);
+                }
+            };
+
+        let mut hash = Sha256::new();
+        hash.update(b"aw-graph-host-node-call-v1\0");
+        for part in [ctx.call_id.as_bytes(), id.as_bytes()] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        hash.update((coordinate as u64).to_be_bytes());
+        hash.update(plan.replay_identity());
+        let call_id = format!("gn_{:x}", hash.finalize());
+        let ownership = ExecutionOwnershipScope::from_trusted_host(
+            self.execution_ref(id, Some(coordinate))?.canonical(),
+            cancellation.clone(),
+        )?;
+        let node_ctx = ToolContext {
+            actor: ctx.actor.clone(),
+            turn_id: ctx.turn_id,
+            call_id,
+            source: binding.source.clone(),
+            effect: binding.effect.clone(),
+            execution_site: binding.execution_site.clone(),
+            cancellation: cancellation.clone(),
+            result_budget_bytes: plan.budget().result_bytes,
+            identity: ctx.identity.clone(),
+            scope: ctx.scope.clone(),
+            execution_owner: ctx.execution_owner.clone(),
+            execution_scope: Some(ownership.clone()),
+        };
+
+        let output = tool.execute(node_ctx, plan.arguments()).await;
+        ownership.wait_quiescent().await;
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self
+                    .manager
+                    .finish_output(id, coordinate, OutputStream::Result);
+                let unknown = Status {
+                    primary: Primary::Unknown,
+                    more: false,
+                    incomplete: ownership.is_unresolved(),
+                };
+                self.settle(
+                    id,
+                    coordinate,
+                    NodeState::Running {
+                        sequence: running_sequence,
+                    },
+                    unknown,
+                )?;
+                return Err(error);
+            }
+        };
+        output.validate()?;
+        if output.content.len() > plan.budget().result_bytes {
+            let _ = self
+                .manager
+                .finish_output(id, coordinate, OutputStream::Result);
+            let unknown = Status {
+                primary: Primary::Unknown,
+                more: false,
+                incomplete: false,
+            };
+            self.settle(
+                id,
+                coordinate,
+                NodeState::Running {
+                    sequence: running_sequence,
+                },
+                unknown,
+            )?;
+            return Err(Error::Limit(
+                "Agent Graph node result exceeds captured semantic ceiling",
+            ));
+        }
+        let retained = self
+            .manager
+            .append_output(
+                id,
+                coordinate,
+                OutputStream::Result,
+                output.content.as_bytes(),
+            )
+            .map_err(|_| Error::Protocol("Agent Graph node result retention failed"))?;
+        if retained != output.content.len()
+            || self
+                .manager
+                .finish_output(id, coordinate, OutputStream::Result)
+                .is_err()
+        {
+            let unknown = Status {
+                primary: Primary::Unknown,
+                more: false,
+                incomplete: false,
+            };
+            self.settle(
+                id,
+                coordinate,
+                NodeState::Running {
+                    sequence: running_sequence,
+                },
+                unknown,
+            )?;
+            return Err(Error::Protocol(
+                "Agent Graph node result could not be retained exactly",
+            ));
+        }
+        let status = if ownership.is_unresolved() {
+            Status {
+                primary: Primary::Unknown,
+                more: false,
+                incomplete: true,
+            }
+        } else {
+            Status {
+                primary: if output.is_error {
+                    Primary::Fail
+                } else {
+                    Primary::Ok
+                },
+                more: false,
+                incomplete: false,
+            }
+        };
+        self.settle(
+            id,
+            coordinate,
+            NodeState::Running {
+                sequence: running_sequence,
+            },
+            status,
+        )?;
+        Ok(status)
     }
 
     /// Execute one V1 native node. Result capacity is reserved while Claimed,
@@ -1477,7 +2731,11 @@ impl JobHost {
                 ));
             }
         };
-        if current_footprint != *plan.footprint() {
+        let current_within_sealed = plan
+            .footprint()
+            .union(&current_footprint)
+            .is_ok_and(|union| union == *plan.footprint());
+        if !current_within_sealed {
             self.settle_unlaunched(id, coordinate, claimed_sequence)?;
             return Err(Error::Denied(
                 "filesystem topology changed after Job preflight; restart the Graph",
@@ -1669,7 +2927,7 @@ impl JobHost {
     /// by the shared manager (conditions, width, global permits and conflict
     /// order); effects inside one wave run concurrently without detached tasks.
     pub async fn run_graph(
-        &self,
+        self: &Arc<Self>,
         ctx: &ToolContext,
         id: &str,
         cancellation: CancellationToken,
@@ -1773,6 +3031,35 @@ impl JobHost {
             .map_err(|_| Error::Protocol("Job cancellation intent failed"))
     }
 
+    /// Model/SDK control path: compare public revision and reserve a fresh
+    /// revision before cancellation intent can leave this live Job owner.
+    pub async fn cancel_control(
+        &self,
+        id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<(bool, Snapshot)> {
+        let _control = self.control_gate.lock().await;
+        let before = self
+            .manager
+            .get(id)
+            .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
+        if expected_revision.is_some_and(|expected| expected != before.sequence) {
+            return Err(Error::Conflict("stale Job revision"));
+        }
+        if before.lifecycle != aw_tools::filesystem::job::Lifecycle::Running {
+            return Ok((false, before));
+        }
+        self.manager
+            .compare_and_bump_revision(id, expected_revision)
+            .map_err(|_| Error::Conflict("stale Job revision"))?;
+        self.cancel(id)?;
+        let after = self
+            .manager
+            .get(id)
+            .map_err(|_| Error::Protocol("Job disappeared after cancellation"))?;
+        Ok((true, after))
+    }
+
     pub fn revoke(&self, id: &str) -> Result<()> {
         let _gate = self
             .transition_gate
@@ -1795,7 +3082,10 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     };
 
     struct ExistingTool;
@@ -1821,6 +3111,101 @@ mod tests {
             _arguments: &'a Value,
         ) -> aw_agent_core::ToolFuture<'a> {
             Box::pin(async { Ok(ToolOutput::text("ok")) })
+        }
+    }
+
+    struct FakeAgentTool {
+        calls: Arc<AtomicUsize>,
+        receipt: &'static str,
+    }
+    impl AgentTool for FakeAgentTool {
+        fn spec(&self) -> aw_agent_core::ToolSpec {
+            aw_agent_core::ToolSpec {
+                name: "agent".into(),
+                description: "fixture Agent constructor".into(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"task":{"type":"string"}},
+                    "required":["task"],
+                    "additionalProperties":false
+                }),
+                effect: ToolEffect::Process,
+            }
+        }
+        fn validate(&self, value: &Value) -> aw_agent_core::Result<()> {
+            value
+                .get("task")
+                .and_then(Value::as_str)
+                .filter(|task| !task.is_empty())
+                .map(|_| ())
+                .ok_or(aw_agent_core::Error::Denied("fixture Agent needs task"))
+        }
+        fn execute<'a>(
+            &'a self,
+            _ctx: ToolContext,
+            _arguments: &'a Value,
+        ) -> aw_agent_core::ToolFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let receipt = self.receipt;
+            Box::pin(async move { Ok(ToolOutput::text(receipt)) })
+        }
+    }
+
+    struct LeaseHoldingAgentTool {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        owner_ref: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl AgentTool for LeaseHoldingAgentTool {
+        fn spec(&self) -> aw_agent_core::ToolSpec {
+            aw_agent_core::ToolSpec {
+                name: "agent".into(),
+                description: "fixture Agent constructor with owned descendant".into(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"task":{"type":"string"}},
+                    "required":["task"],
+                    "additionalProperties":false
+                }),
+                effect: ToolEffect::Process,
+            }
+        }
+
+        fn validate(&self, value: &Value) -> aw_agent_core::Result<()> {
+            value
+                .get("task")
+                .and_then(Value::as_str)
+                .filter(|task| !task.is_empty())
+                .map(|_| ())
+                .ok_or(aw_agent_core::Error::Denied("fixture Agent needs task"))
+        }
+
+        fn execute<'a>(
+            &'a self,
+            ctx: ToolContext,
+            _arguments: &'a Value,
+        ) -> aw_agent_core::ToolFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            let owner_ref = self.owner_ref.clone();
+            Box::pin(async move {
+                let scope = ctx.execution_scope.ok_or(aw_agent_core::Error::Protocol(
+                    "Graph Agent node lost execution ownership scope",
+                ))?;
+                *owner_ref.lock().unwrap() = Some(scope.owner_ref().to_owned());
+                let lease = scope.acquire()?;
+                tokio::spawn(async move {
+                    release.notified().await;
+                    drop(lease);
+                });
+                entered.notify_one();
+                Ok(ToolOutput::text(
+                    "/d:0/i:0/p:0/a:child agent idle rev=7 turn=t:1 outcome=ok",
+                ))
+            })
         }
     }
 
@@ -1877,6 +3262,13 @@ mod tests {
             mode,
             execution_site: "local".into(),
             bash: None,
+            process_input: false,
+            agent_jobs: Default::default(),
+            operation_router: Default::default(),
+            graph_policy_router: Default::default(),
+            graph_host_tools: Default::default(),
+            allow_agent_graph: false,
+            allow_wake: false,
             private_state_dir: None,
             selected_tools: Vec::new(),
             concurrency: crate::LocalToolConcurrency::default(),
@@ -1900,18 +3292,246 @@ mod tests {
                 session_id: "session-a".into(),
                 branch_id: "main".into(),
             }),
+            execution_owner: Some(
+                aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                    "/d:0/i:0/p:0/a:0",
+                    "session-a",
+                    "main",
+                )
+                .unwrap(),
+            ),
+            execution_scope: None,
         }
     }
 
-    fn host(temp: &Temp, agent: &Agent, limits: Limits) -> JobHost {
-        JobHost::new(
-            Arc::new(aw_platform::scoped_fs::Root::open(&temp.workspace).unwrap()),
-            agent.tool_binding_authority(),
-            "session-a",
-            "main",
-            limits,
+    fn host(temp: &Temp, agent: &Agent, limits: Limits) -> Arc<JobHost> {
+        Arc::new(
+            JobHost::new(
+                Arc::new(aw_platform::scoped_fs::Root::open(&temp.workspace).unwrap()),
+                agent.tool_binding_authority(),
+                "session-a",
+                "main",
+                limits,
+            )
+            .unwrap(),
         )
-        .unwrap()
+    }
+
+    fn host_with_graph_agent(
+        temp: &Temp,
+        agent: &Agent,
+        graph_host_tools: Arc<crate::operation_router::GraphHostToolSlot>,
+    ) -> Arc<JobHost> {
+        Arc::new(
+            JobHost::new_with_config(
+                Arc::new(aw_platform::scoped_fs::Root::open(&temp.workspace).unwrap()),
+                agent.tool_binding_authority(),
+                JobHostConfig {
+                    session: "session-a".into(),
+                    branch: "main".into(),
+                    tool_limits: crate::LocalToolLimits::default(),
+                    shells: shell::ShellRegistry::default(),
+                    native_tools: Arc::new(Vec::new()),
+                    parallelism: Arc::new(
+                        GraphParallelism::new(crate::LocalToolConcurrency::default()).unwrap(),
+                    ),
+                    exposure: Arc::new(
+                        ExposureIndex::new(
+                            crate::LocalToolLimits::default().jobs.max_retained_jobs,
+                        )
+                        .unwrap(),
+                    ),
+                    agent_jobs: Default::default(),
+                    graph_policy: Default::default(),
+                    graph_host_tools,
+                    max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn host_qualified_agent_graph_node_uses_same_job_and_retains_factual_receipt() {
+        let temp = Temp::new();
+        let actor = PrincipalId::new("local").unwrap();
+        let mut agent = agent(&temp.workspace, actor.clone(), ToolMode::Off);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn AgentTool> = Arc::new(FakeAgentTool {
+            calls: calls.clone(),
+            receipt: "/d:0/i:0/p:0/a:child agent idle rev=7 turn=t:1 outcome=ok",
+        });
+        agent.register_host_tool(tool.clone()).unwrap();
+        let graph_tools = Arc::new(crate::operation_router::GraphHostToolSlot::default());
+        graph_tools
+            .install(aw_tools::OperationId::Agent, tool)
+            .unwrap();
+        let host = host_with_graph_agent(&temp, &agent, graph_tools);
+        let ctx = context(&agent, actor, "agent-graph-success");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["agent",{"task":"child task"}]]}),
+            )
+            .unwrap();
+        let id = host.admit(prepared).unwrap();
+        let snapshot = host
+            .run_graph(&ctx, &id, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.finished, 1);
+        assert_eq!(snapshot.summary.unwrap().0, Primary::Ok);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let page = host.result_page(&id, 1, 0, 4096).unwrap();
+        assert!(page.writer_finished);
+        assert_eq!(
+            String::from_utf8(page.bytes).unwrap(),
+            "/d:0/i:0/p:0/a:child agent idle rev=7 turn=t:1 outcome=ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_graph_node_waits_for_owned_descendant_lease_before_settlement() {
+        let temp = Temp::new();
+        let actor = PrincipalId::new("local").unwrap();
+        let mut agent = agent(&temp.workspace, actor.clone(), ToolMode::Off);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let owner_ref = Arc::new(std::sync::Mutex::new(None));
+        let tool: Arc<dyn AgentTool> = Arc::new(LeaseHoldingAgentTool {
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            owner_ref: owner_ref.clone(),
+        });
+        agent.register_host_tool(tool.clone()).unwrap();
+        let graph_tools = Arc::new(crate::operation_router::GraphHostToolSlot::default());
+        graph_tools
+            .install(aw_tools::OperationId::Agent, tool)
+            .unwrap();
+        let host = host_with_graph_agent(&temp, &agent, graph_tools);
+        let ctx = context(&agent, actor, "agent-graph-owned-descendant");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["agent",{"task":"child task"}]]}),
+            )
+            .unwrap();
+        let id = host.admit(prepared).unwrap();
+
+        let run_host = host.clone();
+        let run_ctx = ctx.clone();
+        let run_id = id.clone();
+        let run = tokio::spawn(async move {
+            run_host
+                .run_graph(&run_ctx, &run_id, CancellationToken::new())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !run.is_finished(),
+            "Agent node must remain running while an owned descendant lease exists"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let expected = host.execution_ref(&id, Some(1)).unwrap().canonical();
+        assert_eq!(
+            owner_ref.lock().unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+
+        release.notify_one();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.finished, 1);
+        assert_eq!(snapshot.summary.unwrap().0, Primary::Ok);
+    }
+
+    #[tokio::test]
+    async fn prepared_agent_graph_node_rejects_removed_host_generation_before_constructor() {
+        let temp = Temp::new();
+        let actor = PrincipalId::new("local").unwrap();
+        let mut agent = agent(&temp.workspace, actor.clone(), ToolMode::Off);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn AgentTool> = Arc::new(FakeAgentTool {
+            calls: calls.clone(),
+            receipt: "must-not-run",
+        });
+        agent.register_host_tool(tool.clone()).unwrap();
+        let graph_tools = Arc::new(crate::operation_router::GraphHostToolSlot::default());
+        graph_tools
+            .install(aw_tools::OperationId::Agent, tool)
+            .unwrap();
+        let host = host_with_graph_agent(&temp, &agent, graph_tools.clone());
+        let ctx = context(&agent, actor, "agent-graph-revoked");
+        let prepared = host
+            .prepare(
+                &ctx,
+                &serde_json::json!({"ops":[["agent",{"task":"child task"}]]}),
+            )
+            .unwrap();
+        let id = host.admit(prepared).unwrap();
+        graph_tools.remove(aw_tools::OperationId::Agent).unwrap();
+
+        assert!(host
+            .execute_node_local(&ctx, &id, 1, CancellationToken::new())
+            .await
+            .is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "host Agent adapter revocation must fence before constructor entry"
+        );
+        assert!(matches!(
+            host.manager().node_state(&id, 1).unwrap(),
+            NodeState::Pending
+        ));
+    }
+
+    #[test]
+    fn contextless_job_constructor_requires_explicit_existing_agent_owner_before_admission() {
+        let temp = Temp::new();
+        fs::write(temp.workspace.join("a.txt"), "hello\n").unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let agent = agent(&temp.workspace, actor.clone(), ToolMode::ReadOnly);
+        let host = host(&temp, &agent, Limits::default());
+        let arguments = serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]});
+
+        let mut missing = context(&agent, actor.clone(), "contextless-missing-owner");
+        missing.scope = None;
+        missing.execution_owner = None;
+        assert!(matches!(
+            host.prepare(&missing, &arguments),
+            Err(Error::Denied("Job execution requires a bound Agent owner"))
+        ));
+        assert!(
+            host.manager().list(0, 8).unwrap().jobs.is_empty(),
+            "missing owner must deny before creating any finite Job"
+        );
+        assert!(
+            host.exposure.list(None, 8).unwrap().0.is_empty(),
+            "missing owner must deny before reserving any exposure position"
+        );
+
+        let mut explicit = context(&agent, actor, "contextless-explicit-owner");
+        explicit.scope = None;
+        let prepared = host.prepare(&explicit, &arguments).unwrap();
+        let id = host.admit_exposed(prepared).unwrap();
+        assert_eq!(host.manager().list(0, 8).unwrap().jobs.len(), 1);
+        assert_eq!(
+            host.execution_ref(&id, None)
+                .unwrap()
+                .agent_ref()
+                .canonical(),
+            "/d:0/i:0/p:0/a:0",
+            "contextless success uses only the explicitly supplied existing owner"
+        );
     }
 
     #[test]
@@ -2135,6 +3755,13 @@ mod tests {
                 parallelism: Arc::new(
                     GraphParallelism::new(crate::LocalToolConcurrency::default()).unwrap(),
                 ),
+                exposure: Arc::new(
+                    ExposureIndex::new(crate::LocalToolLimits::default().jobs.max_retained_jobs)
+                        .unwrap(),
+                ),
+                agent_jobs: Default::default(),
+                graph_policy: Default::default(),
+                graph_host_tools: Default::default(),
                 max_graph_nodes: 1,
             },
         )
@@ -2168,6 +3795,13 @@ mod tests {
                 parallelism: Arc::new(
                     GraphParallelism::new(crate::LocalToolConcurrency::default()).unwrap(),
                 ),
+                exposure: Arc::new(
+                    ExposureIndex::new(crate::LocalToolLimits::default().jobs.max_retained_jobs)
+                        .unwrap(),
+                ),
+                agent_jobs: Default::default(),
+                graph_policy: Default::default(),
+                graph_host_tools: Default::default(),
                 max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
             },
         );
@@ -2200,6 +3834,13 @@ mod tests {
                 parallelism: Arc::new(
                     GraphParallelism::new(crate::LocalToolConcurrency::default()).unwrap(),
                 ),
+                exposure: Arc::new(
+                    ExposureIndex::new(crate::LocalToolLimits::default().jobs.max_retained_jobs)
+                        .unwrap(),
+                ),
+                agent_jobs: Default::default(),
+                graph_policy: Default::default(),
+                graph_host_tools: Default::default(),
                 max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
             },
         )
@@ -2342,7 +3983,9 @@ mod tests {
         let semantics = prepared.semantic_hash();
         assert!(matches!(
             host.admit_replay(prepared, "session-a", &ctx.call_id),
-            Err(Error::Limit("live Job capacity exhausted"))
+            Err(Error::Limit(
+                "Job exposure recoverability capacity exhausted"
+            ))
         ));
         assert_eq!(
             host.manager()

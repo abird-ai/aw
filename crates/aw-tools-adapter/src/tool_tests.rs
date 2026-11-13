@@ -114,6 +114,15 @@ fn context() -> ToolContext {
             grant_revision: 1,
         },
         scope: None,
+        execution_owner: Some(
+            aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:0",
+                "fixture-session",
+                "main",
+            )
+            .unwrap(),
+        ),
+        execution_scope: None,
     }
 }
 async fn call<T: Tool>(tool: &T, arguments: Value) -> ToolOutput {
@@ -1909,17 +1918,19 @@ fn selecting_shell_implicitly_includes_only_required_job_controls() {
         .collect::<std::collections::BTreeSet<_>>();
     assert!(names.contains("bash"));
     for name in [
-        "job_list",
-        "job_get",
-        "job_output",
-        "job_ack",
-        "job_cancel",
-        "job_restart",
+        "jobs_list",
+        "jobs_get",
+        "jobs_read",
+        "jobs_ack",
+        "jobs_send",
+        "jobs_cancel",
+        "jobs_subscribe",
     ] {
         assert!(names.contains(name), "missing required Job control {name}");
     }
     assert!(!names.contains("batch"));
     assert!(!names.contains("job_start"));
+    assert!(!names.contains("job_restart"));
 }
 
 #[cfg(unix)]
@@ -1952,7 +1963,7 @@ fn trusted_batch_schema_includes_only_prepared_bash_shellnode() {
         .build()
         .unwrap();
     let specs = agent.tool_specs();
-    for constructor in ["batch", "job_start"] {
+    for constructor in ["batch"] {
         let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
         let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
             .as_array()
@@ -1994,7 +2005,7 @@ fn read_only_graph_schemas_do_not_advertise_mutation_nodes() {
         .build()
         .unwrap();
     let specs = agent.tool_specs();
-    for constructor in ["batch", "job_start"] {
+    for constructor in ["batch"] {
         let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
         let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
             .as_array()
@@ -2018,7 +2029,7 @@ fn read_only_graph_schemas_do_not_advertise_mutation_nodes() {
 }
 
 #[test]
-fn canonical_job_surface_registers_job_start_after_shellnode_migration() {
+fn canonical_job_surface_uses_flat_jobs_without_start_or_restart() {
     struct ProviderFixture;
     impl aw_agent_core::Provider for ProviderFixture {
         fn stream<'a>(
@@ -2048,6 +2059,17 @@ fn canonical_job_surface_registers_job_start_after_shellnode_migration() {
         .collect::<std::collections::BTreeSet<_>>();
     for name in [
         "batch",
+        "jobs_list",
+        "jobs_get",
+        "jobs_read",
+        "jobs_ack",
+        "jobs_send",
+        "jobs_cancel",
+        "jobs_subscribe",
+    ] {
+        assert!(names.contains(name), "missing canonical Job tool {name}");
+    }
+    for legacy in [
         "job_start",
         "job_list",
         "job_get",
@@ -2056,7 +2078,10 @@ fn canonical_job_surface_registers_job_start_after_shellnode_migration() {
         "job_cancel",
         "job_restart",
     ] {
-        assert!(names.contains(name), "missing canonical Job tool {name}");
+        assert!(
+            !names.contains(legacy),
+            "legacy Job tool remained visible: {legacy}"
+        );
     }
 }
 
@@ -3248,7 +3273,7 @@ fn volatile_workspace_configuration_omits_rm_and_selected_rm_fails_closed() {
         .unwrap();
     let specs = agent.tool_specs();
     assert!(!specs.iter().any(|spec| spec.name == "rm"));
-    for constructor in ["batch", "job_start"] {
+    for constructor in ["batch"] {
         let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
         let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
             .as_array()
@@ -3296,7 +3321,7 @@ fn durable_private_state_enables_rm_for_direct_and_graph_surfaces() {
         .unwrap();
     let specs = agent.tool_specs();
     assert!(specs.iter().any(|spec| spec.name == "rm"));
-    for constructor in ["batch", "job_start"] {
+    for constructor in ["batch"] {
         let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
         let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
             .as_array()

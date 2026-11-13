@@ -345,19 +345,35 @@ impl Host {
 
     #[cfg(feature = "jsonl")]
     fn switch_session(&mut self, selection: minimal_sessions::Selection<'_>) -> Result<()> {
-        let Some(sessions) = &mut self.sessions else {
+        if self.sessions.is_none() {
             return Err(Error::Config("enable JSONL persistence to select a Session".into()));
-        };
-        let agent = self.agent.as_mut().ok_or_else(|| {
+        }
+        let old_agent = self.agent.take().ok_or_else(|| {
             Error::Config("configure a provider/model before selecting a Session".into())
         })?;
-        if agent.needs_reconciliation() {
+        if old_agent.needs_reconciliation() {
+            self.agent = Some(old_agent);
             return Err(Error::Denied(
                 "inspect and acknowledge uncertain effects before switching Sessions",
             ));
         }
-        sessions.activate(agent, &self.settings, &self.context, &self.tools, selection)?;
-        Ok(())
+        let outcome = (|| {
+            // Agent identity is immutable for one live instance. A Session
+            // switch therefore rebuilds the configured host and binds the
+            // fresh Agent to the selected authoritative Session/branch.
+            self.rebuild()?;
+            let sessions = self.sessions.as_mut().ok_or(Error::Storage(
+                "JSONL Session manager disappeared during Agent rebuild",
+            ))?;
+            let agent = self.agent.as_mut().ok_or(Error::Storage(
+                "Agent missing after Session-switch rebuild",
+            ))?;
+            sessions.activate(agent, &self.settings, &self.context, &self.tools, selection)
+        })();
+        if outcome.is_err() {
+            self.agent = Some(old_agent);
+        }
+        outcome
     }
 
     fn new_session(&mut self) -> Result<()> {
@@ -1044,6 +1060,13 @@ Explicitly requested, owner-approved project skill {} (data, no execution grants
             .bash
             .clone()
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
+        process_input: false,
+        agent_jobs: Default::default(),
+        operation_router: Default::default(),
+        graph_policy_router: Default::default(),
+        graph_host_tools: Default::default(),
+        allow_agent_graph: false,
+        allow_wake: false,
         concurrency: tool_concurrency,
         limits: aw::LocalToolLimits::default(),
         private_state_dir: {

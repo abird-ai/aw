@@ -45,6 +45,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
     time::Duration,
 };
 
@@ -2238,6 +2239,13 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             .bash
             .clone()
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
+        process_input: false,
+        agent_jobs: Default::default(),
+        operation_router: Default::default(),
+        graph_policy_router: Default::default(),
+        graph_host_tools: Default::default(),
+        allow_agent_graph: args.subagents,
+        allow_wake: false,
         concurrency: aw::LocalToolConcurrency {
             graph_width: args.parallel_graph_limit as usize,
             parallelism: aw_agent_core::ToolParallelism {
@@ -3174,6 +3182,7 @@ struct Host {
     last_route_operation: Option<String>,
     agent: Option<Agent>,
     actor_owner: Option<aw::actor_owner::Service>,
+    agent_jobs_owner: Option<aw::actor_owner::Service>,
     pre_dispatch_retries: u8,
     context_compaction_policy:aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -3578,6 +3587,7 @@ impl Host {
             last_route_operation: None,
             agent: None,
             actor_owner: None,
+            agent_jobs_owner: None,
             pre_dispatch_retries: 0,
             context_compaction_policy:aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -3656,12 +3666,47 @@ impl Host {
 
     #[cfg(feature = "jsonl")]
     fn replace_jsonl(&mut self, p: JsonlPersistentSession) -> Result<()> {
-        if let Some(agent) = &mut self.agent {
-            p.apply(agent)?;
+        let branch = p.branch()?.id;
+        let same_binding = self.agent.as_ref().is_some_and(|agent| {
+            agent.execution_binding().is_some_and(|binding| {
+                binding.session_id() == p.session_id() && binding.branch_id() == branch
+            })
+        });
+        if self.agent.as_ref().is_some_and(|agent| agent.execution_binding().is_none())
+            || same_binding
+        {
+            if let Some(agent) = &mut self.agent {
+                p.apply(agent)?;
+            }
+            self.jsonl_store = Some(p.store.clone());
+            self.jsonl_persistent = Some(p);
+            return Ok(());
         }
+        if self.agent.is_none() {
+            self.jsonl_store = Some(p.store.clone());
+            self.jsonl_persistent = Some(p);
+            return Ok(());
+        }
+        if self.agent.as_ref().is_some_and(Agent::needs_reconciliation) {
+            return Err(Error::Denied(
+                "inspect and acknowledge uncertain effects before switching Agents",
+            ));
+        }
+
+        let old_agent = self.agent.take();
+        let old_persistent = self.jsonl_persistent.take();
+        let old_store = self.jsonl_store.clone();
         self.jsonl_store = Some(p.store.clone());
         self.jsonl_persistent = Some(p);
-        Ok(())
+        match self.ensure(false, "Switched Agent") {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.agent = old_agent;
+                self.jsonl_persistent = old_persistent;
+                self.jsonl_store = old_store;
+                Err(error)
+            }
+        }
     }
 
     #[cfg(feature = "jsonl")]
@@ -3942,6 +3987,7 @@ impl Host {
                 "--subagent-guardian-route requires --subagent-team and/or --subagent-planner-route".into(),
             ));
         }
+        let mut stable_agent_service: Option<subagents::Service> = None;
         if self.subagents_enabled {
             if web {
                 return Err(Error::Denied(
@@ -4018,6 +4064,7 @@ impl Host {
                 service_config,
             )?;
             agent.register_host_tool(service.tool())?;
+            stable_agent_service = Some(service.clone());
             #[cfg(all(feature = "pipelines", feature = "routing"))]
             let review_gate = if let Some(selector) = self.subagent_guardian_route.as_deref() {
                 let strategy = persistent.store.routing_strategy(
@@ -4111,6 +4158,69 @@ impl Host {
             self.apply_persistence(&mut agent),
             "loading durable Session history",
         )?;
+        if let Some(persistent) = &self.persistent {
+            let router = Arc::new(aw::agent_jobs::Router::new(
+                persistent.store.clone(),
+                persistent.actor.clone(),
+                self.tools.limits.jobs.max_retained_jobs,
+            )?);
+            self.agent_jobs_owner = None;
+            if let Some(service) = stable_agent_service.as_ref() {
+                service.bind_agent_jobs_router(router.clone())?;
+                let agent_tool = service.agent_tool();
+                agent.register_host_tool(
+                    aw_tools_adapter::operation_router::routed_host_tool(
+                        agent_tool.clone(),
+                        self.tools.operation_router.clone(),
+                    )?,
+                )?;
+                self.tools
+                    .graph_host_tools
+                    .install(aw_tools::OperationId::Agent, agent_tool)?;
+                self.tools.operation_router.replace(Arc::new(
+                    subagents::PolicyOperationRouter::new(
+                        service.clone(),
+                        agent.tool_binding_authority(),
+                        subagents::PolicyOperationConfig::passthrough(),
+                    )?,
+                ))?;
+            } else {
+                self.tools.operation_router.clear()?;
+                self.tools
+                    .graph_host_tools
+                    .remove(aw_tools::OperationId::Agent)?;
+            }
+            if !web {
+                let branch = persistent.handle.branch()?.id;
+                let owner = aw::actor_owner::Service::attach_for_agent(
+                    persistent.store.clone(),
+                    persistent.handle.session_id(),
+                    &branch,
+                    &agent,
+                )?;
+                let canonical = agent
+                    .execution_binding()
+                    .ok_or(Error::Storage("Agent execution binding missing after persistence load"))?
+                    .canonical_ref()
+                    .to_owned();
+                router.register_live_owner(
+                    &canonical,
+                    owner.clone(),
+                    agent.tool_binding_authority(),
+                )?;
+                self.agent_jobs_owner = Some(owner);
+            }
+            self.tools.agent_jobs.replace(router)?;
+        } else {
+            // Never leave a router/owner for a previously active SQLite Agent
+            // when the rebuilt host is memory-only or uses another backend.
+            self.agent_jobs_owner = None;
+            self.tools.agent_jobs.clear()?;
+            self.tools.operation_router.clear()?;
+            self.tools
+                .graph_host_tools
+                .remove(aw_tools::OperationId::Agent)?;
+        }
         self.agent = Some(agent);
         Ok(())
     }
@@ -4212,13 +4322,8 @@ impl Host {
         } else {
             None
         };
-        let result = if let Some(selected) = retry_selected {
-            runtime.block_on(agent.prompt_as(
-                &selected,
-                text,
-                cancelled(cancel.clone()),
-                &mut event,
-            ))
+        let selected = if let Some(selected) = retry_selected {
+            Some(selected)
         } else if let Some(account) = self.account_selector.as_deref() {
             let model = self
                 .settings
@@ -4226,15 +4331,11 @@ impl Host {
                 .model
                 .as_deref()
                 .ok_or_else(|| Error::Config("model required".into()))?;
-            let selected = agent
-                .provider_accounts()
-                .select(agent.actor(), account, model)?;
-            runtime.block_on(agent.prompt_as(
-                &selected,
-                text,
-                cancelled(cancel.clone()),
-                &mut event,
-            ))
+            Some(
+                agent
+                    .provider_accounts()
+                    .select(agent.actor(), account, model)?,
+            )
         } else {
             #[cfg(feature = "routing")]
             let routed = if !self.routing_enabled {
@@ -4266,17 +4367,57 @@ impl Host {
             };
             #[cfg(not(feature = "routing"))]
             let routed: Option<aw::ProviderSelection> = None;
+            routed
+        };
 
-            if let Some(selected) = routed {
-                runtime.block_on(agent.prompt_as(
-                    &selected,
-                    text,
-                    cancelled(cancel.clone()),
-                    &mut event,
+        let result = if let Some(owner) = self.agent_jobs_owner.clone() {
+            let selected = match selected {
+                Some(selected) => selected,
+                None => {
+                    let identity = agent.default_identity()?;
+                    agent.provider_accounts().select(
+                        agent.actor(),
+                        &identity.account_id,
+                        &identity.model,
+                    )?
+                }
+            };
+            owner.submit_bound_text(agent, &text)?;
+
+            // Relay terminal/SIGINT cancellation into the same claimed Actor
+            // Turn. The runner itself is always awaited; cancellation never
+            // drops an admitted Turn future and invents a retryable outcome.
+            let parent_cancel = aw::CancellationToken::new();
+            let relay_signal = parent_cancel.clone();
+            let explicit_cancel = cancel.clone();
+            let relay = runtime.spawn(async move {
+                tokio::select! {
+                    _ = interrupt() => {},
+                    _ = explicit_cancel.cancelled() => {},
+                }
+                relay_signal.cancel();
+            });
+            let run = runtime.block_on(owner.run_once_selected_with_cancel(
+                agent,
+                &selected,
+                parent_cancel,
+                &mut event,
+            ));
+            relay.abort();
+            run.and_then(|turn| {
+                turn.ok_or(Error::Conflict(
+                    "accepted Agent Input produced no claimed Turn",
                 ))
-            } else {
-                runtime.block_on(agent.prompt(text, cancelled(cancel.clone()), &mut event))
-            }
+            })
+        } else if let Some(selected) = selected {
+            runtime.block_on(agent.prompt_as(
+                &selected,
+                text,
+                cancelled(cancel.clone()),
+                &mut event,
+            ))
+        } else {
+            runtime.block_on(agent.prompt(text, cancelled(cancel.clone()), &mut event))
         };
         if let Some(p) = &self.persistent {
             let _ = p.handle.clear_retry_operation();
@@ -4297,12 +4438,47 @@ impl Host {
         result
     }
     fn replace(&mut self, p: PersistentSession) -> Result<()> {
-        if let Some(agent) = &mut self.agent {
-            p.apply(agent)?;
+        let branch = p.handle.branch()?.id;
+        let same_binding = self.agent.as_ref().is_some_and(|agent| {
+            agent.execution_binding().is_some_and(|binding| {
+                binding.session_id() == p.handle.session_id() && binding.branch_id() == branch
+            })
+        });
+        if self.agent.as_ref().is_some_and(|agent| agent.execution_binding().is_none())
+            || same_binding
+        {
+            if let Some(agent) = &mut self.agent {
+                p.apply(agent)?;
+            }
+            self.sqlite_store = Some(p.store.clone());
+            self.persistent = Some(p);
+            return Ok(());
         }
+        if self.agent.is_none() {
+            self.sqlite_store = Some(p.store.clone());
+            self.persistent = Some(p);
+            return Ok(());
+        }
+        if self.agent.as_ref().is_some_and(Agent::needs_reconciliation) {
+            return Err(Error::Denied(
+                "inspect and acknowledge uncertain effects before switching Agents",
+            ));
+        }
+
+        let old_agent = self.agent.take();
+        let old_persistent = self.persistent.take();
+        let old_store = self.sqlite_store.clone();
         self.sqlite_store = Some(p.store.clone());
         self.persistent = Some(p);
-        Ok(())
+        match self.ensure(false, "Switched Agent") {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.agent = old_agent;
+                self.persistent = old_persistent;
+                self.sqlite_store = old_store;
+                Err(error)
+            }
+        }
     }
 
     #[cfg(feature = "workspace")]

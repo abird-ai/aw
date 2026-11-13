@@ -17,12 +17,35 @@ use tokio::sync::watch;
 
 /// Called at the only safe boundaries: pre-model dispatch, and after a
 /// provider result has been journaled but before a new tool batch intent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityUpdate {
+    pub segment: crate::AuthoritySegment,
+    pub input: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentGatePoint {
     BeforeModel,
     BeforeToolBatch,
 }
 pub trait AgentStepGate: Send + Sync {
+    /// Current authenticated authority boundary for this exact Turn. This is
+    /// evidence only; ToolPolicy/Envelope/Session checks remain authoritative.
+    fn authority_segment(&self, _turn_id: u64) -> Result<Option<crate::AuthoritySegment>> {
+        Ok(None)
+    }
+
+    /// Consume at most one already-authenticated, host-custodied same-Turn
+    /// steering boundary at a safe Agent Step boundary.
+    fn take_authority_update(
+        &self,
+        _turn_id: u64,
+        _round: u32,
+        _point: AgentGatePoint,
+    ) -> Result<Option<AuthorityUpdate>> {
+        Ok(None)
+    }
+
     fn checkpoint<'a>(
         &'a self,
         turn_id: u64,
@@ -175,12 +198,144 @@ impl AgentSessionController {
         }
         Ok(())
     }
+    /// Host-only same-Turn steer admission. Durable hosts must custody the
+    /// steering input before calling this method; this only stages it in the
+    /// current Runtime until the next safe Agent Step boundary.
+    pub fn admit_authority_steer(
+        &self,
+        turn_id: u64,
+        boundary_id: &str,
+        input: &str,
+    ) -> Result<crate::AuthoritySegment> {
+        self.verify_writer_fence()?;
+        let segment = self.with_runtime(|runtime| {
+            runtime.admit_authority_steer(
+                &self.principal,
+                self.actor,
+                self.writer_epoch,
+                turn_id,
+                boundary_id,
+                input,
+            )
+        })?;
+        self.changed();
+        Ok(segment)
+    }
+
+    pub fn admit_authority_steer_with_evidence(
+        &self,
+        turn_id: u64,
+        boundary_id: &str,
+        input: &str,
+        evidence: crate::AuthoritySegmentEvidence,
+    ) -> Result<crate::AuthoritySegment> {
+        self.verify_writer_fence()?;
+        let segment = self.with_runtime(|runtime| {
+            runtime.admit_authority_steer_with_evidence(
+                &self.principal,
+                self.actor,
+                self.writer_epoch,
+                turn_id,
+                boundary_id,
+                input,
+                evidence,
+            )
+        })?;
+        self.changed();
+        Ok(segment)
+    }
+
+    pub fn admit_authority_interrupt(
+        &self,
+        turn_id: u64,
+        boundary_id: &str,
+        input: &str,
+    ) -> Result<crate::AuthoritySegment> {
+        self.verify_writer_fence()?;
+        let segment = self.with_runtime(|runtime| {
+            runtime.admit_authority_interrupt(
+                &self.principal,
+                self.actor,
+                self.writer_epoch,
+                turn_id,
+                boundary_id,
+                input,
+            )
+        })?;
+        self.changed();
+        Ok(segment)
+    }
+
+    pub fn admit_authority_interrupt_with_evidence(
+        &self,
+        turn_id: u64,
+        boundary_id: &str,
+        input: &str,
+        evidence: crate::AuthoritySegmentEvidence,
+    ) -> Result<crate::AuthoritySegment> {
+        self.verify_writer_fence()?;
+        let segment = self.with_runtime(|runtime| {
+            runtime.admit_authority_interrupt_with_evidence(
+                &self.principal,
+                self.actor,
+                self.writer_epoch,
+                turn_id,
+                boundary_id,
+                input,
+                evidence,
+            )
+        })?;
+        self.changed();
+        Ok(segment)
+    }
+
+    pub fn discard_authority_steer(
+        &self,
+        turn_id: u64,
+        boundary_id: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<()> {
+        self.verify_writer_fence()?;
+        self.with_runtime(|runtime| {
+            runtime.discard_authority_steer(
+                &self.principal,
+                self.actor,
+                self.writer_epoch,
+                turn_id,
+                boundary_id,
+                fingerprint,
+            )
+        })?;
+        self.changed();
+        Ok(())
+    }
+
     pub fn send(&self, message: ActorMessage, current_turn: u64) -> Result<Delivery> {
         // A stale SQLite Workspace owner may retain a valid in-memory
         // ActorKey. It must not be able to send even a synchronous Control.
         self.verify_writer_fence()?;
         let result = self
             .with_runtime(|r| r.send(&self.principal, self.writer_epoch, message, current_turn))?;
+        self.changed();
+        Ok(result)
+    }
+
+    pub fn send_with_authority(
+        &self,
+        message: ActorMessage,
+        current_turn: u64,
+        evidence: crate::AuthoritySegmentEvidence,
+    ) -> Result<Delivery> {
+        self.verify_writer_fence()?;
+        let result = self.with_runtime(|runtime| {
+            runtime.send_with_authority(
+                &self.principal,
+                self.writer_epoch,
+                message,
+                current_turn,
+                evidence,
+            )
+        })?;
         self.changed();
         Ok(result)
     }
@@ -303,6 +458,49 @@ impl AgentSessionController {
         self.run_once_inner(agent, None, None, Some(verify), on_event)
             .await
     }
+
+    /// Exact selected-provider counterpart used by a durable owning host.
+    /// Participant-shared Sessions use this with the participant's explicitly
+    /// authorized provider selection and the same claimed Input/Turn writer.
+    pub async fn run_once_verified_selected<F, V>(
+        &self,
+        agent: &mut Agent,
+        selected: &crate::ProviderSelection,
+        verify: &V,
+        on_event: F,
+    ) -> Result<Option<Turn>>
+    where
+        F: FnMut(&AgentEvent) -> Result<()> + Send,
+        V: Fn(&ActorMessage, u64) -> Result<()> + Send + Sync,
+    {
+        self.run_once_inner(agent, Some(selected), None, Some(verify), on_event)
+            .await
+    }
+
+    /// Exact selected-provider counterpart used by a durable child owner. The
+    /// already accepted Input proof, parent cancellation and provider lease all
+    /// feed the same Agent Turn/step-gate path; no second model loop exists.
+    pub async fn run_once_verified_selected_with_cancel<F, V>(
+        &self,
+        agent: &mut Agent,
+        selected: &crate::ProviderSelection,
+        parent_cancel: CancellationToken,
+        verify: &V,
+        on_event: F,
+    ) -> Result<Option<Turn>>
+    where
+        F: FnMut(&AgentEvent) -> Result<()> + Send,
+        V: Fn(&ActorMessage, u64) -> Result<()> + Send + Sync,
+    {
+        self.run_once_inner(
+            agent,
+            Some(selected),
+            Some(parent_cancel),
+            Some(verify),
+            on_event,
+        )
+        .await
+    }
     async fn run_once_inner<F>(
         &self,
         agent: &mut Agent,
@@ -317,12 +515,6 @@ impl AgentSessionController {
         self.check_agent_binding(agent)?;
         if let Some(selected) = selected {
             selected.revalidate()?;
-            let binding = agent.default_identity()?;
-            if selected.identity() != &binding {
-                return Err(Error::Denied(
-                    "child selected route differs from bound Agent identity",
-                ));
-            }
         }
         if agent.needs_reconciliation() {
             return Err(Error::Denied(
@@ -343,6 +535,25 @@ impl AgentSessionController {
         };
         if let Some(verify) = verification {
             verify(&claimed.message, turn_id)?;
+        }
+        match (selected, claimed.authority_segment.evidence.as_ref()) {
+            (Some(selected), Some(evidence)) => {
+                evidence.validate_identity(selected.identity())?;
+            }
+            (Some(selected), None) => {
+                let binding = agent.default_identity()?;
+                if selected.identity() != &binding {
+                    return Err(Error::Denied(
+                        "selected provider differs from legacy bound Agent identity",
+                    ));
+                }
+            }
+            (None, Some(_)) => {
+                return Err(Error::Denied(
+                    "participant AuthoritySegment requires an explicit participant provider selection",
+                ));
+            }
+            (None, None) => {}
         }
         self.verify_writer_fence()?;
         // No Runtime mutex is held during provider, tools, hooks or journal
@@ -457,6 +668,27 @@ impl crate::hooks::HookContinuationPort for AgentSessionController {
     }
 }
 impl AgentStepGate for AgentSessionController {
+    fn authority_segment(&self, turn_id: u64) -> Result<Option<crate::AuthoritySegment>> {
+        self.verify_writer_fence()?;
+        self.with_runtime(|runtime| {
+            runtime
+                .active_authority_segment(&self.principal, self.actor, self.writer_epoch, turn_id)
+                .map(Some)
+        })
+    }
+
+    fn take_authority_update(
+        &self,
+        turn_id: u64,
+        _round: u32,
+        _point: AgentGatePoint,
+    ) -> Result<Option<AuthorityUpdate>> {
+        self.verify_writer_fence()?;
+        self.with_runtime(|runtime| {
+            runtime.take_authority_update(&self.principal, self.actor, self.writer_epoch, turn_id)
+        })
+    }
+
     fn hook_continuation_port(&self) -> Option<&dyn crate::hooks::HookContinuationPort> {
         Some(self)
     }
@@ -542,8 +774,9 @@ mod tests {
     use super::*;
     use crate::{
         CompletionFuture, CompletionMeta, DeltaSink, HistoryState, InvocationScope, JournalEntry,
-        JournalFuture, ModelFuture, ModelReply, Outcome, Provider, Tool, ToolCall, ToolContext,
-        ToolEffect, ToolFuture, ToolOutput, ToolSpec, TurnJournal, TurnStart, Usage,
+        JournalFuture, ModelFuture, ModelReply, Outcome, Provider, Role, Tool, ToolCall,
+        ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSpec, ToolStatus, TurnJournal,
+        TurnStart, Usage,
     };
     use aw_agent_kernel::{
         actor::RuntimeKey,
@@ -604,6 +837,13 @@ mod tests {
                     source: "trusted-host".into(),
                     source_epoch: 1,
                     effect: aw_agent_kernel::capability::Effect::Write,
+                },
+                aw_agent_kernel::envelope::ExactGrant {
+                    name: "interrupt_request".into(),
+                    kind: aw_agent_kernel::capability::SourceKind::Host,
+                    source: "trusted-host".into(),
+                    source_epoch: 1,
+                    effect: aw_agent_kernel::capability::Effect::Control,
                 },
             ],
         };
@@ -809,6 +1049,8 @@ mod tests {
     enum CallAction {
         Interrupt,
         Freeze,
+        SameTurnSteer,
+        SameTurnInterruptMidBatch,
     }
     impl Provider for CallProvider {
         fn supports_tools(&self) -> bool {
@@ -841,7 +1083,32 @@ mod tests {
                                 1,
                             )?;
                         }
+                        CallAction::SameTurnSteer => {
+                            self.ctrl
+                                .admit_authority_steer(1, "steer:test:2", "replace")?;
+                        }
+                        CallAction::SameTurnInterruptMidBatch => {}
                     }
+                    let tool_calls = if matches!(self.kind, CallAction::SameTurnInterruptMidBatch) {
+                        vec![
+                            ToolCall {
+                                id: "interrupt-call-1".into(),
+                                name: "interrupt_request".into(),
+                                arguments: json!({}),
+                            },
+                            ToolCall {
+                                id: "tool-call-2".into(),
+                                name: "count".into(),
+                                arguments: json!({}),
+                            },
+                        ]
+                    } else {
+                        vec![ToolCall {
+                            id: "tool-call-1".into(),
+                            name: "count".into(),
+                            arguments: json!({}),
+                        }]
+                    };
                     Ok(ModelReply {
                         meta: CompletionMeta {
                             finish_reason: "tool_calls".into(),
@@ -850,11 +1117,7 @@ mod tests {
                                 output_tokens: Some(2),
                             },
                         },
-                        tool_calls: vec![ToolCall {
-                            id: "tool-call-1".into(),
-                            name: "count".into(),
-                            arguments: json!({}),
-                        }],
+                        tool_calls,
                         ..Default::default()
                     })
                 } else {
@@ -873,6 +1136,38 @@ mod tests {
             })
         }
     }
+    struct InterruptRequestTool {
+        ctrl: AgentSessionController,
+    }
+    impl Tool for InterruptRequestTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "interrupt_request".into(),
+                description: "test-only same-Turn interrupt request".into(),
+                parameters: json!({"type":"object","additionalProperties":false}),
+                effect: ToolEffect::Control,
+            }
+        }
+        fn validate(&self, v: &Value) -> Result<()> {
+            if v.as_object().is_some_and(|object| object.is_empty()) {
+                Ok(())
+            } else {
+                Err(Error::Denied("expected empty"))
+            }
+        }
+        fn execute<'a>(&'a self, _: ToolContext, _: &'a Value) -> ToolFuture<'a> {
+            Box::pin(async move {
+                let segment =
+                    self.ctrl
+                        .admit_authority_interrupt(1, "interrupt:test:2", "replace")?;
+                Ok(ToolOutput::text(format!(
+                    "interrupt-custodied boundary={:?} segment={}",
+                    segment.boundary, segment.ordinal
+                )))
+            })
+        }
+    }
+
     struct CountTool(Arc<AtomicUsize>);
     impl Tool for CountTool {
         fn spec(&self) -> ToolSpec {
@@ -897,6 +1192,103 @@ mod tests {
             })
         }
     }
+    #[tokio::test]
+    async fn same_turn_steer_advances_segment_and_denies_old_tool_proposal() {
+        let (ctrl, actor) = runtime_with_scope(false);
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CallProvider {
+            ctrl: ctrl.clone(),
+            actor,
+            triggered: Arc::new(AtomicBool::new(false)),
+            kind: CallAction::SameTurnSteer,
+        });
+        let mut agent = Agent::builder(provider, crate::AgentOptions::new("p", "m"))
+            .build()
+            .unwrap();
+        agent
+            .register_host_tool(Arc::new(CountTool(tool_calls.clone())))
+            .unwrap();
+        ctrl.send(input(actor, 1, 0, "first"), 1).unwrap();
+
+        let turn = ctrl
+            .run_once(&mut agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.id, 1);
+        assert_eq!(turn.outcome, Outcome::Completed);
+        assert_eq!(turn.answer, "replace");
+        assert_eq!(turn.invocations.len(), 2);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(turn.tool_records.len(), 1);
+        assert_eq!(turn.tool_records[0].call.id, "tool-call-1");
+        assert_eq!(turn.tool_records[0].status, ToolStatus::Denied);
+        assert!(turn.tool_records[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .content
+            .contains("same-Turn authority update"));
+        assert!(turn
+            .context_messages
+            .iter()
+            .any(|message| { message.role == Role::User && message.content == "replace" }));
+    }
+
+    #[tokio::test]
+    async fn same_turn_interrupt_after_factual_effect_denies_only_unstarted_suffix() {
+        let (ctrl, actor) = runtime_with_scope(false);
+        let count_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CallProvider {
+            ctrl: ctrl.clone(),
+            actor,
+            triggered: Arc::new(AtomicBool::new(false)),
+            kind: CallAction::SameTurnInterruptMidBatch,
+        });
+        let mut agent = Agent::builder(provider, crate::AgentOptions::new("p", "m"))
+            .build()
+            .unwrap();
+        agent
+            .register_host_tool(Arc::new(InterruptRequestTool { ctrl: ctrl.clone() }))
+            .unwrap();
+        agent
+            .register_host_tool(Arc::new(CountTool(count_calls.clone())))
+            .unwrap();
+        ctrl.send(input(actor, 1, 0, "first"), 1).unwrap();
+
+        let turn = ctrl
+            .run_once(&mut agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.id, 1);
+        assert_eq!(turn.outcome, Outcome::Completed);
+        assert_eq!(turn.answer, "replace");
+        assert_eq!(turn.invocations.len(), 2);
+        assert_eq!(count_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(turn.tool_records.len(), 2);
+        assert_eq!(turn.tool_records[0].call.name, "interrupt_request");
+        assert_eq!(turn.tool_records[0].status, ToolStatus::Succeeded);
+        assert_eq!(turn.tool_records[1].call.name, "count");
+        assert_eq!(turn.tool_records[1].status, ToolStatus::Denied);
+        assert!(turn.tool_records[1]
+            .output
+            .as_ref()
+            .unwrap()
+            .content
+            .contains("same-Turn interrupt"));
+        assert!(turn
+            .context_messages
+            .iter()
+            .any(|message| { message.role == Role::User && message.content == "replace" }));
+        assert!(turn.tool_records[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .content
+            .contains("boundary=Interrupt segment=2"));
+    }
+
     #[tokio::test]
     async fn urgent_steer_prevents_tool_intent_then_becomes_distinct_turn() {
         let (ctrl, actor) = runtime_with_scope(false);
@@ -1001,6 +1393,8 @@ mod tests {
         fn append<'a>(&'a self, id: u64, entry: JournalEntry) -> JournalFuture<'a, ()> {
             Box::pin(async move {
                 let kind = match entry {
+                    JournalEntry::AuthoritySegmentStarted { .. } => "segment",
+                    JournalEntry::ModelInvocationAdmitted { .. } => "admission",
                     JournalEntry::InvocationStarted { .. } => "intent",
                     JournalEntry::InvocationFinished { .. } => "result",
                     JournalEntry::Assistant { .. } => "assistant",
@@ -1053,14 +1447,22 @@ mod tests {
         );
         assert_eq!(
             &*events.lock().unwrap(),
-            &["begin:1", "intent:1", "result:1", "assistant:1", "settle:1"]
+            &[
+                "begin:1",
+                "segment:1",
+                "admission:1",
+                "intent:1",
+                "result:1",
+                "assistant:1",
+                "settle:1",
+            ]
         );
         assert!(ctrl
             .run_once(&mut agent, |_| Ok(()))
             .await
             .unwrap()
             .is_none());
-        assert_eq!(events.lock().unwrap().len(), 5);
+        assert_eq!(events.lock().unwrap().len(), 7);
     }
     #[tokio::test]
     async fn dropped_runner_marks_claim_unknown_and_never_replays() {

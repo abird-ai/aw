@@ -246,6 +246,7 @@ dependencies = [
  "aw-mcp",
  "aw-pipeline",
  "aw-platform",
+ "aw-policy",
  "aw-providers",
  "aw-routing",
  "aw-session-format",
@@ -254,6 +255,7 @@ dependencies = [
  "aw-store-jsonl",
  "aw-surfaces",
  "aw-terminal",
+ "aw-tools",
  "aw-tools-adapter",
  "aw-ui-extension",
  "aw-workspace",
@@ -402,7 +404,10 @@ dependencies = [
  "aw-agent-core",
  "aw-policy",
  "aw-session",
+ "aw-tools",
  "aw-tools-adapter",
+ "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]
@@ -598,6 +603,7 @@ name = "aw-session"
 version = "0.15.0"
 dependencies = [
  "aw-agent-core",
+ "aw-agent-kernel",
  "aw-store-api",
 ]
 
@@ -629,8 +635,10 @@ dependencies = [
  "aw-collab",
  "aw-pipeline",
  "aw-platform",
+ "aw-policy",
  "aw-routing",
  "aw-store-api",
+ "aw-tools",
  "base64 0.22.1",
  "ed25519-dalek",
  "fs2",

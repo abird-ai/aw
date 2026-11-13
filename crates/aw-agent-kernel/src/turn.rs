@@ -25,8 +25,9 @@ pub enum WaveKind {
     Bash,
 }
 
-/// Choose a maximal bounded prefix of exact Read effects. Unknown, Write and
-/// Process are hard barriers, even when they advertise advisory readOnlyHint.
+/// Choose a maximal bounded prefix of exact Read effects. Unknown, Write,
+/// Process and Control are hard barriers, even when they advertise advisory
+/// readOnlyHint.
 /// Less than two reads is a sequential tool, preserving existing single-step
 /// trace and journal behavior in both hosted and embedded Agents.
 pub fn read_wave_len(effects: &[super::capability::Effect], limit: usize) -> usize {
@@ -487,6 +488,19 @@ impl TurnMachine {
         }
         self.wave_receipt_recorded()
     }
+    /// A newly authenticated same-Turn authority boundary may supersede only
+    /// the still-unstarted suffix of an already admitted batch. Completed
+    /// effects/receipts remain factual; the remaining calls must each receive
+    /// an explicit no-effect denial before another model Step can begin.
+    pub fn reject_remaining(&mut self) -> Result<Event, Error> {
+        if self.phase != Phase::ReadyTool || self.index >= self.pending.len() {
+            return Err(Error::InvalidTransition);
+        }
+        let remaining = self.pending.len() - self.index;
+        self.phase = Phase::AwaitingDenials;
+        Ok(Event::BatchRejected(remaining as u16))
+    }
+
     /// Host prepares a journal intent before entering an external tool.
     pub fn prepare_tool(
         &mut self,
@@ -702,6 +716,14 @@ mod tests {
         );
         assert_eq!(
             read_wave_len(&[Effect::Process, Effect::Read, Effect::Read], 4),
+            0
+        );
+        assert_eq!(
+            read_wave_len(&[Effect::Control, Effect::Read, Effect::Read], 4),
+            0
+        );
+        assert_eq!(
+            read_wave_len(&[Effect::Read, Effect::Control, Effect::Read], 4),
             0
         );
         assert_eq!(read_wave_len(&[Effect::Read; 8], 100), 8);
@@ -945,6 +967,41 @@ mod tests {
             Err(Error::DuplicateCall)
         );
     }
+    #[test]
+    fn authenticated_boundary_can_reject_only_unstarted_admitted_suffix() {
+        use super::super::capability::Effect;
+        let mut machine = TurnMachine::new(21, Limits::new(3, 4).unwrap()).unwrap();
+        machine.begin_model().unwrap();
+        let calls = [
+            ProposedCall {
+                id: "a",
+                name: "read",
+            },
+            ProposedCall {
+                id: "b",
+                name: "write",
+            },
+            ProposedCall {
+                id: "c",
+                name: "read",
+            },
+        ];
+        machine.propose_batch(&calls, true).unwrap();
+        machine.admit_batch().unwrap();
+        machine.prepare_tool("a", Effect::Read).unwrap();
+        machine.intent_recorded().unwrap();
+        machine.start_effect(true).unwrap();
+        machine.settle_effect().unwrap();
+        machine.receipt_recorded().unwrap();
+        assert_eq!(machine.phase(), Phase::ReadyTool);
+        assert_eq!(machine.reject_remaining(), Ok(Event::BatchRejected(2)));
+        assert_eq!(machine.denial_recorded("b"), Ok(Event::DenialRecorded(1)));
+        assert_eq!(machine.denial_recorded("c"), Ok(Event::DenialRecorded(2)));
+        assert_eq!(machine.phase(), Phase::ReadyModel);
+        assert_eq!(machine.calls_used(), 3);
+        assert!(!machine.needs_reconciliation_if_failed());
+    }
+
     #[test]
     fn reject_only_before_any_admitted_tool_effect() {
         let mut machine = TurnMachine::new(1, limits()).unwrap();

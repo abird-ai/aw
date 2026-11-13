@@ -37,7 +37,7 @@ pub use accounts::{
     AccountDescriptor, AccountOwner, BillingOwner, CredentialCustody, InvocationIdentity,
     PrincipalId, ProviderAccounts, ProviderSelection, SelectionReader,
 };
-pub use agent::{Agent, AgentBuilder, AgentEvent, AgentOptions};
+pub use agent::{Agent, AgentBuilder, AgentEvent, AgentExecutionBinding, AgentOptions};
 pub use auxiliary::{
     AuxiliaryExecutor, AuxiliaryInput, AuxiliaryJournal, AuxiliaryKind, AuxiliaryResult,
     MAX_AUXILIARY_OUTPUT,
@@ -55,7 +55,8 @@ pub use conversation::{
 pub use error::{Error, Result};
 pub use extension::{DecisionKind, DecisionPhase, Extension, HookContext, HookEvent, HookFuture};
 pub use journal::{
-    HistoryState, JournalEntry, JournalFuture, ToolSourceEvidence, TurnJournal, TurnStart,
+    AuthorityBoundaryKind, AuthoritySegment, AuthoritySegmentEvidence, HistoryState, JournalEntry,
+    JournalFuture, ModelInvocationAdmission, ToolSourceEvidence, TurnJournal, TurnStart,
 };
 #[cfg(feature = "planner")]
 pub use planner::{PlannerExecutor, PlannerInput, PlannerJournal, PlannerResult};
@@ -72,9 +73,9 @@ pub use reviewer::{ReviewExecutor, ReviewInput, ReviewJournal, ReviewResult};
 #[cfg(feature = "routing")]
 pub use routing::{RoutingExecutor, RoutingInput, RoutingJournal, RoutingResult};
 pub use tool::{
-    Tool, ToolCall, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolParallelism, ToolPolicy,
-    ToolPolicyLifecycle, ToolRecord, ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec,
-    ToolStatus,
+    ExecutionOwnershipLease, ExecutionOwnershipScope, Tool, ToolCall, ToolContext, ToolEffect,
+    ToolFuture, ToolOutput, ToolParallelism, ToolPolicy, ToolPolicyLifecycle, ToolRecord,
+    ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec, ToolStatus,
 };
 
 /// Revalidate the complete provider-bound context after trusted extensions.

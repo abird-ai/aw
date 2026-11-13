@@ -3081,11 +3081,38 @@ async fn change_view_with_membership(
         Ok((next, view, saved))
     })
     .await?;
-    agent
-        .load_history(view.history, Some(Arc::new(next.handle.clone())))
-        .map_err(api_error)?;
+    let shared_read_only = allow_explicit_member && view.session.owner != next.actor;
+    let shared_history = shared_read_only.then(|| view.history.clone());
+    if !shared_read_only {
+        next.apply(&mut agent).map_err(api_error)?;
+    }
     *lock(&app.0.session.persistence) = Some(next);
-    let snapshot = update_projection(app, &agent, Some(saved), false);
+    let snapshot = if let Some(history) = shared_history {
+        // Legacy multiplayer "open shared" is an authorized read/edit surface
+        // over another owner's Session, not a coordinator transfer. Preserve
+        // this participant's immutable Agent↔Session binding and project the
+        // shared history into the UI only.
+        let mut state = lock(&app.0.session.state);
+        let prior = state.snapshot.needs_reconciliation;
+        state.snapshot.turns = history.turns;
+        state.snapshot.saved = Some(saved);
+        state.snapshot.context_checkpoint = history.summary.is_some();
+        state.snapshot.context_blocks = history.context_blocks;
+        state.snapshot.needs_reconciliation = history.needs_reconciliation || prior;
+        state.snapshot.pending = None;
+        state.snapshot.last_error = None;
+        state.snapshot.revision += 1;
+        let revision = state.snapshot.revision;
+        let event = wire(
+            &mut state.snapshot,
+            "changed",
+            serde_json::json!({"revision":revision}),
+        );
+        let _ = app.0.session.events.send(event);
+        state.snapshot.clone()
+    } else {
+        update_projection(app, &agent, Some(saved), false)
+    };
     if !auth_alive(app) {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "session expired"));
     }
@@ -3446,6 +3473,13 @@ mod tests {
             selected_tools: Vec::new(),
             execution_site: "local".into(),
             bash: None,
+            process_input: false,
+            agent_jobs: Default::default(),
+            operation_router: Default::default(),
+            graph_policy_router: Default::default(),
+            graph_host_tools: Default::default(),
+            allow_agent_graph: false,
+            allow_wake: false,
             private_state_dir: None,
             concurrency: crate::LocalToolConcurrency::default(),
             limits: crate::LocalToolLimits::default(),

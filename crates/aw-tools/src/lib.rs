@@ -15,7 +15,13 @@ pub const MAX_BINARY_EDIT_RANGES: usize = 32;
 pub mod binary;
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod coordination;
+pub mod execution_ref;
 pub mod filesystem;
+pub mod job_event;
+pub mod operation;
+pub mod remote_start;
+pub use operation::{ExecutionClass, OperationId};
 #[cfg(feature = "write")]
 pub mod matching;
 #[cfg(feature = "binary")]
@@ -59,6 +65,7 @@ pub enum ToolEffect {
     Read,
     Write,
     Process,
+    Control,
     Unknown,
 }
 

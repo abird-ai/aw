@@ -17,6 +17,8 @@ routing = ["dep:aw-routing", "aw-agent-core/routing"]
 aw-platform = { version = "=0.15.0", path = "../aw-platform" }
 aw-store-api = { version = "=0.15.0", path = "../aw-store-api" }
 aw-agent-core = { version = "=0.15.0", path = "../aw-agent-core" }
+aw-tools = { version = "=0.15.0", path = "../aw-tools", default-features = false }
+aw-policy = { version = "=0.15.0", path = "../aw-policy" }
 aw-collab = { version = "=0.15.0", path = "../aw-collab", optional = true }
 aw-pipeline = { version = "=0.15.0", path = "../aw-pipeline", optional = true }
 aw-routing = { version = "=0.15.0", path = "../aw-routing", optional = true }

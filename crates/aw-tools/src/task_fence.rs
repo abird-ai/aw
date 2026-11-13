@@ -57,7 +57,8 @@ impl TaskIdentity {
             ToolEffect::Read => 0,
             ToolEffect::Write => 1,
             ToolEffect::Process => 2,
-            ToolEffect::Unknown => 3,
+            ToolEffect::Control => 3,
+            ToolEffect::Unknown => 4,
         }]);
         h.finalize().into()
     }

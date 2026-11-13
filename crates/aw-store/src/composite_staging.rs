@@ -22,11 +22,12 @@ use std::{
 };
 
 const CAPTURE_ID: &str = "aw-INTERNAL-PARTIAL-NOT-RECOVERABLE";
-/// AW-P6-10R: stable on-disk complete-manifest V1 contract for operator-only
+/// AW-P6-10R: stable on-disk complete-manifest contract for operator-only
 /// SAME-FILESYSTEM, no-overwrite publication. This is NOT a general user CLI,
 /// remote/model grant or safe cold-restore implementation.
 const COMPLETE_FORMAT: &str = "aw.operator-composite";
-const COMPLETE_VERSION: u32 = 1;
+const COMPLETE_V1: u32 = 1;
+const COMPLETE_V2: u32 = 2;
 /// AW-P6-10S: private inert marker required at every restored destination.
 /// Normal SessionStore::open and trusted-local direct mode reject it BEFORE
 /// registering an owner/Actor process or starting original recovery.
@@ -36,8 +37,20 @@ const MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PRIVATE_ITEMS: usize = 32_768;
 const ITEM_LIMIT: u64 = 64 * 1024 + 6 + 12 + 16;
-const SQLITE_SCHEMA: i64 = 33;
+const LEGACY_SQLITE_SCHEMA: i64 = 33;
 const SQLITE_APPLICATION: i64 = 0x41575333;
+
+fn supported_sqlite_schema(schema: i64) -> bool {
+    schema == LEGACY_SQLITE_SCHEMA || schema == crate::LATEST_SCHEMA_VERSION
+}
+
+fn complete_version_for_schema(schema: i64) -> Option<u32> {
+    match schema {
+        LEGACY_SQLITE_SCHEMA => Some(COMPLETE_V1),
+        current if current == crate::LATEST_SCHEMA_VERSION => Some(COMPLETE_V2),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,7 +74,7 @@ struct PartialManifest {
     files: Vec<FileReceipt>,
 }
 
-/// On-disk schema V1, kept separate from the old Q PARTIAL manifest.
+/// On-disk complete-manifest schema, kept separate from the old Q PARTIAL manifest.
 /// An unkeyed SHA-256 is a corruption check, NOT a signature or an encrypted
 /// operator export. The exact source-independent SQLite/AEAD proof must pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,7 +97,8 @@ impl CompleteManifest {
     fn from_verified_partial(partial: PartialManifest, restore_generation: u64) -> Self {
         Self {
             format: COMPLETE_FORMAT.into(),
-            version: COMPLETE_VERSION,
+            version: complete_version_for_schema(partial.schema)
+                .expect("verified partial has a supported SQLite schema"),
             complete: true,
             store_id: partial.store_id,
             restore_generation,
@@ -260,7 +274,7 @@ fn verify_partial_directory(directory: &Path) -> Result<PartialManifest> {
         .map_err(|_| Error::Denied("invalid internal partial capture manifest"))?;
     if manifest.format != CAPTURE_ID
         || manifest.complete
-        || manifest.schema != SQLITE_SCHEMA
+        || !supported_sqlite_schema(manifest.schema)
         || manifest.application_id != SQLITE_APPLICATION
         || manifest.store_id.is_empty()
         || manifest.files.is_empty()
@@ -325,7 +339,7 @@ fn valid_original_item_name(path: &str) -> bool {
     regular || temporary
 }
 
-/// Source-independent verification of a PUBLISHED V1 complete archive.
+/// Source-independent verification of a PUBLISHED complete archive.
 /// The final directory name must not be an internal `.partial`; after crash
 /// prior to rename, no complete marker inside a `.partial` can certify it.
 fn verify_complete_directory(directory: &Path) -> Result<CompleteManifest> {
@@ -350,21 +364,20 @@ fn verify_complete_payload(directory: &Path) -> Result<CompleteManifest> {
         .take(MAX_MANIFEST_BYTES as u64 + 1)
         .read_to_end(&mut encoded)?;
     if encoded.len() > MAX_MANIFEST_BYTES {
-        return Err(Error::Limit("complete V1 manifest exceeds bounded 8MiB"));
+        return Err(Error::Limit("complete manifest exceeds bounded 8MiB"));
     }
     let manifest: CompleteManifest = serde_json::from_slice(&encoded)
-        .map_err(|_| Error::Denied("invalid operator-composite V1 manifest"))?;
+        .map_err(|_| Error::Denied("invalid operator-composite manifest"))?;
     if manifest.format != COMPLETE_FORMAT
-        || manifest.version != COMPLETE_VERSION
         || !manifest.complete
-        || manifest.schema != SQLITE_SCHEMA
+        || complete_version_for_schema(manifest.schema) != Some(manifest.version)
         || manifest.application_id != SQLITE_APPLICATION
         || manifest.store_id.is_empty()
         || manifest.files.is_empty()
         || manifest.files.len() > MAX_PRIVATE_ITEMS + 2
     {
         return Err(Error::Denied(
-            "unsupported or incomplete operator-composite V1 manifest",
+            "unsupported or incomplete operator-composite manifest",
         ));
     }
     verify_manifest_payload(
@@ -513,7 +526,7 @@ fn verify_manifest_payload(
         return Err(Error::Denied("captured original SQLite identity changed"));
     }
     // AW-P6-10Q: the decisive independent boundary. Re-open ONLY the STAGED
-    // read-only SQLite v33 image and the STAGED, owner-private SecretStore.
+    // read-only supported SQLite image and the STAGED, owner-private SecretStore.
     // Reuse the SAME O active-reference/version/AEAD/Queue-digest validator
     // as the live maintenance-gated Store; do not trust manifest hashes alone.
     // This does NOT create a new key or run the original Agent/Queue/Tool.
@@ -679,7 +692,7 @@ fn inspect_sqlite(path: &Path) -> Result<(String, i64, i64)> {
     ))?;
     let application: i64 = db(connection.pragma_query_value(None, "application_id", |r| r.get(0)))?;
     let schema: i64 = db(connection.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-    if schema != SQLITE_SCHEMA || application != SQLITE_APPLICATION {
+    if !supported_sqlite_schema(schema) || application != SQLITE_APPLICATION {
         return Err(Error::Denied(
             "partial SQLite has unsupported schema/application",
         ));
@@ -944,7 +957,7 @@ fn verify_cold_quarantined_state(
             "offline cold restore quarantine marker/identity changed",
         ));
     }
-    // Original source-independent v33/AEAD verification is reused, not a new
+    // Original source-independent schema/AEAD verification is reused, not a new
     // decryption engine, signing key or hidden provider credential grant.
     let (store_id, app, schema) = inspect_sqlite(&root.join("sessions.sqlite3"))?;
     if store_id != original.store_id
@@ -4328,7 +4341,7 @@ mod tests {
         let other = provider_secret_ref("snapshot", "retired", 1).unwrap();
         vault.put(&other, b"SYNTHETIC_RETIRED_CIPHERTEXT").unwrap();
         let stage = capture_partial(&store, &destination, |_, _| Ok(())).unwrap();
-        let name = "aw-composite-valid-v1";
+        let name = "aw-composite-valid-current";
         let completed = stage.publish_complete(&store, name, |_, _| Ok(())).unwrap();
         assert_eq!(completed, destination.join(name));
         assert!(completed.is_dir());
@@ -4339,7 +4352,8 @@ mod tests {
         );
         let manifest = verify_complete_directory(&completed).unwrap();
         assert!(manifest.complete);
-        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.version, COMPLETE_V2);
+        assert_eq!(manifest.schema, crate::LATEST_SCHEMA_VERSION);
         assert_eq!(manifest.active_items, 1);
         assert_eq!(manifest.unreferenced_items, 1);
         assert!(completed.join("manifest.json").is_file());
@@ -4509,7 +4523,7 @@ mod tests {
             fs::write(&path, &saved).unwrap();
             assert!(verify_complete_directory(&completed).is_ok());
         };
-        mutate(&|value| value.version = 2);
+        mutate(&|value| value.version = COMPLETE_V2 + 1);
         mutate(&|value| value.restore_generation += 1);
         mutate(&|value| value.active_items = 0);
         mutate(&|value| value.format = "aw-INTERNAL-PARTIAL-NOT-RECOVERABLE".into());

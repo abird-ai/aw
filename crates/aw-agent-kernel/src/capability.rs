@@ -18,6 +18,8 @@ pub enum Effect {
     Read,
     Write,
     Process,
+    /// Lifecycle/input/subscription authority. Neither filesystem Write nor Read.
+    Control,
     /// Never assume untrusted read-only hints are authority.
     Unknown,
 }
@@ -70,7 +72,7 @@ pub struct Capability<'a> {
 }
 impl<'a> Capability<'a> {
     pub fn new(name: &'a str, source: Source<'a>, effect: Effect) -> Result<Self, Error> {
-        if !valid_label(name, MAX_NAME_BYTES, b"_-") {
+        if !valid_label(name, MAX_NAME_BYTES, b"_.-") {
             return Err(Error::InvalidName);
         }
         let source = Source::new(source.kind, source.id, source.epoch)?;
@@ -195,6 +197,11 @@ mod tests {
         assert!(!grant.permits(
             "local:user",
             "host:local",
+            &desc("mcp__files__read", "files", 42, Effect::Control)
+        ));
+        assert!(!grant.permits(
+            "local:user",
+            "host:local",
             &desc("mcp__files__write", "files", 42, Effect::Read)
         ));
     }
@@ -202,6 +209,7 @@ mod tests {
     fn bounded_catalog_rejects_duplicates_and_untrusted_labels() {
         let one = desc("read", "files", 1, Effect::Read);
         let two = desc("write", "files", 1, Effect::Write);
+        assert!(Capability::new("process.input", one.source, Effect::Control).is_ok());
         let entries = [one, two];
         let cat = Catalog::new(8, &entries).unwrap();
         assert_eq!(cat.revision(), 8);

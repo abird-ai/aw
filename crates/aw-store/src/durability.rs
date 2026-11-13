@@ -351,6 +351,18 @@ pub(crate) fn commit_event(
     actor: Option<&PrincipalId>,
     payload: serde_json::Value,
 ) -> Result<()> {
+    commit_event_position(c, tx, kind, entity_type, entity_id, actor, payload).map(|_| ())
+}
+
+pub(crate) fn commit_event_position(
+    c: &Connection,
+    tx: &str,
+    kind: &str,
+    entity_type: &str,
+    entity_id: &str,
+    actor: Option<&PrincipalId>,
+    payload: serde_json::Value,
+) -> Result<u64> {
     let store: String = db(c.query_row(
         "SELECT value FROM store_meta WHERE key='store_id'",
         [],
@@ -358,7 +370,7 @@ pub(crate) fn commit_event(
     ))?;
     let event = id("ev")?;
     db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![event,store,tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
-    Ok(())
+    u64::try_from(c.last_insert_rowid()).map_err(|_| Error::Storage("commit log sequence overflow"))
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ref_event(

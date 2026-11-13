@@ -123,6 +123,28 @@ pub struct BranchInfo {
     pub active_run: Option<String>,
 }
 
+/// Backend-authenticated immutable Agent identity derived from one executable
+/// Session/branch. These are canonical handle components only; this value is
+/// evidence, never an execution grant or another Agent mapping database.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBindingInfo {
+    pub session_id: String,
+    pub branch_id: String,
+    pub domain_handle: String,
+    pub identity_handle: String,
+    pub project_handle: String,
+    pub agent_handle: String,
+    pub session_created_at: i64,
+    pub branch_created_at: i64,
+}
+
+impl AgentBindingInfo {
+    pub fn is_root_agent(&self) -> bool {
+        self.agent_handle == "0"
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionView {
     pub session: SessionInfo,
@@ -212,6 +234,19 @@ pub trait SessionBackend: StoreBackend {
     fn list(&self, owner: &PrincipalId) -> Result<Vec<SessionInfo>>;
     fn set_title(&self, owner: &PrincipalId, session: &str, title: &str) -> Result<SessionInfo>;
     fn branches(&self, owner: &PrincipalId, session: &str) -> Result<Vec<BranchInfo>>;
+
+    /// Resolve one already-existing executable Session/branch into its stable
+    /// Agent namespace identity. Parsing defaults must never create a binding.
+    fn agent_binding(
+        &self,
+        owner: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<AgentBindingInfo>;
+
+    /// Discover existing Agent roots in immutable creation order. This must not
+    /// create Sessions, branches, principals or projects.
+    fn agent_bindings(&self, owner: &PrincipalId) -> Result<Vec<AgentBindingInfo>>;
 
     fn fork(
         &self,

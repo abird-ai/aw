@@ -8,13 +8,17 @@ use std::{
     sync::Arc,
 };
 
+pub mod agent_jobs;
 mod binary;
 mod edit;
+mod exposure;
 pub mod job_host;
 pub mod job_runtime;
 pub mod job_tools;
+mod jobs_tools;
 mod lifecycle;
 mod mutate;
+pub mod operation_router;
 mod patch;
 mod private_artifacts;
 mod search;
@@ -723,6 +727,28 @@ pub struct LocalToolOptions {
     pub mode: ToolMode,
     pub execution_site: String,
     pub bash: Option<PathBuf>,
+    /// Independent host grant for live Process stdin. This is not a model tool
+    /// and does not follow automatically from shell or jobs_send authority.
+    pub process_input: bool,
+    /// Host-injected Agent/Turn jobs_* router. The slot itself is not authority
+    /// and finite-only/standalone hosts leave it empty.
+    pub agent_jobs: Arc<agent_jobs::AgentJobRouterSlot>,
+    /// Optional host-owned semantic execution router. Empty preserves the exact
+    /// existing Local executor with no auxiliary model/delegate work.
+    pub operation_router: Arc<operation_router::OperationRouterSlot>,
+    /// Host policy around sealed Graph admission and activation. Empty preserves
+    /// the existing JobManager scheduler exactly.
+    pub graph_policy_router: Arc<operation_router::GraphPolicyRouterSlot>,
+    /// Late-bound host-owned Graph executors such as the real AW Agent
+    /// constructor. Empty keeps the provider/standalone Graph vocabulary
+    /// conservative and cannot grant a tool by itself.
+    pub graph_host_tools: Arc<operation_router::GraphHostToolSlot>,
+    /// Static host intent to expose the real AW Agent constructor in the cached
+    /// Batch schema. Execution still requires a live host-tool binding + grant.
+    pub allow_agent_graph: bool,
+    /// Advertise constructor wake metadata only when this exact Agent has a
+    /// bounded live wake owner and an installed Agent jobs router.
+    pub allow_wake: bool,
     /// Existing AW private state root used only for crash-safe internal tool
     /// records. None preserves explicit memory-only/direct SDK semantics.
     pub private_state_dir: Option<PathBuf>,
@@ -737,6 +763,13 @@ impl LocalToolOptions {
             mode,
             execution_site: "local".into(),
             bash: None,
+            process_input: false,
+            agent_jobs: Arc::new(agent_jobs::AgentJobRouterSlot::default()),
+            operation_router: Arc::new(operation_router::OperationRouterSlot::default()),
+            graph_policy_router: Arc::new(operation_router::GraphPolicyRouterSlot::default()),
+            graph_host_tools: Arc::new(operation_router::GraphHostToolSlot::default()),
+            allow_agent_graph: false,
+            allow_wake: false,
             private_state_dir: None,
             selected_tools: Vec::new(),
             concurrency: LocalToolConcurrency::default(),
@@ -762,6 +795,16 @@ impl ToolPolicyLifecycle for ParallelismCeiling {
     }
 }
 
+fn routed_tool(
+    tool: Arc<dyn Tool>,
+    router: &Arc<operation_router::OperationRouterSlot>,
+) -> Result<Arc<dyn Tool>> {
+    Ok(Arc::new(operation_router::RoutedTool::new(
+        tool,
+        router.clone(),
+    )?))
+}
+
 fn offer<T: Tool + 'static>(
     builder: AgentBuilder,
     tool: T,
@@ -769,15 +812,17 @@ fn offer<T: Tool + 'static>(
     available: &mut BTreeSet<String>,
     policy: &mut ToolPolicy,
     actor: &PrincipalId,
+    router: &Arc<operation_router::OperationRouterSlot>,
 ) -> Result<AgentBuilder> {
-    let spec = tool.spec();
-    available.insert(spec.name.clone());
-    if selected.is_empty() || selected.contains(spec.name.as_str()) {
-        policy.permit_host(actor.clone(), &spec.name, &spec.effect)?;
-        Ok(builder.tool(tool))
-    } else {
-        Ok(builder)
-    }
+    offer_shared(
+        builder,
+        Arc::new(tool),
+        selected,
+        available,
+        policy,
+        actor,
+        router,
+    )
 }
 fn offer_shared(
     builder: AgentBuilder,
@@ -786,12 +831,13 @@ fn offer_shared(
     available: &mut BTreeSet<String>,
     policy: &mut ToolPolicy,
     actor: &PrincipalId,
+    router: &Arc<operation_router::OperationRouterSlot>,
 ) -> Result<AgentBuilder> {
     let spec = tool.spec();
     available.insert(spec.name.clone());
     if selected.is_empty() || selected.contains(spec.name.as_str()) {
         policy.permit_host(actor.clone(), &spec.name, &spec.effect)?;
-        Ok(builder.shared_tool(tool))
+        Ok(builder.shared_tool(routed_tool(tool, router)?))
     } else {
         Ok(builder)
     }
@@ -804,12 +850,13 @@ fn offer_required<T: Tool + 'static>(
     available: &mut BTreeSet<String>,
     policy: &mut ToolPolicy,
     actor: &PrincipalId,
+    router: &Arc<operation_router::OperationRouterSlot>,
 ) -> Result<AgentBuilder> {
     let spec = tool.spec();
     available.insert(spec.name.clone());
     if required || selected.is_empty() || selected.contains(spec.name.as_str()) {
         policy.permit_host(actor.clone(), &spec.name, &spec.effect)?;
-        Ok(builder.tool(tool))
+        Ok(builder.shared_tool(routed_tool(Arc::new(tool), router)?))
     } else {
         Ok(builder)
     }
@@ -820,10 +867,17 @@ pub fn configure(
     options: &LocalToolOptions,
 ) -> Result<AgentBuilder> {
     if options.mode == ToolMode::Off {
-        if !options.selected_tools.is_empty() {
-            return Err(Error::Denied("tool selection needs an enabled mode"));
+        if options.selected_tools.is_empty() {
+            return Ok(builder);
         }
-        return Ok(builder);
+        let agent_subscribe_only = options.selected_tools.len() == 1
+            && options.selected_tools[0] == "jobs_subscribe"
+            && options.agent_jobs.is_installed()?;
+        if !agent_subscribe_only {
+            return Err(Error::Denied(
+                "ToolMode::Off permits only host-backed jobs_subscribe",
+            ));
+        }
     }
     let concurrency = options.concurrency.validate()?;
     let selected = options
@@ -833,26 +887,31 @@ pub fn configure(
         // advertises the sealed DL-150 pwsh identity on Windows.
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    // One live Job runtime is shared by batch, direct Process constructors,
+    // and every jobs_* projection. There is no job_start/job_restart route.
     const JOB_TOOL_NAMES: &[&str] = &[
         "batch",
-        "job_start",
-        "job_list",
-        "job_get",
-        "job_output",
-        "job_ack",
-        "job_cancel",
-        "job_restart",
+        "jobs_list",
+        "jobs_get",
+        "jobs_read",
+        "jobs_ack",
+        "jobs_send",
+        "jobs_cancel",
+        "jobs_subscribe",
     ];
-    let constructor_selected = selected.iter().any(|name| {
-        matches!(
-            *name,
-            "batch" | "job_start" | "bash" | "pwsh" | "powershell"
-        )
-    });
+    let constructor_selected = selected
+        .iter()
+        .any(|name| matches!(*name, "batch" | "bash" | "pwsh" | "powershell"));
     let control_selected = selected.iter().any(|name| {
         matches!(
             *name,
-            "job_list" | "job_get" | "job_output" | "job_ack" | "job_cancel" | "job_restart"
+            "jobs_list"
+                | "jobs_get"
+                | "jobs_read"
+                | "jobs_ack"
+                | "jobs_send"
+                | "jobs_cancel"
+                | "jobs_subscribe"
         )
     });
     let wants_jobs = selected.is_empty() || constructor_selected || control_selected;
@@ -881,6 +940,9 @@ pub fn configure(
             .limits
             .validate_for_core_tools(&active_tools, shell_enabled, wants_jobs)?;
     let mut policy = builder.tool_policy_snapshot();
+    if options.process_input {
+        policy.permit_host(actor.clone(), "process.input", &ToolEffect::Control)?;
+    }
     if policy.execution_site != options.execution_site {
         let default_site = ToolPolicy::default().execution_site;
         if policy.execution_site == default_site && !policy.has_grants() {
@@ -914,8 +976,7 @@ pub fn configure(
     )?);
     let durable_remove = root.private_artifacts().is_durable();
     let mut available = BTreeSet::new();
-    let multi_node_constructor =
-        selected.is_empty() || selected.contains("batch") || selected.contains("job_start");
+    let multi_node_constructor = selected.is_empty() || selected.contains("batch");
     let max_graph_nodes = if multi_node_constructor {
         aw_tools::filesystem::batch::MAX_OPS
     } else {
@@ -929,9 +990,15 @@ pub fn configure(
         .collect::<Vec<_>>();
     let graph_shell_available = shell_enabled;
     if !selected.is_empty() && control_selected && !constructor_selected {
-        return Err(Error::Denied(
-            "selected Job controls require an explicitly selected batch, job_start or shell constructor",
-        ));
+        let agent_router_control_only = options.agent_jobs.is_installed()?
+            && selected
+                .iter()
+                .all(|name| !JOB_TOOL_NAMES.contains(name) || *name == "jobs_subscribe");
+        if !agent_router_control_only {
+            return Err(Error::Denied(
+                "selected finite Job controls require batch/shell; Agent-only jobs_subscribe requires an installed Agent router",
+            ));
+        }
     }
     if !selected.is_empty()
         && constructor_selected
@@ -960,44 +1027,35 @@ pub fn configure(
             builder.tool_binding_authority(),
             limits,
             effective_concurrency,
+            options.agent_jobs.clone(),
+            options.graph_policy_router.clone(),
+            options.graph_host_tools.clone(),
+            options.allow_agent_graph,
+            options.allow_wake,
             max_graph_nodes,
             graph_native_tools,
         )?;
         builder = builder
             .scope_lifecycle(runtime.clone())
             .tool_policy_lifecycle(runtime.clone());
-        builder = offer(
-            builder,
-            job_tools::Batch::new(runtime.clone()),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-        )?;
-        builder = offer(
-            builder,
-            job_tools::JobControl::new(runtime.clone(), job_tools::JobToolKind::Start),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-        )?;
         for kind in [
-            job_tools::JobToolKind::List,
-            job_tools::JobToolKind::Get,
-            job_tools::JobToolKind::Output,
-            job_tools::JobToolKind::Ack,
-            job_tools::JobToolKind::Cancel,
-            job_tools::JobToolKind::Restart,
+            jobs_tools::JobsKind::List,
+            jobs_tools::JobsKind::Get,
+            jobs_tools::JobsKind::Read,
+            jobs_tools::JobsKind::Ack,
+            jobs_tools::JobsKind::Send,
+            jobs_tools::JobsKind::Cancel,
+            jobs_tools::JobsKind::Subscribe,
         ] {
             builder = offer_required(
                 builder,
-                job_tools::JobControl::new(runtime.clone(), kind),
+                jobs_tools::JobsTool::new(runtime.clone(), kind),
                 &selected,
                 constructor_selected,
                 &mut available,
                 &mut policy,
                 &actor,
+                &options.operation_router,
             )?;
         }
         Some(runtime)
@@ -1019,6 +1077,7 @@ pub fn configure(
             &mut available,
             &mut policy,
             &actor,
+            &options.operation_router,
         )?;
     }
     if options
@@ -1058,6 +1117,7 @@ pub fn configure(
                     &mut available,
                     &mut policy,
                     &actor,
+                    &options.operation_router,
                 )?;
             } else {
                 available.insert("bash".into());
@@ -1098,11 +1158,27 @@ pub fn configure(
                     &mut available,
                     &mut policy,
                     &actor,
+                    &options.operation_router,
                 )?;
             } else {
                 // No shell requested in this selected-tool subset.
             }
         }
+    }
+    // Seal the model-facing Graph schema only after every prepared interpreter
+    // has been attached to the shared runtime. Registering Batch earlier would
+    // capture a native-only schema even though the direct shell constructor was
+    // live on the same runtime.
+    if let Some(runtime) = &job_runtime {
+        builder = offer(
+            builder,
+            job_tools::Batch::new(runtime.clone()),
+            &selected,
+            &mut available,
+            &mut policy,
+            &actor,
+            &options.operation_router,
+        )?;
     }
     if selected.iter().any(|name| !available.contains(*name)) {
         return Err(Error::Denied(

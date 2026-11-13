@@ -8,6 +8,8 @@
 extern crate alloc;
 
 pub mod capability;
+pub mod writer_fence;
+pub use writer_fence::WriterFence;
 
 // Four portable runtime primitives and the two-verb hook vocabulary; the OS,
 // scheduler, process and persistence services live in hosted adapters.

@@ -8,6 +8,7 @@ use aw_agent_kernel::{
 };
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::{
     future::Future,
     pin::Pin,
@@ -18,6 +19,60 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::broadcast, time::Instant};
+
+/// Immutable host-verified structural owner for one live Agent execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentExecutionBinding {
+    canonical_ref: String,
+    session_id: String,
+    branch_id: String,
+}
+
+impl AgentExecutionBinding {
+    /// The host must derive canonical_ref from its authoritative Session store.
+    /// This validates only transport shape; it does not parse refs or mint authority.
+    pub fn from_trusted_host(
+        canonical_ref: impl Into<String>,
+        session_id: impl Into<String>,
+        branch_id: impl Into<String>,
+    ) -> Result<Self> {
+        let canonical_ref = canonical_ref.into();
+        let session_id = session_id.into();
+        let branch_id = branch_id.into();
+        let valid_component = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value.is_ascii()
+                && !value.chars().any(char::is_control)
+        };
+        if canonical_ref.len() > 1024
+            || !canonical_ref.starts_with("/d:")
+            || !canonical_ref.is_ascii()
+            || canonical_ref.chars().any(char::is_control)
+            || !valid_component(&session_id)
+            || !valid_component(&branch_id)
+        {
+            return Err(Error::Denied("invalid Agent execution binding"));
+        }
+        Ok(Self {
+            canonical_ref,
+            session_id,
+            branch_id,
+        })
+    }
+
+    pub fn canonical_ref(&self) -> &str {
+        &self.canonical_ref
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn branch_id(&self) -> &str {
+        &self.branch_id
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentOptions {
@@ -257,6 +312,8 @@ impl AgentBuilder {
             events: None,
             needs_reconciliation: false,
             journal: None,
+            execution_binding: None,
+            execution_scope: None,
             persistence_fault: false,
             last_portable_trace: Vec::new(),
             hook_observer_failures: AtomicU64::new(0),
@@ -289,6 +346,8 @@ pub struct Agent {
     events: Option<broadcast::Sender<AgentEvent>>,
     needs_reconciliation: bool,
     journal: Option<Arc<dyn TurnJournal>>,
+    execution_binding: Option<AgentExecutionBinding>,
+    execution_scope: Option<crate::ExecutionOwnershipScope>,
     persistence_fault: bool,
     // Ephemeral, data-free transition evidence from the common portable
     // kernel. Never persisted as authority, and no credentials are included.
@@ -356,6 +415,88 @@ impl Agent {
     }
     pub fn options(&self) -> &AgentOptions {
         &self.options
+    }
+
+    pub fn execution_binding(&self) -> Option<&AgentExecutionBinding> {
+        self.execution_binding.as_ref()
+    }
+
+    pub fn execution_scope(&self) -> Option<&crate::ExecutionOwnershipScope> {
+        self.execution_scope.as_ref()
+    }
+
+    /// Allocate a fresh Agent execution identity while preserving only the
+    /// embedding host's provider/tool configuration. Conversation, journal,
+    /// Session binding, causal execution scope, reconciliation state and
+    /// provider-private continuation are deliberately not carried across.
+    pub fn fresh_execution_identity(&self) -> Result<Self> {
+        self.options.validate()?;
+        self.tool_policy.validate()?;
+        crate::extension::validate_extensions(&self.extensions)?;
+        Ok(Self {
+            conversation: Conversation::new(self.options.system_prompt.clone())?,
+            provider: self.provider.clone(),
+            options: self.options.clone(),
+            extensions: self.extensions.clone(),
+            tools: self.tools.clone(),
+            tool_policy: self.tool_policy.clone(),
+            binding_authority: self.binding_authority.clone(),
+            scope_lifecycles: self.scope_lifecycles.clone(),
+            tool_policy_lifecycles: self.tool_policy_lifecycles.clone(),
+            revision_policy: self.revision_policy.clone(),
+            default_pool: self.default_pool.clone(),
+            default_account: self.default_account.clone(),
+            default_actor: self.default_actor.clone(),
+            events: self.events.clone(),
+            needs_reconciliation: false,
+            journal: None,
+            execution_binding: None,
+            execution_scope: None,
+            persistence_fault: false,
+            last_portable_trace: Vec::new(),
+            hook_observer_failures: AtomicU64::new(0),
+        })
+    }
+
+    /// Bind one temporary causal execution scope to the current work. This is
+    /// intentionally independent from the Agent's immutable Session identity.
+    pub fn bind_execution_scope(&mut self, scope: crate::ExecutionOwnershipScope) -> Result<()> {
+        match &self.execution_scope {
+            None => {
+                self.execution_scope = Some(scope);
+                Ok(())
+            }
+            Some(current) if current.same_instance(&scope) => Ok(()),
+            Some(_) => Err(Error::Conflict(
+                "Agent already carries another live execution ownership scope",
+            )),
+        }
+    }
+
+    pub fn clear_execution_scope(&mut self) {
+        self.execution_scope = None;
+    }
+
+    /// Bind this Agent once to one authoritative Session-derived identity.
+    /// Repeating the exact binding is idempotent; retargeting is forbidden.
+    pub fn bind_execution_owner(&mut self, binding: AgentExecutionBinding) -> Result<()> {
+        if let Some(scope) = self.journal_scope()? {
+            if scope.session_id != binding.session_id || scope.branch_id != binding.branch_id {
+                return Err(Error::Conflict(
+                    "Agent execution binding does not match its journal Session/branch",
+                ));
+            }
+        }
+        match &self.execution_binding {
+            None => {
+                self.execution_binding = Some(binding);
+                Ok(())
+            }
+            Some(current) if current == &binding => Ok(()),
+            Some(_) => Err(Error::Conflict(
+                "live Agent execution identity cannot be rebound",
+            )),
+        }
     }
     /// User-authorized safe-provider-attempt ceiling. Unlike retrying an
     /// uncertain HTTP error, BeforeDispatch explicitly attests no vendor
@@ -552,6 +693,29 @@ impl Agent {
             .effect_of(name)
             .ok_or(Error::Denied("tool effect missing"))?;
         self.tool_policy.permit_host(actor, name, effect)?;
+        self.binding_authority
+            .publish(&self.tools, &self.tool_policy)
+    }
+
+    /// Trusted-host capability that deliberately has no model ToolSpec, such
+    /// as live Process stdin. It uses the same exact source/effect/site grant
+    /// table and publication generation without registering a callable tool.
+    pub fn permit_host_capability(
+        &mut self,
+        actor: PrincipalId,
+        name: &str,
+        effect: &crate::ToolEffect,
+    ) -> Result<()> {
+        self.tool_policy.permit_host(actor, name, effect)?;
+        self.binding_authority
+            .publish(&self.tools, &self.tool_policy)
+    }
+
+    /// Revoke a non-model trusted-host capability while leaving the provider
+    /// catalog unchanged.
+    pub fn revoke_host_capability(&mut self, actor: &PrincipalId, name: &str) -> Result<()> {
+        self.tool_policy
+            .revoke_source(actor, name, &crate::tool::ToolSource::trusted_host());
         self.binding_authority
             .publish(&self.tools, &self.tool_policy)
     }
@@ -814,6 +978,15 @@ impl Agent {
         let next_scope = journal
             .as_ref()
             .map_or(Ok(None), |journal| journal.invocation_scope())?;
+        if let Some(binding) = &self.execution_binding {
+            if next_scope.as_ref().is_none_or(|scope| {
+                scope.session_id != binding.session_id || scope.branch_id != binding.branch_id
+            }) {
+                return Err(Error::Conflict(
+                    "history replacement cannot retarget a bound Agent identity",
+                ));
+            }
+        }
         if previous_scope != next_scope {
             for lifecycle in &self.scope_lifecycles {
                 lifecycle.replace_scope(previous_scope.as_ref(), next_scope.as_ref())?;
@@ -967,6 +1140,125 @@ impl Agent {
         self.prompt_as_inner(selected, prompt, cancel, on_event, Some(gate))
             .await
     }
+    async fn prepare_provider_projection(
+        &self,
+        selected: &ProviderSelection,
+        input: &str,
+        current_turn: Option<&[Message]>,
+        turn_id: u64,
+        step_gate: Option<&dyn crate::control::AgentStepGate>,
+    ) -> Result<(Vec<Message>, Vec<ToolSpec>)> {
+        if self.persistence_fault {
+            return Err(Error::Storage(
+                "journal failed; reload/recover the session before continuing",
+            ));
+        }
+        if self.needs_reconciliation {
+            return Err(Error::Denied(
+                "interrupted tool effects require explicit host inspection/acknowledgement",
+            ));
+        }
+        let mut reader = selected.reader()?;
+        reader.revalidate()?;
+        let identity = selected.identity();
+        let authority_segment = match step_gate {
+            Some(gate) => gate.authority_segment(turn_id)?,
+            None => None,
+        };
+        if let Some(journal) = &self.journal {
+            journal
+                .validate_context_for_segment(identity, authority_segment.as_ref())
+                .await?;
+        }
+
+        let mut messages = if let Some(current_turn) = current_turn {
+            let mut messages = self.conversation.public_messages()?;
+            if let Some(journal) = &self.journal {
+                for block in journal
+                    .additional_context_for_segment(identity, authority_segment.as_ref())
+                    .await?
+                {
+                    block.validate(0)?;
+                    messages.push(block.message(2 + messages.len() as u64));
+                }
+            }
+            messages.extend(current_turn.iter().cloned());
+            Conversation::check_message_budget(&messages)?;
+            messages
+        } else {
+            let mut messages = self.conversation.messages_for(input)?;
+            if let Some(journal) = &self.journal {
+                let current = messages
+                    .pop()
+                    .ok_or(Error::Protocol("missing user prompt"))?;
+                for block in journal
+                    .additional_context_for_segment(identity, authority_segment.as_ref())
+                    .await?
+                {
+                    block.validate(0)?;
+                    messages.push(block.message(2 + messages.len() as u64));
+                }
+                messages.push(current);
+                Conversation::check_message_budget(&messages)?;
+            }
+            messages
+        };
+
+        for message in &mut messages {
+            message.provider_context = None;
+        }
+        self.conversation
+            .check_retained_budget(input, self.options.max_output_bytes)?;
+        let context = HookContext {
+            turn_id,
+            continuation: None,
+            profile: &identity.account_id,
+            model: &identity.model,
+            identity,
+        };
+        messages = crate::hooks::dispatch_extension(
+            &self.extensions,
+            context,
+            crate::extension::HookEvent::Prompt {
+                input: input.to_owned(),
+                messages,
+            },
+            self.options.hook_timeout,
+            step_gate.and_then(|gate| gate.hook_continuation_port()),
+        )
+        .await?
+        .prompt()?;
+        validate_messages(&messages)?;
+
+        let specs = self
+            .tools
+            .visible(&identity.actor, &self.tool_policy)
+            .into_iter()
+            .filter(|spec| {
+                self.tools
+                    .allows_bound(&identity.actor, &self.tool_policy, &spec.name, step_gate)
+            })
+            .collect::<Vec<_>>();
+        let schema_bytes = serde_json::to_vec(&specs)
+            .map_err(|_| Error::Protocol("invalid tool schema"))?
+            .len();
+        if schema_bytes > 128 * 1024 {
+            return Err(Error::Limit("total tool definitions exceed 128 KiB"));
+        }
+        if !specs.is_empty() && !selected.provider().supports_tools() {
+            return Err(Error::Protocol(
+                "selected provider does not support configured tool protocol",
+            ));
+        }
+        reader.revalidate()?;
+        if let Some(journal) = &self.journal {
+            journal
+                .validate_context_for_segment(identity, authority_segment.as_ref())
+                .await?;
+        }
+        Ok((messages, specs))
+    }
+
     async fn prompt_as_inner<C, F>(
         &mut self,
         selected: &ProviderSelection,
@@ -979,95 +1271,28 @@ impl Agent {
         C: Future<Output = ()> + Send,
         F: FnMut(&AgentEvent) -> Result<()> + Send,
     {
-        let mut selection_reader = selected.reader()?;
-        let mut sink_reader = selected.reader()?;
+        let mut active_selection = selected.clone();
+        let mut identity = active_selection.identity().clone();
+        let mut selection_reader = active_selection.reader()?;
+        let mut sink_reader = active_selection.reader()?;
         let prompt = prompt.into();
         let deadline = Instant::now() + self.options.request_timeout;
         tokio::pin!(cancel);
-        let identity = selected.identity().clone();
         let id = self.conversation.next_turn_id();
-        let ctx = HookContext {
-            turn_id: id,
-
-            continuation: None,
-            profile: &identity.account_id,
-            model: &identity.model,
-            identity: &identity,
-        };
-        let prepare = async {
-            if self.persistence_fault {
-                return Err(Error::Storage(
-                    "journal failed; reload/recover the session before continuing",
-                ));
-            }
-            if self.needs_reconciliation {
-                return Err(Error::Denied(
-                    "interrupted tool effects require explicit host inspection/acknowledgement",
-                ));
-            }
-            selection_reader.revalidate()?;
-            if let Some(journal) = &self.journal {
-                journal.validate_context_as(&identity).await?;
-            }
-            let mut messages = self.conversation.messages_for(&prompt)?;
-            if let Some(j) = &self.journal {
-                let current = messages
-                    .pop()
-                    .ok_or(Error::Protocol("missing user prompt"))?;
-                for block in j.additional_context().await? {
-                    block.validate(0)?;
-                    messages.push(block.message(2 + messages.len() as u64));
+        macro_rules! hook_context {
+            () => {
+                HookContext {
+                    turn_id: id,
+                    continuation: None,
+                    profile: &identity.account_id,
+                    model: &identity.model,
+                    identity: &identity,
                 }
-                messages.push(current);
-                validate_messages(&messages)?;
-            }
-            // Provider-private thinking context is never silently sent under a
-            // different model/account. Public transcript remains shared.
-            for message in &mut messages {
-                message.provider_context = None;
-            }
-            self.conversation
-                .check_retained_budget(&prompt, self.options.max_output_bytes)?;
-            messages = crate::hooks::dispatch_extension(
-                &self.extensions,
-                ctx,
-                crate::extension::HookEvent::Prompt {
-                    input: prompt.clone(),
-                    messages,
-                },
-                self.options.hook_timeout,
-                step_gate.and_then(|gate| gate.hook_continuation_port()),
-            )
-            .await?
-            .prompt()?;
-            validate_messages(&messages)?;
-            let specs = self
-                .tools
-                .visible(&identity.actor, &self.tool_policy)
-                .into_iter()
-                .filter(|spec| {
-                    self.tools.allows_bound(
-                        &identity.actor,
-                        &self.tool_policy,
-                        &spec.name,
-                        step_gate,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let schema_bytes = serde_json::to_vec(&specs)
-                .map_err(|_| Error::Protocol("invalid tool schema"))?
-                .len();
-            if schema_bytes > 128 * 1024 {
-                return Err(Error::Limit("total tool definitions exceed 128 KiB"));
-            }
-            if !specs.is_empty() && !selected.provider().supports_tools() {
-                return Err(Error::Protocol(
-                    "selected provider does not support configured tool protocol",
-                ));
-            }
-            Ok::<_, Error>((messages, specs))
-        };
-        let (mut messages, specs) = match controlled(prepare, cancel.as_mut(), deadline).await {
+            };
+        }
+        let prepare =
+            self.prepare_provider_projection(&active_selection, &prompt, None, id, step_gate);
+        let (mut messages, mut specs) = match controlled(prepare, cancel.as_mut(), deadline).await {
             Ok(v) => v,
             Err(e) => {
                 let _ = notify(
@@ -1125,7 +1350,7 @@ impl Agent {
         self.hook_observer_failures.fetch_add(
             crate::hooks::observe_extension(
                 &self.extensions,
-                ctx,
+                hook_context!(),
                 HookStage::Turn,
                 "turn_started",
                 self.options.hook_timeout,
@@ -1159,6 +1384,7 @@ impl Agent {
         ))?;
         let mut portable_trace = Vec::<PortableEvent>::new();
         let mut provider_attempt_ordinal = 0u32;
+        let mut journaled_authority_segment: Option<crate::AuthoritySegment> = None;
         let execution = async {
             notify(
                 &self.events,
@@ -1172,7 +1398,7 @@ impl Agent {
             self.hook_observer_failures.fetch_add(
                 crate::hooks::observe_extension(
                     &self.extensions,
-                    ctx,
+                    hook_context!(),
                     HookStage::Event,
                     "agent_started",
                     self.options.hook_timeout,
@@ -1180,7 +1406,7 @@ impl Agent {
                 .await,
                 Ordering::Relaxed,
             );
-            for round in 0..self.tool_policy.max_model_rounds {
+            'model_rounds: for round in 0..self.tool_policy.max_model_rounds {
                 if let Some(gate) = step_gate {
                     // Prior effects have already been factually receipted.
                     // Cancelled here means a settled interrupted Turn, never
@@ -1191,6 +1417,92 @@ impl Agent {
                         deadline,
                     )
                     .await?;
+                    if let Some(update) = gate.take_authority_update(
+                        id,
+                        round + 1,
+                        crate::control::AgentGatePoint::BeforeModel,
+                    )? {
+                        update.segment.validate()?;
+                        if update.input.is_empty()
+                            || update.input.len() > crate::limits::MAX_PROMPT_BYTES
+                        {
+                            return Err(Error::Denied(
+                                "same-Turn authority-update input is invalid",
+                            ));
+                        }
+                        let message = Message::text(
+                            id * 1024 + turn.context_messages.len() as u64,
+                            Role::User,
+                            update.input,
+                        );
+                        turn.context_messages.push(message.clone());
+                        messages.push(message);
+                    }
+                    if let Some(segment) = gate.authority_segment(id)? {
+                        segment.validate()?;
+                        if let Some(evidence) = segment.evidence.as_ref() {
+                            evidence.validate()?;
+                            match evidence.identity.as_ref() {
+                                Some(expected) if expected != &identity => {
+                                    let next = self.default_pool.select(
+                                        &expected.actor,
+                                        &expected.account_id,
+                                        &expected.model,
+                                    )?;
+                                    next.revalidate()?;
+                                    if next.identity() != expected {
+                                        return Err(Error::Denied(
+                                            "AuthoritySegment provider identity is no longer current",
+                                        ));
+                                    }
+                                    evidence.validate_identity(next.identity())?;
+                                    active_selection = next;
+                                    identity = expected.clone();
+                                    selection_reader = active_selection.reader()?;
+                                    sink_reader = active_selection.reader()?;
+
+                                    let projection_input = turn
+                                        .context_messages
+                                        .iter()
+                                        .rev()
+                                        .find(|message| message.role == Role::User)
+                                        .map(|message| message.content.clone())
+                                        .unwrap_or_else(|| prompt.clone());
+                                    let rebuilt = self
+                                        .prepare_provider_projection(
+                                            &active_selection,
+                                            &projection_input,
+                                            Some(&turn.context_messages),
+                                            id,
+                                            step_gate,
+                                        )
+                                        .await?;
+                                    messages = rebuilt.0;
+                                    specs = rebuilt.1;
+                                }
+                                Some(_) => evidence.validate_identity(&identity)?,
+                                None if evidence.actor != identity.actor => {
+                                    return Err(Error::Denied(
+                                        "cross-participant AuthoritySegment lacks exact provider identity",
+                                    ));
+                                }
+                                None => evidence.validate_identity(&identity)?,
+                            }
+                        }
+                        if journaled_authority_segment.as_ref() != Some(&segment) {
+                            if let Some(journal) = &self.journal {
+                                journal
+                                    .append(
+                                        id,
+                                        JournalEntry::AuthoritySegmentStarted {
+                                            segment: segment.clone(),
+                                        },
+                                    )
+                                    .await?;
+                            }
+                            journaled_authority_segment = Some(segment);
+                        }
+                    }
                 }
                 portable_trace.push(portable_step(machine.begin_model())?);
                 debug_assert_eq!(machine.rounds(), round + 1);
@@ -1222,6 +1534,32 @@ impl Agent {
                     invocation_context.ordinal = provider_attempt_ordinal;
                     selection_reader.revalidate()?;
                     if let Some(j) = &self.journal {
+                        if let Some(segment) = journaled_authority_segment.as_ref() {
+                            let identity_bytes = serde_json::to_vec(&identity).map_err(|_| {
+                                Error::Protocol("cannot encode provider admission identity")
+                            })?;
+                            let mut hash = Sha256::new();
+                            hash.update(b"aw-model-invocation-admission-v1\0");
+                            hash.update(id.to_be_bytes());
+                            hash.update(invocation_context.ordinal.to_be_bytes());
+                            hash.update(segment.ordinal.to_be_bytes());
+                            hash.update(segment.fingerprint);
+                            hash.update((identity_bytes.len() as u64).to_be_bytes());
+                            hash.update(identity_bytes);
+                            let admission = crate::ModelInvocationAdmission {
+                                ordinal: invocation_context.ordinal,
+                                invocation_id: format!("mi_{:x}", hash.finalize()),
+                                authority_segment: segment.ordinal,
+                                authority_fingerprint: segment.fingerprint,
+                                identity: identity.clone(),
+                            };
+                            admission.validate()?;
+                            j.append(
+                                id,
+                                JournalEntry::ModelInvocationAdmitted { admission },
+                            )
+                            .await?;
+                        }
                         j.append(
                             id,
                             JournalEntry::InvocationStarted {
@@ -1266,10 +1604,14 @@ impl Agent {
                             async {
                                 selection_reader.revalidate()?;
                                 if let Some(j) = &self.journal {
-                                    j.validate_context_as(&identity).await?;
+                                    j.validate_context_for_segment(
+                                        &identity,
+                                        journaled_authority_segment.as_ref(),
+                                    )
+                                    .await?;
                                 }
                                 selection_reader.revalidate()?;
-                                selected
+                                active_selection
                                     .provider()
                                     .invoke(
                                         &invocation_context,
@@ -1317,7 +1659,7 @@ impl Agent {
                     self.hook_observer_failures.fetch_add(
                         crate::hooks::observe_extension(
                             &self.extensions,
-                            ctx,
+                            hook_context!(),
                             HookStage::Output,
                             "provider_attempt_recorded",
                             self.options.hook_timeout,
@@ -1371,7 +1713,7 @@ impl Agent {
                 self.hook_observer_failures.fetch_add(
                     crate::hooks::observe_extension(
                         &self.extensions,
-                        ctx,
+                        hook_context!(),
                         HookStage::Message,
                         "assistant_recorded",
                         self.options.hook_timeout,
@@ -1448,7 +1790,7 @@ impl Agent {
                     let approval = controlled(
                         crate::hooks::dispatch_extension(
                             &self.extensions,
-                            ctx,
+                            hook_context!(),
                             crate::extension::HookEvent::ToolCall {
                                 call: call.clone(),
                                 spec: spec.clone(),
@@ -1576,6 +1918,110 @@ impl Agent {
                     }
                     continue;
                 }
+                if let Some(gate) = step_gate {
+                    // This is the last safe point before any ToolRevised or
+                    // ToolStarted intent. A same-Turn steer may supersede the
+                    // provider's complete old proposal without executing it.
+                    controlled(
+                        gate.checkpoint(
+                            id,
+                            round + 1,
+                            crate::control::AgentGatePoint::BeforeToolBatch,
+                        ),
+                        cancel.as_mut(),
+                        deadline,
+                    )
+                    .await?;
+                    if let Some(update) = gate.take_authority_update(
+                        id,
+                        round + 1,
+                        crate::control::AgentGatePoint::BeforeToolBatch,
+                    )? {
+                        update.segment.validate()?;
+                        let current = gate
+                            .authority_segment(id)?
+                            .ok_or(Error::Conflict(
+                                "same-Turn authority update lost its current AuthoritySegment",
+                            ))?;
+                        if current != update.segment {
+                            return Err(Error::Conflict(
+                                "same-Turn authority-update segment changed before journal admission",
+                            ));
+                        }
+                        if journaled_authority_segment.as_ref() != Some(&current) {
+                            if let Some(journal) = &self.journal {
+                                journal
+                                    .append(
+                                        id,
+                                        JournalEntry::AuthoritySegmentStarted {
+                                            segment: current.clone(),
+                                        },
+                                    )
+                                    .await?;
+                            }
+                            journaled_authority_segment = Some(current);
+                        }
+
+                        portable_trace.push(portable_step(machine.reject_batch())?);
+                        messages.push(assistant.clone());
+                        turn.context_messages.push(assistant.clone());
+                        for call in &reply.tool_calls {
+                            let output = ToolOutput::error(
+                                "ERROR: denied before execution (superseded by authenticated same-Turn authority update)",
+                            );
+                            let record = ToolRecord {
+                                call: call.clone(),
+                                effect: self
+                                    .tools
+                                    .effect_of(&call.name)
+                                    .cloned()
+                                    .unwrap_or(ToolEffect::Unknown),
+                                execution_site: self.tool_policy.execution_site.clone(),
+                                status: ToolStatus::Denied,
+                                output: Some(output.clone()),
+                            };
+                            if let Some(journal) = &self.journal {
+                                controlled(
+                                    journal.append(
+                                        id,
+                                        JournalEntry::ToolDenied {
+                                            record: record.clone(),
+                                        },
+                                    ),
+                                    cancel.as_mut(),
+                                    deadline,
+                                )
+                                .await?;
+                            }
+                            portable_trace
+                                .push(portable_step(machine.denial_recorded(&call.id))?);
+                            turn.tool_records.push(record.clone());
+                            let _ = notify(
+                                &sender,
+                                &mut on_event,
+                                AgentEvent::ToolFinished {
+                                    turn_id: id,
+                                    record,
+                                },
+                            );
+                            let result = tool_result_message(
+                                id * 1024 + turn.context_messages.len() as u64,
+                                call,
+                                &output,
+                            );
+                            turn.context_messages.push(result.clone());
+                            messages.push(result);
+                        }
+                        let steering = Message::text(
+                            id * 1024 + turn.context_messages.len() as u64,
+                            Role::User,
+                            update.input,
+                        );
+                        turn.context_messages.push(steering.clone());
+                        messages.push(steering);
+                        continue;
+                    }
+                }
                 // All revisions are authorized by an independent trusted
                 // host policy, and their exact original + revised proposals,
                 // source epoch and effect commit BEFORE tool batch admission.
@@ -1636,22 +2082,6 @@ impl Agent {
                     tool::MAX_TRACE_BYTES.saturating_sub(trace_used),
                     batch.len(),
                 )?;
-                if let Some(gate) = step_gate {
-                    // The provider invocation and assistant answer are
-                    // durable; no tool intent has been admitted yet.
-                    // Pausing/urgent steer is safe HERE, never between an
-                    // external effect's intent and factual receipt.
-                    controlled(
-                        gate.checkpoint(
-                            id,
-                            round + 1,
-                            crate::control::AgentGatePoint::BeforeToolBatch,
-                        ),
-                        cancel.as_mut(),
-                        deadline,
-                    )
-                    .await?;
-                }
                 portable_trace.push(portable_step(machine.admit_batch())?);
                 messages.push(assistant.clone());
                 turn.context_messages.push(assistant);
@@ -1660,6 +2090,119 @@ impl Agent {
                 // No tokio::spawn: cancellation drops every in-flight future.
                 let mut cursor = 0;
                 while cursor < batch.len() {
+                    // A steering/interrupt boundary may arrive while the previous
+                    // effect was running. Never drop that effect: only after its
+                    // factual receipt is journaled may the authenticated boundary
+                    // supersede the still-unstarted suffix of this provider batch.
+                    if cursor > 0 {
+                        if let Some(gate) = step_gate {
+                            controlled(
+                                gate.checkpoint(
+                                    id,
+                                    round + 1,
+                                    crate::control::AgentGatePoint::BeforeToolBatch,
+                                ),
+                                cancel.as_mut(),
+                                deadline,
+                            )
+                            .await?;
+                            if let Some(update) = gate.take_authority_update(
+                                id,
+                                round + 1,
+                                crate::control::AgentGatePoint::BeforeToolBatch,
+                            )? {
+                                update.segment.validate()?;
+                                let current = gate
+                                    .authority_segment(id)?
+                                    .ok_or(Error::Conflict(
+                                        "same-Turn authority update lost its current AuthoritySegment",
+                                    ))?;
+                                if current != update.segment {
+                                    return Err(Error::Conflict(
+                                        "same-Turn authority-update segment changed before suffix denial",
+                                    ));
+                                }
+                                if journaled_authority_segment.as_ref() != Some(&current) {
+                                    if let Some(journal) = &self.journal {
+                                        journal
+                                            .append(
+                                                id,
+                                                JournalEntry::AuthoritySegmentStarted {
+                                                    segment: current.clone(),
+                                                },
+                                            )
+                                            .await?;
+                                    }
+                                    journaled_authority_segment = Some(current);
+                                }
+
+                                portable_trace
+                                    .push(portable_step(machine.reject_remaining())?);
+                                let reason = match update.segment.boundary {
+                                    crate::AuthorityBoundaryKind::Steer => "steer",
+                                    crate::AuthorityBoundaryKind::Interrupt => "interrupt",
+                                    crate::AuthorityBoundaryKind::Input => {
+                                        return Err(Error::Protocol(
+                                            "Input segment cannot supersede an active tool suffix",
+                                        ))
+                                    }
+                                };
+                                for (call, _, spec) in &batch[cursor..] {
+                                    let output = ToolOutput::error(format!(
+                                        "ERROR: denied before execution (superseded by authenticated same-Turn {reason})"
+                                    ));
+                                    let record = ToolRecord {
+                                        call: call.clone(),
+                                        effect: spec.effect.clone(),
+                                        execution_site: self.tool_policy.execution_site.clone(),
+                                        status: ToolStatus::Denied,
+                                        output: Some(output.clone()),
+                                    };
+                                    if let Some(journal) = &self.journal {
+                                        controlled(
+                                            journal.append(
+                                                id,
+                                                JournalEntry::ToolDenied {
+                                                    record: record.clone(),
+                                                },
+                                            ),
+                                            cancel.as_mut(),
+                                            deadline,
+                                        )
+                                        .await?;
+                                    }
+                                    portable_trace.push(portable_step(
+                                        machine.denial_recorded(&call.id),
+                                    )?);
+                                    turn.tool_records.push(record.clone());
+                                    let _ = notify(
+                                        &sender,
+                                        &mut on_event,
+                                        AgentEvent::ToolFinished {
+                                            turn_id: id,
+                                            record,
+                                        },
+                                    );
+                                    let result = tool_result_message(
+                                        id * 1024 + turn.context_messages.len() as u64,
+                                        call,
+                                        &output,
+                                    );
+                                    turn.context_messages.push(result.clone());
+                                    messages.push(result);
+                                }
+                                let steering = Message::text(
+                                    id * 1024 + turn.context_messages.len() as u64,
+                                    Role::User,
+                                    update.input,
+                                );
+                                turn.context_messages.push(steering.clone());
+                                messages.push(steering);
+                                continue 'model_rounds;
+                            }
+                        }
+                    }
+
                     // Model parallel:true must be explicit on each safe read.
                     // A sequential model choice becomes a wave barrier, but
                     // retains its actual Read effect for journal/reconciliation.
@@ -1775,7 +2318,11 @@ impl Agent {
                             // grants are checked after all intents were flushed.
                             selection_reader.revalidate()?;
                             if let Some(j) = &self.journal {
-                                j.validate_context_as(&identity).await?;
+                                j.validate_context_for_segment(
+                                    &identity,
+                                    journaled_authority_segment.as_ref(),
+                                )
+                                .await?;
                             }
                             selection_reader.revalidate()?;
                             for (call, _, spec) in wave {
@@ -1839,17 +2386,25 @@ impl Agent {
                             let registry = &self.tools;
                             let policy = &self.tool_policy;
                             let identity = identity.clone();
+                            let selection = active_selection.clone();
                             let scope = invocation_context.scope.clone();
+                            let execution_owner = self.execution_binding.clone();
+                            let execution_scope = self.execution_scope.clone();
                             let revision = revisions.get(&call.id).cloned();
                             let revision_policy = self.revision_policy.clone();
+                            let authority_segment = journaled_authority_segment.clone();
                             jobs.push(async move {
-                                let mut tool_reader = selected.reader()?;
+                                let mut tool_reader = selection.reader()?;
                                 // No async task may rely just on the gate above:
                                 // each tool rechecks actor, site and source at
                                 // its actual dispatch, after journal flush.
                                 tool_reader.revalidate()?;
                                 if let Some(j) = &journal {
-                                    j.validate_context_as(&identity).await?;
+                                    j.validate_context_for_segment(
+                                        &identity,
+                                        authority_segment.as_ref(),
+                                    )
+                                    .await?;
                                 }
                                 tool_reader.revalidate()?;
                                 if !registry.allows_bound(
@@ -1902,6 +2457,8 @@ impl Agent {
                                             result_budget_bytes: per_tool_output_bytes,
                                             identity: identity.clone(),
                                             scope,
+                                            execution_owner,
+                                            execution_scope,
                                         },
                                         &call.arguments,
                                     ),
@@ -1940,7 +2497,11 @@ impl Agent {
                                 let check = async {
                                     selection_reader.revalidate()?;
                                     if let Some(j) = &self.journal {
-                                        j.validate_context_as(&identity).await?;
+                                        j.validate_context_for_segment(
+                                            &identity,
+                                            journaled_authority_segment.as_ref(),
+                                        )
+                                        .await?;
                                     }
                                     selection_reader.revalidate()?;
                                     for (call, _, spec) in wave {
@@ -2069,7 +2630,7 @@ impl Agent {
                             let public = controlled(
                                 crate::hooks::dispatch_extension(
                                     &self.extensions,
-                                    ctx,
+                                    hook_context!(),
                                     crate::extension::HookEvent::ToolResult {
                                         call: call.clone(),
                                         receipt: output.clone(),
@@ -2162,7 +2723,11 @@ impl Agent {
                             // revoked access. Recheck before entering tool code.
                             selection_reader.revalidate()?;
                             if let Some(j) = &self.journal {
-                                j.validate_context_as(&identity).await?;
+                                j.validate_context_for_segment(
+                                    &identity,
+                                    journaled_authority_segment.as_ref(),
+                                )
+                                .await?;
                             }
                             selection_reader.revalidate()?;
                             if let Some((original, source, effect)) = revisions.get(&call.id) {
@@ -2208,6 +2773,8 @@ impl Agent {
                                     result_budget_bytes: per_tool_output_bytes,
                                     identity: identity.clone(),
                                     scope: invocation_context.scope.clone(),
+                                    execution_owner: self.execution_binding.clone(),
+                                    execution_scope: self.execution_scope.clone(),
                                 },
                                 &call.arguments,
                             )
@@ -2250,7 +2817,7 @@ impl Agent {
                             let public = controlled(
                                 crate::hooks::dispatch_extension(
                                     &self.extensions,
-                                    ctx,
+                                    hook_context!(),
                                     crate::extension::HookEvent::ToolResult {
                                         call: call.clone(),
                                         receipt: output.clone(),
@@ -2403,7 +2970,7 @@ impl Agent {
         self.hook_observer_failures.fetch_add(
             crate::hooks::observe_extension(
                 &self.extensions,
-                ctx,
+                hook_context!(),
                 HookStage::Lifecycle,
                 "turn_settled",
                 self.options.hook_timeout,
@@ -2414,7 +2981,7 @@ impl Agent {
         self.hook_observer_failures.fetch_add(
             crate::hooks::observe_extension(
                 &self.extensions,
-                ctx,
+                hook_context!(),
                 HookStage::Turn,
                 "turn_ended",
                 self.options.hook_timeout,
@@ -2566,6 +3133,7 @@ fn portable_effect(effect: &ToolEffect) -> PortableEffect {
         ToolEffect::Read => PortableEffect::Read,
         ToolEffect::Write => PortableEffect::Write,
         ToolEffect::Process => PortableEffect::Process,
+        ToolEffect::Control => PortableEffect::Control,
         ToolEffect::Unknown => PortableEffect::Unknown,
     }
 }
@@ -2699,6 +3267,39 @@ mod output_projection_tests {
             lifecycle.applies.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[test]
+    fn execution_binding_is_one_time_and_idempotent() {
+        let mut agent = Agent::builder(
+            std::sync::Arc::new(ParallelPolicyProvider),
+            AgentOptions::new("fixture", "model"),
+        )
+        .build()
+        .unwrap();
+        let first =
+            AgentExecutionBinding::from_trusted_host("/d:0/i:0/p:0/a:0", "session-a", "main")
+                .unwrap();
+        agent.bind_execution_owner(first.clone()).unwrap();
+        agent.bind_execution_owner(first).unwrap();
+        assert_eq!(
+            agent.execution_binding().unwrap().canonical_ref(),
+            "/d:0/i:0/p:0/a:0"
+        );
+
+        let other =
+            AgentExecutionBinding::from_trusted_host("/d:0/i:0/p:0/a:2", "session-b", "main")
+                .unwrap();
+        assert!(matches!(
+            agent.bind_execution_owner(other),
+            Err(Error::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn execution_binding_rejects_noncanonical_transport_shape() {
+        assert!(AgentExecutionBinding::from_trusted_host("a:0", "session-a", "main").is_err());
+        assert!(AgentExecutionBinding::from_trusted_host("/d:0/i:0/p:0/a:0", "", "main").is_err());
     }
 
     #[test]

@@ -279,7 +279,7 @@ Implement together:
   ownership transfer semantics.
 
 ### Checkpoint E — multi-user user-visible flows
-- [ ] Validate together:
+- [x] Validate together:
   1. Alice shares an existing personal Session with Bob without changing owner/Agent/branch;
   2. Bob Submit queues under Bob's grants/payer; Alice-only provider/tool/resource rights remain absent;
   3. Bob Control steer creates a Bob authority segment that persists across multiple tool/model

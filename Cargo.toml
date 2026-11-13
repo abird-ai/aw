@@ -51,7 +51,7 @@ minimal = ["jsonl"]
 # coordination, multi-user and distributed-resource commands require its full
 # capability set. Session-only JSONL is a separate lightweight backend.
 sqlite = ["dep:aw-store"]
-durable = ["sqlite", "dep:aw-store-api", "dep:sha2", "dep:zeroize", "dep:getrandom"]
+durable = ["sqlite", "dep:aw-store-api", "dep:sha2", "dep:zeroize", "dep:getrandom", "dep:base64"]
 jsonl = ["dep:aw-store-jsonl", "dep:aw-store-api", "session-interop"]
 session-interop = ["dep:aw-session-format"]
 
@@ -88,6 +88,7 @@ aw-client = { version = "=0.15.0", path = "crates/aw-client", optional = true }
 aw-surfaces = { version = "=0.15.0", path = "crates/aw-surfaces", optional = true }
 aw-agent-core = { version = "=0.15.0", path = "crates/aw-agent-core" }
 aw-host = { version = "=0.15.0", path = "crates/aw-host" }
+aw-policy = { version = "=0.15.0", path = "crates/aw-policy" }
 aw-agent-kernel = { version = "=0.15.0", path = "crates/aw-agent-kernel" }
 aw-mcp = { version = "=0.15.0", path = "crates/aw-mcp" }
 aw-extensions = { version = "=0.15.0", path = "crates/aw-extensions" }
@@ -101,6 +102,7 @@ aw-store-api = { version = "=0.15.0", path = "crates/aw-store-api", optional = t
 aw-store-jsonl = { version = "=0.15.0", path = "crates/aw-store-jsonl", optional = true }
 aw-session-format = { version = "=0.15.0", path = "crates/aw-session-format", optional = true }
 aw-providers = { version = "=0.15.0", path = "crates/aw-providers" }
+aw-tools = { version = "=0.15.0", path = "crates/aw-tools" }
 aw-tools-adapter = { version = "=0.15.0", path = "crates/aw-tools-adapter" }
 aw-store = { version = "=0.15.0", path = "crates/aw-store", optional = true }
 aw-workspace = { version = "=0.15.0", path = "crates/aw-workspace", optional = true }

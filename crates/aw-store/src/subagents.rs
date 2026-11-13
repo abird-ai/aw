@@ -1,6 +1,7 @@
 use crate::{
-    authorize, branch_in, db, decode, durability, ensure_user_for_principal, id, json, label, now,
-    principal_is_session_owner, resources, session_in, SessionBinding, SessionInfo, SessionStore,
+    audit, authorize, branch_in, db, decode, durability, ensure_user_for_principal, id, json,
+    label, now, principal_is_session_owner, resources, session_in, SessionBinding, SessionInfo,
+    SessionStore,
 };
 #[cfg(feature = "routing")]
 use aw_agent_core::RoutingResult;
@@ -8,6 +9,10 @@ use aw_agent_core::{Error, InvocationIdentity, InvocationRecord, PrincipalId, Re
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+const CONTINUATION_ACTION: &str = "delegation.continuation";
+const AGENT_CLOSE_ACTION: &str = "agent.close_requested";
+const AGENT_CONSTRUCTOR_ACTION: &str = "agent.constructor";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1932,6 +1937,86 @@ impl SessionStore {
         execution_binding_id: Option<&str>,
         mode: SubagentMode,
     ) -> Result<(SubagentInfo, SessionInfo, crate::BranchInfo)> {
+        self.create_subagent_session_inner(
+            actor,
+            parent_session,
+            parent_branch,
+            parent_turn_id,
+            title,
+            task_sha256,
+            identity,
+            delegation_root_id,
+            delegation_allocation_id,
+            depth,
+            tool_mode,
+            execution_binding_id,
+            mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_agent_job_session(
+        &self,
+        actor: &PrincipalId,
+        parent_session: &str,
+        parent_branch: &str,
+        parent_turn_id: u64,
+        title: &str,
+        task_sha256: &str,
+        identity: &InvocationIdentity,
+        delegation_root_id: &str,
+        delegation_allocation_id: &str,
+        depth: u8,
+        tool_mode: &str,
+        execution_binding_id: Option<&str>,
+        mode: SubagentMode,
+        constructor_call_id: &str,
+        constructor_fingerprint: &str,
+    ) -> Result<(SubagentInfo, SessionInfo, crate::BranchInfo)> {
+        if constructor_call_id.is_empty()
+            || constructor_call_id.len() > 256
+            || constructor_call_id.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid Agent constructor call identity"));
+        }
+        validate_sha256(constructor_fingerprint)?;
+        self.create_subagent_session_inner(
+            actor,
+            parent_session,
+            parent_branch,
+            parent_turn_id,
+            title,
+            task_sha256,
+            identity,
+            delegation_root_id,
+            delegation_allocation_id,
+            depth,
+            tool_mode,
+            execution_binding_id,
+            mode,
+            Some((constructor_call_id, constructor_fingerprint)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_subagent_session_inner(
+        &self,
+        actor: &PrincipalId,
+        parent_session: &str,
+        parent_branch: &str,
+        parent_turn_id: u64,
+        title: &str,
+        task_sha256: &str,
+        identity: &InvocationIdentity,
+        delegation_root_id: &str,
+        delegation_allocation_id: &str,
+        depth: u8,
+        tool_mode: &str,
+        execution_binding_id: Option<&str>,
+        mode: SubagentMode,
+        constructor_replay: Option<(&str, &str)>,
+    ) -> Result<(SubagentInfo, SessionInfo, crate::BranchInfo)> {
         label(title, 160)?;
         validate_sha256(task_sha256)?;
         validate_tool_mode(tool_mode)?;
@@ -1949,6 +2034,37 @@ impl SessionStore {
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let (parent, branch) =
             require_active_parent_turn(&tx, actor, parent_session, parent_branch, parent_turn_id)?;
+        if let Some((call_id, fingerprint)) = constructor_replay {
+            let existing: Option<String> = db(tx
+                .query_row(
+                    "SELECT json_extract(data_json,'$.fingerprint')
+                     FROM audit
+                     WHERE session_id=?1 AND action=?2
+                       AND json_extract(data_json,'$.parent_branch_id')=?3
+                       AND json_extract(data_json,'$.parent_turn_id')=?4
+                       AND json_extract(data_json,'$.call_id')=?5
+                     ORDER BY seq DESC LIMIT 1",
+                    params![
+                        parent_session,
+                        AGENT_CONSTRUCTOR_ACTION,
+                        branch.id,
+                        parent_turn_id,
+                        call_id
+                    ],
+                    |row| row.get(0),
+                )
+                .optional())?;
+            if let Some(existing) = existing {
+                if existing != fingerprint {
+                    return Err(Error::Denied(
+                        "Agent constructor call identity was reused with changed semantics",
+                    ));
+                }
+                return Err(Error::Conflict(
+                    "Agent constructor replay was already committed",
+                ));
+            }
+        }
         let root = delegation_root_row(&tx, delegation_root_id)?;
         let allocation = delegation_allocation_row(&tx, delegation_allocation_id)?;
         if root.state != "active"
@@ -2218,6 +2334,22 @@ impl SessionStore {
                 depth,
             ],
         ))?;
+        if let Some((call_id, fingerprint)) = constructor_replay {
+            audit(
+                &tx,
+                parent_session,
+                actor,
+                AGENT_CONSTRUCTOR_ACTION,
+                serde_json::json!({
+                    "parent_branch_id": branch.id,
+                    "parent_turn_id": parent_turn_id,
+                    "call_id": call_id,
+                    "fingerprint": fingerprint,
+                    "subagent_id": subagent_id,
+                    "child_session_id": child.id,
+                }),
+            )?;
+        }
         let txid = durability::tx_id()?;
         durability::commit_event(
             &tx,
@@ -2246,11 +2378,473 @@ impl SessionStore {
         Ok((info, child, child_branch))
     }
 
+    pub fn agent_constructor_replay(
+        &self,
+        actor: &PrincipalId,
+        parent_session: &str,
+        parent_branch: &str,
+        parent_turn_id: u64,
+        call_id: &str,
+    ) -> Result<Option<(SubagentInfo, String)>> {
+        if parent_turn_id == 0
+            || call_id.is_empty()
+            || call_id.len() > 256
+            || call_id.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid Agent constructor replay identity"));
+        }
+        let c = self.connection()?;
+        authorize(&c, parent_session, actor, false)?;
+        let branch = branch_in(&c, parent_session, parent_branch)?;
+        let found: Option<(String, String)> = db(c
+            .query_row(
+                "SELECT json_extract(data_json,'$.subagent_id'),
+                        json_extract(data_json,'$.fingerprint')
+                 FROM audit
+                 WHERE session_id=?1 AND action=?2
+                   AND json_extract(data_json,'$.parent_branch_id')=?3
+                   AND json_extract(data_json,'$.parent_turn_id')=?4
+                   AND json_extract(data_json,'$.call_id')=?5
+                 ORDER BY seq DESC LIMIT 1",
+                params![
+                    parent_session,
+                    AGENT_CONSTRUCTOR_ACTION,
+                    branch.id,
+                    parent_turn_id,
+                    call_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional())?;
+        let Some((subagent_id, fingerprint)) = found else {
+            return Ok(None);
+        };
+        validate_sha256(&fingerprint)?;
+        let info = row(&c, &subagent_id)?;
+        if info.parent_session_id != parent_session
+            || info.parent_branch_id != branch.id
+            || info.parent_turn_id != parent_turn_id
+            || info.identity.actor != *actor
+        {
+            return Err(Error::Storage(
+                "Agent constructor replay mapping disagrees with child relation",
+            ));
+        }
+        Ok(Some((info, fingerprint)))
+    }
+
     pub fn subagent(&self, actor: &PrincipalId, id: &str) -> Result<SubagentInfo> {
         let c = self.connection()?;
         let info = row(&c, id)?;
         authorize(&c, &info.parent_session_id, actor, false)?;
         Ok(info)
+    }
+
+    pub fn subagent_for_child_session(
+        &self,
+        actor: &PrincipalId,
+        child_session: &str,
+    ) -> Result<Option<SubagentInfo>> {
+        let c = self.connection()?;
+        let id: Option<String> = db(c
+            .query_row(
+                "SELECT id FROM subagent_sessions WHERE child_session_id=?1 LIMIT 1",
+                [child_session],
+                |row| row.get(0),
+            )
+            .optional())?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let info = row(&c, &id)?;
+        authorize(&c, &info.parent_session_id, actor, false)?;
+        Ok(Some(info))
+    }
+
+    fn delegation_continuation_relation_in(
+        c: &rusqlite::Connection,
+        actor: &PrincipalId,
+        child_session: &str,
+    ) -> Result<(
+        SubagentInfo,
+        DelegationRootInfo,
+        DelegationChildAllocationInfo,
+    )> {
+        let id: String = db(c.query_row(
+            "SELECT id FROM subagent_sessions WHERE child_session_id=?1 LIMIT 1",
+            [child_session],
+            |row| row.get(0),
+        ))?;
+        let relation = row(c, &id)?;
+        authorize(c, &relation.parent_session_id, actor, false)?;
+        if relation.state != "running" {
+            return Err(Error::Conflict(
+                "Agent continuation requires a running child relation",
+            ));
+        }
+        let root_id = relation
+            .delegation_root_id
+            .as_deref()
+            .ok_or(Error::Storage("child relation has no delegation root"))?;
+        let allocation_id = relation
+            .delegation_allocation_id
+            .as_deref()
+            .ok_or(Error::Storage(
+                "child relation has no delegation allocation",
+            ))?;
+        let root = delegation_root_row(c, root_id)?;
+        let allocation = delegation_allocation_row(c, allocation_id)?;
+        if allocation.root_id != root.id
+            || allocation.child_session_id.as_deref() != Some(child_session)
+            || allocation.state != "running"
+        {
+            return Err(Error::Denied(
+                "Agent continuation allocation no longer owns the child Session",
+            ));
+        }
+        if root.state != "active" || now() >= root.deadline_at {
+            return Err(Error::Limit("delegation continuation root is exhausted"));
+        }
+        Ok((relation, root, allocation))
+    }
+
+    pub fn reserve_delegation_continuation(
+        &self,
+        actor: &PrincipalId,
+        child_session: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        if request_id.len() != 67
+            || !request_id.starts_with("jc_")
+            || !request_id[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Denied(
+                "invalid delegation continuation request identity",
+            ));
+        }
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (relation, root, allocation) =
+            Self::delegation_continuation_relation_in(&tx, actor, child_session)?;
+
+        let latest: Option<String> = db(tx
+            .query_row(
+                "SELECT json_extract(data_json,'$.state')
+                 FROM audit
+                 WHERE session_id=?1 AND action=?2
+                   AND json_extract(data_json,'$.request_id')=?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![relation.parent_session_id, CONTINUATION_ACTION, request_id],
+                |row| row.get(0),
+            )
+            .optional())?;
+        match latest.as_deref() {
+            Some("reserved") => {
+                db(tx.commit())?;
+                return Ok(());
+            }
+            Some(_) => {
+                return Err(Error::Conflict(
+                    "delegation continuation identity was already dispositioned",
+                ))
+            }
+            None => {}
+        }
+
+        let outstanding: u32 = db(tx.query_row(
+            "SELECT count(*)
+             FROM audit a
+             WHERE a.session_id=?1 AND a.action=?2
+               AND json_extract(a.data_json,'$.state') IN ('reserved','claimed')
+               AND a.seq=(
+                 SELECT max(b.seq) FROM audit b
+                 WHERE b.session_id=a.session_id AND b.action=a.action
+                   AND json_extract(b.data_json,'$.request_id')=
+                       json_extract(a.data_json,'$.request_id')
+               )",
+            params![relation.parent_session_id, CONTINUATION_ACTION],
+            |row| row.get(0),
+        ))?;
+        if root.model_attempts_started.saturating_add(outstanding) >= root.limits.max_model_attempts
+        {
+            return Err(Error::Limit(
+                "delegation continuation budget has no reserved model-work capacity",
+            ));
+        }
+        audit(
+            &tx,
+            &relation.parent_session_id,
+            actor,
+            CONTINUATION_ACTION,
+            serde_json::json!({
+                "request_id": request_id,
+                "state": "reserved",
+                "root_id": root.id,
+                "allocation_id": allocation.id,
+                "child_session_id": child_session,
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(())
+    }
+
+    pub fn claim_delegation_continuation(
+        &self,
+        actor: &PrincipalId,
+        child_session: &str,
+        request_id: &str,
+        turn_id: u64,
+    ) -> Result<()> {
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (relation, root, allocation) =
+            Self::delegation_continuation_relation_in(&tx, actor, child_session)?;
+        let latest: Option<String> = db(tx
+            .query_row(
+                "SELECT json_extract(data_json,'$.state')
+                 FROM audit
+                 WHERE session_id=?1 AND action=?2
+                   AND json_extract(data_json,'$.request_id')=?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![relation.parent_session_id, CONTINUATION_ACTION, request_id],
+                |row| row.get(0),
+            )
+            .optional())?;
+        match latest.as_deref() {
+            Some("claimed") => {
+                let existing_turn: Option<u64> = db(tx
+                    .query_row(
+                        "SELECT json_extract(data_json,'$.turn_id')
+                         FROM audit
+                         WHERE session_id=?1 AND action=?2
+                           AND json_extract(data_json,'$.request_id')=?3
+                         ORDER BY seq DESC LIMIT 1",
+                        params![relation.parent_session_id, CONTINUATION_ACTION, request_id],
+                        |row| row.get(0),
+                    )
+                    .optional())?;
+                if existing_turn == Some(turn_id) {
+                    db(tx.commit())?;
+                    return Ok(());
+                }
+                return Err(Error::Conflict(
+                    "delegation continuation was claimed for another Turn",
+                ));
+            }
+            Some("reserved") => {}
+            _ => {
+                return Err(Error::Conflict(
+                    "delegation continuation has no live reservation",
+                ))
+            }
+        }
+        audit(
+            &tx,
+            &relation.parent_session_id,
+            actor,
+            CONTINUATION_ACTION,
+            serde_json::json!({
+                "request_id": request_id,
+                "state": "claimed",
+                "turn_id": turn_id,
+                "root_id": root.id,
+                "allocation_id": allocation.id,
+                "child_session_id": child_session,
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(())
+    }
+
+    pub fn consume_delegation_continuation_for_turn(
+        &self,
+        actor: &PrincipalId,
+        child_session: &str,
+        turn_id: u64,
+    ) -> Result<bool> {
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (relation, root, allocation) =
+            Self::delegation_continuation_relation_in(&tx, actor, child_session)?;
+        let mut query = db(tx.prepare(
+            "SELECT json_extract(a.data_json,'$.request_id'),
+                    json_extract(a.data_json,'$.state')
+             FROM audit a
+             WHERE a.session_id=?1 AND a.action=?2
+               AND json_extract(a.data_json,'$.turn_id')=?3
+               AND a.seq=(
+                 SELECT max(b.seq) FROM audit b
+                 WHERE b.session_id=a.session_id AND b.action=a.action
+                   AND json_extract(b.data_json,'$.request_id')=
+                       json_extract(a.data_json,'$.request_id')
+               )
+               AND json_extract(a.data_json,'$.state') IN ('claimed','consumed')
+             ORDER BY a.seq LIMIT 2",
+        ))?;
+        let rows = db(query.query_map(
+            params![relation.parent_session_id, CONTINUATION_ACTION, turn_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ))?;
+        let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        drop(query);
+        if rows.is_empty() {
+            db(tx.commit())?;
+            return Ok(false);
+        }
+        if rows.len() != 1 {
+            return Err(Error::Conflict(
+                "multiple delegation continuations claim the same Agent Turn",
+            ));
+        }
+        let (request_id, state) = &rows[0];
+        if state == "consumed" {
+            db(tx.commit())?;
+            return Ok(true);
+        }
+        if state != "claimed" {
+            return Err(Error::Conflict(
+                "delegation continuation Turn is not claimable",
+            ));
+        }
+        audit(
+            &tx,
+            &relation.parent_session_id,
+            actor,
+            CONTINUATION_ACTION,
+            serde_json::json!({
+                "request_id": request_id,
+                "state": "consumed",
+                "turn_id": turn_id,
+                "root_id": root.id,
+                "allocation_id": allocation.id,
+                "child_session_id": child_session,
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(true)
+    }
+
+    pub fn cancel_delegation_continuation(
+        &self,
+        actor: &PrincipalId,
+        child_session: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (relation, root, allocation) =
+            Self::delegation_continuation_relation_in(&tx, actor, child_session)?;
+        let latest: Option<String> = db(tx
+            .query_row(
+                "SELECT json_extract(data_json,'$.state')
+                 FROM audit
+                 WHERE session_id=?1 AND action=?2
+                   AND json_extract(data_json,'$.request_id')=?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![relation.parent_session_id, CONTINUATION_ACTION, request_id],
+                |row| row.get(0),
+            )
+            .optional())?;
+        match latest.as_deref() {
+            Some("cancelled") => {
+                db(tx.commit())?;
+                return Ok(());
+            }
+            Some("reserved") => {}
+            _ => {
+                return Err(Error::Conflict(
+                    "delegation continuation cannot be cancelled after claim/disposition",
+                ))
+            }
+        }
+        audit(
+            &tx,
+            &relation.parent_session_id,
+            actor,
+            CONTINUATION_ACTION,
+            serde_json::json!({
+                "request_id": request_id,
+                "state": "cancelled",
+                "root_id": root.id,
+                "allocation_id": allocation.id,
+                "child_session_id": child_session,
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(())
+    }
+
+    pub fn request_subagent_close(
+        &self,
+        actor: &PrincipalId,
+        child_session: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        if request_id.len() != 67
+            || !request_id.starts_with("ac_")
+            || !request_id[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Denied("invalid Agent close request identity"));
+        }
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let id: String = db(tx.query_row(
+            "SELECT id FROM subagent_sessions WHERE child_session_id=?1 LIMIT 1",
+            [child_session],
+            |row| row.get(0),
+        ))?;
+        let relation = row(&tx, &id)?;
+        authorize(&tx, &relation.parent_session_id, actor, false)?;
+        authorize(&tx, child_session, actor, false)?;
+        if relation.identity.actor != *actor {
+            return Err(Error::Denied("Agent close belongs to another actor"));
+        }
+        let existing: bool = db(tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM audit
+                WHERE session_id=?1 AND action=?2
+                  AND json_extract(data_json,'$.request_id')=?3
+            )",
+            params![child_session, AGENT_CLOSE_ACTION, request_id],
+            |row| row.get(0),
+        ))?;
+        if existing {
+            db(tx.commit())?;
+            return Ok(());
+        }
+        if relation.state != "running" {
+            return Err(Error::Conflict("Agent is already closed"));
+        }
+        audit(
+            &tx,
+            child_session,
+            actor,
+            AGENT_CLOSE_ACTION,
+            serde_json::json!({
+                "request_id": request_id,
+                "subagent_id": relation.id,
+                "parent_session_id": relation.parent_session_id,
+                "parent_branch_id": relation.parent_branch_id,
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(())
+    }
+
+    pub fn subagent_close_requested(
+        &self,
+        actor: &PrincipalId,
+        child_session: &str,
+    ) -> Result<bool> {
+        let c = self.connection()?;
+        authorize(&c, child_session, actor, false)?;
+        db(c.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM audit WHERE session_id=?1 AND action=?2
+            )",
+            params![child_session, AGENT_CLOSE_ACTION],
+            |row| row.get(0),
+        ))
     }
 
     pub fn subagents_for_parent(
@@ -2448,6 +3042,13 @@ impl SessionStore {
                 ));
             }
         }
+        audit(
+            &tx,
+            &info.child_session_id,
+            actor,
+            "agent.closed",
+            serde_json::json!({"subagent_id":id,"state":state}),
+        )?;
         let txid = durability::tx_id()?;
         durability::commit_event(
             &tx,

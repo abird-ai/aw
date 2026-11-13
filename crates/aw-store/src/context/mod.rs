@@ -120,6 +120,14 @@ pub(crate) fn audience(c: &Connection, session: &str) -> Result<BTreeSet<Princip
             None => PrincipalId::new(principal)?,
         });
     }
+    let mut participants = db(c.prepare(
+        "SELECT user_id FROM session_participation_grants
+         WHERE session_id=?1 AND status='active' AND can_view=1
+         ORDER BY user_id LIMIT 1025",
+    ))?;
+    for row in db(participants.query_map([session], |r| r.get::<_, String>(0)))? {
+        out.insert(stable_user_principal(&db(row)?)?);
+    }
     if out.len() > 1025 {
         return Err(Error::Limit("audience too large"));
     }
@@ -931,18 +939,51 @@ pub(crate) fn authorize_model_context(
     branch: &BranchInfo,
     identity: &aw_agent_core::InvocationIdentity,
 ) -> Result<()> {
+    authorize_model_context_for_participation(
+        c,
+        session,
+        branch,
+        identity,
+        crate::SessionParticipationAction::Submit,
+    )
+}
+
+pub(crate) fn authorize_model_context_for_participation(
+    c: &Connection,
+    session: &str,
+    branch: &BranchInfo,
+    identity: &aw_agent_core::InvocationIdentity,
+    action: crate::SessionParticipationAction,
+) -> Result<()> {
     match authorize(c, session, &identity.actor, true) {
         Ok(()) => {}
         Err(Error::Denied(_)) => {
+            match crate::session_participation::authorize_in(c, &identity.actor, session, action) {
+                Ok(_) => {
+                    return authorize_model_context_after_append_authorized(
+                        c, session, branch, identity,
+                    );
+                }
+                Err(Error::Denied(_)) => {}
+                Err(error) => return Err(error),
+            }
             #[cfg(feature = "multiplayer")]
-            if crate::multiplayer::draft_submit_authorized_in(c, session, &identity.actor)? {
+            if action == crate::SessionParticipationAction::Submit
+                && crate::multiplayer::draft_submit_authorized_in(c, session, &identity.actor)?
+            {
                 return authorize_model_context_after_append_authorized(
                     c, session, branch, identity,
                 );
             }
-            return Err(Error::Denied(
-                "model context requires Session append or shared submit authority",
-            ));
+            return Err(Error::Denied(match action {
+                crate::SessionParticipationAction::Submit => {
+                    "model context requires legacy append or explicit Submit authority"
+                }
+                crate::SessionParticipationAction::Control => {
+                    "model context requires legacy append or explicit Control authority"
+                }
+                _ => "model context requires an executable Session participation authority",
+            }));
         }
         Err(error) => return Err(error),
     }

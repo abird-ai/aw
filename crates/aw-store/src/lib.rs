@@ -8,6 +8,7 @@
 //! are generation/heartbeat/lease fenced. Immutable nodes store history, branch
 //! refs select a path, durable start receipts precede effects.
 mod actor_admission;
+mod actor_authority_steer;
 mod actor_control;
 mod actor_custody;
 mod actor_notice;
@@ -32,6 +33,7 @@ mod coordination;
 pub mod durability;
 mod extension_secret;
 mod identity_continuity;
+mod job_exposure;
 mod journal;
 mod model_agent_pause;
 mod model_process;
@@ -43,7 +45,9 @@ mod oidc_login;
 mod pipelines;
 #[cfg(all(feature = "pipelines", feature = "routing"))]
 mod planner;
+mod policy_admission;
 mod provider_credentials;
+mod remote_start;
 mod resources;
 #[cfg(all(feature = "pipelines", feature = "routing"))]
 mod reviews;
@@ -53,13 +57,19 @@ mod routing;
 mod schedules;
 mod secret_custody_inventory;
 mod secret_store;
+mod session_participation;
 mod subagents;
 #[cfg(feature = "pipelines")]
 mod teams;
 mod types;
 mod workspace_replica;
 mod workspace_writer;
-pub use actor_admission::{ActorInputAdmission, ActorInputFact, InputAdmissionState};
+pub use actor_admission::{
+    ActorInputAdmission, ActorInputFact, InputAdmissionState, ParticipantInputAdmission,
+};
+pub use actor_authority_steer::{
+    AuthoritySteerFact, AuthoritySteerRequest, AuthoritySteerState, ClaimedAuthoritySteer,
+};
 pub use actor_control::{
     ActorControlAction, ActorControlAdmission, ActorControlFact, ActorControlState,
 };
@@ -104,6 +114,7 @@ pub use durability::{
 pub use extension_secret::{SecretSettingScope, SecretSettingState, SecretSettingView};
 use fs2::FileExt;
 pub use identity_continuity::*;
+pub use job_exposure::{FiniteExposure, FiniteExposureState};
 pub use journal::SessionHandle;
 pub use model_agent_pause::{
     model_agent_pause_id, ModelAgentPauseFact, ModelAgentPauseRequest, ModelAgentPauseState,
@@ -120,6 +131,9 @@ pub use oidc_login::*;
 pub use pipelines::*;
 #[cfg(all(feature = "pipelines", feature = "routing"))]
 pub use planner::*;
+pub use policy_admission::{
+    PolicyAdmissionFact, PolicyAdmissionRequest, PolicyAdmissionState, PolicyGuardianJournal,
+};
 pub use provider_credentials::*;
 pub use resources::{
     AwNetPeerInfo, DomainFederationInfo, DomainInfo, FederationLeaseInfo, FleetInfo,
@@ -136,6 +150,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use schedules::*;
 pub use secret_custody_inventory::ActiveSecretCustodyInventory;
 pub use secret_store::*;
+pub use session_participation::{
+    SessionParticipationAction, SessionParticipationEvidence, SessionParticipationPermissions,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -202,8 +219,10 @@ pub const TEAM_TOPOLOGY_SCHEMA: &str = include_str!("../migrations/030_team_topo
 pub const PLANNER_DAGS_SCHEMA: &str = include_str!("../migrations/031_planner_dags.sql");
 pub const GUARDIAN_REVIEW_SCHEMA: &str = include_str!("../migrations/032_guardian_reviews.sql");
 pub const PIPELINE_SCHEDULE_SCHEMA: &str = include_str!("../migrations/033_pipeline_schedules.sql");
+pub const SHARED_SESSION_PARTICIPATION_SCHEMA: &str =
+    include_str!("../migrations/034_shared_session_participation.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 33;
+const LATEST_SCHEMA_VERSION: i64 = 34;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -626,7 +645,7 @@ pub(crate) fn authorize(
     } {
         return Ok(());
     }
-    let can: Option<i64> = if let Some(user_id) = actor_user {
+    let can: Option<i64> = if let Some(user_id) = actor_user.as_deref() {
         db(conn
             .query_row(
                 "SELECT max(can_append) FROM members WHERE session_id=?1 AND (principal_user_id=?2 OR (principal_user_id IS NULL AND principal=?3))",
@@ -646,6 +665,22 @@ pub(crate) fn authorize(
     };
     if can.is_some_and(|v| !append || v == 1) {
         return Ok(());
+    }
+    if !append {
+        if let Some(user_id) = actor_user.as_deref() {
+            let participates: bool = db(conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_participation_grants
+                    WHERE session_id=?1 AND user_id=?2
+                      AND status='active' AND can_view=1
+                )",
+                params![session, user_id],
+                |row| row.get(0),
+            ))?;
+            if participates {
+                return Ok(());
+            }
+        }
     }
     #[cfg(feature = "multiplayer")]
     if !append && multiplayer::draft_read_authorized_in(conn, session, actor)? {
@@ -1427,6 +1462,51 @@ impl SessionStore {
         context::authorize_tree(&c, session, actor)?;
         session_in(&c, session)
     }
+
+    /// Monotonic public revision for one authoritative Agent Session/branch.
+    /// It derives from the existing immutable Session audit stream, so queue,
+    /// control, journal and reconciliation facts can advance observation without
+    /// creating a second Agent lifecycle table.
+    pub fn active_turn_for_branch(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<Option<u64>> {
+        let c = self.connection()?;
+        context::authorize_tree(&c, session, actor)?;
+        let branch = branch_in(&c, session, branch)?;
+        let Some(run) = branch.active_run else {
+            return Ok(None);
+        };
+        let turn: Option<u64> = db(c
+            .query_row(
+                "SELECT turn_id FROM runs
+                 WHERE id=?1 AND session_id=?2 AND branch_id=?3 AND status='running'",
+                params![run, session, branch.id],
+                |row| row.get(0),
+            )
+            .optional())?;
+        Ok(turn)
+    }
+
+    pub fn agent_public_revision(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<u64> {
+        let c = self.connection()?;
+        context::authorize_tree(&c, session, actor)?;
+        let _ = branch_in(&c, session, branch)?;
+        let seq: u64 = db(c.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM audit WHERE session_id=?1",
+            [session],
+            |row| row.get(0),
+        ))?;
+        seq.checked_add(1)
+            .ok_or(Error::Limit("Agent public revision exhausted"))
+    }
     pub fn set_title(
         &self,
         actor: &PrincipalId,
@@ -1563,7 +1643,7 @@ impl SessionStore {
         let viewer = actor_user
             .clone()
             .unwrap_or_else(|| format!("principal:{}", actor.as_str()));
-        let mut q=db(c.prepare("SELECT DISTINCT s.id FROM sessions s LEFT JOIN members m ON m.session_id=s.id WHERE ((s.owner_user_id IS NULL AND s.owner=?1) OR (m.principal_user_id IS NULL AND m.principal=?1) OR (?2 IS NOT NULL AND (s.owner_user_id=?2 OR m.principal_user_id=?2))) AND COALESCE((SELECT CAST(json_extract(c.payload_json,'$.archived') AS INTEGER) FROM commit_log c WHERE c.kind='session.view.changed' AND c.entity_type='session' AND c.entity_id=s.id AND json_extract(c.payload_json,'$.viewer')=?3 ORDER BY c.seq DESC LIMIT 1),CASE WHEN ((s.owner_user_id IS NULL AND s.owner=?1) OR (?2 IS NOT NULL AND s.owner_user_id=?2)) THEN COALESCE((SELECT CASE a.action WHEN 'session.hidden' THEN 1 ELSE 0 END FROM audit a WHERE a.session_id=s.id AND a.action IN ('session.hidden','session.restored') ORDER BY a.seq DESC LIMIT 1),0) ELSE 0 END)=?4 ORDER BY s.updated_at DESC,s.id LIMIT 200"))?;
+        let mut q=db(c.prepare("SELECT DISTINCT s.id FROM sessions s LEFT JOIN members m ON m.session_id=s.id WHERE ((s.owner_user_id IS NULL AND s.owner=?1) OR (m.principal_user_id IS NULL AND m.principal=?1) OR (?2 IS NOT NULL AND (s.owner_user_id=?2 OR m.principal_user_id=?2 OR EXISTS(SELECT 1 FROM session_participation_grants p WHERE p.session_id=s.id AND p.user_id=?2 AND p.status='active' AND p.can_view=1)))) AND COALESCE((SELECT CAST(json_extract(c.payload_json,'$.archived') AS INTEGER) FROM commit_log c WHERE c.kind='session.view.changed' AND c.entity_type='session' AND c.entity_id=s.id AND json_extract(c.payload_json,'$.viewer')=?3 ORDER BY c.seq DESC LIMIT 1),CASE WHEN ((s.owner_user_id IS NULL AND s.owner=?1) OR (?2 IS NOT NULL AND s.owner_user_id=?2)) THEN COALESCE((SELECT CASE a.action WHEN 'session.hidden' THEN 1 ELSE 0 END FROM audit a WHERE a.session_id=s.id AND a.action IN ('session.hidden','session.restored') ORDER BY a.seq DESC LIMIT 1),0) ELSE 0 END)=?4 ORDER BY s.updated_at DESC,s.id LIMIT 200"))?;
         let rows = db(q.query_map(
             params![actor.as_str(), actor_user, viewer, i64::from(archived)],
             |r| r.get::<_, String>(0),
@@ -2429,6 +2509,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 32 {
         migrate_pipeline_schedules(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 33 {
+        migrate_shared_session_participation(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -2465,6 +2549,35 @@ fn add_coordination_column_if_missing(
     }
     let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
     db(c.execute_batch(&statement))?;
+    Ok(())
+}
+
+fn migrate_shared_session_participation(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='phase5-shared-session-participation',generation=generation+1,
+             target_epoch=34,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(SHARED_SESSION_PARTICIPATION_SCHEMA))?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |r| r.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "shared-session participation migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.commit())?;
     Ok(())
 }
 
@@ -3307,6 +3420,109 @@ pub(crate) fn session_in(c: &Connection, id: &str) -> Result<SessionInfo> {
 }
 pub(crate) fn branch_in(c: &Connection, session: &str, name_or_id: &str) -> Result<BranchInfo> {
     db(c.query_row("SELECT id,session_id,name,head,revision,active_run FROM branches WHERE session_id=?1 AND (id=?2 OR name=?2) ORDER BY CASE WHEN id=?2 THEN 0 ELSE 1 END LIMIT 1",params![session,name_or_id],|r|Ok(BranchInfo{id:r.get(0)?,session_id:r.get(1)?,name:r.get(2)?,head:r.get(3)?,revision:r.get(4)?,active_run:r.get(5)?})).optional())?.ok_or(Error::Denied("branch unavailable or not permitted"))
+}
+
+fn validate_agent_handle_component(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 64
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'~' | b'-'))
+    {
+        return Err(Error::Storage(
+            "Session-derived Agent namespace handle is not canonical",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn agent_binding_in(
+    c: &Connection,
+    actor: &PrincipalId,
+    session: &str,
+    branch: &str,
+) -> Result<AgentBindingInfo> {
+    context::authorize_tree(c, session, actor)?;
+    let row: Option<(String, String, i64, String, i64, String, String)> = db(c
+        .query_row(
+            "SELECT COALESCE(s.workspace_id,''),COALESCE(s.owner_user_id,''),s.created_at,
+                    b.id,b.created_at,w.domain_id,s.id
+             FROM sessions s
+             JOIN branches b ON b.session_id=s.id
+             JOIN workspaces w ON w.workspace_id=s.workspace_id
+             WHERE s.id=?1 AND (b.id=?2 OR b.name=?2)
+             ORDER BY CASE WHEN b.id=?2 THEN 0 ELSE 1 END
+             LIMIT 1",
+            params![session, branch],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .optional())?;
+    let Some((
+        workspace_id,
+        owner_user_id,
+        session_created_at,
+        branch_id,
+        branch_created_at,
+        domain_id,
+        session_id,
+    )) = row
+    else {
+        return Err(Error::Denied(
+            "Session/branch Agent binding is unavailable or unauthorized",
+        ));
+    };
+    if workspace_id.is_empty() || owner_user_id.is_empty() {
+        return Err(Error::Storage(
+            "durable Agent binding requires stable Workspace and owner user",
+        ));
+    }
+    for value in [&domain_id, &owner_user_id, &workspace_id, &branch_id] {
+        validate_agent_handle_component(value)?;
+    }
+    let primary: Option<(String, String)> = db(c
+        .query_row(
+            "SELECT s.id,b.id
+             FROM sessions s
+             JOIN branches b ON b.session_id=s.id
+             JOIN nodes root ON root.session_id=s.id AND root.id=s.root_node
+             WHERE s.workspace_id=?1 AND s.owner_user_id=?2
+             ORDER BY root.seq,b.created_at,b.id
+             LIMIT 1",
+            params![workspace_id, owner_user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional())?;
+    let primary = primary.ok_or(Error::Storage(
+        "durable Agent namespace has no primary Session/branch",
+    ))?;
+    let agent_handle = if primary.0 == session_id && primary.1 == branch_id {
+        "0".to_owned()
+    } else {
+        branch_id.clone()
+    };
+    validate_agent_handle_component(&agent_handle)?;
+    Ok(AgentBindingInfo {
+        session_id,
+        branch_id,
+        domain_handle: domain_id,
+        identity_handle: owner_user_id,
+        project_handle: workspace_id,
+        agent_handle,
+        session_created_at,
+        branch_created_at,
+    })
 }
 pub(crate) fn node_in(c: &Connection, session: &str, id: &str) -> Result<Node> {
     let (parent, kind, actor, payload, created) = db(c.query_row(
@@ -5629,6 +5845,66 @@ fn import_portable_session(
     Ok((session, branch, Arc::new(handle)))
 }
 
+#[cfg(test)]
+mod phase5_agent_binding_regressions {
+    use super::*;
+    use aw_store_api::SessionBackend as _;
+
+    fn binding() -> SessionBinding {
+        SessionBinding {
+            working_directory: PathBuf::from("/tmp"),
+            tool_root: PathBuf::from("/tmp"),
+            system_prompt: "system".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "model".into(),
+            destination_fingerprint: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn project_root_agent_is_bound_once_and_never_reassigned_to_later_sessions() {
+        let store = SessionStore::in_memory().unwrap();
+        let owner = PrincipalId::new("internal:fixture:a0-owner").unwrap();
+        let (first, first_branch) = store.create(&owner, "first", binding()).unwrap();
+        let (second, second_branch) = store.create(&owner, "second", binding()).unwrap();
+
+        let first_binding = store
+            .agent_binding(&owner, &first.id, &first_branch.id)
+            .unwrap();
+        let second_binding = store
+            .agent_binding(&owner, &second.id, &second_branch.id)
+            .unwrap();
+        assert!(first_binding.is_root_agent());
+        assert_eq!(first_binding.agent_handle, "0");
+        assert!(!second_binding.is_root_agent());
+        assert_ne!(second_binding.agent_handle, "0");
+
+        let fork = store
+            .fork(&owner, &first.id, "secondary", &first_branch.head)
+            .unwrap();
+        let fork_binding = store.agent_binding(&owner, &first.id, &fork.id).unwrap();
+        assert!(
+            !fork_binding.is_root_agent(),
+            "another branch in the root Session must not alias a:0"
+        );
+
+        store.set_session_archived(&owner, &first.id, true).unwrap();
+        let second_after_archive = store
+            .agent_binding(&owner, &second.id, &second_branch.id)
+            .unwrap();
+        assert_eq!(
+            second_after_archive.agent_handle, second_binding.agent_handle,
+            "retiring/hiding the original Session cannot sequentially reassign a:0"
+        );
+        assert_ne!(second_after_archive.agent_handle, "0");
+
+        let root_after_archive = store
+            .agent_binding(&owner, &first.id, &first_branch.id)
+            .unwrap();
+        assert_eq!(root_after_archive.agent_handle, "0");
+    }
+}
+
 impl aw_store_api::StoreBackend for SessionStore {
     fn descriptor(&self) -> aw_store_api::StoreDescriptor {
         use aw_store_api::{StoreCapabilities, StoreCapability as C, StoreDescriptor, StoreKind};
@@ -5715,6 +5991,37 @@ impl aw_store_api::SessionBackend for SessionStore {
 
     fn branches(&self, owner: &PrincipalId, session: &str) -> Result<Vec<BranchInfo>> {
         SessionStore::branches(self, owner, session)
+    }
+
+    fn agent_binding(
+        &self,
+        owner: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<AgentBindingInfo> {
+        let connection = self.connection()?;
+        agent_binding_in(&connection, owner, session, branch)
+    }
+
+    fn agent_bindings(&self, owner: &PrincipalId) -> Result<Vec<AgentBindingInfo>> {
+        let sessions = SessionStore::list(self, owner)?;
+        let mut bindings = Vec::new();
+        for session in sessions {
+            for branch in SessionStore::branches(self, owner, &session.id)? {
+                bindings.push({
+                    let connection = self.connection()?;
+                    agent_binding_in(&connection, owner, &session.id, &branch.id)?
+                });
+            }
+        }
+        bindings.sort_by(|a, b| {
+            a.session_created_at
+                .cmp(&b.session_created_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+                .then_with(|| a.branch_created_at.cmp(&b.branch_created_at))
+                .then_with(|| a.branch_id.cmp(&b.branch_id))
+        });
+        Ok(bindings)
     }
 
     fn fork(

@@ -95,6 +95,8 @@ impl Service {
             result_budget_bytes: ctx.result_budget_bytes,
             identity: ctx.identity.clone(),
             scope: ctx.scope.clone(),
+            execution_owner: ctx.execution_owner.clone(),
+            execution_scope: ctx.execution_scope.clone(),
         }
     }
 
@@ -577,6 +579,8 @@ mod tests {
                         session_id: parent.id.clone(),
                         branch_id: branch.id.clone(),
                     }),
+                    execution_owner: None,
+                    execution_scope: None,
                 },
                 &json!({"task":"shared task","title":"Team fixture"}),
             )

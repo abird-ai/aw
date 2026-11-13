@@ -22,8 +22,9 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
+    sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 const CAPTURE_HEAD: usize = 48 * 1024;
@@ -32,6 +33,56 @@ const MAX_STDIN_WRITE: usize = 64 * 1024;
 const REAP_DEADLINE: Duration = Duration::from_secs(2);
 const READER_DRAIN_DEADLINE: Duration = Duration::from_millis(600);
 const GRACEFUL_TERM: Duration = Duration::from_millis(350);
+const PROCESS_INPUT_QUEUE: usize = 16;
+
+pub(crate) enum ProcessInputCommand {
+    Write {
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<crate::Result<()>>,
+    },
+    Close {
+        reply: oneshot::Sender<crate::Result<()>>,
+    },
+}
+
+/// Cloneable control endpoint for the one runner that owns the PipeProcess.
+/// It never exposes a PID/ChildStdin and does not create another Process owner.
+#[derive(Clone)]
+pub(crate) struct ProcessInput {
+    tx: mpsc::Sender<ProcessInputCommand>,
+}
+
+impl ProcessInput {
+    pub async fn write(&self, bytes: Vec<u8>) -> crate::Result<()> {
+        if bytes.len() > MAX_STDIN_WRITE {
+            return Err(crate::Error::Limit("process input exceeds 64KiB"));
+        }
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(ProcessInputCommand::Write { bytes, reply })
+            .await
+            .map_err(|_| crate::Error::Denied("process input is closed"))?;
+        result
+            .await
+            .map_err(|_| crate::Error::Transport("process input owner disappeared"))?
+    }
+
+    pub async fn close(&self) -> crate::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(ProcessInputCommand::Close { reply })
+            .await
+            .map_err(|_| crate::Error::Denied("process input is closed"))?;
+        result
+            .await
+            .map_err(|_| crate::Error::Transport("process input owner disappeared"))?
+    }
+}
+
+pub(crate) fn process_input_channel() -> (ProcessInput, mpsc::Receiver<ProcessInputCommand>) {
+    let (tx, rx) = mpsc::channel(PROCESS_INPUT_QUEUE);
+    (ProcessInput { tx }, rx)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessMode {
@@ -1179,6 +1230,81 @@ impl PipeProcess {
         if !output_complete {
             // A descendant may still hold an inherited pipe after its parent
             // has exited. Do not detach that group's possible external effects.
+            self.kill_group();
+        }
+        let output = self.snapshot();
+        ProcessReceipt {
+            outcome,
+            output,
+            output_complete,
+            spools: self.spools.clone(),
+        }
+    }
+
+    /// Interactive wait. The same runner retains sole custody of ChildStdin
+    /// and serializes every bounded write/close request.
+    pub(crate) async fn wait_interactive<C: core::future::Future<Output = ()>>(
+        mut self,
+        cancellation: C,
+        deadline: Duration,
+        mut input: mpsc::Receiver<ProcessInputCommand>,
+    ) -> ProcessReceipt {
+        let cancellation = cancellation;
+        tokio::pin!(cancellation);
+        let deadline = sleep(deadline);
+        tokio::pin!(deadline);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _ = &mut cancellation => break self.stop().await,
+                _ = &mut deadline => {
+                    break if self.stop().await == Outcome::Unknown {
+                        Outcome::Unknown
+                    } else {
+                        Outcome::DeadlineExceeded
+                    };
+                }
+                command = input.recv() => {
+                    let Some(command) = command else {
+                        self.close_stdin();
+                        continue;
+                    };
+                    match command {
+                        ProcessInputCommand::Write { bytes, reply } => {
+                            let _ = reply.send(self.write(&bytes).await);
+                        }
+                        ProcessInputCommand::Close { reply } => {
+                            if self.stdin_open() {
+                                self.close_stdin();
+                                let _ = reply.send(Ok(()));
+                            } else {
+                                let _ = reply.send(Err(crate::Error::Denied("process input is closed")));
+                            }
+                        }
+                    }
+                }
+                result = self.child.wait() => {
+                    break match result {
+                        Ok(status) => Self::status_outcome(status),
+                        Err(_) => {
+                            let _ = self.stop().await;
+                            Outcome::Unknown
+                        }
+                    };
+                }
+            }
+        };
+        input.close();
+        while let Ok(command) = input.try_recv() {
+            match command {
+                ProcessInputCommand::Write { reply, .. } | ProcessInputCommand::Close { reply } => {
+                    let _ = reply.send(Err(crate::Error::Denied("process input is closed")));
+                }
+            }
+        }
+        self.close_stdin();
+        let output_complete = self.drain_output().await;
+        if !output_complete {
             self.kill_group();
         }
         let output = self.snapshot();

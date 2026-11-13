@@ -15,6 +15,7 @@ use aw_agent_kernel::{
         Accepted, ActorMessage, Boundary, Class, ControlKind, Kind, Mailbox, Scope, TurnTarget,
     },
 };
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
     num::NonZeroU64,
@@ -116,12 +117,18 @@ struct AgentRecord {
     binding: SessionBinding,
     envelope: Envelope,
     inbox: Mailbox,
+    /// Host-authenticated participant evidence keyed by the immutable
+    /// (sender ActorKey, message id) of a queued Input. It is not part of the
+    /// untrusted message payload and is consumed with the claim.
+    pending_input_authority: BTreeMap<(ActorKey, u64), crate::AuthoritySegmentEvidence>,
     active: Option<ActiveTurn>,
     pause_current: bool,
 }
 struct ActiveTurn {
     turn_id: u64,
     message: ActorMessage,
+    authority_segment: crate::AuthoritySegment,
+    pending_authority_update: Option<crate::control::AuthorityUpdate>,
     token: CancellationToken,
     /// An aborted runner may have sent billable/model requests or tools.
     /// It is NEVER silently claimed again from the queue.
@@ -131,6 +138,7 @@ struct ActiveTurn {
 pub struct ClaimedInput {
     pub message: ActorMessage,
     pub turn_id: u64,
+    pub authority_segment: crate::AuthoritySegment,
     pub cancellation: CancellationToken,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +343,7 @@ impl HostRuntime {
                 binding: session,
                 envelope: env,
                 inbox,
+                pending_input_authority: BTreeMap::new(),
                 active: None,
                 pause_current: false,
             },
@@ -448,6 +457,7 @@ impl HostRuntime {
                 binding: child,
                 envelope,
                 inbox,
+                pending_input_authority: BTreeMap::new(),
                 active: None,
                 pause_current: false,
             },
@@ -997,6 +1007,53 @@ impl HostRuntime {
         let decision = self.apply_hooks(stage, msg, token, 0)?;
         self.finish_hook(principal, epoch, turn, stage, token, decision)
     }
+
+    /// Same canonical message pipeline plus host-authenticated participant
+    /// evidence. The evidence never changes message addressing or grants an
+    /// Actor capability; it only becomes the claimed Turn's AuthoritySegment.
+    pub fn send_with_authority(
+        &mut self,
+        principal: &PrincipalId,
+        epoch: Option<NonZeroU64>,
+        msg: ActorMessage,
+        turn: u64,
+        evidence: crate::AuthoritySegmentEvidence,
+    ) -> Result<Delivery> {
+        evidence.validate()?;
+        if msg.kind != Kind::Input {
+            return Err(Error::Denied(
+                "participant AuthoritySegment evidence is valid only for Input",
+            ));
+        }
+        let sidecar_key = (msg.from, msg.id);
+        {
+            let record = self.bound(principal, msg.to, epoch)?;
+            if record.pending_input_authority.contains_key(&sidecar_key) {
+                return Err(Error::Denied(
+                    "participant AuthoritySegment evidence already exists for Input",
+                ));
+            }
+        }
+        let target = msg.to;
+        let result = self.send(principal, epoch, msg, turn)?;
+        if matches!(result, Delivery::Queued(_)) {
+            let record = self
+                .agents
+                .get_mut(&target)
+                .expect("validated target Agent");
+            if record
+                .pending_input_authority
+                .insert(sidecar_key, evidence)
+                .is_some()
+            {
+                return Err(Error::Protocol(
+                    "participant AuthoritySegment sidecar changed after queue admission",
+                ));
+            }
+        }
+        Ok(result)
+    }
+
     /// One-shot host-authorized resume. No provider/tool execution is implied,
     /// even when the deferred handler was an approval/reviewer backend.
     pub fn resume(
@@ -1045,6 +1102,92 @@ impl HostRuntime {
         let decision = self.apply_hooks(stage, msg, next, entry.next_index)?;
         self.finish_hook(principal, epoch, entry.current_turn, stage, next, decision)
     }
+    fn initial_authority_segment(
+        principal: &PrincipalId,
+        key: ActorKey,
+        binding: &SessionBinding,
+        message: &ActorMessage,
+        turn: u64,
+        evidence: Option<crate::AuthoritySegmentEvidence>,
+    ) -> Result<crate::AuthoritySegment> {
+        if message.kind != Kind::Input {
+            return Err(Error::Denied(
+                "AuthoritySegment requires the claimed Actor Input",
+            ));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"aw-authority-segment-input-v1\0");
+        let principal_bytes = principal.as_str().as_bytes();
+        hash.update((principal_bytes.len() as u64).to_be_bytes());
+        hash.update(principal_bytes);
+        let session_bytes = binding.session_id.as_bytes();
+        hash.update((session_bytes.len() as u64).to_be_bytes());
+        hash.update(session_bytes);
+        hash.update(
+            binding
+                .writer_epoch
+                .map_or(0, NonZeroU64::get)
+                .to_be_bytes(),
+        );
+        for value in [
+            key.runtime.id.get(),
+            key.runtime.generation.get(),
+            key.id.get(),
+            key.generation.get(),
+            message.from.runtime.id.get(),
+            message.from.runtime.generation.get(),
+            message.from.id.get(),
+            message.from.generation.get(),
+            message.to.runtime.id.get(),
+            message.to.runtime.generation.get(),
+            message.to.id.get(),
+            message.to.generation.get(),
+            message.id,
+            message.source_sequence,
+            turn,
+        ] {
+            hash.update(value.to_be_bytes());
+        }
+        match message.turn {
+            TurnTarget::Auto => hash.update([0]),
+            TurnTarget::Exact(target) => {
+                hash.update([1]);
+                hash.update(target.to_be_bytes());
+            }
+        }
+        hash.update(message.priority.to_be_bytes());
+        if let Some(evidence) = &evidence {
+            evidence.validate()?;
+            hash.update(b"participant\0");
+            for value in [
+                evidence.actor.as_str(),
+                evidence.payer_ref.as_str(),
+                evidence.causal_root.as_str(),
+                evidence.provider_model_ceiling_ref.as_str(),
+                evidence.tool_envelope_ref.as_str(),
+                evidence.disclosure_projection_ref.as_str(),
+            ] {
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value.as_bytes());
+            }
+            hash.update(evidence.membership_epoch.to_be_bytes());
+            hash.update(evidence.audience_epoch.to_be_bytes());
+            hash.update(evidence.context_fingerprint);
+        }
+        let payload = message.payload.as_bytes();
+        hash.update((payload.len() as u64).to_be_bytes());
+        hash.update(payload);
+        let segment = crate::AuthoritySegment {
+            ordinal: 1,
+            boundary: crate::AuthorityBoundaryKind::Input,
+            boundary_id: format!("input:{}:{}", message.id, message.source_sequence),
+            fingerprint: hash.finalize().into(),
+            evidence,
+        };
+        segment.validate()?;
+        Ok(segment)
+    }
+
     /// Claim an Input only at a between-Turn safe point. It is removed from
     /// pending but retained as an *active* reservation until the real Agent
     /// has returned a settled Turn. A dropped/failed runner leaves Unknown,
@@ -1094,19 +1237,321 @@ impl HostRuntime {
         else {
             return Ok(None);
         };
+        let evidence = record
+            .pending_input_authority
+            .remove(&(message.from, message.id));
+        let authority_segment = Self::initial_authority_segment(
+            principal,
+            key,
+            &record.binding,
+            &message,
+            turn,
+            evidence,
+        )?;
         let cancellation = CancellationToken::new();
         record.active = Some(ActiveTurn {
             turn_id: turn,
             message: message.clone(),
+            authority_segment,
+            pending_authority_update: None,
             token: cancellation.clone(),
             uncertain: false,
         });
         Ok(Some(ClaimedInput {
             message,
             turn_id: turn,
+            authority_segment: record
+                .active
+                .as_ref()
+                .expect("claimed Turn installed")
+                .authority_segment
+                .clone(),
             cancellation,
         }))
     }
+    pub(crate) fn active_authority_segment(
+        &self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+    ) -> Result<crate::AuthoritySegment> {
+        let record = self.bound(principal, key, epoch)?;
+        let active = record
+            .active
+            .as_ref()
+            .filter(|active| active.turn_id == turn && !active.uncertain)
+            .ok_or(Error::Conflict("no exact active AuthoritySegment"))?;
+        Ok(active.authority_segment.clone())
+    }
+
+    fn admit_authority_update(
+        &mut self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+        boundary_kind: crate::AuthorityBoundaryKind,
+        boundary_id: &str,
+        input: &str,
+        replacement_evidence: Option<crate::AuthoritySegmentEvidence>,
+    ) -> Result<crate::AuthoritySegment> {
+        if boundary_id.is_empty()
+            || boundary_id.len() > 256
+            || !boundary_id.is_ascii()
+            || boundary_id.chars().any(char::is_control)
+            || input.is_empty()
+            || input.len() > crate::limits::MAX_PROMPT_BYTES
+            || input.contains('\0')
+        {
+            return Err(Error::Denied("invalid same-Turn authority boundary"));
+        }
+        let record = self.bound(principal, key, epoch)?;
+        let active = record
+            .active
+            .as_ref()
+            .filter(|active| active.turn_id == turn && !active.uncertain)
+            .ok_or(Error::Conflict(
+                "same-Turn authority update requires exact active Turn",
+            ))?;
+        if active.pending_authority_update.is_some() {
+            return Err(Error::Conflict(
+                "same-Turn authority update already pending at a safe boundary",
+            ));
+        }
+        let ordinal = active
+            .authority_segment
+            .ordinal
+            .checked_add(1)
+            .ok_or(Error::Limit("AuthoritySegment ordinal exhausted"))?;
+        let binding = record.binding.clone();
+        let previous = active.authority_segment.fingerprint;
+        let segment_evidence = match replacement_evidence {
+            Some(evidence) => {
+                evidence.validate()?;
+                Some(evidence)
+            }
+            None => active.authority_segment.evidence.clone(),
+        };
+
+        let mut hash = Sha256::new();
+        hash.update(b"aw-authority-segment-update-v1\0");
+        hash.update([match boundary_kind {
+            crate::AuthorityBoundaryKind::Input => {
+                return Err(Error::Denied(
+                    "Input cannot be staged as a same-Turn authority update",
+                ));
+            }
+            crate::AuthorityBoundaryKind::Steer => 1,
+            crate::AuthorityBoundaryKind::Interrupt => 2,
+        }]);
+        hash.update(previous);
+        let principal_bytes = principal.as_str().as_bytes();
+        hash.update((principal_bytes.len() as u64).to_be_bytes());
+        hash.update(principal_bytes);
+        let session = binding.session_id.as_bytes();
+        hash.update((session.len() as u64).to_be_bytes());
+        hash.update(session);
+        hash.update(
+            binding
+                .writer_epoch
+                .map_or(0, NonZeroU64::get)
+                .to_be_bytes(),
+        );
+        for value in [
+            key.runtime.id.get(),
+            key.runtime.generation.get(),
+            key.id.get(),
+            key.generation.get(),
+            turn,
+            ordinal as u64,
+        ] {
+            hash.update(value.to_be_bytes());
+        }
+        let boundary = boundary_id.as_bytes();
+        hash.update((boundary.len() as u64).to_be_bytes());
+        hash.update(boundary);
+        let text = input.as_bytes();
+        hash.update((text.len() as u64).to_be_bytes());
+        hash.update(text);
+        if let Some(evidence) = &segment_evidence {
+            let encoded = serde_json::to_vec(evidence)
+                .map_err(|_| Error::Protocol("cannot encode AuthoritySegment evidence"))?;
+            hash.update((encoded.len() as u64).to_be_bytes());
+            hash.update(encoded);
+        }
+        let segment = crate::AuthoritySegment {
+            ordinal,
+            boundary: boundary_kind,
+            boundary_id: boundary_id.to_owned(),
+            fingerprint: hash.finalize().into(),
+            evidence: segment_evidence,
+        };
+        segment.validate()?;
+
+        let record = self.agents.get_mut(&key).expect("verified Actor");
+        let active = record.active.as_mut().expect("checked active Turn");
+        active.pending_authority_update = Some(crate::control::AuthorityUpdate {
+            segment: segment.clone(),
+            input: input.to_owned(),
+        });
+        Ok(segment)
+    }
+
+    pub(crate) fn admit_authority_steer(
+        &mut self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+        boundary_id: &str,
+        input: &str,
+    ) -> Result<crate::AuthoritySegment> {
+        self.admit_authority_update(
+            principal,
+            key,
+            epoch,
+            turn,
+            crate::AuthorityBoundaryKind::Steer,
+            boundary_id,
+            input,
+            None,
+        )
+    }
+
+    pub(crate) fn admit_authority_steer_with_evidence(
+        &mut self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+        boundary_id: &str,
+        input: &str,
+        evidence: crate::AuthoritySegmentEvidence,
+    ) -> Result<crate::AuthoritySegment> {
+        self.admit_authority_update(
+            principal,
+            key,
+            epoch,
+            turn,
+            crate::AuthorityBoundaryKind::Steer,
+            boundary_id,
+            input,
+            Some(evidence),
+        )
+    }
+
+    pub(crate) fn admit_authority_interrupt(
+        &mut self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+        boundary_id: &str,
+        input: &str,
+    ) -> Result<crate::AuthoritySegment> {
+        self.admit_authority_update(
+            principal,
+            key,
+            epoch,
+            turn,
+            crate::AuthorityBoundaryKind::Interrupt,
+            boundary_id,
+            input,
+            None,
+        )
+    }
+
+    pub(crate) fn admit_authority_interrupt_with_evidence(
+        &mut self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+        boundary_id: &str,
+        input: &str,
+        evidence: crate::AuthoritySegmentEvidence,
+    ) -> Result<crate::AuthoritySegment> {
+        self.admit_authority_update(
+            principal,
+            key,
+            epoch,
+            turn,
+            crate::AuthorityBoundaryKind::Interrupt,
+            boundary_id,
+            input,
+            Some(evidence),
+        )
+    }
+
+    pub(crate) fn discard_authority_steer(
+        &mut self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+        boundary_id: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<()> {
+        let record = self.bound(principal, key, epoch)?;
+        let active = record
+            .active
+            .as_ref()
+            .filter(|active| active.turn_id == turn && !active.uncertain)
+            .ok_or(Error::Conflict("no exact active Turn for steer withdrawal"))?;
+        let pending = active
+            .pending_authority_update
+            .as_ref()
+            .ok_or(Error::Conflict("no pending same-Turn steer to withdraw"))?;
+        if pending.segment.boundary_id != boundary_id || pending.segment.fingerprint != fingerprint
+        {
+            return Err(Error::Conflict(
+                "pending same-Turn steer differs from withdrawal receipt",
+            ));
+        }
+        let record = self.agents.get_mut(&key).expect("verified Actor");
+        record
+            .active
+            .as_mut()
+            .expect("checked active Turn")
+            .pending_authority_update = None;
+        Ok(())
+    }
+
+    pub(crate) fn take_authority_update(
+        &mut self,
+        principal: &PrincipalId,
+        key: ActorKey,
+        epoch: Option<NonZeroU64>,
+        turn: u64,
+    ) -> Result<Option<crate::control::AuthorityUpdate>> {
+        let record = self.bound(principal, key, epoch)?;
+        let active = record
+            .active
+            .as_ref()
+            .filter(|active| active.turn_id == turn && !active.uncertain)
+            .ok_or(Error::Conflict(
+                "no exact active Turn for AuthoritySegment update",
+            ))?;
+        if active.pending_authority_update.is_none() {
+            return Ok(None);
+        }
+        let record = self.agents.get_mut(&key).expect("verified Actor");
+        let active = record.active.as_mut().expect("checked active Turn");
+        let update = active
+            .pending_authority_update
+            .take()
+            .expect("checked pending update");
+        if update.segment.ordinal != active.authority_segment.ordinal.saturating_add(1) {
+            active.uncertain = true;
+            return Err(Error::Conflict(
+                "AuthoritySegment update lost monotonic ordering",
+            ));
+        }
+        active.authority_segment = update.segment.clone();
+        Ok(Some(update))
+    }
+
     /// Read-only step gate, callable without holding a Runtime lock during
     /// awaits. A negative-priority Input means interrupt at the NEXT safe
     /// boundary and then dispatch that Input as its own journaled Turn.

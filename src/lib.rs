@@ -27,6 +27,8 @@ use zeroize::Zeroizing;
 /// listener or persist/replay queued message payloads on its own.
 #[cfg(feature = "durable")]
 pub mod actor_owner;
+#[cfg(feature = "durable")]
+pub mod agent_jobs;
 #[cfg(all(feature = "durable", feature = "pipelines", feature = "routing"))]
 pub mod approval_ui;
 pub mod context;
@@ -50,6 +52,8 @@ pub mod model_management;
 pub mod model_process_control;
 #[cfg(feature = "oidc")]
 pub mod oidc_flow;
+#[cfg(feature = "durable")]
+pub mod policy_runtime;
 pub mod presentation;
 pub mod project_resources;
 #[cfg(feature = "durable")]

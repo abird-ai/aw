@@ -7,7 +7,9 @@
 use aw_agent_core::{
     control::{AgentSessionController, WriterEpochFence},
     runtime::{Delivery, HostRuntime},
-    Agent, AgentEvent, Error, PrincipalId, Result, Turn,
+    tool::ToolBindingAuthority,
+    Agent, AgentEvent, AuthoritySegmentEvidence, Error, PrincipalId, ProviderAccounts,
+    ProviderSelection, Result, Turn,
 };
 use aw_agent_kernel::{
     actor::ActorKey,
@@ -18,9 +20,11 @@ use aw_store::{
     model_queue_request_id, queued_input_request_id, ActorControlAction, ActorControlAdmission,
     ActorControlFact, ActorControlState, ActorInputAdmission, ActorInputFact, ActorNoticeFact,
     ActorNoticeRequest, ActorNoticeState, ActorNoticeView, ActorQueueFact, ActorQueueRequest,
-    ActorQueueView, CustodySweep, InputAdmissionState, ModelAgentPauseFact, ModelAgentPauseRequest,
-    ModelProcessAction, ModelProcessFact, ModelProcessRequest, ModelProcessState,
-    ModelQueueDispositionKind, ModelQueueDispositionRequest, QueueTarget, SessionStore,
+    ActorQueueView, AuthoritySteerFact, AuthoritySteerRequest, AuthoritySteerState, CustodySweep,
+    InputAdmissionState, ModelAgentPauseFact, ModelAgentPauseRequest, ModelProcessAction,
+    ModelProcessFact, ModelProcessRequest, ModelProcessState, ModelQueueDispositionKind,
+    ModelQueueDispositionRequest, ParticipantInputAdmission, QueueTarget,
+    SessionParticipationAction, SessionStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -199,6 +203,15 @@ struct State {
     poisoned: bool,
     claiming: bool,
 }
+#[derive(Clone)]
+pub struct ParticipantControlAuthority {
+    provider_accounts: ProviderAccounts,
+    tool_authority: ToolBindingAuthority,
+    session_id: String,
+    branch_id: String,
+    agent_ref: String,
+}
+
 /// Host-owned first-party durable admission adapter. Construct only from a
 /// real current SQLite Session writer and a Session-bound Runtime Actor.
 #[derive(Clone)]
@@ -312,10 +325,582 @@ impl Service {
             state: Arc::new(Mutex::new(State::default())),
         })
     }
+
+    /// Attach the existing durable Agent to one first-party Actor owner using
+    /// only current SessionStore writer evidence and the Agent's exact current
+    /// tool envelope. No caller supplies an Actor key, grant, site or epoch.
+    pub fn attach_for_agent(
+        store: SessionStore,
+        session: &str,
+        branch: &str,
+        agent: &Agent,
+    ) -> Result<Self> {
+        use aw_agent_core::runtime::SessionBinding;
+        use aw_agent_kernel::{
+            actor::{ActorState, RuntimeKey},
+            capability::Effect,
+            envelope::{Access, Budget, EnvelopeSpec, Network},
+        };
+
+        let owner = agent.actor().clone();
+        let binding = agent.execution_binding().ok_or(Error::Denied(
+            "Actor owner attachment requires a Session-derived Agent identity",
+        ))?;
+        if binding.session_id() != session || binding.branch_id() != branch {
+            return Err(Error::Denied(
+                "Actor owner attachment Session differs from Agent identity",
+            ));
+        }
+        let stored = store.session(&owner, session)?;
+        let writer = store.workspace_writer(&owner, None, &stored.workspace_id)?;
+        let epoch = NonZeroU64::new(writer.writer_epoch)
+            .ok_or(Error::Denied("Agent writer epoch is unavailable"))?;
+        if writer.state != "active" {
+            return Err(Error::Denied("Agent Workspace writer is not active"));
+        }
+        store.actor_input_writer_fence(&owner, session, epoch.get())?;
+
+        let grants = agent.requested_tool_envelope_grants()?;
+        let access = if grants
+            .iter()
+            .any(|grant| matches!(grant.effect, Effect::Write | Effect::Unknown))
+        {
+            Access::ReadWrite
+        } else {
+            Access::ReadOnly
+        };
+        let process = grants
+            .iter()
+            .any(|grant| matches!(grant.effect, Effect::Process | Effect::Unknown));
+        let site = agent.tool_execution_site().to_owned();
+
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|_| Error::Storage("Actor Runtime nonce unavailable"))?;
+        let runtime_key = RuntimeKey {
+            id: NonZeroU64::new(u64::from_le_bytes(
+                nonce[..8]
+                    .try_into()
+                    .map_err(|_| Error::Storage("Actor Runtime nonce malformed"))?,
+            ))
+            .ok_or(Error::Storage("Actor Runtime ID was zero"))?,
+            generation: NonZeroU64::new(u64::from_le_bytes(
+                nonce[8..]
+                    .try_into()
+                    .map_err(|_| Error::Storage("Actor Runtime generation malformed"))?,
+            ))
+            .ok_or(Error::Storage("Actor Runtime generation was zero"))?,
+        };
+        let mut runtime = HostRuntime::new(owner.clone(), site.clone(), runtime_key, 64, 32)?;
+        let actor = runtime.bind_agent(
+            &owner,
+            SessionBinding::from_trusted_host(session, Some(epoch))?,
+            None,
+            EnvelopeSpec {
+                actor: owner.as_str().to_owned(),
+                site,
+                revision: 1,
+                access,
+                network: Network::Deny,
+                process,
+                tty: false,
+                microphone: false,
+                speaker: false,
+                budget: Budget {
+                    max_model_rounds: 32,
+                    max_tool_calls: 128,
+                    max_children: 64,
+                    max_depth: 8,
+                    max_output_bytes: agent.options().max_output_bytes.min(1024 * 1024),
+                },
+                grants,
+            },
+            "agent-session",
+        )?;
+        runtime.record_state(&owner, actor, Some(epoch), ActorState::Running)?;
+        let service = Self::new(
+            store,
+            Arc::new(Mutex::new(runtime)),
+            owner,
+            actor,
+            epoch,
+            session,
+            branch,
+        )?;
+        service.verify_rpc_agent(agent)?;
+        Ok(service)
+    }
+
     /// One accepted Input per current branch view. We never persist prompt
     /// text in audit; the original Agent's TurnJournal records user text ONLY
     /// after a guarded claim and factual TurnStart. A repeated request ID
     /// cannot re-enter even after process restart.
+    fn participant_tool_envelope_ref(
+        authority: &ToolBindingAuthority,
+        actor: &PrincipalId,
+    ) -> Result<String> {
+        let bindings = authority.permitted_bindings(actor)?;
+        let mut hash = Sha256::new();
+        hash.update(b"aw-shared-session-tool-envelope-v1\0");
+        hash.update((actor.as_str().len() as u64).to_be_bytes());
+        hash.update(actor.as_str().as_bytes());
+        for binding in bindings {
+            for part in [
+                binding.name.as_str(),
+                binding.source.kind_label(),
+                binding.source.id.as_str(),
+                binding.execution_site.as_str(),
+            ] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part.as_bytes());
+            }
+            hash.update(binding.registry_revision.to_be_bytes());
+            hash.update(binding.authority_revision.to_be_bytes());
+            hash.update(binding.source.epoch.to_be_bytes());
+            hash.update([match binding.effect {
+                aw_agent_core::ToolEffect::Read => 0,
+                aw_agent_core::ToolEffect::Write => 1,
+                aw_agent_core::ToolEffect::Process => 2,
+                aw_agent_core::ToolEffect::Control => 3,
+                aw_agent_core::ToolEffect::Unknown => 4,
+            }]);
+        }
+        Ok(format!("tools:{:x}", hash.finalize()))
+    }
+
+    fn participant_authority_admission(
+        &self,
+        provider_accounts: &ProviderAccounts,
+        tool_authority: &ToolBindingAuthority,
+        participant: &PrincipalId,
+        selected: &ProviderSelection,
+        participation: &aw_store::SessionParticipationEvidence,
+        action: SessionParticipationAction,
+        request_id: &str,
+        branch: &aw_store::BranchInfo,
+        turn_id: u64,
+    ) -> Result<ParticipantInputAdmission> {
+        selected.revalidate()?;
+        if selected.identity().actor != *participant
+            || participation.actor != *participant
+            || participation.session_id != self.session
+            || participation.owner
+            || !participation.permissions.allows(action)
+        {
+            return Err(Error::Denied(
+                "participant action requires exact current collaboration/provider authority",
+            ));
+        }
+        let current = provider_accounts.select(
+            participant,
+            &selected.identity().account_id,
+            &selected.identity().model,
+        )?;
+        if current.identity() != selected.identity() {
+            return Err(Error::Denied(
+                "participant provider/account/model authority changed before admission",
+            ));
+        }
+        self.store.authorize_participant_model_context(
+            participant,
+            &self.session,
+            &branch.id,
+            selected.identity(),
+            action,
+        )?;
+
+        let payer_ref = AuthoritySegmentEvidence::payer_ref(selected.identity())?;
+        let provider_model_ceiling_ref =
+            AuthoritySegmentEvidence::provider_model_ceiling_ref(selected.identity())?;
+        let tool_envelope_ref = Self::participant_tool_envelope_ref(tool_authority, participant)?;
+        let disclosure_projection_ref = format!(
+            "full-session:{}:audience:{}",
+            self.session, participation.audience_epoch
+        );
+
+        let identity_json = serde_json::to_vec(selected.identity())
+            .map_err(|_| Error::Protocol("cannot fingerprint participant provider identity"))?;
+        let mut context = Sha256::new();
+        context.update(b"aw-shared-session-context-v1\0");
+        for part in [
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            branch.head.as_bytes(),
+            request_id.as_bytes(),
+            participant.as_str().as_bytes(),
+            payer_ref.as_bytes(),
+            provider_model_ceiling_ref.as_bytes(),
+            tool_envelope_ref.as_bytes(),
+            disclosure_projection_ref.as_bytes(),
+            identity_json.as_slice(),
+        ] {
+            context.update((part.len() as u64).to_be_bytes());
+            context.update(part);
+        }
+        context.update(branch.revision.to_be_bytes());
+        context.update(turn_id.to_be_bytes());
+        context.update(participation.membership_epoch.to_be_bytes());
+        context.update(participation.audience_epoch.to_be_bytes());
+        let context_fingerprint: [u8; 32] = context.finalize().into();
+
+        let mut causal = Sha256::new();
+        causal.update(match action {
+            SessionParticipationAction::Submit => {
+                b"aw-shared-session-input-causal-root-v1\0".as_slice()
+            }
+            SessionParticipationAction::Control => {
+                b"aw-shared-session-control-causal-root-v1\0".as_slice()
+            }
+            SessionParticipationAction::View
+            | SessionParticipationAction::Contribute
+            | SessionParticipationAction::Manage => {
+                b"aw-shared-session-other-causal-root-v1\0".as_slice()
+            }
+        });
+        for part in [
+            self.session.as_bytes(),
+            request_id.as_bytes(),
+            participant.as_str().as_bytes(),
+        ] {
+            causal.update((part.len() as u64).to_be_bytes());
+            causal.update(part);
+        }
+        let causal_root = format!(
+            "{}:{:x}",
+            if action == SessionParticipationAction::Submit {
+                "input"
+            } else {
+                "control"
+            },
+            causal.finalize()
+        );
+
+        let admission = ParticipantInputAdmission {
+            actor: participant.clone(),
+            identity: selected.identity().clone(),
+            membership_epoch: participation.membership_epoch,
+            audience_epoch: participation.audience_epoch,
+            causal_root,
+            payer_ref,
+            provider_model_ceiling_ref,
+            tool_envelope_ref,
+            disclosure_projection_ref,
+            context_fingerprint,
+        };
+        admission.validate()?;
+        Ok(admission)
+    }
+
+    /// Submit one shared participant Input into this same Agent/Session queue.
+    /// The participant supplies no ActorKey, writer, tool grant or payer token:
+    /// all authority is resolved from current host stores before admission.
+    pub fn submit_participant_text(
+        &self,
+        agent: &Agent,
+        participant: &PrincipalId,
+        selected: &ProviderSelection,
+        text: &str,
+    ) -> Result<ActorInputFact> {
+        if text.is_empty() || text.len() > crate::config::MAX_PROMPT_BYTES || text.contains('\0') {
+            return Err(Error::Denied(
+                "participant Agent Input text is invalid or too large",
+            ));
+        }
+        self.verify_rpc_agent(agent)?;
+        let participation = self.store.authorize_session_participation(
+            participant,
+            &self.session,
+            SessionParticipationAction::Submit,
+        )?;
+        let turn = agent.history_state().next_turn_id;
+        let branch = self
+            .store
+            .branches(&self.owner, &self.session)?
+            .into_iter()
+            .find(|row| row.id == self.branch)
+            .ok_or(Error::Denied("Actor owner branch disappeared"))?;
+
+        let mut request_hash = Sha256::new();
+        request_hash.update(b"aw-shared-session-input-v1\0");
+        for part in [
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            participant.as_str().as_bytes(),
+            &turn.to_be_bytes(),
+            text.as_bytes(),
+        ] {
+            request_hash.update((part.len() as u64).to_be_bytes());
+            request_hash.update(part);
+        }
+        let request_id = format!("pi_{:x}", request_hash.finalize());
+        if let Ok(existing) = self.fact(&request_id) {
+            return Err(match existing.state {
+                InputAdmissionState::Settled => {
+                    Error::Conflict("participant Agent Input already settled; do not replay")
+                }
+                _ => Error::Conflict(
+                    "participant Agent Input already exists or is uncertain; inspect before retry",
+                ),
+            });
+        }
+        let provider_accounts = agent.provider_accounts();
+        let tool_authority = agent.tool_binding_authority();
+        let participant_admission = self.participant_authority_admission(
+            &provider_accounts,
+            &tool_authority,
+            participant,
+            selected,
+            &participation,
+            SessionParticipationAction::Submit,
+            &request_id,
+            &branch,
+            turn,
+        )?;
+        self.submit_inner_with_participant(
+            agent,
+            request_id,
+            ActorMessage {
+                id: turn,
+                source_sequence: turn,
+                from: self.actor,
+                to: self.actor,
+                kind: Kind::Input,
+                turn: TurnTarget::Exact(turn),
+                priority: 0,
+                payload: text.to_owned(),
+                content_type: aw_agent_kernel::message::ContentType::Text,
+            },
+            false,
+            Some(participant_admission),
+        )
+    }
+
+    pub fn participant_control_authority(
+        &self,
+        agent: &Agent,
+    ) -> Result<ParticipantControlAuthority> {
+        self.verify_rpc_agent(agent)?;
+        let scope = agent.journal_scope()?.ok_or(Error::Denied(
+            "participant Control requires a journaled Agent",
+        ))?;
+        let execution = agent.execution_binding().ok_or(Error::Denied(
+            "participant Control requires a bound Agent identity",
+        ))?;
+        if scope.session_id != self.session
+            || scope.branch_id != self.branch
+            || execution.session_id() != self.session
+            || execution.branch_id() != self.branch
+        {
+            return Err(Error::Denied(
+                "participant Control authority differs from owning Session/branch",
+            ));
+        }
+        Ok(ParticipantControlAuthority {
+            provider_accounts: agent.provider_accounts(),
+            tool_authority: agent.tool_binding_authority(),
+            session_id: self.session.clone(),
+            branch_id: self.branch.clone(),
+            agent_ref: execution.canonical_ref().to_owned(),
+        })
+    }
+
+    pub fn prepare_participant_control(
+        &self,
+        agent: &Agent,
+        participant: &PrincipalId,
+        selected: &ProviderSelection,
+        turn_id: u64,
+        request_id: &str,
+    ) -> Result<ParticipantInputAdmission> {
+        let authority = self.participant_control_authority(agent)?;
+        self.prepare_participant_control_live(
+            &authority,
+            participant,
+            selected,
+            turn_id,
+            request_id,
+        )
+    }
+
+    pub fn prepare_participant_control_live(
+        &self,
+        authority: &ParticipantControlAuthority,
+        participant: &PrincipalId,
+        selected: &ProviderSelection,
+        turn_id: u64,
+        request_id: &str,
+    ) -> Result<ParticipantInputAdmission> {
+        if authority.session_id != self.session
+            || authority.branch_id != self.branch
+            || authority.agent_ref.is_empty()
+        {
+            return Err(Error::Denied(
+                "participant Control coordinator snapshot is stale or foreign",
+            ));
+        }
+        if turn_id == 0
+            || request_id.is_empty()
+            || request_id.len() > 128
+            || !request_id.is_ascii()
+            || request_id.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("participant Control identity is invalid"));
+        }
+        self.verify_rpc_state()?;
+        let participation = self.store.authorize_session_participation(
+            participant,
+            &self.session,
+            SessionParticipationAction::Control,
+        )?;
+        let branch = self
+            .store
+            .branches(&self.owner, &self.session)?
+            .into_iter()
+            .find(|row| row.id == self.branch)
+            .ok_or(Error::Denied("Actor owner branch disappeared"))?;
+        self.participant_authority_admission(
+            &authority.provider_accounts,
+            &authority.tool_authority,
+            participant,
+            selected,
+            &participation,
+            SessionParticipationAction::Control,
+            request_id,
+            &branch,
+            turn_id,
+        )
+    }
+
+    pub fn submit_participant_control(
+        &self,
+        participant: ParticipantInputAdmission,
+        boundary: aw_agent_core::AuthorityBoundaryKind,
+        turn_id: u64,
+        request_id: &str,
+        canonical_target: &str,
+        text: &str,
+    ) -> Result<AuthoritySteerFact> {
+        if !matches!(
+            boundary,
+            aw_agent_core::AuthorityBoundaryKind::Steer
+                | aw_agent_core::AuthorityBoundaryKind::Interrupt
+        ) {
+            return Err(Error::Denied(
+                "participant Control must be steer or interrupt",
+            ));
+        }
+        participant.validate()?;
+        if participant.actor == self.owner
+            || turn_id == 0
+            || request_id.is_empty()
+            || request_id.len() > 128
+            || !request_id.is_ascii()
+            || request_id.chars().any(char::is_control)
+            || canonical_target.is_empty()
+            || canonical_target.len() > 1024
+            || !canonical_target.is_ascii()
+            || canonical_target.chars().any(char::is_control)
+            || text.is_empty()
+            || text.len() > 64 * 1024
+            || text.contains('\0')
+        {
+            return Err(Error::Denied("participant Control request is invalid"));
+        }
+        self.verify_rpc_state()?;
+        let payload_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+        if let Ok(existing) =
+            self.store
+                .authority_steer_fact(&self.owner, &self.session, request_id)
+        {
+            if existing.request.branch_id != self.branch
+                || existing.request.turn_id != turn_id
+                || existing.request.canonical_target != canonical_target
+                || existing.request.participant.as_ref() != Some(&participant)
+                || existing.payload_sha256 != payload_sha256
+            {
+                return Err(Error::Denied(
+                    "participant Control replay identity reused with changed semantics",
+                ));
+            }
+            return match existing.state {
+                AuthoritySteerState::Accepted | AuthoritySteerState::Applied => Ok(existing),
+                AuthoritySteerState::Prepared | AuthoritySteerState::Unknown => {
+                    Err(Error::Conflict(
+                        "participant Control outcome is unresolved; inspect, do not replay",
+                    ))
+                }
+                AuthoritySteerState::Rejected | AuthoritySteerState::Inspected => Err(
+                    Error::Conflict("participant Control was dispositioned and cannot be replayed"),
+                ),
+            };
+        }
+
+        let prepared = self.store.authority_steer_prepare(
+            &self.owner,
+            AuthoritySteerRequest {
+                request_id: request_id.to_owned(),
+                session_id: self.session.clone(),
+                branch_id: self.branch.clone(),
+                writer_epoch: self.epoch.get(),
+                turn_id,
+                canonical_target: canonical_target.to_owned(),
+                participant: Some(participant.clone()),
+            },
+            text,
+        )?;
+        let evidence = participant.authority_segment_evidence()?;
+        let staged = match boundary {
+            aw_agent_core::AuthorityBoundaryKind::Steer => self
+                .controller
+                .admit_authority_steer_with_evidence(turn_id, request_id, text, evidence),
+            aw_agent_core::AuthorityBoundaryKind::Interrupt => self
+                .controller
+                .admit_authority_interrupt_with_evidence(turn_id, request_id, text, evidence),
+            aw_agent_core::AuthorityBoundaryKind::Input => unreachable!("checked above"),
+        };
+        let segment = match staged {
+            Ok(segment) => segment,
+            Err(error) => {
+                let _ = self.store.authority_steer_reject_prepared(
+                    &self.owner,
+                    &prepared,
+                    "live Runtime rejected participant Control before admission",
+                );
+                return Err(error);
+            }
+        };
+        match self
+            .store
+            .authority_steer_accept(&self.owner, &prepared, &segment)
+        {
+            Ok(accepted) => Ok(accepted),
+            Err(error) => {
+                let withdrawn = self.controller.discard_authority_steer(
+                    turn_id,
+                    request_id,
+                    segment.fingerprint,
+                );
+                if withdrawn.is_ok() {
+                    let _ = self.store.authority_steer_reject_prepared(
+                        &self.owner,
+                        &prepared,
+                        "durable participant Control accept failed; Runtime update withdrawn",
+                    );
+                } else {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.poisoned = true;
+                    }
+                    let _ = self.store.authority_steer_mark_unknown(
+                        &self.owner,
+                        &prepared,
+                        "durable participant Control accept failed and withdrawal was uncertain",
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn submit(
         &self,
         agent: &Agent,
@@ -330,6 +915,17 @@ impl Service {
         request_id: impl Into<String>,
         message: ActorMessage,
         from_queue: bool,
+    ) -> Result<ActorInputFact> {
+        self.submit_inner_with_participant(agent, request_id, message, from_queue, None)
+    }
+
+    fn submit_inner_with_participant(
+        &self,
+        agent: &Agent,
+        request_id: impl Into<String>,
+        message: ActorMessage,
+        from_queue: bool,
+        participant: Option<ParticipantInputAdmission>,
     ) -> Result<ActorInputFact> {
         let request_id = request_id.into();
         if !from_queue && request_id.starts_with("qi_") {
@@ -393,10 +989,19 @@ impl Service {
             message_id: message.id,
             payload_sha256: format!("{:x}", Sha256::digest(message.payload.as_bytes())),
             priority: message.priority,
+            participant,
         };
         self.store
             .actor_input_prepare(&self.owner, admission.clone())?;
-        let delivered = self.controller.send(message, admission.turn_id);
+        let delivered = if let Some(participant) = &admission.participant {
+            self.controller.send_with_authority(
+                message,
+                admission.turn_id,
+                participant.authority_segment_evidence()?,
+            )
+        } else {
+            self.controller.send(message, admission.turn_id)
+        };
         match delivered {
             Ok(Delivery::Queued(_)) => {
                 // The in-memory queue now contains the message. Until this
@@ -903,6 +1508,37 @@ impl Service {
             .allow_tool(name, &aw_agent_core::ToolSource::trusted_host(), effect)
     }
 
+    /// Stable identity-only gate for replay lookup of an already committed
+    /// jobs_* control receipt. It deliberately does not require an active Turn:
+    /// new effects call verify_model_observation afterwards, while exact replay
+    /// can recover a factual receipt after settlement without re-execution.
+    fn verify_jobs_context_identity(&self, ctx: &aw_agent_core::ToolContext) -> Result<()> {
+        self.verify_rpc_state()?;
+        let binding = ctx
+            .execution_owner
+            .as_ref()
+            .ok_or(Error::Denied("jobs control lacks bound Agent identity"))?;
+        if ctx.turn_id == 0
+            || ctx.call_id.is_empty()
+            || ctx.call_id.len() > 256
+            || ctx.actor != self.owner
+            || ctx.identity.actor != self.owner
+            || ctx.execution_site != self.site
+            || ctx.source != aw_agent_core::ToolSource::trusted_host()
+            || ctx.effect != aw_agent_core::ToolEffect::Control
+            || ctx.scope.as_ref().is_none_or(|scope| {
+                scope.session_id != self.session || scope.branch_id != self.branch
+            })
+            || binding.session_id() != self.session
+            || binding.branch_id() != self.branch
+        {
+            return Err(Error::Denied(
+                "jobs control identity/source/site/Session differs from bound owner",
+            ));
+        }
+        Ok(())
+    }
+
     /// AW-P6-9D2A: exactly one *new future* queue Input per original
     /// journaled originating Turn. `ctx` is the original Agent's private
     /// ToolContext; the external model cannot supply any authority, sender,
@@ -976,6 +1612,555 @@ impl Service {
         )?;
         self.verify_model_observation(ctx)?;
         Ok(view)
+    }
+
+    /// Unified jobs.send same-Turn steer. The text is encrypted and an
+    /// immutable Prepared fact commits before Runtime staging. Accepted commits
+    /// only after the exact pending AuthoritySegment exists in the live owner.
+    pub fn jobs_steer_text(
+        &self,
+        ctx: &aw_agent_core::ToolContext,
+        canonical_target: &str,
+        expected_revision: Option<u64>,
+        text: &str,
+    ) -> Result<AuthoritySteerFact> {
+        self.jobs_authority_update_text(
+            ctx,
+            canonical_target,
+            expected_revision,
+            text,
+            aw_agent_core::AuthorityBoundaryKind::Steer,
+        )
+    }
+
+    /// Interrupt redirects at the earliest *factual* safe boundary. It never
+    /// drops an in-flight paid/provider or external effect merely to appear
+    /// immediate; already-started work must receipt before the new segment.
+    pub fn jobs_interrupt_text(
+        &self,
+        ctx: &aw_agent_core::ToolContext,
+        canonical_target: &str,
+        expected_revision: Option<u64>,
+        text: &str,
+    ) -> Result<AuthoritySteerFact> {
+        self.jobs_authority_update_text(
+            ctx,
+            canonical_target,
+            expected_revision,
+            text,
+            aw_agent_core::AuthorityBoundaryKind::Interrupt,
+        )
+    }
+
+    fn jobs_authority_update_text(
+        &self,
+        ctx: &aw_agent_core::ToolContext,
+        canonical_target: &str,
+        expected_revision: Option<u64>,
+        text: &str,
+        boundary: aw_agent_core::AuthorityBoundaryKind,
+    ) -> Result<AuthoritySteerFact> {
+        if !matches!(
+            boundary,
+            aw_agent_core::AuthorityBoundaryKind::Steer
+                | aw_agent_core::AuthorityBoundaryKind::Interrupt
+        ) {
+            return Err(Error::Denied("invalid same-Turn authority update kind"));
+        }
+        self.verify_jobs_context_identity(ctx)?;
+        if text.is_empty()
+            || text.len() > 64 * 1024
+            || text.contains('\0')
+            || text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(Error::Denied(
+                "same-Turn jobs_send update must be bounded safe text",
+            ));
+        }
+        if canonical_target.is_empty()
+            || canonical_target.len() > 1024
+            || !canonical_target.is_ascii()
+            || canonical_target.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid same-Turn jobs_send target"));
+        }
+
+        let mut id_hash = Sha256::new();
+        id_hash.update(match boundary {
+            aw_agent_core::AuthorityBoundaryKind::Steer => {
+                b"aw-jobs-send-agent-steer-v1\0".as_slice()
+            }
+            aw_agent_core::AuthorityBoundaryKind::Interrupt => {
+                b"aw-jobs-send-agent-interrupt-v1\0".as_slice()
+            }
+            aw_agent_core::AuthorityBoundaryKind::Input => unreachable!("checked above"),
+        });
+        for part in [
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            ctx.actor.as_str().as_bytes(),
+            &ctx.turn_id.to_be_bytes(),
+            ctx.call_id.as_bytes(),
+            canonical_target.as_bytes(),
+        ] {
+            id_hash.update((part.len() as u64).to_be_bytes());
+            id_hash.update(part);
+        }
+        let request_id = format!(
+            "{}_{:x}",
+            if boundary == aw_agent_core::AuthorityBoundaryKind::Steer {
+                "js"
+            } else {
+                "ji"
+            },
+            id_hash.finalize()
+        );
+        let payload_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+
+        if let Ok(existing) =
+            self.store
+                .authority_steer_fact(&self.owner, &self.session, &request_id)
+        {
+            if existing.request.branch_id != self.branch
+                || existing.request.turn_id != ctx.turn_id
+                || existing.request.canonical_target != canonical_target
+                || existing.payload_sha256 != payload_sha256
+            {
+                return Err(Error::Denied(
+                    "jobs_send authority-update replay identity reused with changed semantics",
+                ));
+            }
+            return match existing.state {
+                AuthoritySteerState::Accepted | AuthoritySteerState::Applied => Ok(existing),
+                AuthoritySteerState::Prepared | AuthoritySteerState::Unknown => {
+                    Err(Error::Conflict(
+                        "jobs_send authority-update outcome is unresolved; inspect, do not replay",
+                    ))
+                }
+                AuthoritySteerState::Rejected | AuthoritySteerState::Inspected => {
+                    Err(Error::Conflict(
+                        "jobs_send authority update was dispositioned and cannot be replayed",
+                    ))
+                }
+            };
+        }
+
+        self.verify_model_observation(ctx)?;
+        self.require_model_tool_grant("jobs_send", &aw_agent_core::ToolEffect::Control)?;
+        let current_revision =
+            self.store
+                .agent_public_revision(&self.owner, &self.session, &self.branch)?;
+        if expected_revision.is_some_and(|revision| revision != current_revision) {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+        let prepared = self.store.authority_steer_prepare(
+            &self.owner,
+            AuthoritySteerRequest {
+                request_id: request_id.clone(),
+                session_id: self.session.clone(),
+                branch_id: self.branch.clone(),
+                writer_epoch: self.epoch.get(),
+                turn_id: ctx.turn_id,
+                canonical_target: canonical_target.to_owned(),
+                participant: None,
+            },
+            text,
+        )?;
+
+        let staged = match boundary {
+            aw_agent_core::AuthorityBoundaryKind::Steer => {
+                self.controller
+                    .admit_authority_steer(ctx.turn_id, &request_id, text)
+            }
+            aw_agent_core::AuthorityBoundaryKind::Interrupt => self
+                .controller
+                .admit_authority_interrupt(ctx.turn_id, &request_id, text),
+            aw_agent_core::AuthorityBoundaryKind::Input => unreachable!("checked above"),
+        };
+        let segment = match staged {
+            Ok(segment) => segment,
+            Err(error) => {
+                let _ = self.store.authority_steer_reject_prepared(
+                    &self.owner,
+                    &prepared,
+                    "live Runtime rejected authority update before admission",
+                );
+                return Err(error);
+            }
+        };
+
+        let accepted = match self
+            .store
+            .authority_steer_accept(&self.owner, &prepared, &segment)
+        {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let withdrawn = self.controller.discard_authority_steer(
+                    ctx.turn_id,
+                    &request_id,
+                    segment.fingerprint,
+                );
+                if withdrawn.is_ok() {
+                    let _ = self.store.authority_steer_reject_prepared(
+                        &self.owner,
+                        &prepared,
+                        "durable accept failed; exact Runtime authority update withdrawn",
+                    );
+                } else {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.poisoned = true;
+                    }
+                    let _ = self.store.authority_steer_mark_unknown(
+                        &self.owner,
+                        &prepared,
+                        "durable accept failed and Runtime authority-update withdrawal was uncertain",
+                    );
+                }
+                return Err(error);
+            }
+        };
+        // Post-commit revocation makes this Tool attempt uncertain, but the
+        // accepted durable steer remains the sole custody fact and is never
+        // automatically staged under another request identity.
+        self.verify_model_observation(ctx)?;
+        Ok(accepted)
+    }
+
+    /// Parent/child Agent continuation uses a separate gate from self-control:
+    /// the caller must be the exact active direct-parent Session/branch/Turn
+    /// recorded on this child relation. The target queue remains owned by this
+    /// child Service and continuation capacity is reserved before custody.
+    pub fn jobs_queue_text_from_parent(
+        &self,
+        ctx: &aw_agent_core::ToolContext,
+        canonical_target: &str,
+        expected_revision: Option<u64>,
+        text: &str,
+    ) -> Result<ActorQueueView> {
+        self.verify_rpc_state()?;
+        let scope = ctx.scope.as_ref().ok_or(Error::Denied(
+            "cross-Agent jobs_send requires a durable caller scope",
+        ))?;
+        let caller = ctx.execution_owner.as_ref().ok_or(Error::Denied(
+            "cross-Agent jobs_send lacks caller Agent identity",
+        ))?;
+        if ctx.cancellation.is_cancelled()
+            || ctx.turn_id == 0
+            || ctx.call_id.is_empty()
+            || ctx.call_id.len() > 256
+            || ctx.actor != self.owner
+            || ctx.identity.actor != self.owner
+            || ctx.source != aw_agent_core::ToolSource::trusted_host()
+            || ctx.effect != aw_agent_core::ToolEffect::Control
+            || caller.session_id() != scope.session_id
+            || caller.branch_id() != scope.branch_id
+        {
+            return Err(Error::Denied(
+                "cross-Agent jobs_send caller identity/source/scope is invalid",
+            ));
+        }
+        let relation = self
+            .store
+            .subagent_for_child_session(&self.owner, &self.session)?
+            .ok_or(Error::Denied(
+                "cross-Agent jobs_send target is not a durable delegated Agent",
+            ))?;
+        if relation.state != "running"
+            || relation.parent_session_id != scope.session_id
+            || relation.parent_branch_id != scope.branch_id
+            || self.store.active_turn_for_branch(
+                &self.owner,
+                &scope.session_id,
+                &scope.branch_id,
+            )? != Some(ctx.turn_id)
+        {
+            return Err(Error::Denied(
+                "cross-Agent jobs_send caller is not the active direct parent",
+            ));
+        }
+        if text.is_empty()
+            || text.len() > 64 * 1024
+            || text.contains('\0')
+            || text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(Error::Denied(
+                "Agent jobs_send text must be bounded 1..65536 safe bytes",
+            ));
+        }
+        if canonical_target.is_empty()
+            || canonical_target.len() > 1024
+            || !canonical_target.is_ascii()
+            || canonical_target.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid cross-Agent jobs_send target"));
+        }
+
+        let mut id_hash = Sha256::new();
+        id_hash.update(b"aw-jobs-send-related-agent-queue-v1\0");
+        for part in [
+            scope.session_id.as_bytes(),
+            scope.branch_id.as_bytes(),
+            &ctx.turn_id.to_be_bytes(),
+            ctx.call_id.as_bytes(),
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            canonical_target.as_bytes(),
+        ] {
+            id_hash.update((part.len() as u64).to_be_bytes());
+            id_hash.update(part);
+        }
+        let request_id = format!("jc_{:x}", id_hash.finalize());
+        let payload_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+
+        if let Ok(existing) = self
+            .store
+            .actor_queue_fact(&self.owner, &self.session, &request_id)
+        {
+            if existing.request.branch_id != self.branch
+                || existing.payload_sha256 != payload_sha256
+            {
+                return Err(Error::Denied(
+                    "cross-Agent jobs_send replay identity reused with changed semantics",
+                ));
+            }
+            return Ok((&existing).into());
+        }
+
+        let current_revision =
+            self.store
+                .agent_public_revision(&self.owner, &self.session, &self.branch)?;
+        if expected_revision.is_some_and(|revision| revision != current_revision) {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+        self.store
+            .reserve_delegation_continuation(&self.owner, &self.session, &request_id)?;
+        let sender_hash = format!(
+            "agent:{:x}",
+            Sha256::digest(caller.canonical_ref().as_bytes())
+        );
+        let fact = match self.store.actor_queue_enqueue_minted(
+            &self.owner,
+            ActorQueueRequest {
+                request_id: request_id.clone(),
+                session_id: self.session.clone(),
+                branch_id: self.branch.clone(),
+                recipient_site: self.site.clone(),
+                sender: sender_hash,
+                message_id: 0,
+                writer_epoch: self.epoch.get(),
+                target: QueueTarget::Auto,
+                priority: 0,
+            },
+            text,
+        ) {
+            Ok(fact) => fact,
+            Err(error) => {
+                let _ = self.store.cancel_delegation_continuation(
+                    &self.owner,
+                    &self.session,
+                    &request_id,
+                );
+                return Err(error);
+            }
+        };
+        if self
+            .store
+            .active_turn_for_branch(&self.owner, &scope.session_id, &scope.branch_id)?
+            != Some(ctx.turn_id)
+        {
+            return Err(Error::Conflict(
+                "cross-Agent jobs_send caller changed after factual queue custody; inspect receipt",
+            ));
+        }
+        Ok((&fact).into())
+    }
+
+    pub fn admit_job_event(
+        &self,
+        delivery: &aw_tools::job_event::JobEventDelivery,
+    ) -> Result<(ActorQueueView, bool)> {
+        delivery
+            .validate()
+            .map_err(|_| Error::Denied("invalid Job wake delivery identity"))?;
+        let mode = match delivery.mode {
+            aw_tools::job_event::JobWakeMode::Auto | aw_tools::job_event::JobWakeMode::Queue => {
+                aw_tools::job_event::JobWakeMode::Queue
+            }
+            aw_tools::job_event::JobWakeMode::Steer
+            | aw_tools::job_event::JobWakeMode::Interrupt => {
+                return Err(Error::Denied(
+                    "result/settled wake currently admits only queue delivery",
+                ))
+            }
+        };
+        self.verify_rpc_state()?;
+        if delivery.source_ref == delivery.recipient_ref {
+            return Err(Error::Denied("Job event source cannot wake itself"));
+        }
+
+        let mut hash = Sha256::new();
+        hash.update(b"aw-job-event-continuation-v1\0");
+        for part in [
+            delivery.source_ref.as_bytes(),
+            &delivery.event_rev.to_be_bytes(),
+            delivery.recipient_ref.as_bytes(),
+            &delivery.subscription_generation.to_be_bytes(),
+            mode.as_str().as_bytes(),
+        ] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        // Delegation continuation storage already owns the bounded causal-work
+        // reservation contract and requires this exact jc_<sha256> grammar.
+        let request_id = format!("jc_{:x}", hash.finalize());
+        let payload = format!(
+            "job event source={} rev={}",
+            delivery.source_ref, delivery.event_rev
+        );
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload.as_bytes()));
+
+        if let Ok(existing) = self
+            .store
+            .actor_queue_fact(&self.owner, &self.session, &request_id)
+        {
+            if existing.request.branch_id != self.branch
+                || existing.payload_sha256 != payload_sha256
+            {
+                return Err(Error::Denied(
+                    "Job event continuation identity reused with changed semantics",
+                ));
+            }
+            return Ok(((&existing).into(), false));
+        }
+
+        self.store
+            .reserve_delegation_continuation(&self.owner, &self.session, &request_id)?;
+        let sender = format!(
+            "job-event:{:x}",
+            Sha256::digest(delivery.source_ref.as_bytes())
+        );
+        let fact = match self.store.actor_queue_enqueue_minted(
+            &self.owner,
+            ActorQueueRequest {
+                request_id: request_id.clone(),
+                session_id: self.session.clone(),
+                branch_id: self.branch.clone(),
+                recipient_site: self.site.clone(),
+                sender,
+                message_id: 0,
+                writer_epoch: self.epoch.get(),
+                target: QueueTarget::Auto,
+                priority: 0,
+            },
+            &payload,
+        ) {
+            Ok(fact) => fact,
+            Err(error) => {
+                let _ = self.store.cancel_delegation_continuation(
+                    &self.owner,
+                    &self.session,
+                    &request_id,
+                );
+                return Err(error);
+            }
+        };
+        Ok(((&fact).into(), true))
+    }
+
+    /// Unified jobs.send Agent-root queue path. This reuses the same encrypted
+    /// Actor queue and current writer/Runtime owner. The stable request identity
+    /// is derived from the original ToolCall, so duplicate delivery returns the
+    /// original durable custody fact without enqueuing or paying again.
+    pub fn jobs_queue_text(
+        &self,
+        ctx: &aw_agent_core::ToolContext,
+        canonical_target: &str,
+        expected_revision: Option<u64>,
+        text: &str,
+    ) -> Result<ActorQueueView> {
+        self.verify_jobs_context_identity(ctx)?;
+        if text.is_empty()
+            || text.len() > 64 * 1024
+            || text.contains('\0')
+            || text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(Error::Denied(
+                "Agent jobs_send text must be bounded 1..65536 safe bytes",
+            ));
+        }
+        if canonical_target.is_empty()
+            || canonical_target.len() > 1024
+            || !canonical_target.is_ascii()
+            || canonical_target.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid Agent jobs_send target"));
+        }
+
+        let mut id_hash = Sha256::new();
+        id_hash.update(b"aw-jobs-send-agent-queue-v1\0");
+        for part in [
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            ctx.actor.as_str().as_bytes(),
+            &ctx.turn_id.to_be_bytes(),
+            ctx.call_id.as_bytes(),
+            canonical_target.as_bytes(),
+        ] {
+            id_hash.update((part.len() as u64).to_be_bytes());
+            id_hash.update(part);
+        }
+        let request_id = format!("jq_{:x}", id_hash.finalize());
+
+        let payload_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+        if let Ok(existing) = self
+            .store
+            .actor_queue_fact(&self.owner, &self.session, &request_id)
+        {
+            if existing.request.branch_id != self.branch
+                || existing.payload_sha256 != payload_sha256
+            {
+                return Err(Error::Denied(
+                    "jobs_send replay identity reused with changed queue semantics",
+                ));
+            }
+            return Ok((&existing).into());
+        }
+
+        self.verify_model_observation(ctx)?;
+        self.require_model_tool_grant("jobs_send", &aw_agent_core::ToolEffect::Control)?;
+        let current_revision =
+            self.store
+                .agent_public_revision(&self.owner, &self.session, &self.branch)?;
+        if expected_revision.is_some_and(|revision| revision != current_revision) {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+
+        let fact = self.store.actor_queue_enqueue_minted(
+            &self.owner,
+            ActorQueueRequest {
+                request_id,
+                session_id: self.session.clone(),
+                branch_id: self.branch.clone(),
+                recipient_site: self.site.clone(),
+                sender: label(self.actor),
+                message_id: 0,
+                writer_epoch: self.epoch.get(),
+                target: QueueTarget::Auto,
+                priority: 0,
+            },
+            text,
+        )?;
+        // The queue commit is already factual at this point. If the owner is
+        // revoked now, the Tool attempt is uncertain and must never enqueue a
+        // second item under another identity.
+        self.verify_model_observation(ctx)?;
+        Ok((&fact).into())
     }
 
     pub fn enqueue_model_future_text(
@@ -1268,6 +2453,55 @@ impl Service {
     /// Mint exactly one current owned Input from an RPC-supplied bounded
     /// request correlation and text. No caller may supply Runtime/Actor key,
     /// sender/site, Envelope, process incarnation or writer epoch.
+    /// Same-user fast-path admission for one new original Agent Turn. It
+    /// creates the exact Actor Input message from the already bound owner and
+    /// current Agent next-Turn identity; no queue hop or caller-supplied Actor
+    /// metadata is involved.
+    pub fn submit_bound_text(&self, agent: &Agent, text: &str) -> Result<ActorInputFact> {
+        if text.is_empty() || text.len() > crate::config::MAX_PROMPT_BYTES || text.contains('\0') {
+            return Err(Error::Denied("Agent Input text is invalid or too large"));
+        }
+        self.verify_rpc_agent(agent)?;
+        let turn = agent.history_state().next_turn_id;
+        let mut hash = Sha256::new();
+        hash.update(b"aw-agent-input-fast-path-v1\0");
+        for part in [
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            &turn.to_be_bytes(),
+            text.as_bytes(),
+        ] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        let request_id = format!("ui_{:x}", hash.finalize());
+        if let Ok(existing) = self.fact(&request_id) {
+            return Err(match existing.state {
+                InputAdmissionState::Settled => {
+                    Error::Conflict("Agent Input already settled; do not replay")
+                }
+                _ => Error::Conflict(
+                    "Agent Input already exists or is uncertain; inspect before retry",
+                ),
+            });
+        }
+        self.submit(
+            agent,
+            request_id,
+            ActorMessage {
+                id: turn,
+                source_sequence: turn,
+                from: self.actor,
+                to: self.actor,
+                kind: Kind::Input,
+                turn: TurnTarget::Exact(turn),
+                priority: 0,
+                payload: text.to_owned(),
+                content_type: aw_agent_kernel::message::ContentType::Text,
+            },
+        )
+    }
+
     pub fn enqueue_bound_text(
         &self,
         agent: &Agent,
@@ -1472,6 +2706,14 @@ impl Service {
             .as_ref()
             .ok_or(Error::Storage("queue lost claim identity"));
         let accepted = receipt.and_then(|receipt| {
+            if fact.request.request_id.starts_with("jc_") {
+                self.store.claim_delegation_continuation(
+                    &self.owner,
+                    &self.session,
+                    &fact.request.request_id,
+                    receipt.turn_id,
+                )?;
+            }
             self.submit_inner(
                 agent,
                 queued_input_request_id(&self.session, &fact.request.request_id),
@@ -1499,6 +2741,81 @@ impl Service {
             state.poisoned = true;
         }
         result.map(Some)
+    }
+
+    /// Unified jobs.cancel for the exact currently active Turn. The request
+    /// identity is stable per original ToolCall; duplicate delivery returns the
+    /// immutable Control fact and never emits a second Runtime cancellation.
+    pub fn jobs_cancel_turn(
+        &self,
+        ctx: &aw_agent_core::ToolContext,
+        canonical_target: &str,
+        target_turn: u64,
+        expected_revision: Option<u64>,
+    ) -> Result<ActorControlFact> {
+        self.verify_jobs_context_identity(ctx)?;
+        if target_turn != ctx.turn_id
+            || canonical_target.is_empty()
+            || canonical_target.len() > 1024
+            || !canonical_target.is_ascii()
+            || canonical_target.chars().any(char::is_control)
+        {
+            return Err(Error::Denied(
+                "jobs_cancel requires this owner's exact active Turn",
+            ));
+        }
+
+        let mut id_hash = Sha256::new();
+        id_hash.update(b"aw-jobs-cancel-turn-v1\0");
+        for part in [
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            ctx.actor.as_str().as_bytes(),
+            &ctx.turn_id.to_be_bytes(),
+            ctx.call_id.as_bytes(),
+        ] {
+            id_hash.update((part.len() as u64).to_be_bytes());
+            id_hash.update(part);
+        }
+        let request_id = format!("jc_{:x}", id_hash.finalize());
+
+        if let Ok(existing) = self.control_fact(&request_id) {
+            if existing.admission.action != ActorControlAction::CancelTurn
+                || existing.admission.turn_id != target_turn
+                || existing.admission.session_id != self.session
+                || existing.admission.branch_id != self.branch
+            {
+                return Err(Error::Denied(
+                    "jobs_cancel replay identity reused with changed semantics",
+                ));
+            }
+            return match existing.state {
+                ActorControlState::Applied | ActorControlState::Rejected => Ok(existing),
+                ActorControlState::Prepared | ActorControlState::Unknown => Err(Error::Conflict(
+                    "jobs_cancel outcome is unresolved; inspect, do not replay",
+                )),
+                ActorControlState::Inspected => Err(Error::Conflict(
+                    "jobs_cancel was inspected after uncertainty and cannot be replayed",
+                )),
+            };
+        }
+
+        self.verify_model_observation(ctx)?;
+        self.require_model_tool_grant("jobs_cancel", &aw_agent_core::ToolEffect::Control)?;
+        let current_revision =
+            self.store
+                .agent_public_revision(&self.owner, &self.session, &self.branch)?;
+        if expected_revision.is_some_and(|revision| revision != current_revision) {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+        let sender = label(self.actor);
+        let message_id = self.store.actor_control_next_message_id(
+            &self.owner,
+            &self.session,
+            self.epoch.get(),
+            &sender,
+        )?;
+        self.control(request_id, ActorControlAction::CancelTurn, message_id)
     }
 
     /// Typed, strictly owner-originated synchronous Control on an already
@@ -1625,6 +2942,33 @@ impl Service {
     where
         F: FnMut(&AgentEvent) -> Result<()> + Send,
     {
+        self.run_once_inner(agent, None, None, on_event).await
+    }
+
+    pub async fn run_once_selected_with_cancel<F>(
+        &self,
+        agent: &mut Agent,
+        selected: &aw_agent_core::ProviderSelection,
+        parent_cancel: aw_agent_core::CancellationToken,
+        on_event: F,
+    ) -> Result<Option<Turn>>
+    where
+        F: FnMut(&AgentEvent) -> Result<()> + Send,
+    {
+        self.run_once_inner(agent, Some(selected), Some(parent_cancel), on_event)
+            .await
+    }
+
+    async fn run_once_inner<F>(
+        &self,
+        agent: &mut Agent,
+        selected: Option<&aw_agent_core::ProviderSelection>,
+        parent_cancel: Option<aw_agent_core::CancellationToken>,
+        on_event: F,
+    ) -> Result<Option<Turn>>
+    where
+        F: FnMut(&AgentEvent) -> Result<()> + Send,
+    {
         let admission = {
             let mut state = self
                 .state
@@ -1641,6 +2985,54 @@ impl Service {
             state.busy = true;
             admission
         };
+        let participant_selected = (|| -> Result<Option<aw_agent_core::ProviderSelection>> {
+            if let Some(participant) = &admission.participant {
+                if selected.is_some() || parent_cancel.is_some() {
+                    return Err(Error::Denied(
+                        "participant Input provider is fixed by its durable admission",
+                    ));
+                }
+                let current_participation = self.store.authorize_session_participation(
+                    &participant.actor,
+                    &self.session,
+                    SessionParticipationAction::Submit,
+                )?;
+                if current_participation.owner
+                    || current_participation.membership_epoch != participant.membership_epoch
+                    || current_participation.audience_epoch != participant.audience_epoch
+                {
+                    return Err(Error::Denied(
+                        "participant Submit/audience authority changed before Turn claim",
+                    ));
+                }
+                let current = agent.provider_accounts().select(
+                    &participant.actor,
+                    &participant.identity.account_id,
+                    &participant.identity.model,
+                )?;
+                current.revalidate()?;
+                if current.identity() != &participant.identity {
+                    return Err(Error::Denied(
+                        "participant provider/account/model authority changed before dispatch",
+                    ));
+                }
+                Ok(Some(current))
+            } else {
+                Ok(None)
+            }
+        })();
+        let participant_selected = match participant_selected {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.state
+                    .lock()
+                    .map_err(|_| Error::Storage("Actor owner state lock poisoned"))?
+                    .busy = false;
+                return Err(error);
+            }
+        };
+        let effective_selected = participant_selected.as_ref().or(selected);
+
         let mut guard = RunGuard {
             state: self.state.clone(),
             finished: false,
@@ -1679,10 +3071,32 @@ impl Service {
             )?;
             Ok(())
         };
-        let result = self
-            .controller
-            .run_once_verified(agent, &proof, on_event)
-            .await;
+        let result = match (effective_selected, parent_cancel) {
+            (Some(selected), Some(parent_cancel)) => {
+                self.controller
+                    .run_once_verified_selected_with_cancel(
+                        agent,
+                        selected,
+                        parent_cancel,
+                        &proof,
+                        on_event,
+                    )
+                    .await
+            }
+            (Some(selected), None) => {
+                self.controller
+                    .run_once_verified_selected(agent, selected, &proof, on_event)
+                    .await
+            }
+            (None, None) => {
+                self.controller
+                    .run_once_verified(agent, &proof, on_event)
+                    .await
+            }
+            (None, Some(_)) => Err(Error::Config(
+                "durable Agent cancellation requires an exact selected provider".into(),
+            )),
+        };
         let turn = match result {
             Ok(Some(turn)) if turn.id == admission.turn_id => turn,
             Ok(_) => {
@@ -1700,6 +3114,21 @@ impl Service {
                 return Err(error);
             }
         };
+        if let Err(error) = self.store.authority_steer_finalize_turn(
+            &self.owner,
+            &self.session,
+            &self.branch,
+            self.epoch.get(),
+            admission.turn_id,
+        ) {
+            let _ = self.store.actor_input_transition(
+                &self.owner,
+                &admission,
+                InputAdmissionState::Dispatching,
+                InputAdmissionState::Unknown,
+            );
+            return Err(error);
+        }
         self.store.actor_input_transition(
             &self.owner,
             &admission,
@@ -1718,18 +3147,419 @@ impl Service {
 mod tests {
     use super::*;
     use aw_agent_core::{
-        AgentOptions, CompletionFuture, CompletionMeta, DeltaSink, Provider, Role, Usage,
+        AccountDescriptor, AgentOptions, CompletionFuture, CompletionMeta, DeltaSink, ModelFuture,
+        ModelReply, Provider, Role, Tool, ToolCall, ToolContext, ToolEffect, ToolFuture,
+        ToolOutput, ToolSpec, Usage,
     };
     use aw_agent_kernel::{
         actor::{ActorState, RuntimeKey},
         envelope::{Access, Budget, EnvelopeSpec, Network},
     };
     use aw_store::{SecretStore, SessionBinding as StoredSessionBinding};
+    use aw_store_api::SessionBackend;
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
+    struct SharedParticipantProvider {
+        calls: Arc<AtomicUsize>,
+        saw_owner_history: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Provider for SharedParticipantProvider {
+        fn stream<'a>(
+            &'a self,
+            messages: &'a [aw_agent_core::Message],
+            model: &'a str,
+            sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(model, "model");
+                assert!(messages
+                    .iter()
+                    .any(|message| message.role == Role::User
+                        && message.content == "bob shared turn"));
+                let saw_owner = messages.iter().any(|message| {
+                    message.role == Role::User && message.content == "alice public turn"
+                }) && messages.iter().any(|message| {
+                    message.role == Role::Assistant && message.content == "exact Agent reply"
+                });
+                self.saw_owner_history.store(saw_owner, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                sink("bob shared answer")?;
+                Ok(CompletionMeta {
+                    finish_reason: "stop".into(),
+                    usage: Usage {
+                        input_tokens: Some(5),
+                        output_tokens: Some(3),
+                    },
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_participant_after_acceptance_cannot_claim_or_pay_and_receipt_remains_factual()
+    {
+        let store = SessionStore::in_memory().unwrap();
+        let alice = PrincipalId::new("local").unwrap();
+        let (session, branch) = store
+            .create(
+                &alice,
+                "Revoked shared input",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let session_id = session.id.clone();
+        let mut f = setup_bound(None, store, session, branch, 2);
+        let bob = PrincipalId::new("internal:fixture:revoked-bob").unwrap();
+        f.store
+            .set_session_participation(
+                &alice,
+                &session_id,
+                &bob,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    submit: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let bob_calls = Arc::new(AtomicUsize::new(0));
+        f.agent
+            .register_provider_account(
+                AccountDescriptor::personal(
+                    "revoked-bob-account",
+                    bob.clone(),
+                    "local",
+                    ["model".into()],
+                ),
+                Arc::new(EchoProvider {
+                    calls: bob_calls.clone(),
+                    wait: None,
+                }),
+            )
+            .unwrap();
+        let selected = f
+            .agent
+            .provider_accounts()
+            .select(&bob, "revoked-bob-account", "model")
+            .unwrap();
+
+        let accepted = f
+            .owner
+            .submit_participant_text(&f.agent, &bob, &selected, "accepted then revoked")
+            .unwrap();
+        assert_eq!(accepted.state, InputAdmissionState::Accepted);
+        let request_id = accepted.admission.request_id.clone();
+
+        f.store
+            .revoke_session_participation(&alice, &session_id, &bob)
+            .unwrap();
+
+        assert!(f.owner.run_once(&mut f.agent, |_| Ok(())).await.is_err());
+        assert_eq!(
+            bob_calls.load(Ordering::SeqCst),
+            0,
+            "revocation after inbox acceptance must fence before paid provider dispatch"
+        );
+        let factual = f.owner.fact(&request_id).unwrap();
+        assert_eq!(
+            factual.state,
+            InputAdmissionState::Accepted,
+            "revocation must not rewrite the original factual acceptance receipt"
+        );
+        {
+            let state = f.owner.state.lock().unwrap();
+            assert!(!state.busy);
+            assert!(
+                !state.poisoned,
+                "expected current-authority denial before Runtime claim is not an uncertain effect"
+            );
+        }
+
+        // Re-granting creates a new membership/audience epoch. The old accepted
+        // receipt still cannot be claimed under that later authority.
+        f.store
+            .set_session_participation(
+                &alice,
+                &session_id,
+                &bob,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    submit: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(f.owner.run_once(&mut f.agent, |_| Ok(())).await.is_err());
+        assert_eq!(bob_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.owner.fact(&request_id).unwrap().state,
+            InputAdmissionState::Accepted
+        );
+    }
+
+    struct OwnerOnlyTool;
+    impl Tool for OwnerOnlyTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "owner_only".into(),
+                description: "owner-only fixture".into(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "additionalProperties":false
+                }),
+                effect: ToolEffect::Read,
+            }
+        }
+
+        fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+            if arguments.as_object().is_some_and(serde_json::Map::is_empty) {
+                Ok(())
+            } else {
+                Err(Error::Denied("owner-only fixture args"))
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: ToolContext,
+            _arguments: &'a serde_json::Value,
+        ) -> ToolFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::text("owner-only")) })
+        }
+    }
+
+    struct ParticipantPhaseTool {
+        calls: Arc<AtomicUsize>,
+        actors: Arc<Mutex<Vec<PrincipalId>>>,
+    }
+    impl Tool for ParticipantPhaseTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "phase_tool".into(),
+                description: "shared-control phase fixture".into(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "additionalProperties":false
+                }),
+                effect: ToolEffect::Read,
+            }
+        }
+        fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+            if arguments.as_object().is_some_and(serde_json::Map::is_empty) {
+                Ok(())
+            } else {
+                Err(Error::Denied("phase fixture requires empty object"))
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            ctx: ToolContext,
+            _arguments: &'a serde_json::Value,
+        ) -> ToolFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.actors.lock().unwrap().push(ctx.actor);
+            Box::pin(async { Ok(ToolOutput::text("phase tool factual receipt")) })
+        }
+    }
+
+    struct AliceControlProvider {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl Provider for AliceControlProvider {
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn stream<'a>(
+            &'a self,
+            _: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("Alice control fixture requires tool path")) })
+        }
+        fn stream_tools<'a>(
+            &'a self,
+            history: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a [ToolSpec],
+            _: &'a mut DeltaSink<'_>,
+        ) -> ModelFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call != 0
+                    || history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == Role::User)
+                        .is_none_or(|message| message.content != "alice start")
+                {
+                    return Err(Error::Protocol("unexpected Alice shared-control round"));
+                }
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(ModelReply {
+                    meta: CompletionMeta {
+                        finish_reason: "tool_calls".into(),
+                        usage: Usage {
+                            input_tokens: Some(2),
+                            output_tokens: Some(1),
+                        },
+                    },
+                    tool_calls: vec![ToolCall {
+                        id: "alice-superseded-tool".into(),
+                        name: "phase_tool".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    struct BobControlProvider {
+        calls: Arc<AtomicUsize>,
+        second_entered: Arc<tokio::sync::Notify>,
+        second_release: Arc<tokio::sync::Notify>,
+    }
+    impl Provider for BobControlProvider {
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn stream<'a>(
+            &'a self,
+            _: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("Bob control fixture requires tool path")) })
+        }
+        fn stream_tools<'a>(
+            &'a self,
+            history: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a [ToolSpec],
+            _: &'a mut DeltaSink<'_>,
+        ) -> ModelFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                let latest_user = history
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::User)
+                    .ok_or(Error::Protocol("Bob control fixture user message missing"))?;
+                if latest_user.content != "bob steer" {
+                    return Err(Error::Protocol("Bob control segment text changed"));
+                }
+                match call {
+                    0 => Ok(ModelReply {
+                        meta: CompletionMeta {
+                            finish_reason: "tool_calls".into(),
+                            usage: Usage {
+                                input_tokens: Some(3),
+                                output_tokens: Some(1),
+                            },
+                        },
+                        tool_calls: vec![ToolCall {
+                            id: "bob-factual-tool".into(),
+                            name: "phase_tool".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        ..Default::default()
+                    }),
+                    1 => {
+                        if !history.iter().any(|message| {
+                            message.role == Role::Tool
+                                && message.tool_call_id.as_deref() == Some("bob-factual-tool")
+                        }) {
+                            return Err(Error::Protocol(
+                                "Bob second Step must causally follow his factual tool receipt",
+                            ));
+                        }
+                        self.second_entered.notify_one();
+                        self.second_release.notified().await;
+                        Ok(ModelReply {
+                            meta: CompletionMeta {
+                                finish_reason: "tool_calls".into(),
+                                usage: Usage {
+                                    input_tokens: Some(4),
+                                    output_tokens: Some(1),
+                                },
+                            },
+                            tool_calls: vec![ToolCall {
+                                id: "bob-superseded-tool".into(),
+                                name: "phase_tool".into(),
+                                arguments: serde_json::json!({}),
+                            }],
+                            ..Default::default()
+                        })
+                    }
+                    _ => Err(Error::Protocol("unexpected extra Bob shared-control round")),
+                }
+            })
+        }
+    }
+
+    struct CarolControlProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    impl Provider for CarolControlProvider {
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn stream<'a>(
+            &'a self,
+            _: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("Carol control fixture requires tool path")) })
+        }
+        fn stream_tools<'a>(
+            &'a self,
+            history: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a [ToolSpec],
+            sink: &'a mut DeltaSink<'_>,
+        ) -> ModelFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call != 0
+                    || history
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == Role::User)
+                        .is_none_or(|message| message.content != "carol steer")
+                {
+                    return Err(Error::Protocol("unexpected Carol shared-control round"));
+                }
+                sink("carol final")?;
+                Ok(ModelReply {
+                    meta: CompletionMeta {
+                        finish_reason: "stop".into(),
+                        usage: Usage {
+                            input_tokens: Some(3),
+                            output_tokens: Some(2),
+                        },
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
     struct EchoProvider {
         calls: Arc<AtomicUsize>,
         wait: Option<Arc<tokio::sync::Notify>>,
@@ -1832,6 +3662,25 @@ mod tests {
         agent
             .load_history(view.history, Some(Arc::new(journal)))
             .unwrap();
+        let execution = store
+            .agent_binding(&principal, &session.id, &branch.id)
+            .unwrap();
+        agent
+            .bind_execution_owner(
+                aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                    format!(
+                        "/d:{}/i:{}/p:{}/a:{}",
+                        execution.domain_handle,
+                        execution.identity_handle,
+                        execution.project_handle,
+                        execution.agent_handle,
+                    ),
+                    execution.session_id,
+                    execution.branch_id,
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let epoch = NonZeroU64::new(
             store
                 .workspace_writer(&principal, None, &session.workspace_id)
@@ -1916,6 +3765,656 @@ mod tests {
             content_type: aw_agent_kernel::message::ContentType::Text,
         }
     }
+
+    #[tokio::test]
+    async fn participant_control_rejects_after_private_source_release_is_revoked_before_provider() {
+        let store = SessionStore::in_memory().unwrap();
+        let alice = PrincipalId::new("local").unwrap();
+        let bob = PrincipalId::new("internal:fixture:disclosure-bob").unwrap();
+
+        let (source_session, source_branch) = store
+            .create(
+                &alice,
+                "Private source",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let mut source = setup_bound(
+            None,
+            store.clone(),
+            source_session.clone(),
+            source_branch,
+            21,
+        );
+        source
+            .owner
+            .submit(
+                &source.agent,
+                "private-source-input",
+                input(&source.owner, 1, 1, "private source fact"),
+            )
+            .unwrap();
+        source
+            .owner
+            .run_once(&mut source.agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        let source_branch = store
+            .branches(&alice, &source_session.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let (target_session, target_branch) = store
+            .create(
+                &alice,
+                "Shared target",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+
+        let plan = store
+            .context_prepare(
+                &alice,
+                aw_store::PrepareContext {
+                    target: aw_store::TargetHead::from(&target_branch),
+                    sources: vec![aw_store::SourceSelection {
+                        session_id: source_session.id.clone(),
+                        branch: source_branch.id.clone(),
+                        head: None,
+                        selection: aw_store::Selection::Standalone,
+                    }],
+                    kind: aw_store::PlanKind::Import,
+                    focus: "vetted private source".into(),
+                    max_input_bytes: 512 * 1024,
+                    max_output_bytes: 32 * 1024,
+                    timeout_seconds: 10,
+                },
+            )
+            .unwrap();
+        let artifact = store
+            .context_manual(
+                &alice,
+                &plan.id,
+                "private-source-artifact",
+                "authorized source observation",
+                None,
+            )
+            .unwrap();
+        let applied = store
+            .context_apply(
+                &alice,
+                aw_store::ApplyContext {
+                    artifact_id: artifact.id,
+                    target: aw_store::TargetHead::from(&target_branch),
+                    mode: aw_store::ApplyMode::Append,
+                    request_id: "private-source-apply".into(),
+                    confirmed_disclosure: true,
+                },
+            )
+            .unwrap();
+
+        store
+            .context_grant_read(
+                &alice,
+                &source_session.id,
+                &bob,
+                true,
+                vec!["bob-disclosure-account".into()],
+            )
+            .unwrap();
+        store
+            .set_session_participation(
+                &alice,
+                &target_session.id,
+                &bob,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    control: true,
+                    submit: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut target = setup_bound(
+            None,
+            store.clone(),
+            target_session.clone(),
+            applied.branch,
+            22,
+        );
+        let bob_calls = Arc::new(AtomicUsize::new(0));
+        target
+            .agent
+            .register_provider_account(
+                AccountDescriptor::personal(
+                    "bob-disclosure-account",
+                    bob.clone(),
+                    "local",
+                    ["model".into()],
+                ),
+                Arc::new(EchoProvider {
+                    calls: bob_calls.clone(),
+                    wait: None,
+                }),
+            )
+            .unwrap();
+        let selected = target
+            .agent
+            .provider_accounts()
+            .select(&bob, "bob-disclosure-account", "model")
+            .unwrap();
+
+        store
+            .context_grant_read(&alice, &source_session.id, &bob, false, vec![])
+            .unwrap();
+
+        assert!(
+            target
+                .owner
+                .prepare_participant_control(
+                    &target.agent,
+                    &bob,
+                    &selected,
+                    1,
+                    "unsafe-bob-control",
+                )
+                .is_err(),
+            "cross-user Control must stop before provider dispatch when required source context is no longer disclosable"
+        );
+        assert_eq!(
+            bob_calls.load(Ordering::SeqCst),
+            0,
+            "unsafe disclosure must reject before any Bob provider call"
+        );
+        assert!(store
+            .authority_steer_fact(&alice, &target_session.id, "unsafe-bob-control")
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn participant_control_segments_persist_across_steps_and_change_actor_on_later_steer() {
+        let temp = PrivateTemp::new();
+        let store = SessionStore::open(&temp.0).unwrap();
+        let alice = PrincipalId::new("local").unwrap();
+        let (session, branch) = store
+            .create(
+                &alice,
+                "Shared Control Agent",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let session_id = session.id.clone();
+
+        let alice_calls = Arc::new(AtomicUsize::new(0));
+        let alice_entered = Arc::new(tokio::sync::Notify::new());
+        let alice_release = Arc::new(tokio::sync::Notify::new());
+        let bob_calls = Arc::new(AtomicUsize::new(0));
+        let bob_second_entered = Arc::new(tokio::sync::Notify::new());
+        let bob_second_release = Arc::new(tokio::sync::Notify::new());
+        let carol_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut f = setup_bound_with_tools(
+            None,
+            store,
+            session,
+            branch,
+            12,
+            vec![aw_agent_kernel::envelope::ExactGrant {
+                name: "phase_tool".into(),
+                kind: aw_agent_kernel::capability::SourceKind::Host,
+                source: "trusted-host".into(),
+                source_epoch: 1,
+                effect: aw_agent_kernel::capability::Effect::Read,
+            }],
+            Some(Arc::new(AliceControlProvider {
+                calls: alice_calls.clone(),
+                entered: alice_entered.clone(),
+                release: alice_release.clone(),
+            })),
+        );
+
+        let bob = PrincipalId::new("internal:fixture:control-bob").unwrap();
+        let carol = PrincipalId::new("internal:fixture:control-carol").unwrap();
+        for participant in [&bob, &carol] {
+            let granted = f
+                .store
+                .set_session_participation(
+                    &alice,
+                    &session_id,
+                    participant,
+                    aw_store::SessionParticipationPermissions {
+                        view: true,
+                        control: true,
+                        submit: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert!(granted.permissions.control);
+            assert!(
+                !granted.permissions.submit,
+                "Control must remain independent from Submit"
+            );
+        }
+
+        let phase_calls = Arc::new(AtomicUsize::new(0));
+        let phase_actors = Arc::new(Mutex::new(Vec::new()));
+        f.agent
+            .register_host_tool(Arc::new(ParticipantPhaseTool {
+                calls: phase_calls.clone(),
+                actors: phase_actors.clone(),
+            }))
+            .unwrap();
+        f.agent
+            .permit_registered_host_tool(bob.clone(), "phase_tool")
+            .unwrap();
+        f.agent
+            .permit_registered_host_tool(carol.clone(), "phase_tool")
+            .unwrap();
+
+        f.agent
+            .register_provider_account(
+                AccountDescriptor::personal(
+                    "control-bob-account",
+                    bob.clone(),
+                    "local",
+                    ["model".into()],
+                ),
+                Arc::new(BobControlProvider {
+                    calls: bob_calls.clone(),
+                    second_entered: bob_second_entered.clone(),
+                    second_release: bob_second_release.clone(),
+                }),
+            )
+            .unwrap();
+        f.agent
+            .register_provider_account(
+                AccountDescriptor::personal(
+                    "control-carol-account",
+                    carol.clone(),
+                    "local",
+                    ["model".into()],
+                ),
+                Arc::new(CarolControlProvider {
+                    calls: carol_calls.clone(),
+                }),
+            )
+            .unwrap();
+
+        let accounts = f.agent.provider_accounts();
+        let bob_selected = accounts
+            .select(&bob, "control-bob-account", "model")
+            .unwrap();
+        let carol_selected = accounts
+            .select(&carol, "control-carol-account", "model")
+            .unwrap();
+        let live_control = f.owner.participant_control_authority(&f.agent).unwrap();
+        let canonical_turn = format!(
+            "{}/t:1",
+            f.agent
+                .execution_binding()
+                .expect("shared Control fixture Agent binding")
+                .canonical_ref()
+        );
+
+        f.owner
+            .submit(
+                &f.agent,
+                "shared-control-owner-input",
+                input(&f.owner, 1, 1, "alice start"),
+            )
+            .unwrap();
+
+        let store = f.store.clone();
+        let owner = f.owner.clone();
+        let running_owner = owner.clone();
+        let mut agent = f.agent;
+        let task =
+            tokio::spawn(async move { running_owner.run_once(&mut agent, |_| Ok(())).await });
+
+        tokio::time::timeout(Duration::from_secs(3), alice_entered.notified())
+            .await
+            .unwrap();
+        let bob_evidence = owner
+            .prepare_participant_control_live(
+                &live_control,
+                &bob,
+                &bob_selected,
+                1,
+                "bob-control-1",
+            )
+            .unwrap();
+        let bob_accepted = owner
+            .submit_participant_control(
+                bob_evidence,
+                aw_agent_core::AuthorityBoundaryKind::Steer,
+                1,
+                "bob-control-1",
+                &canonical_turn,
+                "bob steer",
+            )
+            .unwrap();
+        assert_eq!(bob_accepted.state, AuthoritySteerState::Accepted);
+        assert_eq!(bob_accepted.segment_ordinal, Some(2));
+        assert_eq!(
+            bob_accepted
+                .request
+                .participant
+                .as_ref()
+                .expect("Bob Control participant evidence")
+                .actor,
+            bob
+        );
+        alice_release.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(3), bob_second_entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            phase_calls.load(Ordering::SeqCst),
+            1,
+            "Bob's first tool effect must factually settle before Carol redirects"
+        );
+        assert_eq!(phase_actors.lock().unwrap().as_slice(), &[bob.clone()]);
+
+        let carol_evidence = owner
+            .prepare_participant_control_live(
+                &live_control,
+                &carol,
+                &carol_selected,
+                1,
+                "carol-control-1",
+            )
+            .unwrap();
+        let carol_accepted = owner
+            .submit_participant_control(
+                carol_evidence,
+                aw_agent_core::AuthorityBoundaryKind::Steer,
+                1,
+                "carol-control-1",
+                &canonical_turn,
+                "carol steer",
+            )
+            .unwrap();
+        assert_eq!(carol_accepted.state, AuthoritySteerState::Accepted);
+        assert_eq!(carol_accepted.segment_ordinal, Some(3));
+        assert_eq!(
+            carol_accepted
+                .request
+                .participant
+                .as_ref()
+                .expect("Carol Control participant evidence")
+                .actor,
+            carol
+        );
+        bob_second_release.notify_waiters();
+
+        let turn = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.outcome, aw_agent_core::Outcome::Completed);
+        assert_eq!(turn.answer, "carol final");
+        assert_eq!(alice_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bob_calls.load(Ordering::SeqCst),
+            2,
+            "Bob AuthoritySegment must persist across tool receipt into the next model Step"
+        );
+        assert_eq!(carol_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            phase_calls.load(Ordering::SeqCst),
+            1,
+            "Alice and Bob's superseded unstarted proposals must never execute"
+        );
+
+        let actors = turn
+            .invocations
+            .iter()
+            .map(|invocation| invocation.identity.actor.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actors,
+            vec![alice.clone(), bob.clone(), bob.clone(), carol.clone()]
+        );
+        assert!(turn.tool_records.iter().any(|record| {
+            record.call.id == "bob-factual-tool"
+                && record.status == aw_agent_core::ToolStatus::Succeeded
+        }));
+        assert!(turn.tool_records.iter().any(|record| {
+            record.call.id == "alice-superseded-tool"
+                && record.status == aw_agent_core::ToolStatus::Denied
+        }));
+        assert!(turn.tool_records.iter().any(|record| {
+            record.call.id == "bob-superseded-tool"
+                && record.status == aw_agent_core::ToolStatus::Denied
+        }));
+
+        let bob_applied = store
+            .authority_steer_fact(&alice, &session_id, "bob-control-1")
+            .unwrap();
+        let carol_applied = store
+            .authority_steer_fact(&alice, &session_id, "carol-control-1")
+            .unwrap();
+        assert_eq!(bob_applied.state, AuthoritySteerState::Applied);
+        assert_eq!(carol_applied.state, AuthoritySteerState::Applied);
+        assert_eq!(bob_applied.segment_ordinal, Some(2));
+        assert_eq!(carol_applied.segment_ordinal, Some(3));
+    }
+
+    #[tokio::test]
+    async fn shared_session_submit_keeps_one_agent_branch_and_uses_participant_provider_authority()
+    {
+        let store = SessionStore::in_memory().unwrap();
+        let alice = PrincipalId::new("local").unwrap();
+        let (session, branch) = store
+            .create(
+                &alice,
+                "Shared Agent",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let session_id = session.id.clone();
+        let branch_id = branch.id.clone();
+        let mut f = setup_bound_with_tools(
+            None,
+            store,
+            session,
+            branch,
+            2,
+            vec![aw_agent_kernel::envelope::ExactGrant {
+                name: "owner_only".into(),
+                kind: aw_agent_kernel::capability::SourceKind::Host,
+                source: "trusted-host".into(),
+                source_epoch: 1,
+                effect: aw_agent_kernel::capability::Effect::Read,
+            }],
+            None,
+        );
+        let canonical_before = f
+            .agent
+            .execution_binding()
+            .unwrap()
+            .canonical_ref()
+            .to_owned();
+
+        f.owner
+            .submit_bound_text(&f.agent, "alice public turn")
+            .unwrap();
+        let alice_turn = f
+            .owner
+            .run_once(&mut f.agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice_turn.id, 1);
+        assert_eq!(alice_turn.answer, "exact Agent reply");
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+
+        f.agent.register_host_tool(Arc::new(OwnerOnlyTool)).unwrap();
+        assert!(f.agent.permitted_tool_binding(&alice, "owner_only").is_ok());
+
+        let bob = PrincipalId::new("internal:fixture:shared-bob").unwrap();
+        let grant = f
+            .store
+            .set_session_participation(
+                &alice,
+                &session_id,
+                &bob,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    submit: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!grant.owner);
+        assert!(grant.permissions.view && grant.permissions.submit);
+        assert!(!grant.permissions.control);
+
+        let shared = f.store.session(&bob, &session_id).unwrap();
+        assert_eq!(
+            shared.owner, alice,
+            "sharing must not change the Session resource owner"
+        );
+        let bob_binding = f
+            .store
+            .agent_binding(&bob, &session_id, &branch_id)
+            .unwrap();
+        assert_eq!(
+            format!(
+                "/d:{}/i:{}/p:{}/a:{}",
+                bob_binding.domain_handle,
+                bob_binding.identity_handle,
+                bob_binding.project_handle,
+                bob_binding.agent_handle
+            ),
+            canonical_before,
+            "participant sees the same resource-owned Agent identity"
+        );
+
+        let bob_calls = Arc::new(AtomicUsize::new(0));
+        let saw_owner_history = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        f.agent
+            .register_provider_account(
+                AccountDescriptor::personal("bob-account", bob.clone(), "local", ["model".into()]),
+                Arc::new(SharedParticipantProvider {
+                    calls: bob_calls.clone(),
+                    saw_owner_history: saw_owner_history.clone(),
+                }),
+            )
+            .unwrap();
+        let selected = f
+            .agent
+            .provider_accounts()
+            .select(&bob, "bob-account", "model")
+            .unwrap();
+        assert!(f.agent.permitted_tool_binding(&bob, "owner_only").is_err());
+
+        let accepted = f
+            .owner
+            .submit_participant_text(&f.agent, &bob, &selected, "bob shared turn")
+            .unwrap();
+        assert_eq!(accepted.state, InputAdmissionState::Accepted);
+        let participant = accepted
+            .admission
+            .participant
+            .as_ref()
+            .expect("shared Input must persist participant authority");
+        assert_eq!(participant.actor, bob);
+        assert_eq!(participant.identity, *selected.identity());
+        assert_eq!(participant.membership_epoch, grant.membership_epoch);
+        assert_eq!(participant.audience_epoch, grant.audience_epoch);
+        assert!(participant
+            .disclosure_projection_ref
+            .starts_with("full-session:"));
+
+        let bob_turn = f
+            .owner
+            .run_once(&mut f.agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bob_turn.id, 2);
+        assert_eq!(bob_turn.prompt, "bob shared turn");
+        assert_eq!(
+            bob_turn.outcome,
+            crate::conversation::Outcome::Completed,
+            "participant Turn error={:?} owner_calls={} bob_calls={}",
+            bob_turn.error,
+            f.calls.load(Ordering::SeqCst),
+            bob_calls.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            bob_turn.answer,
+            "bob shared answer",
+            "participant Turn error={:?} owner_calls={} bob_calls={}",
+            bob_turn.error,
+            f.calls.load(Ordering::SeqCst),
+            bob_calls.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            1,
+            "Bob's Turn must not fall back to Alice's provider/payer"
+        );
+        assert_eq!(bob_calls.load(Ordering::SeqCst), 1);
+        assert!(saw_owner_history.load(Ordering::SeqCst));
+
+        assert_eq!(
+            f.agent.execution_binding().unwrap().canonical_ref(),
+            canonical_before,
+            "participant Submit must not rebind the Agent"
+        );
+        let branches = f.store.branches(&bob, &session_id).unwrap();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].id, branch_id);
+        assert!(branches[0].active_run.is_none());
+        let history = f
+            .store
+            .open(&bob, &session_id, &branch_id)
+            .unwrap()
+            .view()
+            .unwrap()
+            .history;
+        assert_eq!(history.turns.len(), 2);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn aw_p6_9b2b_child_notify_uses_original_runtime_and_persistent_private_receipts() {
@@ -2359,6 +4858,7 @@ mod tests {
             message_id: 5,
             payload_sha256: "f".repeat(64),
             priority: 0,
+            participant: None,
         };
         assert!(matches!(
             f.store.actor_input_prepare(&f.owner.owner,forged),
@@ -4491,6 +6991,46 @@ mod tests {
             effect: aw_agent_kernel::capability::Effect::Write,
         }
     }
+
+    fn steer_request_control_grant() -> aw_agent_kernel::envelope::ExactGrant {
+        aw_agent_kernel::envelope::ExactGrant {
+            name: "steer_request".into(),
+            kind: aw_agent_kernel::capability::SourceKind::Host,
+            source: "trusted-host".into(),
+            source_epoch: 1,
+            effect: aw_agent_kernel::capability::Effect::Control,
+        }
+    }
+
+    fn interrupt_request_control_grant() -> aw_agent_kernel::envelope::ExactGrant {
+        aw_agent_kernel::envelope::ExactGrant {
+            name: "interrupt_request".into(),
+            kind: aw_agent_kernel::capability::SourceKind::Host,
+            source: "trusted-host".into(),
+            source_epoch: 1,
+            effect: aw_agent_kernel::capability::Effect::Control,
+        }
+    }
+
+    fn jobs_cancel_control_grant() -> aw_agent_kernel::envelope::ExactGrant {
+        aw_agent_kernel::envelope::ExactGrant {
+            name: "jobs_cancel".into(),
+            kind: aw_agent_kernel::capability::SourceKind::Host,
+            source: "trusted-host".into(),
+            source_epoch: 1,
+            effect: aw_agent_kernel::capability::Effect::Control,
+        }
+    }
+
+    fn jobs_send_control_grant() -> aw_agent_kernel::envelope::ExactGrant {
+        aw_agent_kernel::envelope::ExactGrant {
+            name: "jobs_send".into(),
+            kind: aw_agent_kernel::capability::SourceKind::Host,
+            source: "trusted-host".into(),
+            source_epoch: 1,
+            effect: aw_agent_kernel::capability::Effect::Control,
+        }
+    }
     #[test]
     fn aw_p6_9d2a_model_enqueue_requires_exact_write_not_read_or_source_name() {
         let mut plain = setup(None);
@@ -5038,6 +7578,8 @@ mod tests {
             result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: f.agent.default_identity().unwrap(),
             scope: f.agent.journal_scope().unwrap(),
+            execution_owner: None,
+            execution_scope: None,
         };
         assert!(
             f.owner.verify_model_observation(&context).is_err(),
@@ -5057,6 +7599,606 @@ mod tests {
             f.agent.tool_specs().is_empty(),
             "retired original Actor generation cannot advertise cached management Tools"
         );
+    }
+
+    struct DurableSteerProvider {
+        calls: Arc<AtomicUsize>,
+        request_tool: &'static str,
+    }
+    impl Provider for DurableSteerProvider {
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn stream<'a>(
+            &'a self,
+            _: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("durable steer fixture requires tool path")) })
+        }
+        fn stream_tools<'a>(
+            &'a self,
+            history: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a [ToolSpec],
+            sink: &'a mut DeltaSink<'_>,
+        ) -> ModelFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return Ok(ModelReply {
+                        meta: CompletionMeta {
+                            finish_reason: "tool_calls".into(),
+                            usage: Usage {
+                                input_tokens: Some(3),
+                                output_tokens: Some(2),
+                            },
+                        },
+                        tool_calls: vec![ToolCall {
+                            id: "authority-update-call-1".into(),
+                            name: self.request_tool.into(),
+                            arguments: serde_json::json!({"text":"replace"}),
+                        }],
+                        ..Default::default()
+                    });
+                }
+                let steering = history
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::User)
+                    .ok_or(Error::Protocol("same-Turn steer user message missing"))?;
+                if steering.content != "replace" {
+                    return Err(Error::Protocol("same-Turn steer text changed"));
+                }
+                sink(&steering.content)?;
+                Ok(ModelReply {
+                    meta: CompletionMeta {
+                        finish_reason: "stop".into(),
+                        usage: Usage {
+                            input_tokens: Some(4),
+                            output_tokens: Some(1),
+                        },
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    struct AuthorityUpdateRequestTool {
+        owner: Service,
+        accepted: Arc<Mutex<Option<AuthoritySteerFact>>>,
+        boundary: aw_agent_core::AuthorityBoundaryKind,
+    }
+    impl AuthorityUpdateRequestTool {
+        fn name(&self) -> &'static str {
+            match self.boundary {
+                aw_agent_core::AuthorityBoundaryKind::Steer => "steer_request",
+                aw_agent_core::AuthorityBoundaryKind::Interrupt => "interrupt_request",
+                aw_agent_core::AuthorityBoundaryKind::Input => "invalid_input_request",
+            }
+        }
+    }
+    impl Tool for AuthorityUpdateRequestTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().into(),
+                description: "test-only same-Turn authority update request".into(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"text":{"type":"string"}},
+                    "required":["text"],
+                    "additionalProperties":false
+                }),
+                effect: ToolEffect::Control,
+            }
+        }
+        fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+            if self.boundary == aw_agent_core::AuthorityBoundaryKind::Input {
+                return Err(Error::Denied("Input is not a same-Turn update"));
+            }
+            let object = arguments
+                .as_object()
+                .ok_or(Error::Denied("authority-update fixture needs object"))?;
+            if object.len() != 1
+                || object
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|text| text != "replace")
+            {
+                return Err(Error::Denied("invalid authority-update fixture text"));
+            }
+            Ok(())
+        }
+        fn execute<'a>(
+            &'a self,
+            ctx: ToolContext,
+            arguments: &'a serde_json::Value,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                let text = arguments
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Denied("authority-update fixture text missing"))?;
+                let owner = ctx.execution_owner.as_ref().ok_or(Error::Denied(
+                    "authority-update fixture Agent owner missing",
+                ))?;
+                let target = format!("{}/t:{}", owner.canonical_ref(), ctx.turn_id);
+                let fact = match self.boundary {
+                    aw_agent_core::AuthorityBoundaryKind::Steer => {
+                        self.owner.jobs_steer_text(&ctx, &target, None, text)?
+                    }
+                    aw_agent_core::AuthorityBoundaryKind::Interrupt => {
+                        self.owner.jobs_interrupt_text(&ctx, &target, None, text)?
+                    }
+                    aw_agent_core::AuthorityBoundaryKind::Input => {
+                        return Err(Error::Denied("Input is not a same-Turn update"))
+                    }
+                };
+                *self.accepted.lock().map_err(|_| {
+                    Error::Storage("authority-update fixture receipt lock poisoned")
+                })? = Some(fact.clone());
+                Ok(ToolOutput::text(format!(
+                    "accepted {}={} segment={}",
+                    self.name(),
+                    fact.request.request_id,
+                    fact.segment_ordinal.unwrap_or(0)
+                )))
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_send_agent_queue_is_replay_safe_and_revision_fenced() {
+        let temp = PrivateTemp::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let principal = PrincipalId::new("local").unwrap();
+        let store = SessionStore::open(&temp.0).unwrap();
+        let (session, branch) = store
+            .create(
+                &principal,
+                "jobs send queue fixture",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let fixture = setup_bound_with_tools(
+            Some(started.clone()),
+            store,
+            session,
+            branch,
+            7,
+            vec![jobs_send_control_grant()],
+            None,
+        );
+        let owner = fixture.owner.clone();
+        let store = fixture.store.clone();
+        let canonical = fixture
+            .agent
+            .execution_binding()
+            .unwrap()
+            .canonical_ref()
+            .to_owned();
+        owner
+            .submit(
+                &fixture.agent,
+                "jobs_send_source",
+                input(&owner, 1, 1, "run while queueing continuation"),
+            )
+            .unwrap();
+
+        let mut context = aw_agent_core::ToolContext {
+            actor: owner.owner.clone(),
+            turn_id: 1,
+            call_id: "jobs-send-1".into(),
+            source: aw_agent_core::ToolSource::trusted_host(),
+            effect: aw_agent_core::ToolEffect::Control,
+            execution_site: "local".into(),
+            cancellation: aw_agent_core::CancellationToken::new(),
+            result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+            identity: fixture.agent.default_identity().unwrap(),
+            scope: fixture.agent.journal_scope().unwrap(),
+            execution_owner: fixture.agent.execution_binding().cloned(),
+            execution_scope: None,
+        };
+
+        let mut agent = fixture.agent;
+        let running = owner.clone();
+        let task = tokio::spawn(async move { running.run_once(&mut agent, |_| Ok(())).await });
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        let before = store
+            .agent_public_revision(&owner.owner, &owner.session, &owner.branch)
+            .unwrap();
+
+        let first = owner
+            .jobs_queue_text(&context, &canonical, Some(before), "continue once")
+            .unwrap();
+        assert!(first.request_id.starts_with("jq_"));
+        assert_eq!(first.state, aw_store::QueueState::Pending);
+        let duplicate = owner
+            .jobs_queue_text(&context, &canonical, Some(before), "continue once")
+            .unwrap();
+        assert_eq!(duplicate.request_id, first.request_id);
+        assert_eq!(owner.queue_list().unwrap().len(), 1);
+
+        assert!(owner
+            .jobs_queue_text(&context, &canonical, Some(before), "changed replay body")
+            .is_err());
+        context.call_id = "jobs-send-2".into();
+        assert!(matches!(
+            owner.jobs_queue_text(&context, &canonical, Some(before), "second request"),
+            Err(Error::Conflict("stale Agent revision"))
+        ));
+        assert_eq!(owner.queue_list().unwrap().len(), 1);
+        let public = serde_json::to_string(&owner.queue_list().unwrap()).unwrap();
+        assert!(!public.contains("continue once"));
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn jobs_cancel_turn_is_revision_fenced_and_replay_recovers_after_settlement() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let principal = PrincipalId::new("local").unwrap();
+        let store = SessionStore::in_memory().unwrap();
+        let (session, branch) = store
+            .create(
+                &principal,
+                "jobs cancel fixture",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let fixture = setup_bound_with_tools(
+            Some(entered.clone()),
+            store,
+            session,
+            branch,
+            9,
+            vec![jobs_cancel_control_grant()],
+            None,
+        );
+        fixture
+            .owner
+            .submit(
+                &fixture.agent,
+                "jobs_cancel_source",
+                input(&fixture.owner, 1, 1, "cancel this exact turn"),
+            )
+            .unwrap();
+
+        let owner = fixture.owner.clone();
+        let mut agent = fixture.agent;
+        let identity = agent.default_identity().unwrap();
+        let scope = agent.journal_scope().unwrap();
+        let execution_owner = agent.execution_binding().cloned();
+        let canonical = format!("{}/t:1", execution_owner.as_ref().unwrap().canonical_ref());
+        let context = aw_agent_core::ToolContext {
+            actor: owner.owner.clone(),
+            turn_id: 1,
+            call_id: "jobs-cancel-call-1".into(),
+            source: aw_agent_core::ToolSource::trusted_host(),
+            effect: aw_agent_core::ToolEffect::Control,
+            execution_site: "local".into(),
+            cancellation: aw_agent_core::CancellationToken::new(),
+            result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+            identity,
+            scope,
+            execution_owner,
+            execution_scope: None,
+        };
+
+        let running = owner.clone();
+        let task = tokio::spawn(async move { running.run_once(&mut agent, |_| Ok(())).await });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        let revision = owner
+            .store
+            .agent_public_revision(&owner.owner, &owner.session, &owner.branch)
+            .unwrap();
+
+        let cancelled = owner
+            .jobs_cancel_turn(&context, &canonical, 1, Some(revision))
+            .unwrap();
+        assert_eq!(cancelled.state, ActorControlState::Applied);
+        assert_eq!(cancelled.admission.action, ActorControlAction::CancelTurn);
+        assert_eq!(cancelled.admission.turn_id, 1);
+
+        let router =
+            crate::agent_jobs::Router::new(owner.store.clone(), owner.owner.clone(), 8).unwrap();
+        let mut observe = context.clone();
+        observe.effect = aw_agent_core::ToolEffect::Read;
+        let projected = aw_tools_adapter::agent_jobs::AgentJobRouter::get(
+            &router,
+            &observe,
+            aw_tools_adapter::agent_jobs::AgentJobGet {
+                reference: canonical.clone(),
+                revision: None,
+                wait_ms: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            projected.content.contains(" turn cancelling "),
+            "applied cancel must project public Turn cancelling before settlement: {}",
+            projected.content
+        );
+        assert!(!projected.content.contains("blocked"));
+
+        let turn = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.id, 1);
+        assert_eq!(turn.outcome, aw_agent_core::Outcome::Cancelled);
+
+        let duplicate = owner
+            .jobs_cancel_turn(&context, &canonical, 1, Some(revision))
+            .unwrap();
+        assert_eq!(duplicate, cancelled);
+        assert_eq!(owner.controls().unwrap().len(), 1);
+
+        let mut changed = context.clone();
+        changed.call_id = "jobs-cancel-call-2".into();
+        assert!(owner
+            .jobs_cancel_turn(&changed, &canonical, 1, Some(revision))
+            .is_err());
+        assert_eq!(owner.controls().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_send_same_turn_steer_is_custodied_segmented_and_applied_once() {
+        let temp = PrivateTemp::new();
+        let principal = PrincipalId::new("local").unwrap();
+        let store = SessionStore::open(&temp.0).unwrap();
+        let (session, branch) = store
+            .create(
+                &principal,
+                "jobs send steer fixture",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(DurableSteerProvider {
+            calls: provider_calls.clone(),
+            request_tool: "steer_request",
+        });
+        let mut fixture = setup_bound_with_tools(
+            None,
+            store,
+            session,
+            branch,
+            8,
+            vec![jobs_send_control_grant(), steer_request_control_grant()],
+            Some(provider),
+        );
+        let accepted = Arc::new(Mutex::new(None));
+        fixture
+            .agent
+            .register_host_tool(Arc::new(AuthorityUpdateRequestTool {
+                owner: fixture.owner.clone(),
+                accepted: accepted.clone(),
+                boundary: aw_agent_core::AuthorityBoundaryKind::Steer,
+            }))
+            .unwrap();
+        fixture
+            .owner
+            .submit(
+                &fixture.agent,
+                "steer_source",
+                input(&fixture.owner, 1, 1, "start then steer"),
+            )
+            .unwrap();
+
+        let turn = fixture
+            .owner
+            .run_once(&mut fixture.agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.id, 1);
+        assert_eq!(turn.outcome, aw_agent_core::Outcome::Completed);
+        assert_eq!(turn.answer, "replace");
+        assert_eq!(turn.invocations.len(), 2);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(turn.tool_records.len(), 1);
+        assert_eq!(turn.tool_records[0].call.name, "steer_request");
+        assert_eq!(
+            turn.tool_records[0].status,
+            aw_agent_core::ToolStatus::Succeeded
+        );
+        assert!(turn
+            .context_messages
+            .iter()
+            .any(|message| { message.role == Role::User && message.content == "replace" }));
+
+        let accepted = accepted
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("steer Tool must publish Accepted custody fact");
+        assert_eq!(accepted.state, AuthoritySteerState::Accepted);
+        assert_eq!(accepted.segment_ordinal, Some(2));
+        let applied = fixture
+            .store
+            .authority_steer_fact(
+                &fixture.owner.owner,
+                &fixture.owner.session,
+                &accepted.request.request_id,
+            )
+            .unwrap();
+        assert_eq!(applied.state, AuthoritySteerState::Applied);
+        assert_eq!(applied.segment_ordinal, Some(2));
+        assert_eq!(applied.segment_fingerprint, accepted.segment_fingerprint);
+        assert!(!serde_json::to_string(&accepted)
+            .unwrap()
+            .contains("replace"));
+        assert!(!serde_json::to_string(&applied).unwrap().contains("replace"));
+
+        let view = fixture
+            .store
+            .open(
+                &fixture.owner.owner,
+                &fixture.owner.session,
+                &fixture.owner.branch,
+            )
+            .unwrap()
+            .view()
+            .unwrap();
+        assert_eq!(view.history.turns.len(), 1);
+        assert_eq!(view.history.turns[0].id, 1);
+        assert_eq!(view.history.turns[0].answer, "replace");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_send_same_turn_interrupt_is_custodied_segmented_and_applied_once() {
+        let temp = PrivateTemp::new();
+        let principal = PrincipalId::new("local").unwrap();
+        let store = SessionStore::open(&temp.0).unwrap();
+        let (session, branch) = store
+            .create(
+                &principal,
+                "jobs send interrupt fixture",
+                StoredSessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(DurableSteerProvider {
+            calls: provider_calls.clone(),
+            request_tool: "interrupt_request",
+        });
+        let mut fixture = setup_bound_with_tools(
+            None,
+            store,
+            session,
+            branch,
+            9,
+            vec![jobs_send_control_grant(), interrupt_request_control_grant()],
+            Some(provider),
+        );
+        let accepted = Arc::new(Mutex::new(None));
+        fixture
+            .agent
+            .register_host_tool(Arc::new(AuthorityUpdateRequestTool {
+                owner: fixture.owner.clone(),
+                accepted: accepted.clone(),
+                boundary: aw_agent_core::AuthorityBoundaryKind::Interrupt,
+            }))
+            .unwrap();
+        fixture
+            .owner
+            .submit(
+                &fixture.agent,
+                "interrupt_source",
+                input(&fixture.owner, 1, 1, "start then interrupt"),
+            )
+            .unwrap();
+
+        let turn = fixture
+            .owner
+            .run_once(&mut fixture.agent, |_| Ok(()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.id, 1);
+        assert_eq!(turn.outcome, aw_agent_core::Outcome::Completed);
+        assert_eq!(turn.answer, "replace");
+        assert_eq!(turn.invocations.len(), 2);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(turn.tool_records.len(), 1);
+        assert_eq!(turn.tool_records[0].call.name, "interrupt_request");
+        assert_eq!(
+            turn.tool_records[0].status,
+            aw_agent_core::ToolStatus::Succeeded
+        );
+        assert!(turn
+            .context_messages
+            .iter()
+            .any(|message| { message.role == Role::User && message.content == "replace" }));
+
+        let accepted = accepted
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("interrupt Tool must publish Accepted custody fact");
+        assert!(accepted.request.request_id.starts_with("ji_"));
+        assert_eq!(accepted.state, AuthoritySteerState::Accepted);
+        assert_eq!(accepted.segment_ordinal, Some(2));
+        let applied = fixture
+            .store
+            .authority_steer_fact(
+                &fixture.owner.owner,
+                &fixture.owner.session,
+                &accepted.request.request_id,
+            )
+            .unwrap();
+        assert_eq!(applied.state, AuthoritySteerState::Applied);
+        assert_eq!(applied.segment_ordinal, Some(2));
+        assert_eq!(applied.segment_fingerprint, accepted.segment_fingerprint);
+        assert!(!serde_json::to_string(&accepted)
+            .unwrap()
+            .contains("replace"));
+        assert!(!serde_json::to_string(&applied).unwrap().contains("replace"));
+
+        let duplicate = fixture
+            .store
+            .authority_steer_fact(
+                &fixture.owner.owner,
+                &fixture.owner.session,
+                &accepted.request.request_id,
+            )
+            .unwrap();
+        assert_eq!(duplicate, applied);
+        let view = fixture
+            .store
+            .open(
+                &fixture.owner.owner,
+                &fixture.owner.session,
+                &fixture.owner.branch,
+            )
+            .unwrap()
+            .view()
+            .unwrap();
+        assert_eq!(view.history.turns.len(), 1);
+        assert_eq!(view.history.turns[0].id, 1);
     }
 
     #[tokio::test]
@@ -5083,6 +8225,8 @@ mod tests {
             result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
             identity: fixture.agent.default_identity().unwrap(),
             scope: fixture.agent.journal_scope().unwrap(),
+            execution_owner: None,
+            execution_scope: None,
         };
         assert!(
             owner.verify_model_observation(&ctx).is_err(),

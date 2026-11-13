@@ -7,15 +7,27 @@
 use aw::{
     config::{self, Settings},
     context::ExecutionContext,
-    Agent, Error, LocalToolOptions, PrincipalId, Result,
+    Agent, AgentExecutionBinding, Error, LocalToolOptions, PrincipalId, Result,
 };
 use aw_agent_core::CompactionPolicy;
-use aw_store_api::{SessionBackend, SessionBinding, SessionCursor, SessionInfo};
+use aw_store_api::{AgentBindingInfo, SessionBackend, SessionBinding, SessionCursor, SessionInfo};
 use aw_store_jsonl::JsonlStore;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+fn bind_execution_owner(agent: &mut Agent, info: AgentBindingInfo) -> Result<()> {
+    let canonical_ref = format!(
+        "/d:{}/i:{}/p:{}/a:{}",
+        info.domain_handle, info.identity_handle, info.project_handle, info.agent_handle
+    );
+    agent.bind_execution_owner(AgentExecutionBinding::from_trusted_host(
+        canonical_ref,
+        info.session_id,
+        info.branch_id,
+    )?)
+}
 
 pub enum Selection<'a> {
     New,
@@ -167,7 +179,9 @@ impl Sessions {
         Self::validate_binding(&view.session.binding, &current)?;
         self.ensure_no_other_unresolved_effects(&current.tool_root, Some(cursor.session_id()))?;
         let id = cursor.session_id().to_owned();
+        let execution = self.store.agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
         agent.load_history(view.history, Some(cursor.journal()))?;
+        bind_execution_owner(agent, execution)?;
         self.current = Some(cursor);
         Ok(id)
     }
@@ -185,7 +199,9 @@ impl Sessions {
                 &view.session.binding,
                 &Self::binding(settings, context, tools)?,
             )?;
+            let execution = self.store.agent_binding(&self.actor, &view.session.id, &view.branch.id)?;
             agent.load_history(view.history, Some(cursor.journal()))?;
+            bind_execution_owner(agent, execution)?;
         }
         Ok(())
     }

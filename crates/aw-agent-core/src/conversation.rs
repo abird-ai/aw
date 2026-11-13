@@ -335,13 +335,7 @@ impl Conversation {
             .filter(|t| t.outcome != Outcome::Completed && t.tool_records.is_empty())
             .map(|t| t.prompt.as_str())
     }
-    pub fn messages_for(&self, prompt: &str) -> Result<Vec<Message>> {
-        if prompt.trim().is_empty() {
-            return Err(Error::Config("prompt is empty".into()));
-        }
-        if prompt.len() > MAX_PROMPT_BYTES {
-            return Err(Error::Limit("prompt exceeds 128 KiB"));
-        }
+    pub(crate) fn public_messages(&self) -> Result<Vec<Message>> {
         if self.turns.len() >= MAX_ATTEMPTS {
             return Err(Error::Limit("in-memory turn limit reached; use /new"));
         }
@@ -385,12 +379,35 @@ impl Conversation {
         for block in blocks {
             messages.push(block.message(2 + messages.len() as u64));
         }
-        messages.push(Message::text(self.next_id * 1024, Role::User, prompt));
+        Ok(messages)
+    }
+
+    pub(crate) fn check_message_budget(messages: &[Message]) -> Result<()> {
         if messages.iter().map(Message::context_bytes).sum::<usize>() > MAX_CONTEXT_BYTES {
             return Err(Error::Limit(
                 "local context limit reached; use /new (no hidden truncation or summarization)",
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn messages_with_current_turn(&self, current: &[Message]) -> Result<Vec<Message>> {
+        let mut messages = self.public_messages()?;
+        messages.extend(current.iter().cloned());
+        Self::check_message_budget(&messages)?;
+        Ok(messages)
+    }
+
+    pub fn messages_for(&self, prompt: &str) -> Result<Vec<Message>> {
+        if prompt.trim().is_empty() {
+            return Err(Error::Config("prompt is empty".into()));
+        }
+        if prompt.len() > MAX_PROMPT_BYTES {
+            return Err(Error::Limit("prompt exceeds 128 KiB"));
+        }
+        let mut messages = self.public_messages()?;
+        messages.push(Message::text(self.next_id * 1024, Role::User, prompt));
+        Self::check_message_budget(&messages)?;
         Ok(messages)
     }
 

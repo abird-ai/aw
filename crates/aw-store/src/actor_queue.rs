@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 const ACTION: &str = "actor.queue";
+const EXECUTION_SCOPE_ACTION: &str = "actor.queue.execution_scope";
 const MAX_EVENTS: usize = 8192;
 const MAX_PENDING_PER_RECIPIENT: usize = 32;
 const MAX_BODY: usize = 64 * 1024;
@@ -992,6 +993,105 @@ impl SessionStore {
             .into_iter()
             .find(|f| f.request.request_id == id)
             .ok_or(Error::Denied("Actor queue request not found"))
+    }
+
+    /// Bind one durable queue fact to an ephemeral live causal execution owner.
+    /// Only the owner ref is persisted. The non-serializable live lease stays in
+    /// the current host process; a restart therefore cannot silently relabel
+    /// this queue item as independent work.
+    pub fn actor_queue_bind_execution_scope(
+        &self,
+        owner: &PrincipalId,
+        session: &str,
+        request_id: &str,
+        writer_epoch: u64,
+        owner_ref: &str,
+    ) -> Result<()> {
+        if !token(request_id, 128)
+            || !owner_ref.starts_with('/')
+            || owner_ref.len() > 2048
+            || !owner_ref.is_ascii()
+            || owner_ref.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid queued execution ownership binding"));
+        }
+        let mut conn = self.connection()?;
+        let tx = db(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        writer(&tx, owner, session, writer_epoch)?;
+        let current = latest(&events(&tx, session)?);
+        let fact = current.get(request_id).ok_or(Error::Denied(
+            "queued execution owner requires an existing queue fact",
+        ))?;
+        if fact.state != QueueState::Pending {
+            return Err(Error::Conflict(
+                "queued execution owner can bind only a pending queue fact",
+            ));
+        }
+        let existing: Option<String> = db(tx
+            .query_row(
+                "SELECT json_extract(data_json,'$.owner_ref')
+                 FROM audit
+                 WHERE session_id=?1 AND action=?2
+                   AND json_extract(data_json,'$.request_id')=?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![session, EXECUTION_SCOPE_ACTION, request_id],
+                |row| row.get(0),
+            )
+            .optional())?;
+        match existing.as_deref() {
+            Some(existing) if existing == owner_ref => {
+                db(tx.commit())?;
+                return Ok(());
+            }
+            Some(_) => {
+                return Err(Error::Denied(
+                    "queued execution ownership cannot be rebound",
+                ))
+            }
+            None => {}
+        }
+        audit(
+            &tx,
+            session,
+            owner,
+            EXECUTION_SCOPE_ACTION,
+            serde_json::json!({
+                "request_id": request_id,
+                "owner_ref": owner_ref,
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(())
+    }
+
+    pub fn actor_queue_execution_scope(
+        &self,
+        owner: &PrincipalId,
+        session: &str,
+        request_id: &str,
+    ) -> Result<Option<String>> {
+        if !token(request_id, 128) {
+            return Err(Error::Denied(
+                "invalid queued execution ownership request id",
+            ));
+        }
+        let conn = self.connection()?;
+        if !principal_is_session_owner(&conn, session, owner)? {
+            return Err(Error::Denied(
+                "queued execution ownership belongs to Session owner",
+            ));
+        }
+        db(conn
+            .query_row(
+                "SELECT json_extract(data_json,'$.owner_ref')
+                 FROM audit
+                 WHERE session_id=?1 AND action=?2
+                   AND json_extract(data_json,'$.request_id')=?3
+                 ORDER BY seq DESC LIMIT 1",
+                params![session, EXECUTION_SCOPE_ACTION, request_id],
+                |row| row.get(0),
+            )
+            .optional())
     }
 
     /// Select under BEGIN IMMEDIATE, original-mailbox priority and stable

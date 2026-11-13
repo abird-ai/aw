@@ -478,6 +478,8 @@ impl OutputStore {
 struct OwnerAck {
     through: u64,
     acknowledged: bool,
+    delivered_through: u64,
+    delivered_once: bool,
 }
 
 struct OwnedOutput {
@@ -671,6 +673,12 @@ pub struct TaskProjection {
     pub result_owner: OutputOwner,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FiniteJobKind {
+    Process,
+    Graph,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub id: String,
@@ -740,6 +748,38 @@ pub struct ListPage {
     pub next_offset: Option<usize>,
 }
 
+/// Stable continuation position in the immutable exposure ordering. The
+/// adapter authenticates/encodes this value for callers; it is not authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListCursor {
+    created_order: u64,
+    id: String,
+}
+
+impl ListCursor {
+    pub fn from_trusted_parts(created_order: u64, id: String) -> Result<Self, Error> {
+        if created_order == 0 || id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidOutput);
+        }
+        Ok(Self { created_order, id })
+    }
+
+    pub fn created_order(&self) -> u64 {
+        self.created_order
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CursorListPage {
+    pub jobs: Vec<Snapshot>,
+    pub next_cursor: Option<ListCursor>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunnerLoad {
     pub job_active: usize,
@@ -770,6 +810,11 @@ impl Visibility {
 struct ManagedJob {
     job: Job,
     plans: Vec<NodePlan>,
+    projection_kind: Option<FiniteJobKind>,
+    /// Public compare-and-act revision. Distinct from Job's internal journal
+    /// sequence because a control effect (for example stdin input) can mutate
+    /// live execution without a lifecycle transition.
+    revision: u64,
     visibility: Visibility,
     created_order: u64,
     transition_inflight: Option<Transition>,
@@ -796,6 +841,9 @@ impl ManagedJob {
 
 struct State {
     jobs: HashMap<String, ManagedJob>,
+    /// Capacity-only pre-admission reservations. They own aggregate and class
+    /// quota but intentionally contain no Graph/lifecycle state.
+    pre_admissions: HashMap<String, Visibility>,
     next_order: u64,
     active_nodes: usize,
     replays: HashMap<[u8; 32], ReplayEntry>,
@@ -815,6 +863,7 @@ impl JobManager {
             limits,
             state: Mutex::new(State {
                 jobs: HashMap::new(),
+                pre_admissions: HashMap::new(),
                 next_order: 1,
                 active_nodes: 0,
                 replays: HashMap::new(),
@@ -841,6 +890,11 @@ impl JobManager {
             .values()
             .filter(|managed| managed.visibility.reserves_exposed())
             .count()
+            + state
+                .pre_admissions
+                .values()
+                .filter(|visibility| visibility.reserves_exposed())
+                .count()
     }
 
     fn hidden_jobs(state: &State) -> usize {
@@ -849,6 +903,15 @@ impl JobManager {
             .values()
             .filter(|managed| managed.visibility == Visibility::Hidden)
             .count()
+            + state
+                .pre_admissions
+                .values()
+                .filter(|visibility| **visibility == Visibility::Hidden)
+                .count()
+    }
+
+    fn retained_slots(state: &State) -> usize {
+        state.jobs.len().saturating_add(state.pre_admissions.len())
     }
 
     fn ensure_exposed_capacity(
@@ -864,9 +927,7 @@ impl JobManager {
             let exposed_ok = Self::exposed_jobs(state)
                 .checked_add(additional)
                 .is_some_and(|count| count <= self.limits.max_exposed_jobs);
-            let aggregate_ok = state
-                .jobs
-                .len()
+            let aggregate_ok = Self::retained_slots(state)
                 .checked_add(additional)
                 .is_some_and(|count| count <= self.limits.max_retained_jobs);
             if exposed_ok && aggregate_ok {
@@ -930,7 +991,7 @@ impl JobManager {
                 return Err(Error::Capacity);
             }
         } else if Self::hidden_jobs(&state) >= self.limits.max_hidden_jobs
-            || state.jobs.len() >= self.limits.max_retained_jobs
+            || Self::retained_slots(&state) >= self.limits.max_retained_jobs
         {
             // Hidden host/transport work must never reclaim exposed history to admit
             // itself. The host may explicitly expire/release state and retry.
@@ -947,12 +1008,108 @@ impl JobManager {
             ManagedJob {
                 job,
                 plans,
+                projection_kind: None,
+                revision: 1,
                 visibility,
                 created_order,
                 transition_inflight: None,
                 outputs: BTreeMap::new(),
                 process_terminals: BTreeMap::new(),
                 task_binding,
+            },
+        );
+        state.active_nodes += restored_active;
+        Ok(())
+    }
+
+    /// Reserve aggregate + hidden/exposed-class metadata capacity before a
+    /// host runs any paid Graph admission policy. This creates no Job and owns
+    /// no lifecycle/output state.
+    pub fn reserve_task_admission(&self, id: &str, exposed: bool) -> Result<(), Error> {
+        if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            return Err(Error::InvalidPlans);
+        }
+        let visibility = if exposed {
+            Visibility::ReservedExposed
+        } else {
+            Visibility::Hidden
+        };
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        if state.jobs.contains_key(id) || state.pre_admissions.contains_key(id) {
+            return Err(Error::DuplicateId);
+        }
+        if visibility.reserves_exposed() {
+            if !self.ensure_exposed_capacity(&mut state, None, 1) {
+                return Err(Error::Capacity);
+            }
+        } else if Self::hidden_jobs(&state) >= self.limits.max_hidden_jobs
+            || Self::retained_slots(&state) >= self.limits.max_retained_jobs
+        {
+            return Err(Error::Capacity);
+        }
+        state.pre_admissions.insert(id.to_owned(), visibility);
+        Ok(())
+    }
+
+    pub fn release_task_admission(&self, id: &str) -> Result<(), Error> {
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        state
+            .pre_admissions
+            .remove(id)
+            .map(|_| ())
+            .ok_or(Error::NotFound)
+    }
+
+    /// Finalize one capacity-only reservation with the now-sealed Graph.
+    /// Capacity is not checked a second time; all semantic/plan validation still
+    /// happens here before the reservation is consumed.
+    pub fn admit_pre_reserved_task(
+        &self,
+        graph: Graph,
+        plans: Vec<NodePlan>,
+        admission: TaskAdmission<'_>,
+    ) -> Result<(), Error> {
+        let job = Job::after_task_intent(
+            graph,
+            admission.task,
+            admission.id,
+            admission.admission_sequence,
+            admission.width,
+        )?;
+        Self::validate_plans(&job, &plans)?;
+        let expected = if admission.exposed {
+            Visibility::ReservedExposed
+        } else {
+            Visibility::Hidden
+        };
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        if state.jobs.contains_key(admission.id) {
+            return Err(Error::DuplicateId);
+        }
+        if state.pre_admissions.get(admission.id).copied() != Some(expected) {
+            return Err(Error::InvalidPlans);
+        }
+        let restored_active = job.active();
+        if state.active_nodes.saturating_add(restored_active) > self.limits.max_active_nodes {
+            return Err(Error::Capacity);
+        }
+        let created_order = state.next_order;
+        let next_order = state.next_order.checked_add(1).ok_or(Error::Capacity)?;
+        state.pre_admissions.remove(admission.id);
+        state.next_order = next_order;
+        state.jobs.insert(
+            admission.id.to_owned(),
+            ManagedJob {
+                job,
+                plans,
+                projection_kind: None,
+                revision: 1,
+                visibility: expected,
+                created_order,
+                transition_inflight: None,
+                outputs: BTreeMap::new(),
+                process_terminals: BTreeMap::new(),
+                task_binding: Some(admission.task.clone()),
             },
         );
         state.active_nodes += restored_active;
@@ -1172,6 +1329,44 @@ impl JobManager {
         Ok(())
     }
 
+    /// Set immutable user-facing finite Job semantics. This is projection
+    /// metadata on the existing Job, never a second execution owner.
+    pub fn set_finite_kind(&self, id: &str, kind: FiniteJobKind) -> Result<(), Error> {
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
+        match managed.projection_kind {
+            None => {
+                managed.projection_kind = Some(kind);
+                Ok(())
+            }
+            Some(existing) if existing == kind => Ok(()),
+            Some(_) => Err(Error::ReplayMismatch),
+        }
+    }
+
+    pub fn finite_kind(&self, id: &str) -> Result<FiniteJobKind, Error> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        state
+            .jobs
+            .get(id)
+            .ok_or(Error::NotFound)?
+            .projection_kind
+            .ok_or(Error::InvalidPlans)
+    }
+
+    /// Atomically compare and reserve the next public revision before an
+    /// effectful control leaves the JobManager. The caller must establish its
+    /// replay identity before invoking this method.
+    pub fn compare_and_bump_revision(&self, id: &str, expected: Option<u64>) -> Result<u64, Error> {
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
+        if expected.is_some_and(|expected| expected != managed.revision) {
+            return Err(Error::Job(JobError::StaleGeneration));
+        }
+        managed.revision = managed.revision.checked_add(1).ok_or(Error::Capacity)?;
+        Ok(managed.revision)
+    }
+
     fn snapshot(id: &str, managed: &ManagedJob) -> Snapshot {
         let label = if managed.job.total() == 1 {
             managed.job.graph().steps()[0].tool.name().to_owned()
@@ -1187,7 +1382,7 @@ impl JobManager {
             label,
             lifecycle: managed.job.lifecycle(),
             stop_reason: managed.job.stop_reason(),
-            sequence: managed.job.sequence(),
+            sequence: managed.revision,
             finished: managed.job.finished(),
             total: managed.job.total(),
             summary: managed.job.summary(),
@@ -1503,6 +1698,54 @@ impl JobManager {
         })
     }
 
+    /// Newest exposed Job first with an immutable logical continuation.
+    /// Jobs exposed after the first page never move the continuation boundary.
+    pub fn list_cursor(
+        &self,
+        cursor: Option<&ListCursor>,
+        limit: usize,
+    ) -> Result<CursorListPage, Error> {
+        if limit == 0 || limit > self.limits.max_exposed_jobs.min(MAX_JOB_LIST_PAGE) {
+            return Err(Error::InvalidLimits);
+        }
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let mut jobs = state
+            .jobs
+            .iter()
+            .filter(|(_, managed)| managed.visibility.is_exposed())
+            .filter(|(id, managed)| {
+                cursor.is_none_or(|cursor| {
+                    managed.created_order < cursor.created_order
+                        || (managed.created_order == cursor.created_order
+                            && id.as_str() > cursor.id.as_str())
+                })
+            })
+            .collect::<Vec<_>>();
+        jobs.sort_by(|(id_a, a), (id_b, b)| {
+            b.created_order
+                .cmp(&a.created_order)
+                .then_with(|| id_a.cmp(id_b))
+        });
+        let has_more = jobs.len() > limit;
+        jobs.truncate(limit);
+        let next_cursor = has_more.then(|| {
+            let (id, managed) = jobs
+                .last()
+                .expect("has_more implies at least one returned Job");
+            ListCursor {
+                created_order: managed.created_order,
+                id: (*id).clone(),
+            }
+        });
+        Ok(CursorListPage {
+            jobs: jobs
+                .into_iter()
+                .map(|(id, managed)| Self::snapshot(id, managed))
+                .collect(),
+            next_cursor,
+        })
+    }
+
     fn lower_conflict(managed: &ManagedJob, coordinate: usize) -> bool {
         let Some(current) = managed.plans.get(coordinate.saturating_sub(1)) else {
             return true;
@@ -1601,6 +1844,12 @@ impl JobManager {
                     let managed = state.jobs.get_mut(id).expect("checked manager entry");
                     let result = managed.job.apply_committed(proposal);
                     managed.transition_inflight = None;
+                    if result.is_ok() {
+                        managed.revision = managed
+                            .revision
+                            .checked_add(1)
+                            .ok_or(JobError::InvalidSequence)?;
+                    }
                     result
                 };
                 if applied.is_err() {
@@ -2434,6 +2683,87 @@ impl JobManager {
             through: ack.through,
             acknowledged: ack.acknowledged,
             released: output.released,
+        })
+    }
+
+    /// Public/SDK lease read for one exact retained owner. Unlike host-internal
+    /// observation, this advances only that owner's delivered watermark.
+    pub fn output_page_for_owner(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        owner: OutputOwner,
+        offset: u64,
+        limit: usize,
+    ) -> Result<OutputPage, Error> {
+        if limit == 0 || limit > MAX_SPOOL_PAGE_BYTES || offset.checked_add(limit as u64).is_none()
+        {
+            return Err(Error::InvalidOutput);
+        }
+        let output = self.output_handle(id, coordinate, stream)?;
+        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
+        if output.released {
+            return Err(Error::OutputReleased);
+        }
+        if !output.owners.contains_key(&owner) {
+            return Err(Error::InvalidOutput);
+        }
+        let summary = output.spool.summary();
+        let bytes = output.spool.read_retained_page(offset, limit)?;
+        let next = offset + bytes.len() as u64;
+        let lease = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+        lease.delivered_through = lease.delivered_through.max(next);
+        lease.delivered_once = true;
+        Ok(OutputPage {
+            bytes,
+            next_offset: (next < summary.retained_bytes).then_some(next),
+            writer_finished: output.writer_finished,
+            truncated: summary.truncated,
+            total_bytes: summary.total_bytes,
+            retained_bytes: summary.retained_bytes,
+        })
+    }
+
+    /// Strict public ACK: an owner cannot acknowledge bytes it has not actually
+    /// received through output_page_for_owner. Empty output still requires one
+    /// owner read before offset zero is ACKable.
+    pub fn acknowledge_delivered_output(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        owner: OutputOwner,
+        through: u64,
+    ) -> Result<OutputAck, Error> {
+        let output = self.output_handle(id, coordinate, stream)?;
+        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
+        if output.released {
+            return Ok(OutputAck {
+                changed: false,
+                released: true,
+            });
+        }
+        let retained = output.spool.retained_bytes();
+        if through > retained {
+            return Err(Error::InvalidOutput);
+        }
+        let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+        if !current.delivered_once || through > current.delivered_through {
+            return Err(Error::InvalidOutput);
+        }
+        if current.acknowledged && through <= current.through {
+            return Ok(OutputAck {
+                changed: false,
+                released: false,
+            });
+        }
+        current.through = current.through.max(through);
+        current.acknowledged = true;
+        let released = output.maybe_release()?;
+        Ok(OutputAck {
+            changed: true,
+            released,
         })
     }
 
@@ -4269,6 +4599,99 @@ mod tests {
             manager.get("restart-reserved").unwrap().id,
             "restart-reserved"
         );
+    }
+
+    #[test]
+    fn preseal_capacity_reservation_is_invisible_and_consumed_without_second_quota_race() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        manager.reserve_task_admission("planned", true).unwrap();
+        assert!(matches!(manager.get("planned"), Err(Error::NotFound)));
+        assert!(manager.list(0, 1).unwrap().jobs.is_empty());
+
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+        let node_plans = plans(&graph);
+        assert_eq!(
+            manager.admit_runtime(
+                graph.clone(),
+                node_plans.clone(),
+                RuntimeAdmission {
+                    id: "other",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            ),
+            Err(Error::Capacity),
+            "pre-seal reservation must own aggregate/exposed capacity before a Job exists"
+        );
+
+        let task = TaskIdentity {
+            actor: "a".into(),
+            source_kind: "host".into(),
+            source_id: "source".into(),
+            source_epoch: 1,
+            execution_site: "local".into(),
+            session: "s".into(),
+            branch: "main".into(),
+            turn_id: 1,
+            call_id: "planned".into(),
+            effect: ToolEffect::Control,
+        };
+        manager
+            .admit_pre_reserved_task(
+                graph,
+                node_plans,
+                TaskAdmission {
+                    id: "planned",
+                    task: &task,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(manager.get("planned"), Err(Error::NotExposed)));
+        manager.expose("planned").unwrap();
+        assert_eq!(manager.get("planned").unwrap().id, "planned");
+
+        // A released pre-admission returns capacity without creating history.
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        manager.reserve_task_admission("temporary", true).unwrap();
+        manager.release_task_admission("temporary").unwrap();
+        assert!(manager.list(0, 1).unwrap().jobs.is_empty());
+        let graph = Graph::compile(&json!({"ops":[["read",{"path":"b"}]]}), |_, _| true).unwrap();
+        manager
+            .admit_runtime(
+                graph.clone(),
+                plans(&graph),
+                RuntimeAdmission {
+                    id: "visible",
+                    runtime_session: "s",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            )
+            .unwrap();
     }
 
     #[test]

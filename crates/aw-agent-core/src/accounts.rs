@@ -420,6 +420,10 @@ impl ProviderSelection {
     pub fn revalidate(&self) -> Result<()> {
         self.reader()?.revalidate()
     }
+    pub fn supports_tools(&self) -> bool {
+        self.provider.supports_tools()
+    }
+
     pub(crate) fn provider(&self) -> &dyn Provider {
         self.provider.as_ref()
     }
