@@ -10,6 +10,7 @@ description = "Explicit stdio/Streamable HTTP MCP client adapters for aw"
 [dependencies]
 aw-agent-core = { version = "=0.15.0", path = "../aw-agent-core" }
 aw-agent-kernel = { version = "=0.15.0", path = "../aw-agent-kernel" }
+aw-tools = { version = "=0.15.0", path = "../aw-tools", default-features = false, features = ["conformance", "durable"] }
 rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest"] }
 serde_json = { workspace = true }
 serde = { workspace = true }

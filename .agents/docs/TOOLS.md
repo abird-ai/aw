@@ -334,29 +334,24 @@ The optional native workspace uses the same current account/tool grants and pers
 
 ## Phase 42 child file-tool isolation
 
-`--subagents` grants the model the bounded delegation tool; it does not grant local file tools. `--subagent-tools off|read-only|workspace` is a separate host choice. `off` preserves Phase-41 model-only children. `read-only` advertises only `read`; `workspace` advertises `read`, `write`, `edit`. `trusted` is rejected for child Agents in Phase 42. The model cannot choose this mode.
+`--subagents` grants the model the canonical bounded `agent` constructor; it does not grant local file tools. `--subagent-tools off|read-only|workspace` is a separate host choice. `off` preserves model-only children. `read-only` advertises only `read`; `workspace` advertises `read`, `write`, `edit`. `trusted` is rejected for child Agents. The model cannot choose this mode.
 
-For a non-off child, aw requires a clean non-bare Git parent checkout, creates a detached managed worktree under the private aw state directory at the exact committed HEAD, and roots child file tools inside that isolated binding. The child never receives `bash`, `subagent`, or Git-management tools. The existing file-tool no-follow/path bounds remain unchanged. Worktree isolation separates cooperating aw file effects; it is not an OS sandbox against malicious same-UID code. See [accepted history](../plans/accepted-history/TODO.md).
+For a non-off child, aw requires a clean non-bare Git parent checkout, creates a detached managed worktree under the private aw state directory at the exact committed HEAD, and roots child file tools inside that isolated binding. The child never receives `bash` or Git-management tools. Recursive children may receive only the same bounded canonical `agent` constructor when depth allows. The existing file-tool no-follow/path bounds remain unchanged. Worktree isolation separates cooperating aw file effects; it is not an OS sandbox against malicious same-UID code. See [accepted history](../plans/accepted-history/TODO.md).
 
 
 ## Phase 44 recursive tool inheritance
 
-When `--subagent-max-depth` is greater than the current child depth, a child Agent may receive the same bounded `subagent` tool. The model still cannot select depth, budgets, account/model, routing, file-tool mode or worktree. Descendants inherit the root host's `off`, `read-only` or `workspace` file-tool mode unchanged (equal authority, never broader); `trusted`/bash remains unavailable. At the configured maximum depth the `subagent` Tool is absent from the child's advertised registry.
+When `--subagent-max-depth` is greater than the current child depth, a child Agent may receive the same bounded canonical `agent` constructor. The model still cannot select depth, budgets, account/model, routing, file-tool mode or worktree. Descendants inherit the root host's `off`, `read-only` or `workspace` file-tool mode unchanged (equal authority, never broader); `trusted`/bash remains unavailable. At the configured maximum depth the `agent` constructor is absent from the child's advertised registry.
 
 
 ## Phase 45 routing does not grant tools
 
-`--subagent-route` can change only the already-authorized provider account/model used for a child. It never changes the host-selected child file-tool mode, root, worktree, shell authority or recursive depth. A routed descendant therefore still receives exactly the same `off`, `read-only` or `workspace` tool grant inherited from the root configuration; `trusted`/bash remains forbidden. The model-facing `subagent` JSON has no route/account/model/candidate fields.
+`--subagent-route` can change only the already-authorized provider account/model used for a child. It never changes the host-selected child file-tool mode, root, worktree, shell authority or recursive depth. A routed descendant therefore still receives exactly the same `off`, `read-only` or `workspace` tool grant inherited from the root configuration; `trusted`/bash remains forbidden. The model-facing `agent` JSON has no route/account/model/candidate fields.
 
 
-## Phase 46 team tool is topology, not authority
+## Historical team/planner/review model routes
 
-The root-only `team` tool accepts only `task` plus optional `title`. A host-selected immutable 2–4 member template decides candidate roles/instructions and `all_required` join. Each candidate is executed through the existing subagent Service, so the team cannot grant new provider/model, routing, file-tool, worktree, recursion, budget or shell authority. Candidate member text is untrusted evidence. Recursive child Agents do not receive the `team` tool in Phase 46.
-
-
-## Phase 49 planner output is not tool authority
-
-The root `plan` tool can request a bounded generative task proposal, but planner output is data only. Task roles are semantic labels and cannot grant files, shell, worktree, route/account/model, depth or budget authority. Each planned task is executed through the already configured subagent Service, so its effective local tools remain exactly the host-selected `off`, `read-only` or `workspace` grant and `trusted`/bash remains forbidden for these children. The planner provider invocation itself is tool-free.
+Phases 46, 49 and 50 introduced `team`, `plan` and `review_release` model tools. The unified Jobs + Agent hard cutover removes those routes and their host adapters. Durable team/planner/review records remain readable for historical/admin workflows, but they no longer add model tools, provider rounds, tool authority or a second Agent orchestration surface. New model-directed child work uses only the canonical bounded `agent` constructor plus the shared Jobs/Graph controls.
 
 
 ### Shared toolset follow-up — 2026-10-30

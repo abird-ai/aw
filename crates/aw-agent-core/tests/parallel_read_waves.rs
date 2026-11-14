@@ -249,6 +249,10 @@ impl TurnJournal for Journal {
                 JournalEntry::InvocationFinished { .. } => "model.finish",
                 JournalEntry::ToolDenied { .. } => "tool.denied",
                 JournalEntry::ToolRevised { .. } => "tool.revised",
+                JournalEntry::AuthoritySegmentStarted { .. }
+                | JournalEntry::ModelInvocationAdmitted { .. } => {
+                    panic!("plain parallel-read fixture must not invent Actor authority admissions")
+                }
             };
             self.proof.emit(name);
             Ok(())

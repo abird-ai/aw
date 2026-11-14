@@ -135,6 +135,10 @@ impl TurnJournal for JournalFixture {
                 JournalEntry::ToolFinished { .. } => "tool_receipt",
                 JournalEntry::ToolDenied { .. } => "tool_denied",
                 JournalEntry::ToolRevised { .. } => "tool_revised",
+                JournalEntry::AuthoritySegmentStarted { .. }
+                | JournalEntry::ModelInvocationAdmitted { .. } => {
+                    panic!("plain hosted parity flow must not invent Actor authority admissions")
+                }
             };
             self.proof.journal.lock().unwrap().push(kind);
             if kind == "tool_receipt" && self.fail_receipt {

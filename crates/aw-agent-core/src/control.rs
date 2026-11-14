@@ -231,15 +231,16 @@ impl AgentSessionController {
     ) -> Result<crate::AuthoritySegment> {
         self.verify_writer_fence()?;
         let segment = self.with_runtime(|runtime| {
-            runtime.admit_authority_steer_with_evidence(
-                &self.principal,
-                self.actor,
-                self.writer_epoch,
-                turn_id,
+            runtime.admit_authority_update(crate::runtime::AuthorityUpdateRequest {
+                principal: &self.principal,
+                key: self.actor,
+                epoch: self.writer_epoch,
+                turn: turn_id,
+                boundary_kind: crate::AuthorityBoundaryKind::Steer,
                 boundary_id,
                 input,
-                evidence,
-            )
+                replacement_evidence: Some(evidence),
+            })
         })?;
         self.changed();
         Ok(segment)
@@ -275,15 +276,16 @@ impl AgentSessionController {
     ) -> Result<crate::AuthoritySegment> {
         self.verify_writer_fence()?;
         let segment = self.with_runtime(|runtime| {
-            runtime.admit_authority_interrupt_with_evidence(
-                &self.principal,
-                self.actor,
-                self.writer_epoch,
-                turn_id,
+            runtime.admit_authority_update(crate::runtime::AuthorityUpdateRequest {
+                principal: &self.principal,
+                key: self.actor,
+                epoch: self.writer_epoch,
+                turn: turn_id,
+                boundary_kind: crate::AuthorityBoundaryKind::Interrupt,
                 boundary_id,
                 input,
-                evidence,
-            )
+                replacement_evidence: Some(evidence),
+            })
         })?;
         self.changed();
         Ok(segment)

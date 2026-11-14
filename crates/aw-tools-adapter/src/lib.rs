@@ -845,13 +845,13 @@ fn offer_shared(
 fn offer_required<T: Tool + 'static>(
     builder: AgentBuilder,
     tool: T,
-    selected: &BTreeSet<&str>,
-    required: bool,
+    selection: (&BTreeSet<&str>, bool),
     available: &mut BTreeSet<String>,
     policy: &mut ToolPolicy,
     actor: &PrincipalId,
     router: &Arc<operation_router::OperationRouterSlot>,
 ) -> Result<AgentBuilder> {
+    let (selected, required) = selection;
     let spec = tool.spec();
     available.insert(spec.name.clone());
     if required || selected.is_empty() || selected.contains(spec.name.as_str()) {
@@ -1027,12 +1027,14 @@ pub fn configure(
             builder.tool_binding_authority(),
             limits,
             effective_concurrency,
-            options.agent_jobs.clone(),
-            options.graph_policy_router.clone(),
-            options.graph_host_tools.clone(),
-            options.allow_agent_graph,
-            options.allow_wake,
-            max_graph_nodes,
+            job_runtime::JobRuntimeOptions {
+                agent_jobs: options.agent_jobs.clone(),
+                graph_policy: options.graph_policy_router.clone(),
+                graph_host_tools: options.graph_host_tools.clone(),
+                allow_agent_graph: options.allow_agent_graph,
+                allow_wake: options.allow_wake,
+                max_graph_nodes,
+            },
             graph_native_tools,
         )?;
         builder = builder
@@ -1050,8 +1052,7 @@ pub fn configure(
             builder = offer_required(
                 builder,
                 jobs_tools::JobsTool::new(runtime.clone(), kind),
-                &selected,
-                constructor_selected,
+                (&selected, constructor_selected),
                 &mut available,
                 &mut policy,
                 &actor,

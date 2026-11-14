@@ -391,13 +391,6 @@ impl Conversation {
         Ok(())
     }
 
-    pub(crate) fn messages_with_current_turn(&self, current: &[Message]) -> Result<Vec<Message>> {
-        let mut messages = self.public_messages()?;
-        messages.extend(current.iter().cloned());
-        Self::check_message_budget(&messages)?;
-        Ok(messages)
-    }
-
     pub fn messages_for(&self, prompt: &str) -> Result<Vec<Message>> {
         if prompt.trim().is_empty() {
             return Err(Error::Config("prompt is empty".into()));

@@ -118,6 +118,48 @@ fn session_action(
 }
 
 impl SessionStore {
+    /// Recover an already-committed Start by the context-independent original
+    /// effect-attempt identity, before any current ToolBinding reauthorization or
+    /// contextual ref resolution. This does not make an expired proof executable;
+    /// the remote owner still validates its target-issued lease and generation.
+    pub fn remote_start_lookup_attempt(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        original_invocation_id: &str,
+        effect_attempt_id: &str,
+    ) -> Result<Option<RemoteStartAuthorization>> {
+        if original_invocation_id.is_empty()
+            || original_invocation_id.len() > 512
+            || !original_invocation_id.is_ascii()
+            || original_invocation_id.chars().any(char::is_control)
+            || effect_attempt_id.is_empty()
+            || effect_attempt_id.len() > 256
+            || !effect_attempt_id.is_ascii()
+            || effect_attempt_id.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid remote Start replay identity"));
+        }
+        let connection = self.connection()?;
+        let facts = events(&connection, session)?;
+        let mut found = None;
+        for fact in facts.iter().rev() {
+            if fact.provenance.actor == actor.as_str()
+                && fact.provenance.session_id == session
+                && fact.intent.original_invocation_id == original_invocation_id
+                && fact.intent.effect_attempt_id == effect_attempt_id
+            {
+                if found.is_some() {
+                    return Err(Error::Storage(
+                        "duplicate persisted remote Start attempt identity",
+                    ));
+                }
+                found = Some(fact.clone());
+            }
+        }
+        Ok(found)
+    }
+
     /// Recover an already-committed Start without current effect reauthorization.
     /// This does not make an expired proof executable; the remote owner still
     /// validates its target-issued lease and live runtime generation.
@@ -477,6 +519,17 @@ mod tests {
             .remote_start_authorize(&actor, &session, &policy_id, intent.clone(), source())
             .unwrap();
 
+        let by_attempt = store
+            .remote_start_lookup_attempt(
+                &actor,
+                &session,
+                &intent.original_invocation_id,
+                &intent.effect_attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_attempt, first);
+
         let replay = store
             .remote_start_lookup(&actor, &session, &intent)
             .unwrap()
@@ -500,6 +553,18 @@ mod tests {
         assert_eq!(
             store
                 .remote_start_authorize(&actor, &session, &policy_id, intent.clone(), source(),)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            store
+                .remote_start_lookup_attempt(
+                    &actor,
+                    &session,
+                    &intent.original_invocation_id,
+                    &intent.effect_attempt_id,
+                )
+                .unwrap()
                 .unwrap(),
             first
         );

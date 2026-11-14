@@ -295,9 +295,9 @@ After a successful switch the snapshot refreshes Session/title/branch plus root,
 The empty fullscreen composer continues to use the Phase-47 adaptive single-line hint, but its semantic muted style no longer adds `DIM`. This specifically avoids terminals/themes where only the cursor-covered leading `A` remained visibly apparent.
 
 
-## Phase 49 planner visibility
+## Historical Phase 49 planner visibility
 
-Phase 49 does not add a separate mandatory planner pane. Planned workers are ordinary child Sessions and therefore appear through the existing Session/subagent family projection. Planner/task/join receipts remain host/state data and are not injected into model context except for the explicit bounded final `plan` tool result. The current Agent remains the one publisher of the parent continuation.
+Phase 49 did not add a separate mandatory planner pane. Planned workers were ordinary child Sessions and appeared through the existing Session/Agent projection. The unified Jobs + Agent hard cutover removes the model-facing `plan` route; planner/task/join receipts remain host/state history and are not injected into current model context. The current Agent remains the one publisher of the parent continuation.
 
 Dependencies are displayed/recorded as task topology only; Phase 49 does not create child-to-child transcript sharing. A dependent child receives predecessor task IDs in its bounded task prompt but not predecessor answer text. Future coordination/peer-message UI requires a separate phase.
 

@@ -15,10 +15,15 @@ use aw_agent_core::{
     Error, Result, Tool,
 };
 use aw_agent_kernel::capability::SourceKind;
+use aw_tools::{
+    remote_start::{arguments_sha256, RemoteRuntimeLease, RemoteStartAuthorization},
+    OperationId,
+};
+use futures_util::StreamExt as _;
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, ClientConfig, ContentBlock,
-        PaginatedRequestParams, ProtocolVersion,
+        PaginatedRequestParams, ProtocolVersion, RequestMetaObject,
     },
     service::RunningService,
     transport::{
@@ -39,9 +44,11 @@ use tokio::{
     process::{Child, Command},
     sync::Mutex,
 };
+use zeroize::Zeroizing;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_START_META_KEY: &str = "io.abird.aw/remoteStart";
 
 fn label(s: &str, max: usize) -> bool {
     !s.is_empty()
@@ -95,6 +102,13 @@ impl Endpoint {
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct RemoteExecutionSite {
+    pub site: String,
+    pub endpoint: Endpoint,
+}
+
 type ToolGrants = BTreeSet<(String, String)>;
 
 #[derive(Clone, Debug, Default, clap::Args)]
@@ -120,6 +134,11 @@ pub struct Options {
     /// Optional explicit HTTPS root CA PEM bundle SERVER=/ABS/FILE, max 1 MiB.
     #[arg(long = "mcp-ca-file", value_name = "SERVER=/ABS/PEM")]
     pub ca_file: Vec<String>,
+    /// Bind one bearer-authenticated Streamable HTTP server as this Agent's
+    /// concrete execution site. This selects transport only; ToolPolicy still
+    /// must explicitly grant the same SITE.
+    #[arg(long = "mcp-execution-site", value_name = "SITE=SERVER")]
+    pub execution_site: Option<String>,
     /// Grant a discovered remote capability SERVER:TOOL
     #[arg(long = "mcp-allow", value_name = "SERVER:TOOL")]
     pub allow: Vec<String>,
@@ -128,6 +147,24 @@ pub struct Options {
     pub resource_allow: Vec<String>,
 }
 impl Options {
+    pub fn execution_site_binding(&self) -> Result<Option<RemoteExecutionSite>> {
+        let Some(binding) = self.execution_site.as_deref() else {
+            return Ok(None);
+        };
+        let (site, server) = binding
+            .split_once('=')
+            .ok_or(Error::Denied("MCP execution site requires SITE=SERVER"))?;
+        let (servers, _) = self.parsed()?;
+        let endpoint = servers
+            .into_iter()
+            .find(|endpoint| endpoint.id() == server)
+            .ok_or(Error::Denied("MCP execution site names an unknown server"))?;
+        Ok(Some(RemoteExecutionSite {
+            site: site.to_owned(),
+            endpoint,
+        }))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.stdio.is_empty()
             && self.http.is_empty()
@@ -136,6 +173,7 @@ impl Options {
             && self.pass_env.is_empty()
             && self.auth_env.is_empty()
             && self.ca_file.is_empty()
+            && self.execution_site.is_none()
             && self.allow.is_empty()
             && self.resource_allow.is_empty()
     }
@@ -295,11 +333,49 @@ impl Options {
                 return Err(Error::Denied("invalid/duplicate MCP resource grant"));
             }
         }
+        if let Some(binding) = self.execution_site.as_deref() {
+            let (site, server) = binding
+                .split_once('=')
+                .ok_or(Error::Denied("MCP execution site requires SITE=SERVER"))?;
+            if site.is_empty()
+                || site == "local"
+                || site.len() > 128
+                || !site.is_ascii()
+                || site.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+            {
+                return Err(Error::Denied("invalid MCP execution-site identity"));
+            }
+            if allowed.iter().any(|(id, _)| id == server)
+                || uris.iter().any(|(id, _)| *id == server)
+            {
+                return Err(Error::Denied(
+                    "MCP execution-site server cannot also expose ordinary model tools/resources",
+                ));
+            }
+            match servers.get(server) {
+                Some(Endpoint::Http {
+                    bearer_env: Some(_),
+                    ..
+                }) => {}
+                Some(_) => {
+                    return Err(Error::Denied(
+                        "MCP execution site requires bearer-authenticated Streamable HTTP",
+                    ));
+                }
+                None => return Err(Error::Denied("MCP execution site names an unknown server")),
+            }
+        }
         if servers.is_empty() && !self.is_empty() {
             return Err(Error::Denied("MCP grants/args require a selected server"));
         }
         Ok((servers.into_values().collect(), allowed))
     }
+}
+
+struct HttpBridgeTransport {
+    client: reqwest::Client,
+    lease_url: reqwest::Url,
+    bearer: Zeroizing<String>,
 }
 
 struct Connection {
@@ -310,6 +386,7 @@ struct Connection {
     // kill_on_drop prevents orphaned child processes on shutdown.
     _child: Option<Mutex<Child>>,
     _legacy: Option<legacy_sse::Pumps>,
+    http_bridge: Option<HttpBridgeTransport>,
     subscription_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 impl Drop for Connection {
@@ -319,6 +396,216 @@ impl Drop for Connection {
         }
     }
 }
+fn tool_output_from_response(response: CallToolResponse) -> Result<ToolOutput> {
+    let response = match response {
+        CallToolResponse::Complete(response) => response,
+        _ => {
+            return Err(Error::Denied(
+                "MCP interactive/task result needs separate authorization",
+            ));
+        }
+    };
+    let mut content = String::new();
+    for item in response.content {
+        let ContentBlock::Text(text) = item else {
+            return Err(Error::Denied(
+                "non-text MCP tool output requires explicit media handler",
+            ));
+        };
+        if content.len().saturating_add(text.text.len() + 1) > MAX_TOOL_RESULT_BYTES {
+            return Err(Error::Limit("MCP response exceeds 128 KiB"));
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&text.text);
+    }
+    if let Some(value) = response.structured_content {
+        let text = serde_json::to_string(&value)
+            .map_err(|_| Error::Protocol("invalid structured MCP result"))?;
+        if content.len().saturating_add(text.len() + 1) > MAX_TOOL_RESULT_BYTES {
+            return Err(Error::Limit("MCP structured output too large"));
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&text);
+    }
+    Ok(ToolOutput {
+        content,
+        is_error: response.is_error.unwrap_or(false),
+        truncated: false,
+    })
+}
+
+#[derive(Clone)]
+pub struct RemoteBridge {
+    conn: Arc<Connection>,
+}
+
+impl RemoteBridge {
+    pub async fn lease(&self) -> Result<RemoteRuntimeLease> {
+        const MAX_LEASE_BYTES: usize = 16 * 1024;
+        let bridge = self.conn.http_bridge.as_ref().ok_or(Error::Denied(
+            "remote Start requires authenticated Streamable HTTP MCP",
+        ))?;
+        let response = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            bridge
+                .client
+                .get(bridge.lease_url.clone())
+                .bearer_auth(bridge.bearer.as_str())
+                .send(),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::Transport("remote Start lease request failed"))?;
+        if !response.status().is_success() {
+            return Err(Error::Denied("remote Start lease was rejected"));
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| Error::Transport("remote Start lease body failed"))?;
+            if body.len().saturating_add(chunk.len()) > MAX_LEASE_BYTES {
+                return Err(Error::Limit("remote Start lease response too large"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let lease = serde_json::from_slice::<RemoteRuntimeLease>(&body)
+            .map_err(|_| Error::Protocol("invalid remote Start lease"))?;
+        lease
+            .validate()
+            .map_err(|_| Error::Protocol("invalid remote Start lease"))?;
+        Ok(lease)
+    }
+
+    async fn call_params(
+        &self,
+        ctx: &ToolContext,
+        params: CallToolRequestParams,
+    ) -> Result<ToolOutput> {
+        if ctx.cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let call = async {
+            self.conn
+                .peer
+                .lock()
+                .await
+                .call_tool_once(params)
+                .await
+                .map_err(|_| Error::Transport("remote MCP tool response/connection failed"))
+        };
+        let response = tokio::select! {
+            _ = ctx.cancellation.cancelled()=>return Err(Error::Cancelled),
+            outcome=tokio::time::timeout(TOOL_TIMEOUT,call)=>
+                outcome.map_err(|_|Error::Timeout)??,
+        };
+        tool_output_from_response(response)
+    }
+
+    pub async fn call_read(
+        &self,
+        ctx: &ToolContext,
+        operation: OperationId,
+        arguments: &Value,
+    ) -> Result<ToolOutput> {
+        let allowed = match operation {
+            OperationId::Fs(tool) => tool.action() == aw_tools::filesystem::access::Action::Read,
+            OperationId::JobsList | OperationId::JobsGet | OperationId::JobsRead => true,
+            _ => false,
+        };
+        if !allowed {
+            return Err(Error::Denied(
+                "remote read bridge accepts only filesystem reads and jobs list/get/read",
+            ));
+        }
+        let arguments = arguments.as_object().cloned().ok_or(Error::Denied(
+            "remote operation arguments must be an object",
+        ))?;
+        self.call_params(
+            ctx,
+            CallToolRequestParams::new(operation.model_name()).with_arguments(arguments),
+        )
+        .await
+    }
+
+    fn effect_params(
+        operation: OperationId,
+        arguments: &Value,
+        authorization: &RemoteStartAuthorization,
+    ) -> Result<CallToolRequestParams> {
+        let allowed = match operation {
+            OperationId::Fs(tool) => tool.action() != aw_tools::filesystem::access::Action::Read,
+            OperationId::Bash
+            | OperationId::Pwsh
+            | OperationId::Powershell
+            | OperationId::Batch
+            | OperationId::JobsAck
+            | OperationId::JobsSend
+            | OperationId::JobsCancel => true,
+            _ => false,
+        };
+        if !allowed {
+            return Err(Error::Denied("unsupported remote Start operation"));
+        }
+        authorization
+            .validate()
+            .map_err(|_| Error::Denied("invalid committed remote Start authorization"))?;
+        if authorization.intent.operation != operation.semantic_name()
+            || authorization.intent.arguments_sha256 != arguments_sha256(arguments)
+        {
+            return Err(Error::Denied(
+                "remote Start authorization differs from operation arguments",
+            ));
+        }
+        let arguments = arguments.as_object().cloned().ok_or(Error::Denied(
+            "remote operation arguments must be an object",
+        ))?;
+        let mut meta = RequestMetaObject::new();
+        meta.insert(
+            REMOTE_START_META_KEY.to_owned(),
+            serde_json::to_value(authorization)
+                .map_err(|_| Error::Protocol("cannot encode remote Start authorization"))?,
+        );
+        let mut params =
+            CallToolRequestParams::new(operation.model_name()).with_arguments(arguments);
+        params.meta = Some(meta);
+        Ok(params)
+    }
+
+    pub async fn call_effect(
+        &self,
+        ctx: &ToolContext,
+        operation: OperationId,
+        arguments: &Value,
+        authorization: &RemoteStartAuthorization,
+    ) -> Result<ToolOutput> {
+        let params = Self::effect_params(operation, arguments, authorization)?;
+        self.call_params(ctx, params).await
+    }
+}
+
+pub async fn connect_remote_bridge(endpoint: &Endpoint) -> Result<RemoteBridge> {
+    if !matches!(
+        endpoint,
+        Endpoint::Http {
+            bearer_env: Some(_),
+            ..
+        }
+    ) {
+        return Err(Error::Denied(
+            "remote Start bridge requires bearer-authenticated Streamable HTTP MCP",
+        ));
+    }
+    let conn = connect(endpoint).await?;
+    if conn.http_bridge.is_none() {
+        return Err(Error::Denied("remote Start HTTP bridge unavailable"));
+    }
+    Ok(RemoteBridge { conn })
+}
+
 struct RemoteTool {
     spec: ToolSpec,
     revision: u64,
@@ -496,6 +783,16 @@ fn epoch() -> Result<u64> {
 /// Long-lived GET SSE and modern subscriptions/listen never use a whole-response
 /// deadline. Explicit discovery/read/tool calls retain their own bounded Tokio
 /// deadlines; all connections keep a bounded TCP connect timeout.
+fn remote_start_lease_url(uri: &str) -> Result<reqwest::Url> {
+    let mut url =
+        reqwest::Url::parse(uri).map_err(|_| Error::Denied("invalid MCP HTTP endpoint"))?;
+    let path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{path}/remote-start-lease"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
 fn verified_http_client(
     uri: &str,
     ca_file: Option<&PathBuf>,
@@ -591,6 +888,7 @@ async fn connect(spec: &Endpoint) -> Result<Arc<Connection>> {
                 revisions: revisions.clone(),
                 _child: Some(Mutex::new(child)),
                 _legacy: None,
+                http_bridge: None,
                 subscription_abort: Mutex::new(None),
             }))
         }
@@ -605,6 +903,17 @@ async fn connect(spec: &Endpoint) -> Result<Arc<Connection>> {
             // deadlines; an HTTP-client whole-response deadline would expire
             // the active subscription and spuriously invalidate tool grants.
             let client = verified_http_client(url, ca_file.as_ref(), None)?;
+            let bearer = match bearer_env {
+                Some(name) => {
+                    let secret = std::env::var(name)
+                        .map_err(|_| Error::Denied("selected MCP bearer env missing"))?;
+                    if secret.is_empty() || secret.len() > 4096 || secret.contains(['\r', '\n']) {
+                        return Err(Error::Denied("invalid MCP bearer"));
+                    }
+                    Some(Zeroizing::new(secret))
+                }
+                None => None,
+            };
             let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone());
             // Modern subscriptions/listen is a long-lived POST. Reserve one
             // HTTP request for that explicit change feed and one for ordinary
@@ -612,14 +921,18 @@ async fn connect(spec: &Endpoint) -> Result<Arc<Connection>> {
             config.max_concurrent_requests = 2;
             config.max_sse_event_size = 128 * 1024;
             config.reinit_on_expired_session = false; // no ambiguous external-effect replay
-            if let Some(name) = bearer_env {
-                let secret = std::env::var(name)
-                    .map_err(|_| Error::Denied("selected MCP bearer env missing"))?;
-                if secret.is_empty() || secret.len() > 4096 || secret.contains(['\r', '\n']) {
-                    return Err(Error::Denied("invalid MCP bearer"));
-                }
-                config = config.auth_header(secret);
+            if let Some(secret) = bearer.as_deref() {
+                config = config.auth_header(secret.to_owned());
             }
+            let bridge = bearer
+                .map(|bearer| {
+                    remote_start_lease_url(url).map(|lease_url| HttpBridgeTransport {
+                        client: client.clone(),
+                        lease_url,
+                        bearer,
+                    })
+                })
+                .transpose()?;
             let transport = StreamableHttpClientTransport::with_client(client, config);
             let service = tokio::time::timeout(
                 CONNECT_TIMEOUT,
@@ -645,6 +958,7 @@ async fn connect(spec: &Endpoint) -> Result<Arc<Connection>> {
                 revisions: revisions.clone(),
                 _child: None,
                 _legacy: None,
+                http_bridge: bridge,
                 subscription_abort: Mutex::new(None),
             }))
         }
@@ -678,6 +992,7 @@ async fn connect(spec: &Endpoint) -> Result<Arc<Connection>> {
                 revisions: revisions.clone(),
                 _child: None,
                 _legacy: Some(pumps),
+                http_bridge: None,
                 subscription_abort: Mutex::new(None),
             }))
         }
@@ -1005,7 +1320,328 @@ pub async fn attach(agent: &mut Agent, options: &Options) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aw_agent_core::{
+        AccountOwner, BillingOwner, CancellationToken, CredentialCustody, InvocationIdentity,
+        PrincipalId,
+    };
+    use aw_tools::{
+        filesystem::schema::Tool as FsTool,
+        remote_start::{
+            RemoteSessionAction, RemoteStartIntent, RemoteStartProvenance, RemoteStartSource,
+            REMOTE_START_VERSION,
+        },
+    };
     use serde_json::json;
+
+    fn live_bridge_context() -> ToolContext {
+        let actor = PrincipalId::new("local:bridge-test").unwrap();
+        ToolContext {
+            actor: actor.clone(),
+            turn_id: 1,
+            call_id: "bridge-test".into(),
+            source: ToolSource::trusted_host(),
+            effect: ToolEffect::Control,
+            execution_site: "dotlink:test".into(),
+            cancellation: CancellationToken::new(),
+            result_budget_bytes: MAX_TOOL_RESULT_BYTES,
+            identity: InvocationIdentity {
+                actor: actor.clone(),
+                account_id: "fixture".into(),
+                account_owner: AccountOwner::User(actor.clone()),
+                payer: BillingOwner::User(actor),
+                credential_custody: CredentialCustody::UserDevice("fixture".into()),
+                credential_version: None,
+                inference_executor: "local".into(),
+                model: "fixture".into(),
+                grant_revision: 1,
+            },
+            scope: None,
+            execution_owner: None,
+            execution_scope: None,
+        }
+    }
+
+    fn live_start(
+        lease: &RemoteRuntimeLease,
+        operation: OperationId,
+        arguments: &Value,
+        canonical_ref: &str,
+        action: RemoteSessionAction,
+        attempt: &str,
+    ) -> RemoteStartAuthorization {
+        RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: format!("turn:1/call:{attempt}"),
+                turn_id: 1,
+                call_id: attempt.into(),
+                effect_attempt_id: attempt.into(),
+                operation: operation.semantic_name().into(),
+                canonical_ref: canonical_ref.into(),
+                arguments_sha256: arguments_sha256(arguments),
+                original_request_sha256: [3; 32],
+                session_action: action,
+                target: lease.clone(),
+            },
+            RemoteStartProvenance {
+                actor: "local:bridge-test".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: operation.semantic_name().into(),
+                    source_epoch: 1,
+                    site: "dotlink:test".into(),
+                    resource_scope: canonical_ref.into(),
+                    grant_sha256: [4; 32],
+                },
+                policy_revision_sha256: [5; 32],
+                policy_admission_id: format!("policy-{attempt}"),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap()
+    }
+
+    fn job_ref(output: &ToolOutput) -> String {
+        output
+            .content
+            .split_whitespace()
+            .next()
+            .filter(|reference| reference.starts_with("j:"))
+            .expect("remote effect must return one compact Job ref")
+            .to_owned()
+    }
+
+    async fn wait_settled(bridge: &RemoteBridge, ctx: &ToolContext, reference: &str) -> ToolOutput {
+        for _ in 0..80 {
+            let status = bridge
+                .call_read(
+                    ctx,
+                    OperationId::JobsGet,
+                    &json!({"ref":reference,"wait_ms":100}),
+                )
+                .await
+                .unwrap();
+            if status.content.contains(" settled ") || status.content.contains(" cancelled ") {
+                return status;
+            }
+        }
+        panic!("remote Job did not settle")
+    }
+
+    async fn live_bridge_fixture() -> Option<(RemoteBridge, RemoteRuntimeLease, ToolContext)> {
+        let Ok(url) = std::env::var("AW_DOTLINK_BRIDGE_TEST_URL") else {
+            return None;
+        };
+        std::env::var_os("AW_DOTLINK_BRIDGE_TEST_TOKEN")?;
+        let endpoint = Endpoint::Http {
+            id: "dotlink-test".into(),
+            url,
+            bearer_env: Some("AW_DOTLINK_BRIDGE_TEST_TOKEN".into()),
+            ca_file: None,
+        };
+        let bridge = connect_remote_bridge(&endpoint).await.unwrap();
+        let lease = bridge.lease().await.unwrap();
+        Some((bridge, lease, live_bridge_context()))
+    }
+
+    #[tokio::test]
+    async fn live_dotlink_remote_bridge_filesystem_graph_and_read() {
+        let Some((bridge, lease, ctx)) = live_bridge_fixture().await else {
+            return;
+        };
+
+        let write_args = json!({"path":"bridge-source.txt","content":"source"});
+        let write = live_start(
+            &lease,
+            OperationId::Fs(FsTool::Write),
+            &write_args,
+            "/d:d/i:i/p:p/a:0/t:1",
+            RemoteSessionAction::Submit,
+            "write",
+        );
+        let write_result = bridge
+            .call_effect(&ctx, OperationId::Fs(FsTool::Write), &write_args, &write)
+            .await
+            .unwrap();
+        assert!(!write_result.is_error, "{}", write_result.content);
+
+        let move_args = json!({"from":"bridge-source.txt","to":"bridge-dest.txt"});
+        let moved = live_start(
+            &lease,
+            OperationId::Fs(FsTool::Move),
+            &move_args,
+            "/d:d/i:i/p:p/a:0/t:1",
+            RemoteSessionAction::Submit,
+            "move",
+        );
+        let first_move = bridge
+            .call_effect(&ctx, OperationId::Fs(FsTool::Move), &move_args, &moved)
+            .await
+            .unwrap();
+        let replay_move = bridge
+            .call_effect(&ctx, OperationId::Fs(FsTool::Move), &move_args, &moved)
+            .await
+            .unwrap();
+        assert_eq!(replay_move.content, first_move.content);
+        assert_eq!(replay_move.is_error, first_move.is_error);
+        let read = bridge
+            .call_read(
+                &ctx,
+                OperationId::Fs(FsTool::Read),
+                &json!({"path":"bridge-dest.txt","numbered":false}),
+            )
+            .await
+            .unwrap();
+        assert!(read.content.contains("source"), "{}", read.content);
+
+        // A valid upstream Start is not a dotlink filesystem grant: escaping
+        // the configured narrow root still fails at the concrete owner.
+        let denied_args = json!({"path":"../bridge-outside.txt","content":"blocked"});
+        let denied = live_start(
+            &lease,
+            OperationId::Fs(FsTool::Write),
+            &denied_args,
+            "/d:d/i:i/p:p/a:0/t:1",
+            RemoteSessionAction::Submit,
+            "denied-write",
+        );
+        let denied_result = bridge
+            .call_effect(&ctx, OperationId::Fs(FsTool::Write), &denied_args, &denied)
+            .await
+            .unwrap();
+        assert!(denied_result.is_error, "{}", denied_result.content);
+
+        // This server has shell disabled. A fully valid Start cannot mint the
+        // missing local launcher/tool grant.
+        let shell_args = json!({"command":"true","dir":".","timeout_secs":2});
+        let shell = live_start(
+            &lease,
+            OperationId::Bash,
+            &shell_args,
+            "/d:d/i:i/p:p/a:0/t:1",
+            RemoteSessionAction::Submit,
+            "denied-shell",
+        );
+        assert!(
+            bridge
+                .call_effect(&ctx, OperationId::Bash, &shell_args, &shell)
+                .await
+                .is_err(),
+            "upstream Start must not create absent dotlink shell authority"
+        );
+
+        let graph_args = json!({
+            "ops":[["write",{"path":"bridge-graph.txt","content":"graph"}]],
+            "background":true
+        });
+        let graph = live_start(
+            &lease,
+            OperationId::Batch,
+            &graph_args,
+            "/d:d/i:i/p:p/a:0/t:1",
+            RemoteSessionAction::Submit,
+            "graph",
+        );
+        let graph_receipt = bridge
+            .call_effect(&ctx, OperationId::Batch, &graph_args, &graph)
+            .await
+            .unwrap();
+        let graph_ref = job_ref(&graph_receipt);
+        let replay_graph = bridge
+            .call_effect(&ctx, OperationId::Batch, &graph_args, &graph)
+            .await
+            .unwrap();
+        assert_eq!(replay_graph.content, graph_receipt.content);
+        wait_settled(&bridge, &ctx, &graph_ref).await;
+        let node = format!("{graph_ref}/n:1");
+        let graph_result = bridge
+            .call_read(
+                &ctx,
+                OperationId::JobsRead,
+                &json!({"ref":node,"view":"result","encoding":"text"}),
+            )
+            .await
+            .unwrap();
+        assert!(!graph_result.is_error, "{}", graph_result.content);
+        let graph_file = bridge
+            .call_read(
+                &ctx,
+                OperationId::Fs(FsTool::Read),
+                &json!({"path":"bridge-graph.txt","numbered":false}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            graph_file.content.contains("graph"),
+            "{}",
+            graph_file.content
+        );
+    }
+
+    #[tokio::test]
+    async fn live_dotlink_remote_bridge_process_control_and_read() {
+        let Some((bridge, lease, ctx)) = live_bridge_fixture().await else {
+            return;
+        };
+
+        let shell_args = json!({
+            "command":"IFS= read -r line; printf '%s' \"$line\"",
+            "dir":".",
+            "interactive":true,
+            "timeout_secs":5
+        });
+        let shell = live_start(
+            &lease,
+            OperationId::Bash,
+            &shell_args,
+            "/d:d/i:i/p:p/a:0/t:1",
+            RemoteSessionAction::Submit,
+            "shell",
+        );
+        let shell_receipt = bridge
+            .call_effect(&ctx, OperationId::Bash, &shell_args, &shell)
+            .await
+            .unwrap();
+        assert!(!shell_receipt.is_error, "{}", shell_receipt.content);
+        let shell_ref = job_ref(&shell_receipt);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let send_args = json!({"ref":shell_ref,"input":{"text":"hello-live\n"}});
+        let send = live_start(
+            &lease,
+            OperationId::JobsSend,
+            &send_args,
+            &format!("/d:d/i:i/p:p/a:0/{}", shell_ref),
+            RemoteSessionAction::Control,
+            "send",
+        );
+        let first_send = bridge
+            .call_effect(&ctx, OperationId::JobsSend, &send_args, &send)
+            .await
+            .unwrap();
+        let replay_send = bridge
+            .call_effect(&ctx, OperationId::JobsSend, &send_args, &send)
+            .await
+            .unwrap();
+        assert_eq!(replay_send.content, first_send.content);
+        assert_eq!(replay_send.is_error, first_send.is_error);
+        assert!(!first_send.is_error, "{}", first_send.content);
+        wait_settled(&bridge, &ctx, &shell_ref).await;
+        let stdout = bridge
+            .call_read(
+                &ctx,
+                OperationId::JobsRead,
+                &json!({"ref":shell_ref,"view":"stdout","encoding":"text"}),
+            )
+            .await
+            .unwrap();
+        assert!(stdout.content.contains("hello-live"), "{}", stdout.content);
+    }
+
     #[test]
     fn explicit_sources_are_bounded_and_never_get_implicit_tool_grants() {
         let opts = Options {
@@ -1048,6 +1684,122 @@ mod tests {
         .parsed()
         .is_err());
     }
+    #[test]
+    fn execution_site_requires_exact_bearer_authenticated_http_server() {
+        let base = Options {
+            http: vec!["l5=https://example.test/mcp".into()],
+            auth_env: vec!["l5=DOTLINK_TOKEN".into()],
+            execution_site: Some("dotlink:l5=l5".into()),
+            ..Default::default()
+        };
+        let binding = base.execution_site_binding().unwrap().unwrap();
+        assert_eq!(binding.site, "dotlink:l5");
+        assert!(matches!(
+            binding.endpoint,
+            Endpoint::Http { ref id, ref bearer_env, .. }
+                if id == "l5" && bearer_env.as_deref() == Some("DOTLINK_TOKEN")
+        ));
+
+        let mut invalid = base.clone();
+        invalid.execution_site = Some("local=l5".into());
+        assert!(invalid.parsed().is_err());
+
+        invalid = base.clone();
+        invalid.execution_site = Some("dotlink:l5=missing".into());
+        assert!(invalid.parsed().is_err());
+
+        invalid = base.clone();
+        invalid.auth_env.clear();
+        assert!(invalid.parsed().is_err());
+
+        invalid = base.clone();
+        invalid.allow = vec!["l5:bash".into()];
+        assert!(invalid.parsed().is_err());
+
+        invalid = base.clone();
+        invalid.resource_allow = vec!["l5:test://docs/report".into()];
+        assert!(invalid.parsed().is_err());
+
+        invalid = Options {
+            stdio: vec!["l5=/bin/true".into()],
+            execution_site: Some("dotlink:l5=l5".into()),
+            ..Default::default()
+        };
+        assert!(invalid.parsed().is_err());
+    }
+
+    #[test]
+    fn remote_effect_wire_metadata_binds_exact_authorization_and_arguments() {
+        use aw_tools::remote_start::{
+            RemoteRuntimeLease, RemoteSessionAction, RemoteStartIntent, RemoteStartProvenance,
+            RemoteStartSource, REMOTE_START_VERSION,
+        };
+
+        let operation = OperationId::Fs(aw_tools::filesystem::schema::Tool::Move);
+        let arguments = json!({"from":"a.txt","to":"b.txt"});
+        let authorization = RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: "turn:1/call:mv".into(),
+                turn_id: 1,
+                call_id: "mv".into(),
+                effect_attempt_id: "mv".into(),
+                operation: operation.semantic_name().into(),
+                canonical_ref: "/d:d/i:i/p:p/a:0/t:1".into(),
+                arguments_sha256: arguments_sha256(&arguments),
+                original_request_sha256: [3; 32],
+                session_action: RemoteSessionAction::Submit,
+                target: RemoteRuntimeLease {
+                    target_host: "l5".into(),
+                    target_profile: "default".into(),
+                    generation: [7; 32],
+                    issued_at_unix_ms: 10,
+                    expires_at_unix_ms: 20,
+                },
+            },
+            RemoteStartProvenance {
+                actor: "actor".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: "mv".into(),
+                    source_epoch: 1,
+                    site: "dotlink:l5".into(),
+                    resource_scope: "root".into(),
+                    grant_sha256: [4; 32],
+                },
+                policy_revision_sha256: [5; 32],
+                policy_admission_id: "policy".into(),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap();
+
+        let params = RemoteBridge::effect_params(operation, &arguments, &authorization).unwrap();
+        let wire = serde_json::to_value(params).unwrap();
+        assert_eq!(wire["name"], "mv");
+        assert_eq!(wire["arguments"], arguments);
+        assert_eq!(
+            wire["_meta"][REMOTE_START_META_KEY],
+            serde_json::to_value(&authorization).unwrap()
+        );
+        assert!(RemoteBridge::effect_params(
+            operation,
+            &json!({"from":"other.txt","to":"b.txt"}),
+            &authorization,
+        )
+        .is_err());
+        assert!(RemoteBridge::effect_params(
+            OperationId::Fs(aw_tools::filesystem::schema::Tool::Read),
+            &arguments,
+            &authorization,
+        )
+        .is_err());
+    }
+
     #[test]
     fn explicit_legacy_sse_never_inherits_http_or_stdio_grants() {
         let legacy = Options {

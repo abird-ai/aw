@@ -34,6 +34,8 @@ impl TurnJournal for MemoryJournal {
                 JournalEntry::ToolFinished { .. } => "tool_finish",
                 JournalEntry::ToolDenied { .. } => "tool_denied",
                 JournalEntry::ToolRevised { .. } => "tool_revised",
+                JournalEntry::AuthoritySegmentStarted { .. } => "authority_segment_started",
+                JournalEntry::ModelInvocationAdmitted { .. } => "model_invocation_admitted",
             })
         })
     }

@@ -245,9 +245,11 @@ Fixed, route-once and route-each child selection use the same bounded routing ev
 A child allocation is reserved first, then target selection is durably consumed into that allocation **before** worktree planning, Session creation or child provider entry. Classified child routing wraps the normal Phase-40 routing journal with the Phase-43 root budget: the delegation routing attempt reserves a root model-attempt slot before Phase-40 classifier intent/provider entry, while the ordinary routing result commits before delegation usage settlement. Recursive descendants inherit the same root route revision and may select different candidates only within that predeclared set.
 
 
-## Phase 46 — bounded multi-model teams and explicit join
+## Historical Phase 46 — bounded multi-model teams and explicit join
 
-Phase 46 adds a host-selected immutable team template but **no second agent engine**. The root Agent receives a `team` tool only when `--subagent-team` resolves an actor-owned immutable template revision. The tool schema contains only a task and optional title; the model cannot choose members, join policy, provider/model, route, tool authority, depth, worktree, budgets or publisher. Recursive child Agents do not receive `team`.
+> Current surface: the unified Jobs + Agent hard cutover removed the model-facing `team` route and its CLI activation flags. The durable Phase-46 records remain historical/admin state only.
+
+Phase 46 added a host-selected immutable team template but **no second agent engine**. The root Agent receives a `team` tool only when `--subagent-team` resolves an actor-owned immutable template revision. The tool schema contains only a task and optional title; the model cannot choose members, join policy, provider/model, route, tool authority, depth, worktree, budgets or publisher. Recursive child Agents do not receive `team`.
 
 A team template contains 2–4 ordered static members `(id, role, instruction)` and `all_required` join only. Candidates run sequentially in template order through the existing `subagents::Service`, therefore reusing Phase-42 worktree isolation, Phase-43 budgets/deadline accounting, Phase-44 recursion and Phase-45 child routing. Each candidate is an ordinary durable child Session. Candidate full answers remain there; team receipts store only Session/subagent IDs, answer digest and truncation evidence.
 
@@ -270,9 +272,11 @@ The current live profile object may satisfy a saved Session when its profile nam
 The same phase removes the extra DIM modifier from the empty fullscreen composer placeholder. The placeholder remains semantic-muted and one-line; this avoids terminal themes where muted+DIM made all text except the cursor-overlaid first character effectively invisible.
 
 
-## Phase 49 — governed generative task planning
+## Historical Phase 49 — governed generative task planning
 
-Phase 49 adds a root-only `plan` tool without introducing a second orchestration engine. The trusted host pins one actor-owned immutable routing strategy whose role is `planner` and whose mode is `fixed`; planner model selection is therefore host-declared and inference-free. The model-facing `plan` schema contains only a task and optional title. Planner/provider account, model, route, role allowlist, task count, child routing/tools/worktree/depth/budgets and publication policy remain host-owned.
+> Current surface: the model-facing `plan` route and planner activation flags were removed by the unified Jobs + Agent hard cutover. Planner receipts remain durable history/admin state only.
+
+Phase 49 added a root-only `plan` tool without introducing a second orchestration engine. The trusted host pins one actor-owned immutable routing strategy whose role is `planner` and whose mode is `fixed`; planner model selection is therefore host-declared and inference-free. The model-facing `plan` schema contains only a task and optional title. Planner/provider account, model, route, role allowlist, task count, child routing/tools/worktree/depth/budgets and publication policy remain host-owned.
 
 The planner provider call uses a dedicated tool-free `PlannerExecutor` / `PlannerJournal` and `InvocationPurpose::Planner`. Planner evidence is bounded JSON containing only the root task, host-approved role labels and max-task cap. Strict planner output contains 1–6 typed tasks with ID, semantic role, bounded task text and dependency IDs. Unknown fields/roles/dependencies, self-dependencies, duplicates, cycles and oversized proposals fail before child admission.
 
@@ -280,9 +284,11 @@ The planner call creates/reuses the ordinary Phase-43 delegation root and consum
 
 Each imported child result is verified against the authoritative completed child Session before a digest receipt is attached. The final planner join is deterministic and stores only task/session/subagent IDs, dependencies, answer digests/truncation flags and joined digest; full child/joined answer bodies remain outside the planner receipt tables. The root parent Agent receives the joined evidence as one tool result and is the sole final publisher/synthesizer. Restart never automatically replays planner or planned-child provider effects.
 
-## Phase 50 — governed guardian review before parent publication
+## Historical Phase 50 — governed guardian review before parent publication
 
-Phase 50 adds one optional host-selected guardian gate over already verified Phase-46 team joins and Phase-49 planner joins. It does **not** create another orchestration engine. The trusted native host pins one actor-owned immutable routing revision with `role=guardian` and `mode=fixed`, plus bounded host policy text. `aw-agent-core` invokes that target through a distinct tool-free `ReviewExecutor` / `ReviewJournal` and `InvocationPurpose::Guardian`; guardian output is strict typed `pass | deny | needs_human | require_evidence` data.
+> Current surface: the model-facing `review_release` route and guardian activation flags were removed by the unified Jobs + Agent hard cutover. Durable review/approval records remain administrative history and do not become model authority.
+
+Phase 50 added one optional host-selected guardian gate over already verified Phase-46 team joins and Phase-49 planner joins. It does **not** create another orchestration engine. The trusted native host pins one actor-owned immutable routing revision with `role=guardian` and `mode=fixed`, plus bounded host policy text. `aw-agent-core` invokes that target through a distinct tool-free `ReviewExecutor` / `ReviewJournal` and `InvocationPurpose::Guardian`; guardian output is strict typed `pass | deny | needs_human | require_evidence` data.
 
 The team/planner join is committed and independently verified first. With a guardian configured, joined evidence is then quarantined from the parent Agent until the review gate releases it. `pass` satisfies only that review requirement. `deny` and `require_evidence` release no joined text. `needs_human` creates one durable owner approval request; a later parent turn may call the root-only `review_release` tool with only the review ID.
 

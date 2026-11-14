@@ -9,12 +9,6 @@ mod resource_cli_args;
 mod skill_package;
 #[cfg(feature = "routing")]
 mod routing_runtime;
-#[cfg(feature = "pipelines")]
-mod subagent_teams;
-#[cfg(all(feature = "pipelines", feature = "routing"))]
-mod subagent_planner;
-#[cfg(all(feature = "pipelines", feature = "routing"))]
-mod subagent_reviews;
 #[cfg(all(feature = "team", target_os = "linux"))]
 mod team;
 // Opt-in host-only Actor/child services. 9C gates authenticated stdio
@@ -386,33 +380,6 @@ pub(crate) struct ToolCliArgs {
     /// Optional exact immutable child-routing strategy revision.
     #[arg(long)]
     subagent_route_revision: Option<String>,
-    /// Optional immutable candidate-team template exposed as the root Agent `team` tool.
-    #[arg(long)]
-    subagent_team: Option<String>,
-    /// Optional exact immutable candidate-team template revision.
-    #[arg(long)]
-    subagent_team_revision: Option<String>,
-    /// Optional immutable fixed planner routing strategy exposed as the root Agent `plan` tool.
-    #[arg(long)]
-    subagent_planner_route: Option<String>,
-    /// Optional exact immutable planner routing strategy revision.
-    #[arg(long)]
-    subagent_planner_route_revision: Option<String>,
-    /// Host-approved semantic role the generative planner may assign to tasks. Repeatable.
-    #[arg(long = "subagent-planner-role")]
-    subagent_planner_roles: Vec<String>,
-    /// Maximum tasks one planner proposal may contain (hard max 6).
-    #[arg(long, default_value_t = 4)]
-    subagent_planner_max_tasks: u8,
-    /// Optional immutable fixed guardian routing strategy used to review joined team/planner evidence.
-    #[arg(long)]
-    subagent_guardian_route: Option<String>,
-    /// Optional exact immutable guardian routing strategy revision.
-    #[arg(long)]
-    subagent_guardian_route_revision: Option<String>,
-    /// Host-authored bounded guardian policy. Required with --subagent-guardian-route.
-    #[arg(long)]
-    subagent_guardian_policy: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1036,15 +1003,6 @@ pub(crate) struct RunArgs {
     subagent_deadline_secs: u32,
     subagent_route: Option<String>,
     subagent_route_revision: Option<String>,
-    subagent_team: Option<String>,
-    subagent_team_revision: Option<String>,
-    subagent_planner_route: Option<String>,
-    subagent_planner_route_revision: Option<String>,
-    subagent_planner_roles: Vec<String>,
-    subagent_planner_max_tasks: u8,
-    subagent_guardian_route: Option<String>,
-    subagent_guardian_route_revision: Option<String>,
-    subagent_guardian_policy: Option<String>,
     allow_web_tools: bool,
     web_workspace: bool,
     allow_web_terminals: bool,
@@ -1183,15 +1141,6 @@ impl RunArgs {
             subagent_deadline_secs: tools.subagent_deadline_secs,
             subagent_route: tools.subagent_route,
             subagent_route_revision: tools.subagent_route_revision,
-            subagent_team: tools.subagent_team,
-            subagent_team_revision: tools.subagent_team_revision,
-            subagent_planner_route: tools.subagent_planner_route,
-            subagent_planner_route_revision: tools.subagent_planner_route_revision,
-            subagent_planner_roles: tools.subagent_planner_roles,
-            subagent_planner_max_tasks: tools.subagent_planner_max_tasks,
-            subagent_guardian_route: tools.subagent_guardian_route,
-            subagent_guardian_route_revision: tools.subagent_guardian_route_revision,
-            subagent_guardian_policy: tools.subagent_guardian_policy,
             allow_web_tools: web_options.allow_web_tools,
             web_workspace: web_options.web_workspace,
             allow_web_terminals: web_options.allow_web_terminals,
@@ -2226,6 +2175,11 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         idle_timeout: Duration::from_secs(args.idle_timeout),
         max_output_bytes: config::MAX_OUTPUT_BYTES,
     };
+    let execution_site = args
+        .mcp
+        .execution_site_binding()?
+        .map(|binding| binding.site)
+        .unwrap_or_else(|| "local".to_owned());
     let tool_options = aw::LocalToolOptions {
         root: args
             .tool_root
@@ -2234,7 +2188,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             .unwrap_or_else(|| ctx.working_directory.clone()),
         mode: args.tools,
         selected_tools: args.tool_allow.clone(),
-        execution_site: "local".into(),
+        execution_site,
         bash: args
             .bash
             .clone()
@@ -2450,15 +2404,6 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                 64,
                 1,
                 3600,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Vec::new(),
-                4,
-                None,
                 None,
                 None,
                 directory.clone(),
@@ -2758,15 +2703,6 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         args.subagent_deadline_secs,
         args.subagent_route.clone(),
         args.subagent_route_revision.clone(),
-        args.subagent_team.clone(),
-        args.subagent_team_revision.clone(),
-        args.subagent_planner_route.clone(),
-        args.subagent_planner_route_revision.clone(),
-        args.subagent_planner_roles.clone(),
-        args.subagent_planner_max_tasks,
-        args.subagent_guardian_route.clone(),
-        args.subagent_guardian_route_revision.clone(),
-        args.subagent_guardian_policy.clone(),
         directory,
         args.store_backend,
         persistent,
@@ -3153,15 +3089,6 @@ struct Host {
     subagent_deadline_secs: u32,
     subagent_route: Option<String>,
     subagent_route_revision: Option<String>,
-    subagent_team: Option<String>,
-    subagent_team_revision: Option<String>,
-    subagent_planner_route: Option<String>,
-    subagent_planner_route_revision: Option<String>,
-    subagent_planner_roles: Vec<String>,
-    subagent_planner_max_tasks: u8,
-    subagent_guardian_route: Option<String>,
-    subagent_guardian_route_revision: Option<String>,
-    subagent_guardian_policy: Option<String>,
     state_dir: Option<PathBuf>,
     store_backend: resources_cli::SessionStoreBackendArg,
     sqlite_store: Option<SessionStore>,
@@ -3517,15 +3444,6 @@ impl Host {
         subagent_deadline_secs: u32,
         subagent_route: Option<String>,
         subagent_route_revision: Option<String>,
-        subagent_team: Option<String>,
-        subagent_team_revision: Option<String>,
-        subagent_planner_route: Option<String>,
-        subagent_planner_route_revision: Option<String>,
-        subagent_planner_roles: Vec<String>,
-        subagent_planner_max_tasks: u8,
-        subagent_guardian_route: Option<String>,
-        subagent_guardian_route_revision: Option<String>,
-        subagent_guardian_policy: Option<String>,
         state_dir: Option<PathBuf>,
         store_backend: resources_cli::SessionStoreBackendArg,
         persistent: Option<PersistentSession>,
@@ -3558,15 +3476,6 @@ impl Host {
             subagent_deadline_secs,
             subagent_route,
             subagent_route_revision,
-            subagent_team,
-            subagent_team_revision,
-            subagent_planner_route,
-            subagent_planner_route_revision,
-            subagent_planner_roles,
-            subagent_planner_max_tasks,
-            subagent_guardian_route,
-            subagent_guardian_route_revision,
-            subagent_guardian_policy,
             state_dir,
             store_backend,
             sqlite_store: persistent.as_ref().map(|saved| saved.store.clone()),
@@ -3918,75 +3827,6 @@ impl Host {
                 "--subagent-route requires the separate --subagents opt-in".into(),
             ));
         }
-        if self.subagent_team_revision.is_some() && self.subagent_team.is_none() {
-            return Err(Error::Config(
-                "--subagent-team-revision requires --subagent-team".into(),
-            ));
-        }
-        if self.subagent_team.is_some() && !self.subagents_enabled {
-            return Err(Error::Config(
-                "--subagent-team requires the separate --subagents opt-in".into(),
-            ));
-        }
-        if self.subagent_planner_route_revision.is_some()
-            && self.subagent_planner_route.is_none()
-        {
-            return Err(Error::Config(
-                "--subagent-planner-route-revision requires --subagent-planner-route".into(),
-            ));
-        }
-        if !self.subagent_planner_roles.is_empty() && self.subagent_planner_route.is_none() {
-            return Err(Error::Config(
-                "--subagent-planner-role requires --subagent-planner-route".into(),
-            ));
-        }
-        if self.subagent_planner_route.is_some() && !self.subagents_enabled {
-            return Err(Error::Config(
-                "--subagent-planner-route requires the separate --subagents opt-in".into(),
-            ));
-        }
-        if self.subagent_planner_route.is_some()
-            && !(1..=6).contains(&self.subagent_planner_max_tasks)
-        {
-            return Err(Error::Config(
-                "--subagent-planner-max-tasks must be between 1 and 6".into(),
-            ));
-        }
-        if self.subagent_guardian_route_revision.is_some()
-            && self.subagent_guardian_route.is_none()
-        {
-            return Err(Error::Config(
-                "--subagent-guardian-route-revision requires --subagent-guardian-route".into(),
-            ));
-        }
-        if self.subagent_guardian_policy.is_some() && self.subagent_guardian_route.is_none() {
-            return Err(Error::Config(
-                "--subagent-guardian-policy requires --subagent-guardian-route".into(),
-            ));
-        }
-        if self.subagent_guardian_route.is_some() && !self.subagents_enabled {
-            return Err(Error::Config(
-                "--subagent-guardian-route requires the separate --subagents opt-in".into(),
-            ));
-        }
-        if self.subagent_guardian_route.is_some()
-            && self
-                .subagent_guardian_policy
-                .as_deref()
-                .is_none_or(|policy| policy.trim().is_empty())
-        {
-            return Err(Error::Config(
-                "--subagent-guardian-route requires --subagent-guardian-policy".into(),
-            ));
-        }
-        if self.subagent_guardian_route.is_some()
-            && self.subagent_team.is_none()
-            && self.subagent_planner_route.is_none()
-        {
-            return Err(Error::Config(
-                "--subagent-guardian-route requires --subagent-team and/or --subagent-planner-route".into(),
-            ));
-        }
         let mut stable_agent_service: Option<subagents::Service> = None;
         if self.subagents_enabled {
             if web {
@@ -4063,101 +3903,18 @@ impl Host {
                 self.settings.clone(),
                 service_config,
             )?;
-            agent.register_host_tool(service.tool())?;
             stable_agent_service = Some(service.clone());
-            #[cfg(all(feature = "pipelines", feature = "routing"))]
-            let review_gate = if let Some(selector) = self.subagent_guardian_route.as_deref() {
-                let strategy = persistent.store.routing_strategy(
-                    &persistent.actor,
-                    selector,
-                    self.subagent_guardian_route_revision.as_deref(),
-                )?;
-                let guardian_config = subagent_reviews::GuardianConfig::new(
-                    &agent,
-                    &persistent.store,
-                    strategy,
-                    &self.file_config,
-                    self.subagent_guardian_policy
-                        .clone()
-                        .ok_or(Error::Config(
-                            "--subagent-guardian-route requires --subagent-guardian-policy".into(),
-                        ))?,
-                    self.settings.idle_timeout,
-                    self.settings.request_timeout,
-                )?;
-                let gate =
-                    subagent_reviews::ReviewGate::new(persistent.store.clone(), guardian_config);
-                agent.register_host_tool(gate.release_tool())?;
-                Some(gate)
-            } else {
-                None
-            };
-            #[cfg(not(all(feature = "pipelines", feature = "routing")))]
-            if self.subagent_guardian_route.is_some() {
-                return Err(Error::Config(
-                    "this build does not include governed guardian review support".into(),
-                ));
-            }
-            #[cfg(feature = "pipelines")]
-            if let Some(selector) = self.subagent_team.as_deref() {
-                let revision = persistent.store.team_revision(
-                    &persistent.actor,
-                    selector,
-                    self.subagent_team_revision.as_deref(),
-                )?;
-                let team_service = subagent_teams::Service::new(
-                    persistent.store.clone(),
-                    revision,
-                    service.clone(),
-                );
-                #[cfg(feature = "routing")]
-                let team_service = team_service.with_review_gate(review_gate.clone());
-                agent.register_host_tool(team_service.tool())?;
-            }
-            #[cfg(not(feature = "pipelines"))]
-            if self.subagent_team.is_some() {
-                return Err(Error::Config(
-                    "this build does not include bounded team templates".into(),
-                ));
-            }
-            #[cfg(all(feature = "pipelines", feature = "routing"))]
-            if let Some(selector) = self.subagent_planner_route.as_deref() {
-                let strategy = persistent.store.routing_strategy(
-                    &persistent.actor,
-                    selector,
-                    self.subagent_planner_route_revision.as_deref(),
-                )?;
-                let planner_config = subagent_planner::PlannerConfig::new(
-                    &agent,
-                    &persistent.store,
-                    strategy,
-                    &self.file_config,
-                    subagent_planner::PlannerRuntimePolicy {
-                        allowed_roles: self.subagent_planner_roles.clone(),
-                        max_tasks: self.subagent_planner_max_tasks,
-                        idle_timeout: self.settings.idle_timeout,
-                        request_timeout: self.settings.request_timeout,
-                    },
-                )?;
-                let planner_service = subagent_planner::Service::new(
-                    persistent.store.clone(),
-                    planner_config,
-                    service.clone(),
-                )
-                .with_review_gate(review_gate.clone());
-                agent.register_host_tool(planner_service.tool())?;
-            }
-            #[cfg(not(all(feature = "pipelines", feature = "routing")))]
-            if self.subagent_planner_route.is_some() {
-                return Err(Error::Config(
-                    "this build does not include governed planner support".into(),
-                ));
-            }
         }
         Self::storage_step(
             self.apply_persistence(&mut agent),
             "loading durable Session history",
         )?;
+        let remote_execution = self.mcp.execution_site_binding()?;
+        if remote_execution.is_some() && self.persistent.is_none() {
+            return Err(Error::Denied(
+                "remote MCP execution sites require a durable SQLite Session owner",
+            ));
+        }
         if let Some(persistent) = &self.persistent {
             let router = Arc::new(aw::agent_jobs::Router::new(
                 persistent.store.clone(),
@@ -4177,18 +3934,47 @@ impl Host {
                 self.tools
                     .graph_host_tools
                     .install(aw_tools::OperationId::Agent, agent_tool)?;
-                self.tools.operation_router.replace(Arc::new(
-                    subagents::PolicyOperationRouter::new(
-                        service.clone(),
-                        agent.tool_binding_authority(),
-                        subagents::PolicyOperationConfig::passthrough(),
-                    )?,
-                ))?;
             } else {
-                self.tools.operation_router.clear()?;
                 self.tools
                     .graph_host_tools
                     .remove(aw_tools::OperationId::Agent)?;
+            }
+
+            let mut operation_router = if let Some(service) = stable_agent_service.as_ref() {
+                Some(subagents::PolicyOperationRouter::new(
+                    service.clone(),
+                    agent.tool_binding_authority(),
+                    subagents::PolicyOperationConfig::passthrough(),
+                )?)
+            } else if remote_execution.is_some() {
+                Some(subagents::PolicyOperationRouter::local(
+                    persistent.store.clone(),
+                    agent.tool_binding_authority(),
+                    subagents::PolicyOperationConfig::passthrough(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(binding) = remote_execution {
+                if binding.site != self.tools.execution_site {
+                    return Err(Error::Denied(
+                        "remote execution-site binding differs from ToolPolicy site",
+                    ));
+                }
+                let runtime = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(Error::Storage("missing MCP runtime for remote execution site"))?;
+                let bridge = runtime.block_on(aw_mcp::connect_remote_bridge(&binding.endpoint))?;
+                operation_router = Some(
+                    operation_router
+                        .ok_or(Error::Storage("remote operation router missing"))?
+                        .with_remote_site(binding.site, bridge)?,
+                );
+            }
+            match operation_router {
+                Some(router) => self.tools.operation_router.replace(Arc::new(router))?,
+                None => self.tools.operation_router.clear()?,
             }
             if !web {
                 let branch = persistent.handle.branch()?.id;

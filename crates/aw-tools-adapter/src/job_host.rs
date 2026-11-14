@@ -419,6 +419,27 @@ fn direct_error_result(
     )
 }
 
+pub(crate) struct FiniteSubscriptionRequest<'a> {
+    pub(crate) actor: &'a PrincipalId,
+    pub(crate) id: &'a str,
+    pub(crate) node: Option<usize>,
+    pub(crate) expected_revision: Option<u64>,
+    pub(crate) recipient_ref: &'a str,
+    pub(crate) recipient_authority_ref: &'a str,
+    pub(crate) rules: EventRuleSet,
+}
+
+pub(crate) struct InitialWakeAdmissionRequest<'a> {
+    pub(crate) prepared: PreparedJob,
+    pub(crate) namespace: &'a str,
+    pub(crate) request_id: &'a str,
+    pub(crate) reserve_exposed: bool,
+    pub(crate) actor: &'a PrincipalId,
+    pub(crate) recipient_ref: &'a str,
+    pub(crate) recipient_authority_ref: &'a str,
+    pub(crate) rules: EventRuleSet,
+}
+
 pub(crate) struct JobHostConfig {
     pub session: String,
     pub branch: String,
@@ -547,14 +568,17 @@ impl JobHost {
 
     pub(crate) fn subscribe_finite(
         &self,
-        actor: &PrincipalId,
-        id: &str,
-        node: Option<usize>,
-        expected_revision: Option<u64>,
-        recipient_ref: &str,
-        recipient_authority_ref: &str,
-        rules: EventRuleSet,
+        request: FiniteSubscriptionRequest<'_>,
     ) -> Result<(String, SubscriptionUpdate)> {
+        let FiniteSubscriptionRequest {
+            actor,
+            id,
+            node,
+            expected_revision,
+            recipient_ref,
+            recipient_authority_ref,
+            rules,
+        } = request;
         let _transition = self
             .transition_gate
             .lock()
@@ -1350,15 +1374,15 @@ impl JobHost {
             let actor = actor.ok_or(Error::Protocol(
                 "initial Graph wake registration lacks authenticated actor",
             ))?;
-            if let Err(error) = self.subscribe_finite(
+            if let Err(error) = self.subscribe_finite(FiniteSubscriptionRequest {
                 actor,
-                &reservation.id,
-                None,
-                None,
-                recipient,
-                authority_ref,
+                id: &reservation.id,
+                node: None,
+                expected_revision: None,
+                recipient_ref: recipient,
+                recipient_authority_ref: authority_ref,
                 rules,
-            ) {
+            }) {
                 let _ = self.discard_unstarted_with_exposure(&reservation.id);
                 return Err(error);
             }
@@ -1425,22 +1449,19 @@ impl JobHost {
 
     pub(crate) fn admit_replay_with_initial_wake(
         &self,
-        prepared: PreparedJob,
-        namespace: &str,
-        request_id: &str,
-        reserve_exposed: bool,
-        actor: &PrincipalId,
-        recipient_ref: &str,
-        recipient_authority_ref: &str,
-        rules: EventRuleSet,
+        request: InitialWakeAdmissionRequest<'_>,
     ) -> Result<AdmissionDecision> {
         self.admit_replay_with_visibility(
-            prepared,
-            namespace,
-            request_id,
-            reserve_exposed,
-            Some(actor),
-            Some((recipient_ref, recipient_authority_ref, rules)),
+            request.prepared,
+            request.namespace,
+            request.request_id,
+            request.reserve_exposed,
+            Some(request.actor),
+            Some((
+                request.recipient_ref,
+                request.recipient_authority_ref,
+                request.rules,
+            )),
         )
     }
 
@@ -1533,15 +1554,15 @@ impl JobHost {
                     let actor = actor.ok_or(Error::Protocol(
                         "initial replay wake registration lacks authenticated actor",
                     ))?;
-                    if let Err(error) = self.subscribe_finite(
+                    if let Err(error) = self.subscribe_finite(FiniteSubscriptionRequest {
                         actor,
-                        &job_id,
-                        None,
-                        None,
-                        recipient,
-                        authority_ref,
-                        rules.clone(),
-                    ) {
+                        id: &job_id,
+                        node: None,
+                        expected_revision: None,
+                        recipient_ref: recipient,
+                        recipient_authority_ref: authority_ref,
+                        rules: rules.clone(),
+                    }) {
                         self.discard_unstarted_with_exposure(&job_id)?;
                         return Err(error);
                     }

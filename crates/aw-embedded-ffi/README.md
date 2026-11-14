@@ -60,7 +60,9 @@ must set output written <= capacity. Rust does not pass persistent raw
 interior pointers to C. Answer and trace exports copy into C-owned buffers
 and return BUFFER_TOO_SMALL with the exact required length/count if needed.
 They are NOT NUL-terminated. Native tool/event IDs have stable numeric ABI
-values; they are NOT Rust enum layout/discriminants.
+values; they are NOT Rust enum layout/discriminants. Tool effect codes are
+additive and frozen for V1: Read=1, Write=2, Process=3, Unknown=4, Control=5;
+new effects must never renumber an existing value.
 
 No callback may implicitly grant a tool, select a model, choose credentials,
 retry a paid request or replay an uncertain effect. Registration is source-

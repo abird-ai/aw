@@ -468,10 +468,7 @@ impl JobsTool {
         node: Option<usize>,
         view: Option<&str>,
     ) -> Result<(usize, OutputStream)> {
-        let coordinate = match node {
-            Some(node) => node,
-            None => 1,
-        };
+        let coordinate = node.unwrap_or(1);
         let plans = manager
             .plans(id)
             .map_err(|_| Error::Denied("Job plan is unavailable"))?;
@@ -1152,7 +1149,7 @@ impl Tool for JobsTool {
                             }
                             receipt.output
                         }
-                        ControlReplayDecision::Unknown(_) => ToolOutput::error(
+                        ControlReplayDecision::Unknown => ToolOutput::error(
                             "unknown jobs_send outcome; do not retry automatically",
                         ),
                         ControlReplayDecision::New(key) => {
@@ -1315,7 +1312,7 @@ impl Tool for JobsTool {
                             }
                             receipt.output
                         }
-                        ControlReplayDecision::Unknown(_) => ToolOutput::error(
+                        ControlReplayDecision::Unknown => ToolOutput::error(
                             "unknown jobs_cancel outcome; do not retry automatically",
                         ),
                         ControlReplayDecision::New(key) => {
@@ -1459,7 +1456,7 @@ impl Tool for JobsTool {
                             }
                             receipt.output
                         }
-                        ControlReplayDecision::Unknown(_) => ToolOutput::error(
+                        ControlReplayDecision::Unknown => ToolOutput::error(
                             "unknown jobs_subscribe outcome; do not retry automatically",
                         ),
                         ControlReplayDecision::New(key) => {
@@ -1590,13 +1587,15 @@ impl Tool for JobsTool {
                                 let canonical = host.execution_ref(&id, node)?.canonical();
                                 self.runtime.bind_control_replay_target(key, &canonical)?;
                                 match host.subscribe_finite(
-                                    &ctx.actor,
-                                    &id,
-                                    node,
-                                    revision,
-                                    &recipient.canonical_ref,
-                                    &recipient.authority_ref,
-                                    rules,
+                                    crate::job_host::FiniteSubscriptionRequest {
+                                        actor: &ctx.actor,
+                                        id: &id,
+                                        node,
+                                        expected_revision: revision,
+                                        recipient_ref: &recipient.canonical_ref,
+                                        recipient_authority_ref: &recipient.authority_ref,
+                                        rules,
+                                    },
                                 ) {
                                     Ok((_, update)) => {
                                         let output = ToolOutput::text(format!(

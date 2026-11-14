@@ -474,6 +474,7 @@ version = "0.15.0"
 dependencies = [
  "aw-agent-core",
  "aw-agent-kernel",
+ "aw-tools",
  "clap",
  "futures-util",
  "getrandom 0.3.4",

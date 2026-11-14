@@ -28,42 +28,82 @@ Canonical dotlink checkout: `/home/pvl/spaces/abird/src/dotlink`
 
 - Repo: `/home/pvl/spaces/abird/src/aw`
 - Branch: `main`
+- Current pushed HEAD: `7800c8b832c927960dc6b2b69c0529e89a9999d3`.
 - Normative design authority remains
   `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`
   (`Resolve shared Job, replay, wake, and Graph ownership design`).
-- Reviewed/pushed implementation checkpoint:
+- Reviewed/pushed implementation baseline:
   `9e9ab043410241c3f797f760d93a1cfd9126fdd2`
   (`Implement unified Jobs and Agent runtime checkpoint`).
-- One canonical worktree only. Never inspect or touch `.agents/plans/ux/**`;
+- The current main worktree is intentionally dirty and unstaged with the completed
+  D2/D3/Phase-7 implementation and final qualification fixes. It is newer than
+  `9e9ab043...` and has **not** yet been committed/pushed.
+- Runtime Checkpoints 0/A/B/C/D/E/F/G are reconciled and green. The current
+  unified TODO intentionally has one remaining unchecked repository-finalization
+  item: the exact final cross-repo shared pin.
+- Final AW review/qualification includes:
+  - strict Clippy for changed crates/targets;
+  - stateless/minimal/no_std+alloc + wasm32v1-none boundaries;
+  - DL-150 shared conformance (`aw-tools` 303/303 + AW adapter vectors);
+  - deterministic Read/Graph/Bash-Jobs/Agent model/tool-round fixtures;
+  - live Qwen 3.8 27B first-call/continuation selection on x2;
+  - hard removal of old model/API routes and the production-dead
+    `PolicyGraphRouter` owner.
+- One canonical AW worktree only. Never inspect or touch `.agents/plans/ux/**`;
   another owner reserves it.
-- The v34 shared-Session migration, Phases 1–5 runtime implementation, shared
-  `OperationId`/`ExecutionRef` contracts, and AW-side D2 source-fenced Start
-  authorization are committed in that checkpoint.
-- AW-side Start authorization is qualified for replay-before-reauthorization,
-  writer/membership/source revocation ordering, exact target-generation binding,
-  and no replacement Start after changed/ambiguous intent.
+- Nothing is staged.
 
 ### dotlink
 
 - Repo: `/home/pvl/spaces/abird/src/dotlink`
 - Branch: `main`
-- Reviewed/pushed D1 checkpoint:
-  `3f59bb16b0262f6157351fd28b13167cc1b3e5db`
-  (`Cut over standalone Jobs to shared AW runtime`).
-- dotlink pins `aw-tools`, `aw-tools-fs-unix`, and `aw-tools-fs-win` exactly to
-  AW `9e9ab043410241c3f797f760d93a1cfd9126fdd2`.
-- D1 standalone cutover and reviewed-shared-pin boundary are complete and qualified.
-- D2 dotlink remote Start consume/claim/local-authority/dispatch is the exact next
-  implementation boundary.
+- Current pushed HEAD: `01e13a0bf52dc7d6afb3da51a93f533d5aeee34f`.
+- Pushed D1 checkpoint:
+  `3f59bb16b0262f6157351fd28b13167cc1b3e5db`.
+- dotlink currently pins `aw-tools`, `aw-tools-fs-unix`, and
+  `aw-tools-fs-win` exactly to reachable AW
+  `9e9ab043410241c3f797f760d93a1cfd9126fdd2`.
+- The current dirty main worktree contains completed D2/D3/final bridge work.
+  Dotlink Checkpoint 3 is green.
+- Final cross-repo diff review fixed replay-first ordering for remote Graph,
+  shell, and cancel:
+  - exact Graph replay is claimed before mutable Graph preparation/topology checks;
+  - exact shell replay is claimed before current local shell-policy recheck;
+  - exact cancel replay is claimed before current revision recheck.
+- Fresh post-review dotlink qualification:
+  - **651 passed / 0 failed / 1 intentional external-fixture ignore**;
+  - integration binaries **1/1, 8/8, 1/1, 12/12, 4/4**;
+  - strict all-target/all-feature Clippy green;
+  - rustfmt/diff check green.
 - Existing second worktree:
   `/home/pvl/spaces/abird/src/dotlink-016-fixes`, branch `release/0.16`.
   Do not touch it and do not create another worktree.
-- `docs/CHATGPT_PLUGIN.md` remains a pre-existing unrelated dirty modification;
-  preserve it byte-for-byte unless the user explicitly asks to include it.
+- `docs/CHATGPT_PLUGIN.md` remains unrelated pre-existing dirty work; preserve it.
+- Nothing is staged.
+
+### Remaining repository-finalization dependency
+
+Runtime implementation and qualification are complete. The only remaining
+cross-repo finalization step is intentionally blocked on explicit commit/push
+authorization:
+
+1. final AW diff/hygiene review;
+2. commit and push AW first;
+3. capture the exact reachable new AW SHA;
+4. repin dotlink's three shared AW dependencies to that SHA;
+5. replace dotlink's temporary local remote-Start argument-digest mirror with
+   `aw_tools::remote_start::arguments_sha256`;
+6. regenerate dotlink `Cargo.lock`;
+7. run one locked dotlink all-features/integration + strict-Clippy/fmt/diff gate;
+8. commit/push dotlink only if the user explicitly authorizes it.
+
+Never repin dotlink to dirty/unpushed AW and never substitute a sibling path,
+`file://` dependency, or vendored copy.
 
 ### User process constraints
 
-- Use **dotlink---l5 only**. Do not use or modify the A1 tunnel/machine.
+- Use **dotlink---l5 only** for implementation/source work. Do not use A1.
+- x2 may be used only as an inference host; it is not source authority.
 - Work in the two canonical checkouts above; do not create another worktree.
 - Limit one model/user work turn to roughly **30 minutes**.
 - Aim for the next coherent checkpoint, record state, then pause.
@@ -71,8 +111,6 @@ Canonical dotlink checkout: `/home/pvl/spaces/abird/src/dotlink`
 - No push, version, tag, release, deploy, history rewrite, reset-hard or destructive
   action without separate explicit authorization.
 - A request to implement is not authorization to commit or push.
-- The 2026-11-14 AW/D1 implementation checkpoints were explicitly authorized and
-  pushed; that does not authorize future commits/pushes.
 - If asked to commit, commits are signed and only owned paths may be staged.
 
 ---
@@ -893,143 +931,158 @@ copied AW source remain. D1's shared-pin prerequisite is complete.
 
 ---
 
-## 6. The exact next boundary: Phase 6 / dotlink D2
+## 6. Exact next boundary: final exact cross-repo pin
 
-Do **not** begin by refactoring D1 again. D1 and the shared-pin boundary are complete.
+D1, D2, D3, AW Phase 7, Checkpoint F and runtime Checkpoint G are implemented and
+qualified. Do **not** restart D2, redesign the bridge, reintroduce old routes, or
+repeat unchanged primitive suites.
 
-### 6.1 Shared pin resolved; AW Start owner available
+The next boundary is repository finalization, and it depends on commit order.
 
-AW implementation checkpoint `9e9ab043410241c3f797f760d93a1cfd9126fdd2`
-contains the reviewed shared primitives and the AW-side durable source-fenced Start
-authorization owner. dotlink D1 checkpoint
-`3f59bb16b0262f6157351fd28b13167cc1b3e5db` consumes that exact revision.
+### 6.1 Why dotlink cannot be repinned yet
 
-The next work is exclusively the dotlink half of D2: authenticate/validate the AW Start,
-claim the exact effect attempt through dotlink's existing replay owner before effect,
-recheck current local launcher/sandbox/source/site/resource authority, and dispatch at
-most once. Do not introduce a second replay database or upstream policy implementation.
+dotlink's three shared dependencies still point at the last reachable reviewed AW
+revision:
 
-### 6.2 D2 Start authorization contract
+`9e9ab043410241c3f797f760d93a1cfd9126fdd2`
 
-The D2 bridge accepts only **AW-resolved canonical intent**.
+The current AW worktree is newer and includes, among other reviewed changes, the
+shared canonical `aw_tools::remote_start::arguments_sha256` helper. dotlink
+temporarily mirrors that exact digest implementation locally so D2 can be tested
+against the old reachable pin.
 
-Each new remote effect must have one per-attempt source-fenced Start authorization that is
-atomically issued by AW and bound to:
+That mirror is **temporary by construction**. It should disappear only after AW is
+committed/pushed and dotlink can consume the helper from one exact reviewed Git SHA.
 
-- original authenticated invocation/replay identity;
-- exact effect-attempt ID;
-- canonical operation/ref;
-- exact arguments digest;
-- target dotlink host/profile;
-- target **live dotlink runtime generation**;
-- actor/source/site/resource grant provenance;
-- Session membership/audience where relevant;
-- WriterFence/branch/workspace epochs where relevant;
-- bounded expiry;
-- no broader permission than the original semantic operation.
+### 6.2 Authorized finalization sequence
 
-Linearization:
+Only after explicit user authorization to commit/push:
 
-1. AW rechecks current authority and atomically commits Start authorization.
-2. dotlink claims it through its **existing** replay owner before effect.
-3. dotlink independently rechecks local launcher/sandbox/source/site/resource authority.
-4. effect starts at most once.
-5. factual receipt returns to AW.
+1. revalidate AW status/diff and run only any ownership-triggered final hygiene;
+2. commit and push the reviewed AW implementation;
+3. record the exact reachable AW SHA;
+4. update dotlink `Cargo.toml` so `aw-tools`, `aw-tools-fs-unix`, and
+   `aw-tools-fs-win` all pin that exact SHA;
+5. replace dotlink's local `arguments_sha256` mirror with
+   `aw_tools::remote_start::arguments_sha256`;
+6. regenerate dotlink `Cargo.lock` from the Git pin, with no path override;
+7. run exactly one locked final dotlink qualification:
+   - `cargo test --offline --locked --all-features`;
+   - strict all-target/all-feature Clippy;
+   - rustfmt + `git diff --check`;
+8. if and only if separately/currently authorized, commit/push dotlink.
 
-Race rules:
+If commit/push remains unauthorized, stop after revalidation and report:
+**runtime-qualified; exact-pin repository finalization pending authorization**.
 
-- revoke wins before authorization → deny;
-- Start authorization commits first → one bounded accepted/unknown attempt may dispatch;
-- AW offline **before** authorization → no new Start;
-- AW offline **after committed authorization** → same-generation bounded dispatch may finish;
-- expiry must not outlive dedupe retention;
-- old-generation proof never executes after dotlink runtime restart;
-- ambiguous effect cannot get a replacement Start for the same original attempt;
-- duplicate/lost Start response never double-launches.
+### 6.3 Final remote-Start replay contract now implemented
 
-### 6.3 D2 ref/control boundary
+The final review confirmed and regression-locked replay-first ordering:
 
-AW resolves:
-
-- current Agent context;
-- `^`;
-- structural overlays;
-- participant/Session semantics.
-
-dotlink receives:
-
-- accepted exact canonical finite target only;
-- original attempt/replay identity;
-- authenticated Start provenance.
-
-dotlink does **not** resolve AW parent/Agent/Session hierarchy.
-
-Remote Process/Graph control/read must preserve:
-
-- one dotlink JobManager;
-- current local sandbox/launcher policy;
-- current Process stdin authority;
-- writer/runtime generation fences;
-- exact retained output/ACK ownership;
-- no Agent transcript/state in dotlink.
-
-### 6.4 D2 wake boundary
-
-Initial D2 must **reject**:
-
-- constructor wake on dotlink-owned remote Process/Graph sources;
-- later `jobs_subscribe` on dotlink-owned sources.
-
-Do not extend remote wake merely because AW now has a local source-event protocol.
-The dotlink TODO explicitly requires a separately reviewed atomic remote source-owner
-event protocol before remote wake is allowed.
-
-### 6.5 D2 checkpoint F cases
-
-Run together after D2 is implemented:
-
-- AW→remote Process/Graph execution;
-- exact remote control/read;
-- stale writer/source/site denial;
-- upstream allow + missing local sandbox grant → deny;
-- revoked stdin → deny before bytes;
-- duplicate request idempotence;
-- no Agent state leakage;
-- unsupported remote wake rejection;
-- revoke-vs-Start race;
-- duplicate proof / lost response;
-- expiry vs dedupe retention;
-- runtime-generation restart;
-- AW offline before new authorization;
-- AW offline after accepted Start;
-- no old proof in new generation;
-- no double launch;
-- MCP Task/replay/ACK/stdout cleanliness.
+- AW redelivery looks up immutable Start attempt identity before current
+  ToolBinding/ref resolution and rejects changed semantic request digest.
+- dotlink validates target/op/args/generation, then the concrete effect owner
+  claims the Start before mutable local checks/effects.
+- remote Graph claims before Graph preparation/topology revalidation.
+- remote shell claims before current shell-policy revalidation.
+- remote cancel claims before current revision precondition.
+- `jobs_ack`, `jobs_send`, and shared native FS already had claim-first ordering.
+- exact Ready receipt replays after later mutable-state/policy/revision changes.
+- Claimed/Unknown never becomes a fresh effect.
+- new attempts still recheck current dotlink launcher/sandbox/tool/resource authority.
 
 ---
 
-## 7. D3 and final AW Phase 7
+## 7. Runtime completion and final qualification
 
-After D2 passes, do D3:
+### 7.1 Hard cutover
 
-- remove any remaining old dotlink compatibility decoders/helpers/tests;
-- update dotlink live docs/examples;
-- record standalone provider schema bytes/tokens;
-- verify advanced AW host capabilities did not grow standalone dotlink model Graph/tool surface;
-- run dotlink checkpoint 3 only for affected ownership lanes.
+Completed:
 
-Then return to AW Phase 7:
+- old `job_*`, `job_start`, `job_restart`;
+- grouped jobs/agents compatibility routes;
+- old `subagent`, `team`, `plan`, `review_release` model routes;
+- route-specific dead CLI/module plumbing;
+- production-dead AW `PolicyGraphRouter` / guardian / narrow / approval owner
+  (~1,361 lines / ~57 KiB) and its router-only tests/providers.
 
-- hard source/API cleanup;
-- remove obsolete `job_*`, grouped jobs/agents, separate Agents model route,
-  subagent/team/plan/review_release model routes where no independent consumer remains;
-- no dual-schema/compatibility service;
-- update public docs/SDK examples;
-- final grouped G qualification.
+Retained deliberately:
 
-Do not call the product complete until formal ordered checkpoints
-`0, A, B, C, D, E, F, G` are reconciled and required external/platform gates are either
-passed or explicitly pending.
+- one canonical AW Agent/Session/Actor/Turn/Job runtime;
+- one shared `aw-tools::JobManager`;
+- generic `GraphPolicyRouterSlot` as the independently tested shared JobHost seam;
+- dotlink finite/native Process/Graph ownership only.
+
+### 7.2 AW qualification
+
+Green evidence includes:
+
+- strict Clippy across all changed crates/targets with no lint suppressions;
+- `aw-tools-adapter` 227/227 at the strict-clean checkpoint;
+- Actor-owner 45/45;
+- policy-runtime 4/4;
+- dock 24/24;
+- canonical subagents 14/14 after final model-first fixtures;
+- `aw-mcp` 15/15;
+- Store library 208/208;
+- stateless 27/110/6 and JSONL-minimal 27/113/6;
+- no_std+alloc kernel/embedded/FFI + wasm32v1-none;
+- independent C11 FFI consumer: 710 checks;
+- `aw-tools --all-features --lib`: 303/303;
+- AW direct-adapter DL-150 conformance vectors green.
+
+### 7.3 Model-first qualification
+
+Deterministic real Agent/effect fixtures on L5:
+
+- direct Read: 2 parent provider rounds / 1 tool;
+- 3-node Graph: 2 / 1;
+- Bash background -> `jobs_get` -> `jobs_read` -> `jobs_ack`: 5 / 4;
+- Agent: 2 parent + 1 child provider round / 1 parent tool.
+
+Live model-selection evidence on **pvl-x2 inference only** used managed ROCm
+Ollama `qwen3.8:27b` with the exact current L5-generated 23-tool AW catalog:
+
+- Read 5/5 -> `read`;
+- Graph 5/5 -> `batch`;
+- Bash 5/5 -> `bash` with `background=true`;
+- Agent 5/5 -> `agent`;
+- read-only Job observation 5/5 -> `jobs_get`;
+- cancellation 5/5 -> `jobs_cancel`.
+
+Total first-call selection/schema/task validity: **30/30**.
+
+Continuation probes:
+
+- `bash -> jobs_get -> jobs_read -> jobs_ack -> final`: 3/3;
+- `agent -> final` with no redundant `jobs_read`: 3/3.
+
+The same representative Qwen Read prompt is 69 prompt tokens without tools and
+3,409 with the full catalog, so the actual provider tool-envelope overhead is
+about **3,340 Qwen/Ollama prompt tokens**.
+
+### 7.4 dotlink qualification
+
+Fresh after the final replay-first review:
+
+- main suite **651 passed / 0 failed / 1 intentional ignore**;
+- all five integrations green;
+- strict all-target/all-feature Clippy green;
+- rustfmt/diff green;
+- old-generation Start rejection green;
+- Process stdin revoke-before-bytes green;
+- standalone no-Agent/no-wake/no-legacy surface green;
+- final Unix standalone catalog: 21 tools / 13,832 serialized MCP bytes.
+
+Checkpoint F's real OAuth/TCP Process and FS/Graph bridge evidence remains
+current; later cleanup did not change that transport owner.
+
+### 7.5 What remains
+
+Only the exact final shared Git pin sequence in Section 6. Runtime behavior and
+qualification are complete; repository finalization is not complete until the
+new AW SHA is reachable and dotlink is repinned/relocated off the temporary digest
+mirror.
 
 ---
 
@@ -1172,26 +1225,28 @@ Do not:
 
 ## 13. Next coherent work sequence
 
-1. Revalidate both pushed checkpoints and this handoff.
-2. Re-read `890e9a` D2/remote Start sections and dotlink D2 TODO.
-3. Implement dotlink-side Start envelope validation and one-use claim through the existing
-   replay/owner ledger, bound to host/profile/live runtime generation and expiry.
-4. Recheck current local launcher/sandbox/source/site/resource authority before each effect,
-   including Process stdin delivery.
-5. Wire AW→dotlink remote finite Process/Graph Start/control/read while keeping
-   Agent/Session/Policy/history AW-owned and rejecting remote wake/subscription.
-6. Run dotlink Checkpoint 2 / AW Checkpoint F as one grouped matrix.
-7. Pause and hand off before D3 if the turn approaches ~30 minutes.
+1. Revalidate both canonical L5 worktrees, staged files, worktrees and unrelated dirty paths.
+2. Confirm the user has explicitly authorized commit/push. If not, stop and report the exact-pin
+   finalization blocker; do not manufacture a local-only pin.
+3. If authorized, final AW diff/hygiene review, then signed AW commit + push.
+4. Capture the exact reachable AW SHA.
+5. Repin dotlink's three AW Git dependencies to that SHA.
+6. Replace dotlink's temporary remote-Start argument-digest mirror with the shared AW helper.
+7. Regenerate dotlink `Cargo.lock`.
+8. Run one locked dotlink all-features/integration + strict Clippy/fmt/diff qualification.
+9. Commit/push dotlink only if that action is explicitly authorized.
+10. Pause at that exact cross-repo pin checkpoint; do not expand into release/tag/deploy work.
 
 ---
 
 ## 14. Copy/paste prompt for the next agent
 
-Use the prompt in
-`.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/NEXT-AGENT.md`.
+Use the current prompt in:
 
-The prompt deliberately tells the agent to read this handoff and the normative design rather
-than reproducing all details inline.
+`.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/NEXT-AGENT.md`
+
+It now describes **final exact-pin / commit preparation**, not D2 implementation.
+The dotlink companion prompt says the same thing.
 
 ---
 

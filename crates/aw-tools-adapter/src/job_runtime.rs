@@ -98,7 +98,7 @@ struct ControlReplayEntry {
 pub(crate) enum ControlReplayDecision {
     New([u8; 32]),
     Existing(ControlReplayReceipt),
-    Unknown(Option<String>),
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +116,28 @@ pub enum StartDecision {
     New(StartedJob),
     Existing { id: String, host: Arc<JobHost> },
     Unknown,
+}
+
+pub(crate) struct JobRuntimeOptions {
+    pub(crate) agent_jobs: Arc<crate::agent_jobs::AgentJobRouterSlot>,
+    pub(crate) graph_policy: Arc<crate::operation_router::GraphPolicyRouterSlot>,
+    pub(crate) graph_host_tools: Arc<crate::operation_router::GraphHostToolSlot>,
+    pub(crate) allow_agent_graph: bool,
+    pub(crate) allow_wake: bool,
+    pub(crate) max_graph_nodes: usize,
+}
+
+impl Default for JobRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            agent_jobs: Arc::new(crate::agent_jobs::AgentJobRouterSlot::default()),
+            graph_policy: Arc::new(crate::operation_router::GraphPolicyRouterSlot::default()),
+            graph_host_tools: Arc::new(crate::operation_router::GraphHostToolSlot::default()),
+            allow_agent_graph: false,
+            allow_wake: false,
+            max_graph_nodes: aw_tools::filesystem::batch::MAX_OPS,
+        }
+    }
 }
 
 pub struct JobRuntime {
@@ -164,12 +186,7 @@ impl JobRuntime {
             authority,
             tool_limits,
             concurrency,
-            Arc::new(crate::agent_jobs::AgentJobRouterSlot::default()),
-            Arc::new(crate::operation_router::GraphPolicyRouterSlot::default()),
-            Arc::new(crate::operation_router::GraphHostToolSlot::default()),
-            false,
-            false,
-            aw_tools::filesystem::batch::MAX_OPS,
+            JobRuntimeOptions::default(),
             native_tools,
         )
     }
@@ -179,14 +196,17 @@ impl JobRuntime {
         authority: ToolBindingAuthority,
         tool_limits: crate::LocalToolLimits,
         concurrency: crate::LocalToolConcurrency,
-        agent_jobs: Arc<crate::agent_jobs::AgentJobRouterSlot>,
-        graph_policy: Arc<crate::operation_router::GraphPolicyRouterSlot>,
-        graph_host_tools: Arc<crate::operation_router::GraphHostToolSlot>,
-        allow_agent_graph: bool,
-        allow_wake: bool,
-        max_graph_nodes: usize,
+        options: JobRuntimeOptions,
         native_tools: Vec<aw_tools::filesystem::schema::Tool>,
     ) -> Result<Arc<Self>> {
+        let JobRuntimeOptions {
+            agent_jobs,
+            graph_policy,
+            graph_host_tools,
+            allow_agent_graph,
+            allow_wake,
+            max_graph_nodes,
+        } = options;
         let scope = LiveScope::memory()?;
         let shells = shell::ShellRegistry::default();
         let native_tools = Arc::new(native_tools);
@@ -298,7 +318,7 @@ impl JobRuntime {
                     ControlReplayDecision::Existing(receipt.clone())
                 }
                 ControlReplayState::Pending | ControlReplayState::Unknown => {
-                    ControlReplayDecision::Unknown(entry.canonical_ref.clone())
+                    ControlReplayDecision::Unknown
                 }
             });
         }
@@ -792,16 +812,17 @@ impl JobRuntime {
                 .map_or_else(|| "main".to_owned(), |scope| scope.branch_id.clone())
         );
         self.revalidate_initial_wake(ctx, &wake)?;
-        let decision = host.admit_replay_with_initial_wake(
-            prepared,
-            &namespace,
-            &ctx.call_id,
-            expose,
-            &ctx.actor,
-            &wake.recipient.canonical_ref,
-            &wake.recipient.authority_ref,
-            wake.rules.clone(),
-        )?;
+        let decision =
+            host.admit_replay_with_initial_wake(crate::job_host::InitialWakeAdmissionRequest {
+                prepared,
+                namespace: &namespace,
+                request_id: &ctx.call_id,
+                reserve_exposed: expose,
+                actor: &ctx.actor,
+                recipient_ref: &wake.recipient.canonical_ref,
+                recipient_authority_ref: &wake.recipient.authority_ref,
+                rules: wake.rules.clone(),
+            })?;
         match decision {
             crate::job_host::AdmissionDecision::Unknown => Ok(StartDecision::Unknown),
             crate::job_host::AdmissionDecision::Existing(id) => {
@@ -1318,12 +1339,10 @@ mod tests {
             agent.tool_binding_authority(),
             crate::LocalToolLimits::default(),
             crate::LocalToolConcurrency::default(),
-            router_slot,
-            Arc::new(crate::operation_router::GraphPolicyRouterSlot::default()),
-            Arc::new(crate::operation_router::GraphHostToolSlot::default()),
-            false,
-            false,
-            aw_tools::filesystem::batch::MAX_OPS,
+            JobRuntimeOptions {
+                agent_jobs: router_slot,
+                ..Default::default()
+            },
             vec![aw_tools::filesystem::schema::Tool::Read],
         )
         .unwrap();
@@ -1407,12 +1426,10 @@ mod tests {
             agent.tool_binding_authority(),
             crate::LocalToolLimits::default(),
             crate::LocalToolConcurrency::default(),
-            router_slot,
-            Arc::new(crate::operation_router::GraphPolicyRouterSlot::default()),
-            Arc::new(crate::operation_router::GraphHostToolSlot::default()),
-            false,
-            false,
-            aw_tools::filesystem::batch::MAX_OPS,
+            JobRuntimeOptions {
+                agent_jobs: router_slot,
+                ..Default::default()
+            },
             vec![aw_tools::filesystem::schema::Tool::Read],
         )
         .unwrap();
@@ -1460,15 +1477,15 @@ mod tests {
         ])
         .unwrap();
         let (_, update) = host
-            .subscribe_finite(
-                &actor,
-                &id,
-                None,
-                None,
-                &router.recipient,
-                "jwa_fixture",
+            .subscribe_finite(crate::job_host::FiniteSubscriptionRequest {
+                actor: &actor,
+                id: &id,
+                node: None,
+                expected_revision: None,
+                recipient_ref: &router.recipient,
+                recipient_authority_ref: "jwa_fixture",
                 rules,
-            )
+            })
             .unwrap();
         assert!(update.active);
         let snapshot = host
@@ -1525,12 +1542,11 @@ mod tests {
             agent.tool_binding_authority(),
             crate::LocalToolLimits::default(),
             crate::LocalToolConcurrency::default(),
-            slot,
-            Arc::new(crate::operation_router::GraphPolicyRouterSlot::default()),
-            Arc::new(crate::operation_router::GraphHostToolSlot::default()),
-            false,
-            true,
-            aw_tools::filesystem::batch::MAX_OPS,
+            JobRuntimeOptions {
+                agent_jobs: slot,
+                allow_wake: true,
+                ..Default::default()
+            },
             vec![aw_tools::filesystem::schema::Tool::Read],
         )
         .unwrap();
@@ -2293,7 +2309,6 @@ mod tests {
 mod graph_policy_tests {
     use super::*;
     use crate::{
-        agent_jobs::AgentJobRouterSlot,
         configure,
         operation_router::{
             GraphNodePolicyRequest, GraphPolicyFuture, GraphPolicyRequest, GraphPolicyRouter,
@@ -2456,12 +2471,10 @@ mod graph_policy_tests {
             agent.tool_binding_authority(),
             LocalToolLimits::default(),
             LocalToolConcurrency::default(),
-            Arc::new(AgentJobRouterSlot::default()),
-            graph_policy,
-            Arc::new(crate::operation_router::GraphHostToolSlot::default()),
-            false,
-            false,
-            aw_tools::filesystem::batch::MAX_OPS,
+            JobRuntimeOptions {
+                graph_policy,
+                ..Default::default()
+            },
             native,
         )
         .unwrap();
@@ -2521,12 +2534,10 @@ mod graph_policy_tests {
                 agent.tool_binding_authority(),
                 LocalToolLimits::default(),
                 LocalToolConcurrency::default(),
-                Arc::new(AgentJobRouterSlot::default()),
-                Arc::new(GraphPolicyRouterSlot::default()),
-                Arc::new(crate::operation_router::GraphHostToolSlot::default()),
-                allow_agent_graph,
-                false,
-                aw_tools::filesystem::batch::MAX_OPS,
+                JobRuntimeOptions {
+                    allow_agent_graph,
+                    ..Default::default()
+                },
                 vec![FsTool::Read],
             )
             .unwrap()

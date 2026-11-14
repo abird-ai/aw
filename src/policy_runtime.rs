@@ -141,22 +141,38 @@ pub fn authorize_remote_start(
     })
 }
 
+/// Inputs for one already-authorized guardian attempt. Grouped as one value so
+/// the call site makes the authority tuple explicit without a wide positional
+/// parameter list.
+pub struct AdmissionGuardianRequest<'a> {
+    pub store: &'a SessionStore,
+    pub actor: &'a PrincipalId,
+    pub request: PolicyAdmissionRequest,
+    pub authorized: AuthorizedPolicy,
+    pub selected: &'a ProviderSelection,
+    pub input: &'a AuxiliaryInput,
+    pub decision_revision: u64,
+}
+
 /// Execute at most one guardian inference for one already-authorized operation.
 /// The original policy claim and all approval/provider/payer evidence must be
 /// prepared before this function is called.
 pub async fn run_admission_guardian<C>(
-    store: &SessionStore,
-    actor: &PrincipalId,
-    request: PolicyAdmissionRequest,
-    authorized: AuthorizedPolicy,
-    selected: &ProviderSelection,
-    input: &AuxiliaryInput,
-    decision_revision: u64,
+    admission: AdmissionGuardianRequest<'_>,
     cancel: C,
 ) -> Result<PolicyAdmissionFact>
 where
     C: Future<Output = ()> + Send,
 {
+    let AdmissionGuardianRequest {
+        store,
+        actor,
+        request,
+        authorized,
+        selected,
+        input,
+        decision_revision,
+    } = admission;
     if decision_revision == 0 {
         return Err(Error::Denied("policy decision revision is invalid"));
     }
@@ -469,13 +485,15 @@ mod tests {
         };
 
         let first = run_admission_guardian(
-            &store,
-            &actor,
-            request.clone(),
-            authorized,
-            &selected,
-            &input,
-            4,
+            AdmissionGuardianRequest {
+                store: &store,
+                actor: &actor,
+                request: request.clone(),
+                authorized,
+                selected: &selected,
+                input: &input,
+                decision_revision: 4,
+            },
             pending::<()>(),
         )
         .await
@@ -484,13 +502,15 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let replay = run_admission_guardian(
-            &store,
-            &actor,
-            request.clone(),
-            authorized,
-            &selected,
-            &input,
-            4,
+            AdmissionGuardianRequest {
+                store: &store,
+                actor: &actor,
+                request: request.clone(),
+                authorized,
+                selected: &selected,
+                input: &input,
+                decision_revision: 4,
+            },
             pending::<()>(),
         )
         .await
@@ -506,13 +526,15 @@ mod tests {
         changed.policy_revision_sha256 = "d".repeat(64);
         assert!(matches!(
             run_admission_guardian(
-                &store,
-                &actor,
-                changed,
-                authorized,
-                &selected,
-                &input,
-                4,
+                AdmissionGuardianRequest {
+                    store: &store,
+                    actor: &actor,
+                    request: changed,
+                    authorized,
+                    selected: &selected,
+                    input: &input,
+                    decision_revision: 4,
+                },
                 pending::<()>(),
             )
             .await,
@@ -658,13 +680,15 @@ mod tests {
 
         assert!(matches!(
             run_admission_guardian(
-                &store,
-                &actor,
-                request.clone(),
-                authorized,
-                &selected,
-                &input,
-                4,
+                AdmissionGuardianRequest {
+                    store: &store,
+                    actor: &actor,
+                    request: request.clone(),
+                    authorized,
+                    selected: &selected,
+                    input: &input,
+                    decision_revision: 4,
+                },
                 pending::<()>(),
             )
             .await,
@@ -680,13 +704,15 @@ mod tests {
         changed.policy_revision_sha256 = "4".repeat(64);
         assert!(matches!(
             run_admission_guardian(
-                &store,
-                &actor,
-                changed,
-                authorized,
-                &selected,
-                &input,
-                4,
+                AdmissionGuardianRequest {
+                    store: &store,
+                    actor: &actor,
+                    request: changed,
+                    authorized,
+                    selected: &selected,
+                    input: &input,
+                    decision_revision: 4,
+                },
                 pending::<()>(),
             )
             .await,

@@ -236,6 +236,7 @@ fn binding_from_c(value: &AwE5ToolV1) -> Result<Binding, u32> {
         2 => Effect::Write,
         3 => Effect::Process,
         4 => Effect::Unknown,
+        5 => Effect::Control,
         _ => return Err(result_code::INVALID),
     };
     let name = unsafe { owned_utf8(value.name, value.name_len, 64) }?;
@@ -737,6 +738,7 @@ mod tests {
         assert_eq!(error_code(EngineError::Denied), result_code::DENIED);
         assert_eq!(error_code(EngineError::TooLarge), result_code::TOO_LARGE);
         assert_eq!(ports::effect_name(Effect::Unknown), "unknown");
+        assert_eq!(ports::effect_name(Effect::Control), "control");
         assert_eq!(ports::source_code(SourceKind::Extension), 3);
         assert_eq!(
             event_code(Event::TextCompleted),

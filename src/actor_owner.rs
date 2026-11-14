@@ -122,7 +122,7 @@ impl ActorOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActorOperationResult {
-    Input { fact: ActorInputFact },
+    Input { fact: Box<ActorInputFact> },
     Control { fact: ActorControlFact },
     Controls { facts: Vec<ActorControlFact> },
     Queue { fact: ActorQueueView },
@@ -210,6 +210,18 @@ pub struct ParticipantControlAuthority {
     session_id: String,
     branch_id: String,
     agent_ref: String,
+}
+
+struct ParticipantAuthorityAdmission<'a> {
+    provider_accounts: &'a ProviderAccounts,
+    tool_authority: &'a ToolBindingAuthority,
+    participant: &'a PrincipalId,
+    selected: &'a ProviderSelection,
+    participation: &'a aw_store::SessionParticipationEvidence,
+    action: SessionParticipationAction,
+    request_id: &'a str,
+    branch: &'a aw_store::BranchInfo,
+    turn_id: u64,
 }
 
 /// Host-owned first-party durable admission adapter. Construct only from a
@@ -470,16 +482,19 @@ impl Service {
 
     fn participant_authority_admission(
         &self,
-        provider_accounts: &ProviderAccounts,
-        tool_authority: &ToolBindingAuthority,
-        participant: &PrincipalId,
-        selected: &ProviderSelection,
-        participation: &aw_store::SessionParticipationEvidence,
-        action: SessionParticipationAction,
-        request_id: &str,
-        branch: &aw_store::BranchInfo,
-        turn_id: u64,
+        request: ParticipantAuthorityAdmission<'_>,
     ) -> Result<ParticipantInputAdmission> {
+        let ParticipantAuthorityAdmission {
+            provider_accounts,
+            tool_authority,
+            participant,
+            selected,
+            participation,
+            action,
+            request_id,
+            branch,
+            turn_id,
+        } = request;
         selected.revalidate()?;
         if selected.identity().actor != *participant
             || participation.actor != *participant
@@ -645,17 +660,18 @@ impl Service {
         }
         let provider_accounts = agent.provider_accounts();
         let tool_authority = agent.tool_binding_authority();
-        let participant_admission = self.participant_authority_admission(
-            &provider_accounts,
-            &tool_authority,
-            participant,
-            selected,
-            &participation,
-            SessionParticipationAction::Submit,
-            &request_id,
-            &branch,
-            turn,
-        )?;
+        let participant_admission =
+            self.participant_authority_admission(ParticipantAuthorityAdmission {
+                provider_accounts: &provider_accounts,
+                tool_authority: &tool_authority,
+                participant,
+                selected,
+                participation: &participation,
+                action: SessionParticipationAction::Submit,
+                request_id: &request_id,
+                branch: &branch,
+                turn_id: turn,
+            })?;
         self.submit_inner_with_participant(
             agent,
             request_id,
@@ -758,17 +774,17 @@ impl Service {
             .into_iter()
             .find(|row| row.id == self.branch)
             .ok_or(Error::Denied("Actor owner branch disappeared"))?;
-        self.participant_authority_admission(
-            &authority.provider_accounts,
-            &authority.tool_authority,
+        self.participant_authority_admission(ParticipantAuthorityAdmission {
+            provider_accounts: &authority.provider_accounts,
+            tool_authority: &authority.tool_authority,
             participant,
             selected,
-            &participation,
-            SessionParticipationAction::Control,
+            participation: &participation,
+            action: SessionParticipationAction::Control,
             request_id,
-            &branch,
+            branch: &branch,
             turn_id,
-        )
+        })
     }
 
     pub fn submit_participant_control(
@@ -1059,7 +1075,7 @@ impl Service {
     pub fn operate(&self, op: ActorOperation) -> Result<ActorOperationResult> {
         match op {
             ActorOperation::QueryInput { request_id } => Ok(ActorOperationResult::Input {
-                fact: self.fact(&request_id)?,
+                fact: Box::new(self.fact(&request_id)?),
             }),
             ActorOperation::QueryControl { request_id } => Ok(ActorOperationResult::Control {
                 fact: self.control_fact(&request_id)?,
@@ -1075,13 +1091,13 @@ impl Service {
                 fact: self.control(request_id, action, message_id)?,
             }),
             ActorOperation::InspectInput { request_id, note } => Ok(ActorOperationResult::Input {
-                fact: self.store.actor_input_inspect(
+                fact: Box::new(self.store.actor_input_inspect(
                     &self.owner,
                     &self.session,
                     &request_id,
                     self.epoch.get(),
                     &note,
-                )?,
+                )?),
             }),
             ActorOperation::InspectControl { request_id, note } => {
                 Ok(ActorOperationResult::Control {
@@ -3893,7 +3909,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut target = setup_bound(
+        let target = setup_bound(
             None,
             store.clone(),
             target_session.clone(),
@@ -4141,7 +4157,10 @@ mod tests {
             1,
             "Bob's first tool effect must factually settle before Carol redirects"
         );
-        assert_eq!(phase_actors.lock().unwrap().as_slice(), &[bob.clone()]);
+        assert_eq!(
+            phase_actors.lock().unwrap().as_slice(),
+            std::slice::from_ref(&bob)
+        );
 
         let carol_evidence = owner
             .prepare_participant_control_live(

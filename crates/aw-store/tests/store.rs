@@ -170,7 +170,7 @@ fn mixed_job_exposure_positions_interleave_agents_and_finite_jobs_without_duplic
     assert_eq!(finite[0].canonical_ref, finite_ref);
     assert_eq!(finite[0].position, reserved.position);
 
-    let mut combined = vec![
+    let mut combined = [
         (first_position, first_agent_ref),
         (
             second_position,

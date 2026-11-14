@@ -705,10 +705,10 @@ pub(super) async fn confirm(
         Phase::Accepted { receiver_id, .. } => receiver_id.clone(),
         _ => return Err(ApiError(StatusCode::CONFLICT, "receiver has not accepted")),
     };
-    if !registry
+    if registry
         .windows
         .get(&receiver_id)
-        .is_some_and(|window| window.deadline > Instant::now())
+        .is_none_or(|window| window.deadline <= Instant::now())
     {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -831,10 +831,10 @@ pub(super) async fn status(
             // receiving presentation. This is a lease, not a claim of perfect
             // process liveness after the last successful HTTP round trip.
             let registry = lock(&app.0.dock);
-            if !registry
+            if registry
                 .windows
                 .get(receiver_id)
-                .is_some_and(|w| w.deadline > Instant::now())
+                .is_none_or(|w| w.deadline <= Instant::now())
             {
                 "receiver_unavailable"
             } else if !confirmation_requested {

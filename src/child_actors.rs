@@ -48,6 +48,16 @@ struct BoundChild {
     subagent_id: String,
     next_message: Arc<AtomicU64>,
 }
+pub(crate) struct DelegatedAttachRequest<'a> {
+    pub(crate) durable: &'a SubagentInfo,
+    pub(crate) agent: &'a Agent,
+    pub(crate) selected: &'a ProviderSelection,
+    pub(crate) task: &'a str,
+    pub(crate) next_turn: u64,
+    pub(crate) gate_name: &'a str,
+    pub(crate) gate_effect: Effect,
+}
+
 pub struct ChildLease {
     host: Service,
     pub key: ActorKey,
@@ -322,16 +332,19 @@ impl Service {
         self.attach_inner(durable, agent, selected, task, next_turn, None)
     }
 
-    pub fn attach_delegated(
+    pub(crate) fn attach_delegated(
         &self,
-        durable: &SubagentInfo,
-        agent: &Agent,
-        selected: &ProviderSelection,
-        task: &str,
-        next_turn: u64,
-        gate_name: &str,
-        gate_effect: Effect,
+        request: DelegatedAttachRequest<'_>,
     ) -> Result<ChildLease> {
+        let DelegatedAttachRequest {
+            durable,
+            agent,
+            selected,
+            task,
+            next_turn,
+            gate_name,
+            gate_effect,
+        } = request;
         if gate_name.is_empty()
             || gate_name.len() > 128
             || !gate_name

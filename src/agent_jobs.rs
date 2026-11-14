@@ -6,8 +6,8 @@
 
 use crate::{actor_owner, Error, Result};
 use aw_agent_core::{
-    tool::{ToolBindingAuthority, ToolBindingSnapshot},
-    Outcome, PrincipalId, ToolContext, ToolOutput, ToolStatus,
+    tool::{ToolBindingAuthority, ToolBindingSnapshot, ToolCapabilitySnapshot},
+    Outcome, PrincipalId, ToolContext, ToolEffect, ToolOutput, ToolSource, ToolStatus,
 };
 use aw_store::{QueueState, SessionStore};
 use aw_store_api::{AgentBindingInfo, SessionBackend, SessionView};
@@ -52,6 +52,56 @@ struct LiveOwner {
     wake_authority: ToolBindingAuthority,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WakeAuthority {
+    Visible(ToolBindingSnapshot),
+    Hidden(ToolCapabilitySnapshot),
+}
+
+impl WakeAuthority {
+    fn name(&self) -> &str {
+        match self {
+            Self::Visible(binding) => &binding.name,
+            Self::Hidden(binding) => &binding.name,
+        }
+    }
+
+    fn source(&self) -> &ToolSource {
+        match self {
+            Self::Visible(binding) => &binding.source,
+            Self::Hidden(binding) => &binding.source,
+        }
+    }
+
+    fn effect(&self) -> &ToolEffect {
+        match self {
+            Self::Visible(binding) => &binding.effect,
+            Self::Hidden(binding) => &binding.effect,
+        }
+    }
+
+    fn execution_site(&self) -> &str {
+        match self {
+            Self::Visible(binding) => &binding.execution_site,
+            Self::Hidden(binding) => &binding.execution_site,
+        }
+    }
+
+    fn authority_revision(&self) -> u64 {
+        match self {
+            Self::Visible(binding) => binding.authority_revision,
+            Self::Hidden(binding) => binding.authority_revision,
+        }
+    }
+
+    fn registry_revision(&self) -> u64 {
+        match self {
+            Self::Visible(binding) => binding.registry_revision,
+            Self::Hidden(_) => 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WakeAdmission {
     recipient_ref: String,
@@ -60,7 +110,7 @@ struct WakeAdmission {
     membership_epoch: u64,
     audience_epoch: u64,
     owner: bool,
-    binding: ToolBindingSnapshot,
+    authority: WakeAuthority,
 }
 
 #[derive(Clone)]
@@ -1042,18 +1092,19 @@ impl Router {
         membership_epoch: u64,
         audience_epoch: u64,
         owner: bool,
-        binding: &ToolBindingSnapshot,
+        authority: &WakeAuthority,
     ) -> String {
+        let source = authority.source();
         let mut hash = Sha256::new();
-        hash.update(b"aw-agent-wake-recipient-admission-v1\0");
+        hash.update(b"aw-agent-wake-recipient-admission-v2\0");
         for part in [
             recipient_ref.as_bytes(),
             actor.as_str().as_bytes(),
             session_id.as_bytes(),
-            binding.name.as_bytes(),
-            binding.source.kind_label().as_bytes(),
-            binding.source.id.as_bytes(),
-            binding.execution_site.as_bytes(),
+            authority.name().as_bytes(),
+            source.kind_label().as_bytes(),
+            source.id.as_bytes(),
+            authority.execution_site().as_bytes(),
         ] {
             hash.update((part.len() as u64).to_be_bytes());
             hash.update(part);
@@ -1061,15 +1112,15 @@ impl Router {
         hash.update(membership_epoch.to_be_bytes());
         hash.update(audience_epoch.to_be_bytes());
         hash.update([u8::from(owner)]);
-        hash.update(binding.registry_revision.to_be_bytes());
-        hash.update(binding.authority_revision.to_be_bytes());
-        hash.update(binding.source.epoch.to_be_bytes());
-        hash.update([match binding.effect {
-            aw_agent_core::ToolEffect::Read => 0,
-            aw_agent_core::ToolEffect::Write => 1,
-            aw_agent_core::ToolEffect::Process => 2,
-            aw_agent_core::ToolEffect::Control => 3,
-            aw_agent_core::ToolEffect::Unknown => 4,
+        hash.update(authority.registry_revision().to_be_bytes());
+        hash.update(authority.authority_revision().to_be_bytes());
+        hash.update(source.epoch.to_be_bytes());
+        hash.update([match authority.effect() {
+            ToolEffect::Read => 0,
+            ToolEffect::Write => 1,
+            ToolEffect::Process => 2,
+            ToolEffect::Control => 3,
+            ToolEffect::Unknown => 4,
         }]);
         format!("jwa_{:x}", hash.finalize())
     }
@@ -1102,12 +1153,21 @@ impl Router {
             execution.session_id(),
             aw_store::SessionParticipationAction::Control,
         )?;
-        let binding = live
+        let authority = match live
             .wake_authority
-            .permitted_binding(&ctx.actor, "jobs_subscribe")?;
-        if binding.effect != aw_agent_core::ToolEffect::Control {
+            .permitted_binding(&ctx.actor, "jobs_subscribe")
+        {
+            Ok(binding) => WakeAuthority::Visible(binding),
+            Err(_) => WakeAuthority::Hidden(live.wake_authority.permitted_capability_binding(
+                &ctx.actor,
+                "jobs_subscribe",
+                &ToolSource::trusted_host(),
+                &ToolEffect::Control,
+            )?),
+        };
+        if authority.effect() != &ToolEffect::Control {
             return Err(Error::Denied(
-                "jobs_subscribe recipient binding is not Control",
+                "jobs_subscribe recipient authority is not Control",
             ));
         }
         let authority_ref = Self::wake_authority_ref(
@@ -1117,7 +1177,7 @@ impl Router {
             participation.membership_epoch,
             participation.audience_epoch,
             participation.owner,
-            &binding,
+            &authority,
         );
         let admission = WakeAdmission {
             recipient_ref: canonical.clone(),
@@ -1126,14 +1186,14 @@ impl Router {
             membership_epoch: participation.membership_epoch,
             audience_epoch: participation.audience_epoch,
             owner: participation.owner,
-            binding,
+            authority,
         };
         let mut admissions = self
             .wake_admissions
             .lock()
             .map_err(|_| Error::Storage("Agent wake admission registry poisoned"))?;
         if !admissions.contains_key(&authority_ref)
-            && admissions.len() >= self.finite_capacity.max(64).min(8_192)
+            && admissions.len() >= self.finite_capacity.clamp(64, 8_192)
         {
             return Err(Error::Limit("Agent wake admission registry is full"));
         }
@@ -1188,13 +1248,20 @@ impl Router {
                 "wake recipient no longer owns bounded automatic work",
             ));
         }
-        let current = live
-            .wake_authority
-            .permitted_binding(&admission.actor, "jobs_subscribe")?;
-        if current != admission.binding {
-            return Err(Error::Denied(
-                "jobs_subscribe grant changed after wake registration",
-            ));
+        match &admission.authority {
+            WakeAuthority::Visible(binding) => {
+                let current = live
+                    .wake_authority
+                    .permitted_binding(&admission.actor, "jobs_subscribe")?;
+                if &current != binding {
+                    return Err(Error::Denied(
+                        "jobs_subscribe grant changed after wake registration",
+                    ));
+                }
+            }
+            WakeAuthority::Hidden(binding) => live
+                .wake_authority
+                .revalidate_capability(&admission.actor, binding)?,
         }
         Ok(admission)
     }

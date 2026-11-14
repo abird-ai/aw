@@ -68,6 +68,10 @@ impl TurnJournal for Journal {
                 | JournalEntry::ToolRevised { .. } => {
                     panic!("provider retry must never invent a tool side effect")
                 }
+                JournalEntry::AuthoritySegmentStarted { .. }
+                | JournalEntry::ModelInvocationAdmitted { .. } => {
+                    panic!("plain provider retry must not invent Actor authority admissions")
+                }
             };
             self.0.lock().unwrap().push(value);
             Ok(())

@@ -7,6 +7,7 @@
 
 use crate::{execution_ref::ExecutionRef, operation::OperationId};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 pub const REMOTE_START_VERSION: u16 = 1;
@@ -38,6 +39,50 @@ fn put_bytes(hash: &mut Sha256, value: &[u8]) {
 
 fn put_str(hash: &mut Sha256, value: &str) {
     put_bytes(hash, value.as_bytes());
+}
+
+/// Canonical digest for the exact semantic argument value bound into a remote
+/// Start. Object key ordering is deliberately normalized so hosts and targets
+/// do not depend on serde map insertion order.
+pub fn arguments_sha256(value: &Value) -> [u8; 32] {
+    fn write_value(hash: &mut Sha256, value: &Value) {
+        match value {
+            Value::Null => hash.update([0]),
+            Value::Bool(value) => hash.update([1, u8::from(*value)]),
+            Value::Number(value) => {
+                hash.update([2]);
+                hash.update(value.to_string().as_bytes());
+            }
+            Value::String(value) => {
+                hash.update([3]);
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value.as_bytes());
+            }
+            Value::Array(values) => {
+                hash.update([4]);
+                hash.update((values.len() as u64).to_be_bytes());
+                for value in values {
+                    write_value(hash, value);
+                }
+            }
+            Value::Object(values) => {
+                hash.update([5]);
+                hash.update((values.len() as u64).to_be_bytes());
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                for key in keys {
+                    hash.update((key.len() as u64).to_be_bytes());
+                    hash.update(key.as_bytes());
+                    write_value(hash, &values[key]);
+                }
+            }
+        }
+    }
+
+    let mut hash = Sha256::new();
+    hash.update(b"aw-remote-start-arguments-v1\0");
+    write_value(&mut hash, value);
+    hash.finalize().into()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +385,17 @@ mod tests {
             membership_epoch: 7,
             audience_epoch: 8,
         }
+    }
+
+    #[test]
+    fn argument_digest_is_stable_across_object_order() {
+        let left = serde_json::json!({"b":[2,1],"a":{"z":true,"x":"v"}});
+        let right = serde_json::json!({"a":{"x":"v","z":true},"b":[2,1]});
+        assert_eq!(arguments_sha256(&left), arguments_sha256(&right));
+        assert_ne!(
+            arguments_sha256(&left),
+            arguments_sha256(&serde_json::json!({"b":[1,2],"a":{"z":true,"x":"v"}}))
+        );
     }
 
     #[test]

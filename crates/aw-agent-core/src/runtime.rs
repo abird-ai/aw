@@ -195,6 +195,17 @@ struct DeferredMessage {
     current_turn: u64,
     deadline: Instant,
 }
+pub(crate) struct AuthorityUpdateRequest<'a> {
+    pub(crate) principal: &'a PrincipalId,
+    pub(crate) key: ActorKey,
+    pub(crate) epoch: Option<NonZeroU64>,
+    pub(crate) turn: u64,
+    pub(crate) boundary_kind: crate::AuthorityBoundaryKind,
+    pub(crate) boundary_id: &'a str,
+    pub(crate) input: &'a str,
+    pub(crate) replacement_evidence: Option<crate::AuthoritySegmentEvidence>,
+}
+
 /// Per owner/site logical Runtime. The owning Agent and durable store remain
 /// separate: an accepted message means queued, never executed or paid.
 pub struct HostRuntime {
@@ -1285,17 +1296,20 @@ impl HostRuntime {
         Ok(active.authority_segment.clone())
     }
 
-    fn admit_authority_update(
+    pub(crate) fn admit_authority_update(
         &mut self,
-        principal: &PrincipalId,
-        key: ActorKey,
-        epoch: Option<NonZeroU64>,
-        turn: u64,
-        boundary_kind: crate::AuthorityBoundaryKind,
-        boundary_id: &str,
-        input: &str,
-        replacement_evidence: Option<crate::AuthoritySegmentEvidence>,
+        request: AuthorityUpdateRequest<'_>,
     ) -> Result<crate::AuthoritySegment> {
+        let AuthorityUpdateRequest {
+            principal,
+            key,
+            epoch,
+            turn,
+            boundary_kind,
+            boundary_id,
+            input,
+            replacement_evidence,
+        } = request;
         if boundary_id.is_empty()
             || boundary_id.len() > 256
             || !boundary_id.is_ascii()
@@ -1407,38 +1421,16 @@ impl HostRuntime {
         boundary_id: &str,
         input: &str,
     ) -> Result<crate::AuthoritySegment> {
-        self.admit_authority_update(
+        self.admit_authority_update(AuthorityUpdateRequest {
             principal,
             key,
             epoch,
             turn,
-            crate::AuthorityBoundaryKind::Steer,
+            boundary_kind: crate::AuthorityBoundaryKind::Steer,
             boundary_id,
             input,
-            None,
-        )
-    }
-
-    pub(crate) fn admit_authority_steer_with_evidence(
-        &mut self,
-        principal: &PrincipalId,
-        key: ActorKey,
-        epoch: Option<NonZeroU64>,
-        turn: u64,
-        boundary_id: &str,
-        input: &str,
-        evidence: crate::AuthoritySegmentEvidence,
-    ) -> Result<crate::AuthoritySegment> {
-        self.admit_authority_update(
-            principal,
-            key,
-            epoch,
-            turn,
-            crate::AuthorityBoundaryKind::Steer,
-            boundary_id,
-            input,
-            Some(evidence),
-        )
+            replacement_evidence: None,
+        })
     }
 
     pub(crate) fn admit_authority_interrupt(
@@ -1450,38 +1442,16 @@ impl HostRuntime {
         boundary_id: &str,
         input: &str,
     ) -> Result<crate::AuthoritySegment> {
-        self.admit_authority_update(
+        self.admit_authority_update(AuthorityUpdateRequest {
             principal,
             key,
             epoch,
             turn,
-            crate::AuthorityBoundaryKind::Interrupt,
+            boundary_kind: crate::AuthorityBoundaryKind::Interrupt,
             boundary_id,
             input,
-            None,
-        )
-    }
-
-    pub(crate) fn admit_authority_interrupt_with_evidence(
-        &mut self,
-        principal: &PrincipalId,
-        key: ActorKey,
-        epoch: Option<NonZeroU64>,
-        turn: u64,
-        boundary_id: &str,
-        input: &str,
-        evidence: crate::AuthoritySegmentEvidence,
-    ) -> Result<crate::AuthoritySegment> {
-        self.admit_authority_update(
-            principal,
-            key,
-            epoch,
-            turn,
-            crate::AuthorityBoundaryKind::Interrupt,
-            boundary_id,
-            input,
-            Some(evidence),
-        )
+            replacement_evidence: None,
+        })
     }
 
     pub(crate) fn discard_authority_steer(

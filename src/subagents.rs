@@ -4,8 +4,7 @@ use aw::{
 };
 use aw_agent_core::{
     AgentExecutionBinding, AuxiliaryInput, AuxiliaryKind, ExecutionOwnershipLease,
-    InvocationIdentity, JournalEntry, JournalFuture, PrincipalId, ProviderAccounts,
-    ProviderSelection, Tool,
+    InvocationIdentity, JournalEntry, JournalFuture, ProviderAccounts, ProviderSelection, Tool,
     ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSpec, TurnJournal, TurnStart,
 };
 #[cfg(feature = "routing")]
@@ -23,17 +22,15 @@ use aw_host::{
 };
 use aw_store_api::SessionBackend;
 use aw_tools::{
-    coordination::{ApprovalId, ApprovalState, ApprovalTarget, PendingApproval, PendingApprovalSet},
-    execution_ref::{ExecutionRef, ExecutionSegment, Handle, NodeCoordinate, ResolvedExecutionRef, Revision},
+    execution_ref::{ExecutionRef, ExecutionSegment, Handle, ResolvedExecutionRef},
     filesystem::schema::Tool as FsTool,
     operation::OperationId,
+    remote_start::{
+        RemoteSessionAction, RemoteStartIntent, REMOTE_START_VERSION,
+        arguments_sha256 as remote_arguments_sha256,
+    },
 };
-use aw_tools_adapter::operation_router::{
-    GraphFootprintOverride, GraphNodeExecutionFuture, GraphNodeOriginalExecutor,
-    GraphNodePolicyRequest, GraphPolicyFuture, GraphPolicyRequest, GraphPolicyRouter,
-    GraphPresealDecision, GraphPresealFuture, GraphPresealNode, GraphPresealRequest,
-    OperationRouter,
-};
+use aw_tools_adapter::operation_router::OperationRouter;
 #[cfg(feature = "routing")]
 use aw_store::{RoutingSelectionSource, RoutingStrategyRevisionInfo};
 use serde::Deserialize;
@@ -393,8 +390,6 @@ struct SpawnArgs {
     task: String,
     #[serde(default)]
     title: Option<String>,
-    #[serde(default)]
-    mode: ModeArg,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +413,16 @@ struct PolicyGateSpec {
     tool: Arc<dyn Tool>,
     name: String,
     effect: ToolEffect,
+}
+
+struct PrepareRequest {
+    args: SpawnArgs,
+    mode: SubagentMode,
+    attach_legacy_child_actor: bool,
+    constructor_fingerprint: Option<String>,
+    tool_mode_override: Option<ToolMode>,
+    allow_recursive_tools: bool,
+    policy_gate: Option<PolicyGateSpec>,
 }
 
 #[derive(Clone)]
@@ -544,18 +549,6 @@ impl PolicyOperationConfig {
         })
     }
 
-    pub fn with_guardian(mut self, enabled: bool) -> Self {
-        self.guardian = enabled;
-        self
-    }
-
-    pub const fn policy(self) -> aw_policy::Policy {
-        self.policy
-    }
-
-    pub const fn revision(self) -> u64 {
-        self.revision
-    }
 }
 
 struct PreparedOriginalOperation {
@@ -578,9 +571,11 @@ impl OriginalOperationExecutor for PreparedOriginalOperation {
 
 #[derive(Clone)]
 pub struct PolicyOperationRouter {
-    service: Service,
+    store: SessionStore,
+    service: Option<Service>,
     authority: aw_agent_core::tool::ToolBindingAuthority,
     config: PolicyOperationConfig,
+    remote_sites: BTreeMap<String, aw_mcp::RemoteBridge>,
 }
 
 impl PolicyOperationRouter {
@@ -593,10 +588,52 @@ impl PolicyOperationRouter {
             PolicyOperationConfig::deterministic(config.policy, config.revision)?;
         }
         Ok(Self {
-            service,
+            store: service.inner.store.clone(),
+            service: Some(service),
             authority,
             config,
+            remote_sites: BTreeMap::new(),
         })
+    }
+
+    pub fn local(
+        store: SessionStore,
+        authority: aw_agent_core::tool::ToolBindingAuthority,
+        config: PolicyOperationConfig,
+    ) -> Result<Self> {
+        if config.enabled {
+            PolicyOperationConfig::deterministic(config.policy, config.revision)?;
+        }
+        Ok(Self {
+            store,
+            service: None,
+            authority,
+            config,
+            remote_sites: BTreeMap::new(),
+        })
+    }
+
+    fn delegation_service(&self) -> Result<&Service> {
+        self.service.as_ref().ok_or(Error::Denied(
+            "operation route requires unavailable Agent delegation/guardian service",
+        ))
+    }
+
+    pub fn with_remote_site(
+        mut self,
+        site: impl Into<String>,
+        bridge: aw_mcp::RemoteBridge,
+    ) -> Result<Self> {
+        let site = site.into();
+        if site.is_empty()
+            || site.len() > 128
+            || site.chars().any(char::is_control)
+            || site == "local"
+            || self.remote_sites.insert(site, bridge).is_some()
+        {
+            return Err(Error::Denied("invalid or duplicate remote execution site"));
+        }
+        Ok(self)
     }
 
     fn current_agent_ref(ctx: &ToolContext) -> Result<ResolvedExecutionRef> {
@@ -688,12 +725,116 @@ impl PolicyOperationRouter {
         hash.finalize().into()
     }
 
-    fn request_sha256(operation: OperationId, arguments: &Value) -> String {
+    fn request_digest(operation: OperationId, arguments: &Value) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"aw-policy-operation-semantic-request-v1\0");
         hash.update(operation.semantic_name().as_bytes());
         hash.update(Self::canonical_json_hash(arguments));
-        format!("{:x}", hash.finalize())
+        hash.finalize().into()
+    }
+
+    fn request_sha256(operation: OperationId, arguments: &Value) -> String {
+        let digest = Self::request_digest(operation, arguments);
+        let mut encoded = String::with_capacity(64);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    fn remote_wire_ref(canonical: &str) -> Result<String> {
+        let resolved = ExecutionRef::parse(canonical)
+            .map_err(|_| Error::Denied("invalid canonical remote Job ref"))?
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("remote Job ref must already be canonical"))?;
+        match resolved.suffix() {
+            [ExecutionSegment::Job(job)] => Ok(format!("j:{}", job.as_str())),
+            [ExecutionSegment::Job(job), ExecutionSegment::Node(node)] => {
+                Ok(format!("j:{}/n:{}", job.as_str(), node.get()))
+            }
+            _ => Err(Error::Denied(
+                "remote dotlink control/read requires an exact finite Job or node ref",
+            )),
+        }
+    }
+
+    fn remote_arguments(
+        operation: OperationId,
+        canonical_target: &str,
+        arguments: &Value,
+    ) -> Result<Value> {
+        let mut remote = arguments
+            .as_object()
+            .cloned()
+            .ok_or(Error::Denied("remote operation arguments must be an object"))?;
+        match operation {
+            OperationId::JobsGet
+            | OperationId::JobsRead
+            | OperationId::JobsAck
+            | OperationId::JobsSend
+            | OperationId::JobsCancel => {
+                remote.insert(
+                    "ref".into(),
+                    Value::String(Self::remote_wire_ref(canonical_target)?),
+                );
+            }
+            OperationId::JobsList
+            | OperationId::Fs(_)
+            | OperationId::Bash
+            | OperationId::Pwsh
+            | OperationId::Powershell
+            | OperationId::Batch => {}
+            _ => return Err(Error::Denied("operation has no initial dotlink bridge mapping")),
+        }
+        Ok(Value::Object(remote))
+    }
+
+    fn remote_read(operation: OperationId) -> bool {
+        match operation {
+            OperationId::Fs(tool) => {
+                tool.action() == aw_tools::filesystem::access::Action::Read
+            }
+            OperationId::JobsList | OperationId::JobsGet | OperationId::JobsRead => true,
+            _ => false,
+        }
+    }
+
+    fn remote_effect(operation: OperationId) -> bool {
+        match operation {
+            OperationId::Fs(tool) => {
+                tool.action() != aw_tools::filesystem::access::Action::Read
+            }
+            OperationId::Bash
+            | OperationId::Pwsh
+            | OperationId::Powershell
+            | OperationId::Batch
+            | OperationId::JobsAck
+            | OperationId::JobsSend
+            | OperationId::JobsCancel => true,
+            _ => false,
+        }
+    }
+
+    fn remote_session_action(operation: OperationId) -> Result<RemoteSessionAction> {
+        if matches!(
+            operation,
+            OperationId::JobsAck | OperationId::JobsSend | OperationId::JobsCancel
+        ) {
+            Ok(RemoteSessionAction::Control)
+        } else if matches!(
+            operation,
+            OperationId::Fs(_)
+                | OperationId::Bash
+                | OperationId::Pwsh
+                | OperationId::Powershell
+                | OperationId::Batch
+        ) {
+            Ok(RemoteSessionAction::Submit)
+        } else {
+            Err(Error::Denied("operation does not require remote Start"))
+        }
     }
 
     fn policy_sha256(&self) -> String {
@@ -788,10 +929,10 @@ impl PolicyOperationRouter {
         arguments: Value,
         original: Arc<dyn Tool>,
     ) -> Result<ToolOutput> {
-        if !self.config.enabled {
+        let selected_remote_site = self.remote_sites.contains_key(&ctx.execution_site);
+        if !self.config.enabled && !selected_remote_site {
             return original.execute(ctx, &arguments).await;
         }
-        original.validate(&arguments)?;
         let scope = ctx.scope.as_ref().ok_or(Error::Denied(
             "policy operation routing requires a durable Session/branch",
         ))?;
@@ -803,12 +944,45 @@ impl PolicyOperationRouter {
                 "policy operation scope differs from bound Agent identity",
             ));
         }
-        if ctx.actor != ctx.identity.actor
-            || ctx.source != aw_agent_core::ToolSource::trusted_host()
-            || ctx.execution_site.is_empty()
-        {
+
+        if ctx.actor != ctx.identity.actor || ctx.source != aw_agent_core::ToolSource::trusted_host() {
             return Err(Error::Denied(
-                "policy operation source/actor/site is not an authenticated Host invocation",
+                "policy operation source/actor is not an authenticated Host invocation",
+            ));
+        }
+        let invocation = format!("turn:{}/call:{}", ctx.turn_id, ctx.call_id);
+        if Self::remote_effect(operation) {
+            if let Some(existing) = self.store.remote_start_lookup_attempt(
+                &ctx.actor,
+                &scope.session_id,
+                &invocation,
+                &ctx.call_id,
+            )? {
+                if existing.intent.original_request_sha256
+                    != Self::request_digest(operation, &arguments)
+                {
+                    return Err(Error::Conflict(
+                        "remote Start replay identity was reused with a changed original request",
+                    ));
+                }
+                let bridge = self
+                    .remote_sites
+                    .get(&existing.provenance.source.site)
+                    .ok_or(Error::Conflict(
+                        "committed remote Start site is no longer connected; preserve the original attempt",
+                    ))?;
+                let remote_arguments =
+                    Self::remote_arguments(operation, &existing.intent.canonical_ref, &arguments)?;
+                return bridge
+                    .call_effect(&ctx, operation, &remote_arguments, &existing)
+                    .await;
+            }
+        }
+
+        original.validate(&arguments)?;
+        if ctx.execution_site.is_empty() {
+            return Err(Error::Denied(
+                "policy operation execution site is not an authenticated Host invocation",
             ));
         }
 
@@ -835,7 +1009,6 @@ impl PolicyOperationRouter {
             ));
         }
 
-        let invocation = format!("turn:{}/call:{}", ctx.turn_id, ctx.call_id);
         let operation_context = evidence.operation_context();
         let policy_context = aw_policy::PolicyContext {
             actor: ctx.actor.as_str(),
@@ -858,8 +1031,8 @@ impl PolicyOperationRouter {
             .map_err(|_| Error::Denied("effective operation policy denied"))?;
         let effective = authorized.effective();
 
-        let session = self.service.inner.store.session(&ctx.actor, &scope.session_id)?;
-        let writer = self.service.inner.store.workspace_writer(
+        let session = self.store.session(&ctx.actor, &scope.session_id)?;
+        let writer = self.store.workspace_writer(
             &ctx.actor,
             None,
             &session.workspace_id,
@@ -870,7 +1043,7 @@ impl PolicyOperationRouter {
         let policy_sha = self.policy_sha256();
         let authority_sha = evidence.authority_sha256();
         let selected_for_guardian = if self.config.guardian {
-            Some(self.service.exact_selection(&ctx)?)
+            Some(self.delegation_service()?.exact_selection(&ctx)?)
         } else {
             None
         };
@@ -899,11 +1072,7 @@ impl PolicyOperationRouter {
             authorized_approvers: Vec::new(),
             approval_expires_at: None,
         };
-        let claimed = self
-            .service
-            .inner
-            .store
-            .policy_admission_claim(&ctx.actor, request)?;
+        let claimed = self.store.policy_admission_claim(&ctx.actor, request)?;
 
         let decided = if self.config.guardian {
             let selected = selected_for_guardian
@@ -931,20 +1100,22 @@ impl PolicyOperationRouter {
                     .await?,
                 max_output_bytes: 8 * 1024,
                 timeout: self
-                    .service
+                    .delegation_service()?
                     .inner
                     .settings
                     .request_timeout
                     .min(Duration::from_secs(60)),
             };
             aw::policy_runtime::run_admission_guardian(
-                &self.service.inner.store,
-                &ctx.actor,
-                claimed.request.clone(),
-                authorized,
-                selected,
-                &input,
-                self.config.revision,
+                aw::policy_runtime::AdmissionGuardianRequest {
+                    store: &self.store,
+                    actor: &ctx.actor,
+                    request: claimed.request.clone(),
+                    authorized,
+                    selected,
+                    input: &input,
+                    decision_revision: self.config.revision,
+                },
                 ctx.cancellation.clone().cancelled(),
             )
             .await?
@@ -953,7 +1124,7 @@ impl PolicyOperationRouter {
                 PolicyAdmissionState::Claimed => {
                     let route = effective.strategy();
                     let digest = Self::decision_digest(self.config.revision, route, "allow");
-                    self.service.inner.store.policy_admission_record_decision(
+                    self.store.policy_admission_record_decision(
                         &ctx.actor,
                         &scope.session_id,
                         &claimed.id,
@@ -1005,8 +1176,46 @@ impl PolicyOperationRouter {
         }
 
         let strategy = Self::selected_route(&decided, effective.strategy())?;
+        let remote_bridge = if strategy == aw_policy::Strategy::Local {
+            self.remote_sites.get(&ctx.execution_site).cloned()
+        } else {
+            None
+        };
+        let remote_arguments = remote_bridge
+            .as_ref()
+            .map(|_| Self::remote_arguments(operation, &target, &arguments))
+            .transpose()?;
+        if remote_bridge.is_some()
+            && !Self::remote_read(operation)
+            && !Self::remote_effect(operation)
+        {
+            return Err(Error::Denied("operation is not supported by the initial dotlink bridge"));
+        }
+        let remote_intent = match remote_bridge.as_ref() {
+            Some(bridge) if Self::remote_effect(operation) => {
+                let lease = bridge.lease().await?;
+                let wire_arguments = remote_arguments
+                    .as_ref()
+                    .ok_or(Error::Protocol("remote arguments disappeared"))?;
+                Some(RemoteStartIntent {
+                    version: REMOTE_START_VERSION,
+                    original_invocation_id: invocation.clone(),
+                    turn_id: ctx.turn_id,
+                    call_id: ctx.call_id.clone(),
+                    effect_attempt_id: ctx.call_id.clone(),
+                    operation: operation.semantic_name().into(),
+                    canonical_ref: target.clone(),
+                    arguments_sha256: remote_arguments_sha256(wire_arguments),
+                    original_request_sha256: Self::request_digest(operation, &arguments),
+                    session_action: Self::remote_session_action(operation)?,
+                    target: lease,
+                })
+            }
+            _ => None,
+        };
+
         evidence.revalidate(&self.authority)?;
-        let consumed = self.service.inner.store.policy_admission_consume(
+        let consumed = self.store.policy_admission_consume(
             &ctx.actor,
             &scope.session_id,
             &decided.id,
@@ -1021,6 +1230,28 @@ impl PolicyOperationRouter {
             ));
         }
 
+        if let Some(bridge) = remote_bridge {
+            let wire_arguments = remote_arguments
+                .as_ref()
+                .ok_or(Error::Protocol("remote arguments disappeared"))?;
+            if Self::remote_read(operation) {
+                return bridge.call_read(&ctx, operation, wire_arguments).await;
+            }
+            let intent = remote_intent.ok_or(Error::Protocol("remote Start intent disappeared"))?;
+            let authorization = aw::policy_runtime::authorize_remote_start(
+                &self.store,
+                &self.authority,
+                &ctx.actor,
+                &evidence,
+                &scope.session_id,
+                &consumed.id,
+                intent,
+            )?;
+            return bridge
+                .call_effect(&ctx, operation, wire_arguments, &authorization)
+                .await;
+        }
+
         let original_executor = Arc::new(PreparedOriginalOperation {
             original,
             ctx: ctx.clone(),
@@ -1028,11 +1259,12 @@ impl PolicyOperationRouter {
         });
         let delegated = if strategy == aw_policy::Strategy::DelegateAgent {
             let request = Self::delegation_request(operation, &ctx, &target)?;
+            let service = self.delegation_service()?;
             Some(DelegateExecution {
                 request,
-                port: self.service.policy_delegate_port(&ctx),
+                port: service.policy_delegate_port(&ctx),
                 delegate_binding: None,
-                delegate_admission: self.service.policy_delegate_admission(&ctx),
+                delegate_admission: service.policy_delegate_admission(&ctx),
             })
         } else {
             None
@@ -1062,1367 +1294,6 @@ impl OperationRouter for PolicyOperationRouter {
     }
 }
 
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct GraphNarrowProposal {
-    pub narrow_ref: String,
-    pub arguments: Value,
-}
-
-/// Trusted host-only argument revision source. Policy/guardian output can select
-/// one opaque narrow_ref, but never supplies replacement arguments directly.
-pub trait GraphNarrowAuthority: Send + Sync {
-    fn proposal(
-        &self,
-        ctx: &ToolContext,
-        node: &GraphPresealNode,
-    ) -> Result<Option<GraphNarrowProposal>>;
-}
-
-#[derive(Clone)]
-pub struct PolicyGraphConfig {
-    policy: aw_policy::Policy,
-    revision: u64,
-    guardian: bool,
-    authorized_approvers: Vec<PrincipalId>,
-    approval_ttl: Duration,
-    narrow_authority: Option<Arc<dyn GraphNarrowAuthority>>,
-}
-
-impl PolicyGraphConfig {
-    pub fn deterministic(policy: aw_policy::Policy, revision: u64) -> Result<Self> {
-        if revision == 0 {
-            return Err(Error::Denied("Graph policy revision must be nonzero"));
-        }
-        aw_policy::resolve_scoped(&[aw_policy::PolicyLayer {
-            scope: aw_policy::PolicyScope::Node,
-            revision,
-            policy: &policy,
-        }])
-        .map_err(|_| Error::Denied("invalid Graph policy"))?;
-        Ok(Self {
-            policy,
-            revision,
-            guardian: false,
-            authorized_approvers: Vec::new(),
-            approval_ttl: Duration::from_secs(300),
-            narrow_authority: None,
-        })
-    }
-
-    pub fn with_narrow_authority(
-        mut self,
-        authority: Arc<dyn GraphNarrowAuthority>,
-    ) -> Self {
-        self.narrow_authority = Some(authority);
-        self
-    }
-
-    pub fn with_guardian(
-        mut self,
-        approvers: Vec<PrincipalId>,
-        approval_ttl: Duration,
-    ) -> Result<Self> {
-        if approval_ttl.is_zero() || approval_ttl > Duration::from_secs(86_400) {
-            return Err(Error::Limit("Graph approval TTL must be 1..86400 seconds"));
-        }
-        let mut names = approvers
-            .iter()
-            .map(|principal| principal.as_str().to_owned())
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        if names.len() != approvers.len() || names.len() > 32 {
-            return Err(Error::Denied(
-                "Graph policy approvers must be unique and bounded",
-            ));
-        }
-        self.guardian = true;
-        self.authorized_approvers = approvers;
-        self.approval_ttl = approval_ttl;
-        Ok(self)
-    }
-}
-
-#[derive(Clone)]
-struct GraphNodeStatusExecutor {
-    original: Arc<dyn GraphNodeOriginalExecutor>,
-    status: Arc<Mutex<Option<aw_tools::filesystem::batch::Status>>>,
-}
-
-impl OriginalOperationExecutor for GraphNodeStatusExecutor {
-    fn execute<'a>(&'a self) -> HostExecutionFuture<'a, ToolOutput> {
-        let original = self.original.clone();
-        let status = self.status.clone();
-        Box::pin(async move {
-            let factual = original.execute().await?;
-            *status
-                .lock()
-                .map_err(|_| Error::Storage("Graph node delegate status lock poisoned"))? =
-                Some(factual);
-            Ok(ToolOutput::text("graph node factual execution completed"))
-        })
-    }
-}
-
-#[derive(Clone)]
-struct GraphAdmission {
-    admission_id: String,
-    session_id: String,
-    policy_sha256: String,
-    authority_sha256: String,
-    evidence: AuthenticatedToolGrantEvidence,
-    route: aw_policy::Strategy,
-    replay_identity: [u8; 32],
-}
-
-#[derive(Clone)]
-struct PendingGraphState {
-    session_id: String,
-    set: PendingApprovalSet,
-    by_coordinate: BTreeMap<u32, String>,
-}
-
-#[derive(Clone)]
-struct PresealedGraphAdmission {
-    target: String,
-    evidence: AuthenticatedToolGrantEvidence,
-    authorized: aw_policy::AuthorizedPolicy,
-    fact: aw_store::PolicyAdmissionFact,
-    original_replay_identity: [u8; 32],
-}
-
-#[derive(Clone)]
-pub struct PolicyGraphRouter {
-    service: Service,
-    authority: aw_agent_core::tool::ToolBindingAuthority,
-    config: PolicyGraphConfig,
-    pending: Arc<Mutex<BTreeMap<String, PendingGraphState>>>,
-    presealed: Arc<Mutex<BTreeMap<(String, u32), PresealedGraphAdmission>>>,
-    admitted: Arc<Mutex<BTreeMap<(String, u32), GraphAdmission>>>,
-    wake: Arc<tokio::sync::Notify>,
-}
-
-struct PreparedGraphAdmission {
-    node: aw_tools_adapter::operation_router::GraphPolicyNode,
-    target: String,
-    evidence: AuthenticatedToolGrantEvidence,
-    authorized: aw_policy::AuthorizedPolicy,
-    fact: aw_store::PolicyAdmissionFact,
-}
-
-impl PolicyGraphRouter {
-    pub fn new(
-        service: Service,
-        authority: aw_agent_core::tool::ToolBindingAuthority,
-        config: PolicyGraphConfig,
-    ) -> Result<Self> {
-        PolicyGraphConfig::deterministic(config.policy, config.revision)?;
-        Ok(Self {
-            service,
-            authority,
-            config,
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
-            presealed: Arc::new(Mutex::new(BTreeMap::new())),
-            admitted: Arc::new(Mutex::new(BTreeMap::new())),
-            wake: Arc::new(tokio::sync::Notify::new()),
-        })
-    }
-
-    fn graph_ref(ctx: &ToolContext, job_id: &str) -> Result<ResolvedExecutionRef> {
-        let current = PolicyOperationRouter::current_agent_ref(ctx)?;
-        ResolvedExecutionRef::new(
-            current.agent_ref().clone(),
-            vec![
-                ExecutionSegment::Turn(
-                    Handle::new(ctx.turn_id.to_string())
-                        .map_err(|_| Error::Denied("invalid Graph Turn handle"))?,
-                ),
-                ExecutionSegment::Job(
-                    Handle::new(job_id.to_owned())
-                        .map_err(|_| Error::Denied("invalid Graph Job handle"))?,
-                ),
-            ],
-        )
-        .map_err(|_| Error::Denied("cannot construct canonical Graph ref"))
-    }
-
-    fn node_ref(graph: &ResolvedExecutionRef, coordinate: u32) -> Result<ResolvedExecutionRef> {
-        let mut suffix = graph.suffix().to_vec();
-        suffix.push(ExecutionSegment::Node(
-            NodeCoordinate::new(coordinate)
-                .map_err(|_| Error::Denied("invalid Graph node coordinate"))?,
-        ));
-        ResolvedExecutionRef::new(graph.agent_ref().clone(), suffix)
-            .map_err(|_| Error::Denied("cannot construct canonical Graph node ref"))
-    }
-
-    fn policy_sha256(&self) -> String {
-        let mut hash = Sha256::new();
-        hash.update(b"aw-graph-policy-config-v1\0");
-        hash.update(self.config.revision.to_be_bytes());
-        let policy = self.config.policy;
-        hash.update([
-            u8::from(policy.deny),
-            u8::from(policy.routes.contains(aw_policy::Strategy::Local)),
-            u8::from(policy.routes.contains(aw_policy::Strategy::DelegateAgent)),
-            match policy.prefer {
-                None => 0,
-                Some(aw_policy::Strategy::Local) => 1,
-                Some(aw_policy::Strategy::DelegateAgent) => 2,
-            },
-            u8::from(policy.require_preferred),
-            u8::from(self.config.guardian),
-        ]);
-        hash.update(policy.max_model_rounds.unwrap_or(0).to_be_bytes());
-        format!("{:x}", hash.finalize())
-    }
-
-    fn request_sha256_parts(
-        graph_fingerprint: [u8; 32],
-        coordinate: u32,
-        operation: OperationId,
-        replay_identity: [u8; 32],
-        footprint_fingerprint: [u8; 32],
-        dependencies: &[u32],
-    ) -> String {
-        let mut hash = Sha256::new();
-        hash.update(b"aw-graph-policy-node-request-v1\0");
-        hash.update(graph_fingerprint);
-        hash.update(coordinate.to_be_bytes());
-        hash.update(operation.semantic_name().as_bytes());
-        hash.update(replay_identity);
-        hash.update(footprint_fingerprint);
-        for dependency in dependencies {
-            hash.update(dependency.to_be_bytes());
-        }
-        format!("{:x}", hash.finalize())
-    }
-
-    fn request_sha256(
-        request: &GraphPolicyRequest,
-        node: &aw_tools_adapter::operation_router::GraphPolicyNode,
-    ) -> String {
-        Self::request_sha256_parts(
-            request.graph_fingerprint,
-            node.coordinate,
-            node.operation,
-            node.replay_identity,
-            node.footprint_fingerprint,
-            &node.dependencies,
-        )
-    }
-
-    fn preseal_request_sha256(request: &GraphPresealRequest, node: &GraphPresealNode) -> String {
-        Self::request_sha256_parts(
-            request.graph_fingerprint,
-            node.coordinate,
-            node.operation,
-            node.replay_identity,
-            node.footprint.fingerprint(),
-            &node.dependencies,
-        )
-    }
-
-    fn validate_narrow_proposal(
-        node: &GraphPresealNode,
-        proposal: GraphNarrowProposal,
-    ) -> Result<GraphNarrowProposal> {
-        if proposal.narrow_ref.is_empty()
-            || proposal.narrow_ref.len() > 256
-            || !proposal.narrow_ref.is_ascii()
-            || !proposal
-                .narrow_ref
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._~:/@-".contains(&byte))
-            || !proposal.arguments.is_object()
-            || serde_json::to_vec(&proposal.arguments)
-                .map_err(|_| Error::Denied("cannot encode Graph narrow arguments"))?
-                .len()
-                > aw_agent_core::tool::MAX_TOOL_ARGUMENT_BYTES
-            || proposal.arguments == node.arguments
-        {
-            return Err(Error::Denied(
-                "invalid or no-op host Graph argument narrowing proposal",
-            ));
-        }
-        Ok(proposal)
-    }
-
-    fn apply_narrowed_arguments(
-        graph: &mut Value,
-        coordinate: u32,
-        arguments: Value,
-    ) -> Result<()> {
-        let ops = graph
-            .get_mut("ops")
-            .and_then(Value::as_array_mut)
-            .ok_or(Error::Protocol("pre-seal Graph lost ops array"))?;
-        let index = usize::try_from(coordinate.saturating_sub(1))
-            .map_err(|_| Error::Protocol("Graph narrow coordinate overflow"))?;
-        let node = ops
-            .get_mut(index)
-            .and_then(Value::as_array_mut)
-            .ok_or(Error::Protocol("Graph narrow coordinate is unavailable"))?;
-        if node.len() < 2 {
-            return Err(Error::Protocol("Graph narrow node is malformed"));
-        }
-        node[1] = arguments;
-        Ok(())
-    }
-
-    fn preseal_policy_node(node: &GraphPresealNode) -> aw_tools_adapter::operation_router::GraphPolicyNode {
-        aw_tools_adapter::operation_router::GraphPolicyNode {
-            coordinate: node.coordinate,
-            operation: node.operation,
-            replay_identity: node.replay_identity,
-            footprint_fingerprint: node.footprint.fingerprint(),
-            dependencies: node.dependencies.clone(),
-        }
-    }
-
-    fn approval_id(admission_id: &str) -> ApprovalId {
-        let mut hash = Sha256::new();
-        hash.update(b"aw-graph-policy-approval-v1\0");
-        hash.update(admission_id.as_bytes());
-        ApprovalId(hash.finalize().into())
-    }
-
-    fn fingerprint_strings(domain: &[String], label: &[u8]) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(label);
-        let mut values = domain.to_vec();
-        values.sort();
-        for value in values {
-            hash.update((value.len() as u64).to_be_bytes());
-            hash.update(value.as_bytes());
-        }
-        hash.finalize().into()
-    }
-
-    fn graph_admission_identity(
-        ctx: &ToolContext,
-        request: &GraphPolicyRequest,
-    ) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(b"aw-graph-policy-admission-set-v1\0");
-        hash.update(request.graph_fingerprint);
-        hash.update(ctx.turn_id.to_be_bytes());
-        hash.update(ctx.call_id.as_bytes());
-        hash.finalize().into()
-    }
-
-    pub fn pending_approvals(&self, job_id: &str) -> Option<PendingApprovalSet> {
-        self.pending
-            .lock()
-            .ok()
-            .and_then(|pending| pending.get(job_id).map(|state| state.set.clone()))
-    }
-
-    pub fn decide_graph_approval(
-        &self,
-        job_id: &str,
-        coordinate: u32,
-        approver: &PrincipalId,
-        approve: bool,
-    ) -> Result<aw_store::PolicyAdmissionFact> {
-        let (session, admission_id, approval_id) = {
-            let pending = self
-                .pending
-                .lock()
-                .map_err(|_| Error::Storage("Graph approval set lock poisoned"))?;
-            let state = pending
-                .get(job_id)
-                .ok_or(Error::Denied("Graph has no pending approval set"))?;
-            let admission_id = state
-                .by_coordinate
-                .get(&coordinate)
-                .cloned()
-                .ok_or(Error::Denied("Graph node is not awaiting approval"))?;
-            (
-                state.session_id.clone(),
-                admission_id.clone(),
-                Self::approval_id(&admission_id),
-            )
-        };
-        let fact = self.service.inner.store.policy_admission_decide(
-            approver,
-            &session,
-            &admission_id,
-            approve,
-        )?;
-        if let Ok(mut pending) = self.pending.lock() {
-            if let Some(state) = pending.get_mut(job_id) {
-                if let Some(entry) = state.set.entry_mut(approval_id) {
-                    let projected = match fact.state {
-                        PolicyAdmissionState::AskApproved => ApprovalState::Approved,
-                        PolicyAdmissionState::AskDenied => ApprovalState::Denied,
-                        PolicyAdmissionState::AskExpired => ApprovalState::Expired,
-                        _ => ApprovalState::Pending,
-                    };
-                    if projected != ApprovalState::Pending {
-                        let _ = entry.resolve(projected);
-                    }
-                }
-            }
-        }
-        self.wake.notify_waiters();
-        Ok(fact)
-    }
-
-    async fn guardian_decide(
-        &self,
-        ctx: &ToolContext,
-        prepared: &PreparedGraphAdmission,
-        approval_scope: Option<&str>,
-        admission_narrow_ref: Option<&str>,
-    ) -> Result<aw_store::PolicyAdmissionFact> {
-        if !self.config.guardian {
-            let effective = prepared.authorized.effective();
-            let route = effective.strategy();
-            let digest =
-                PolicyOperationRouter::decision_digest(self.config.revision, route, "allow");
-            return self.service.inner.store.policy_admission_record_decision(
-                &ctx.actor,
-                &prepared.fact.request.session_id,
-                &prepared.fact.id,
-                aw_policy::PolicyDecision {
-                    decision: aw_policy::Decision::Allow,
-                    revision: self.config.revision,
-                    route: Some(route),
-                    approval_scope: None,
-                    narrow_ref: None,
-                },
-                &digest,
-            );
-        }
-        let selected = self.service.exact_selection(ctx)?;
-        let scratch = Agent::builder_from_selection(
-            selected.clone(),
-            AgentOptions::new(
-                selected.identity().account_id.clone(),
-                selected.identity().model.clone(),
-            ),
-        )
-        .build()?;
-        let ask_instruction = approval_scope.map_or_else(
-            || "Ask is unavailable for this node.".to_owned(),
-            |scope| format!(
-                "If human approval is required, return decision=ask and approval_scope exactly {scope:?}."
-            ),
-        );
-        let narrow_instruction = admission_narrow_ref.map_or_else(
-            || "Argument Narrow is unavailable at this stage; do not return decision=narrow.".to_owned(),
-            |reference| format!(
-                "Admission-time argument Narrow is available only by returning decision=narrow and narrow_ref exactly {reference:?}. The replacement arguments are trusted-host authored and are not disclosed to you."
-            ),
-        );
-        let prompt = format!(
-            "Return strict JSON only: decision allow|deny|ask|narrow, optional route local|delegate_agent.              Graph node {} operation {}. Effect {:?}. Site {}. Target {}. Dependencies {:?}.              Arguments and private results are intentionally undisclosed. {} {}",
-            prepared.node.coordinate,
-            prepared.node.operation.semantic_name(),
-            ctx.effect,
-            ctx.execution_site,
-            prepared.target,
-            prepared.node.dependencies,
-            ask_instruction,
-            narrow_instruction,
-        );
-        let input = AuxiliaryInput {
-            kind: AuxiliaryKind::Side,
-            messages: scratch.auxiliary_messages(&selected, &prompt).await?,
-            max_output_bytes: 8 * 1024,
-            timeout: self
-                .service
-                .inner
-                .settings
-                .request_timeout
-                .min(Duration::from_secs(60)),
-        };
-        aw::policy_runtime::run_admission_guardian(
-            &self.service.inner.store,
-            &ctx.actor,
-            prepared.fact.request.clone(),
-            prepared.authorized,
-            &selected,
-            &input,
-            self.config.revision,
-            ctx.cancellation.clone().cancelled(),
-        )
-        .await
-    }
-
-    fn route_for_fact(
-        fact: &aw_store::PolicyAdmissionFact,
-        fallback: aw_policy::Strategy,
-    ) -> Result<aw_policy::Strategy> {
-        PolicyOperationRouter::selected_route(fact, fallback)
-    }
-
-    async fn wait_for_approvals(
-        &self,
-        ctx: &ToolContext,
-        job_id: &str,
-    ) -> Result<()> {
-        loop {
-            let snapshot = {
-                let pending = self
-                    .pending
-                    .lock()
-                    .map_err(|_| Error::Storage("Graph approval set lock poisoned"))?;
-                pending
-                    .get(job_id)
-                    .cloned()
-                    .ok_or(Error::Conflict("Graph approval set disappeared"))?
-            };
-            let mut ready = true;
-            let mut failed = false;
-            for (coordinate, admission_id) in &snapshot.by_coordinate {
-                let fact = self.service.inner.store.policy_admission_fact(
-                    &ctx.actor,
-                    &snapshot.session_id,
-                    admission_id,
-                )?;
-                let state = match fact.state {
-                    PolicyAdmissionState::AskApproved => ApprovalState::Approved,
-                    PolicyAdmissionState::AskDenied => ApprovalState::Denied,
-                    PolicyAdmissionState::AskExpired => ApprovalState::Expired,
-                    PolicyAdmissionState::AskPending => {
-                        ready = false;
-                        ApprovalState::Pending
-                    }
-                    _ => {
-                        return Err(Error::Conflict(
-                            "Graph Ask admission left its approval lifecycle",
-                        ))
-                    }
-                };
-                if matches!(state, ApprovalState::Denied | ApprovalState::Expired) {
-                    failed = true;
-                }
-                if state != ApprovalState::Pending {
-                    if let Ok(mut pending) = self.pending.lock() {
-                        if let Some(graph) = pending.get_mut(job_id) {
-                            if let Some(entry) =
-                                graph.set.entry_mut(Self::approval_id(admission_id))
-                            {
-                                let _ = entry.resolve(state);
-                            }
-                        }
-                    }
-                }
-                let _ = coordinate;
-            }
-            if failed {
-                self.pending.lock().ok().map(|mut pending| pending.remove(job_id));
-                return Err(Error::Denied("Graph approval denied or expired"));
-            }
-            if ready {
-                self.pending
-                    .lock()
-                    .map_err(|_| Error::Storage("Graph approval set lock poisoned"))?
-                    .remove(job_id);
-                return Ok(());
-            }
-            tokio::select! {
-                _ = ctx.cancellation.cancelled() => return Err(Error::Cancelled),
-                _ = self.wake.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(35)) => {},
-            }
-        }
-    }
-}
-
-impl GraphPolicyRouter for PolicyGraphRouter {
-    fn before_seal<'a>(
-        &'a self,
-        ctx: &'a ToolContext,
-        request: GraphPresealRequest,
-    ) -> GraphPresealFuture<'a> {
-        Box::pin(async move {
-            if request.nodes.is_empty() || request.nodes.len() > 64 {
-                return Err(Error::Limit("Graph pre-seal policy node set must be 1..64"));
-            }
-            for pair in request.nodes.windows(2) {
-                if pair[0].coordinate >= pair[1].coordinate {
-                    return Err(Error::Denied(
-                        "Graph pre-seal node coordinates must be canonical and sorted",
-                    ));
-                }
-            }
-            let scope = ctx.scope.as_ref().ok_or(Error::Denied(
-                "durable Graph pre-seal policy requires a Session/branch scope",
-            ))?;
-            let owner = ctx.execution_owner.as_ref().ok_or(Error::Denied(
-                "durable Graph pre-seal policy requires a bound Agent owner",
-            ))?;
-            if owner.session_id() != scope.session_id || owner.branch_id() != scope.branch_id {
-                return Err(Error::Denied(
-                    "Graph pre-seal policy scope differs from bound Agent owner",
-                ));
-            }
-
-            let graph_ref = Self::graph_ref(ctx, &request.job_id)?;
-            let current = PolicyOperationRouter::current_agent_ref(ctx)?;
-            let project_scope = PolicyOperationRouter::project_scope(&current);
-            let target_domain = PolicyOperationRouter::target_domain(&current);
-            let session = self
-                .service
-                .inner
-                .store
-                .session(&ctx.actor, &scope.session_id)?;
-            let writer = self.service.inner.store.workspace_writer(
-                &ctx.actor,
-                None,
-                &session.workspace_id,
-            )?;
-            if writer.state != "active" {
-                return Err(Error::Denied("Graph pre-seal policy writer is not active"));
-            }
-
-            let policy_sha = self.policy_sha256();
-            let selected = if self.config.guardian {
-                Some(self.service.exact_selection(ctx)?)
-            } else {
-                None
-            };
-            let approvers = self
-                .config
-                .authorized_approvers
-                .iter()
-                .map(|principal| principal.as_str().to_owned())
-                .collect::<Vec<_>>();
-            let expiry = (!approvers.is_empty()).then(|| {
-                unix_micros().saturating_add(
-                    self.config
-                        .approval_ttl
-                        .as_micros()
-                        .min(i64::MAX as u128) as i64,
-                )
-            });
-
-            // Claim every original node before any guardian/provider work. The
-            // request hash uses the original draft fingerprint/replay identity,
-            // never the later narrowed Graph.
-            let mut prepared = Vec::with_capacity(request.nodes.len());
-            let mut proposals = BTreeMap::<u32, GraphNarrowProposal>::new();
-            let mut footprint_overrides = Vec::new();
-            for node in &request.nodes {
-                let target = Self::node_ref(&graph_ref, node.coordinate)?.canonical();
-                let evidence = AuthenticatedToolGrantEvidence::capture(
-                    &self.authority,
-                    &ctx.actor,
-                    node.operation.model_name(),
-                    node.operation.semantic_name(),
-                    target_domain.clone(),
-                    target.clone(),
-                    project_scope.clone(),
-                )?;
-                let operation = evidence.operation_context();
-                let invocation = format!(
-                    "turn:{}/call:{}/graph:{}/node:{}",
-                    ctx.turn_id, ctx.call_id, request.job_id, node.coordinate
-                );
-                let graph_name = graph_ref.canonical();
-                let policy_context = aw_policy::PolicyContext {
-                    actor: ctx.actor.as_str(),
-                    domain: &target_domain,
-                    active_team: None,
-                    workspace: &project_scope,
-                    session: Some(owner.canonical_ref()),
-                    graph: Some(&graph_name),
-                    node: Some(node.coordinate),
-                    invocation: &invocation,
-                    operation,
-                };
-                let layer = aw_policy::PolicyLayer {
-                    scope: aw_policy::PolicyScope::Node,
-                    revision: self.config.revision,
-                    policy: &self.config.policy,
-                };
-                let grant = evidence.as_policy_path();
-                let authorized =
-                    aw_policy::resolve_authorized(&policy_context, &[grant], &[layer])
-                        .map_err(|_| {
-                            Error::Denied("Graph pre-seal node policy denied exact authority")
-                        })?;
-                let effective = authorized.effective();
-                if effective
-                    .routes()
-                    .contains(aw_policy::Strategy::DelegateAgent)
-                {
-                    footprint_overrides.push(GraphFootprintOverride {
-                        coordinate: node.coordinate,
-                        footprint: aw_tools::filesystem::footprint::Footprint::unknown(true, true),
-                    });
-                }
-
-                let proposal = if self.config.guardian {
-                    match self.config.narrow_authority.as_ref() {
-                        Some(authority) => authority
-                            .proposal(ctx, node)?
-                            .map(|proposal| Self::validate_narrow_proposal(node, proposal))
-                            .transpose()?,
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                if let Some(proposal) = proposal {
-                    proposals.insert(node.coordinate, proposal);
-                }
-
-                let fact = self.service.inner.store.policy_admission_claim(
-                    &ctx.actor,
-                    PolicyAdmissionRequest {
-                        session_id: scope.session_id.clone(),
-                        branch_id: scope.branch_id.clone(),
-                        writer_epoch: writer.writer_epoch,
-                        turn_id: ctx.turn_id,
-                        call_id: ctx.call_id.clone(),
-                        canonical_target: target.clone(),
-                        request_sha256: Self::preseal_request_sha256(&request, node),
-                        policy_revision_sha256: policy_sha.clone(),
-                        authority_sha256: evidence.authority_sha256(),
-                        candidate_local: effective.routes().contains(aw_policy::Strategy::Local),
-                        candidate_delegate_agent: effective
-                            .routes()
-                            .contains(aw_policy::Strategy::DelegateAgent),
-                        guardian_required: self.config.guardian,
-                        guardian_identity: selected
-                            .as_ref()
-                            .map(|selected| selected.identity().clone()),
-                        guardian_site: selected
-                            .as_ref()
-                            .map(|selected| selected.identity().inference_executor.clone()),
-                        approval_scope: (!approvers.is_empty()).then(|| target.clone()),
-                        authorized_approvers: approvers.clone(),
-                        approval_expires_at: expiry,
-                    },
-                )?;
-                prepared.push(PreparedGraphAdmission {
-                    node: Self::preseal_policy_node(node),
-                    target,
-                    evidence,
-                    authorized,
-                    fact,
-                });
-            }
-
-            let mut revised_graph = request.original_graph.clone();
-            let mut staged = Vec::with_capacity(prepared.len());
-            for prepared_node in prepared {
-                let approval_scope = prepared_node.fact.request.approval_scope.as_deref();
-                let narrow_ref = proposals
-                    .get(&prepared_node.node.coordinate)
-                    .map(|proposal| proposal.narrow_ref.as_str());
-                let mut fact = match prepared_node.fact.state {
-                    PolicyAdmissionState::Claimed => {
-                        self.guardian_decide(
-                            ctx,
-                            &prepared_node,
-                            approval_scope,
-                            narrow_ref,
-                        )
-                        .await?
-                    }
-                    _ => prepared_node.fact.clone(),
-                };
-
-                match fact.state {
-                    PolicyAdmissionState::Narrowed => {
-                        let proposal = proposals
-                            .get(&prepared_node.node.coordinate)
-                            .ok_or(Error::Denied(
-                                "guardian requested Graph Narrow without a trusted host revision",
-                            ))?;
-                        if fact.narrow_ref.as_deref() != Some(proposal.narrow_ref.as_str()) {
-                            return Err(Error::Denied(
-                                "guardian Graph Narrow reference differs from trusted host revision",
-                            ));
-                        }
-                        Self::apply_narrowed_arguments(
-                            &mut revised_graph,
-                            prepared_node.node.coordinate,
-                            proposal.arguments.clone(),
-                        )?;
-                        prepared_node.evidence.revalidate(&self.authority)?;
-                        let route =
-                            Self::route_for_fact(&fact, prepared_node.authorized.effective().strategy())?;
-                        fact = self.service.inner.store.policy_admission_consume(
-                            &ctx.actor,
-                            &scope.session_id,
-                            &fact.id,
-                            &policy_sha,
-                            &prepared_node.evidence.authority_sha256(),
-                            Some(route),
-                            Some(&proposal.narrow_ref),
-                        )?;
-                        if fact.state != PolicyAdmissionState::Consumed {
-                            return Err(Error::Conflict(
-                                "pre-seal Graph Narrow was not durably consumed",
-                            ));
-                        }
-                    }
-                    PolicyAdmissionState::Allowed
-                    | PolicyAdmissionState::AskPending
-                    | PolicyAdmissionState::AskApproved => {}
-                    PolicyAdmissionState::Denied
-                    | PolicyAdmissionState::AskDenied
-                    | PolicyAdmissionState::AskExpired => {
-                        return Err(Error::Denied(
-                            "Graph node denied during pre-seal policy admission",
-                        ))
-                    }
-                    PolicyAdmissionState::GuardianStarted
-                    | PolicyAdmissionState::GuardianUnknown
-                    | PolicyAdmissionState::GuardianSettled => {
-                        return Err(Error::Conflict(
-                            "Graph pre-seal guardian outcome is unresolved; do not replay",
-                        ))
-                    }
-                    PolicyAdmissionState::Consumed => {
-                        return Err(Error::Conflict(
-                            "Graph pre-seal policy admission was already consumed",
-                        ))
-                    }
-                    PolicyAdmissionState::Claimed => {
-                        return Err(Error::Conflict(
-                            "Graph pre-seal policy admission remained undecided",
-                        ))
-                    }
-                }
-
-                staged.push((
-                    (request.job_id.clone(), prepared_node.node.coordinate),
-                    PresealedGraphAdmission {
-                        target: prepared_node.target,
-                        evidence: prepared_node.evidence,
-                        authorized: prepared_node.authorized,
-                        fact,
-                        original_replay_identity: prepared_node.node.replay_identity,
-                    },
-                ));
-            }
-
-            let mut live = self
-                .presealed
-                .lock()
-                .map_err(|_| Error::Storage("Graph pre-seal admission registry lock poisoned"))?;
-            if staged.iter().any(|(key, _)| live.contains_key(key)) {
-                return Err(Error::Conflict(
-                    "Graph pre-seal admission already exists for this Job",
-                ));
-            }
-            live.extend(staged);
-            Ok(GraphPresealDecision {
-                graph: revised_graph,
-                footprint_overrides,
-            })
-        })
-    }
-
-    fn abandon_preseal(&self, job_id: &str) -> Result<()> {
-        self.presealed
-            .lock()
-            .map_err(|_| Error::Storage("Graph pre-seal admission registry lock poisoned"))?
-            .retain(|(job, _), _| job != job_id);
-        Ok(())
-    }
-
-    fn before_run<'a>(
-        &'a self,
-        ctx: &'a ToolContext,
-        request: GraphPolicyRequest,
-    ) -> GraphPolicyFuture<'a> {
-        Box::pin(async move {
-            if request.nodes.is_empty() || request.nodes.len() > 64 {
-                return Err(Error::Limit("Graph policy node set must be 1..64"));
-            }
-            for pair in request.nodes.windows(2) {
-                if pair[0].coordinate >= pair[1].coordinate {
-                    return Err(Error::Denied(
-                        "Graph policy node coordinates must be canonical and sorted",
-                    ));
-                }
-            }
-            let scope = ctx.scope.as_ref().ok_or(Error::Denied(
-                "durable Graph policy requires a Session/branch scope",
-            ))?;
-            let owner = ctx.execution_owner.as_ref().ok_or(Error::Denied(
-                "durable Graph policy requires a bound Agent owner",
-            ))?;
-            if owner.session_id() != scope.session_id || owner.branch_id() != scope.branch_id {
-                return Err(Error::Denied(
-                    "Graph policy scope differs from bound Agent owner",
-                ));
-            }
-            let graph_ref = Self::graph_ref(ctx, &request.job_id)?;
-            let current = PolicyOperationRouter::current_agent_ref(ctx)?;
-            let project_scope = PolicyOperationRouter::project_scope(&current);
-            let target_domain = PolicyOperationRouter::target_domain(&current);
-            let session = self
-                .service
-                .inner
-                .store
-                .session(&ctx.actor, &scope.session_id)?;
-            let writer = self.service.inner.store.workspace_writer(
-                &ctx.actor,
-                None,
-                &session.workspace_id,
-            )?;
-            if writer.state != "active" {
-                return Err(Error::Denied("Graph policy writer is not active"));
-            }
-            let policy_sha = self.policy_sha256();
-            let selected = if self.config.guardian {
-                Some(self.service.exact_selection(ctx)?)
-            } else {
-                None
-            };
-            let approvers = self
-                .config
-                .authorized_approvers
-                .iter()
-                .map(|principal| principal.as_str().to_owned())
-                .collect::<Vec<_>>();
-            let expiry = (!approvers.is_empty()).then(|| {
-                unix_micros().saturating_add(
-                    self.config
-                        .approval_ttl
-                        .as_micros()
-                        .min(i64::MAX as u128) as i64,
-                )
-            });
-
-            // Batch pre-seal admission stages the original claims before the
-            // Graph is sealed. Direct/internal start_graph callers may still
-            // reach this path without that stage; preserve the existing
-            // claim-before-guardian behavior as a fallback.
-            let presealed = {
-                let mut live = self
-                    .presealed
-                    .lock()
-                    .map_err(|_| Error::Storage("Graph pre-seal admission registry lock poisoned"))?;
-                let count = live
-                    .keys()
-                    .filter(|(job, _)| job == &request.job_id)
-                    .count();
-                if count == 0 {
-                    None
-                } else {
-                    if count != request.nodes.len() {
-                        live.retain(|(job, _), _| job != &request.job_id);
-                        return Err(Error::Conflict(
-                            "Graph pre-seal admission set is incomplete",
-                        ));
-                    }
-                    let mut staged = Vec::with_capacity(request.nodes.len());
-                    for node in &request.nodes {
-                        let entry = live
-                            .remove(&(request.job_id.clone(), node.coordinate))
-                            .ok_or(Error::Conflict(
-                                "Graph pre-seal admission coordinate is missing",
-                            ))?;
-                        staged.push((node.clone(), entry));
-                    }
-                    Some(staged)
-                }
-            };
-
-            let mut prepared = Vec::with_capacity(request.nodes.len());
-            if let Some(staged) = presealed {
-                for (node, entry) in staged {
-                    let target = Self::node_ref(&graph_ref, node.coordinate)?.canonical();
-                    if target != entry.target
-                        || entry.original_replay_identity == [0; 32]
-                        || entry.evidence.operation_context().operation
-                            != node.operation.semantic_name()
-                        || entry.evidence.binding().name != node.operation.model_name()
-                    {
-                        return Err(Error::Denied(
-                            "sealed Graph differs from its pre-seal policy identity",
-                        ));
-                    }
-                    entry.evidence.revalidate(&self.authority)?;
-                    let fact = self.service.inner.store.policy_admission_fact(
-                        &ctx.actor,
-                        &scope.session_id,
-                        &entry.fact.id,
-                    )?;
-                    if fact.request.policy_revision_sha256 != policy_sha
-                        || fact.request.authority_sha256 != entry.evidence.authority_sha256()
-                    {
-                        return Err(Error::Conflict(
-                            "pre-seal Graph policy/authority generation changed before seal",
-                        ));
-                    }
-                    prepared.push(PreparedGraphAdmission {
-                        node,
-                        target,
-                        evidence: entry.evidence,
-                        authorized: entry.authorized,
-                        fact,
-                    });
-                }
-            } else {
-                // Fallback used by direct/internal Graph starts that did not
-                // traverse Batch's async pre-seal admission stage.
-                for node in &request.nodes {
-                    let target = Self::node_ref(&graph_ref, node.coordinate)?.canonical();
-                    let evidence = AuthenticatedToolGrantEvidence::capture(
-                        &self.authority,
-                        &ctx.actor,
-                        node.operation.model_name(),
-                        node.operation.semantic_name(),
-                        target_domain.clone(),
-                        target.clone(),
-                        project_scope.clone(),
-                    )?;
-                    let operation = evidence.operation_context();
-                    let invocation = format!(
-                        "turn:{}/call:{}/graph:{}/node:{}",
-                        ctx.turn_id, ctx.call_id, request.job_id, node.coordinate
-                    );
-                    let graph_name = graph_ref.canonical();
-                    let policy_context = aw_policy::PolicyContext {
-                        actor: ctx.actor.as_str(),
-                        domain: &target_domain,
-                        active_team: None,
-                        workspace: &project_scope,
-                        session: Some(owner.canonical_ref()),
-                        graph: Some(&graph_name),
-                        node: Some(node.coordinate),
-                        invocation: &invocation,
-                        operation,
-                    };
-                    let layer = aw_policy::PolicyLayer {
-                        scope: aw_policy::PolicyScope::Node,
-                        revision: self.config.revision,
-                        policy: &self.config.policy,
-                    };
-                    let grant = evidence.as_policy_path();
-                    let authorized = aw_policy::resolve_authorized(
-                        &policy_context,
-                        &[grant],
-                        &[layer],
-                    )
-                    .map_err(|_| Error::Denied("Graph node policy denied exact authority"))?;
-                    let effective = authorized.effective();
-                    let fact = self.service.inner.store.policy_admission_claim(
-                        &ctx.actor,
-                        PolicyAdmissionRequest {
-                            session_id: scope.session_id.clone(),
-                            branch_id: scope.branch_id.clone(),
-                            writer_epoch: writer.writer_epoch,
-                            turn_id: ctx.turn_id,
-                            call_id: ctx.call_id.clone(),
-                            canonical_target: target.clone(),
-                            request_sha256: Self::request_sha256(&request, node),
-                            policy_revision_sha256: policy_sha.clone(),
-                            authority_sha256: evidence.authority_sha256(),
-                            candidate_local: effective.routes().contains(aw_policy::Strategy::Local),
-                            candidate_delegate_agent: effective
-                                .routes()
-                                .contains(aw_policy::Strategy::DelegateAgent),
-                            guardian_required: self.config.guardian,
-                            guardian_identity: selected
-                                .as_ref()
-                                .map(|selected| selected.identity().clone()),
-                            guardian_site: selected
-                                .as_ref()
-                                .map(|selected| selected.identity().inference_executor.clone()),
-                            approval_scope: (!approvers.is_empty()).then(|| target.clone()),
-                            authorized_approvers: approvers.clone(),
-                            approval_expires_at: expiry,
-                        },
-                    )?;
-                    prepared.push(PreparedGraphAdmission {
-                        node: node.clone(),
-                        target,
-                        evidence,
-                        authorized,
-                        fact,
-                    });
-                }
-            }
-
-            let mut asks = Vec::new();
-            let mut executable = Vec::new();
-            for prepared_node in &prepared {
-                let approval_scope = prepared_node.fact.request.approval_scope.as_deref();
-                let fact = match prepared_node.fact.state {
-                    PolicyAdmissionState::Claimed => {
-                        self.guardian_decide(ctx, prepared_node, approval_scope, None)
-                            .await?
-                    }
-                    _ => prepared_node.fact.clone(),
-                };
-                match fact.state {
-                    PolicyAdmissionState::Allowed | PolicyAdmissionState::AskApproved => {
-                        executable.push((prepared_node, fact));
-                    }
-                    PolicyAdmissionState::AskPending => asks.push((prepared_node, fact)),
-                    PolicyAdmissionState::Denied
-                    | PolicyAdmissionState::AskDenied
-                    | PolicyAdmissionState::AskExpired => {
-                        return Err(Error::Denied("Graph node denied by admitted policy"))
-                    }
-                    PolicyAdmissionState::Narrowed => {
-                        return Err(Error::Denied(
-                            "post-seal Graph node policy cannot mutate prepared arguments",
-                        ))
-                    }
-                    PolicyAdmissionState::GuardianStarted
-                    | PolicyAdmissionState::GuardianUnknown
-                    | PolicyAdmissionState::GuardianSettled => {
-                        return Err(Error::Conflict(
-                            "Graph guardian outcome is unresolved; do not replay",
-                        ))
-                    }
-                    PolicyAdmissionState::Consumed
-                        if fact.narrow_ref.is_some() =>
-                    {
-                        executable.push((prepared_node, fact));
-                    }
-                    PolicyAdmissionState::Consumed => {
-                        return Err(Error::Conflict(
-                            "Graph policy admission already consumed by another runner",
-                        ))
-                    }
-                    PolicyAdmissionState::Claimed => {
-                        return Err(Error::Conflict(
-                            "Graph policy admission remained undecided",
-                        ))
-                    }
-                }
-            }
-
-            if !asks.is_empty() {
-                let admission_identity = Self::graph_admission_identity(ctx, &request);
-                let decision_revision = Revision::new(self.config.revision)
-                    .map_err(|_| Error::Denied("invalid Graph policy decision revision"))?;
-                let approver_names = approvers.clone();
-                let approver_fingerprint = Self::fingerprint_strings(
-                    &approver_names,
-                    b"aw-graph-policy-approvers-v1\0",
-                );
-                let entries = asks
-                    .iter()
-                    .map(|(prepared_node, fact)| {
-                        let scope = fact
-                            .request
-                            .approval_scope
-                            .as_ref()
-                            .ok_or(Error::Denied("Graph Ask lacks approval scope"))?;
-                        let approval_scope = Self::fingerprint_strings(
-                            &[scope.clone()],
-                            b"aw-graph-policy-approval-scope-v1\0",
-                        );
-                        Ok(PendingApproval {
-                            approval_id: Self::approval_id(&fact.id),
-                            target: ApprovalTarget::Node(
-                                NodeCoordinate::new(prepared_node.node.coordinate)
-                                    .map_err(|_| Error::Denied("invalid approval node"))?,
-                            ),
-                            policy_decision_revision: Revision::new(
-                                fact.decision_revision.unwrap_or(self.config.revision),
-                            )
-                            .map_err(|_| Error::Denied("invalid approval decision revision"))?,
-                            approval_scope,
-                            authorized_approvers: approver_fingerprint,
-                            expiry_unix_ms: fact
-                                .request
-                                .approval_expires_at
-                                .unwrap_or_default()
-                                .max(0) as u64
-                                / 1_000,
-                            state: ApprovalState::Pending,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let set = PendingApprovalSet::new(
-                    graph_ref.clone(),
-                    admission_identity,
-                    decision_revision,
-                    entries,
-                    64,
-                )
-                .map_err(|_| Error::Denied("invalid Graph approval set"))?;
-                let by_coordinate = asks
-                    .iter()
-                    .map(|(prepared_node, fact)| (prepared_node.node.coordinate, fact.id.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                self.pending
-                    .lock()
-                    .map_err(|_| Error::Storage("Graph approval set lock poisoned"))?
-                    .insert(
-                        request.job_id.clone(),
-                        PendingGraphState {
-                            session_id: scope.session_id.clone(),
-                            set,
-                            by_coordinate,
-                        },
-                    );
-                self.wait_for_approvals(ctx, &request.job_id).await?;
-                executable.clear();
-                for prepared_node in &prepared {
-                    let fact = self.service.inner.store.policy_admission_fact(
-                        &ctx.actor,
-                        &scope.session_id,
-                        &prepared_node.fact.id,
-                    )?;
-                    if !matches!(
-                        fact.state,
-                        PolicyAdmissionState::Allowed
-                            | PolicyAdmissionState::AskApproved
-                            | PolicyAdmissionState::Consumed
-                    ) || (fact.state == PolicyAdmissionState::Consumed
-                        && fact.narrow_ref.is_none())
-                    {
-                        return Err(Error::Denied(
-                            "Graph approvals did not produce an executable complete set",
-                        ));
-                    }
-                    executable.push((prepared_node, fact));
-                }
-            }
-
-            let mut admitted = BTreeMap::new();
-            for (prepared_node, fact) in executable {
-                prepared_node.evidence.revalidate(&self.authority)?;
-                let effective = prepared_node.authorized.effective();
-                let route = Self::route_for_fact(&fact, effective.strategy())?;
-                let consumed = if fact.state == PolicyAdmissionState::Consumed {
-                    fact.clone()
-                } else {
-                    self.service.inner.store.policy_admission_consume(
-                        &ctx.actor,
-                        &scope.session_id,
-                        &fact.id,
-                        &policy_sha,
-                        &prepared_node.evidence.authority_sha256(),
-                        Some(route),
-                        None,
-                    )?
-                };
-                if consumed.state != PolicyAdmissionState::Consumed {
-                    return Err(Error::Conflict(
-                        "Graph node policy admission was not consumed",
-                    ));
-                }
-                admitted.insert(
-                    (request.job_id.clone(), prepared_node.node.coordinate),
-                    GraphAdmission {
-                        admission_id: fact.id.clone(),
-                        session_id: scope.session_id.clone(),
-                        policy_sha256: policy_sha.clone(),
-                        authority_sha256: prepared_node.evidence.authority_sha256(),
-                        evidence: prepared_node.evidence.clone(),
-                        route,
-                        replay_identity: prepared_node.node.replay_identity,
-                    },
-                );
-            }
-            self.admitted
-                .lock()
-                .map_err(|_| Error::Storage("Graph admission registry lock poisoned"))?
-                .extend(admitted);
-            Ok(())
-        })
-    }
-
-    fn before_node<'a>(
-        &'a self,
-        ctx: &'a ToolContext,
-        request: GraphNodePolicyRequest,
-    ) -> GraphPolicyFuture<'a> {
-        Box::pin(async move {
-            let admission = self
-                .admitted
-                .lock()
-                .map_err(|_| Error::Storage("Graph admission registry lock poisoned"))?
-                .get(&(request.job_id.clone(), request.coordinate))
-                .cloned()
-                .ok_or(Error::Denied("Graph node lacks admitted policy evidence"))?;
-            if admission.replay_identity != request.replay_identity {
-                return Err(Error::Denied(
-                    "Graph node replay identity changed after policy admission",
-                ));
-            }
-            admission.evidence.revalidate(&self.authority)?;
-            if admission.authority_sha256 != admission.evidence.authority_sha256()
-                || admission.policy_sha256 != self.policy_sha256()
-            {
-                return Err(Error::Denied(
-                    "Graph node policy/authority/route changed before activation",
-                ));
-            }
-            let fact = self.service.inner.store.policy_admission_fact(
-                &ctx.actor,
-                &admission.session_id,
-                &admission.admission_id,
-            )?;
-            if fact.state != PolicyAdmissionState::Consumed {
-                return Err(Error::Conflict(
-                    "Graph node policy admission is no longer consumed",
-                ));
-            }
-            Ok(())
-        })
-    }
-
-    fn execute_node<'a>(
-        &'a self,
-        ctx: &'a ToolContext,
-        request: GraphNodePolicyRequest,
-        original: Arc<dyn GraphNodeOriginalExecutor>,
-    ) -> GraphNodeExecutionFuture<'a> {
-        Box::pin(async move {
-            self.before_node(ctx, request.clone()).await?;
-            let admission = self
-                .admitted
-                .lock()
-                .map_err(|_| Error::Storage("Graph admission registry lock poisoned"))?
-                .get(&(request.job_id.clone(), request.coordinate))
-                .cloned()
-                .ok_or(Error::Denied("Graph node lacks admitted policy route"))?;
-            match admission.route {
-                aw_policy::Strategy::Local => original.execute().await,
-                aw_policy::Strategy::DelegateAgent => {
-                    let status = Arc::new(Mutex::new(None));
-                    let original_executor: Arc<dyn OriginalOperationExecutor> =
-                        Arc::new(GraphNodeStatusExecutor {
-                            original,
-                            status: status.clone(),
-                        });
-                    execute_with_strategy(
-                        aw_policy::Strategy::DelegateAgent,
-                        request.operation,
-                        original_executor,
-                        admission.evidence.clone(),
-                        self.authority.clone(),
-                        Some(DelegateExecution {
-                            request: DelegationRequest::transient(request.operation),
-                            port: self.service.policy_delegate_port(ctx),
-                            delegate_binding: None,
-                            delegate_admission: self.service.policy_delegate_admission(ctx),
-                        }),
-                    )
-                    .await?;
-                    let factual = status
-                        .lock()
-                        .map_err(|_| Error::Storage("Graph node delegate status lock poisoned"))?
-                        .take()
-                        .ok_or(Error::Conflict(
-                            "DelegateAgent returned without the factual Graph node executor",
-                        ))?;
-                    Ok(factual)
-                }
-            }
-        })
-    }
-}
 
 #[derive(Clone)]
 pub struct PolicyDelegateAdmission {
@@ -2528,17 +1399,18 @@ impl DelegateAgentPort for PolicyDelegatePort {
                 .service
                 .prepare(
                     &self.parent_context,
-                    SpawnArgs {
-                        task: task.clone(),
-                        title: Some(format!("Delegate: {}", operation.semantic_name())),
-                        mode: ModeArg::Foreground,
+                    PrepareRequest {
+                        args: SpawnArgs {
+                            task: task.clone(),
+                            title: Some(format!("Delegate: {}", operation.semantic_name())),
+                        },
+                        mode: SubagentMode::Foreground,
+                        attach_legacy_child_actor: true,
+                        constructor_fingerprint: None,
+                        tool_mode_override: Some(ToolMode::Off),
+                        allow_recursive_tools: false,
+                        policy_gate: Some(gate_spec),
                     },
-                    SubagentMode::Foreground,
-                    true,
-                    None,
-                    Some(ToolMode::Off),
-                    false,
-                    Some(gate_spec),
                 )
                 .await?;
             if prepared.actor_lease.is_none() {
@@ -2602,14 +1474,6 @@ impl aw::agent_jobs::LiveAgentWake for LiveAgentWakeHandle {
     fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ModeArg {
-    #[default]
-    Foreground,
-    Background,
 }
 
 struct ActiveBackground {
@@ -2735,10 +1599,6 @@ impl Service {
         }
     }
 
-    pub fn tool(&self) -> Arc<dyn Tool> {
-        Arc::new(self.clone())
-    }
-
     pub fn policy_delegate_port(
         &self,
         parent_context: &ToolContext,
@@ -2792,22 +1652,6 @@ impl Service {
         Arc::new(AgentConstructor {
             service: self.clone(),
         })
-    }
-    #[cfg(all(feature = "pipelines", feature = "routing"))]
-    pub fn delegation_limits(&self) -> DelegationLimits {
-        self.inner.budget.limits
-    }
-
-    #[cfg(all(feature = "pipelines", feature = "routing"))]
-    pub fn child_route_revision(&self) -> Option<&str> {
-        self.child_routing_revision_id()
-    }
-
-    /// Optional Actor Step authority over existing paid decision executors.
-    /// Store journal/owner budgets remain mandatory even when this is absent.
-    #[cfg(feature = "pipelines")]
-    pub fn actor_authority(&self) -> Option<crate::child_actors::Service> {
-        self.inner.child_actors.clone()
     }
     pub fn authorize_decision(
         &self,
@@ -3137,31 +1981,6 @@ impl Service {
         }
     }
 
-    fn validate_args(arguments: &Value) -> Result<SpawnArgs> {
-        let args: SpawnArgs = serde_json::from_value(arguments.clone()).map_err(|_| {
-            Error::Denied("subagent arguments must contain task, optional title, optional mode")
-        })?;
-        if args.task.trim().is_empty()
-            || args.task.len() > aw::config::MAX_PROMPT_BYTES
-            || args.task.chars().any(|ch| ch == '\0')
-        {
-            return Err(Error::Config(
-                "subagent task needs 1..131072 bounded UTF-8 bytes".into(),
-            ));
-        }
-        if let Some(title) = &args.title {
-            if title.trim().is_empty()
-                || title.len() > 160
-                || title.chars().any(char::is_control)
-            {
-                return Err(Error::Config(
-                    "subagent title needs 1..160 printable bytes".into(),
-                ));
-            }
-        }
-        Ok(args)
-    }
-
     fn validate_agent_args(arguments: &Value) -> Result<AgentSpawnArgs> {
         let args: AgentSpawnArgs = serde_json::from_value(arguments.clone()).map_err(|_| {
             Error::Denied(
@@ -3233,11 +2052,6 @@ impl Service {
         let spawn = SpawnArgs {
             task: args.task,
             title: args.title,
-            mode: if background {
-                ModeArg::Background
-            } else {
-                ModeArg::Foreground
-            },
         };
         let mode = if background {
             SubagentMode::Background
@@ -3247,13 +2061,15 @@ impl Service {
         Ok((
             self.prepare(
                 ctx,
-                spawn,
-                mode,
-                false,
-                Some(constructor_fingerprint),
-                None,
-                true,
-                None,
+                PrepareRequest {
+                    args: spawn,
+                    mode,
+                    attach_legacy_child_actor: false,
+                    constructor_fingerprint: Some(constructor_fingerprint.to_owned()),
+                    tool_mode_override: None,
+                    allow_recursive_tools: true,
+                    policy_gate: None,
+                },
             )
             .await?,
             background,
@@ -3413,14 +2229,18 @@ impl Service {
     async fn prepare(
         &self,
         ctx: &ToolContext,
-        args: SpawnArgs,
-        mode: SubagentMode,
-        attach_legacy_child_actor: bool,
-        constructor_fingerprint: Option<&str>,
-        tool_mode_override: Option<ToolMode>,
-        allow_recursive_tools: bool,
-        policy_gate: Option<PolicyGateSpec>,
+        request: PrepareRequest,
     ) -> Result<Prepared> {
+        let PrepareRequest {
+            args,
+            mode,
+            attach_legacy_child_actor,
+            constructor_fingerprint,
+            tool_mode_override,
+            allow_recursive_tools,
+            policy_gate,
+        } = request;
+        let constructor_fingerprint = constructor_fingerprint.as_deref();
         let inner = &self.inner;
         let child_tool_mode = tool_mode_override.unwrap_or(inner.child_tool_mode);
         if ctx.cancellation.is_cancelled() {
@@ -3673,7 +2493,6 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             if allow_recursive_tools && allocation.depth < root.limits.max_depth {
                 let descendant_service =
                     self.for_child(root.id.clone(), allocation.id.clone(), allocation.depth);
-                agent.register_host_tool(descendant_service.tool())?;
                 if !attach_legacy_child_actor {
                     // Stable Agents inherit only the same already-bound router
                     // and delegation root. This adds no provider/root/tool
@@ -3726,15 +2545,15 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             if let Some(service)=&inner.child_actors {
             let turn=agent.history_state().next_turn_id;
             let attached = if let Some(gate) = policy_gate.as_ref() {
-                service.attach_delegated(
-                    &info,
-                    &agent,
-                    &selected,
-                    &args.task,
-                    turn,
-                    &gate.name,
-                    kernel_effect(&gate.effect),
-                )
+                service.attach_delegated(crate::child_actors::DelegatedAttachRequest {
+                    durable: &info,
+                    agent: &agent,
+                    selected: &selected,
+                    task: &args.task,
+                    next_turn: turn,
+                    gate_name: &gate.name,
+                    gate_effect: kernel_effect(&gate.effect),
+                })
             } else {
                 service.attach(&info, &agent, &selected, &args.task, turn)
             };
@@ -4188,7 +3007,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 .agent
                 .execution_scope()
                 .map(|scope| scope.cancellation())
-                .unwrap_or_else(CancellationToken::new);
+                .unwrap_or_default();
             let first = runtime.block_on(Self::run_stable_claimed_turn(
                 &mut prepared,
                 &runtime_state.owner,
@@ -4389,14 +3208,12 @@ impl Tool for AgentConstructor {
                 .clone();
 
             if background {
-                if let Err(error) = Service::spawn_stable_background_worker(
+                Service::spawn_stable_background_worker(
                     self.service.inner.clone(),
                     prepared,
                     runtime_state,
                     active,
-                ) {
-                    return Err(error);
-                }
+                )?;
                 let revision = self.service.inner.store.agent_public_revision(
                     &ctx.actor,
                     binding.session_id(),
@@ -4476,94 +3293,6 @@ impl Tool for AgentConstructor {
     }
 }
 
-impl Tool for Service {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "subagent".into(),
-            description: "Delegate one bounded task to an isolated durable child Agent Session. The trusted host may preconfigure an immutable bounded child-routing strategy, but you cannot choose provider, model, route, root, actor, budget, depth, or additional authority. Foreground waits for the result; background returns the child Session immediately.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string"},
-                    "title": {"type": "string"},
-                    "mode": {
-                        "type": "string",
-                        "enum": ["foreground", "background"],
-                        "default": "foreground"
-                    }
-                },
-                "required": ["task"],
-                "additionalProperties": false
-            }),
-            effect: ToolEffect::Process,
-        }
-    }
-
-    fn validate(&self, arguments: &Value) -> Result<()> {
-        Self::validate_args(arguments).map(|_| ())
-    }
-
-    fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
-        Box::pin(async move {
-            let args = Self::validate_args(arguments)?;
-            // Revalidate the exact selected identity before creating any child state.
-            self.exact_selection(&ctx)?;
-            match args.mode {
-                ModeArg::Foreground => {
-                    let prepared = self.prepare(&ctx, args, SubagentMode::Foreground, true, None, None, true, None).await?;
-                    Self::run_prepared(self.inner.clone(), prepared, ctx.cancellation).await
-                }
-                ModeArg::Background => {
-                    let active = Self::reserve_background(&self.inner)?;
-                    let prepared = self.prepare(&ctx, args, SubagentMode::Background, true, None, None, true, None).await?;
-                    let response = json!({
-                        "subagent_id": prepared.info.id,
-                        "session_id": prepared.info.child_session_id,
-                        "state": "running",
-                    })
-                    .to_string();
-                    let inner = self.inner.clone();
-                    let spawn = thread::Builder::new()
-                        .name(format!(
-                            "aw-subagent-{}",
-                            prepared.info.id.chars().rev().take(8).collect::<String>()
-                        ))
-                        .spawn(move || {
-                            let _active = active;
-                            let runtime = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .max_blocking_threads(4)
-                                .build();
-                            match runtime {
-                                Ok(runtime) => {
-                                    let _ = runtime.block_on(Self::run_prepared(
-                                        inner,
-                                        prepared,
-                                        CancellationToken::new(),
-                                    ));
-                                }
-                                Err(error) => {
-                                    let actor = prepared.info.identity.actor.clone();
-                                    let detail = format!("cannot start subagent runtime: {error}");
-                                    let _ = inner.store.settle_subagent(
-                                        &actor,
-                                        &prepared.info.id,
-                                        "failed",
-                                        Some(&detail),
-                                    );
-                                }
-                            }
-                        });
-                    if let Err(error) = spawn {
-                        return Err(Error::Io(error));
-                    }
-                    Ok(ToolOutput::text(response))
-                }
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4578,189 +3307,454 @@ mod tests {
     use std::process::Command;
     use std::{
         path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
         time::Duration,
     };
 
-
-
-
-    struct GraphDelegateProvider {
-        main_calls: Arc<AtomicUsize>,
-        delegate_calls: Arc<AtomicUsize>,
+    async fn execute_agent_fixture(
+        service: &Service,
+        mut ctx: ToolContext,
+        arguments: &Value,
+    ) -> Result<ToolOutput> {
+        if service.agent_jobs_router().is_err() {
+            service.bind_agent_jobs_router(Arc::new(aw::agent_jobs::Router::new(
+                service.inner.store.clone(),
+                ctx.actor.clone(),
+                LocalToolLimits::default().jobs.max_retained_jobs,
+            )?))?;
+        }
+        if ctx.execution_owner.is_none() {
+            let scope = ctx
+                .scope
+                .as_ref()
+                .ok_or(Error::Denied("Agent fixture requires a durable parent scope"))?;
+            ctx.execution_owner = Some(aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:0",
+                scope.session_id.clone(),
+                scope.branch_id.clone(),
+            )?);
+        }
+        service.agent_tool().execute(ctx, arguments).await
     }
 
-    impl Provider for GraphDelegateProvider {
-        fn supports_tools(&self) -> bool {
-            true
-        }
+    #[derive(Clone, Copy, Debug)]
+    enum ModelFirstWorkflow {
+        Read,
+        Graph,
+        BashHandoff,
+    }
 
-        fn stream<'a>(
-            &'a self,
-            _messages: &'a [Message],
-            _model: &'a str,
-            _sink: &'a mut DeltaSink<'_>,
-        ) -> CompletionFuture<'a> {
-            Box::pin(async { Err(Error::Protocol("Graph delegate fixture requires tool protocol")) })
-        }
-
-        fn stream_tools<'a>(
-            &'a self,
-            messages: &'a [Message],
-            _model: &'a str,
-            tools: &'a [ToolSpec],
-            sink: &'a mut DeltaSink<'_>,
-        ) -> ModelFuture<'a> {
-            Box::pin(async move {
-                let delegated = messages.iter().any(|message| {
-                    message
-                        .content
-                        .contains("operation-scoped execution delegate")
-                });
-                if delegated {
-                    self.delegate_calls.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(
-                        tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
-                        vec!["read"]
-                    );
-                    if messages.last().is_some_and(|message| message.role == Role::Tool) {
-                        sink("delegate prose is not the node result")?;
-                        return Ok(ModelReply {
-                            meta: CompletionMeta {
-                                finish_reason: "stop".into(),
-                                usage: Usage {
-                                    input_tokens: Some(3),
-                                    output_tokens: Some(2),
-                                },
-                            },
-                            ..Default::default()
-                        });
-                    }
-                    return Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "tool_calls".into(),
-                            usage: Usage {
-                                input_tokens: Some(3),
-                                output_tokens: Some(1),
-                            },
-                        },
-                        tool_calls: vec![ToolCall {
-                            id: "delegate-graph-node".into(),
-                            name: "read".into(),
-                            arguments: json!({}),
-                        }],
-                        provider_context: None,
-                    });
-                }
-
-                self.main_calls.fetch_add(1, Ordering::SeqCst);
-                assert!(tools.iter().any(|tool| tool.name == "batch"));
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
-                    sink("delegated graph complete")?;
-                    return Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "stop".into(),
-                            usage: Usage {
-                                input_tokens: Some(4),
-                                output_tokens: Some(2),
-                            },
-                        },
-                        ..Default::default()
-                    });
-                }
-                Ok(ModelReply {
-                    meta: CompletionMeta {
-                        finish_reason: "tool_calls".into(),
-                        usage: Usage {
-                            input_tokens: Some(4),
-                            output_tokens: Some(1),
-                        },
-                    },
-                    tool_calls: vec![ToolCall {
-                        id: "delegate-node-batch".into(),
-                        name: "batch".into(),
-                        arguments: json!({
-                            "ops":[
-                                ["read",{"path":"delegated.txt","numbered":false},"*"]
-                            ]
-                        }),
-                    }],
-                    provider_context: None,
-                })
-            })
+    impl ModelFirstWorkflow {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Read => "read",
+                Self::Graph => "graph3",
+                Self::BashHandoff => "bash_handoff_jobs",
+            }
         }
     }
 
-    struct GraphAskProvider {
-        main_calls: Arc<AtomicUsize>,
-        guardian_calls: Arc<AtomicUsize>,
+    struct ModelFirstProvider {
+        workflow: ModelFirstWorkflow,
+        calls: Arc<AtomicUsize>,
+        first_tool: Arc<Mutex<Option<String>>>,
+        job_ref: Arc<Mutex<Option<String>>>,
     }
 
-    impl GraphAskProvider {
-        fn approval_scope(messages: &[Message]) -> Result<String> {
-            let prompt = messages
-                .iter()
-                .rev()
-                .find(|message| message.role == Role::User)
-                .map(|message| message.content.as_str())
-                .ok_or(Error::Protocol("Graph guardian prompt missing"))?;
-            let marker = "approval_scope exactly \"";
-            let rest = prompt
-                .split_once(marker)
-                .map(|(_, rest)| rest)
-                .ok_or(Error::Protocol("Graph guardian approval scope missing"))?;
-            rest.split_once('"')
-                .map(|(scope, _)| scope.to_owned())
-                .filter(|scope| !scope.is_empty())
-                .ok_or(Error::Protocol("Graph guardian approval scope invalid"))
-        }
-    }
-
-    impl Provider for GraphAskProvider {
-        fn supports_tools(&self) -> bool {
-            true
-        }
-
-        fn stream<'a>(
-            &'a self,
-            messages: &'a [Message],
-            _model: &'a str,
-            sink: &'a mut DeltaSink<'_>,
-        ) -> CompletionFuture<'a> {
-            Box::pin(async move {
-                self.guardian_calls.fetch_add(1, Ordering::SeqCst);
-                let scope = Self::approval_scope(messages)?;
-                sink(&serde_json::json!({
-                    "decision":"ask",
-                    "route":"local",
-                    "approval_scope":scope,
-                }).to_string())?;
-                Ok(CompletionMeta {
-                    finish_reason: "stop".into(),
+    impl ModelFirstProvider {
+        fn tool_reply(call_id: &str, name: &str, arguments: Value) -> ModelReply {
+            ModelReply {
+                meta: CompletionMeta {
+                    finish_reason: "tool_calls".into(),
                     usage: Usage {
-                        input_tokens: Some(6),
+                        input_tokens: Some(8),
                         output_tokens: Some(4),
                     },
+                },
+                tool_calls: vec![ToolCall {
+                    id: call_id.into(),
+                    name: name.into(),
+                    arguments,
+                }],
+                provider_context: None,
+            }
+        }
+
+        fn final_reply(sink: &mut DeltaSink<'_>, answer: &str) -> Result<ModelReply> {
+            sink(answer)?;
+            Ok(ModelReply {
+                meta: CompletionMeta {
+                    finish_reason: "stop".into(),
+                    usage: Usage {
+                        input_tokens: Some(8),
+                        output_tokens: Some(4),
+                    },
+                },
+                ..Default::default()
+            })
+        }
+
+        fn last_tool_content(messages: &[Message]) -> Result<&str> {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::Tool)
+                .map(|message| message.content.as_str())
+                .ok_or(Error::Protocol("model-first fixture expected factual tool result"))
+        }
+
+        fn capture_job_ref(&self, messages: &[Message]) -> Result<String> {
+            let content = Self::last_tool_content(messages)?;
+            let reference = content
+                .split_whitespace()
+                .next()
+                .filter(|reference| {
+                    reference.starts_with("j:")
+                        || (reference.starts_with("/d:") && reference.contains("/j:"))
                 })
+                .ok_or(Error::Protocol("Bash handoff did not return compact/canonical Job ref"))?
+                .to_owned();
+            *self.job_ref.lock().unwrap() = Some(reference.clone());
+            Ok(reference)
+        }
+    }
+
+    impl Provider for ModelFirstProvider {
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("model-first fixture requires tool protocol")) })
+        }
+
+        fn stream_tools<'a>(
+            &'a self,
+            messages: &'a [Message],
+            _: &'a str,
+            tools: &'a [ToolSpec],
+            sink: &'a mut DeltaSink<'_>,
+        ) -> ModelFuture<'a> {
+            Box::pin(async move {
+                let round = self.calls.fetch_add(1, Ordering::SeqCst);
+                let names = tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                for removed in ["job_start", "job_restart", "subagent", "team", "plan", "review_release"] {
+                    assert!(!names.contains(removed), "removed route leaked into provider catalog: {removed}");
+                }
+                let reply = match (self.workflow, round) {
+                    (ModelFirstWorkflow::Read, 0) => {
+                        assert!(names.contains("read"));
+                        *self.first_tool.lock().unwrap() = Some("read".into());
+                        Self::tool_reply(
+                            "mf-read",
+                            "read",
+                            json!({"path":"read.txt","numbered":false}),
+                        )
+                    }
+                    (ModelFirstWorkflow::Read, 1) => {
+                        return Self::final_reply(sink, "read workflow complete")
+                    }
+                    (ModelFirstWorkflow::Graph, 0) => {
+                        assert!(names.contains("batch"));
+                        *self.first_tool.lock().unwrap() = Some("batch".into());
+                        Self::tool_reply(
+                            "mf-graph",
+                            "batch",
+                            json!({"ops":[
+                                ["read",{"path":"a.txt","numbered":false},"*"],
+                                ["read",{"path":"b.txt","numbered":false},"*"],
+                                ["read",{"path":"c.txt","numbered":false},"*"]
+                            ]}),
+                        )
+                    }
+                    (ModelFirstWorkflow::Graph, 1) => {
+                        return Self::final_reply(sink, "graph workflow complete")
+                    }
+                    (ModelFirstWorkflow::BashHandoff, 0) => {
+                        assert!(names.contains("bash"));
+                        *self.first_tool.lock().unwrap() = Some("bash".into());
+                        Self::tool_reply(
+                            "mf-bash",
+                            "bash",
+                            json!({"command":"printf 0123456789","background":true}),
+                        )
+                    }
+                    (ModelFirstWorkflow::BashHandoff, 1) => {
+                        assert!(names.contains("jobs_get"));
+                        let reference = self.capture_job_ref(messages)?;
+                        Self::tool_reply(
+                            "mf-jobs-get",
+                            "jobs_get",
+                            json!({"ref":reference,"wait_ms":3000}),
+                        )
+                    }
+                    (ModelFirstWorkflow::BashHandoff, 2) => {
+                        assert!(names.contains("jobs_read"));
+                        let reference = self
+                            .job_ref
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .ok_or(Error::Protocol("model-first fixture lost Job ref"))?;
+                        Self::tool_reply(
+                            "mf-jobs-read",
+                            "jobs_read",
+                            json!({
+                                "ref":reference,"view":"stdout","offset":0,"limit":4,"encoding":"text"
+                            }),
+                        )
+                    }
+                    (ModelFirstWorkflow::BashHandoff, 3) => {
+                        assert!(names.contains("jobs_ack"));
+                        let content = Self::last_tool_content(messages)?;
+                        assert!(content.contains("0123"), "{content}");
+                        let offset = content
+                            .split_whitespace()
+                            .find_map(|part| part.strip_prefix("offset="))
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .ok_or(Error::Protocol("jobs_read did not expose continuation offset"))?;
+                        assert_eq!(offset, 4);
+                        let reference = self
+                            .job_ref
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .ok_or(Error::Protocol("model-first fixture lost Job ref"))?;
+                        Self::tool_reply(
+                            "mf-jobs-ack",
+                            "jobs_ack",
+                            json!({"ref":reference,"view":"stdout","offset":offset}),
+                        )
+                    }
+                    (ModelFirstWorkflow::BashHandoff, 4) => {
+                        return Self::final_reply(sink, "bash handoff workflow complete")
+                    }
+                    _ => return Err(Error::Protocol("unexpected model-first provider round")),
+                };
+                Ok(reply)
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_first_local_workflows_measure_first_valid_call_rounds_and_result_bytes() {
+        let bash = std::env::var_os("AW_BASH")
+            .map(PathBuf::from)
+            .expect("model-first Bash workflow requires pinned AW_BASH");
+        let mut first_valid = 0usize;
+        let workflows = [
+            (ModelFirstWorkflow::Read, "read", 2usize, vec!["read"]),
+            (ModelFirstWorkflow::Graph, "batch", 2usize, vec!["batch"]),
+            (
+                ModelFirstWorkflow::BashHandoff,
+                "bash",
+                5usize,
+                vec!["bash", "jobs_get", "jobs_read", "jobs_ack"],
+            ),
+        ];
+
+        let workflow_count = workflows.len();
+        for (workflow, expected_first, expected_rounds, expected_tools) in workflows {
+            let root = std::env::temp_dir().join(format!(
+                "aw-model-first-{}-{}-{}",
+                workflow.label(),
+                std::process::id(),
+                unix_micros()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("read.txt"), "read-value\n").unwrap();
+            std::fs::write(root.join("a.txt"), "a\n").unwrap();
+            std::fs::write(root.join("b.txt"), "b\n").unwrap();
+            std::fs::write(root.join("c.txt"), "c\n").unwrap();
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let first_tool = Arc::new(Mutex::new(None));
+            let provider = Arc::new(ModelFirstProvider {
+                workflow,
+                calls: calls.clone(),
+                first_tool: first_tool.clone(),
+                job_ref: Arc::new(Mutex::new(None)),
+            });
+            let actor = PrincipalId::new("local").unwrap();
+            let builder = Agent::builder(
+                provider,
+                AgentOptions::new("fixture-account", "fixture-model"),
+            );
+            let mut options = LocalToolOptions::new(&root, ToolMode::Trusted);
+            options.bash = Some(bash.clone());
+            options.selected_tools = vec!["read".into(), "bash".into(), "batch".into()];
+            let mut agent = aw_tools_adapter::configure(builder, actor.clone(), &options)
+                .unwrap()
+                .build()
+                .unwrap();
+            let store = SessionStore::in_memory().unwrap();
+            let (session, branch) = store
+                .create(
+                    &actor,
+                    &format!("model-first {}", workflow.label()),
+                    aw_store::SessionBinding {
+                        working_directory: root.clone(),
+                        tool_root: root.clone(),
+                        system_prompt: "model-first fixture".into(),
+                        profile_hint: "fixture-account".into(),
+                        model_hint: "fixture-model".into(),
+                        destination_fingerprint: "0".repeat(64),
+                    },
+                )
+                .unwrap();
+            let (view, handle) = store.activate(&actor, &session.id, &branch.id).unwrap();
+            agent
+                .load_history(view.history, Some(Arc::new(handle)))
+                .unwrap();
+            let binding = store
+                .agent_binding(&actor, &session.id, &branch.id)
+                .unwrap();
+            agent
+                .bind_execution_owner(
+                    AgentExecutionBinding::from_trusted_host(
+                        format!(
+                            "/d:{}/i:{}/p:{}/a:{}",
+                            binding.domain_handle,
+                            binding.identity_handle,
+                            binding.project_handle,
+                            binding.agent_handle,
+                        ),
+                        binding.session_id,
+                        binding.branch_id,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let turn = tokio::time::timeout(
+                Duration::from_secs(8),
+                agent.prompt(
+                    &format!("model-first workflow {}", workflow.label()),
+                    std::future::pending::<()>(),
+                    |_| Ok(()),
+                ),
+            )
+            .await
+            .expect("model-first workflow timed out")
+            .unwrap();
+            assert_eq!(
+                turn.outcome,
+                aw::conversation::Outcome::Completed,
+                "workflow={} answer={} tools={:?}",
+                workflow.label(),
+                turn.answer,
+                turn.tool_records
+                    .iter()
+                    .map(|record| (
+                        record.call.name.as_str(),
+                        record.status.clone(),
+                        record.output.as_ref().map(|output| output.content.as_str())
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            let actual_tools = turn
+                .tool_records
+                .iter()
+                .map(|record| record.call.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_tools, expected_tools);
+            assert_eq!(calls.load(Ordering::SeqCst), expected_rounds);
+            if first_tool.lock().unwrap().as_deref() == Some(expected_first) {
+                first_valid += 1;
+            }
+            let result_bytes = turn
+                .tool_records
+                .iter()
+                .filter_map(|record| record.output.as_ref())
+                .map(|output| output.content.len())
+                .sum::<usize>();
+            println!(
+                "model-first workflow={} first={} provider_rounds={} tool_calls={} result_bytes={} approx_result_tokens={}",
+                workflow.label(),
+                expected_first,
+                expected_rounds,
+                turn.tool_records.len(),
+                result_bytes,
+                result_bytes.div_ceil(4),
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+        assert_eq!(first_valid, workflow_count);
+        println!(
+            "model-first first_valid_call_rate={}/{} deterministic_schema_valid=100%",
+            first_valid,
+            workflow_count
+        );
+    }
+
+    struct ModelFirstAgentProvider {
+        parent_calls: Arc<AtomicUsize>,
+        child_calls: Arc<AtomicUsize>,
+        first_tool: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ModelFirstAgentProvider {
+        fn is_child(messages: &[Message]) -> bool {
+            messages
+                .iter()
+                .any(|message| message.role == Role::User && message.content == "model-first child task")
+        }
+    }
+
+    impl Provider for ModelFirstAgentProvider {
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn stream<'a>(
+            &'a self,
+            messages: &'a [Message],
+            _: &'a str,
+            sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async move {
+                if Self::is_child(messages) {
+                    self.child_calls.fetch_add(1, Ordering::SeqCst);
+                    sink("model-first child answer")?;
+                    return Ok(CompletionMeta {
+                        finish_reason: "stop".into(),
+                        usage: Usage {
+                            input_tokens: Some(6),
+                            output_tokens: Some(4),
+                        },
+                    });
+                }
+                Err(Error::Protocol("parent Agent workflow requires tool protocol"))
             })
         }
 
         fn stream_tools<'a>(
             &'a self,
             messages: &'a [Message],
-            _model: &'a str,
+            _: &'a str,
             tools: &'a [ToolSpec],
             sink: &'a mut DeltaSink<'_>,
         ) -> ModelFuture<'a> {
             Box::pin(async move {
-                if tools.is_empty() {
-                    self.guardian_calls.fetch_add(1, Ordering::SeqCst);
-                    let scope = Self::approval_scope(messages)?;
-                    sink(&serde_json::json!({
-                        "decision":"ask",
-                        "route":"local",
-                        "approval_scope":scope,
-                    }).to_string())?;
+                if Self::is_child(messages) {
+                    self.child_calls.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        tools.iter().all(|tool| tool.name == "jobs_subscribe"),
+                        "stable model-only child may expose only jobs_subscribe: {:?}",
+                        tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>()
+                    );
+                    sink("model-first child answer")?;
                     return Ok(ModelReply {
                         meta: CompletionMeta {
                             finish_reason: "stop".into(),
@@ -4772,192 +3766,255 @@ mod tests {
                         ..Default::default()
                     });
                 }
-                self.main_calls.fetch_add(1, Ordering::SeqCst);
-                assert!(tools.iter().any(|tool| tool.name == "batch"));
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
-                    sink("graph complete")?;
-                    return Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "stop".into(),
-                            usage: Usage {
-                                input_tokens: Some(3),
-                                output_tokens: Some(2),
+
+                let round = self.parent_calls.fetch_add(1, Ordering::SeqCst);
+                let names = tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(names.contains("agent"));
+                for removed in ["subagent", "team", "plan", "review_release"] {
+                    assert!(!names.contains(removed));
+                }
+                match round {
+                    0 => {
+                        *self.first_tool.lock().unwrap() = Some("agent".into());
+                        Ok(ModelReply {
+                            meta: CompletionMeta {
+                                finish_reason: "tool_calls".into(),
+                                usage: Usage {
+                                    input_tokens: Some(8),
+                                    output_tokens: Some(4),
+                                },
                             },
-                        },
-                        ..Default::default()
-                    });
-                }
-                Ok(ModelReply {
-                    meta: CompletionMeta {
-                        finish_reason: "tool_calls".into(),
-                        usage: Usage {
-                            input_tokens: Some(4),
-                            output_tokens: Some(1),
-                        },
-                    },
-                    tool_calls: vec![ToolCall {
-                        id: "graph-ask-batch".into(),
-                        name: "batch".into(),
-                        arguments: json!({
-                            "ops":[
-                                ["write",{"path":"approved-one.txt","content":"one"},"*"],
-                                ["write",{"path":"approved-two.txt","content":"two"},"*"]
-                            ]
-                        }),
-                    }],
-                    provider_context: None,
-                })
-            })
-        }
-    }
-
-    struct GraphNarrowProvider {
-        main_calls: Arc<AtomicUsize>,
-        guardian_calls: Arc<AtomicUsize>,
-    }
-
-    impl GraphNarrowProvider {
-        fn narrow_ref(messages: &[Message]) -> Result<String> {
-            let prompt = messages
-                .iter()
-                .rev()
-                .find(|message| message.role == Role::User)
-                .map(|message| message.content.as_str())
-                .ok_or(Error::Protocol("Graph narrow guardian prompt missing"))?;
-            let marker = "narrow_ref exactly \"";
-            let rest = prompt
-                .split_once(marker)
-                .map(|(_, rest)| rest)
-                .ok_or(Error::Protocol("Graph narrow ref missing from guardian prompt"))?;
-            rest.split_once('"')
-                .map(|(reference, _)| reference.to_owned())
-                .filter(|reference| !reference.is_empty())
-                .ok_or(Error::Protocol("Graph narrow ref is invalid"))
-        }
-
-        fn guardian_reply(
-            &self,
-            messages: &[Message],
-            sink: &mut DeltaSink<'_>,
-        ) -> Result<CompletionMeta> {
-            self.guardian_calls.fetch_add(1, Ordering::SeqCst);
-            let narrow_ref = Self::narrow_ref(messages)?;
-            sink(
-                &serde_json::json!({
-                    "decision":"narrow",
-                    "route":"local",
-                    "narrow_ref":narrow_ref,
-                })
-                .to_string(),
-            )?;
-            Ok(CompletionMeta {
-                finish_reason: "stop".into(),
-                usage: Usage {
-                    input_tokens: Some(5),
-                    output_tokens: Some(3),
-                },
-            })
-        }
-    }
-
-    impl Provider for GraphNarrowProvider {
-        fn supports_tools(&self) -> bool {
-            true
-        }
-
-        fn stream<'a>(
-            &'a self,
-            messages: &'a [Message],
-            _model: &'a str,
-            sink: &'a mut DeltaSink<'_>,
-        ) -> CompletionFuture<'a> {
-            Box::pin(async move { self.guardian_reply(messages, sink) })
-        }
-
-        fn stream_tools<'a>(
-            &'a self,
-            messages: &'a [Message],
-            _model: &'a str,
-            tools: &'a [ToolSpec],
-            sink: &'a mut DeltaSink<'_>,
-        ) -> ModelFuture<'a> {
-            Box::pin(async move {
-                if tools.is_empty() {
-                    let meta = self.guardian_reply(messages, sink)?;
-                    return Ok(ModelReply {
-                        meta,
-                        ..Default::default()
-                    });
-                }
-                self.main_calls.fetch_add(1, Ordering::SeqCst);
-                assert!(tools.iter().any(|tool| tool.name == "batch"));
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
-                    let result = messages.last().unwrap();
-                    assert_eq!(result.tool_call_id.as_deref(), Some("graph-narrow-batch"));
-                    assert!(!result.content.is_empty());
-                    sink("narrow graph complete")?;
-                    return Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "stop".into(),
-                            usage: Usage {
-                                input_tokens: Some(3),
-                                output_tokens: Some(2),
+                            tool_calls: vec![ToolCall {
+                                id: "mf-agent".into(),
+                                name: "agent".into(),
+                                arguments: json!({
+                                    "task":"model-first child task",
+                                    "background":false
+                                }),
+                            }],
+                            provider_context: None,
+                        })
+                    }
+                    1 => {
+                        let result = messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == Role::Tool)
+                            .ok_or(Error::Protocol("parent Agent workflow missing child result"))?;
+                        assert!(result.content.contains("model-first child answer"));
+                        sink("parent Agent workflow complete")?;
+                        Ok(ModelReply {
+                            meta: CompletionMeta {
+                                finish_reason: "stop".into(),
+                                usage: Usage {
+                                    input_tokens: Some(8),
+                                    output_tokens: Some(4),
+                                },
                             },
-                        },
-                        ..Default::default()
-                    });
+                            ..Default::default()
+                        })
+                    }
+                    _ => Err(Error::Protocol("unexpected parent Agent workflow round")),
                 }
-                Ok(ModelReply {
-                    meta: CompletionMeta {
-                        finish_reason: "tool_calls".into(),
-                        usage: Usage {
-                            input_tokens: Some(4),
-                            output_tokens: Some(1),
-                        },
-                    },
-                    tool_calls: vec![ToolCall {
-                        id: "graph-narrow-batch".into(),
-                        name: "batch".into(),
-                        arguments: json!({
-                            "ops":[[
-                                "write",
-                                {"path":"unsafe.txt","content":"narrowed-value"},
-                                "*"
-                            ]]
-                        }),
-                    }],
-                    provider_context: None,
-                })
             })
         }
     }
 
-    struct StaticGraphNarrowAuthority {
-        calls: Arc<AtomicUsize>,
+    #[tokio::test]
+    async fn model_first_agent_constructor_measures_parent_and_child_rounds() {
+        let actor = PrincipalId::new("local:model-first-agent").unwrap();
+        let parent_calls = Arc::new(AtomicUsize::new(0));
+        let child_calls = Arc::new(AtomicUsize::new(0));
+        let first_tool = Arc::new(Mutex::new(None));
+        let provider = Arc::new(ModelFirstAgentProvider {
+            parent_calls: parent_calls.clone(),
+            child_calls: child_calls.clone(),
+            first_tool: first_tool.clone(),
+        });
+        let accounts = ProviderAccounts::new("local").unwrap();
+        accounts
+            .register(
+                AccountDescriptor::personal(
+                    "fixture-account",
+                    actor.clone(),
+                    "local",
+                    ["fixture-model".into()],
+                ),
+                provider,
+            )
+            .unwrap();
+        let selected = accounts
+            .select(&actor, "fixture-account", "fixture-model")
+            .unwrap();
+
+        let store = SessionStore::in_memory().unwrap();
+        let (parent, branch) = store
+            .create(&actor, "model-first Agent parent", binding())
+            .unwrap();
+        let (view, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
+        let mut agent = Agent::builder_from_selection(
+            selected,
+            AgentOptions::new("fixture-account", "fixture-model"),
+        )
+        .build()
+        .unwrap();
+        agent
+            .load_history(view.history, Some(Arc::new(handle)))
+            .unwrap();
+        let binding_info = store.agent_binding(&actor, &parent.id, &branch.id).unwrap();
+        agent
+            .bind_execution_owner(
+                AgentExecutionBinding::from_trusted_host(
+                    format!(
+                        "/d:{}/i:{}/p:{}/a:{}",
+                        binding_info.domain_handle,
+                        binding_info.identity_handle,
+                        binding_info.project_handle,
+                        binding_info.agent_handle,
+                    ),
+                    binding_info.session_id,
+                    binding_info.branch_id,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let service = Service::new(
+            store.clone(),
+            accounts,
+            settings(),
+            ServiceConfig::new(
+                ToolMode::Off,
+                BudgetConfig::default(),
+                PathBuf::from("/tmp"),
+                None,
+            ),
+        )
+        .unwrap();
+        let router = Arc::new(
+            aw::agent_jobs::Router::new(
+                store.clone(),
+                actor.clone(),
+                LocalToolLimits::default().jobs.max_retained_jobs,
+            )
+            .unwrap(),
+        );
+        service.bind_agent_jobs_router(router.clone()).unwrap();
+        agent.register_host_tool(service.agent_tool()).unwrap();
+
+        let turn = tokio::time::timeout(
+            Duration::from_secs(8),
+            agent.prompt(
+                "model-first Agent workflow",
+                std::future::pending::<()>(),
+                |_| Ok(()),
+            ),
+        )
+        .await
+        .expect("model-first Agent workflow timed out")
+        .unwrap();
+        assert_eq!(turn.outcome, aw::conversation::Outcome::Completed);
+        assert_eq!(turn.answer, "parent Agent workflow complete");
+        assert_eq!(turn.tool_records.len(), 1);
+        assert_eq!(turn.tool_records[0].call.name, "agent");
+        assert_eq!(first_tool.lock().unwrap().as_deref(), Some("agent"));
+        assert_eq!(parent_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(child_calls.load(Ordering::SeqCst), 1);
+        let result_bytes = turn.tool_records[0]
+            .output
+            .as_ref()
+            .map_or(0, |output| output.content.len());
+        println!(
+            "model-first workflow=agent first=agent parent_provider_rounds=2 child_provider_rounds=1 total_provider_rounds=3 tool_calls=1 result_bytes={} approx_result_tokens={}",
+            result_bytes,
+            result_bytes.div_ceil(4),
+        );
+        drop(router);
     }
 
-    impl GraphNarrowAuthority for StaticGraphNarrowAuthority {
-        fn proposal(
-            &self,
-            _ctx: &ToolContext,
-            node: &GraphPresealNode,
-        ) -> Result<Option<GraphNarrowProposal>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            if node.coordinate != 1 || node.operation != OperationId::Fs(FsTool::Write) {
-                return Ok(None);
+    #[test]
+    fn final_agent_constructor_schema_footprint_is_measured() {
+        let actor = PrincipalId::new("local:schema-agent").unwrap();
+        let accounts = ProviderAccounts::new("local").unwrap();
+        struct ProviderFixture;
+        impl Provider for ProviderFixture {
+            fn stream<'a>(
+                &'a self,
+                _: &'a [Message],
+                _: &'a str,
+                _: &'a mut DeltaSink<'_>,
+            ) -> CompletionFuture<'a> {
+                Box::pin(async { Err(Error::Protocol("provider unused")) })
             }
-            assert_eq!(
-                node.arguments.get("path").and_then(Value::as_str),
-                Some("unsafe.txt")
-            );
-            Ok(Some(GraphNarrowProposal {
-                narrow_ref: "narrow:graph-safe-path-v1".into(),
-                arguments: json!({
-                    "path":"safe.txt",
-                    "content":"narrowed-value"
-                }),
-            }))
         }
+        accounts
+            .register(
+                AccountDescriptor::personal(
+                    "fixture-account",
+                    actor,
+                    "local",
+                    ["fixture-model".into()],
+                ),
+                Arc::new(ProviderFixture),
+            )
+            .unwrap();
+        let service = Service::new(
+            SessionStore::in_memory().unwrap(),
+            accounts,
+            settings(),
+            ServiceConfig::new(
+                ToolMode::Off,
+                BudgetConfig::default(),
+                PathBuf::from("/tmp"),
+                None,
+            ),
+        )
+        .unwrap();
+        let spec = service.agent_tool().spec();
+        let bytes = serde_json::to_vec(&spec).unwrap().len();
+        println!(
+            "final-agent-schema tools=1 bytes={} approx_tokens={} name={}",
+            bytes,
+            bytes.div_ceil(4),
+            spec.name
+        );
+        assert_eq!(spec.name, "agent");
+        assert_eq!(spec.parameters["required"], json!(["task"]));
+        assert!(spec.parameters["properties"].get("mode").is_none());
+    }
+
+    #[test]
+    fn remote_dotlink_projection_keeps_only_finite_job_refs_and_exact_fs_arguments() {
+        let canonical_job = "/d:local/i:owner/p:repo/a:0/j:job-1";
+        let canonical_node = "/d:local/i:owner/p:repo/a:0/j:job-1/n:3";
+        assert_eq!(
+            PolicyOperationRouter::remote_wire_ref(canonical_job).unwrap(),
+            "j:job-1"
+        );
+        assert_eq!(
+            PolicyOperationRouter::remote_wire_ref(canonical_node).unwrap(),
+            "j:job-1/n:3"
+        );
+        let projected = PolicyOperationRouter::remote_arguments(
+            OperationId::JobsRead,
+            canonical_node,
+            &json!({"ref":".","view":"stdout","offset":0,"limit":128}),
+        )
+        .unwrap();
+        assert_eq!(projected["ref"], "j:job-1/n:3");
+        let fs = json!({"path":"src/lib.rs","line":1,"lines":10,"numbered":false});
+        assert_eq!(
+            PolicyOperationRouter::remote_arguments(
+                OperationId::Fs(FsTool::Read),
+                "/d:local/i:owner/p:repo/a:0/t:1",
+                &fs,
+            )
+            .unwrap(),
+            fs
+        );
     }
 
     struct WholeGraphDelegateProvider {
@@ -5402,25 +4459,6 @@ mod tests {
 
     /// Never completes on its own; only an authenticated Actor Turn cancel
     /// can finish this real background Agent provider attempt.
-    struct BlockingProvider {
-        calls: Arc<AtomicUsize>,
-        entered: Arc<tokio::sync::Notify>,
-    }
-    impl Provider for BlockingProvider {
-        fn stream<'a>(
-            &'a self, messages:&'a [aw_agent_core::Message], _:&'a str,
-            _:&'a mut DeltaSink<'_>,
-        ) -> CompletionFuture<'a> {
-            Box::pin(async move {
-                assert!(messages.iter().any(|m|m.content=="background task"));
-                assert!(!messages.iter().any(|m|m.content=="parent secret text"));
-                self.calls.fetch_add(1,Ordering::SeqCst);
-                self.entered.notify_one();
-                std::future::pending::<Result<CompletionMeta>>().await
-            })
-        }
-    }
-
     struct RecursiveProvider {
         calls: Arc<AtomicUsize>,
     }
@@ -5458,8 +4496,8 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(model, "fixture-model");
                 let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
-                if names.is_empty() {
-                    assert!(messages.iter().any(|message| message.content == "level2 task"));
+                if messages.iter().any(|message| message.content == "level2 task") {
+                    assert_eq!(names, vec!["jobs_subscribe"]);
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     sink("level2 answer")?;
                     return Ok(ModelReply {
@@ -5473,15 +4511,14 @@ mod tests {
                         ..Default::default()
                     });
                 }
-                assert_eq!(names, vec!["subagent"]);
+                assert_eq!(names, vec!["agent", "jobs_subscribe"]);
                 assert!(messages.iter().any(|message| message.content == "level1 task"));
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 if messages.last().is_some_and(|message| message.role == Role::Tool) {
                     let result = messages.last().unwrap();
                     assert_eq!(result.tool_call_id.as_deref(), Some("recursive-leaf"));
-                    let body: serde_json::Value = serde_json::from_str(&result.content).unwrap();
-                    assert_eq!(body["state"], "completed");
-                    assert_eq!(body["answer"], "level2 answer");
+                    assert!(result.content.contains(" agent idle "), "{}", result.content);
+                    assert!(result.content.contains("level2 answer"), "{}", result.content);
                     sink("level1 answer")?;
                     Ok(ModelReply {
                         meta: CompletionMeta {
@@ -5504,208 +4541,15 @@ mod tests {
                         },
                         tool_calls: vec![ToolCall {
                             id: "recursive-leaf".into(),
-                            name: "subagent".into(),
+                            name: "agent".into(),
                             arguments: json!({
                                 "task": "level2 task",
                                 "title": "Leaf child",
-                                "mode": "foreground"
+                                "background": false
                             }),
                         }],
                         provider_context: None,
                     })
-                }
-            })
-        }
-    }
-
-    #[cfg(feature = "workspace")]
-    struct RecursiveWorkspaceProvider {
-        calls: Arc<AtomicUsize>,
-    }
-    #[cfg(feature = "workspace")]
-    impl Provider for RecursiveWorkspaceProvider {
-        fn supports_tools(&self) -> bool {
-            true
-        }
-        fn stream<'a>(
-            &'a self,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a mut DeltaSink<'_>,
-        ) -> CompletionFuture<'a> {
-            Box::pin(async { Err(Error::Protocol("recursive workspace fixture uses tool adapter")) })
-        }
-        fn stream_tools<'a>(
-            &'a self,
-            messages: &'a [Message],
-            model: &'a str,
-            tools: &'a [ToolSpec],
-            sink: &'a mut DeltaSink<'_>,
-        ) -> ModelFuture<'a> {
-            Box::pin(async move {
-                assert_eq!(model, "fixture-model");
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
-                let parent_task = messages.iter().any(|m| m.content == "workspace-parent task");
-                let leaf_task = messages.iter().any(|m| m.content == "workspace-leaf task");
-                if parent_task {
-                    assert_eq!(names, vec!["edit", "read", "subagent", "write"]);
-                    if messages.last().is_some_and(|message| message.role == Role::Tool) {
-                        let result = messages.last().unwrap();
-                        assert_eq!(result.tool_call_id.as_deref(), Some("workspace-recursive-leaf"));
-                        let body: serde_json::Value = serde_json::from_str(&result.content).unwrap();
-                        assert_eq!(body["state"], "completed");
-                        assert_eq!(body["answer"], "workspace-leaf answer");
-                        sink("workspace-parent answer")?;
-                        return Ok(ModelReply {
-                            meta: CompletionMeta {
-                                finish_reason: "stop".into(),
-                                usage: Usage {
-                                    input_tokens: Some(5),
-                                    output_tokens: Some(2),
-                                },
-                            },
-                            ..Default::default()
-                        });
-                    }
-                    return Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "tool_calls".into(),
-                            usage: Usage {
-                                input_tokens: Some(4),
-                                output_tokens: Some(1),
-                            },
-                        },
-                        tool_calls: vec![ToolCall {
-                            id: "workspace-recursive-leaf".into(),
-                            name: "subagent".into(),
-                            arguments: json!({
-                                "task":"workspace-leaf task",
-                                "title":"Workspace leaf",
-                                "mode":"foreground"
-                            }),
-                        }],
-                        provider_context: None,
-                    });
-                }
-                assert!(leaf_task);
-                assert_eq!(names, vec!["edit", "read", "write"]);
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
-                    let result = messages.last().unwrap();
-                    assert_eq!(result.tool_call_id.as_deref(), Some("workspace-leaf-write"));
-                    assert!(!result.content.starts_with("ERROR:"));
-                    sink("workspace-leaf answer")?;
-                    Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "stop".into(),
-                            usage: Usage {
-                                input_tokens: Some(3),
-                                output_tokens: Some(2),
-                            },
-                        },
-                        ..Default::default()
-                    })
-                } else {
-                    Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "tool_calls".into(),
-                            usage: Usage {
-                                input_tokens: Some(3),
-                                output_tokens: Some(1),
-                            },
-                        },
-                        tool_calls: vec![ToolCall {
-                            id: "workspace-leaf-write".into(),
-                            name: "write".into(),
-                            arguments: json!({
-                                "path":"grandchild-only.txt",
-                                "content":"grandchild isolated bytes\\n"
-                            }),
-                        }],
-                        provider_context: None,
-                    })
-                }
-            })
-        }
-    }
-
-    #[cfg(feature = "workspace")]
-    struct DirtyRecursiveWorkspaceProvider {
-        calls: Arc<AtomicUsize>,
-    }
-    #[cfg(feature = "workspace")]
-    impl Provider for DirtyRecursiveWorkspaceProvider {
-        fn supports_tools(&self) -> bool {
-            true
-        }
-        fn stream<'a>(
-            &'a self,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a mut DeltaSink<'_>,
-        ) -> CompletionFuture<'a> {
-            Box::pin(async { Err(Error::Protocol("dirty recursive fixture uses tool adapter")) })
-        }
-        fn stream_tools<'a>(
-            &'a self,
-            messages: &'a [Message],
-            _: &'a str,
-            tools: &'a [ToolSpec],
-            sink: &'a mut DeltaSink<'_>,
-        ) -> ModelFuture<'a> {
-            Box::pin(async move {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                assert!(messages.iter().any(|m| m.content == "dirty-parent task"));
-                let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
-                assert_eq!(names, vec!["edit", "read", "subagent", "write"]);
-                let last_tool = messages
-                    .last()
-                    .filter(|message| message.role == Role::Tool)
-                    .and_then(|message| message.tool_call_id.as_deref());
-                match last_tool {
-                    None => Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "tool_calls".into(),
-                            ..Default::default()
-                        },
-                        tool_calls: vec![ToolCall {
-                            id: "dirty-parent-write".into(),
-                            name: "write".into(),
-                            arguments: json!({
-                                "path":"dirty-before-delegate.txt",
-                                "content":"dirty parent bytes\\n"
-                            }),
-                        }],
-                        provider_context: None,
-                    }),
-                    Some("dirty-parent-write") => Ok(ModelReply {
-                        meta: CompletionMeta {
-                            finish_reason: "tool_calls".into(),
-                            ..Default::default()
-                        },
-                        tool_calls: vec![ToolCall {
-                            id: "dirty-parent-subagent".into(),
-                            name: "subagent".into(),
-                            arguments: json!({
-                                "task":"must never reach descendant provider",
-                                "mode":"foreground"
-                            }),
-                        }],
-                        provider_context: None,
-                    }),
-                    Some("dirty-parent-subagent") => {
-                        let result = messages.last().unwrap();
-                        assert!(result.content.contains("clean parent checkout"));
-                        sink("dirty descendant correctly blocked")?;
-                        Ok(ModelReply {
-                            meta: CompletionMeta {
-                                finish_reason: "stop".into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        })
-                    }
-                    other => panic!("unexpected tool result {other:?}"),
                 }
             })
         }
@@ -5738,8 +4582,8 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(model, "fixture-model");
                 let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
-                assert_eq!(names, vec!["edit", "read", "write"]);
-                assert!(!names.contains(&"subagent"));
+                assert_eq!(names, vec!["edit", "jobs_subscribe", "read", "write"]);
+                assert!(!names.contains(&"agent"));
                 assert!(!names.contains(&"bash"));
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 if messages.last().is_some_and(|message| message.role == Role::Tool) {
@@ -5805,7 +4649,7 @@ mod tests {
         ) -> ModelFuture<'a> {
             Box::pin(async move {
                 let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
-                assert_eq!(names, vec!["read"]);
+                assert_eq!(names, vec!["jobs_subscribe", "read"]);
                 if messages.last().is_some_and(|message| message.role == Role::Tool) {
                     assert!(messages.last().unwrap().content.contains("parent bytes"));
                     sink("read-only child answer")?;
@@ -5942,7 +4786,7 @@ mod tests {
         };
         use std::{num::NonZeroU64, sync::Mutex};
         let mut grants = vec![ExactGrant {
-            name: "subagent".into(),
+            name: "agent".into(),
             kind: SourceKind::Host,
             source: "trusted-host".into(),
             source_epoch: 1,
@@ -6222,712 +5066,7 @@ mod tests {
 
 
 
-    #[tokio::test]
-    async fn graph_approval_does_not_survive_exact_tool_grant_revocation() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "aw-graph-revoke-{}-{}",
-            std::process::id(),
-            unix_micros()
-        ));
-        aw_platform::ensure_private_dir(&state_dir).unwrap();
-        let workspace = state_dir.join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-
-        let actor = PrincipalId::new("local:graph-revoke").unwrap();
-        let main_calls = Arc::new(AtomicUsize::new(0));
-        let guardian_calls = Arc::new(AtomicUsize::new(0));
-        let provider = Arc::new(GraphAskProvider {
-            main_calls,
-            guardian_calls: guardian_calls.clone(),
-        });
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                provider,
-            )
-            .unwrap();
-        let selected = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap();
-        let identity = selected.identity().clone();
-
-        let store = SessionStore::open(&state_dir).unwrap();
-        let (parent, branch) = store
-            .create(
-                &actor,
-                "Graph revoke parent",
-                aw_store::SessionBinding {
-                    working_directory: workspace.clone(),
-                    tool_root: workspace.clone(),
-                    system_prompt: "system".into(),
-                    profile_hint: "fixture-account".into(),
-                    model_hint: "fixture-model".into(),
-                    destination_fingerprint: "0".repeat(64),
-                },
-            )
-            .unwrap();
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Off,
-                BudgetConfig::default(),
-                state_dir.clone(),
-                None,
-            ),
-        )
-        .unwrap();
-
-        let mut tools = LocalToolOptions::new(&workspace, ToolMode::Workspace);
-        tools.selected_tools = vec!["write".into()];
-        let mut agent = aw_tools_adapter::configure(
-            Agent::builder_from_selection(
-                selected,
-                AgentOptions::new("fixture-account", "fixture-model"),
-            ),
-            actor.clone(),
-            &tools,
-        )
-        .unwrap()
-        .build()
-        .unwrap();
-        let (view, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        agent
-            .load_history(view.history, Some(Arc::new(handle.clone())))
-            .unwrap();
-        let binding_info = store.agent_binding(&actor, &parent.id, &branch.id).unwrap();
-        let execution_owner = AgentExecutionBinding::from_trusted_host(
-            format!(
-                "/d:{}/i:{}/p:{}/a:{}",
-                binding_info.domain_handle,
-                binding_info.identity_handle,
-                binding_info.project_handle,
-                binding_info.agent_handle,
-            ),
-            binding_info.session_id,
-            binding_info.branch_id,
-        )
-        .unwrap();
-        agent
-            .bind_execution_owner(execution_owner.clone())
-            .unwrap();
-        handle
-            .begin(TurnStart {
-                turn_id: 1,
-                prompt: "pending Graph approval".into(),
-                identity: identity.clone(),
-            })
-            .await
-            .unwrap();
-
-        let local_policy = aw_policy::Policy {
-            deny: false,
-            routes: aw_policy::Routes::LOCAL,
-            prefer: Some(aw_policy::Strategy::Local),
-            require_preferred: true,
-            max_model_rounds: None,
-        };
-        let router = Arc::new(
-            PolicyGraphRouter::new(
-                service,
-                agent.tool_binding_authority(),
-                PolicyGraphConfig::deterministic(local_policy, 41)
-                    .unwrap()
-                    .with_guardian(vec![actor.clone()], Duration::from_secs(60))
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-        let ctx = ToolContext {
-            actor: actor.clone(),
-            turn_id: 1,
-            call_id: "graph-revoke-call".into(),
-            source: aw_agent_core::ToolSource::trusted_host(),
-            effect: ToolEffect::Control,
-            execution_site: "local".into(),
-            cancellation: CancellationToken::new(),
-            result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-            identity,
-            scope: Some(InvocationScope {
-                session_id: parent.id.clone(),
-                branch_id: branch.id.clone(),
-            }),
-            execution_owner: Some(execution_owner),
-            execution_scope: None,
-        };
-        let request = GraphPolicyRequest {
-            job_id: "graph-revoke-job".into(),
-            graph_fingerprint: [7; 32],
-            nodes: vec![aw_tools_adapter::operation_router::GraphPolicyNode {
-                coordinate: 1,
-                operation: OperationId::Fs(FsTool::Write),
-                replay_identity: [8; 32],
-                footprint_fingerprint: [9; 32],
-                dependencies: Vec::new(),
-            }],
-        };
-        let task_router = router.clone();
-        let task_ctx = ctx.clone();
-        let task =
-            tokio::spawn(async move { task_router.before_run(&task_ctx, request).await });
-
-        let admission_id = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(id) = router
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .get("graph-revoke-job")
-                    .and_then(|state| state.by_coordinate.get(&1))
-                    .cloned()
-                {
-                    break id;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(guardian_calls.load(Ordering::SeqCst), 1);
-
-        agent
-            .revoke_registered_source_tool(
-                &actor,
-                "write",
-                &aw_agent_core::ToolSource::trusted_host(),
-            )
-            .unwrap();
-        router
-            .decide_graph_approval("graph-revoke-job", 1, &actor, true)
-            .unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            result,
-            Err(Error::Denied("captured tool binding is no longer live"))
-        ));
-        let fact = store
-            .policy_admission_fact(&actor, &parent.id, &admission_id)
-            .unwrap();
-        assert_eq!(fact.state, PolicyAdmissionState::AskApproved);
-        assert_eq!(guardian_calls.load(Ordering::SeqCst), 1);
-
-        let _ = std::fs::remove_dir_all(state_dir);
-    }
-
-    #[tokio::test]
-    async fn graph_node_delegate_executes_same_jobhost_node_once_and_returns_native_receipt() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "aw-graph-node-delegate-{}-{}",
-            std::process::id(),
-            unix_micros()
-        ));
-        aw_platform::ensure_private_dir(&state_dir).unwrap();
-        let workspace = state_dir.join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("delegated.txt"), "native delegated value\n").unwrap();
-
-        let actor = PrincipalId::new("local:graph-node-delegate").unwrap();
-        let main_calls = Arc::new(AtomicUsize::new(0));
-        let delegate_calls = Arc::new(AtomicUsize::new(0));
-        let provider = Arc::new(GraphDelegateProvider {
-            main_calls: main_calls.clone(),
-            delegate_calls: delegate_calls.clone(),
-        });
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                provider,
-            )
-            .unwrap();
-        let selected = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap();
-
-        let store = SessionStore::open(&state_dir).unwrap();
-        let (parent, branch) = store
-            .create(
-                &actor,
-                "Graph node delegate parent",
-                aw_store::SessionBinding {
-                    working_directory: workspace.clone(),
-                    tool_root: workspace.clone(),
-                    system_prompt: "system".into(),
-                    profile_hint: "fixture-account".into(),
-                    model_hint: "fixture-model".into(),
-                    destination_fingerprint: "0".repeat(64),
-                },
-            )
-            .unwrap();
-        let child_runtime =
-            actor_owner_for_mode(&store, &actor, &parent.id, 2, ToolMode::ReadOnly);
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Off,
-                BudgetConfig::default(),
-                state_dir.clone(),
-                None,
-            )
-            .with_child_actors(child_runtime),
-        )
-        .unwrap();
-
-        let graph_slot = Arc::new(
-            aw_tools_adapter::operation_router::GraphPolicyRouterSlot::default(),
-        );
-        let mut tools = LocalToolOptions::new(&workspace, ToolMode::ReadOnly);
-        tools.selected_tools = vec!["read".into(), "batch".into()];
-        tools.graph_policy_router = graph_slot.clone();
-        let mut agent = aw_tools_adapter::configure(
-            Agent::builder_from_selection(
-                selected.clone(),
-                AgentOptions::new("fixture-account", "fixture-model"),
-            ),
-            actor.clone(),
-            &tools,
-        )
-        .unwrap()
-        .build()
-        .unwrap();
-        let (view, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        agent
-            .load_history(view.history, Some(Arc::new(handle)))
-            .unwrap();
-        let binding_info = store.agent_binding(&actor, &parent.id, &branch.id).unwrap();
-        agent
-            .bind_execution_owner(
-                AgentExecutionBinding::from_trusted_host(
-                    format!(
-                        "/d:{}/i:{}/p:{}/a:{}",
-                        binding_info.domain_handle,
-                        binding_info.identity_handle,
-                        binding_info.project_handle,
-                        binding_info.agent_handle,
-                    ),
-                    binding_info.session_id,
-                    binding_info.branch_id,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-
-        let delegate_policy = aw_policy::Policy {
-            deny: false,
-            routes: aw_policy::Routes::BOTH,
-            prefer: Some(aw_policy::Strategy::DelegateAgent),
-            require_preferred: true,
-            max_model_rounds: Some(2),
-        };
-        graph_slot
-            .replace(Arc::new(
-                PolicyGraphRouter::new(
-                    service,
-                    agent.tool_binding_authority(),
-                    PolicyGraphConfig::deterministic(delegate_policy, 31).unwrap(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-
-        let turn = agent
-            .prompt(
-                "run delegated graph node",
-                std::future::pending::<()>(),
-                |_| Ok(()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(turn.outcome, aw::conversation::Outcome::Completed);
-        assert_eq!(turn.answer, "delegated graph complete");
-        assert_eq!(main_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(delegate_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(turn.tool_records.len(), 1);
-        assert_eq!(turn.tool_records[0].call.name, "batch");
-        let batch_receipt = turn.tool_records[0]
-            .output
-            .as_ref()
-            .expect("Batch factual receipt")
-            .content
-            .clone();
-        assert!(batch_receipt.contains("native delegated value"));
-        assert!(!batch_receipt.contains("delegate prose"));
-        let children = store.visible_subagents(&actor).unwrap();
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0].state, "completed");
-
-        let _ = std::fs::remove_dir_all(state_dir);
-    }
-
-    #[tokio::test]
-    async fn graph_admission_narrow_rewrites_arguments_before_seal_and_guardian_runs_once() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "aw-graph-narrow-{}-{}",
-            std::process::id(),
-            unix_micros()
-        ));
-        aw_platform::ensure_private_dir(&state_dir).unwrap();
-        let workspace = state_dir.join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-
-        let actor = PrincipalId::new("local:graph-narrow").unwrap();
-        let main_calls = Arc::new(AtomicUsize::new(0));
-        let guardian_calls = Arc::new(AtomicUsize::new(0));
-        let narrow_calls = Arc::new(AtomicUsize::new(0));
-        let provider = Arc::new(GraphNarrowProvider {
-            main_calls: main_calls.clone(),
-            guardian_calls: guardian_calls.clone(),
-        });
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                provider,
-            )
-            .unwrap();
-        let selected = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap();
-
-        let store = SessionStore::open(&state_dir).unwrap();
-        let (parent, branch) = store
-            .create(
-                &actor,
-                "Graph Narrow parent",
-                aw_store::SessionBinding {
-                    working_directory: workspace.clone(),
-                    tool_root: workspace.clone(),
-                    system_prompt: "system".into(),
-                    profile_hint: "fixture-account".into(),
-                    model_hint: "fixture-model".into(),
-                    destination_fingerprint: "0".repeat(64),
-                },
-            )
-            .unwrap();
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Off,
-                BudgetConfig::default(),
-                state_dir.clone(),
-                None,
-            ),
-        )
-        .unwrap();
-
-        let graph_slot = Arc::new(
-            aw_tools_adapter::operation_router::GraphPolicyRouterSlot::default(),
-        );
-        let mut tools = LocalToolOptions::new(&workspace, ToolMode::Workspace);
-        tools.selected_tools = vec!["write".into(), "batch".into()];
-        tools.graph_policy_router = graph_slot.clone();
-        let mut agent = aw_tools_adapter::configure(
-            Agent::builder_from_selection(
-                selected.clone(),
-                AgentOptions::new("fixture-account", "fixture-model"),
-            ),
-            actor.clone(),
-            &tools,
-        )
-        .unwrap()
-        .build()
-        .unwrap();
-        let (view, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        agent
-            .load_history(view.history, Some(Arc::new(handle)))
-            .unwrap();
-        let binding_info = store.agent_binding(&actor, &parent.id, &branch.id).unwrap();
-        agent
-            .bind_execution_owner(
-                AgentExecutionBinding::from_trusted_host(
-                    format!(
-                        "/d:{}/i:{}/p:{}/a:{}",
-                        binding_info.domain_handle,
-                        binding_info.identity_handle,
-                        binding_info.project_handle,
-                        binding_info.agent_handle,
-                    ),
-                    binding_info.session_id,
-                    binding_info.branch_id,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-
-        let local_policy = aw_policy::Policy {
-            deny: false,
-            routes: aw_policy::Routes::LOCAL,
-            prefer: Some(aw_policy::Strategy::Local),
-            require_preferred: true,
-            max_model_rounds: None,
-        };
-        let config = PolicyGraphConfig::deterministic(local_policy, 41)
-            .unwrap()
-            .with_narrow_authority(Arc::new(StaticGraphNarrowAuthority {
-                calls: narrow_calls.clone(),
-            }))
-            .with_guardian(Vec::new(), Duration::from_secs(60))
-            .unwrap();
-        graph_slot
-            .replace(Arc::new(
-                PolicyGraphRouter::new(
-                    service,
-                    agent.tool_binding_authority(),
-                    config,
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-
-        let turn = tokio::time::timeout(
-            Duration::from_secs(8),
-            agent.prompt(
-                "run narrowed graph",
-                std::future::pending::<()>(),
-                |_| Ok(()),
-            ),
-        )
-        .await
-        .expect("pre-seal Graph Narrow must not deadlock")
-        .unwrap();
-        assert_eq!(turn.outcome, aw::conversation::Outcome::Completed);
-        assert_eq!(turn.answer, "narrow graph complete");
-        assert_eq!(main_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            guardian_calls.load(Ordering::SeqCst),
-            1,
-            "one original policy claim may run at most one guardian"
-        );
-        assert_eq!(
-            narrow_calls.load(Ordering::SeqCst),
-            1,
-            "trusted host revision authority is consulted exactly once"
-        );
-        assert!(
-            !workspace.join("unsafe.txt").exists(),
-            "original unsealed arguments must never execute"
-        );
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("safe.txt")).unwrap(),
-            "narrowed-value"
-        );
-        assert_eq!(turn.tool_records.len(), 1);
-        assert_eq!(turn.tool_records[0].call.name, "batch");
-
-        let _ = std::fs::remove_dir_all(state_dir);
-    }
-
-    #[tokio::test]
-    async fn graph_multi_ask_starts_zero_roots_until_all_approvals_and_is_idempotent() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "aw-graph-multi-ask-{}-{}",
-            std::process::id(),
-            unix_micros()
-        ));
-        aw_platform::ensure_private_dir(&state_dir).unwrap();
-        let workspace = state_dir.join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-
-        let actor = PrincipalId::new("local:graph-ask").unwrap();
-        let main_calls = Arc::new(AtomicUsize::new(0));
-        let guardian_calls = Arc::new(AtomicUsize::new(0));
-        let provider = Arc::new(GraphAskProvider {
-            main_calls: main_calls.clone(),
-            guardian_calls: guardian_calls.clone(),
-        });
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                provider,
-            )
-            .unwrap();
-        let selected = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap();
-
-        let store = SessionStore::open(&state_dir).unwrap();
-        let (parent, branch) = store
-            .create(
-                &actor,
-                "Graph Ask parent",
-                aw_store::SessionBinding {
-                    working_directory: workspace.clone(),
-                    tool_root: workspace.clone(),
-                    system_prompt: "system".into(),
-                    profile_hint: "fixture-account".into(),
-                    model_hint: "fixture-model".into(),
-                    destination_fingerprint: "0".repeat(64),
-                },
-            )
-            .unwrap();
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Off,
-                BudgetConfig::default(),
-                state_dir.clone(),
-                None,
-            ),
-        )
-        .unwrap();
-
-        let graph_slot = Arc::new(
-            aw_tools_adapter::operation_router::GraphPolicyRouterSlot::default(),
-        );
-        let mut tools = LocalToolOptions::new(&workspace, ToolMode::Workspace);
-        tools.selected_tools = vec!["write".into(), "batch".into()];
-        tools.graph_policy_router = graph_slot.clone();
-        let mut agent = aw_tools_adapter::configure(
-            Agent::builder_from_selection(
-                selected.clone(),
-                AgentOptions::new("fixture-account", "fixture-model"),
-            ),
-            actor.clone(),
-            &tools,
-        )
-        .unwrap()
-        .build()
-        .unwrap();
-        let (view, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        agent
-            .load_history(view.history, Some(Arc::new(handle)))
-            .unwrap();
-        let binding_info = store.agent_binding(&actor, &parent.id, &branch.id).unwrap();
-        agent
-            .bind_execution_owner(
-                AgentExecutionBinding::from_trusted_host(
-                    format!(
-                        "/d:{}/i:{}/p:{}/a:{}",
-                        binding_info.domain_handle,
-                        binding_info.identity_handle,
-                        binding_info.project_handle,
-                        binding_info.agent_handle,
-                    ),
-                    binding_info.session_id,
-                    binding_info.branch_id,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-
-        let local_policy = aw_policy::Policy {
-            deny: false,
-            routes: aw_policy::Routes::LOCAL,
-            prefer: Some(aw_policy::Strategy::Local),
-            require_preferred: true,
-            max_model_rounds: None,
-        };
-        let router = Arc::new(
-            PolicyGraphRouter::new(
-                service,
-                agent.tool_binding_authority(),
-                PolicyGraphConfig::deterministic(local_policy, 21)
-                    .unwrap()
-                    .with_guardian(vec![actor.clone()], Duration::from_secs(60))
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-        graph_slot.replace(router.clone()).unwrap();
-
-        let task = tokio::spawn(async move {
-            agent
-                .prompt("run the gated graph", std::future::pending::<()>(), |_| Ok(()))
-                .await
-        });
-
-        let job_id = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(job_id) = router
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .next()
-                    .cloned()
-                {
-                    break job_id;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let pending = router
-            .pending_approvals(&job_id)
-            .expect("Graph approval set must be published");
-        assert_eq!(pending.entries().len(), 2);
-        assert_eq!(guardian_calls.load(Ordering::SeqCst), 2);
-        assert!(!workspace.join("approved-one.txt").exists());
-        assert!(!workspace.join("approved-two.txt").exists());
-        assert!(!task.is_finished());
-
-        let first = router
-            .decide_graph_approval(&job_id, 1, &actor, true)
-            .unwrap();
-        let duplicate = router
-            .decide_graph_approval(&job_id, 1, &actor, true)
-            .unwrap();
-        assert_eq!(first, duplicate, "approval replay must be idempotent");
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        assert!(!workspace.join("approved-one.txt").exists());
-        assert!(!workspace.join("approved-two.txt").exists());
-        assert!(!task.is_finished(), "one of two approvals cannot release Graph roots");
-
-        router
-            .decide_graph_approval(&job_id, 2, &actor, true)
-            .unwrap();
-        let turn = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(turn.outcome, aw::conversation::Outcome::Completed);
-        assert_eq!(turn.answer, "graph complete");
-        assert_eq!(std::fs::read_to_string(workspace.join("approved-one.txt")).unwrap(), "one");
-        assert_eq!(std::fs::read_to_string(workspace.join("approved-two.txt")).unwrap(), "two");
-        assert_eq!(guardian_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(main_calls.load(Ordering::SeqCst), 2);
-        assert!(router.pending_approvals(&job_id).is_none());
-
-        let _ = std::fs::remove_dir_all(state_dir);
-    }
-
-    #[tokio::test]
+                    #[tokio::test]
     async fn policy_operation_router_local_and_delegate_share_one_factual_executor() {
         let actor = PrincipalId::new("local:policy-operation").unwrap();
         let provider_calls = Arc::new(AtomicUsize::new(0));
@@ -7042,12 +5181,10 @@ mod tests {
             require_preferred: true,
             max_model_rounds: None,
         };
-        let local_config =
-            PolicyOperationConfig::deterministic(local_policy, 11)
-                .unwrap()
-                .with_guardian(false);
-        assert_eq!(local_config.policy(), local_policy);
-        assert_eq!(local_config.revision(), 11);
+        let local_config = PolicyOperationConfig::deterministic(local_policy, 11).unwrap();
+        assert_eq!(local_config.policy, local_policy);
+        assert_eq!(local_config.revision, 11);
+        assert!(!local_config.guardian);
         let local_router =
             PolicyOperationRouter::new(service.clone(), authority.clone(), local_config).unwrap();
         let local_args = json!({"path":"local.txt"});
@@ -7932,257 +6069,7 @@ mod tests {
         assert_eq!(closed_root.model_attempts_finished, 3);
     }
 
-    #[tokio::test]
-    async fn foreground_tool_uses_exact_parent_lease_and_isolated_child_session() {
-        let actor = PrincipalId::new("local:test").unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = Arc::new(EchoProvider {
-            calls: calls.clone(),
-        });
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                provider,
-            )
-            .unwrap();
-        let selection = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap();
-        let identity = selection.identity().clone();
-
-        let store = SessionStore::in_memory().unwrap();
-        let (parent, branch) = store
-            .create(&actor, "Parent", binding())
-            .unwrap();
-        let (_, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        handle
-            .begin(TurnStart {
-                turn_id: 1,
-                prompt: "parent secret text".into(),
-                identity: identity.clone(),
-            })
-            .await
-            .unwrap();
-        // The real Agent journals its Assistant proposal before the Process
-        // tool intent; interrupted-parent fixtures preserve that ordering.
-        let mut assistant = Message::text(2, Role::Assistant, "");
-        assistant.tool_calls = vec![ToolCall {
-            id: "call-subagent-fixture".into(), name: "subagent".into(),
-            arguments: json!({"task":"research task"}),
-        }];
-        handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
-        handle
-            .append(
-                1,
-                JournalEntry::ToolStarted {
-                    record: ToolRecord {
-                        call: ToolCall {
-                            id: "call-subagent-fixture".into(),
-                            name: "subagent".into(),
-                            arguments: json!({"task":"research task"}),
-                        },
-                        effect: ToolEffect::Process,
-                        execution_site: "local".into(),
-                        status: ToolStatus::Running,
-                        output: None,
-                    },
-                    source: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let actor_service=actor_owner(&store,&actor,&parent.id,2);
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Off,
-                BudgetConfig::default(),
-                PathBuf::from("/tmp"),
-                None,
-            ).with_child_actors(actor_service.clone()),
-        ).unwrap();
-        assert!(service
-            .validate(&json!({"task":"x","model":"other"}))
-            .is_err());
-
-        let output = service
-            .execute(
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity: identity.clone(),
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                },
-                &json!({
-                    "task": "research task",
-                    "title": "Research child",
-                    "mode": "foreground"
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(!output.is_error);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let result: serde_json::Value = serde_json::from_str(&output.content).unwrap();
-        assert_eq!(result["state"], "completed");
-        assert_eq!(result["answer"], "child answer");
-
-        let relations = store.subagents_for_parent(&actor, &parent.id).unwrap();
-        assert_eq!(relations.len(), 1);
-        let relation = &relations[0];
-        assert_eq!(relation.identity, identity);
-        assert_eq!(relation.state, "completed");
-        let live=actor_service.list().unwrap();
-        assert_eq!(live.len(),1);
-        assert_eq!(live[0].0.id,relation.id);
-        assert!(live[0].1.parent.is_some());
-        assert_eq!(live[0].1.kind,aw_agent_kernel::actor::ActorKind::Agent);
-        assert_eq!(live[0].1.state,aw_agent_kernel::actor::ActorState::Settled);
-        assert_eq!(live[0].1.depth,1);
-        let (stored,descriptor)=actor_service.status(&relation.id).unwrap();
-        assert_eq!(stored.state,"completed");
-        assert_eq!(descriptor.key,live[0].1.key);
-        let fact=actor_service.wait(&relation.id,CancellationToken::new(),
-            Duration::from_millis(200)).await.unwrap();
-        assert_eq!(fact.state,"completed");
-        assert!(actor_service.signal(&relation.id,
-            aw_agent_kernel::message::ControlKind::Cancel(
-                aw_agent_kernel::message::Scope::Turn),1).is_err());
-        assert!(actor_service.release_settled(&relation.id).is_err(),
-            "cannot discard a final parent notice before it is consumed");
-        let notice=actor_service.poll_root_notification(1).unwrap().unwrap();
-        assert_eq!(notice.from,descriptor.key);
-        assert_eq!(notice.kind,aw_agent_kernel::message::Kind::Notify);
-        assert!(!notice.payload.contains("child answer"));
-        assert!(!notice.payload.contains("parent secret text"));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&notice.payload)
-            .unwrap()["state"],"completed");
-        assert!(actor_service.poll_root_notification(1).unwrap().is_none());
-        actor_service.release_settled(&relation.id).unwrap();
-        assert!(actor_service.list().unwrap().is_empty());
-        assert!(actor_service.status(&relation.id).is_err());
-        assert_eq!(store.subagent(&actor,&relation.id).unwrap().state,"completed");
-
-
-        let (view, _) = store
-            .activate(&actor, &relation.child_session_id, "main")
-            .unwrap();
-        assert_eq!(view.session.title, "Research child");
-        assert_eq!(view.history.turns.len(), 1);
-        assert_eq!(view.history.turns[0].prompt, "research task");
-        assert_eq!(view.history.turns[0].answer, "child answer");
-        assert!(!view
-            .history
-            .turns
-            .iter()
-            .any(|turn| turn.prompt == "parent secret text"));
-
-        // The parent turn is still a separate active turn; the service did not
-        // mutate or complete it while running the child.
-        assert!(store.branches(&actor, &parent.id).unwrap()[0]
-            .active_run
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn attached_background_child_cancel_is_fenced_and_never_replayed() {
-        use aw_agent_kernel::message::{ControlKind, Scope};
-        let actor=PrincipalId::new("local:child-cancel").unwrap();
-        let calls=Arc::new(AtomicUsize::new(0));
-        let entered=Arc::new(tokio::sync::Notify::new());
-        let accounts=ProviderAccounts::new("local").unwrap();
-        accounts.register(AccountDescriptor::personal(
-            "fixture-account",actor.clone(),"local",["fixture-model".into()]
-        ),Arc::new(BlockingProvider{
-            calls:calls.clone(),entered:entered.clone()
-        })).unwrap();
-        let identity=accounts.select(&actor,"fixture-account","fixture-model")
-            .unwrap().identity().clone();
-        let store=SessionStore::in_memory().unwrap();
-        let (parent,branch)=store.create(&actor,"Parent",binding()).unwrap();
-        let (_,journal)=store.activate(&actor,&parent.id,&branch.id).unwrap();
-        journal.begin(TurnStart{
-            turn_id:1,prompt:"parent secret text".into(),identity:identity.clone()
-        }).await.unwrap();
-        let mut proposal=Message::text(2,Role::Assistant,"");
-        proposal.tool_calls=vec![ToolCall{
-            id:"bg-child".into(),name:"subagent".into(),
-            arguments:json!({"task":"background task","mode":"background"}),
-        }];
-        journal.append(1,JournalEntry::Assistant{message:proposal}).await.unwrap();
-        journal.append(1,JournalEntry::ToolStarted{record:ToolRecord{
-            call:ToolCall{id:"bg-child".into(),name:"subagent".into(),
-                arguments:json!({"task":"background task","mode":"background"})},
-            effect:ToolEffect::Process,execution_site:"local".into(),
-            status:ToolStatus::Running,output:None
-        },
-                source: None,}).await.unwrap();
-        let actors=actor_owner(&store,&actor,&parent.id,2);
-        let service=Service::new(store.clone(),accounts,settings(),
-            ServiceConfig::new(ToolMode::Off,BudgetConfig::default(),
-                PathBuf::from("/tmp"),None).with_child_actors(actors.clone())).unwrap();
-        let response=service.execute(ToolContext{
-            actor:actor.clone(),turn_id:1,call_id:"host-direct".into(),source:aw_agent_core::ToolSource::trusted_host(),effect:aw_agent_core::ToolEffect::Unknown,execution_site:"local".into(),
-            cancellation:CancellationToken::new(),
-            result_budget_bytes:aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-            identity,
-            scope:Some(InvocationScope{
-                session_id:parent.id.clone(),branch_id:branch.id.clone()
-            }),
-            execution_owner: None,
-            execution_scope: None,
-        },&json!({"task":"background task","mode":"background"})).await.unwrap();
-        assert!(!response.is_error);
-        let response:serde_json::Value=serde_json::from_str(&response.content).unwrap();
-        let id=response["subagent_id"].as_str().unwrap();
-        assert_eq!(response["state"],"running");
-        tokio::time::timeout(Duration::from_secs(3),entered.notified())
-            .await.expect("original child provider never started");
-        assert_eq!(calls.load(Ordering::SeqCst),1);
-        // Broad or stale signals are never executed as child cancellation.
-        assert!(matches!(actors.signal(id,ControlKind::Freeze(Scope::Turn),1),
-            Ok(aw_agent_core::runtime::Delivery::Applied(_))));
-        assert!(matches!(actors.signal(id,ControlKind::Resume(Scope::Turn),1),
-            Ok(aw_agent_core::runtime::Delivery::Applied(_))));
-        assert!(actors.signal(id,ControlKind::Cancel(Scope::Subtree),1).is_err());
-        assert!(actors.signal(id,ControlKind::Cancel(Scope::Turn),2).is_err());
-        assert!(matches!(actors.signal(id,ControlKind::Cancel(Scope::Turn),1),
-            Ok(aw_agent_core::runtime::Delivery::Applied(_))));
-        let settled=actors.wait(id,CancellationToken::new(),
-            Duration::from_secs(3)).await.unwrap();
-        assert_eq!(settled.state,"cancelled");
-        assert_eq!(calls.load(Ordering::SeqCst),1);
-        assert_eq!(actors.status(id).unwrap().1.state,
-            aw_agent_kernel::actor::ActorState::Cancelled);
-        assert!(actors.signal(id,ControlKind::Cancel(Scope::Turn),1).is_err());
-        let notice=actors.poll_root_notification(1).unwrap().unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&notice.payload)
-            .unwrap()["state"],"cancelled");
-        assert!(!notice.payload.contains("background task"));
-        assert!(actors.poll_root_notification(1).unwrap().is_none());
-    }
-
-    #[tokio::test]
+            #[tokio::test]
     async fn recursive_model_only_child_delegates_to_depth_two_under_same_root() {
         let actor = PrincipalId::new("local:recursive-off").unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -8220,7 +6107,7 @@ mod tests {
         // tool intent; interrupted-parent fixtures preserve that ordering.
         let mut assistant = Message::text(2, Role::Assistant, "");
         assistant.tool_calls = vec![ToolCall {
-            id: "call-recursive-root".into(), name: "subagent".into(),
+            id: "call-recursive-root".into(), name: "agent".into(),
             arguments: json!({"task":"level1 task"}),
         }];
         handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
@@ -8231,7 +6118,7 @@ mod tests {
                     record: ToolRecord {
                         call: ToolCall {
                             id: "call-recursive-root".into(),
-                            name: "subagent".into(),
+                            name: "agent".into(),
                             arguments: json!({"task":"level1 task"}),
                         },
                         effect: ToolEffect::Process,
@@ -8257,8 +6144,7 @@ mod tests {
             ).with_child_actors(actor_service.clone()),
         )
         .unwrap();
-        let output = service
-            .execute(
+        let output = execute_agent_fixture(&service,
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
@@ -8276,21 +6162,14 @@ mod tests {
                     execution_owner: None,
                     execution_scope: None,
                 },
-                &json!({"task":"level1 task","title":"First child","mode":"foreground"}),
+                &json!({"task":"level1 task","title":"First child","background":false}),
             )
             .await
             .unwrap();
         assert!(!output.is_error);
-        let body: serde_json::Value = serde_json::from_str(&output.content).unwrap();
-        assert_eq!(body["answer"], "level1 answer");
+        assert!(output.content.contains(" agent idle "), "{}", output.content);
+        assert!(output.content.contains("level1 answer"), "{}", output.content);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        let live=actor_service.list().unwrap();
-        assert_eq!(live.len(),2);
-        let depth_one=live.iter().find(|(_,a)|a.depth==1).unwrap();
-        let depth_two=live.iter().find(|(_,a)|a.depth==2).unwrap();
-        assert_eq!(depth_two.1.parent,Some(depth_one.1.key));
-        assert_eq!(depth_one.1.state,aw_agent_kernel::actor::ActorState::Settled);
-        assert_eq!(depth_two.1.state,aw_agent_kernel::actor::ActorState::Settled);
 
         let first = store
             .subagents_for_parent(&actor, &parent.id)
@@ -8299,7 +6178,7 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(first.depth, Some(1));
-        assert_eq!(first.state, "completed");
+        assert_eq!(first.state, "running");
         let second = store
             .subagents_for_parent(&actor, &first.child_session_id)
             .unwrap()
@@ -8307,399 +6186,20 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(second.depth, Some(2));
-        assert_eq!(second.state, "completed");
-        assert!(actor_service.release_settled(&second.id).is_err(),
-            "nested parent's unconsumed final notice must block release");
-        let nested_notice=actor_service.poll_child_notification(&first.id,1)
-            .unwrap().unwrap();
-        assert_eq!(nested_notice.from,depth_two.1.key);
-        assert_eq!(nested_notice.to,depth_one.1.key);
-        assert!(nested_notice.payload.contains("completed"));
-        assert!(!nested_notice.payload.contains("level2 answer"));
-        actor_service.release_settled(&second.id).unwrap();
-        assert!(actor_service.release_settled(&first.id).is_err());
-        let root_notice=actor_service.poll_root_notification(1).unwrap().unwrap();
-        assert_eq!(root_notice.from,depth_one.1.key);
-        assert!(!root_notice.payload.contains("level1 answer"));
-        actor_service.release_settled(&first.id).unwrap();
-        assert!(actor_service.list().unwrap().is_empty());
-        assert_eq!(store.subagent(&actor,&first.id).unwrap().state,"completed");
-        assert_eq!(store.subagent(&actor,&second.id).unwrap().state,"completed");
+        assert_eq!(second.state, "running");
+        assert_eq!(second.parent_session_id, first.child_session_id);
+        assert_eq!(store.subagent(&actor,&first.id).unwrap().state,"running");
+        assert_eq!(store.subagent(&actor,&second.id).unwrap().state,"running");
 
         assert_eq!(second.delegation_root_id, first.delegation_root_id);
         let root = store
             .delegation_root(&actor, first.delegation_root_id.as_deref().unwrap())
             .unwrap();
         assert_eq!(root.children_created, 2);
-        assert_eq!(root.active_children, 0);
+        assert_eq!(root.active_children, 2);
         assert_eq!(root.model_attempts_started, 3);
         assert_eq!(root.model_attempts_finished, 3);
         assert_eq!(root.limits.max_depth, 2);
-    }
-
-    #[cfg(all(unix, feature = "workspace"))]
-    #[tokio::test]
-    async fn recursive_workspace_child_gets_clean_sibling_worktree_and_same_root() {
-        let fixture = GitFixture::new();
-        let actor = PrincipalId::new("local:recursive-workspace").unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                Arc::new(RecursiveWorkspaceProvider {
-                    calls: calls.clone(),
-                }),
-            )
-            .unwrap();
-        let identity = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap()
-            .identity()
-            .clone();
-        let store = SessionStore::in_memory().unwrap();
-        let parent_binding = aw_store::SessionBinding {
-            working_directory: fixture.repo.clone(),
-            tool_root: fixture.repo.clone(),
-            system_prompt: "parent instructions".into(),
-            profile_hint: "fixture-account".into(),
-            model_hint: "fixture-model".into(),
-            destination_fingerprint: "0".repeat(64),
-        };
-        let (parent, branch) = store.create(&actor, "Parent", parent_binding).unwrap();
-        let (_, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        handle
-            .begin(TurnStart {
-                turn_id: 1,
-                prompt: "parent secret".into(),
-                identity: identity.clone(),
-            })
-            .await
-            .unwrap();
-        // The real Agent journals its Assistant proposal before the Process
-        // tool intent; interrupted-parent fixtures preserve that ordering.
-        let mut assistant = Message::text(2, Role::Assistant, "");
-        assistant.tool_calls = vec![ToolCall {
-            id: "call-recursive-workspace".into(),
-            name: "subagent".into(),
-            arguments: json!({"task":"workspace-parent task"}),
-        }];
-        handle
-            .append(1, JournalEntry::Assistant { message: assistant })
-            .await
-            .unwrap();
-        handle
-            .append(
-                1,
-                JournalEntry::ToolStarted {
-                    record: ToolRecord {
-                        call: ToolCall {
-                            id: "call-recursive-workspace".into(),
-                            name: "subagent".into(),
-                            arguments: json!({"task":"workspace-parent task"}),
-                        },
-                        effect: ToolEffect::Process,
-                        execution_site: "local".into(),
-                        status: ToolStatus::Running,
-                        output: None,
-                    },
-                    source: None,
-                },
-            )
-            .await
-            .unwrap();
-        let actor_service =
-            actor_owner_for_mode(&store, &actor, &parent.id, 2, ToolMode::Workspace);
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Workspace,
-                BudgetConfig::new(4, 3, 8, 2, 3600).unwrap(),
-                fixture.state.clone(),
-                Some(fixture.git.clone()),
-            )
-            .with_child_actors(actor_service.clone()),
-        )
-        .unwrap();
-        let output = service
-            .execute(
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity,
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                },
-                &json!({"task":"workspace-parent task","mode":"foreground"}),
-            )
-            .await
-            .unwrap();
-        assert!(!output.is_error);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
-        assert!(!fixture.repo.join("grandchild-only.txt").exists());
-
-        let first = store
-            .subagents_for_parent(&actor, &parent.id)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        let second = store
-            .subagents_for_parent(&actor, &first.child_session_id)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(first.depth, Some(1));
-        assert_eq!(second.depth, Some(2));
-        let first_actor = actor_service.status(&first.id).unwrap().1;
-        let second_actor = actor_service.status(&second.id).unwrap().1;
-        assert_eq!(first_actor.depth, 1);
-        assert_eq!(second_actor.depth, 2);
-        assert_eq!(second_actor.parent, Some(first_actor.key));
-        assert_eq!(
-            first_actor.state,
-            aw_agent_kernel::actor::ActorState::Settled
-        );
-        assert_eq!(
-            second_actor.state,
-            aw_agent_kernel::actor::ActorState::Settled
-        );
-        let first_env = actor_service.envelope(&first.id).unwrap();
-        let second_env = actor_service.envelope(&second.id).unwrap();
-        assert_eq!(first_env.site(), format!("subagent:{}", first.id));
-        assert_eq!(second_env.site(), format!("subagent:{}", second.id));
-        assert_ne!(first_env.site(), second_env.site());
-        assert_eq!(
-            first_env.spec().network,
-            aw_agent_kernel::envelope::Network::Deny
-        );
-        assert_eq!(
-            second_env.spec().network,
-            aw_agent_kernel::envelope::Network::Deny
-        );
-        assert!(actor_service.release_settled(&second.id).is_err());
-        let nested = actor_service
-            .poll_child_notification(&first.id, 1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(nested.from, second_actor.key);
-        assert_eq!(nested.to, first_actor.key);
-        assert!(!nested.payload.contains("grandchild isolated bytes"));
-        actor_service.release_settled(&second.id).unwrap();
-        assert!(actor_service.release_settled(&first.id).is_err());
-        let root_notice = actor_service.poll_root_notification(1).unwrap().unwrap();
-        assert_eq!(root_notice.from, first_actor.key);
-        actor_service.release_settled(&first.id).unwrap();
-        assert!(actor_service.list().unwrap().is_empty());
-
-        let first_exec = store
-            .subagent_execution_binding_for_subagent(&actor, &first.id)
-            .unwrap()
-            .unwrap();
-        let second_exec = store
-            .subagent_execution_binding_for_subagent(&actor, &second.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            first_exec.execution_root.parent(),
-            second_exec.execution_root.parent()
-        );
-        assert!(!second_exec
-            .execution_root
-            .starts_with(&first_exec.execution_root));
-        assert!(!first_exec
-            .execution_root
-            .join("grandchild-only.txt")
-            .exists());
-        assert_eq!(
-            std::fs::read(second_exec.execution_root.join("grandchild-only.txt")).unwrap(),
-            b"grandchild isolated bytes\\n"
-        );
-        let repo = aw_git::Repository::discover(&fixture.git, &fixture.repo).unwrap();
-        let first_repo =
-            aw_git::Repository::discover(&fixture.git, &first_exec.execution_root).unwrap();
-        assert!(first_repo.status().unwrap().changes.is_empty());
-        assert!(repo.status().unwrap().changes.is_empty());
-        let root = store
-            .delegation_root(&actor, first.delegation_root_id.as_deref().unwrap())
-            .unwrap();
-        assert_eq!(root.children_created, 2);
-        assert_eq!(root.active_children, 0);
-        assert_eq!(root.model_attempts_started, 4);
-        assert_eq!(root.limits.max_depth, 2);
-
-        let cleanup_second = store
-            .begin_subagent_execution_cleanup(&actor, &second.id)
-            .unwrap();
-        repo.remove_managed_worktree(&cleanup_second.execution_root, true)
-            .unwrap();
-        store
-            .finish_subagent_execution_cleanup(&actor, &cleanup_second.id)
-            .unwrap();
-        let cleanup_first = store
-            .begin_subagent_execution_cleanup(&actor, &first.id)
-            .unwrap();
-        repo.remove_managed_worktree(&cleanup_first.execution_root, false)
-            .unwrap();
-        store
-            .finish_subagent_execution_cleanup(&actor, &cleanup_first.id)
-            .unwrap();
-    }
-
-    #[cfg(all(unix, feature = "workspace"))]
-    #[tokio::test]
-    async fn dirty_recursive_parent_consumes_allocation_but_never_dispatches_descendant() {
-        let fixture = GitFixture::new();
-        let actor = PrincipalId::new("local:dirty-recursive").unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                Arc::new(DirtyRecursiveWorkspaceProvider {
-                    calls: calls.clone(),
-                }),
-            )
-            .unwrap();
-        let identity = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap()
-            .identity()
-            .clone();
-        let store = SessionStore::in_memory().unwrap();
-        let parent_binding = aw_store::SessionBinding {
-            working_directory: fixture.repo.clone(),
-            tool_root: fixture.repo.clone(),
-            system_prompt: "parent instructions".into(),
-            profile_hint: "fixture-account".into(),
-            model_hint: "fixture-model".into(),
-            destination_fingerprint: "0".repeat(64),
-        };
-        let (parent, branch) = store.create(&actor, "Parent", parent_binding).unwrap();
-        let (_, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        handle
-            .begin(TurnStart {
-                turn_id: 1,
-                prompt: "root".into(),
-                identity: identity.clone(),
-            })
-            .await
-            .unwrap();
-        // The real Agent journals its Assistant proposal before the Process
-        // tool intent; interrupted-parent fixtures preserve that ordering.
-        let mut assistant = Message::text(2, Role::Assistant, "");
-        assistant.tool_calls = vec![ToolCall {
-            id: "root-dirty-recursive".into(), name: "subagent".into(),
-            arguments: json!({"task":"dirty-parent task"}),
-        }];
-        handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
-        handle
-            .append(
-                1,
-                JournalEntry::ToolStarted {
-                    record: ToolRecord {
-                        call: ToolCall {
-                            id: "root-dirty-recursive".into(),
-                            name: "subagent".into(),
-                            arguments: json!({"task":"dirty-parent task"}),
-                        },
-                        effect: ToolEffect::Process,
-                        execution_site: "local".into(),
-                        status: ToolStatus::Running,
-                        output: None,
-                    },
-                    source: None,
-                },
-            )
-            .await
-            .unwrap();
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Workspace,
-                BudgetConfig::new(4, 2, 8, 2, 3600).unwrap(),
-                fixture.state.clone(),
-                Some(fixture.git.clone()),
-            ),
-        )
-        .unwrap();
-        let output = service
-            .execute(
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity,
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                },
-                &json!({"task":"dirty-parent task","mode":"foreground"}),
-            )
-            .await
-            .unwrap();
-        assert!(output.is_error);
-        assert!(output.content.contains("managed child worktree requires a clean parent checkout"));
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "descendant provider must never run");
-        let first = store
-            .subagents_for_parent(&actor, &parent.id)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(store.subagents_for_parent(&actor, &first.child_session_id).unwrap().len(), 0);
-        let root = store
-            .delegation_root(&actor, first.delegation_root_id.as_deref().unwrap())
-            .unwrap();
-        assert_eq!(root.children_created, 2, "failed descendant allocation stays consumed");
-        assert_eq!(root.active_children, 0);
-        let first_exec = store
-            .subagent_execution_binding_for_subagent(&actor, &first.id)
-            .unwrap()
-            .unwrap();
-        assert!(first_exec.execution_root.join("dirty-before-delegate.txt").exists());
-        let cleanup = store
-            .begin_subagent_execution_cleanup(&actor, &first.id)
-            .unwrap();
-        let repo = aw_git::Repository::discover(&fixture.git, &fixture.repo).unwrap();
-        repo.remove_managed_worktree(&cleanup.execution_root, true)
-            .unwrap();
-        store
-            .finish_subagent_execution_cleanup(&actor, &cleanup.id)
-            .unwrap();
     }
 
     #[cfg(all(unix, feature = "workspace"))]
@@ -8751,7 +6251,7 @@ mod tests {
         let mut assistant = Message::text(2, Role::Assistant, "");
         assistant.tool_calls = vec![ToolCall {
             id: "call-subagent-workspace".into(),
-            name: "subagent".into(),
+            name: "agent".into(),
             arguments: json!({"task":"workspace task"}),
         }];
         handle
@@ -8765,7 +6265,7 @@ mod tests {
                     record: ToolRecord {
                         call: ToolCall {
                             id: "call-subagent-workspace".into(),
-                            name: "subagent".into(),
+                            name: "agent".into(),
                             arguments: json!({"task":"workspace task"}),
                         },
                         effect: ToolEffect::Process,
@@ -8794,8 +6294,7 @@ mod tests {
             .with_child_actors(actor_service.clone()),
         )
         .unwrap();
-        let output = service
-            .execute(
+        let output = execute_agent_fixture(&service,
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
@@ -8816,7 +6315,7 @@ mod tests {
                 &json!({
                     "task":"workspace task",
                     "title":"Editing child",
-                    "mode":"foreground"
+                    "background":false
                 }),
             )
             .await
@@ -8835,27 +6334,8 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        assert_eq!(relation.state, "completed");
+        assert_eq!(relation.state, "running");
         assert_eq!(relation.tool_mode,"workspace");
-        let (actor_info, descriptor) = actor_service.status(&relation.id).unwrap();
-        assert_eq!(actor_info.child_session_id, relation.child_session_id);
-        assert_eq!(descriptor.depth, 1);
-        assert_eq!(
-            descriptor.state,
-            aw_agent_kernel::actor::ActorState::Settled
-        );
-        let bound = actor_service.envelope(&relation.id).unwrap();
-        assert_eq!(bound.site(), format!("subagent:{}", relation.id));
-        assert_eq!(
-            bound.spec().network,
-            aw_agent_kernel::envelope::Network::Deny
-        );
-        assert_eq!(bound.spec().grants.len(), 3);
-        assert!(bound
-            .spec()
-            .grants
-            .iter()
-            .all(|g| g.kind == aw_agent_kernel::capability::SourceKind::Host));
         let execution = store
             .subagent_execution_binding_for_subagent(&actor, &relation.id)
             .unwrap()
@@ -8876,29 +6356,8 @@ mod tests {
         assert!(view.history.turns[0]
             .tool_records
             .iter()
-            .all(|record| record.call.name != "subagent" && record.call.name != "bash"));
-
-        let cleanup = store
-            .begin_subagent_execution_cleanup(&actor, &relation.id)
-            .unwrap();
-        let repo = aw_git::Repository::discover(&fixture.git, &fixture.repo).unwrap();
-        assert!(matches!(
-            repo.remove_managed_worktree(&cleanup.execution_root, false),
-            Err(aw_git::Error::Stale)
-        ));
-        let restored = store
-            .cancel_subagent_execution_cleanup(&actor, &cleanup.id)
-            .unwrap();
-        assert_eq!(restored.state, "bound");
-        let cleanup = store
-            .begin_subagent_execution_cleanup(&actor, &relation.id)
-            .unwrap();
-        repo.remove_managed_worktree(&cleanup.execution_root, true)
-            .unwrap();
-        let removed = store
-            .finish_subagent_execution_cleanup(&actor, &cleanup.id)
-            .unwrap();
-        assert_eq!(removed.state, "removed");
+            .all(|record| record.call.name != "agent" && record.call.name != "bash"));
+        assert_eq!(execution.state, "bound");
         assert_eq!(
             store
                 .session(&actor, &relation.child_session_id)
@@ -8953,7 +6412,7 @@ mod tests {
         // tool intent; interrupted-parent fixtures preserve that ordering.
         let mut assistant = Message::text(2, Role::Assistant, "");
         assistant.tool_calls = vec![ToolCall {
-            id: "call-subagent-read-only".into(), name: "subagent".into(),
+            id: "call-subagent-read-only".into(), name: "agent".into(),
             arguments: json!({"task":"read task"}),
         }];
         handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
@@ -8964,7 +6423,7 @@ mod tests {
                     record: ToolRecord {
                         call: ToolCall {
                             id: "call-subagent-read-only".into(),
-                            name: "subagent".into(),
+                            name: "agent".into(),
                             arguments: json!({"task":"read task"}),
                         },
                         effect: ToolEffect::Process,
@@ -8989,8 +6448,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let output = service
-            .execute(
+        let output = execute_agent_fixture(&service,
                 ToolContext {
                     actor: actor.clone(),
                     turn_id: 1,
@@ -9008,303 +6466,31 @@ mod tests {
                     execution_owner: None,
                     execution_scope: None,
                 },
-                &json!({"task":"read task","mode":"foreground"}),
+                &json!({"task":"read task","background":false}),
             )
             .await
             .unwrap();
-        let result: serde_json::Value = serde_json::from_str(&output.content).unwrap();
-        assert_eq!(result["answer"], "read-only child answer");
+        assert!(output.content.contains(" agent idle "), "{}", output.content);
+        assert!(
+            output.content.contains("read-only child answer"),
+            "{}",
+            output.content
+        );
         let relation = store
             .subagents_for_parent(&actor, &parent.id)
             .unwrap()
             .into_iter()
             .next()
             .unwrap();
+        assert_eq!(relation.state, "running");
         assert_eq!(relation.tool_mode, "read-only");
         let execution = store
             .subagent_execution_binding_for_subagent(&actor, &relation.id)
             .unwrap()
             .unwrap();
+        assert_eq!(execution.state, "bound");
         assert!(execution.execution_root.join("base.txt").exists());
-        let cleanup = store
-            .begin_subagent_execution_cleanup(&actor, &relation.id)
-            .unwrap();
-        let repo = aw_git::Repository::discover(&fixture.git, &fixture.repo).unwrap();
-        repo.remove_managed_worktree(&cleanup.execution_root, false)
-            .unwrap();
-        assert_eq!(
-            store
-                .finish_subagent_execution_cleanup(&actor, &cleanup.id)
-                .unwrap()
-                .state,
-            "removed"
-        );
         assert!(store.session(&actor, &relation.child_session_id).is_ok());
-    }
-
-    #[cfg(all(unix, feature = "workspace"))]
-    #[tokio::test]
-    async fn delegation_model_attempt_limit_blocks_second_provider_round() {
-        let fixture = GitFixture::new();
-        let actor = PrincipalId::new("local:budget-limit-child").unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                Arc::new(WorkspaceToolProvider {
-                    calls: calls.clone(),
-                }),
-            )
-            .unwrap();
-        let identity = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap()
-            .identity()
-            .clone();
-        let store = SessionStore::in_memory().unwrap();
-        let parent_binding = aw_store::SessionBinding {
-            working_directory: fixture.repo.clone(),
-            tool_root: fixture.repo.clone(),
-            system_prompt: "parent instructions".into(),
-            profile_hint: "fixture-account".into(),
-            model_hint: "fixture-model".into(),
-            destination_fingerprint: "0".repeat(64),
-        };
-        let (parent, branch) = store.create(&actor, "Parent", parent_binding).unwrap();
-        let (_, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        handle
-            .begin(TurnStart {
-                turn_id: 1,
-                prompt: "delegate".into(),
-                identity: identity.clone(),
-            })
-            .await
-            .unwrap();
-        // The real Agent journals its Assistant proposal before the Process
-        // tool intent; interrupted-parent fixtures preserve that ordering.
-        let mut assistant = Message::text(2, Role::Assistant, "");
-        assistant.tool_calls = vec![ToolCall {
-            id: "call-subagent-budget".into(), name: "subagent".into(),
-            arguments: json!({"task":"workspace task"}),
-        }];
-        handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
-        handle
-            .append(
-                1,
-                JournalEntry::ToolStarted {
-                    record: ToolRecord {
-                        call: ToolCall {
-                            id: "call-subagent-budget".into(),
-                            name: "subagent".into(),
-                            arguments: json!({"task":"workspace task"}),
-                        },
-                        effect: ToolEffect::Process,
-                        execution_site: "local".into(),
-                        status: ToolStatus::Running,
-                        output: None,
-                    },
-                    source: None,
-                },
-            )
-            .await
-            .unwrap();
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Workspace,
-                BudgetConfig::new(4, 1, 1, 1, 3600).unwrap(),
-                fixture.state.clone(),
-                Some(fixture.git.clone()),
-            ),
-        )
-        .unwrap();
-        let output = service
-            .execute(
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity,
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                },
-                &json!({"task":"workspace task","mode":"foreground"}),
-            )
-            .await
-            .unwrap();
-        assert!(output.is_error);
-        assert!(output.content.contains("delegation model-attempt limit reached"));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let relation = store
-            .subagents_for_parent(&actor, &parent.id)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(relation.state, "failed");
-        let root = store
-            .delegation_root_for_session(&actor, &relation.child_session_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(root.model_attempts_started, 1);
-        assert_eq!(root.model_attempts_finished, 1);
-        assert_eq!(root.active_children, 0);
-        let execution = store
-            .subagent_execution_binding_for_subagent(&actor, &relation.id)
-            .unwrap()
-            .unwrap();
-        assert!(execution.execution_root.join("child-created.txt").exists());
-        let cleanup = store
-            .begin_subagent_execution_cleanup(&actor, &relation.id)
-            .unwrap();
-        let repo = aw_git::Repository::discover(&fixture.git, &fixture.repo).unwrap();
-        repo.remove_managed_worktree(&cleanup.execution_root, true)
-            .unwrap();
-        store
-            .finish_subagent_execution_cleanup(&actor, &cleanup.id)
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn background_tool_returns_immediately_and_settles_child_independently() {
-        let actor = PrincipalId::new("local:background").unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let accounts = ProviderAccounts::new("local").unwrap();
-        accounts
-            .register(
-                AccountDescriptor::personal(
-                    "fixture-account",
-                    actor.clone(),
-                    "local",
-                    ["fixture-model".into()],
-                ),
-                Arc::new(EchoProvider {
-                    calls: calls.clone(),
-                }),
-            )
-            .unwrap();
-        let identity = accounts
-            .select(&actor, "fixture-account", "fixture-model")
-            .unwrap()
-            .identity()
-            .clone();
-        let store = SessionStore::in_memory().unwrap();
-        let (parent, branch) = store.create(&actor, "Parent", binding()).unwrap();
-        let (_, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
-        handle
-            .begin(TurnStart {
-                turn_id: 1,
-                prompt: "parent secret text".into(),
-                identity: identity.clone(),
-            })
-            .await
-            .unwrap();
-        // The real Agent journals its Assistant proposal before the Process
-        // tool intent; interrupted-parent fixtures preserve that ordering.
-        let mut assistant = Message::text(2, Role::Assistant, "");
-        assistant.tool_calls = vec![ToolCall {
-            id: "call-subagent-background".into(), name: "subagent".into(),
-            arguments: json!({"task":"research task","mode":"background"}),
-        }];
-        handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
-        handle
-            .append(
-                1,
-                JournalEntry::ToolStarted {
-                    record: ToolRecord {
-                        call: ToolCall {
-                            id: "call-subagent-background".into(),
-                            name: "subagent".into(),
-                            arguments: json!({"task":"research task","mode":"background"}),
-                        },
-                        effect: ToolEffect::Process,
-                        execution_site: "local".into(),
-                        status: ToolStatus::Running,
-                        output: None,
-                    },
-                    source: None,
-                },
-            )
-            .await
-            .unwrap();
-        let service = Service::new(
-            store.clone(),
-            accounts,
-            settings(),
-            ServiceConfig::new(
-                ToolMode::Off,
-                BudgetConfig::default(),
-                PathBuf::from("/tmp"),
-                None,
-            ),
-        ).unwrap();
-        let output = service
-            .execute(
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity,
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                },
-                &json!({"task":"research task","mode":"background"}),
-            )
-            .await
-            .unwrap();
-        let started: serde_json::Value = serde_json::from_str(&output.content).unwrap();
-        assert_eq!(started["state"], "running");
-        let child_session = started["session_id"].as_str().unwrap().to_owned();
-
-        let mut settled = None;
-        for _ in 0..100 {
-            let relation = store
-                .subagents_for_parent(&actor, &parent.id)
-                .unwrap()
-                .into_iter()
-                .find(|item| item.child_session_id == child_session)
-                .unwrap();
-            if relation.state != "running" && relation.state != "admitted" {
-                settled = Some(relation);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let relation = settled.expect("background child did not settle");
-        assert_eq!(relation.state, "completed");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let (view, _) = store.activate(&actor, &child_session, "main").unwrap();
-        assert_eq!(view.history.turns.len(), 1);
-        assert_eq!(view.history.turns[0].answer, "child answer");
-        assert!(store.branches(&actor, &parent.id).unwrap()[0]
-            .active_run
-            .is_some());
     }
 
 }

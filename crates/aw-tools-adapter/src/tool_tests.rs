@@ -1963,21 +1963,20 @@ fn trusted_batch_schema_includes_only_prepared_bash_shellnode() {
         .build()
         .unwrap();
     let specs = agent.tool_specs();
-    for constructor in ["batch"] {
-        let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
-        let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            names.contains("bash"),
-            "{constructor} must expose prepared bash"
-        );
-        assert!(!names.contains("pwsh"));
-        assert!(!names.contains("powershell"));
-    }
+    let constructor = "batch";
+    let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
+    let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        names.contains("bash"),
+        "{constructor} must expose prepared bash"
+    );
+    assert!(!names.contains("pwsh"));
+    assert!(!names.contains("powershell"));
 }
 
 #[test]
@@ -3188,6 +3187,94 @@ async fn sealed_grep_context_and_copy_recursive_default() {
         .get("best_effort")
         .is_none());
 }
+#[cfg(unix)]
+#[test]
+fn final_unix_local_catalog_schema_footprint_is_measured() {
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+    let Some(bash) = std::env::var_os("AW_BASH").map(PathBuf::from) else {
+        return;
+    };
+    let tree = Tree::new();
+    let state = Tree::new();
+    let private = state.path("private");
+    aw_platform::ensure_private_dir(&private).unwrap();
+    let actor = PrincipalId::new("local").unwrap();
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::Trusted);
+    options.private_state_dir = Some(private);
+    options.bash = Some(bash);
+    let agent = configure(builder, actor, &options)
+        .unwrap()
+        .build()
+        .unwrap();
+    let specs = agent.tool_specs();
+    let names = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+    let bytes = specs
+        .iter()
+        .map(|spec| serde_json::to_vec(spec).unwrap().len())
+        .sum::<usize>();
+    println!(
+        "final-unix-local-catalog tools={} bytes={} approx_tokens={} names={:?}",
+        specs.len(),
+        bytes,
+        bytes.div_ceil(4),
+        names
+    );
+    assert_eq!(specs.len(), 22, "unexpected Unix local catalog: {names:?}");
+    for expected in [
+        "ls",
+        "find",
+        "grep",
+        "read",
+        "write",
+        "edit",
+        "patch",
+        "cp",
+        "mv",
+        "rm",
+        "bread",
+        "bwrite",
+        "bedit",
+        "bash",
+        "batch",
+        "jobs_list",
+        "jobs_get",
+        "jobs_read",
+        "jobs_ack",
+        "jobs_send",
+        "jobs_cancel",
+        "jobs_subscribe",
+    ] {
+        assert!(names.contains(&expected), "missing {expected}: {names:?}");
+    }
+    for removed in [
+        "subagent",
+        "team",
+        "plan",
+        "review_release",
+        "job_start",
+        "job_restart",
+    ] {
+        assert!(!names.contains(&removed), "removed tool leaked: {removed}");
+    }
+}
+
 #[test]
 fn dl150_schema_and_compact_rendering_budgets_are_measured() {
     let tree = Tree::new();
@@ -3273,13 +3360,11 @@ fn volatile_workspace_configuration_omits_rm_and_selected_rm_fails_closed() {
         .unwrap();
     let specs = agent.tool_specs();
     assert!(!specs.iter().any(|spec| spec.name == "rm"));
-    for constructor in ["batch"] {
-        let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
-        let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
-            .as_array()
-            .unwrap();
-        assert!(!names.iter().any(|name| name == "rm"));
-    }
+    let spec = specs.iter().find(|spec| spec.name == "batch").unwrap();
+    let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(!names.iter().any(|name| name == "rm"));
 
     let builder = Agent::builder(
         Arc::new(ProviderFixture),
@@ -3321,13 +3406,11 @@ fn durable_private_state_enables_rm_for_direct_and_graph_surfaces() {
         .unwrap();
     let specs = agent.tool_specs();
     assert!(specs.iter().any(|spec| spec.name == "rm"));
-    for constructor in ["batch"] {
-        let spec = specs.iter().find(|spec| spec.name == constructor).unwrap();
-        let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
-            .as_array()
-            .unwrap();
-        assert!(names.iter().any(|name| name == "rm"));
-    }
+    let spec = specs.iter().find(|spec| spec.name == "batch").unwrap();
+    let names = spec.parameters["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(names.iter().any(|name| name == "rm"));
 }
 
 #[test]

@@ -33,6 +33,7 @@ pub(crate) fn effect_name(effect: Effect) -> &'static str {
         Effect::Read => "read",
         Effect::Write => "write",
         Effect::Process => "process",
+        Effect::Control => "control",
         Effect::Unknown => "unknown",
     }
 }

@@ -12,7 +12,8 @@ pub use aw_agent_core::{
     ProviderAccounts, ProviderSelection, SourceKind, Tool, ToolPolicy, ToolSource,
 };
 pub use aw_agent_core::{
-    Agent, AgentBuilder, AgentEvent, AgentOptions, CancellationToken, Error, Extension, Result,
+    Agent, AgentBuilder, AgentEvent, AgentExecutionBinding, AgentOptions, CancellationToken, Error,
+    Extension, Result,
 };
 pub use aw_providers::{catalog, config, discovery, provider};
 #[cfg(feature = "durable")]

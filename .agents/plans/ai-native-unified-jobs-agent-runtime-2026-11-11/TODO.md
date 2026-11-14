@@ -41,24 +41,24 @@ accepting their checkpoint.
 
 Goal: start from the actual current architecture without redesigning it during implementation.
 
-- [ ] Re-read live AW/dotlink source, current plan index, affected tests and dirty work.
+- [x] Re-read live AW/dotlink source, current plan index, affected tests and dirty work.
       Map the current `aw-tools` JobManager/Graph/PreparedOperation owners,
       `aw-tools-adapter`, Agent/Actor/TurnJournal, SessionStore, Process/output
       retention/replay/MCP Task paths, and the thin `aw-policy`/`aw-session`/`aw-host`
       skeleton.
-- [ ] Produce one short implementation map in the commit/working notes: exact crates/files
+- [x] Produce one short implementation map in the commit/working notes: exact crates/files
       owning OperationId/ToolEffect, refs, Job control, Agent Turn control, policy,
       Session coordination and dotlink bridge. If live ownership materially differs
       from DESIGN, fix the plan once before implementation rather than carrying two paths.
-- [ ] Identify obsolete pre-vNext routes/helpers to delete during cutover. No migration,
+- [x] Identify obsolete pre-vNext routes/helpers to delete during cutover. No migration,
       compatibility decoder, second Job/Agent engine or parallel policy/session store.
-- [ ] Reconcile the approved initial Graph eligibility: native DL-150 Graph leaves + AW `agent`,
+- [x] Reconcile the approved initial Graph eligibility: native DL-150 Graph leaves + AW `agent`,
       **no nested `batch` on any surface**; prove the paid-guardian replay ordering, mixed-owner
       Job-list ordering, explicit SDK Agent owner, and remote Start linearization in the design
       before freezing dependent public interfaces. Implementation code does not decide these.
 
 ### Checkpoint 0 — baseline / ownership
-- [ ] Current targeted crates build in the configurations needed to start implementation;
+- [x] Current targeted crates build in the configurations needed to start implementation;
       existing unrelated failures are identified before edits. No broad qualification run
       is required here.
 
@@ -88,7 +88,7 @@ Do **not** implement multi-user policy, Agent delegation or dotlink bridge behav
 Unsupported advanced paths must fail closed.
 
 ### Checkpoint A — shared foundation + unchanged Local behavior
-- [ ] Validate as one group:
+- [x] Validate as one group:
   1. provider catalog remains flat and bounded; model Graph uses the same flat leaf spelling;
   2. representative direct `read/edit` and compact native `batch` still produce DL-150
      outcomes/`more`/`incomplete` and deterministic node coordinates; **nested `batch`
@@ -135,7 +135,7 @@ Implement together:
   and **nested `batch` remains rejected everywhere**.
 
 ### Checkpoint B — finite Job user flows
-- [ ] Validate these flows together:
+- [x] Validate these flows together:
   1. shell completes synchronously **or** hands off to the same Job; lost response never reruns it;
   2. background shell/Graph returns compact ref+rev and `jobs_get(wait_ms)` observes settlement;
   3. Process stdout/stderr/result and Graph whole/node reads page exactly; read never ACKs;
@@ -298,11 +298,11 @@ Implement together:
 Goal: consume one reviewed AW/shared revision and project only concrete remote execution,
 never AW policy/Session/Agent ownership.
 
-- [ ] **D1 may begin after reviewed AW A/B shared refs and finite Job contracts**, independent
+- [x] **D1 may begin after reviewed AW A/B shared refs and finite Job contracts**, independent
       of Agent/Session-sharing checkpoints; consume one exact reviewed shared revision (no
       sibling path/copy). Land standalone dotlink flat jobs/ref/read/ack/control with original
       sandbox/launcher/protected-path checks and no Agent leaf or nested `batch`.
-- [ ] **D2 waits for AW E** and the necessary Policy/Start contracts. Bridge only resolved
+- [x] **D2 waits for AW E** and the necessary Policy/Start contracts. Bridge only resolved
       AW canonical intent plus authenticated actor/source/site/epoch/writer/grant evidence.
       Each remote effect requires an AW-owner **source-fenced Start authorization** bound to
       original attempt/ref/args, exact target host/profile and **dotlink live generation**;
@@ -311,14 +311,14 @@ never AW policy/Session/Agent ownership.
       Revocation before AW authorization denies; an already committed proof may dispatch
       during bounded lifetime even after AW disconnects. AW offline blocks **new** Start
       grants, not accepted in-flight dispatch. Dotlink still checks local authority.
-- [ ] Keep standalone Agent/filter/subscribe/wake absent. Initial bridge rejects remote
+- [x] Keep standalone Agent/filter/subscribe/wake absent. Initial bridge rejects remote
       dotlink-source wake/subscription until a reviewed source-owner-fenced protocol exists.
-- [ ] Keep nested `batch` disabled **even in SDK/host Graphs**. AW model Graph adds
+- [x] Keep nested `batch` disabled **even in SDK/host Graphs**. AW model Graph adds
       `agent` to DL-150 eligible leaves; standalone dotlink Graph stays native/shell-only.
       Advanced `jobs.*` Graph controls stay explicitly qualified typed SDK/host-only.
 
 ### Checkpoint F — standalone + bridge
-- [ ] Validate together:
+- [x] Validate together:
   1. standalone Process/Graph jobs_list/get/read/ack/send/cancel;
   2. standalone schema has no Agent/filter/subscribe/wake or advanced model Graph growth;
   3. AW bridge controls the exact remote Job with stable replay identity and writer fences;
@@ -330,36 +330,150 @@ never AW policy/Session/Agent ownership.
      Start** must not launch twice, revive old Process/Graph or reinterpret old authority;
   6. no Agent/Session/transcript state appears in dotlink and no duplicate remote Job/Graph owner;
   7. MCP Task/replay/ACK ownership and stdout protocol cleanliness remain intact.
+  - 2026-11-14 L5 grouped Checkpoint F is green. Two real cross-process OAuth/TCP lanes use the
+    production `aw-mcp::RemoteBridge` against the current dotlink binary: explicit no-sandbox
+    Process → `jobs_send` duplicate replay → `jobs_read`, and narrow-RW filesystem mutation →
+    duplicate replay → Graph → node/read. The narrow server also proves a valid upstream Start
+    cannot escape the filesystem grant or mint absent local shell authority.
+  - AW authority/race gates are green: shared remote-Start 5/5; Store remote-Start 3/3 including
+    writer/membership revoke-before-Start and replay-before-current-reauthorization; exact
+    ToolBinding revoke serialization; exact replay survives later revoke while a fresh Start
+    denies; execution-site retarget denial; policy-operation-router regression; `aw-mcp` unit
+    suite and explicit bearer-HTTP execution-site/proof serialization; all-feature CLI compile.
+  - dotlink grouped regression is green: 649 passed / 1 reviewed conformance fixture ignored plus
+    all integration suites (child env, exit semantics, live OAuth rotation, private generations,
+    stdio tools), strict all-target/all-feature Clippy, remote-Start cluster including runtime
+    restart/new-generation rejection, revoked Process stdin before bytes, no wake/subscribe/Agent
+    standalone surface, Tasks/replay/ACK ownership and stdout cleanliness. `cargo tree` confirms
+    no AW Agent/Store/Host/Policy/Session crate dependency. Same-generation committed proofs are
+    self-contained at dotlink; new authorization still requires the live AW lease/commit path.
 
 ## Phase 7 — hard cutover, cleanup and final qualification
 
 Goal: remove obsolete code only after the replacement flows are working, then qualify the
 consolidated product once.
 
-- [ ] Remove old `job_*`, `job_start`, `job_restart`, grouped jobs/agents, separate Agents API,
+- [x] Remove old `job_*`, `job_start`, `job_restart`, grouped jobs/agents, separate Agents API,
       subagent/team/plan/review_release model routes and compatibility-only helpers/tests that no
       longer have an independent product consumer.
-- [ ] Keep the pre-1.0 cutover hard: no migration/dual-schema/legacy replay service. Reset old
+- [x] Keep the pre-1.0 cutover hard: no migration/dual-schema/legacy replay service. Reset old
       transient dev/test state only through the DESIGN quiescence gate.
-- [ ] Remove dead duplicate policy/session/host wiring exposed by the new canonical path.
-- [ ] Update live public docs/examples/SDK references to the new model/SDK names.
-- [ ] Capture final provider catalog/schema bytes + representative tokenizer estimate and compare
+- [x] Remove dead duplicate policy/session/host wiring exposed by the new canonical path.
+      - 2026-11-14 L5: removed the production-dead AW `PolicyGraphRouter`/narrow/guardian/
+        approval owner (1,361 lines / ~57 KiB) plus its four router-only tests/providers. The
+        generic `GraphPolicyRouterSlot` remains in `aw-tools-adapter` because JobHost/JobRuntime
+        still own and test that shared extension seam; AW no longer layers a second Session/policy
+        owner over it. Surviving canonical `subagents::tests` are 12/12 green and the full binary
+        test target compiles.
+      - Earlier model/API cutover gate: `aw-agent-core` 87 passed / 1 ignored; canonical
+        Agent/delegation-focused binary group 17/17; all-feature AW compile green. The cutover also
+        fixed stable-Agent hidden `jobs_subscribe` wake authority by giving non-advertised host
+        capabilities the same source/site/revoke-generation fencing as visible Tool bindings.
+      - Strict all-target/all-feature AW Clippy is still a Checkpoint-G gate: after this cleanup
+        the touched Agent-jobs `manual_clamp` lint is gone. Remaining blockers are outside this
+        bounded cleanup: `actor_owner` (`large_enum_variant`, one 10-argument helper, one
+        `unused_mut`, one test-only cloned-ref lint), `policy_runtime::run_admission_guardian`
+        (`too_many_arguments`), and two `web/dock` boolean simplifications. These remain explicit
+        next-gate work rather than being silently suppressed or mixed into this checkpoint.
+- [x] Update live public docs/examples/SDK references to the new model/SDK names.
+- [x] Capture final provider catalog/schema bytes + representative tokenizer estimate and compare
       model/tool rounds for the core user-visible workflows.
+      - 2026-11-14 L5 schema snapshot: effective Unix local catalog = 22 tools / 12,524 serialized
+        `ToolSpec` bytes (~3,131 at a deliberately rough 4-bytes/token estimate); canonical `agent`
+        = 531 bytes (~133), for an effective root catalog of 23 tools / 13,055 bytes (~3,264).
+        Cross-platform design ceiling remains 25 when both PowerShell spellings are available.
+      - Current 13-tool canonical filesystem subset = 6,295 bytes versus the recorded DL-150
+        6,177-byte baseline: +118 bytes (~1.9%).
+      - 2026-11-14 L5 deterministic model-first execution snapshot now drives the real Agent/tool
+        loop and durable Session authority with canonical schemas: direct Read first-selects
+        `read` and completes in 2 parent provider rounds / 1 tool call with 11 returned tool-result
+        bytes (~3 tokens at the same rough 4-byte heuristic); a 3-node read-only Graph first-selects
+        `batch` and completes in 2 / 1 with 20 bytes (~5); Bash background handoff first-selects
+        `bash`, then factually follows `jobs_get -> jobs_read(stdout,limit=4) -> jobs_ack(offset=4)`
+        in 5 parent provider rounds / 4 tool calls with 404 aggregate returned tool-result bytes
+        (~101); canonical `agent` first-selects `agent`, uses 2 parent + 1 child provider round,
+        one parent tool call and 215 returned bytes (~54). All four scripted workflows produced a
+        schema-valid canonical first call with zero recovery/alias rounds; the Bash/Jobs chain's
+        subsequent three controls were also valid on first attempt.
+      - Live representative-model selection is now measured on `pvl-x2` against its managed ROCm
+        Ollama `qwen3.8:27b` (27.3B Q4_K_M, 262k context, llama.cpp runner), using the exact current
+        L5-generated 23-tool AW catalog transferred verbatim to x2. Five prompt variants each for
+        direct Read, 3-node Graph, background Bash and Agent creation were 20/20 correct tool
+        selections, 20/20 schema-valid and 20/20 task-valid on the first call. Five additional
+        read-only Job observation prompts selected `jobs_get` 5/5 and five cancellation prompts
+        selected `jobs_cancel` 5/5, for **30/30 live first-call disambiguation** across six classes.
+        Full-catalog first-call averages: Read 3,408 prompt / 25 output tokens / 2.39 s; Graph
+        3,415 / 58 / 3.43 s; Bash 3,420 / 49 / 3.18 s; Agent 3,411 / 67 / 4.18 s; jobs_get
+        3,404 / 29 / 2.71 s; jobs_cancel 3,398 / 29 / 2.87 s. The same Read prompt without tools
+        is 69 prompt tokens, so Qwen/Ollama measures the complete current provider tool envelope at
+        about **3,340 prompt tokens**, validating the earlier ~3.26k rough estimate.
+      - Live continuation probes using factual synthetic receipts isolate model routing from effects:
+        Bash followed `bash -> jobs_get -> jobs_read -> jobs_ack -> final` exactly 3/3, with the model
+        carrying `j:bench`, `view=stdout`, `limit=4` and the returned `offset=4`; Agent followed
+        `agent -> final` 3/3 and never issued a redundant `jobs_read`. The L5 deterministic fixtures
+        above separately execute the real effects/Session/Job paths, so selection evidence is not
+        being substituted for execution correctness. No numerical historical DL-150 live-model
+        baseline exists, therefore no unsupported relative improvement percentage is claimed.
 
 ### Checkpoint G — final product gate
-- [ ] Run one final grouped qualification:
+- [x] Run one final grouped qualification:
   - workspace/package build + strict Clippy for crates changed by this implementation;
+    - 2026-11-14 L5 strict-clean slice is green with no lint suppressions: `aw-agent-core`,
+      `aw-tools`, `aw-tools-adapter`, `aw-store`, and `aw-mcp` all-target Clippy pass with
+      `-D warnings`; AW lib, `aw` binary and test targets pass separately with `--no-deps
+      -D warnings` (split only to avoid the all-target peak that was killed by the L5 job runner).
+      Affected behavior gates are green: `aw-agent-core` all targets; `aw-tools-adapter` 227/227
+      with pinned `AW_BASH`; Actor-owner 45/45; policy-runtime 4/4; dock 24/24 with pinned
+      `AW_GIT`; canonical subagents 12/12; `aw-mcp` 15/15. The Store library remained 208/208;
+      its one stale design-only manifest test still hardcoded schema v33 and was corrected to the
+      current v34 remote-Start schema, then passed directly. Unchanged long composite fault lanes
+      were not rerun again per the ownership-trigger rule below.
   - minimal/no-default/no_std/alloc lanes whose dependency boundaries changed;
+    - 2026-11-14 L5 reduced-boundary slice is green. `aw-tools`: no-default compile,
+      read-only 99/99, RW 149/149. Stateless AW: 27 lib / 110 binary / 6 integration;
+      JSONL-minimal: 27 / 113 / 6. `aw-agent-kernel`: 33/33 native plus alloc-only
+      `wasm32v1-none`; `aw-embedded`: alloc-only native + `wasm32v1-none` compile;
+      `aw-embedded-ffi`: 3/3 under both default and alloc-only cuts, alloc-only native +
+      `wasm32v1-none`, strict alloc-only Clippy, plus the independent C11 `-Werror`
+      consumer: `E5_C_ABI_NATIVE_OK checks=710 model_calls=2 tool_calls=1 events=10`.
+      The gate found and fixed two genuine cut regressions: minimal now reuses/re-exports
+      the canonical immutable `AgentExecutionBinding` and preserves `switch_session -> ()`;
+      portable C ABI gained additive effect code `Control=5` while preserving Unknown=4
+      and all prior V1 numeric values. Stateless/minimal strict Clippy also pass.
   - AW user flows from Checkpoints B–E and dotlink bridge flow from F;
   - DL-150 filesystem/Graph conformance **once** if shared primitive code changed since its last
     accepted checkpoint;
+    - 2026-11-14 L5 fresh shared pass after the `aw-tools` changes: `aw-tools --all-features --lib`
+      303/303 green, and the actual AW adapter `aw_direct_adapter_accepts_every_shared_canonical_request_vector`
+      passes with the shared conformance feature. This is the one ownership-triggered DL-150 rerun;
+      unchanged secured filesystem/platform primitives were not requalified again.
   - replay/unknown-effect/retention/ACK and policy/authority failure boundaries touched since
     their last accepted checkpoint;
   - platform-native Bubblewrap/Windows/macOS gates only when affected or on a capable final host;
   - provider schema/token snapshot and first-valid-call/round-count comparison.
-- [ ] Do not rerun unchanged primitive suites solely because the final phase removed old routes.
+    - Deterministic real-Agent execution/round evidence is recorded above, and the representative
+      live-model selection gate is now green via `dotlink---x2` / ROCm Ollama `qwen3.8:27b`: 30/30
+      first-call disambiguation across Read/Graph/Bash/Agent/jobs_get/jobs_cancel plus 3/3 exact Bash
+      Jobs continuation and 3/3 Agent synchronous-result continuation. This uses current L5-generated
+      schemas; x2 is inference-only and is not an implementation/source authority.
+    - Dotlink checkpoint 3 is separately green after the final replay-first review: 651 active
+      tests + 1 intentional ignore, all five integrations, strict Clippy, generation-fenced Start,
+      stdin revoke-before-bytes and canonical
+      standalone surface. The real OAuth/TCP bridge evidence from Checkpoint F remains current because
+      neither bridge owner nor remote-Start semantics changed afterward.
+- [x] Do not rerun unchanged primitive suites solely because the final phase removed old routes.
       Re-run by ownership/dependency trigger, not habit.
-- [ ] Leave any unavailable external/platform gate explicitly pending; do not call a partial run full.
+- [x] Leave any unavailable external/platform gate explicitly pending; do not call a partial run full.
+      Native Windows/macOS remain separate release/platform gates and are not claimed from L5;
+      Bubblewrap/filesystem sandbox primitives were unchanged by this cutover and were not rerun.
+
+### Final exact cross-repo pin — blocked only on commit/push authorization
+- [ ] Commit and push the reviewed AW implementation first; then repin dotlink's three shared AW
+      dependencies from `9e9ab043...` to that exact new SHA, replace dotlink's temporary local
+      remote-Start argument-digest mirror with `aw_tools::remote_start::arguments_sha256`, regenerate
+      dotlink `Cargo.lock`, and rerun one locked dotlink package/integration + strict-Clippy gate.
+      Never repin to dirty/unpushed AW or use a sibling path. Runtime Checkpoint G is green; this is
+      the remaining repository-finalization dependency.
 
 ## Completion
 

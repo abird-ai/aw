@@ -389,7 +389,7 @@ The canonical run flags are:
 | `-m, --model-id MODEL` | Override the selected profile/default model. |
 | `-a, --account-id ACCOUNT` | Override the permitted provider account. |
 | `--tools-mode MODE` | Override the local filesystem/shell tool grant/profile for this run. |
-| `--subagent-enabled` | Explicitly permit bounded durable child-Agent inference through the `subagent` tool. Separate from local file-tool grants. |
+| `--subagent-enabled` | Explicitly permit bounded durable child-Agent inference through the canonical `agent` tool. Separate from local file-tool grants. |
 | `--subagent-tools MODE` | Host-selected child file tools: `off` (default), `read-only`, or `workspace`; non-off requires `--subagent-enabled` and an isolated clean Git worktree. `trusted` is rejected for children. |
 | `--subagent-max-created N` | Root-turn child-allocation cap; default 32, hard max 32. |
 | `--subagent-max-active N` | Root-turn concurrent child cap; default 4, hard max 4 and cannot exceed max-created. |
@@ -397,8 +397,6 @@ The canonical run flags are:
 | `--subagent-max-depth N` | Recursive child depth; default 1 preserves non-recursive behavior, hard max 4. Descendants share the same root envelope. |
 | `--subagent-route ROUTE` | Optional actor-owned immutable routing strategy for child workers; strategy role must be `worker`. No flag preserves exact parent-model inheritance. |
 | `--subagent-route-revision REV` | Optional exact immutable child-route revision; requires `--subagent-route`. |
-| `--subagent-team TEAM` | Optional actor-owned immutable bounded team template exposed as the root Agent `team` tool; requires `--subagent-enabled`. |
-| `--subagent-team-revision REV` | Optional exact immutable team-template revision; requires `--subagent-team`. |
 | `--subagent-deadline-secs N` | Root delegation deadline from first child allocation; default 3600, hard max 86400. |
 | `--session-id ID` | Continue an existing Session instead of creating/selecting the ordinary current one. |
 | `--session-branch ID_OR_NAME` | Select a branch within an existing Session. |
@@ -417,7 +415,6 @@ aw --session-id sess_123 "continue with the implementation"
 aw --subagent-enabled "delegate bounded research when useful"
 aw --subagent-enabled --subagent-tools workspace "delegate an isolated edit when useful"
 aw --subagent-enabled --subagent-route worker-route "delegate to permitted worker targets"
-aw --subagent-enabled --subagent-team candidate-team "use the bounded team when useful"
 ```
 
 ### 3.1 Profile semantics
@@ -783,34 +780,6 @@ aw net --help
 `/resume SESSION [BRANCH]`, Session-tree clicks and command-palette Session selection reactivate the selected durable Agent in its own saved working directory/tool root/profile/model binding. They do not reinterpret that Session under the currently active Agent's root. Real binding changes still require an explicit new/import/transfer flow; ordinary caller-supplied resume under a different root continues to fail closed.
 
 
-### Governed planner flags
+### Historical planner/team/guardian model routes
 
-The native owner can opt into Phase-49 planning only together with `--subagent-enabled`:
-
-- `--subagent-planner-route ROUTE` — actor-owned immutable routing strategy; Phase 49 requires `role=planner` and `mode=fixed`.
-- `--subagent-planner-route-revision REV` — optional exact immutable planner revision; requires the route selector.
-- `--subagent-planner-role ROLE` — repeatable host-approved semantic task role. The planner may use only these role labels.
-- `--subagent-planner-max-tasks N` — planner proposal bound, 1..6; default 4.
-
-With planner enabled the root Agent gains a `plan` tool whose model arguments are only `task` and optional `title`. Planner and planned-child provider/model/account/routing/tool/worktree/depth/budget choices are not model arguments. Planned tasks execute sequentially as ordinary subagents, and dependencies do not automatically disclose predecessor answers.
-
-### Guardian review flags and review decisions
-
-The native owner may add the Phase-50 review gate only with the existing `--subagent-enabled` opt-in and at least one reviewed source (`--subagent-team` and/or `--subagent-planner-route`):
-
-- `--subagent-guardian-route ROUTE` — actor-owned immutable routing strategy; Phase 50 requires `role=guardian` and `mode=fixed`.
-- `--subagent-guardian-route-revision REV` — optional exact immutable guardian revision; requires the route selector.
-- `--subagent-guardian-policy TEXT` — required bounded host-authored review policy. This is host configuration, not a model argument.
-
-When enabled, joined team/planner evidence is reviewed before it is disclosed to the parent model. A guardian `pass` may release it immediately; `deny` and `require_evidence` do not. `needs_human` creates an explicit durable approval request.
-
-Human review state is managed through the typed resource command:
-
-```bash
-aw review list
-aw review show REVIEW_ID
-aw review approve REVIEW_ID
-aw review deny REVIEW_ID
-```
-
-Only the stable owning actor may decide the waiting approval. A later parent turn may use the root-only `review_release` tool after approval. Its model-facing schema contains only `review_id`; it cannot select policy, source, account/model, route, tools or budgets. Release remains bound to the original parent Session/branch and exact parent `InvocationIdentity`, so approval is not a context-transfer or provider-switch mechanism.
+The unified Jobs + Agent hard cutover removes the old `team`, `plan`, `review_release` and `subagent` model routes and their route-specific CLI activation flags. Durable team/planner/review records and typed administrative review commands may remain available for inspection/history, but they do not add model tools or release evidence into a later model turn. Model-directed child work is exposed only through the canonical `agent` constructor; routing, provider/account/model, tools, worktree, depth and budgets remain host-owned.

@@ -30,7 +30,8 @@ impl NodeTool {
             // Agent stays host-qualified. OperationId::provider_graph_eligible
             // deliberately remains false so standalone/model-default Graphs
             // cannot acquire it merely by knowing the name.
-            OperationId::Agent | _ => return None,
+            OperationId::Agent => return None,
+            _ => return None,
         })
     }
     pub fn operation(self) -> OperationId {

@@ -368,7 +368,9 @@ impl Host {
             let agent = self.agent.as_mut().ok_or(Error::Storage(
                 "Agent missing after Session-switch rebuild",
             ))?;
-            sessions.activate(agent, &self.settings, &self.context, &self.tools, selection)
+            sessions
+                .activate(agent, &self.settings, &self.context, &self.tools, selection)
+                .map(|_| ())
         })();
         if outcome.is_err() {
             self.agent = Some(old_agent);

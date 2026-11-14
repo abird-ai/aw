@@ -379,6 +379,19 @@ pub struct ToolBindingSnapshot {
     pub execution_site: String,
 }
 
+/// Exact grant snapshot for a host capability that is intentionally not in the
+/// model-visible ToolRegistry. It carries the same revoke/regrant generation
+/// fence as a ToolBindingSnapshot, but has no registry revision because no
+/// model tool is advertised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCapabilitySnapshot {
+    pub name: String,
+    pub authority_revision: u64,
+    pub source: ToolSource,
+    pub effect: ToolEffect,
+    pub execution_site: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ToolSource {
     pub kind: SourceKind,
@@ -980,17 +993,17 @@ impl ToolBindingAuthority {
         })
     }
 
-    /// Check one exact current capability that is intentionally not a
-    /// registered model tool (for example live Process stdin authority).
-    /// This never advertises or registers a tool and never infers authority
-    /// from the capability name.
-    pub fn permits_capability(
+    /// Capture one exact current capability that is intentionally not a
+    /// registered model tool (for example live Process stdin or Agent wake
+    /// authority). This never advertises or registers a tool and never infers
+    /// authority from the capability name.
+    pub fn permitted_capability_binding(
         &self,
         actor: &PrincipalId,
         name: &str,
         source: &ToolSource,
         effect: &ToolEffect,
-    ) -> Result<()> {
+    ) -> Result<ToolCapabilitySnapshot> {
         let view = self
             .inner
             .view
@@ -1003,9 +1016,72 @@ impl ToolBindingAuthority {
                 grant.permits(actor.as_str(), &view.policy.execution_site, &descriptor)
             })
         });
-        permitted
-            .then_some(())
-            .ok_or(Error::Denied("exact capability is not currently granted"))
+        if !permitted {
+            return Err(Error::Denied("exact capability is not currently granted"));
+        }
+        let key = binding_key(actor, name, source, effect, &view.policy.execution_site);
+        let authority_revision = *view
+            .generations
+            .get(&key)
+            .ok_or(Error::Denied("capability grant generation unavailable"))?;
+        Ok(ToolCapabilitySnapshot {
+            name: name.to_owned(),
+            authority_revision,
+            source: source.clone(),
+            effect: effect.clone(),
+            execution_site: view.policy.execution_site.clone(),
+        })
+    }
+
+    pub fn permits_capability(
+        &self,
+        actor: &PrincipalId,
+        name: &str,
+        source: &ToolSource,
+        effect: &ToolEffect,
+    ) -> Result<()> {
+        self.permitted_capability_binding(actor, name, source, effect)
+            .map(|_| ())
+    }
+
+    pub fn revalidate_capability(
+        &self,
+        actor: &PrincipalId,
+        binding: &ToolCapabilitySnapshot,
+    ) -> Result<()> {
+        let view = self
+            .inner
+            .view
+            .read()
+            .map_err(|_| Error::Denied("tool binding authority poisoned"))?;
+        if binding.execution_site != view.policy.execution_site {
+            return Err(Error::Denied("captured capability execution site changed"));
+        }
+        let descriptor = Capability::new(
+            &binding.name,
+            binding.source.as_kernel()?,
+            kernel_effect(&binding.effect),
+        )
+        .map_err(|_| Error::Denied("invalid exact capability"))?;
+        let permitted = view.policy.source_grants.get(actor).is_some_and(|grants| {
+            grants.iter().any(|grant| {
+                grant.permits(actor.as_str(), &view.policy.execution_site, &descriptor)
+            })
+        });
+        if !permitted {
+            return Err(Error::Denied("captured capability is no longer granted"));
+        }
+        let key = binding_key(
+            actor,
+            &binding.name,
+            &binding.source,
+            &binding.effect,
+            &binding.execution_site,
+        );
+        if view.generations.get(&key).copied() != Some(binding.authority_revision) {
+            return Err(Error::Denied("captured capability generation changed"));
+        }
+        Ok(())
     }
 
     /// Wait until this exact captured binding is no longer live. Unrelated
