@@ -5,11 +5,16 @@ use super::machinelink::{
 use super::reachability::open_punched_quic;
 use super::*;
 use aw::PrincipalId;
+use aw_store::{AuthenticatedStableUser, RemoteViewGrant, RemoteViewPermission};
 use aw_tools_adapter::browse::{EntryKind, WorkspaceFiles};
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{path::PathBuf, time::Duration};
 
 const MACHINE_SERVICE_VERSION: u16 = 1;
+const REMOTE_VIEW_SERVICE_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -20,6 +25,9 @@ pub enum MachineReadRequest {
     FileRead { path: String },
     GitStatus,
     Sessions,
+    ViewFileList { path: String },
+    ViewFileRead { path: String },
+    ViewGitStatus,
 }
 
 impl MachineReadRequest {
@@ -27,9 +35,22 @@ impl MachineReadRequest {
         match self {
             Self::MachineInfo => MachineCapability::MachineInfo,
             Self::Workspaces => MachineCapability::WorkspaceDiscovery,
-            Self::FileList { .. } | Self::FileRead { .. } => MachineCapability::FileRead,
-            Self::GitStatus => MachineCapability::GitRead,
+            Self::FileList { .. }
+            | Self::FileRead { .. }
+            | Self::ViewFileList { .. }
+            | Self::ViewFileRead { .. } => MachineCapability::FileRead,
+            Self::GitStatus | Self::ViewGitStatus => MachineCapability::GitRead,
             Self::Sessions => MachineCapability::SessionRead,
+        }
+    }
+
+    fn remote_view_permission(&self) -> Option<RemoteViewPermission> {
+        match self {
+            Self::ViewFileList { .. } | Self::ViewFileRead { .. } => {
+                Some(RemoteViewPermission::Files)
+            }
+            Self::ViewGitStatus => Some(RemoteViewPermission::Git),
+            _ => None,
         }
     }
 }
@@ -103,12 +124,20 @@ pub struct MachineServiceServeOptions {
     pub actor: PrincipalId,
     pub root: PathBuf,
     pub git: PathBuf,
+    pub remote_view_workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteViewReadOptions {
+    pub grant: RemoteViewGrant,
+    pub signing_key: SigningKey,
 }
 
 #[derive(Clone, Debug)]
 pub struct MachineServiceRequestOptions {
     pub link: MachineLinkConnectOptions,
     pub request: MachineReadRequest,
+    pub remote_view: Option<RemoteViewReadOptions>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -119,11 +148,49 @@ pub struct MachineServiceResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RemoteViewReadHello {
+    grant_id: String,
+    domain_id: String,
+    public_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteViewReadChallenge {
+    version: u16,
+    lease_id: String,
+    request_id: String,
+    grant_id: String,
+    domain_id: String,
+    workspace_id: String,
+    public_key: String,
+    target_node_id: String,
+    target_store_id: String,
+    peer_node_id: String,
+    request_sha256: String,
+    nonce: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteViewReadProof {
+    version: u16,
+    lease_id: String,
+    request_id: String,
+    grant_id: String,
+    public_key: String,
+    signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServiceRequestEnvelope {
     version: u16,
     lease_id: String,
     request_id: String,
     request: MachineReadRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_view: Option<RemoteViewReadHello>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,11 +202,129 @@ struct ServiceResponseEnvelope {
     response: MachineReadResponse,
 }
 
+fn machine_service_version(request: &MachineReadRequest) -> u16 {
+    if request.remote_view_permission().is_some() {
+        REMOTE_VIEW_SERVICE_VERSION
+    } else {
+        MACHINE_SERVICE_VERSION
+    }
+}
+
+fn validate_service_mode(
+    remote_view_workspace_id: Option<&str>,
+    request: &MachineReadRequest,
+) -> Result<Option<RemoteViewPermission>> {
+    let permission = request.remote_view_permission();
+    match (remote_view_workspace_id, permission) {
+        (Some(_), None) => Err(Error::Denied(
+            "remote-view Machine service rejects legacy ungranted reads",
+        )),
+        (None, Some(_)) => Err(Error::Denied(
+            "ordinary Machine service does not accept remote-view reads",
+        )),
+        _ => Ok(permission),
+    }
+}
+
+fn require_capability(
+    capabilities: &[MachineCapability],
+    required: MachineCapability,
+    message: &'static str,
+) -> Result<()> {
+    if capabilities.contains(&required) {
+        Ok(())
+    } else {
+        Err(Error::Denied(message))
+    }
+}
+
 fn request_id() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
         .map_err(|_| Error::Storage("OS randomness unavailable for MachineLink request"))?;
     Ok(format!("mr_{}", hex(&bytes)))
+}
+
+fn remote_view_nonce() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| Error::Storage("OS randomness unavailable for remote-view challenge"))?;
+    Ok(hex(&bytes))
+}
+
+fn request_sha256(request: &MachineReadRequest) -> Result<String> {
+    let encoded = serde_json::to_vec(request)
+        .map_err(|_| Error::Storage("cannot encode remote-view read request"))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn remote_view_read_transcript(
+    challenge: &RemoteViewReadChallenge,
+    public_key: &str,
+) -> Vec<u8> {
+    let fields: [&[u8]; 12] = [
+        challenge.lease_id.as_bytes(),
+        challenge.request_id.as_bytes(),
+        challenge.grant_id.as_bytes(),
+        challenge.domain_id.as_bytes(),
+        challenge.workspace_id.as_bytes(),
+        challenge.target_node_id.as_bytes(),
+        challenge.target_store_id.as_bytes(),
+        challenge.peer_node_id.as_bytes(),
+        challenge.request_sha256.as_bytes(),
+        challenge.nonce.as_bytes(),
+        challenge.public_key.as_bytes(),
+        public_key.as_bytes(),
+    ];
+    let mut out = Vec::with_capacity(768);
+    out.extend_from_slice(b"aw-remote-view-read-v1\0");
+    for field in fields {
+        let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    out
+}
+
+fn authenticate_remote_view_read(
+    store: &SessionStore,
+    signed_peer_node_id: &str,
+    server_workspace_id: &str,
+    permission: RemoteViewPermission,
+    challenge: &RemoteViewReadChallenge,
+    proof: &RemoteViewReadProof,
+) -> Result<AuthenticatedStableUser> {
+    if proof.version != REMOTE_VIEW_SERVICE_VERSION
+        || proof.lease_id != challenge.lease_id
+        || proof.request_id != challenge.request_id
+        || proof.grant_id != challenge.grant_id
+        || proof.public_key != challenge.public_key
+    {
+        return Err(Error::Protocol(
+            "remote-view read proof correlation failed",
+        ));
+    }
+    let authenticated = store.authenticate_portable_device_signature(
+        &challenge.domain_id,
+        &proof.public_key,
+        &remote_view_read_transcript(challenge, &proof.public_key),
+        &proof.signature,
+    )?;
+    let grant = store.authorize_remote_view(
+        &challenge.grant_id,
+        &authenticated,
+        signed_peer_node_id,
+        permission,
+    )?;
+    if grant.workspace_id != server_workspace_id
+        || grant.domain_id != challenge.domain_id
+        || grant.workspace_id != challenge.workspace_id
+    {
+        return Err(Error::Denied(
+            "remote-view grant does not match the exported Workspace",
+        ));
+    }
+    Ok(authenticated)
 }
 
 fn execute_read_request(
@@ -188,7 +373,7 @@ fn execute_read_request(
                 .collect();
             Ok(MachineReadResponse::Workspaces { workspaces })
         }
-        MachineReadRequest::FileList { path } => {
+        MachineReadRequest::FileList { path } | MachineReadRequest::ViewFileList { path } => {
             let listing = WorkspaceFiles::open(root)
                 .map_err(|_| Error::Denied("exported file root is unavailable"))?
                 .list(path)
@@ -212,7 +397,7 @@ fn execute_read_request(
                 incomplete: listing.incomplete,
             })
         }
-        MachineReadRequest::FileRead { path } => {
+        MachineReadRequest::FileRead { path } | MachineReadRequest::ViewFileRead { path } => {
             let text = WorkspaceFiles::open(root)
                 .map_err(|_| Error::Denied("exported file root is unavailable"))?
                 .read(path)
@@ -222,7 +407,7 @@ fn execute_read_request(
                 text,
             })
         }
-        MachineReadRequest::GitStatus => {
+        MachineReadRequest::GitStatus | MachineReadRequest::ViewGitStatus => {
             let repository = aw_git::Repository::discover(git, root)
                 .map_err(|_| Error::Denied("exported root is not an available Git repository"))?;
             let status = repository
@@ -265,6 +450,7 @@ pub fn serve_machine_service(
     }
     let peer = store.awnet_peer_by_node_id(&opts.link.route.peer_node_id)?;
     let identity = ensure_identity(store, state_dir)?;
+    let target_store_id = store.store_id()?;
     let link = open_punched_quic(store, state_dir, opts.link.route)?;
     let result = link.runtime.block_on(async {
         let lease = negotiate_server(
@@ -281,9 +467,62 @@ pub fn serve_machine_service(
                 .map_err(|_| Error::Timeout)?
                 .map_err(|_| Error::Transport("Machine service request stream was not opened"))?;
         let envelope: ServiceRequestEnvelope = read_frame(&mut recv).await?;
-        if envelope.version != MACHINE_SERVICE_VERSION || envelope.lease_id != lease.lease_id {
+        let protocol_version = machine_service_version(&envelope.request);
+        if envelope.version != protocol_version || envelope.lease_id != lease.lease_id {
             return Err(Error::Protocol("Machine service lease/request mismatch"));
         }
+        let remote_permission =
+            validate_service_mode(opts.remote_view_workspace_id.as_deref(), &envelope.request)?;
+        let remote_authorization = if let Some(permission) = remote_permission {
+            require_capability(
+                &lease.capabilities,
+                MachineCapability::IdentityAuthenticate,
+                "MachineLink lease does not grant remote-view device authentication",
+            )?;
+            let hello = envelope.remote_view.as_ref().ok_or(Error::Denied(
+                "remote-view read requires an exact grant and device proof",
+            ))?;
+            let workspace_id = opts.remote_view_workspace_id.as_deref().ok_or(Error::Denied(
+                "Machine service did not bind this exported root to a remote-view Workspace",
+            ))?;
+            let challenge = RemoteViewReadChallenge {
+                version: REMOTE_VIEW_SERVICE_VERSION,
+                lease_id: lease.lease_id.clone(),
+                request_id: envelope.request_id.clone(),
+                grant_id: hello.grant_id.clone(),
+                domain_id: hello.domain_id.clone(),
+                workspace_id: workspace_id.to_owned(),
+                public_key: hello.public_key.clone(),
+                target_node_id: identity.node_id.clone(),
+                target_store_id: target_store_id.clone(),
+                peer_node_id: peer.node_id.clone(),
+                request_sha256: request_sha256(&envelope.request)?,
+                nonce: remote_view_nonce()?,
+            };
+            write_frame(&mut send, &challenge).await?;
+            let proof: RemoteViewReadProof = read_frame(&mut recv).await?;
+            let authenticated = authenticate_remote_view_read(
+                store,
+                &peer.node_id,
+                workspace_id,
+                permission,
+                &challenge,
+                &proof,
+            )?;
+            Some((
+                authenticated,
+                permission,
+                hello.grant_id.clone(),
+                workspace_id.to_owned(),
+            ))
+        } else {
+            if envelope.remote_view.is_some() {
+                return Err(Error::Protocol(
+                    "remote-view authorization was attached to a legacy Machine read",
+                ));
+            }
+            None
+        };
         let response = execute_read_request(
             store,
             &opts.actor,
@@ -292,10 +531,23 @@ pub fn serve_machine_service(
             &lease,
             &envelope.request,
         )?;
+        if let Some((authenticated, permission, grant_id, workspace_id)) = &remote_authorization {
+            let grant = store.authorize_remote_view(
+                grant_id,
+                authenticated,
+                &peer.node_id,
+                *permission,
+            )?;
+            if grant.workspace_id != *workspace_id {
+                return Err(Error::Denied(
+                    "remote-view grant changed before response publication",
+                ));
+            }
+        }
         write_frame(
             &mut send,
             &ServiceResponseEnvelope {
-                version: MACHINE_SERVICE_VERSION,
+                version: protocol_version,
                 lease_id: lease.lease_id.clone(),
                 request_id: envelope.request_id,
                 response: response.clone(),
@@ -325,8 +577,50 @@ pub fn request_machine_service(
             "Machine service request capability must be present in the requested lease".into(),
         ));
     }
+    let remote_permission = opts.request.remote_view_permission();
+    match (remote_permission, opts.remote_view.as_ref()) {
+        (Some(permission), Some(remote)) => {
+            if !opts
+                .link
+                .requested
+                .contains(&MachineCapability::IdentityAuthenticate)
+                || !remote.grant.permissions.contains(&permission)
+            {
+                return Err(Error::Config(
+                    "remote-view read requires identity-authenticate and the exact grant permission"
+                        .into(),
+                ));
+            }
+            let public_key = hex(&remote.signing_key.verifying_key().to_bytes());
+            if public_key != remote.grant.device_public_key {
+                return Err(Error::Denied(
+                    "remote-view signing key does not match the granted device",
+                ));
+            }
+        }
+        (Some(_), None) => {
+            return Err(Error::Config(
+                "remote-view read requires a persisted grant and signing key".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(Error::Config(
+                "remote-view authorization cannot be attached to a legacy Machine read".into(),
+            ))
+        }
+        (None, None) => {}
+    }
     let peer = store.awnet_peer_by_node_id(&opts.link.route.peer_node_id)?;
     let identity = ensure_identity(store, state_dir)?;
+    if let Some(remote) = &opts.remote_view {
+        if remote.grant.requester_machine_node_id != identity.node_id
+            || remote.grant.target_machine_node_id != peer.node_id
+        {
+            return Err(Error::Denied(
+                "remote-view grant is bound to different requester/target Machines",
+            ));
+        }
+    }
     let link = open_punched_quic(store, state_dir, opts.link.route)?;
     let result = link.runtime.block_on(async {
         let lease = negotiate_client(
@@ -348,18 +642,65 @@ pub fn request_machine_service(
                 .map_err(|_| Error::Timeout)?
                 .map_err(|_| Error::Transport("cannot open Machine service request stream"))?;
         let request_id = request_id()?;
+        let protocol_version = machine_service_version(&opts.request);
+        let request_hash = request_sha256(&opts.request)?;
+        let remote_hello = opts.remote_view.as_ref().map(|remote| RemoteViewReadHello {
+            grant_id: remote.grant.grant_id.clone(),
+            domain_id: remote.grant.domain_id.clone(),
+            public_key: hex(&remote.signing_key.verifying_key().to_bytes()),
+        });
         write_frame(
             &mut send,
             &ServiceRequestEnvelope {
-                version: MACHINE_SERVICE_VERSION,
+                version: protocol_version,
                 lease_id: lease.lease_id.clone(),
                 request_id: request_id.clone(),
-                request: opts.request,
+                request: opts.request.clone(),
+                remote_view: remote_hello,
             },
         )
         .await?;
+        if let Some(remote) = &opts.remote_view {
+            let challenge: RemoteViewReadChallenge = read_frame(&mut recv).await?;
+            if challenge.version != REMOTE_VIEW_SERVICE_VERSION
+                || challenge.lease_id != lease.lease_id
+                || challenge.request_id != request_id
+                || challenge.grant_id != remote.grant.grant_id
+                || challenge.domain_id != remote.grant.domain_id
+                || challenge.workspace_id != remote.grant.workspace_id
+                || challenge.public_key != remote.grant.device_public_key
+                || challenge.target_node_id != peer.node_id
+                || challenge.peer_node_id != identity.node_id
+                || challenge.request_sha256 != request_hash
+            {
+                return Err(Error::Protocol(
+                    "remote-view read challenge correlation failed",
+                ));
+            }
+            let signature = STANDARD.encode(
+                remote
+                    .signing_key
+                    .sign(&remote_view_read_transcript(
+                        &challenge,
+                        &remote.grant.device_public_key,
+                    ))
+                    .to_bytes(),
+            );
+            write_frame(
+                &mut send,
+                &RemoteViewReadProof {
+                    version: REMOTE_VIEW_SERVICE_VERSION,
+                    lease_id: lease.lease_id.clone(),
+                    request_id: request_id.clone(),
+                    grant_id: remote.grant.grant_id.clone(),
+                    public_key: remote.grant.device_public_key.clone(),
+                    signature,
+                },
+            )
+            .await?;
+        }
         let response: ServiceResponseEnvelope = read_frame(&mut recv).await?;
-        if response.version != MACHINE_SERVICE_VERSION
+        if response.version != protocol_version
             || response.lease_id != lease.lease_id
             || response.request_id != request_id
         {
@@ -401,5 +742,108 @@ mod tests {
             MachineReadRequest::Sessions.required_capability(),
             MachineCapability::SessionRead
         );
+        assert_eq!(
+            MachineReadRequest::ViewFileRead {
+                path: "a.txt".into()
+            }
+            .required_capability(),
+            MachineCapability::FileRead
+        );
+        assert_eq!(
+            MachineReadRequest::ViewFileRead {
+                path: "a.txt".into()
+            }
+            .remote_view_permission(),
+            Some(RemoteViewPermission::Files)
+        );
+        assert_eq!(
+            MachineReadRequest::ViewGitStatus.remote_view_permission(),
+            Some(RemoteViewPermission::Git)
+        );
+        assert_eq!(
+            MachineReadRequest::FileRead {
+                path: "a.txt".into()
+            }
+            .remote_view_permission(),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_view_service_mode_fails_closed_against_protocol_downgrade() {
+        let legacy = MachineReadRequest::FileRead {
+            path: "src/lib.rs".into(),
+        };
+        let protected = MachineReadRequest::ViewFileRead {
+            path: "src/lib.rs".into(),
+        };
+        assert!(validate_service_mode(Some("ws_fixture"), &legacy).is_err());
+        assert!(validate_service_mode(None, &protected).is_err());
+        assert_eq!(
+            validate_service_mode(Some("ws_fixture"), &protected).unwrap(),
+            Some(RemoteViewPermission::Files)
+        );
+        assert_eq!(validate_service_mode(None, &legacy).unwrap(), None);
+    }
+
+    #[test]
+    fn legacy_machine_read_v1_omits_remote_view_wire_field() {
+        let request = MachineReadRequest::FileRead {
+            path: "src/lib.rs".into(),
+        };
+        assert_eq!(machine_service_version(&request), MACHINE_SERVICE_VERSION);
+        assert_eq!(
+            machine_service_version(&MachineReadRequest::ViewFileRead {
+                path: "src/lib.rs".into(),
+            }),
+            REMOTE_VIEW_SERVICE_VERSION
+        );
+
+        let envelope = ServiceRequestEnvelope {
+            version: MACHINE_SERVICE_VERSION,
+            lease_id: "ml_fixture".into(),
+            request_id: "mr_fixture".into(),
+            request,
+            remote_view: None,
+        };
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert!(json.get("remote_view").is_none());
+    }
+
+    #[test]
+    fn remote_view_read_transcript_binds_grant_workspace_peer_and_request() {
+        let request = MachineReadRequest::ViewFileRead {
+            path: "src/lib.rs".into(),
+        };
+        let mut challenge = RemoteViewReadChallenge {
+            version: REMOTE_VIEW_SERVICE_VERSION,
+            lease_id: "ml_fixture".into(),
+            request_id: "mr_fixture".into(),
+            grant_id: "rvg_fixture".into(),
+            domain_id: "dom_fixture".into(),
+            workspace_id: "ws_fixture".into(),
+            public_key: "11".repeat(32),
+            target_node_id: "node_target".into(),
+            target_store_id: "store_target".into(),
+            peer_node_id: "node_client".into(),
+            request_sha256: request_sha256(&request).unwrap(),
+            nonce: "aa".repeat(32),
+        };
+        let key = challenge.public_key.clone();
+        let baseline = remote_view_read_transcript(&challenge, &key);
+
+        challenge.grant_id = "rvg_other".into();
+        assert_ne!(baseline, remote_view_read_transcript(&challenge, &key));
+        challenge.grant_id = "rvg_fixture".into();
+
+        challenge.workspace_id = "ws_other".into();
+        assert_ne!(baseline, remote_view_read_transcript(&challenge, &key));
+        challenge.workspace_id = "ws_fixture".into();
+
+        challenge.request_sha256 = request_sha256(&MachineReadRequest::ViewFileRead {
+            path: "src/main.rs".into(),
+        })
+        .unwrap();
+        assert_ne!(baseline, remote_view_read_transcript(&challenge, &key));
     }
 }

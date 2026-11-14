@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createAgentDocking, createDocumentDocking, takeAgentDockTicket, takeDocumentDockTicket,
+  createAgentDocking, createDelegatedSurfaceDocking, createDocumentDocking,
+  takeAgentDockTicket, takeDelegatedSurfaceDockTicket, takeDocumentDockTicket,
 } from '../web/src/document-docking.js';
 import { createAgentViews } from '../web/src/agent-views.js';
+import { documentFingerprint } from '../web/src/document-presentation.js';
+import { createWorkspaceViews } from '../web/src/workspace-views.js';
 
 const ticket = 'a'.repeat(64);
 const owner = { source_id: 'source-dock', scope_id: 'root-scope', owner_epoch: 'epoch' };
@@ -249,6 +252,301 @@ test('unknown delegated Agent acceptance outcome remains inspectable but cannot 
   assert.equal(retained.snapshot.title, 'Private delegated Agent');
   await assert.rejects(docking.receive(ticket), /already received/);
   assert.equal(agentViews.list().length, 1, 'reload/retry cannot silently mint a second delegated view');
+});
+
+const delegatedFileTarget = Object.freeze({
+  source_id: 'surface-delegated', scope_id: 'scope-delegated', path: 'src/private.rs',
+});
+
+test('distinct-Actor File handoff sends exact identity only and closes source after release', async () => {
+  const calls = [], links = [];
+  let document = {
+    id: 'workspace-document-51', containerId: 'workspace-container-1', kind: 'file',
+    target: delegatedFileTarget,
+    data: { context: delegatedFileTarget.scope_id, path: delegatedFileTarget.path,
+      text: 'PRIVATE FILE BYTES', read_only: true },
+    delegated: false, pending: false, unavailable: false, error: '',
+  };
+  let statuses = 0;
+  const views = {
+    getDocument: id => id === document?.id ? document : null,
+    closeDocument(id) { assert.equal(id, document.id); document = null; return true; },
+    openDelegatedDocument() { throw new Error('source must not open receiver document'); },
+    refreshDocument() { throw new Error('source must not refresh receiver document'); },
+  };
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/register')) return {
+      window_id: 'b'.repeat(64), window_proof: 'c'.repeat(64),
+      store_id: 'store-team', source_epoch: 'owner-epoch',
+    };
+    if (path.endsWith('/prepare')) return { ticket, grant_generation: '12' };
+    if (path.endsWith('/status')) return {
+      state: ++statuses === 1 ? 'confirming' : 'accepted', document_id: 'workspace-document-51',
+    };
+    if (path.endsWith('/confirm')) return { state: 'confirming' };
+    if (path.endsWith('/release')) return { state: 'released', document_id: 'workspace-document-51' };
+    if (path.endsWith('/cancel')) return { state: 'cancelled' };
+    throw new Error('Unexpected delegated Surface operation ' + path);
+  };
+  const sourcePresentation = {
+    query: 'PRIVATE', selected: 0, focus: 'pane0',
+    panes: [{ anchor: 2, head: 7, from: 0, top: 144, left: 9 }],
+  };
+  const docking = createDelegatedSurfaceDocking({
+    api, views, sleep: async () => {}, capture: () => sourcePresentation,
+    onLinkReady: (_id, value) => { if (value) links.push(value); },
+    makeLink: value => 'https://owner.invalid/#aw-surface-dock=' + value,
+  });
+  docking.stage('workspace-document-51');
+  assert.equal(await docking.send('workspace-document-51', 'bob'), true);
+  assert.equal(document, null);
+  const preparedBody = calls.find(call => call.path.endsWith('/prepare')).body;
+  const { presentation, ...identity } = preparedBody;
+  assert.deepEqual(identity, {
+    window_id: 'b'.repeat(64), window_proof: 'c'.repeat(64),
+    store_id: 'store-team', source_epoch: 'owner-epoch',
+    source_id: delegatedFileTarget.source_id, scope_id: delegatedFileTarget.scope_id,
+    owner_epoch: 'owner-epoch', document_id: 'workspace-document-51',
+    recipient_id: 'bob', kind: 'file', path: delegatedFileTarget.path,
+  });
+  assert.deepEqual(presentation, {
+    ...sourcePresentation, version: 1,
+    fingerprint: await documentFingerprint('file', {
+      context: delegatedFileTarget.scope_id, path: delegatedFileTarget.path,
+      text: 'PRIVATE FILE BYTES', read_only: true,
+    }),
+  });
+  assert.equal(JSON.stringify(calls).includes('PRIVATE FILE BYTES'), false);
+  assert.deepEqual(links, ['https://owner.invalid/#aw-surface-dock=' + ticket]);
+});
+
+test('lost delegated File release response preserves source and cannot pretend transfer completed', async () => {
+  const calls = [];
+  let document = {
+    id: 'workspace-document-release-loss', containerId: 'workspace-container-1', kind: 'file',
+    target: delegatedFileTarget,
+    data: { context: delegatedFileTarget.scope_id, path: delegatedFileTarget.path,
+      text: 'release loss bytes', read_only: true },
+    delegated: false, pending: false, unavailable: false, error: '',
+  };
+  const views = {
+    getDocument: id => id === document?.id ? document : null,
+    closeDocument() { throw new Error('source must remain open without a factual release receipt'); },
+    openDelegatedDocument() { throw new Error('source must not open receiver document'); },
+    refreshDocument() { throw new Error('source must not refresh receiver document'); },
+  };
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/register')) return {
+      window_id: 'b'.repeat(64), window_proof: 'c'.repeat(64),
+      store_id: 'store-team', source_epoch: 'owner-epoch',
+    };
+    if (path.endsWith('/prepare')) return { ticket, grant_generation: '31' };
+    if (path.endsWith('/status')) return { state: 'accepted', document_id: document.id };
+    if (path.endsWith('/release')) {
+      throw Object.assign(new Error('release response lost'), { status: 503 });
+    }
+    if (path.endsWith('/cancel')) {
+      throw Object.assign(new Error('already committed'), { status: 409 });
+    }
+    throw new Error('Unexpected delegated Surface operation ' + path);
+  };
+  const docking = createDelegatedSurfaceDocking({
+    api, views, sleep: async () => {},
+    makeLink: value => 'https://owner.invalid/#aw-surface-dock=' + value,
+  });
+  await assert.rejects(docking.send(document.id, 'bob'), /release response lost/);
+  assert.equal(document.data.text, 'release loss bytes');
+  assert.deepEqual(calls.slice(-2).map(call => call.path), [
+    '/api/dock/surface/release', '/api/dock/surface/cancel',
+  ]);
+});
+
+test('delegated File receiver restores bounded Find, caret and scroll before acceptance', async () => {
+  const calls = [];
+  const views = createWorkspaceViews({
+    request: async () => { throw new Error('ordinary Workspace reader must not be used'); },
+  });
+  const fileData = {
+    context: delegatedFileTarget.scope_id, path: delegatedFileTarget.path,
+    text: 'receiver private bytes', read_only: true,
+  };
+  const presentation = {
+    version: 1, fingerprint: await documentFingerprint('file', fileData),
+    query: 'private', selected: 0, focus: 'pane0',
+    panes: [{ anchor: 3, head: 11, from: 0, top: 222, left: 17 }],
+  };
+  let restored = null;
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/receive')) return {
+      window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64), ticket,
+      resource: { kind: 'file', ...delegatedFileTarget, owner_epoch: 'owner-epoch' },
+      grant_generation: '14', presentation,
+    };
+    if (path.endsWith('/read')) return {
+      source_id: delegatedFileTarget.source_id, scope_id: delegatedFileTarget.scope_id,
+      result: fileData,
+    };
+    if (path.endsWith('/accept')) {
+      assert.deepEqual(restored, presentation, 'presentation restores before Accept');
+      return { state: 'accepted' };
+    }
+    if (path.endsWith('/heartbeat')) return { state: 'released' };
+    throw new Error('Unexpected delegated Surface operation ' + path);
+  };
+  let received;
+  const docking = createDelegatedSurfaceDocking({
+    api, views, sleep: async () => {}, isRendered: () => true,
+    restore: async (_id, state) => { restored = state; return true; },
+    onReceiveDocument: (id, kind, target) => { received = { id, kind, target }; },
+  });
+  const result = await docking.receive(ticket);
+  assert.equal(result.kind, 'file');
+  assert.equal(result.documentId, received.id);
+  assert.equal(received.kind, 'file');
+  assert.deepEqual(received.target, delegatedFileTarget);
+  const document = views.getDocument(received.id);
+  assert.equal(document.delegated, true);
+  assert.equal(document.containerId, null);
+  assert.equal(document.data.text, 'receiver private bytes');
+  assert.deepEqual(views.listContainers(), []);
+  assert.deepEqual(calls.map(call => call.path), [
+    '/api/dock/surface/receive', '/api/dock/surface/read',
+    '/api/dock/surface/accept', '/api/dock/surface/heartbeat',
+  ]);
+  assert.deepEqual(calls[1].body, {
+    window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64), ticket,
+  });
+});
+
+test('delegated Review receiver restores bounded two-pane Find, selection, scroll and focus', async () => {
+  const calls = [];
+  const target = {
+    source_id: 'surface-review', scope_id: 'scope-review', review_id: 'review-delegated-9',
+  };
+  const reviewData = {
+    kind: 'review', id: target.review_id, root: '/fixture/review', path: 'src/lib.rs',
+    basis: 'immutable review', lines: [
+      { kind: 'context', text: 'alpha' },
+      { kind: 'added', text: '+private delta' },
+    ],
+    binary: false, truncated: false, same_agent_root: true, read_only: true,
+  };
+  const presentation = {
+    version: 1, fingerprint: await documentFingerprint('review', reviewData),
+    query: 'private', selected: 0, focus: 'pane1',
+    panes: [
+      { anchor: 1, head: 4, from: 0, top: 120, left: 3 },
+      { anchor: 2, head: 8, from: 0, top: 360, left: 11 },
+    ],
+  };
+  const views = createWorkspaceViews({
+    request: async () => { throw new Error('ordinary Workspace reader must not be used'); },
+  });
+  let restored = null, received = null;
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/receive')) return {
+      window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64), ticket,
+      resource: { kind: 'review', ...target, owner_epoch: 'owner-epoch' },
+      grant_generation: '22', presentation,
+    };
+    if (path.endsWith('/read')) return {
+      source_id: target.source_id, scope_id: target.scope_id, result: reviewData,
+    };
+    if (path.endsWith('/accept')) {
+      assert.deepEqual(restored, presentation, 'two-pane presentation restores before Accept');
+      return { state: 'accepted' };
+    }
+    if (path.endsWith('/heartbeat')) return { state: 'released' };
+    throw new Error('Unexpected delegated Review operation ' + path);
+  };
+  const docking = createDelegatedSurfaceDocking({
+    api, views, sleep: async () => {}, isRendered: () => true,
+    restore: async (_id, state) => { restored = state; return true; },
+    onReceiveDocument: (id, kind, exact) => { received = { id, kind, target: exact }; },
+  });
+  const result = await docking.receive(ticket);
+  assert.deepEqual(result, { documentId: received.id, kind: 'review' });
+  assert.deepEqual(received.target, target);
+  assert.equal(views.getDocument(received.id).data.id, target.review_id);
+  assert.equal(views.getDocument(received.id).containerId, null);
+  assert.deepEqual(views.listContainers(), []);
+  assert.deepEqual(calls.map(call => call.path), [
+    '/api/dock/surface/receive', '/api/dock/surface/read',
+    '/api/dock/surface/accept', '/api/dock/surface/heartbeat',
+  ]);
+});
+
+test('delegated presentation fingerprint mismatch cannot accept or retain receiver plaintext', async () => {
+  const calls = [];
+  const views = createWorkspaceViews({
+    request: async () => { throw new Error('ordinary Workspace reader must not be used'); },
+  });
+  let receivedId = null;
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/receive')) return {
+      window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64), ticket,
+      resource: { kind: 'file', ...delegatedFileTarget, owner_epoch: 'owner-epoch' },
+      grant_generation: '23',
+      presentation: {
+        version: 1, fingerprint: 'f'.repeat(64), query: 'private', selected: 0, focus: 'pane0',
+        panes: [{ anchor: 0, head: 1, from: 0, top: 0, left: 0 }],
+      },
+    };
+    if (path.endsWith('/read')) return {
+      source_id: delegatedFileTarget.source_id, scope_id: delegatedFileTarget.scope_id,
+      result: {
+        context: delegatedFileTarget.scope_id, path: delegatedFileTarget.path,
+        text: 'different receiver bytes', read_only: true,
+      },
+    };
+    throw new Error('Accept must not run after fingerprint mismatch: ' + path);
+  };
+  const docking = createDelegatedSurfaceDocking({
+    api, views, sleep: async () => {}, isRendered: () => true,
+    onReceiveDocument: id => { receivedId = id; },
+  });
+  await assert.rejects(docking.receive(ticket), /content changed/);
+  assert.equal(views.getDocument(receivedId), null);
+  assert.equal(calls.some(call => call.path.endsWith('/accept')), false);
+});
+
+test('known delegated File revoke after acceptance closes and scrubs the exact receiver document', async () => {
+  const views = createWorkspaceViews({ request: async () => { throw new Error('ordinary reader must not run'); } });
+  const api = async path => {
+    if (path.endsWith('/receive')) return {
+      window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64), ticket,
+      resource: { kind: 'file', ...delegatedFileTarget, owner_epoch: 'owner-epoch' },
+      grant_generation: '15',
+    };
+    if (path.endsWith('/read')) return {
+      source_id: delegatedFileTarget.source_id, scope_id: delegatedFileTarget.scope_id,
+      result: { context: delegatedFileTarget.scope_id, path: delegatedFileTarget.path,
+        text: 'must be scrubbed', read_only: true },
+    };
+    if (path.endsWith('/accept')) return { state: 'accepted' };
+    if (path.endsWith('/heartbeat')) throw Object.assign(new Error('grant revoked'), { status: 403 });
+    throw new Error('Unexpected delegated Surface operation ' + path);
+  };
+  let id;
+  const docking = createDelegatedSurfaceDocking({
+    api, views, sleep: async () => {}, onReceiveDocument: value => { id = value; },
+  });
+  await assert.rejects(docking.receive(ticket), /revoked/);
+  assert.equal(views.getDocument(id), null);
+  assert.deepEqual(views.listDocuments(), []);
+});
+
+test('delegated Surface fragment is correlation-only and stripped before receiver reads', () => {
+  const history = { calls: [], replaceState(...args) { this.calls.push(args); } };
+  const location = { hash: '#aw-surface-dock=' + ticket, pathname: '/app', search: '?mode=file' };
+  assert.equal(takeDelegatedSurfaceDockTicket(location, history), ticket);
+  assert.deepEqual(history.calls, [[null, '', '/app?mode=file']]);
+  assert.equal(takeDelegatedSurfaceDockTicket({ hash: '#aw-surface-dock=bad', pathname: '/' }, history), null);
 });
 
 test('delegated Agent fragment is correlation-only and stripped before receiver reads', () => {

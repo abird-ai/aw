@@ -7,16 +7,18 @@ use super::*;
 use aw::PrincipalId;
 use aw_store::{
     identity_continuity_snapshot_transcript, AuthSessionInfo, AuthenticatedStableUser,
-    IdentityContinuityApplyResult, IdentityContinuitySnapshot, SessionInfo,
+    IdentityContinuityApplyResult, IdentityContinuitySnapshot, RemoteViewGrant,
+    RemoteViewPermission, SessionInfo,
 };
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 use zeroize::{Zeroize, Zeroizing};
 
 const IDENTITY_SYNC_STREAM_VERSION: u16 = 1;
 const IDENTITY_AUTH_STREAM_VERSION: u16 = 2;
+const IDENTITY_AUTH_REMOTE_VIEW_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +73,14 @@ pub struct IdentityContinuitySyncResult {
     pub applied: IdentityContinuityApplyResult,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteViewGrantRequest {
+    pub workspace_id: String,
+    pub permissions: BTreeSet<RemoteViewPermission>,
+    pub ttl_secs: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityAuthHello {
@@ -81,6 +91,8 @@ struct IdentityAuthHello {
     public_key: String,
     session_id: Option<String>,
     auth_session_ttl: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_view: Option<RemoteViewGrantRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +108,8 @@ pub struct IdentityAuthChallenge {
     pub nonce: String,
     pub session_id: Option<String>,
     pub auth_session_ttl: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_view: Option<RemoteViewGrantRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,6 +137,8 @@ pub struct IdentityAuthReply {
     pub request_id: String,
     pub authenticated: AuthenticatedStableUser,
     pub session: Option<SessionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_view_grant: Option<RemoteViewGrant>,
     auth_session: Option<IdentityAuthSessionWire>,
 }
 
@@ -131,6 +147,7 @@ pub struct IdentityAuthRequestOptions {
     pub domain_id: String,
     pub session_id: Option<String>,
     pub auth_session_ttl: Option<u64>,
+    pub remote_view: Option<RemoteViewGrantRequest>,
     pub signing_key: SigningKey,
 }
 
@@ -139,6 +156,7 @@ pub struct IdentityAuthServeOptions {
     pub link: MachineLinkServeOptions,
     pub domain_id: String,
     pub auth_session_max_ttl: Option<u64>,
+    pub remote_view_max_ttl: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -147,6 +165,7 @@ pub struct IdentityAuthServeResult {
     pub authenticated_user_id: String,
     pub session_authorized: bool,
     pub auth_session_issued: bool,
+    pub remote_view_grant_issued: bool,
 }
 
 #[derive(Serialize)]
@@ -155,6 +174,7 @@ pub struct IdentityAuthRequestResult {
     pub authenticated: AuthenticatedStableUser,
     pub session: Option<SessionInfo>,
     pub auth_session: Option<AuthSessionInfo>,
+    pub remote_view_grant: Option<RemoteViewGrant>,
     #[serde(skip_serializing)]
     pub refresh_token: Option<Zeroizing<String>>,
 }
@@ -185,6 +205,47 @@ fn require_capability(
     }
 }
 
+fn remote_view_capability(permission: RemoteViewPermission) -> MachineCapability {
+    match permission {
+        RemoteViewPermission::Files => MachineCapability::FileRead,
+        RemoteViewPermission::Git => MachineCapability::GitRead,
+    }
+}
+
+fn validate_remote_view_request<'a>(
+    request: &RemoteViewGrantRequest,
+    capabilities: impl IntoIterator<Item = &'a MachineCapability>,
+    max_ttl: u64,
+) -> Result<()> {
+    if request.permissions.is_empty()
+        || request.permissions.len() > 2
+        || request.ttl_secs < 5
+        || request.ttl_secs > max_ttl
+        || max_ttl > 60 * 60
+    {
+        return Err(Error::Denied(
+            "requested remote-view grant exceeds the server policy",
+        ));
+    }
+    let capabilities = capabilities.into_iter().copied().collect::<BTreeSet<_>>();
+    for permission in &request.permissions {
+        if !capabilities.contains(&remote_view_capability(*permission)) {
+            return Err(Error::Denied(
+                "MachineLink lease does not grant the requested remote-view surface",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn identity_auth_version(remote_view: Option<&RemoteViewGrantRequest>) -> u16 {
+    if remote_view.is_some() {
+        IDENTITY_AUTH_REMOTE_VIEW_VERSION
+    } else {
+        IDENTITY_AUTH_STREAM_VERSION
+    }
+}
+
 pub fn identity_device_auth_transcript(
     challenge: &IdentityAuthChallenge,
     public_key: &str,
@@ -194,7 +255,56 @@ pub fn identity_device_auth_transcript(
         .auth_session_ttl
         .map(|value| value.to_string())
         .unwrap_or_default();
-    let fields: [&[u8]; 10] = [
+
+    let mut out = Vec::with_capacity(672);
+    if challenge.version == IDENTITY_AUTH_STREAM_VERSION {
+        out.extend_from_slice(b"aw-user-device-auth-v2\0");
+        for field in [
+            challenge.machine_lease_id.as_bytes(),
+            challenge.request_id.as_bytes(),
+            challenge.domain_id.as_bytes(),
+            challenge.target_node_id.as_bytes(),
+            challenge.target_store_id.as_bytes(),
+            challenge.peer_node_id.as_bytes(),
+            challenge.nonce.as_bytes(),
+            public_key.as_bytes(),
+            session.as_bytes(),
+            ttl.as_bytes(),
+        ] {
+            let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(field);
+        }
+        return out;
+    }
+
+    let remote_workspace = challenge
+        .remote_view
+        .as_ref()
+        .map(|request| request.workspace_id.as_str())
+        .unwrap_or("");
+    let remote_permissions = challenge
+        .remote_view
+        .as_ref()
+        .map(|request| {
+            request
+                .permissions
+                .iter()
+                .map(|permission| match permission {
+                    RemoteViewPermission::Files => "files",
+                    RemoteViewPermission::Git => "git",
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let remote_ttl = challenge
+        .remote_view
+        .as_ref()
+        .map(|request| request.ttl_secs.to_string())
+        .unwrap_or_default();
+    out.extend_from_slice(b"aw-user-device-auth-v3\0");
+    for field in [
         challenge.machine_lease_id.as_bytes(),
         challenge.request_id.as_bytes(),
         challenge.domain_id.as_bytes(),
@@ -205,10 +315,10 @@ pub fn identity_device_auth_transcript(
         public_key.as_bytes(),
         session.as_bytes(),
         ttl.as_bytes(),
-    ];
-    let mut out = Vec::with_capacity(544);
-    out.extend_from_slice(b"aw-user-device-auth-v2\0");
-    for field in fields {
+        remote_workspace.as_bytes(),
+        remote_permissions.as_bytes(),
+        remote_ttl.as_bytes(),
+    ] {
         let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(field);
@@ -396,6 +506,14 @@ pub fn serve_identity_auth(
             "identity auth native-session max TTL must be between 60 seconds and 30 days".into(),
         ));
     }
+    if opts
+        .remote_view_max_ttl
+        .is_some_and(|ttl| !(5..=60 * 60).contains(&ttl))
+    {
+        return Err(Error::Config(
+            "identity auth remote-view max TTL must be between 5 seconds and 1 hour".into(),
+        ));
+    }
     if !opts
         .link
         .allowed
@@ -429,7 +547,8 @@ pub fn serve_identity_auth(
                 .map_err(|_| Error::Timeout)?
                 .map_err(|_| Error::Transport("identity auth stream was not opened"))?;
         let hello: IdentityAuthHello = read_data_frame(&mut recv).await?;
-        if hello.version != IDENTITY_AUTH_STREAM_VERSION
+        let protocol_version = identity_auth_version(hello.remote_view.as_ref());
+        if hello.version != protocol_version
             || hello.machine_lease_id != lease.lease_id
             || hello.domain_id != opts.domain_id
         {
@@ -447,8 +566,14 @@ pub fn serve_identity_auth(
                 ));
             }
         }
+        if let Some(remote_view) = &hello.remote_view {
+            let max = opts.remote_view_max_ttl.ok_or(Error::Denied(
+                "identity auth server did not enable remote-view grant issuance",
+            ))?;
+            validate_remote_view_request(remote_view, &lease.capabilities, max)?;
+        }
         let challenge = IdentityAuthChallenge {
-            version: IDENTITY_AUTH_STREAM_VERSION,
+            version: protocol_version,
             machine_lease_id: lease.lease_id.clone(),
             request_id: hello.request_id.clone(),
             domain_id: opts.domain_id.clone(),
@@ -458,6 +583,7 @@ pub fn serve_identity_auth(
             nonce: nonce()?,
             session_id: hello.session_id.clone(),
             auth_session_ttl: hello.auth_session_ttl,
+            remote_view: hello.remote_view.clone(),
         };
         write_data_frame(&mut send, &challenge).await?;
         let (mut proof_send, mut proof_recv) =
@@ -466,7 +592,7 @@ pub fn serve_identity_auth(
                 .map_err(|_| Error::Timeout)?
                 .map_err(|_| Error::Transport("identity auth proof stream was not opened"))?;
         let proof: IdentityAuthProof = read_data_frame(&mut proof_recv).await?;
-        if proof.version != IDENTITY_AUTH_STREAM_VERSION
+        if proof.version != protocol_version
             || proof.machine_lease_id != lease.lease_id
             || proof.request_id != hello.request_id
             || proof.public_key != hello.public_key
@@ -500,16 +626,30 @@ pub fn serve_identity_auth(
                 )
             })
             .transpose()?;
+        let remote_view_grant = hello
+            .remote_view
+            .as_ref()
+            .map(|request| {
+                store.issue_remote_view_grant(
+                    &authenticated,
+                    &peer.node_id,
+                    &request.workspace_id,
+                    request.permissions.clone(),
+                    request.ttl_secs,
+                )
+            })
+            .transpose()?;
         let wire_session = issued.as_ref().map(|issued| IdentityAuthSessionWire {
             info: issued.info.clone(),
             refresh_token: issued.refresh_token.as_str().to_owned(),
         });
         let mut reply = IdentityAuthReply {
-            version: IDENTITY_AUTH_STREAM_VERSION,
+            version: protocol_version,
             machine_lease_id: lease.lease_id.clone(),
             request_id: hello.request_id,
             authenticated: authenticated.clone(),
             session: session.clone(),
+            remote_view_grant: remote_view_grant.clone(),
             auth_session: wire_session,
         };
         let send_result = write_data_frame(&mut proof_send, &reply).await;
@@ -520,6 +660,9 @@ pub fn serve_identity_auth(
             if let Some(issued) = &issued {
                 let _ = store.revoke_auth_session_by_token(&issued.refresh_token);
             }
+            if let Some(grant) = &remote_view_grant {
+                let _ = store.revoke_remote_view_grant(&principal, &grant.grant_id);
+            }
             return Err(error);
         }
         Ok::<_, Error>(IdentityAuthServeResult {
@@ -527,6 +670,7 @@ pub fn serve_identity_auth(
             authenticated_user_id: authenticated.user_id,
             session_authorized: session.is_some(),
             auth_session_issued: issued.is_some(),
+            remote_view_grant_issued: remote_view_grant.is_some(),
         })
     });
     link.connection
@@ -549,6 +693,9 @@ pub fn request_identity_auth(
         return Err(Error::Config(
             "identity auth client must explicitly request identity-authenticate".into(),
         ));
+    }
+    if let Some(remote_view) = &opts.remote_view {
+        validate_remote_view_request(remote_view, &opts.link.requested, 60 * 60)?;
     }
     let peer = store.awnet_peer_by_node_id(&opts.link.route.peer_node_id)?;
     let identity = ensure_identity(store, state_dir)?;
@@ -574,21 +721,23 @@ pub fn request_identity_auth(
                 .map_err(|_| Error::Timeout)?
                 .map_err(|_| Error::Transport("cannot open identity auth stream"))?;
         let request_id = request_id("iarq")?;
+        let protocol_version = identity_auth_version(opts.remote_view.as_ref());
         write_data_frame(
             &mut send,
             &IdentityAuthHello {
-                version: IDENTITY_AUTH_STREAM_VERSION,
+                version: protocol_version,
                 machine_lease_id: lease.lease_id.clone(),
                 request_id: request_id.clone(),
                 domain_id: opts.domain_id.clone(),
                 public_key: public_key.clone(),
                 session_id: opts.session_id.clone(),
                 auth_session_ttl: opts.auth_session_ttl,
+                remote_view: opts.remote_view.clone(),
             },
         )
         .await?;
         let challenge: IdentityAuthChallenge = read_data_frame(&mut recv).await?;
-        if challenge.version != IDENTITY_AUTH_STREAM_VERSION
+        if challenge.version != protocol_version
             || challenge.machine_lease_id != lease.lease_id
             || challenge.request_id != request_id
             || challenge.domain_id != opts.domain_id
@@ -596,6 +745,7 @@ pub fn request_identity_auth(
             || challenge.peer_node_id != identity.node_id
             || challenge.session_id != opts.session_id
             || challenge.auth_session_ttl != opts.auth_session_ttl
+            || challenge.remote_view != opts.remote_view
         {
             return Err(Error::Protocol(
                 "identity auth challenge correlation failed",
@@ -614,7 +764,7 @@ pub fn request_identity_auth(
         write_data_frame(
             &mut proof_send,
             &IdentityAuthProof {
-                version: IDENTITY_AUTH_STREAM_VERSION,
+                version: protocol_version,
                 machine_lease_id: lease.lease_id.clone(),
                 request_id: request_id.clone(),
                 public_key,
@@ -623,11 +773,25 @@ pub fn request_identity_auth(
         )
         .await?;
         let reply: IdentityAuthReply = read_data_frame(&mut proof_recv).await?;
-        if reply.version != IDENTITY_AUTH_STREAM_VERSION
+        if reply.version != protocol_version
             || reply.machine_lease_id != lease.lease_id
             || reply.request_id != request_id
         {
             return Err(Error::Protocol("identity auth reply correlation failed"));
+        }
+        match (&opts.remote_view, &reply.remote_view_grant) {
+            (None, None) => {}
+            (Some(request), Some(grant))
+                if grant.domain_id == opts.domain_id
+                    && grant.workspace_id == request.workspace_id
+                    && grant.permissions == request.permissions
+                    && grant.requester_machine_node_id == identity.node_id
+                    && grant.target_machine_node_id == peer.node_id => {}
+            _ => {
+                return Err(Error::Protocol(
+                    "identity auth remote-view grant correlation failed",
+                ))
+            }
         }
         let (auth_session, refresh_token) = match reply.auth_session {
             Some(grant) => (Some(grant.info), Some(Zeroizing::new(grant.refresh_token))),
@@ -638,6 +802,7 @@ pub fn request_identity_auth(
             authenticated: reply.authenticated,
             session: reply.session,
             auth_session,
+            remote_view_grant: reply.remote_view_grant,
             refresh_token,
         })
     });
@@ -665,6 +830,7 @@ mod tests {
             nonce: "aa".repeat(32),
             session_id: Some("s_fixture".into()),
             auth_session_ttl: Some(600),
+            remote_view: None,
         };
         let a = identity_device_auth_transcript(&challenge, &"11".repeat(32));
         let mut changed = challenge.clone();
@@ -676,6 +842,93 @@ mod tests {
         assert_ne!(
             a,
             identity_device_auth_transcript(&ttl_changed, &"11".repeat(32))
+        );
+
+        let mut remote_changed = challenge.clone();
+        remote_changed.version = IDENTITY_AUTH_REMOTE_VIEW_VERSION;
+        remote_changed.remote_view = Some(RemoteViewGrantRequest {
+            workspace_id: "ws_fixture".into(),
+            permissions: BTreeSet::from([RemoteViewPermission::Files]),
+            ttl_secs: 60,
+        });
+        let remote = identity_device_auth_transcript(&remote_changed, &"11".repeat(32));
+        assert_ne!(a, remote);
+        remote_changed.remote_view.as_mut().unwrap().ttl_secs = 61;
+        assert_ne!(
+            remote,
+            identity_device_auth_transcript(&remote_changed, &"11".repeat(32))
+        );
+    }
+
+    #[test]
+    fn remote_view_request_requires_exact_machine_link_read_capabilities() {
+        let request = RemoteViewGrantRequest {
+            workspace_id: "ws_fixture".into(),
+            permissions: BTreeSet::from([
+                RemoteViewPermission::Files,
+                RemoteViewPermission::Git,
+            ]),
+            ttl_secs: 60,
+        };
+        assert!(validate_remote_view_request(
+            &request,
+            &[
+                MachineCapability::IdentityAuthenticate,
+                MachineCapability::FileRead,
+                MachineCapability::GitRead,
+            ],
+            60,
+        )
+        .is_ok());
+        assert!(validate_remote_view_request(
+            &request,
+            &[
+                MachineCapability::IdentityAuthenticate,
+                MachineCapability::FileRead,
+            ],
+            60,
+        )
+        .is_err());
+        assert_eq!(identity_auth_version(None), IDENTITY_AUTH_STREAM_VERSION);
+        assert_eq!(
+            identity_auth_version(Some(&request)),
+            IDENTITY_AUTH_REMOTE_VIEW_VERSION
+        );
+    }
+
+    #[test]
+    fn legacy_identity_auth_v2_omits_remote_view_wire_fields() {
+        let hello = IdentityAuthHello {
+            version: IDENTITY_AUTH_STREAM_VERSION,
+            machine_lease_id: "ml_fixture".into(),
+            request_id: "iarq_fixture".into(),
+            domain_id: "dom_fixture".into(),
+            public_key: "11".repeat(32),
+            session_id: None,
+            auth_session_ttl: None,
+            remote_view: None,
+        };
+        let hello_json = serde_json::to_value(&hello).unwrap();
+        assert!(hello_json.get("remote_view").is_none());
+
+        let challenge = IdentityAuthChallenge {
+            version: IDENTITY_AUTH_STREAM_VERSION,
+            machine_lease_id: "ml_fixture".into(),
+            request_id: "iarq_fixture".into(),
+            domain_id: "dom_fixture".into(),
+            target_node_id: "node_target".into(),
+            target_store_id: "store_target".into(),
+            peer_node_id: "node_client".into(),
+            nonce: "aa".repeat(32),
+            session_id: None,
+            auth_session_ttl: None,
+            remote_view: None,
+        };
+        let challenge_json = serde_json::to_value(&challenge).unwrap();
+        assert!(challenge_json.get("remote_view").is_none());
+        assert!(
+            identity_device_auth_transcript(&challenge, &"11".repeat(32))
+                .starts_with(b"aw-user-device-auth-v2\0")
         );
     }
 }

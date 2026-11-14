@@ -48,6 +48,7 @@ mod planner;
 mod policy_admission;
 mod provider_credentials;
 mod remote_start;
+mod remote_view;
 mod resources;
 #[cfg(all(feature = "pipelines", feature = "routing"))]
 mod reviews;
@@ -135,6 +136,7 @@ pub use policy_admission::{
     PolicyAdmissionFact, PolicyAdmissionRequest, PolicyAdmissionState, PolicyGuardianJournal,
 };
 pub use provider_credentials::*;
+pub use remote_view::*;
 pub use resources::{
     AwNetPeerInfo, DomainFederationInfo, DomainInfo, FederationLeaseInfo, FleetInfo,
     FleetMemberInfo, FleetOperationInfo, FleetOperationMemberInfo, FleetOperationSnapshot,
@@ -221,8 +223,9 @@ pub const GUARDIAN_REVIEW_SCHEMA: &str = include_str!("../migrations/032_guardia
 pub const PIPELINE_SCHEDULE_SCHEMA: &str = include_str!("../migrations/033_pipeline_schedules.sql");
 pub const SHARED_SESSION_PARTICIPATION_SCHEMA: &str =
     include_str!("../migrations/034_shared_session_participation.sql");
+pub const REMOTE_VIEW_TRUST_SCHEMA: &str = include_str!("../migrations/035_remote_view_trust.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 34;
+const LATEST_SCHEMA_VERSION: i64 = 35;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2513,6 +2516,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 33 {
         migrate_shared_session_participation(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 34 {
+        migrate_remote_view_trust(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -2549,6 +2556,35 @@ fn add_coordination_column_if_missing(
     }
     let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
     db(c.execute_batch(&statement))?;
+    Ok(())
+}
+
+fn migrate_remote_view_trust(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='workspace-views-remote-view-trust',generation=generation+1,
+             target_epoch=35,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(REMOTE_VIEW_TRUST_SCHEMA))?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |r| r.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "remote-view trust migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.commit())?;
     Ok(())
 }
 

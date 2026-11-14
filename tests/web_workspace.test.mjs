@@ -61,6 +61,8 @@ async function wsSettleFile(fixture, documentId, value) {
 test('shipping workspace capabilities admit only launch Files and opaque known Git scopes', async () => {
   const f = wsFixture(), files = f.state.openContainer('files'), git = f.state.openContainer('git');
   assert.notEqual(files, git);
+  assert.equal(f.state.getContainer(files).navigator.view, 'tree');
+  assert.equal(f.state.getContainer(git).navigator.view, 'list');
   assert.equal(f.state.getContainer(files).scope_id, 'launch-scope');
   assert.throws(() => f.state.openContainer('files', '/tmp/forged'), /authorized/);
   assert.throws(() => f.state.openContainer('git', 'unknown'), /authorized/);
@@ -290,6 +292,72 @@ test('source replacement clears same-named scopes, pending data and metadata bef
   assert.equal(await reading, false);
   assert.equal(f.state.getDocument(fresh).data, null);
   await wsSettleFile(f, fresh, 'new source');
+});
+
+test('delegated document survives ordinary source replacement and cannot move into a navigator scope', async () => {
+  const f = wsFixture(), owner = f.state.openContainer('files');
+  const ordinary = f.state.openFile(owner, 'src/lib.rs'); await wsSettleFile(f, ordinary, 'ordinary bytes');
+  const calls = [];
+  const reader = (body, options) => new Promise((resolve, reject) => calls.push({ body, ...options, resolve, reject }));
+  const target = { source_id: 'delegated-source', scope_id: 'delegated-scope', path: 'src/lib.rs' };
+  const delegated = f.state.openDelegatedDocument('file', target, reader, 'delegated-surface:ticket-a:1');
+  assert.equal(f.state.getDocument(delegated).delegated, true);
+  assert.equal(f.state.getDocument(delegated).containerId, null);
+  const loading = f.state.refreshDocument(delegated), call = calls.at(-1);
+  call.resolve({ source_id: target.source_id, scope_id: target.scope_id,
+    result: { context: target.scope_id, path: target.path, text: 'delegated bytes', read_only: true } });
+  assert.equal(await loading, true);
+  const held = f.state.getDocument(delegated).data;
+  f.state.setSource(wsSource('replacement-owner'));
+  assert.equal(f.state.getDocument(ordinary), null);
+  assert.equal(f.state.getDocument(delegated).data, held, 'independent grant survives owner navigator replacement');
+  const replacement = f.state.openContainer('files');
+  assert.throws(() => f.state.moveDocument(delegated, replacement), /delegated document/);
+});
+
+test('delegated grant denial scrubs only that authority lifetime for the same exact File', async () => {
+  const f = wsFixture(), owner = f.state.openContainer('files');
+  const ordinary = f.state.openFile(owner, 'src/lib.rs'); await wsSettleFile(f, ordinary, 'owner bytes');
+  const target = { source_id: 'delegated-source', scope_id: 'delegated-scope', path: 'src/lib.rs' };
+  const aCalls = [], bCalls = [];
+  const deferred = calls => (body, options) => new Promise((resolve, reject) => calls.push({ body, ...options, resolve, reject }));
+  const a = f.state.openDelegatedDocument('file', target, deferred(aCalls), 'delegated-surface:ticket-a:1');
+  const b = f.state.openDelegatedDocument('file', target, deferred(bCalls), 'delegated-surface:ticket-b:2');
+  assert.notEqual(a, b, 'same resource under distinct grants is never deduplicated');
+  const ar = f.state.refreshDocument(a), br = f.state.refreshDocument(b);
+  for (const [call, value] of [[aCalls[0], 'grant A bytes'], [bCalls[0], 'grant B bytes']]) {
+    call.resolve({ source_id: target.source_id, scope_id: target.scope_id,
+      result: { context: target.scope_id, path: target.path, text: value, read_only: true } });
+  }
+  assert.equal(await ar, true); assert.equal(await br, true);
+  assert.equal(f.state.getDocument(a).data.text, 'grant A bytes');
+  assert.equal(f.state.getDocument(b).data.text, 'grant B bytes');
+  const denied = f.state.refreshDocument(a), deniedCall = aCalls.at(-1);
+  deniedCall.reject(Object.assign(new Error('grant revoked'), { status: 403 }));
+  assert.equal(await denied, false);
+  assert.equal(f.state.getDocument(a).data, null);
+  assert.equal(f.state.getDocument(a).unavailable, true);
+  assert.equal(f.state.getDocument(b).data.text, 'grant B bytes');
+  assert.equal(f.state.getDocument(ordinary).data.text, 'owner bytes');
+  assert.equal(f.state.getDocument(b).unavailable, false);
+});
+
+test('delegated authentication expiry scrubs every ordinary and delegated browser cache', async () => {
+  const f = wsFixture(), owner = f.state.openContainer('files');
+  const ordinary = f.state.openFile(owner, 'src/lib.rs'); await wsSettleFile(f, ordinary, 'owner bytes');
+  const target = { source_id: 'delegated-source', scope_id: 'delegated-scope', path: 'src/lib.rs' };
+  const calls = [];
+  const reader = (body, options) => new Promise((resolve, reject) => calls.push({ body, ...options, resolve, reject }));
+  const delegated = f.state.openDelegatedDocument('file', target, reader, 'delegated-surface:ticket-auth:3');
+  const first = f.state.refreshDocument(delegated);
+  calls[0].resolve({ source_id: target.source_id, scope_id: target.scope_id,
+    result: { context: target.scope_id, path: target.path, text: 'delegated bytes', read_only: true } });
+  assert.equal(await first, true);
+  const expired = f.state.refreshDocument(delegated);
+  calls.at(-1).reject(Object.assign(new Error('browser expired'), { status: 401 }));
+  assert.equal(await expired, false);
+  assert.deepEqual(f.state.listDocuments(), []);
+  assert.deepEqual(f.state.listContainers(), []);
 });
 
 test('typed scope denial scrubs all matching scope data and derived labels before abort, preserving another scope', async () => {

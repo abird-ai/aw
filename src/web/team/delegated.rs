@@ -8,7 +8,7 @@
 use super::*;
 use crate::sessions::branch_view::{Reader, Target as AgentTarget};
 #[cfg(feature = "surfaces")]
-use crate::web::surface_read;
+use crate::web::{dock::Presentation, surface_read};
 use axum::body::to_bytes;
 use serde::{de::DeserializeOwned, Deserialize};
 use std::collections::BTreeMap;
@@ -112,6 +112,8 @@ struct Ticket {
     authority_store_id: String,
     source_epoch: String,
     resource: TicketResource,
+    #[cfg(feature = "surfaces")]
+    presentation: Option<Presentation>,
     binding: delegation::Binding,
     grant_id: String,
     grant_generation: u64,
@@ -166,6 +168,8 @@ struct PrepareSurface {
     path: Option<String>,
     #[serde(default)]
     review_id: Option<String>,
+    #[serde(default)]
+    presentation: Option<Presentation>,
 }
 
 #[derive(Deserialize)]
@@ -515,6 +519,41 @@ fn revalidate_grant(owner: &Entry, ticket: &Ticket) -> ApiResult<delegation::Wit
     Ok(witness)
 }
 
+#[cfg(feature = "surfaces")]
+async fn revalidate_surface_presentation(owner: &Entry, ticket: &Ticket) -> ApiResult<()> {
+    let Some(presentation) = ticket.presentation.as_ref() else {
+        return Ok(());
+    };
+    let target = match &ticket.resource {
+        TicketResource::Surface(target) => target,
+        TicketResource::Agent(_) => {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "delegated resource is not a Surface view",
+            ))
+        }
+    };
+    if !matches!(&target.resource, surface_read::Resource::File { .. }) {
+        return Ok(());
+    }
+    let host = owner.delegated_surface.as_ref().ok_or(ApiError(
+        StatusCode::FORBIDDEN,
+        "delegated Surface source is not enabled for this owner",
+    ))?;
+    let projected = surface_read::read_with_host(&owner.app, host.clone(), target).await?;
+    let text = projected["result"]["text"].as_str().ok_or(ApiError(
+        StatusCode::CONFLICT,
+        "delegated File snapshot changed",
+    ))?;
+    if !presentation.matches_file_text(text) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "delegated File content changed",
+        ));
+    }
+    surface_read::current_with_host(&owner.app, host, target)
+}
+
 async fn register(team: &TeamState, entry: &Entry, request: Request) -> ApiResult<Response> {
     let _: Empty = body(request).await?;
     let (_, store_id, source_epoch) = store_and_epoch(entry)?;
@@ -620,6 +659,8 @@ async fn prepare(team: &TeamState, entry: &Entry, request: Request) -> ApiResult
         authority_store_id: target.store_id.clone(),
         source_epoch: request.source_epoch,
         resource: TicketResource::Agent(target),
+        #[cfg(feature = "surfaces")]
+        presentation: None,
         binding,
         grant_id: issued.id.clone(),
         grant_generation: issued.generation,
@@ -681,6 +722,7 @@ async fn prepare_surface(team: &TeamState, entry: &Entry, request: Request) -> A
             "invalid delegated Surface descriptor",
         ));
     }
+    let presentation = request.presentation;
     let resource = match request.kind.as_str() {
         "file" => match (request.path, request.review_id) {
             (Some(path), None) => surface_read::Resource::File { path },
@@ -711,6 +753,15 @@ async fn prepare_surface(team: &TeamState, entry: &Entry, request: Request) -> A
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "invalid delegated Surface resource",
+        ));
+    }
+    if presentation
+        .as_ref()
+        .is_some_and(|state| !state.valid_for(&resource))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid delegated Surface presentation",
         ));
     }
     let recipient = team_entry(team, &request.recipient_id)?.clone();
@@ -745,7 +796,21 @@ async fn prepare_surface(team: &TeamState, entry: &Entry, request: Request) -> A
     ))?;
     // Prove the exact retained resource exists before issuing a grant. These
     // bytes remain owner-side; only the capability binding is returned.
-    let _ = surface_read::read_with_host(&entry.app, host.clone(), &target).await?;
+    let projected = surface_read::read_with_host(&entry.app, host.clone(), &target).await?;
+    if let (surface_read::Resource::File { .. }, Some(state)) =
+        (&target.resource, presentation.as_ref())
+    {
+        let text = projected["result"]["text"].as_str().ok_or(ApiError(
+            StatusCode::CONFLICT,
+            "delegated File snapshot changed",
+        ))?;
+        if !state.matches_file_text(text) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "delegated File content changed before delegation",
+            ));
+        }
+    }
     let (store, parent) = surface_parent(entry, &target, &request.source_epoch)?;
     if store.store_id().map_err(api_error)? != request.store_id {
         return Err(ApiError(
@@ -777,6 +842,7 @@ async fn prepare_surface(team: &TeamState, entry: &Entry, request: Request) -> A
         authority_store_id: request.store_id,
         source_epoch: request.source_epoch,
         resource: TicketResource::Surface(target),
+        presentation,
         binding,
         grant_id: issued.id.clone(),
         grant_generation: issued.generation,
@@ -903,14 +969,18 @@ async fn receive(
             descriptor
         }
     };
-    Ok(Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "window_id": id,
         "window_proof": proof,
         "ticket": request.ticket,
         "resource": resource,
         "grant_generation": ticket.grant_generation.to_string(),
-    }))
-    .into_response())
+    });
+    #[cfg(feature = "surfaces")]
+    if let Some(presentation) = ticket.presentation.as_ref() {
+        response["presentation"] = serde_json::json!(presentation);
+    }
+    Ok(Json(response).into_response())
 }
 
 async fn read_agent(team: &TeamState, entry: &Entry, request: Request) -> ApiResult<Response> {
@@ -1093,6 +1163,10 @@ async fn accept(
     let (ticket, owner) = ticket_for_recipient(team, entry, &request)?;
     ensure_kind(&ticket, expected)?;
     revalidate_grant(&owner, &ticket)?;
+    #[cfg(feature = "surfaces")]
+    if matches!(expected, RouteKind::Surface) {
+        revalidate_surface_presentation(&owner, &ticket).await?;
+    }
     let mut registry = lock(&team.0.delegated);
     prune(&mut registry);
     let held = registry.tickets.get_mut(&request.ticket).ok_or(ApiError(
@@ -1249,6 +1323,10 @@ async fn release(
     let (ticket, _) = ticket_for_owner(team, entry, &request)?;
     ensure_kind(&ticket, expected)?;
     let witness = revalidate_grant(entry, &ticket)?;
+    #[cfg(feature = "surfaces")]
+    if matches!(expected, RouteKind::Surface) {
+        revalidate_surface_presentation(entry, &ticket).await?;
+    }
     let (store, parent) = ticket_parent(entry, &ticket)?;
     let grants = lock(&entry.app.0.delegation);
     grants

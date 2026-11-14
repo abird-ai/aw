@@ -71,7 +71,7 @@ view never implicitly stops an Agent or PTY.
   registered Reader behind another shared Mutex. Keep admission/receipt/State,
   PTY/lease/queue locks and single-owner caches until measurements justify a
   different design.
-- Remote views remain unavailable until their exact authority/lifetime tests pass.
+- Shipping remote views remain unavailable. The current uncommitted tree now has the schema-v35 exact device/user/Domain/Machine/Workspace authority, expiry/revoke/reconnect tests and protected AwNet Files/Git read protocol documented in [REMOTE-DEVICE-TRUST.md](REMOTE-DEVICE-TRUST.md); V1.5 product target/root-worktree integration plus real two-node and live presentation acceptance remain required.
 
 ## Scoped native Files containers
 

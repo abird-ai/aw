@@ -1,6 +1,8 @@
 //! Explicit invite-only team launch. Does not run from ordinary `aw` startup.
 //! Host configuration determines identities and accounts, never browser JSON.
-//! First slice: private per-principal conversations, no tools or human surfaces.
+//! Private per-principal conversations remain tool/surface-free by default. A
+//! trusted config may separately opt a participant into human read-only
+//! File/Review delegation without granting that authority to the Agent.
 use aw::{
     AccountDescriptor, AccountOwner, Agent, AgentOptions, BillingOwner, CredentialCustody, Error,
     PrincipalId, Result,
@@ -69,6 +71,11 @@ struct MemberConfig {
     device_links: Vec<PathBuf>,
     default_account: String,
     default_model: String,
+    /// Explicitly let this participant browse the trusted Team directory as a
+    /// read-only delegated source and grant exact File/Review views to another
+    /// participant. This never grants tools, terminals or a recipient root.
+    #[serde(default)]
+    delegate_workspace_views: bool,
     #[serde(default)]
     resume: Option<Resume>,
 }
@@ -131,6 +138,16 @@ fn prepare(path: &Path, provider_config: Option<&Path>) -> Result<Prepared> {
     {
         return Err(Error::Config(
             "team needs version1, absolute roots and timeout 1..600 seconds".into(),
+        ));
+    }
+    #[cfg(not(feature = "surfaces"))]
+    if cfg
+        .participants
+        .iter()
+        .any(|member| member.delegate_workspace_views)
+    {
+        return Err(Error::Config(
+            "delegate_workspace_views requires the surfaces feature".into(),
         ));
     }
     cfg.directory = cfg.directory.canonicalize()?;
@@ -346,6 +363,7 @@ pub(crate) fn run_command(command: Command) -> Result<u8> {
             let members=prepared.config.participants.iter().map(|m| Ok(serde_json::json!({
                 "id":m.id,"principal":prepared.roster.principal(&m.id).map_err(|_|Error::Denied("invalid roster"))?,
                 "default_account":m.default_account,"default_model":m.default_model,
+                "delegate_workspace_views":m.delegate_workspace_views,
                 "shared_accounts":m.shared_profiles,"personal_accounts":prepared.links[&m.id].iter().map(|l|&l.account_id).collect::<Vec<_>>()
             }))).collect::<Result<Vec<_>>>()?;
             super::print_json(
@@ -364,6 +382,8 @@ pub(crate) fn run_command(command: Command) -> Result<u8> {
             let store = open_store(&prepared.config)?;
             super::runtime()?.block_on(async move {
                 let mut runtimes=Vec::new();let mut listeners=Vec::new();
+                #[cfg(feature = "surfaces")]
+                let mut delegated_surfaces=Vec::new();
                 let mut common_providers: BTreeMap<String,Arc<dyn Provider>>=BTreeMap::new();
                 for (id,p) in &prepared.profiles {
                     common_providers.insert(id.clone(),Arc::new(aw::provider::LazyHttpProvider::new(p.clone(),Duration::from_secs(prepared.config.timeout_seconds))?));
@@ -390,8 +410,28 @@ pub(crate) fn run_command(command: Command) -> Result<u8> {
                     let binding=binding(&prepared,member)?;
                     let persistence=if let Some(resume)=&member.resume {
                         if store.session(&actor,&resume.session_id)?.owner!=actor {return Err(Error::Denied("participant can resume only its own private sessions"));}
-                        aw::sessions::PersistentSession::open(store.clone(),actor,binding,&resume.session_id,&resume.branch,resume.allow_context_transfer)?
-                    }else{aw::sessions::PersistentSession::create(store.clone(),actor,binding,"Private participant conversation")?};
+                        aw::sessions::PersistentSession::open(store.clone(),actor.clone(),binding,&resume.session_id,&resume.branch,resume.allow_context_transfer)?
+                    }else{aw::sessions::PersistentSession::create(store.clone(),actor.clone(),binding,"Private participant conversation")?};
+                    #[cfg(feature = "surfaces")]
+                    if member.delegate_workspace_views {
+                        delegated_surfaces.push(aw::web::team::DelegatedSurfaceSource {
+                            participant_id: member.id.clone(),
+                            options: aw::web::WorkspaceOptions {
+                                root: prepared.config.directory.clone(),
+                                git: std::env::var_os("AW_GIT")
+                                    .map(PathBuf::from)
+                                    .or_else(|| option_env!("AW_DEFAULT_GIT").map(PathBuf::from))
+                                    .unwrap_or_else(|| PathBuf::from("/usr/bin/git")),
+                                bash: std::env::var_os("AW_BASH")
+                                    .map(PathBuf::from)
+                                    .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from))
+                                    .unwrap_or_else(|| PathBuf::from("/bin/bash")),
+                                actor: actor.as_str().to_owned(),
+                                allow_terminals: false,
+                                sites: Vec::new(),
+                            },
+                        });
+                    }
                     runtimes.push(aw::web::team::ParticipantRuntime{participant_id:member.id.clone(),agent,persistence});
                 }
                 let stop=CancellationToken::new();let watcher_stop=stop.clone();
@@ -411,6 +451,13 @@ pub(crate) fn run_command(command: Command) -> Result<u8> {
                 });
                 let mut tasks=Vec::new();for listener in listeners {let token=stop.clone();tasks.push(tokio::spawn(async move {listener.run(token).await}));}
                 let stopping=stop.clone();
+                #[cfg(feature = "surfaces")]
+                let result=if delegated_surfaces.is_empty() {
+                    aw::web::team::serve(prepared.roster,runtimes,listen,async move {tokio::select!{_ = super::interrupt()=>{},_ = stopping.cancelled()=>{}}}).await
+                } else {
+                    aw::web::team::serve_with_delegated_surfaces(prepared.roster,runtimes,delegated_surfaces,listen,async move {tokio::select!{_ = super::interrupt()=>{},_ = stopping.cancelled()=>{}}}).await
+                };
+                #[cfg(not(feature = "surfaces"))]
                 let result=aw::web::team::serve(prepared.roster,runtimes,listen,async move {tokio::select!{_ = super::interrupt()=>{},_ = stopping.cancelled()=>{}}}).await;
                 stop.cancel();watcher.abort();
                 for mut task in tasks {if tokio::time::timeout(Duration::from_secs(6),&mut task).await.is_err(){task.abort();let _=task.await;}}
@@ -445,6 +492,7 @@ mod tests {
                 device_links: vec![],
                 default_account: "team-local".into(),
                 default_model: "fixture".into(),
+                delegate_workspace_views: false,
                 resume: None,
             }],
         }
@@ -493,6 +541,22 @@ mod tests {
         let c = config();
         let other: TeamConfig = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(other.participants[0].default_account, "team-local");
+        assert!(!other.participants[0].delegate_workspace_views);
+    }
+    #[test]
+    fn delegated_workspace_source_is_explicit_opt_in_and_version1_compatible() {
+        let mut legacy = serde_json::to_value(config()).unwrap();
+        legacy["participants"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("delegate_workspace_views");
+        let legacy: TeamConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.participants[0].delegate_workspace_views);
+
+        let base = config();
+        let mut delegated = base.clone();
+        delegated.participants[0].delegate_workspace_views = true;
+        assert_ne!(digest(&base).unwrap(), digest(&delegated).unwrap());
     }
     #[test]
     fn configuration_fingerprint_changes_when_member_removed() {

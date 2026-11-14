@@ -1381,7 +1381,7 @@ Active. Canonical checklist: [workspace-views/TODO.md](../plans/workspace-views/
 - **Pending · Uncommitted:** Evaluate left-right publication only at measured read-heavy shared ownership seams; benchmark before migrating locks and drop guards before render/I/O/await.
 - **Pending · Tests and verification:** Further native narrow/maximize, modal-focus and child-PTY acceptance, plus docking-specific checks when implemented — remain open beyond this checkpoint.
 - **Pending · Tests and verification:** Windows scoped-directory and DirectoryIdentity filesystem tests — execute on an actual Windows host; reparse-point case requires symlink privilege or Developer Mode. Compilation does not supply this runtime result.
-- **Pending · Deferred:** Remote views — remain unavailable until exact machine/member/revision/expiry/offline tests exist; no local fallback or execution retargeting.
+- **Pending · Deferred:** Shipping remote views — current uncommitted schema-v35 backend now pins exact device/user/Domain policy+security/Machine/Workspace revision, expiry/revoke/reconnect authority and protects AwNet Files/Git `View*` reads; product target/root-worktree integration, production-authorized two-node continuity acceptance, remote Agent/member views and offline/live presentation gates remain. No local fallback or execution retargeting.
 
 ### Remaining native and browser UX convergence
 

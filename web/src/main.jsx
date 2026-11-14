@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, lazy, on, onCleanup, onMount, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack } from "solid-js";
 import { render } from "solid-js/web";
 import { api, workspaceAction } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
@@ -8,16 +8,29 @@ import { AgentViewPanel } from "./agent-view-panel.jsx";
 import { createAgentViews } from "./agent-views.js";
 import { createWorkspaceViews } from "./workspace-views.js";
 import {
-  createAgentDocking, createDocumentDocking, takeAgentDockTicket, takeDocumentDockTicket,
+  createAgentDocking, createDelegatedSurfaceDocking, createDocumentDocking,
+  takeAgentDockTicket, takeDelegatedSurfaceDockTicket, takeDocumentDockTicket,
 } from "./document-docking.js";
 import { applyThemePreference, finishBoot } from "./theme.js";
+import { BuildLayout, TerminalPane } from "./terminal-layout.jsx";
 
-const CodeFile = lazy(() =>
-  import("./code-surface.jsx").then(module => ({ default: module.CodeFile }))
-);
-const CodeDiff = lazy(() =>
-  import("./code-surface.jsx").then(module => ({ default: module.CodeDiff }))
-);
+let codeSurfaceModule = null;
+let codeSurfaceLoad = null;
+async function preloadCodeSurfaces() {
+  if (codeSurfaceModule) return codeSurfaceModule;
+  codeSurfaceLoad ||= import("./code-surface.jsx")
+    .then(module => codeSurfaceModule = module)
+    .catch(error => { codeSurfaceLoad = null; throw error; });
+  return codeSurfaceLoad;
+}
+function CodeFile(props) {
+  const Component = codeSurfaceModule?.CodeFile;
+  return Component ? <Component {...props} /> : null;
+}
+function CodeDiff(props) {
+  const Component = codeSurfaceModule?.CodeDiff;
+  return Component ? <Component {...props} /> : null;
+}
 import { acceptDelta, acceptSnapshot, accountChoices, canSend, draftTargetChanged, isSubmitKey, needsDraftPublicationConsent, submission } from "../model.js";
 import "./styles.css";
 
@@ -272,7 +285,9 @@ function CommandBar(props) {
             key: "tab:" + tab.id,
             label: tab.title,
             meta: "Window · " + (tab.path || "Agent"),
-            icon: tab.kind === "chat" || tab.kind === "agent-view" ? "chat" : tab.kind === "review" ? "git" : "file",
+            icon: tab.kind === "chat" || tab.kind === "agent-view" ? "chat"
+              : tab.kind === "review" || tab.kind === "git-container" ? "git"
+              : tab.kind === "build-layout" ? "command" : "file",
             target: tab.id === "chat" ? "chat" : "tab",
             run: () => props.activateTab(tab.id),
           });
@@ -430,8 +445,13 @@ function CommandBar(props) {
 
   return (
     <>
-      <button class="command-bar" ref={launcher} onClick={show} aria-haspopup="dialog" aria-expanded={open()} aria-label="Open Command Palette">
-        <Icon name="search" size={14} /><span class="command-label">Search or run a command…</span><kbd>Ctrl K</kbd>
+      <button class={props.compact ? "palette-launcher" : "command-bar"} ref={launcher} onClick={show}
+        aria-haspopup="dialog" aria-expanded={open()} aria-label="Open Command Palette"
+        title={props.compact ? "Command Palette · Ctrl+Shift+P / F1" : undefined}>
+        <Icon name="search" size={14} />
+        <Show when={!props.compact}>
+          <span class="command-label">Search or run a command…</span><kbd>Ctrl K</kbd>
+        </Show>
       </button>
       <Show when={open()}>
         <dialog class="command-palette" aria-modal="true" aria-labelledby="command-title"
@@ -653,7 +673,7 @@ function FilesNavigator(props) {
     await props.controller.loadNavigator(props.id, { op: "files", path });
   }
 
-  onMount(() => load(""));
+  onMount(() => { if (!props.passive) void load(""); });
   onCleanup(() => { request = {}; clearTimeout(timer); });
 
   createEffect(() => {
@@ -661,7 +681,7 @@ function FilesNavigator(props) {
     clearTimeout(timer);
     const token = request = {};
     setAppliedQuery("");
-    if (!value) return;
+    if (props.passive || !value) return;
     timer = setTimeout(async () => {
       const accepted = await props.controller.loadNavigator(props.id, { op: "file_search", query: value, limit: 120 });
       if (accepted && token === request) setAppliedQuery(value);
@@ -735,14 +755,16 @@ function FilesNavigator(props) {
   }
 
   return (
-    <div class="navigator">
-      <div class="navigator-toolbar">
-        <NavigatorSearch value={query()} onInput={setQuery} placeholder="Search files" />
-        <ViewToggle value={view()} onChange={setView} />
-        <button class="mini-icon" onClick={refreshFiles} title="Refresh files" aria-label="Refresh files">
-          <Icon name="refresh" size={13} />
-        </button>
-      </div>
+    <div class={"navigator " + (props.passive ? "passive-navigator" : "")}>
+      <Show when={!props.passive}>
+        <div class="navigator-toolbar">
+          <NavigatorSearch value={query()} onInput={setQuery} placeholder="Search files" />
+          <ViewToggle value={view()} onChange={setView} />
+          <button class="mini-icon" onClick={refreshFiles} title="Refresh files" aria-label="Refresh files">
+            <Icon name="refresh" size={13} />
+          </button>
+        </div>
+      </Show>
       <div class="navigator-caption">
         <span title={props.state?.label}>Files · {props.state?.label || "Unavailable"}</span>
         <Show when={searching()}><span class="navigator-status">searching…</span></Show>
@@ -813,7 +835,7 @@ function GitNavigator(props) {
   createEffect(() => {
     const nextMode = mode();
     context();
-    if (!untrack(unavailable)) void load(nextMode);
+    if (!props.passive && !untrack(unavailable)) void load(nextMode);
   });
 
   const items = createMemo(() => {
@@ -911,30 +933,32 @@ function GitNavigator(props) {
   }
 
   return (
-    <div class="navigator">
-      <div class="git-mode-row">
-        <div class="segmented git-modes" role="tablist" aria-label="Git view">
-          <For each={[["changes", "Changes"], ["worktrees", "Worktrees"], ["branches", "Branches"]]}>
-            {entry => (
-              <button
-                class={mode() === entry[0] ? "active" : ""}
-                onClick={() => setMode(entry[0])}
-                role="tab"
-                aria-selected={mode() === entry[0]}
-              >
-                {entry[1]}
-              </button>
-            )}
-          </For>
+    <div class={"navigator " + (props.passive ? "passive-navigator" : "")}>
+      <Show when={!props.passive}>
+        <div class="git-mode-row">
+          <div class="segmented git-modes" role="tablist" aria-label="Git view">
+            <For each={[["changes", "Changes"], ["worktrees", "Worktrees"], ["branches", "Branches"]]}>
+              {entry => (
+                <button
+                  class={mode() === entry[0] ? "active" : ""}
+                  onClick={() => setMode(entry[0])}
+                  role="tab"
+                  aria-selected={mode() === entry[0]}
+                >
+                  {entry[1]}
+                </button>
+              )}
+            </For>
+          </div>
+          <ViewToggle value={view()} onChange={setView} />
         </div>
-        <ViewToggle value={view()} onChange={setView} />
-      </div>
-      <div class="navigator-toolbar git-toolbar">
-        <NavigatorSearch value={query()} onInput={setQuery} placeholder={"Search " + mode()} />
-        <button class="mini-icon" onClick={() => void props.controller.refreshNavigator(props.id)} title="Refresh Git" aria-label="Refresh Git">
-          <Icon name="refresh" size={13} />
-        </button>
-      </div>
+        <div class="navigator-toolbar git-toolbar">
+          <NavigatorSearch value={query()} onInput={setQuery} placeholder={"Search " + mode()} />
+          <button class="mini-icon" onClick={() => void props.controller.refreshNavigator(props.id)} title="Refresh Git" aria-label="Refresh Git">
+            <Icon name="refresh" size={13} />
+          </button>
+        </div>
+      </Show>
       <div class="navigator-caption git-context">
         <span class="branch-pill" title={props.state?.label}><Icon name="branch" size={11} />{inventory().branch || props.state?.label || "Unavailable"}</span>
         <Show when={loading()}><span class="navigator-status">refreshing…</span></Show>
@@ -1016,6 +1040,159 @@ function GitNavigator(props) {
       <Show when={!items().length && !loading()}>
         <div class="navigator-empty">{query() ? "No matching Git items" : "Nothing to show."}</div>
       </Show>
+    </div>
+  );
+}
+
+function ReviewLayout(props) {
+  const maximized = () => props.maximized?.() || null;
+  const review = () => props.review?.() || null;
+  const data = () => review()?.data || null;
+  const active = () => Boolean(props.active?.());
+
+  return (
+    <div class="review-layout" hidden={!active()}>
+      <div class={"review-grid " + (maximized() ? "max-" + maximized() : "")}>
+        <section class="review-pane review-agent-pane" hidden={maximized() && maximized() !== "agent"}>
+          <div class="pane-bar">
+            <span><span class="review-status-dot" /> {props.agentTitle?.() || "Agent"} · Agent</span>
+            <button class="pane-icon" type="button" onClick={() => props.toggleMax("agent")}
+              aria-label={maximized() === "agent" ? "Restore Agent pane" : "Maximize Agent pane"}>
+              <span aria-hidden="true">{maximized() === "agent" ? "❐" : "⛶"}</span>
+            </button>
+          </div>
+          <div class="review-agent-scroll">
+            <For each={props.snapshot?.()?.turns || []}>{turn => <>
+              <Message role="user" text={turn.prompt} />
+              <Message role="assistant" text={turn.answer} outcome={turn.outcome} tools={turn.tool_records}
+                showTools={props.ui?.()?.show_tool_calls} showThinking={props.ui?.()?.show_thinking} />
+            </>}</For>
+            <Show when={!props.snapshot?.()?.turns?.length}>
+              <div class="review-pane-empty">Current Agent · same Session and draft. No duplicate runtime.</div>
+            </Show>
+          </div>
+          <form class="review-composer" onSubmit={event => { event.preventDefault(); void props.send(); }}>
+            <textarea value={props.prompt?.() || ""} placeholder="Message Agent…"
+              disabled={props.posting?.()}
+              onInput={event => props.setPrompt(event.currentTarget.value)}
+              onKeyDown={event => {
+                if (isSubmitKey(event)) { event.preventDefault(); void props.send(); }
+              }} />
+            <button class="send" type="submit" disabled={props.posting?.() || !String(props.prompt?.() || "").trim()}>Send ↑</button>
+          </form>
+        </section>
+
+        <section class="review-pane review-diff-pane" hidden={maximized() && maximized() !== "diff"}>
+          <div class="pane-bar">
+            <span>{data() ? "Diff · " + basename(data().path || "review") : "Diff"}</span>
+            <button class="pane-icon" type="button" onClick={() => props.toggleMax("diff")}
+              aria-label={maximized() === "diff" ? "Restore Diff pane" : "Maximize Diff pane"}>
+              <span aria-hidden="true">{maximized() === "diff" ? "❐" : "⛶"}</span>
+            </button>
+          </div>
+          <div class="review-diff-body">
+            <Show when={data()} fallback={
+              <div class="review-pane-empty">Select a change in Git to project its exact immutable Review here.</div>
+            }>
+              <CodeDiff review={data()} active={active()} onCheckAccess={() => Boolean(review()?.data)} />
+            </Show>
+          </div>
+        </section>
+
+        <section class="review-pane review-terminal-pane" hidden={maximized() && maximized() !== "terminal"}>
+          <div class="pane-bar">
+            <span><span class="terminal-status-dot" /> Terminal · local PTY</span>
+            <button class="pane-icon" type="button" onClick={() => props.toggleMax("terminal")}
+              aria-label={maximized() === "terminal" ? "Restore Terminal pane" : "Maximize Terminal pane"}>
+              <span aria-hidden="true">{maximized() === "terminal" ? "❐" : "⛶"}</span>
+            </button>
+          </div>
+          <TerminalPane enabled={props.terminals?.()} active={active} request={props.request} />
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceContainerPanel(props) {
+  const container = () => typeof props.container === "function" ? props.container() : props.container;
+  const document = () => typeof props.document === "function" ? props.document() : props.document || null;
+  const active = () => props.activeTab?.() === props.tabId;
+  const maximized = () => typeof props.maximized === "function" ? props.maximized() : props.maximized || null;
+  const kind = () => container()?.kind || "files";
+  const data = () => document()?.data || null;
+  const previewTitle = () => {
+    const value = data();
+    if (!value) return kind() === "files" ? "Preview" : "Diff preview";
+    const name = basename(value.path || value.file || "");
+    return kind() === "files" ? (name || "Preview") : "Diff · " + (name || "review");
+  };
+  const activePath = () => document()?.kind === "file" ? (document()?.target?.path || data()?.path || "") : "";
+
+  return (
+    <div class="contained-surface">
+      <div class={"contained-layout " + (maximized() ? "max-" + maximized() : "")}>
+        <section class="contained-pane contained-navigator-pane" hidden={maximized() === "preview"}>
+          <div class="pane-bar">
+            <span>{kind() === "files" ? "Explorer · Files" : "Changes · Git"}</span>
+            <div class="pane-actions">
+              <button class="pane-icon" type="button" onClick={() => props.toggleMax("navigator")}
+                aria-label={maximized() === "navigator" ? "Restore navigator pane" : "Maximize navigator pane"}
+                title={maximized() === "navigator" ? "Restore" : "Maximize"}>
+                <span aria-hidden="true">{maximized() === "navigator" ? "❐" : "⛶"}</span>
+              </button>
+            </div>
+          </div>
+          <div class="contained-pane-body navigator-pane-body">
+            <Show when={kind() === "files"}
+              fallback={<GitNavigator passive id={container()?.id} state={container()} controller={props.controller}
+                fail={props.fail} openReview={props.previewReview} />}>
+              <FilesNavigator passive id={container()?.id} state={container()} controller={props.controller}
+                fail={props.fail} openFile={props.previewFile} activePath={activePath()} />
+            </Show>
+          </div>
+        </section>
+
+        <section class="contained-pane contained-preview-pane" hidden={maximized() === "navigator"}>
+          <div class="pane-bar">
+            <span>{previewTitle()}</span>
+            <div class="pane-actions">
+              <Show when={document()}>
+                <button class="pane-icon" type="button" onClick={() => props.breakOut(document().id)}
+                  aria-label={document()?.kind === "review" ? "Break out Diff into a standalone tab" : "Break out File into a standalone tab"}
+                  title="Break out">
+                  <Icon name="popout" size={12} />
+                </button>
+              </Show>
+              <button class="pane-icon" type="button" onClick={() => props.toggleMax("preview")}
+                aria-label={maximized() === "preview" ? "Restore preview pane" : "Maximize preview pane"}
+                title={maximized() === "preview" ? "Restore" : "Maximize"}>
+                <span aria-hidden="true">{maximized() === "preview" ? "❐" : "⛶"}</span>
+              </button>
+            </div>
+          </div>
+          <div class="contained-pane-body preview-pane-body">
+            <Show when={document()} fallback={
+              <div class="contained-empty">
+                {kind() === "files"
+                  ? "Select a file to preview it here. Break out opens the exact same read-only document as a standalone tab."
+                  : "Select a changed file to preview its immutable diff here. Staging remains an explicit Git action."}
+              </div>
+            }>
+              <Show when={document()?.pending}><div class="document-state" role="status">Loading…</div></Show>
+              <Show when={document()?.error}><div class="document-state" role="status">{document().error}</div></Show>
+              <Show when={data()} fallback={<div class="contained-empty">{document()?.pending ? "" : "This preview is unavailable."}</div>}>
+                <Show when={document()?.kind === "file"} fallback={
+                  <CodeDiff review={data()} active={active()} onCheckAccess={() => Boolean(document()?.data)} />
+                }>
+                  <CodeFile text={data()?.text || ""} path={data()?.path || ""} active={active()}
+                    onCheckAccess={() => Boolean(document()?.data)} />
+                </Show>
+              </Show>
+            </Show>
+          </div>
+        </section>
+      </div>
     </div>
   );
 }
@@ -1805,6 +1982,7 @@ function App() {
   const [dockingDocument, setDockingDocument] = createSignal(null);
   const [dockingAgentView, setDockingAgentView] = createSignal(null);
   const [handoffLink, setHandoffLink] = createSignal(null);
+  const [delegatedDocumentLink, setDelegatedDocumentLink] = createSignal(null);
   const [agentHandoffLink, setAgentHandoffLink] = createSignal(null);
   const [pairedBrowserMode, setPairedBrowserMode] = createSignal(false);
   const [browserInvite, setBrowserInvite] = createSignal(null);
@@ -1813,15 +1991,22 @@ function App() {
   const [workspaceEnabled, setWorkspaceEnabled] = createSignal(false);
   const [tabs, setTabs] = createSignal([{ id: "chat", kind: "chat", title: "Agent" }]);
   const [activeTab, setActiveTab] = createSignal("chat");
+  const initialMode = (() => {
+    try { return localStorage.getItem("aw.presentation.mode") === "minimal" ? "minimal" : "workspace"; }
+    catch { return "workspace"; }
+  })();
+  const [appMode, setAppMode] = createSignal(initialMode);
   const [sidebarWidth, setSidebarWidth] = createSignal(
-    Math.min(520, Math.max(220, Number(localStorage.getItem("aw.sidebar.width")) || 286)),
+    Math.min(440, Math.max(240, Number(localStorage.getItem("aw.sidebar.width")) || 292)),
   );
+  let workspaceReturnTab = "chat";
   let resizingSidebar = false;
   let browserInviteExpiry;
   // The correlation fragment is removed from history before any API request.
   // It is held only in this renderer's memory, never browser storage.
   let pendingDockTicket = takeDocumentDockTicket(window.location, window.history);
-  let pendingAgentDockTicket = pendingDockTicket ? null : takeAgentDockTicket(window.location, window.history);
+  let pendingSurfaceDockTicket = pendingDockTicket ? null : takeDelegatedSurfaceDockTicket(window.location, window.history);
+  let pendingAgentDockTicket = pendingDockTicket || pendingSurfaceDockTicket ? null : takeAgentDockTicket(window.location, window.history);
   let source;
   let observationLifetime = {};
   let workspaceDiscoveryLifetime = {};
@@ -1838,8 +2023,17 @@ function App() {
   const [viewSource, setViewSource] = createSignal(null);
   const [workspaceChange, setWorkspaceChange] = createSignal(null);
   const [workspaceSource, setWorkspaceSource] = createSignal(null);
+  const [workspaceSourceMode, setWorkspaceSourceMode] = createSignal(null);
   const [workspaceToken, setWorkspaceToken] = createSignal({});
   const [selectedContainers, setSelectedContainers] = createSignal({ files: null, git: null });
+  const [containedDocuments, setContainedDocuments] = createSignal({});
+  const [brokenOutDocuments, setBrokenOutDocuments] = createSignal(new Set());
+  const [maximizedPanes, setMaximizedPanes] = createSignal({});
+  const [reviewMaximizedPane, setReviewMaximizedPane] = createSignal(null);
+  const [immersiveDocumentId, setImmersiveDocumentId] = createSignal(null);
+  let reviewDefaulted = false;
+  const containerTabId = containerId => "workspace-container-tab-" + containerId;
+  const containerTabKind = kind => kind === "git" ? "git-container" : "files-container";
   const presentationControllers = new Map();
   const bindPresentation = (documentId, controller) => {
     if (controller) presentationControllers.set(documentId, controller);
@@ -1848,45 +2042,178 @@ function App() {
   const workspaceViews = createWorkspaceViews({
     request: async (body, { signal }) => {
       const lifetime = observationLifetime;
-      try { return await workspaceAction(body, { signal }); }
-      catch (error) {
+      try {
+        return workspaceSourceMode() === "team-delegated"
+          ? await api("/api/team/delegation/surface/action", body, 15000, { signal })
+          : await workspaceAction(body, { signal });
+      } catch (error) {
         if (lifetime === observationLifetime && error.status === 401) expireBrowserAccess();
         throw error;
       }
     },
     externalDocumentCount: () => tabs().filter(tab => tab.kind !== "file" && tab.kind !== "review").length,
     onChange: event => untrack(() => {
-      if (event.type === "clear" || event.type === "source") presentationControllers.clear();
+      if (event.type === "clear") presentationControllers.clear();
       setWorkspaceChange({});
       const documents = workspaceViews.listDocuments();
       const live = new Set(documents.map(document => document.id));
+      const containers = workspaceViews.listContainers();
+      const liveContainers = new Set(containers.map(container => container.id));
+      for (const documentId of presentationControllers.keys()) if (!live.has(documentId)) presentationControllers.delete(documentId);
+      setContainedDocuments(current => Object.fromEntries(Object.entries(current).filter(
+        ([containerId, documentId]) => liveContainers.has(containerId) && live.has(documentId)
+          && workspaceViews.getDocument(documentId)?.containerId === containerId
+      )));
+      setBrokenOutDocuments(current => new Set([...current].filter(documentId => live.has(documentId))));
+      setMaximizedPanes(current => Object.fromEntries(Object.entries(current).filter(([containerId]) => liveContainers.has(containerId))));
+      const broken = brokenOutDocuments();
       setTabs(current => {
-        const kept = current.filter(tab => (tab.kind !== "file" && tab.kind !== "review") || live.has(tab.id));
+        const kept = current.filter(tab => {
+          if (tab.kind === "file" || tab.kind === "review") {
+            const document = workspaceViews.getDocument(tab.id);
+            return Boolean(document && (document.delegated || broken.has(tab.id)));
+          }
+          if (tab.kind === "files-container" || tab.kind === "git-container") return liveContainers.has(tab.containerId);
+          return true;
+        });
         for (const tab of current) if (!kept.includes(tab)) tabTargets.delete(tab.id);
         const present = new Set(kept.map(tab => tab.id));
-        return [...kept, ...documents.filter(document => !present.has(document.id))
-          .map(document => ({ id: document.id, kind: document.kind, title: document.kind === "file" ? "File" : "Diff" }))];
+        const containerTabs = containers.filter(container => !present.has(containerTabId(container.id))).map(container => ({
+          id: containerTabId(container.id), kind: containerTabKind(container.kind),
+          title: container.kind === "files" ? "Files" : "Git", containerId: container.id,
+        }));
+        const documentTabs = documents.filter(document => (document.delegated || broken.has(document.id)) && !present.has(document.id))
+          .map(document => ({ id: document.id, kind: document.kind, title: document.kind === "file" ? "File" : "Diff" }));
+        return [...kept, ...containerTabs, ...documentTabs];
       });
       if (activeTab().startsWith("workspace-document-") && !live.has(activeTab())) setActiveTab("chat");
-      const containers = workspaceViews.listContainers();
+      if (activeTab().startsWith("workspace-container-tab-")
+        && !liveContainers.has(activeTab().slice("workspace-container-tab-".length))) setActiveTab("chat");
+      const delegatedLink = delegatedDocumentLink();
+      if (delegatedLink && !live.has(delegatedLink.documentId)) setDelegatedDocumentLink(null);
+      const movingDocument = dockingDocument();
+      if (movingDocument && !live.has(movingDocument)) setDockingDocument(null);
       setSelectedContainers(current => Object.fromEntries(["files", "git"].map(kind => [kind,
         containers.some(container => container.id === current[kind] && container.kind === kind)
           ? current[kind] : containers.find(container => container.kind === kind)?.id || null])));
-      if (["clear", "source", "scope-denied", "refresh", "close-container"].includes(event.type)) setWorkspaceToken({});
-      if (event.type === "clear") {
+      if (["clear", "source", "source-clear", "scope-denied", "refresh", "close-container"].includes(event.type)) setWorkspaceToken({});
+      if (event.type === "clear" || event.type === "source-clear") {
         workspaceDiscoveryLifetime = {};
         setWorkspaceSource(null);
+        setWorkspaceSourceMode(null);
+        setWorkspaceEnabled(false);
       }
     }),
   });
   const workspaceContainers = createMemo(() => { workspaceChange(); return workspaceViews.listContainers(); });
   const workspaceDocumentIds = createMemo(() => { workspaceChange(); return workspaceViews.listDocuments().map(document => document.id); });
+  const workspaceStandaloneDocumentIds = createMemo(() => {
+    workspaceChange();
+    const broken = brokenOutDocuments();
+    return workspaceViews.listDocuments()
+      .filter(document => document.delegated || broken.has(document.id))
+      .map(document => document.id);
+  });
   const workspaceDocument = id => { workspaceChange(); return workspaceViews.getDocument(id); };
   const workspaceContainer = id => { workspaceChange(); return workspaceViews.getContainer(id); };
+  const reviewDocument = createMemo(() => {
+    workspaceChange();
+    const git = workspaceViews.listContainers().find(container => container.kind === "git");
+    if (!git) return null;
+    const documentId = containedDocuments()[git.id];
+    const document = documentId ? workspaceViews.getDocument(documentId) : null;
+    return document?.kind === "review" ? document : null;
+  });
+  createEffect(() => {
+    const ordinary = workspaceEnabled() && workspaceSourceMode() === "ordinary" && workspaceSource();
+    if (!ordinary) {
+      reviewDefaulted = false;
+      setReviewMaximizedPane(null);
+      setTabs(current => current.filter(tab => tab.id !== "review-layout" && tab.id !== "build-layout"));
+      if (activeTab() === "review-layout" || activeTab() === "build-layout") setActiveTab("chat");
+      return;
+    }
+    setTabs(current => current.some(tab => tab.id === "review-layout")
+      ? current
+      : [{ id: "review-layout", kind: "review-layout", title: "Review" }, ...current]);
+    if (!reviewDefaulted && activeTab() === "chat") {
+      reviewDefaulted = true;
+      setActiveTab("review-layout");
+    }
+    for (const kind of ["files", "git"]) {
+      if (workspaceContainers().some(container => container.kind === kind)) continue;
+      try { ensureWorkspaceContainer(kind); }
+      catch (error) { setError(error.message); }
+    }
+    const terminals = Boolean(workspaceSource()?.terminals);
+    setTabs(current => {
+      const withoutBuild = current.filter(tab => tab.id !== "build-layout");
+      return terminals
+        ? [...withoutBuild, { id: "build-layout", kind: "build-layout", title: "Build" }]
+        : withoutBuild;
+    });
+    if (!terminals && activeTab() === "build-layout") setActiveTab("review-layout");
+  });
+  async function workspaceTerminalRequest(body) {
+    try { return await workspaceAction(body); }
+    catch (error) {
+      if (error?.status === 401) expireBrowserAccess();
+      throw error;
+    }
+  }
+  function clearWorkspaceSource() {
+    workspaceViews.clearSource();
+    setWorkspaceSource(null);
+    setWorkspaceSourceMode(null);
+    setWorkspaceEnabled(false);
+  }
   function clearWorkspaceViews() {
     workspaceViews.clear();
     setWorkspaceSource(null);
+    setWorkspaceSourceMode(null);
     setWorkspaceEnabled(false);
+  }
+  const captureDocumentPresentation = documentId => presentationControllers.get(documentId)?.capture() || null;
+  const restoreDocumentPresentation = (documentId, state) => presentationControllers.get(documentId)?.restore(state) || false;
+  const isDocumentRendered = documentId => activeTab() === documentId
+    && Boolean(document.querySelector('.surface.code-surface:not([hidden]) .cm-editor'));
+  const delegatedSurfaceDocking = createDelegatedSurfaceDocking({
+    api: async (...args) => {
+      try { return await api(...args); }
+      catch (error) {
+        if (error?.status === 401) expireBrowserAccess();
+        throw error;
+      }
+    },
+    views: workspaceViews,
+    capture: captureDocumentPresentation,
+    restore: restoreDocumentPresentation,
+    isRendered: isDocumentRendered,
+    onProgress: (documentId, active) => setDockingDocument(active ? documentId : null),
+    onLinkReady: (documentId, url) => setDelegatedDocumentLink(current =>
+      url ? { documentId, url } : current?.documentId === documentId ? null : current),
+    onReceiveDocument: documentId => {
+      setActiveTab(documentId);
+      setMobileNav(false);
+    },
+  });
+  async function receivePendingSurfaceDock() {
+    if (!pendingSurfaceDockTicket || !paired()) return;
+    const ticket = pendingSurfaceDockTicket;
+    pendingSurfaceDockTicket = null;
+    if (!teamInfo()?.delegated_surface_receive) {
+      setError("This browser identity cannot receive delegated File/Review views. No view was opened.");
+      return;
+    }
+    try {
+      await preloadCodeSurfaces();
+      await delegatedSurfaceDocking.receive(ticket);
+    } catch (error) { setError(error.message); }
+  }
+  async function delegateWorkspaceDocument(documentId, recipientId) {
+    setError("");
+    try { return await delegatedSurfaceDocking.send(documentId, recipientId); }
+    catch (error) { setError(error.message); return false; }
   }
   const documentDocking = createDocumentDocking({
     api, views: workspaceViews,
@@ -1904,8 +2231,8 @@ function App() {
         }).catch(() => {});
       } catch {}
     },
-    capture: documentId => presentationControllers.get(documentId)?.capture() || null,
-    restore: (documentId, state) => presentationControllers.get(documentId)?.restore(state) || false,
+    capture: captureDocumentPresentation,
+    restore: restoreDocumentPresentation,
     currentOwner: () => {
       const scope = workspaceSource(), owner = snapshot();
       return scope && owner ? {
@@ -1923,8 +2250,7 @@ function App() {
     close: documentId => closeTab(documentId),
     popup: () => window.open("about:blank", "_blank"),
     onProgress: (documentId, active) => setDockingDocument(active ? documentId : null),
-    isRendered: documentId => activeTab() === documentId
-      && Boolean(document.querySelector('.surface.code-surface:not([hidden]) .cm-editor')),
+    isRendered: isDocumentRendered,
   });
   async function receivePendingDocumentDock() {
     if (!pendingDockTicket || !paired()) return;
@@ -1934,8 +2260,10 @@ function App() {
       setError("The original read-only workspace owner is unavailable here. No view was transferred.");
       return;
     }
-    try { await documentDocking.receive(ticket); }
-    catch (error) { setError(error.message); }
+    try {
+      await preloadCodeSurfaces();
+      await documentDocking.receive(ticket);
+    } catch (error) { setError(error.message); }
   }
   const agentViews = createAgentViews({
     read: async (target, { signal }) => {
@@ -2020,6 +2348,7 @@ function App() {
     clearWorkspaceViews();
     setBrowserInvite(null);
     setHandoffLink(null);
+    setDelegatedDocumentLink(null);
     setAgentHandoffLink(null);
     setDelegationRecipients([]);
     setPairedBrowserMode(false);
@@ -2058,7 +2387,7 @@ function App() {
   createEffect(on(() => snapshot()?.instance, (instance, previous) => {
     if (previous && instance !== previous) {
       clearAgentViews("Owner changed; reopen the read-only view.");
-      clearWorkspaceViews();
+      clearWorkspaceSource();
     }
   }));
 
@@ -2068,8 +2397,9 @@ function App() {
     tabs().find(tab => tab.id === activeTab()) || tabs()[0] || { id: "chat", kind: "chat", title: "Agent" }
   );
   const activeFilePath = containerId => {
-    const document = workspaceDocument(activeTab());
-    return document?.kind === "file" && document.containerId === containerId && document.data ? document.data.path : null;
+    const documentId = containedDocuments()[containerId];
+    const document = documentId ? workspaceDocument(documentId) : null;
+    return document?.kind === "file" && document.data ? document.data.path : null;
   };
   createEffect(() => {
     const id = activeTab();
@@ -2254,20 +2584,26 @@ function App() {
     const owner = snapshot()?.instance;
     const discovery = workspaceDiscoveryLifetime;
     try {
-      const value = await api("/api/workspace");
+      let value = await api("/api/workspace");
+      let mode = "ordinary";
+      if (!value?.enabled && teamInfo()?.delegated_surface_views) {
+        value = await api("/api/team/delegation/surface");
+        mode = "team-delegated";
+      }
       if (lifetime !== observationLifetime || discovery !== workspaceDiscoveryLifetime || owner !== snapshot()?.instance) return;
       const enabled = Boolean(value?.enabled);
       if (enabled) {
         if (value.instance !== owner) return;
         workspaceViews.setSource(value.capabilities);
-        setWorkspaceSource({ source_id: value.capabilities.source_id, view_root: value.capabilities.view_root });
-      } else clearWorkspaceViews();
+        setWorkspaceSourceMode(mode);
+        setWorkspaceSource({ ...value.capabilities });
+      } else clearWorkspaceSource();
       setWorkspaceEnabled(enabled);
       if (!enabled && nav() !== "sessions") setNav("sessions");
     } catch (error) {
       if (lifetime !== observationLifetime || discovery !== workspaceDiscoveryLifetime || owner !== snapshot()?.instance) return;
       if (error.status === 401) expireBrowserAccess();
-      else if (error.status === 403) clearWorkspaceViews();
+      else if (error.status === 403) clearWorkspaceSource();
       if (!workspaceEnabled() && nav() !== "sessions") setNav("sessions");
     }
   }
@@ -2473,7 +2809,7 @@ function App() {
     listen("changed", () => void refresh(false));
     listen("context_revoked", () => {
       clearAgentViews("Read access changed; reopen permitted views.");
-      clearWorkspaceViews();
+      clearWorkspaceSource();
       void refresh(false);
     });
     listen("delta", event => {
@@ -2614,12 +2950,20 @@ function App() {
   onMount(() => {
     const pulse = setInterval(pulseAgentViews, 500);
     const wake = () => pulseAgentViews();
+    const presentationKey = event => {
+      if (event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (event.key !== "F2" || document.querySelector('[aria-modal="true"]')) return;
+      event.preventDefault();
+      togglePresentationMode();
+    };
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("focus", wake);
+    window.addEventListener("keydown", presentationKey);
     const retireDockOnPageHide = () => documentDocking.retire();
     window.addEventListener("pagehide", retireDockOnPageHide);
     onCleanup(() => {
       window.removeEventListener("pagehide", retireDockOnPageHide);
+      window.removeEventListener("keydown", presentationKey);
       clearInterval(pulse);
       document.removeEventListener("visibilitychange", wake);
       window.removeEventListener("focus", wake);
@@ -2628,12 +2972,14 @@ function App() {
     finishBoot();
     void refresh().then(() => {
       void receivePendingDocumentDock();
+      void receivePendingSurfaceDock();
       void receivePendingAgentDock();
     });
   });
   onCleanup(() => {
     clearTimeout(browserInviteExpiry);
     documentDocking.dispose();
+    delegatedSurfaceDocking.dispose();
     agentDocking.dispose();
     presentationControllers.clear();
     observationLifetime = {};
@@ -2656,6 +3002,7 @@ function App() {
       setPairCode("");
       await refresh();
       await receivePendingDocumentDock();
+      await receivePendingSurfaceDock();
       await receivePendingAgentDock();
     } catch (e) {
       setError(e.message);
@@ -2667,6 +3014,7 @@ function App() {
       setError("Start aw with workspace surfaces enabled to browse Files or Git.");
       return false;
     }
+    if (kind !== "sessions") void preloadCodeSurfaces().catch(() => {});
     setNav(kind);
     if (kind !== "sessions" && !selectedContainers()[kind]) {
       try { ensureWorkspaceContainer(kind); }
@@ -2707,6 +3055,31 @@ function App() {
     return { entries: (result?.entries || []).map(entry => ({ ...entry, containerId: id })) };
   }
 
+  function setPresentationMode(mode) {
+    const next = mode === "minimal" ? "minimal" : "workspace";
+    if (next === appMode()) return;
+    if (next === "minimal") {
+      workspaceReturnTab = activeTab();
+      setImmersiveDocumentId(null);
+      setActiveTab("chat");
+      setMobileNav(false);
+    } else if (tabs().some(tab => tab.id === workspaceReturnTab)) {
+      setActiveTab(workspaceReturnTab);
+    }
+    setAppMode(next);
+    try { localStorage.setItem("aw.presentation.mode", next); } catch {}
+    queueMicrotask(() => next === "minimal" ? composerTextarea?.focus({ preventScroll: true }) : tabTargets.get(activeTab())?.focus({ preventScroll: true }));
+  }
+
+  function togglePresentationMode() {
+    setPresentationMode(appMode() === "minimal" ? "workspace" : "minimal");
+  }
+
+  createEffect(() => {
+    const documentId = immersiveDocumentId();
+    if (documentId && activeTab() !== documentId) setImmersiveDocumentId(null);
+  });
+
   function showChat() {
     setActiveTab("chat");
     setMobileNav(false);
@@ -2725,6 +3098,19 @@ function App() {
     });
   }
 
+  function activateWorkspaceTab(id) {
+    const tab = tabs().find(item => item.id === id);
+    if (tab?.containerId && (tab.kind === "files-container" || tab.kind === "git-container")) {
+      const kind = tab.kind === "files-container" ? "files" : "git";
+      setSelectedContainers(current => ({ ...current, [kind]: tab.containerId }));
+      setNav(kind);
+    } else if (tab?.kind === "review-layout" || tab?.kind === "build-layout"
+      || tab?.kind === "chat" || tab?.kind === "agent-view") {
+      setNav("sessions");
+    }
+    setActiveTab(id);
+  }
+
   function upsertTab(tab) {
     setTabs(current => {
       const index = current.findIndex(item => item.id === tab.id);
@@ -2736,19 +3122,62 @@ function App() {
     setActiveTab(tab.id);
   }
 
+  function breakOutDocument(id) {
+    const document = workspaceViews.getDocument(id);
+    if (!document) return false;
+    setBrokenOutDocuments(current => {
+      const next = new Set(current);
+      next.add(id);
+      return next;
+    });
+    upsertTab({ id, kind: document.kind, title: document.kind === "file" ? "File" : "Diff" });
+    return true;
+  }
+
+  function toggleContainerMax(containerId, pane) {
+    setMaximizedPanes(current => {
+      const next = { ...current };
+      if (next[containerId] === pane) delete next[containerId];
+      else next[containerId] = pane;
+      return next;
+    });
+  }
+
+  function toggleReviewMax(pane) {
+    setReviewMaximizedPane(current => current === pane ? null : pane);
+  }
+
   function closeTab(id) {
     if (id === "chat") return;
     const current = tabs();
+    const tab = current.find(item => item.id === id);
+    if (tab?.kind === "files-container" || tab?.kind === "git-container"
+      || tab?.kind === "review-layout" || tab?.kind === "build-layout") return;
     const wasActive = activeTab() === id;
-    const index = current.findIndex(tab => tab.id === id);
+    const index = current.findIndex(item => item.id === id);
     if (agentViews.get(id)) agentViews.close(id);
-    if (workspaceViews.getDocument(id)) workspaceViews.closeDocument(id);
-    const next = current.filter(tab => tab.id !== id);
+    if (immersiveDocumentId() === id) setImmersiveDocumentId(null);
+    const document = workspaceViews.getDocument(id);
+    const containedOwner = document?.containerId && containedDocuments()[document.containerId] === id
+      ? document.containerId : null;
+    if (document) {
+      if (containedOwner) {
+        setBrokenOutDocuments(currentSet => {
+          const nextSet = new Set(currentSet);
+          nextSet.delete(id);
+          return nextSet;
+        });
+      } else workspaceViews.closeDocument(id);
+    }
+    const next = current.filter(item => item.id !== id);
     setTabs(next);
     tabTargets.delete(id);
     if (wasActive) {
-      const replacement = next[Math.min(index, next.length - 1)] || next[0];
-      setActiveTab(replacement?.id || "chat");
+      if (containedOwner) setActiveTab(containerTabId(containedOwner));
+      else {
+        const replacement = next[Math.min(index, next.length - 1)] || next[0];
+        setActiveTab(replacement?.id || "chat");
+      }
     }
     tabTargets.get(activeTab())?.focus();
   }
@@ -2767,7 +3196,7 @@ function App() {
       default: return;
     }
     event.preventDefault();
-    setActiveTab(current[next].id);
+    activateWorkspaceTab(current[next].id);
     tabTargets.get(current[next].id)?.focus();
   }
 
@@ -2780,7 +3209,7 @@ function App() {
 
   function moveSidebarResize(event) {
     if (!resizingSidebar) return;
-    const width = Math.min(520, Math.max(220, event.clientX));
+    const width = Math.min(440, Math.max(240, event.clientX));
     setSidebarWidth(width);
   }
 
@@ -2927,10 +3356,22 @@ function App() {
     }
   }
 
-  function openFile(containerId, path) {
+  function setContainedPreview(containerId, documentId) {
+    const previous = containedDocuments()[containerId];
+    setContainedDocuments(current => ({ ...current, [containerId]: documentId }));
+    if (previous && previous !== documentId && !brokenOutDocuments().has(previous)) {
+      workspaceViews.closeDocument(previous);
+    }
+  }
+
+  async function previewFile(containerId, path) {
     try {
+      await preloadCodeSurfaces();
       const id = workspaceViews.openFile(containerId, path);
-      setActiveTab(id);
+      setContainedPreview(containerId, id);
+      setSelectedContainers(current => ({ ...current, files: containerId }));
+      setNav("files");
+      setActiveTab(containerTabId(containerId));
       setMobileNav(false);
       return true;
     } catch (e) {
@@ -2939,16 +3380,44 @@ function App() {
     }
   }
 
-  function openReview(containerId, origin) {
+  async function previewReview(containerId, origin) {
     try {
+      await preloadCodeSurfaces();
       const id = workspaceViews.openReview(containerId, origin);
-      setActiveTab(id);
+      setContainedPreview(containerId, id);
+      setSelectedContainers(current => ({ ...current, git: containerId }));
+      setNav("git");
+      setActiveTab(containerTabId(containerId));
       setMobileNav(false);
       return true;
     } catch (error) { setError(error.message); return false; }
   }
 
+  async function openFile(containerId, path) {
+    try {
+      await preloadCodeSurfaces();
+      const id = workspaceViews.openFile(containerId, path);
+      setBrokenOutDocuments(current => {
+        const next = new Set(current);
+        next.add(id);
+        return next;
+      });
+      upsertTab({ id, kind: "file", title: "File" });
+      setMobileNav(false);
+      return true;
+    } catch (e) {
+      setError(e.message);
+      return false;
+    }
+  }
+
   const title = createMemo(() => snapshot()?.saved?.title || "New Agent");
+  const projectLabel = createMemo(() => {
+    const root = workspaceSource()?.view_root?.label || snapshot()?.saved?.directory || "";
+    return basename(root) || "workspace";
+  });
+  const branchLabel = createMemo(() => snapshot()?.saved?.branch_name || "main");
+  const dirtyLabel = createMemo(() => workspaceSource()?.view_root?.dirty ? "M" : "");
 
   return (
     <Show
@@ -2969,100 +3438,117 @@ function App() {
         </main>
       }
     >
-      <div class="shell" style={{ "--sidebar-width": String(sidebarWidth()) + "px" }}>
+      <div class={"shell mode-" + appMode() + (immersiveDocumentId() && activeTab() === immersiveDocumentId() ? " immersive-document" : "")}
+        style={{ "--sidebar-width": String(sidebarWidth()) + "px" }}>
         <aside class={"sidebar " + (mobileNav() ? "open" : "")}>
-          <div class="brand">
-            <Mark />
-            <span>aw</span>
-            <small>by abird</small>
-          </div>
-          <div class="new-row">
-            <button class="new-button" onClick={newChat}>
-              <Icon name="plus" size={14} />
-              <span>New</span>
-            </button>
-          </div>
-          <nav class="nav-tabs" aria-label="Explorer">
-            <For each={[
-              ["sessions", "Sessions", "chat"],
-              ["files", "Files", "file"],
-              ["git", "Git", "git"],
-            ]}>
-              {item => (
-                <button
-                  class={"nav-tab " + (nav() === item[0] ? "active" : "")}
-                  onClick={() => showNav(item[0])}
-                  disabled={item[0] !== "sessions" && !workspaceEnabled()}
-                >
-                  <Icon name={item[2]} size={13} />
-                  <span>{item[1]}</span>
-                </button>
-              )}
-            </For>
-          </nav>
-          <div class="sidebar-body">
-            <div class="scoped-navigator" hidden={nav() !== "sessions"}>
-              <SessionNavigator sessions={sessions()} snapshot={snapshot()} openSession={openSession} openReadonly={openReadonly} canInspect={Boolean(viewSource())} />
-            </div>
-            <Show when={nav() !== "sessions"}>
-              <div class="navigator-views">
-                <select aria-label={nav() === "files" ? "Files views" : "Git views"} value={selectedContainers()[nav()] || ""}
-                  disabled={!workspaceContainers().some(container => container.kind === nav())}
-                  onChange={event => {
-                    const id = event.currentTarget.value;
-                    if (workspaceViews.getContainer(id)?.kind === nav()) setSelectedContainers(value => ({ ...value, [nav()]: id }));
-                  }}>
-                  <Show when={!workspaceContainers().some(container => container.kind === nav())}><option value="">No open views</option></Show>
-                  <For each={workspaceContainers().filter(container => container.kind === nav())}>
-                    {(container, index) => <option value={container.id}>{index() + 1}. {container.label}</option>}
-                  </For>
-                </select>
-                <button class="mini-icon" type="button" aria-label={nav() === "files" ? "New Files view" : "New Git view"}
-                  title="Open another independent view" onClick={() => void newWorkspaceContainer(nav())}><Icon name="plus" size={13} /></button>
-                <button class="mini-icon" type="button" aria-label={nav() === "files" ? "Close Files view and its documents" : "Close Git view and its documents"}
-                  title="Close this view and its documents" disabled={!selectedContainers()[nav()]} onClick={() => closeWorkspaceContainer(nav())}><Icon name="close" size={13} /></button>
+          <section class="sidebar-section sidebar-projects">
+            <div class="sidebar-minihead">
+              <span>projects</span>
+              <div class="sidebar-mini-actions">
+                <button class="mini-icon active" type="button" aria-label="Projects" title="Projects"><Icon name="tree" size={13} /></button>
+                <button class="mini-icon" type="button" aria-label="New Agent" title="New Agent" onClick={newChat}><Icon name="plus" size={13} /></button>
               </div>
-              <Show when={!selectedContainers()[nav()]}>
-                <div class="navigator-empty">Open a {nav() === "files" ? "Files" : "Git"} view to browse independently.</div>
+            </div>
+            <div class="project-summary">
+              <button class="project-row active" type="button" onClick={showChat} title={workspaceSource()?.view_root?.label || snapshot()?.saved?.directory || projectLabel()}>
+                <span class="project-chevron">▾</span>
+                <strong>{projectLabel()}</strong>
+                <Show when={dirtyLabel()}><span class="project-dirty">{dirtyLabel()}</span></Show>
+              </button>
+              <div class="project-branch">
+                <Icon name="branch" size={12} />
+                <span>{branchLabel()}</span>
+                <span class="project-site">· local</span>
+              </div>
+            </div>
+          </section>
+
+          <div class="sidebar-section-divider" aria-hidden="true" />
+
+          <section class="sidebar-section sidebar-activity">
+            <div class="sidebar-minihead">
+              <span>{nav() === "sessions" ? "activity" : nav()}</span>
+              <nav class="nav-tabs" aria-label="Activity, Git and Files">
+                <For each={[
+                  ["sessions", "Activity", "chat"],
+                  ["git", "Git", "git"],
+                  ["files", "Files", "file"],
+                ]}>
+                  {item => (
+                    <button
+                      class={"nav-tab " + (nav() === item[0] ? "active" : "")}
+                      onClick={() => showNav(item[0])}
+                      disabled={item[0] !== "sessions" && !workspaceEnabled()}
+                      aria-label={item[1]}
+                      title={item[1]}
+                    >
+                      <Icon name={item[2]} size={13} />
+                    </button>
+                  )}
+                </For>
+              </nav>
+            </div>
+            <div class="sidebar-body">
+              <div class="scoped-navigator" hidden={nav() !== "sessions"}>
+                <SessionNavigator sessions={sessions()} snapshot={snapshot()} openSession={openSession} openReadonly={openReadonly} canInspect={Boolean(viewSource())} />
+              </div>
+              <Show when={nav() !== "sessions"}>
+                <div class="navigator-views">
+                  <select aria-label={nav() === "files" ? "Files views" : "Git views"} value={selectedContainers()[nav()] || ""}
+                    disabled={!workspaceContainers().some(container => container.kind === nav())}
+                    onChange={event => {
+                      const id = event.currentTarget.value;
+                      if (workspaceViews.getContainer(id)?.kind === nav()) setSelectedContainers(value => ({ ...value, [nav()]: id }));
+                    }}>
+                    <Show when={!workspaceContainers().some(container => container.kind === nav())}><option value="">No open views</option></Show>
+                    <For each={workspaceContainers().filter(container => container.kind === nav())}>
+                      {(container, index) => <option value={container.id}>{index() + 1}. {container.label}</option>}
+                    </For>
+                  </select>
+                  <button class="mini-icon" type="button" aria-label={nav() === "files" ? "New Files view" : "New Git view"}
+                    title="Open another independent view" onClick={() => void newWorkspaceContainer(nav())}><Icon name="plus" size={13} /></button>
+                  <button class="mini-icon" type="button" aria-label={nav() === "files" ? "Close Files view and its documents" : "Close Git view and its documents"}
+                    title="Close this view and its documents" disabled={!selectedContainers()[nav()]} onClick={() => closeWorkspaceContainer(nav())}><Icon name="close" size={13} /></button>
+                </div>
+                <Show when={!selectedContainers()[nav()]}>
+                  <div class="navigator-empty">Open a {nav() === "files" ? "Files" : "Git"} view to browse independently.</div>
+                </Show>
               </Show>
-            </Show>
-            <For each={workspaceContainers().map(container => container.id)}>
-              {id => {
-                const kind = workspaceViews.getContainer(id).kind;
-                const state = createMemo(() => workspaceContainer(id));
-                return <div class="scoped-navigator" hidden={nav() !== kind || selectedContainers()[kind] !== id}>
-                  <Show when={kind === "files"} fallback={<GitNavigator id={id} state={state()} controller={workspaceViews} fail={setError} openReview={openReview} />}>
-                    <FilesNavigator id={id} state={state()} controller={workspaceViews} fail={setError} openFile={openFile} activePath={activeFilePath(id)} />
-                  </Show>
-                </div>;
-              }}
-            </For>
-          </div>
-          <div class="sidebar-footer">
-            <Show when={pairedBrowserMode()}>
+              <For each={workspaceContainers().map(container => container.id)}>
+                {id => {
+                  const kind = workspaceViews.getContainer(id).kind;
+                  const state = createMemo(() => workspaceContainer(id));
+                  return <div class="scoped-navigator" hidden={nav() !== kind || selectedContainers()[kind] !== id}>
+                    <Show when={kind === "files"} fallback={<GitNavigator id={id} state={state()} controller={workspaceViews} fail={setError} openReview={previewReview} />}>
+                      <FilesNavigator id={id} state={state()} controller={workspaceViews} fail={setError} openFile={previewFile} activePath={activeFilePath(id)} />
+                    </Show>
+                  </div>;
+                }}
+              </For>
+            </div>
+          </section>
+
+          <Show when={pairedBrowserMode()}>
+            <div class="sidebar-footer">
               <button class="quiet settings-link" type="button" aria-label="Invite another browser profile"
                 onClick={() => void issueBrowserInvite()}>
                 <Icon name="link" size={14} />
-                <span>Pair another browser</span>
+                <span>Pair browser</span>
               </button>
               <Show when={browserInvite()}>
                 <div class="browser-pair-invite">
-                  <span>Grants the same owner access, including sessions and enabled tools. One use; expires within 5 minutes. Cancel stops an unused code; logging out revokes every paired browser.</span>
+                  <span>Same-owner access. One use; expires within 5 minutes.</span>
                   <input type="text" aria-label="One-time second browser code" readOnly
                     value={browserInvite().code} onFocus={event => event.currentTarget.select()} />
                   <div>
-                    <button class="quiet" type="button" onClick={() => void copyPrivateLink(browserInvite().code)}>Copy code</button>
+                    <button class="quiet" type="button" onClick={() => void copyPrivateLink(browserInvite().code)}>Copy</button>
                     <button class="quiet" type="button" aria-label="Cancel browser invitation"
-                      onClick={() => void cancelBrowserInvite()}>Cancel invitation</button>
+                      onClick={() => void cancelBrowserInvite()}>Cancel</button>
                   </div>
                 </div>
               </Show>
-            </Show>
-            <button class="quiet settings-link" onClick={() => setSettings(true)}>
-              <Icon name="settings" size={14} />
-              <span>Settings</span>
-            </button>
-          </div>
+            </div>
+          </Show>
         </aside>
 
         <div
@@ -3083,33 +3569,45 @@ function App() {
         <main class="main">
           <header class="workspace-chrome">
             <div class="command-row">
-              <button class="icon-button mobile-nav" onClick={() => setMobileNav(true)} aria-label="Open Explorer">
-                ☰
-              </button>
-              <CommandBar
-                workspaceEnabled={workspaceEnabled()}
-                sessions={sessions()}
-                tabs={tabs().map(tab => ({ ...tab, title: tabTitle(tab), path: tabDescription(tab) }))}
-                agent={{ title: agentTabTitle() }}
-                newChat={newChat}
-                chat={showChat}
-                nav={showNav}
-                settings={() => setSettings(true)}
-                activateTab={setActiveTab}
-                openSession={openSession}
-                openFile={openFile}
-                searchFiles={searchWorkspaceFiles}
-                fileSearchContainer={() => ensureWorkspaceContainer("files")}
-                workspaceToken={workspaceToken()}
-                focusSurface={focusPaletteSurface}
-              />
-              <span class="connection" title={connection()}>
-                <i class={"connection-dot " + (online() ? "online" : "")} />
-                <span>{connection()}</span>
-              </span>
-              <button class="icon-button chrome-settings" onClick={() => setSettings(true)} aria-label="Settings">
-                <Icon name="settings" size={14} />
-              </button>
+              <div class="workspace-breadcrumb" title={workspaceSource()?.view_root?.label || snapshot()?.saved?.directory || ""}>
+                <button class="icon-button mobile-nav" onClick={() => setMobileNav(true)} aria-label="Open Explorer">☰</button>
+                <strong class="workspace-wordmark">aw</strong>
+                <span class="breadcrumb-sep">/</span>
+                <span>local</span>
+                <span class="breadcrumb-sep">/</span>
+                <strong>{projectLabel()}</strong>
+                <span class="branch-mark">◆</span>
+                <span>{branchLabel()}</span>
+                <Show when={dirtyLabel()}><span class="project-dirty">{dirtyLabel()}</span></Show>
+              </div>
+              <div class="workspace-actions">
+                <CommandBar
+                  compact
+                  workspaceEnabled={workspaceEnabled()}
+                  sessions={sessions()}
+                  tabs={tabs().map(tab => ({ ...tab, title: tabTitle(tab), path: tabDescription(tab) }))}
+                  agent={{ title: agentTabTitle() }}
+                  newChat={newChat}
+                  chat={showChat}
+                  nav={showNav}
+                  settings={() => setSettings(true)}
+                  activateTab={activateWorkspaceTab}
+                  openSession={openSession}
+                  openFile={openFile}
+                  searchFiles={searchWorkspaceFiles}
+                  fileSearchContainer={() => ensureWorkspaceContainer("files")}
+                  workspaceToken={workspaceToken()}
+                  focusSurface={focusPaletteSurface}
+                />
+                <span class="connection" title={connection()}>
+                  <i class={"connection-dot " + (online() ? "online" : "")} />
+                  <span>{connection()}</span>
+                </span>
+                <button class="mode-switch" type="button" onClick={() => setPresentationMode("minimal")} title="Minimal mode · F2">Minimal</button>
+                <button class="icon-button chrome-settings" onClick={() => setSettings(true)} aria-label="Settings">
+                  <Icon name="settings" size={14} />
+                </button>
+              </div>
             </div>
             <div class="document-tabs">
               <div class="tab-strip" role="tablist" aria-label="Workspace documents" aria-orientation="horizontal">
@@ -3125,14 +3623,17 @@ function App() {
                         aria-label={tabDescription(tab)}
                         aria-controls="workspace-document-panel"
                         tabIndex={activeTab() === tab.id ? 0 : -1}
-                        onClick={() => setActiveTab(tab.id)}
+                        onClick={() => activateWorkspaceTab(tab.id)}
                         onKeyDown={event => onTabKeyDown(event, tab.id)}
                         title={tabDescription(tab)}
                       >
-                        <Icon name={tab.kind === "chat" || tab.kind === "agent-view" ? "chat" : tab.kind === "review" ? "git" : "file"} size={13} />
+                        <Icon name={tab.kind === "chat" || tab.kind === "agent-view" ? "chat"
+                          : tab.kind === "review" || tab.kind === "git-container" ? "git"
+                          : tab.kind === "build-layout" ? "command" : "file"} size={13} />
                         <span>{tabTitle(tab)}</span>
                       </button>
-                      <Show when={tab.id !== "chat"}>
+                      <Show when={tab.id !== "chat" && tab.kind !== "files-container" && tab.kind !== "git-container"
+                        && tab.kind !== "review-layout" && tab.kind !== "build-layout"}>
                         <button class="doc-tab-close" tabIndex={activeTab() === tab.id ? 0 : -1} onClick={() => closeTab(tab.id)} aria-label={"Close " + tabTitle(tab)}>
                           <Icon name="close" size={11} />
                         </button>
@@ -3141,11 +3642,9 @@ function App() {
                   )}
                 </For>
               </div>
-              <div class="model-state" title="Current provider profile and model">
-                <span>{snapshot()?.profile || "not configured"}</span>
-                <span class="model-state-dot">·</span>
-                <span>{snapshot()?.model || "choose a model"}</span>
-              </div>
+              <button class="tab-add" type="button" onClick={newChat} aria-label="New Agent" title="New Agent">
+                <Icon name="plus" size={12} />
+              </button>
             </div>
           </header>
 
@@ -3159,7 +3658,7 @@ function App() {
           </Show>
 
           <div class="workspace-document-panel" id="workspace-document-panel" role="tabpanel" aria-labelledby={tabElementId(activeTab())}>
-            <div class="current-agent-panel" hidden={surface().kind !== "chat"}>
+            <div class="current-agent-panel" hidden={activeTab() !== "chat"}>
               <div class="chat-scroll">
                 <div class="chat">
                   <ResourceHeader snapshot={snapshot()} />
@@ -3294,7 +3793,61 @@ function App() {
                   </div>
                 </form>
               </div>
+              <Show when={appMode() === "minimal"}>
+                <div class="minimal-status" role="status" aria-label="Minimal Agent status">
+                  <span>{projectLabel()} <span class="branch-mark">◆</span> {branchLabel()} {dirtyLabel()}</span>
+                  <span>{snapshot()?.model || "model not configured"} · {snapshot()?.profile || "no profile"} · {snapshot()?.pending ? "working" : "ready"}</span>
+                </div>
+              </Show>
             </div>
+
+            <ReviewLayout
+              active={() => activeTab() === "review-layout"}
+              maximized={() => reviewMaximizedPane()}
+              review={() => reviewDocument()}
+              agentTitle={agentTabTitle}
+              snapshot={snapshot}
+              ui={presentationUi}
+              prompt={prompt}
+              posting={posting}
+              setPrompt={setPrompt}
+              send={send}
+              terminals={() => Boolean(workspaceSource()?.terminals)}
+              request={workspaceTerminalRequest}
+              toggleMax={toggleReviewMax}
+            />
+
+            <BuildLayout
+              active={() => activeTab() === "build-layout"}
+              enabled={() => Boolean(workspaceSource()?.terminals)}
+              request={workspaceTerminalRequest}
+            />
+
+            <For each={workspaceContainers().map(container => container.id)}>
+              {containerId => {
+                const state = createMemo(() => workspaceContainer(containerId));
+                const tabId = containerTabId(containerId);
+                const preview = createMemo(() => {
+                  const documentId = containedDocuments()[containerId];
+                  return documentId ? workspaceDocument(documentId) : null;
+                });
+                return <div class="workspace-container-host" hidden={activeTab() !== tabId}>
+                  <WorkspaceContainerPanel
+                    container={() => state()}
+                    document={() => preview()}
+                    activeTab={activeTab}
+                    tabId={tabId}
+                    maximized={() => maximizedPanes()[containerId] || null}
+                    controller={workspaceViews}
+                    fail={setError}
+                    previewFile={previewFile}
+                    previewReview={previewReview}
+                    breakOut={breakOutDocument}
+                    toggleMax={pane => toggleContainerMax(containerId, pane)}
+                  />
+                </div>;
+              }}
+            </For>
 
             <For each={pinnedIds()}>
               {id => {
@@ -3321,10 +3874,15 @@ function App() {
               }}
             </For>
 
-            <For each={workspaceDocumentIds()}>
+            <For each={workspaceStandaloneDocumentIds()}>
               {id => {
                 const document = createMemo(() => workspaceDocument(id));
                 const data = createMemo(() => document()?.data);
+                const [surfaceRecipient, setSurfaceRecipient] = createSignal("");
+                createEffect(() => {
+                  const selected = surfaceRecipient();
+                  if (selected && !delegationRecipients().some(recipient => recipient.id === selected)) setSurfaceRecipient("");
+                });
                 const checkAccess = () => Boolean(workspaceViews.getDocument(id)?.data);
                 const destinationKind = () => document()?.kind === "file" ? "files" : "git";
                 const destinations = createMemo(() => workspaceContainers().filter(
@@ -3341,11 +3899,17 @@ function App() {
                     event.currentTarget.value = origin;
                   }
                 };
+                const immersive = () => immersiveDocumentId() === id;
                 return <div class="surface code-surface" hidden={activeTab() !== id}>
                   <div class="surface-bar" aria-label="Document source and access" title={data()?.path || ""}>
-                    <span class="surface-path">{data() ? [document()?.kind === "review" ? data().root : "", dirname(data().path), data().basis].filter(Boolean).join(" · ") || "." : "Read-only document"}</span>
-                    <span class="surface-badge">{document()?.kind === "review" ? "diff · " : ""}read only</span>
-                    <Show when={destinations().length > 1}>
+                    <span class="surface-path">{data()
+                      ? immersive()
+                        ? [document()?.kind === "review" ? "Diff · " : "", basename(data().path || "document"),
+                          document()?.kind === "review" ? data().basis : ""].filter(Boolean).join(" ")
+                        : [document()?.kind === "review" ? data().root : "", dirname(data().path), data().basis].filter(Boolean).join(" · ") || "."
+                      : "Read-only document"}</span>
+                    <span class="surface-badge">{document()?.delegated ? "delegated · " : document()?.kind === "review" ? "diff · " : ""}read only</span>
+                    <Show when={!document()?.delegated && destinations().length > 1}>
                       <select class="surface-move-view"
                         aria-label={destinationKind() === "files" ? "Move document to another Files view" : "Move document to another Git view"}
                         title="Move this read-only tab without changing its source"
@@ -3356,7 +3920,8 @@ function App() {
                         </For>
                       </select>
                     </Show>
-                    <Show when={["file", "review"].includes(document()?.kind) && data()
+                    <Show when={!document()?.delegated && workspaceSourceMode() === "ordinary"
+                      && ["file", "review"].includes(document()?.kind) && data()
                       && !document()?.pending && !document()?.unavailable && workspaceEnabled()}>
                       <button class="mini-icon" type="button"
                         aria-label={document()?.kind === "review" ? "Move Review to a new window" : "Move File to a new window"}
@@ -3381,7 +3946,32 @@ function App() {
                         <Icon name="link" size={13} />
                       </button>
                     </Show>
+                    <Show when={!document()?.delegated && workspaceSourceMode() === "team-delegated"
+                      && teamInfo()?.delegated_surface_views && data() && !document()?.pending
+                      && !document()?.unavailable && delegationRecipients().length > 0}>
+                      <select class="surface-delegate-recipient" aria-label="Delegate read-only document to recipient"
+                        value={surfaceRecipient()}
+                        onPointerDown={() => delegatedSurfaceDocking.stage(id)}
+                        onChange={event => setSurfaceRecipient(event.currentTarget.value)}>
+                        <option value="">Recipient…</option>
+                        <For each={delegationRecipients()}>{recipient => <option value={recipient.id}>{recipient.display_name}</option>}</For>
+                      </select>
+                      <button class="mini-icon" type="button" aria-label="Create delegated read-only document link"
+                        title="Create a short-lived read-only link for the selected Team participant"
+                        disabled={!surfaceRecipient() || Boolean(dockingDocument())}
+                        onPointerDown={() => delegatedSurfaceDocking.stage(id, { preserveFocus: true })}
+                        onPointerCancel={() => delegatedSurfaceDocking.cancelStage(id)}
+                        onClick={() => void delegateWorkspaceDocument(id, surfaceRecipient())}>
+                        <Icon name="link" size={13} />
+                      </button>
+                    </Show>
                     <button class="mini-icon" type="button" aria-label="Refresh document" title="Refresh this exact document" onClick={() => void workspaceViews.refreshDocument(id)}><Icon name="refresh" size={13} /></button>
+                    <button class="mini-icon document-zoom" type="button"
+                      aria-label={immersive() ? "Restore Workspace around document" : (document()?.kind === "review" ? "Maximize Diff" : "Maximize File")}
+                      title={immersive() ? "Restore Workspace" : "Maximize"}
+                      onClick={() => setImmersiveDocumentId(immersive() ? null : id)}>
+                      <span aria-hidden="true">{immersive() ? "❐" : "⛶"}</span>
+                    </button>
                   </div>
                   <Show when={handoffLink()?.documentId === id}>
                     <div class="dock-link-share" role="status">
@@ -3391,6 +3981,16 @@ function App() {
                         onFocus={event => event.currentTarget.select()} />
                       <button type="button" class="quiet"
                         onClick={() => void copyPrivateLink(handoffLink().url)}>Copy link</button>
+                    </div>
+                  </Show>
+                  <Show when={delegatedDocumentLink()?.documentId === id}>
+                    <div class="dock-link-share" role="status">
+                      <span>Private recipient link. Only the selected Team participant can use this grant.</span>
+                      <input type="text" readOnly value={delegatedDocumentLink().url}
+                        aria-label="Delegated read-only document link"
+                        onFocus={event => event.currentTarget.select()} />
+                      <button type="button" class="quiet"
+                        onClick={() => void copyPrivateLink(delegatedDocumentLink().url)}>Copy link</button>
                     </div>
                   </Show>
                   <Show when={document()?.pending}><div class="document-state" role="status">Loading…</div></Show>
@@ -3407,6 +4007,12 @@ function App() {
             </For>
           </div>
         </main>
+        <Show when={appMode() === "workspace"}>
+          <footer class="workspace-status" role="status" aria-label="Workspace status">
+            <span>{projectLabel()} / {branchLabel()} {dirtyLabel()}</span>
+            <span>{snapshot()?.pending ? "● working" : "○ ready"}<Show when={snapshot()?.needs_reconciliation}> · ◐ attention</Show></span>
+          </footer>
+        </Show>
       </div>
 
       <Show when={settings()}>

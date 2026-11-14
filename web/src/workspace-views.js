@@ -144,12 +144,26 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
     return token;
   }
   function cancelAll(entry) { const tokens = [...entry.tokens.values()]; entry.tokens.clear(); refreshValue(entry); return tokens; }
+  function clearSource() {
+    const tokens = [];
+    // Source replacement revokes only ordinary navigator-owned documents.
+    // Delegated documents have independent per-grant readers and survive.
+    for (const entry of containers.values()) { tokens.push(...cancelAll(entry)); scrub(entry); }
+    for (const [documentId, entry] of documents) {
+      if (entry.reader) continue;
+      tokens.push(...cancelAll(entry)); scrub(entry); documents.delete(documentId);
+    }
+    source = null; containers.clear(); scopes.clear();
+    retained = [...documents.values()].reduce((total, entry) => total
+      + [...entry.cache.values()].reduce((sum, item) => sum + item.bytes, 0), 0);
+    emit("source-clear");
+    for (const token of tokens) token.control.abort();
+  }
   function clear() {
     const tokens = [];
-    // Scrub awaiting entry frames and remove live identities before abort callbacks.
+    // Full browser authority expiry scrubs every grant, ordinary or delegated.
     for (const entry of [...containers.values(), ...documents.values()]) {
-      tokens.push(...cancelAll(entry));
-      scrub(entry);
+      tokens.push(...cancelAll(entry)); scrub(entry);
     }
     source = null; containers.clear(); documents.clear(); scopes.clear(); retained = 0;
     emit("clear");
@@ -160,7 +174,7 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
     const scope = scopes.get(scope_id);
     if (scope) scopes.set(scope_id, Object.freeze({ ...scope, unavailable: true }));
     for (const entry of [...containers.values(), ...documents.values()]) {
-      if ((entry.document ? entry.value.target.scope_id : entry.value.scope_id) !== scope_id) continue;
+      if (entry.reader || (entry.document ? entry.value.target.scope_id : entry.value.scope_id) !== scope_id) continue;
       tokens.push(...cancelAll(entry)); scrub(entry, error, true);
       if (!entry.document) publish(entry, { generation: allocate() });
     }
@@ -184,20 +198,25 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
   }
   async function run(entry, slot, raw, { signal, accept, transient = false } = {}) {
     const command = requestCopy(raw);
-    if (!source || disposed || signal?.aborted) return null;
+    if ((!source && !entry.reader) || disposed || signal?.aborted) return null;
     cancel(entry, slot)?.control.abort();
     if (outstanding.size >= WORKSPACE_VIEW_LIMITS.pending) { publish(entry, { error: "Workspace readers busy; refresh when a pending request finishes." }); emit(); return null; }
-    const target = Object.freeze({ source_id: source.source_id, scope_id: entry.document ? entry.value.target.scope_id : entry.value.scope_id });
+    const target = Object.freeze({
+      source_id: entry.reader ? entry.value.target.source_id : source.source_id,
+      scope_id: entry.document ? entry.value.target.scope_id : entry.value.scope_id,
+    });
+    const reader = entry.reader || request;
+    const authorityKey = entry.authorityKey;
     const token = { sequence: allocate(), control: new AbortController() };
     entry.tokens.set(slot, token); outstanding.add(token);
     const abort = () => { if (entry.tokens.get(slot) === token) { cancel(entry, slot); emit(); } token.control.abort(); };
     signal?.addEventListener("abort", abort, { once: true });
-    const current = () => source?.source_id === target.source_id && entry.tokens.get(slot) === token
-      && (entry.document ? documents : containers).get(entry.value.id) === entry;
+    const current = () => (entry.reader ? entry.authorityKey === authorityKey : source?.source_id === target.source_id)
+      && entry.tokens.get(slot) === token && (entry.document ? documents : containers).get(entry.value.id) === entry;
     publish(entry, { pending: true, error: "" }); emit();
     try {
       if (!current()) return null;
-      const reply = await request({ op: "view", ...target, request: command }, { signal: token.control.signal });
+      const reply = await reader({ op: "view", ...target, request: command }, { signal: token.control.signal });
       if (!current() || signal?.aborted) return null;
       const result = replyCopy(reply, target, command);
       if (!current() || signal?.aborted) return null;
@@ -207,8 +226,14 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
     } catch (error) {
       if (!current()) return null;
       const message = String(error?.message || "Workspace read unavailable.").slice(0, 1024);
-      if (error?.status === 401 || (error?.status === 403 && error.code === "source_changed"
-        && error.source_id === target.source_id && error.scope_id === target.scope_id)) clear();
+      if (entry.reader && error?.status === 401) {
+        clear();
+      } else if (entry.reader && error?.status === 403) {
+        // Delegated cache lifetime is the exact grant lifetime. Never scrub an
+        // ordinary owner read or another grant for the same resource.
+        removeCache(entry, slot); publish(entry, { error: message, unavailable: true }); refreshValue(entry); emit("delegated-denied");
+      } else if (error?.status === 401 || (error?.status === 403 && error.code === "source_changed"
+        && error.source_id === target.source_id && error.scope_id === target.scope_id)) clearSource();
       else if (error?.status === 403 && error.code === "scope_denied" && error.source_id === target.source_id && error.scope_id === target.scope_id) denyScope(target.scope_id, message);
       else {
         if (error?.status === 403) removeCache(entry, slot);
@@ -225,13 +250,29 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
     ready(); assertCanOpenDocument();
     const documentId = `workspace-document-${allocate()}`;
     const entry = { document: true, cache: new Map(), tokens: new Map(), origin,
-      value: Object.freeze({ id: documentId, containerId: owner.value.id, kind, target: Object.freeze(target), data: null, pending: false, error: "", unavailable: false }) };
+      value: Object.freeze({ id: documentId, containerId: owner.value.id, kind, target: Object.freeze(target), delegated: false, authorityKey: null, data: null, pending: false, error: "", unavailable: false }) };
     documents.set(documentId, entry); emit(); void refreshDocument(documentId);
+    return documentId;
+  }
+  function openDelegatedDocument(kind, target, reader, authorityKey) {
+    if (disposed || !["file", "review"].includes(kind) || typeof reader !== "function"
+      || !target || !id(target.source_id) || !id(target.scope_id) || !text(authorityKey, 512)
+      || (kind === "file" ? !path(target.path) : !id(target.review_id))) {
+      throw new Error("Delegated document requires one exact bounded resource and reader.");
+    }
+    assertCanOpenDocument();
+    const documentId = `workspace-document-${allocate()}`;
+    const exact = kind === "file"
+      ? { source_id: target.source_id, scope_id: target.scope_id, path: target.path }
+      : { source_id: target.source_id, scope_id: target.scope_id, review_id: target.review_id };
+    const entry = { document: true, cache: new Map(), tokens: new Map(), origin: null, reader, authorityKey,
+      value: Object.freeze({ id: documentId, containerId: null, kind, target: Object.freeze(exact), delegated: true, authorityKey, data: null, pending: false, error: "", unavailable: false }) };
+    documents.set(documentId, entry); emit("delegated-open");
     return documentId;
   }
   async function refreshDocument(documentId) {
     const entry = documents.get(documentId);
-    if (!entry || !source) return false;
+    if (!entry || (!source && !entry.reader)) return false;
     const target = entry.value.target;
     const command = entry.value.kind === "file" ? { op: "file", path: target.path }
       : target.review_id ? { op: "review", review_id: target.review_id } : { op: "git_open", ...entry.origin };
@@ -262,6 +303,7 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
     ready();
     const document = documents.get(documentId);
     if (!document) throw new Error("Document is no longer open.");
+    if (document.reader) throw new Error("A delegated document cannot be moved into an unrelated Workspace scope.");
     const destination = container(destinationId);
     const kind = document.value.kind === "file" ? "files" : "git";
     if (destination.value.kind !== kind || destination.value.unavailable || document.value.unavailable) {
@@ -296,10 +338,10 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
   }
   return Object.freeze({
     setSource(value) {
-      if (value === null) { clear(); return true; }
+      if (value === null) { clearSource(); return true; }
       if (disposed || !value || !id(value.source_id) || !id(value.view_root?.id) || !text(value.view_root?.label, 1024)) throw new Error("Invalid workspace source capability.");
       if (source?.source_id === value.source_id && source.view_root.id === value.view_root.id) return false;
-      clear(); source = freeze({ source_id: value.source_id, view_root: { id: value.view_root.id, label: value.view_root.label } });
+      clearSource(); source = freeze({ source_id: value.source_id, view_root: { id: value.view_root.id, label: value.view_root.label } });
       scopes.set(source.view_root.id, source.view_root); emit("source"); return true;
     },
     openContainer(kind, scope_id = source?.view_root.id) {
@@ -308,8 +350,11 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
       if (scopes.get(scope_id).unavailable) throw new Error("Workspace scope unavailable; refresh an existing view explicitly.");
       if (containers.size >= WORKSPACE_VIEW_LIMITS.containers) throw new Error("At most 8 Files/Git containers may be open.");
       const generation = allocate(), containerId = `workspace-container-${generation}`;
+      const navigator = kind === "git"
+        ? Object.freeze({ ...defaultNavigator(), view: "list" })
+        : defaultNavigator();
       containers.set(containerId, { document: false, tokens: new Map(), cache: new Map(), value: Object.freeze({ id: containerId,
-        kind, scope_id, label: scopes.get(scope_id).label, generation, navigator: defaultNavigator(), listings: Object.freeze({}), search: null, inventory: null, pending: false, error: "", unavailable: false }) });
+        kind, scope_id, label: scopes.get(scope_id).label, generation, navigator, listings: Object.freeze({}), search: null, inventory: null, pending: false, error: "", unavailable: false }) });
       emit(); return containerId;
     },
     listContainers: () => Object.freeze([...containers.values()].map(entry => entry.value)),
@@ -385,7 +430,7 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
       } });
       return Boolean(result);
     },
-    assertCanOpenDocument, refreshDocument, closeDocument, moveDocument, closeContainer, clear,
+    assertCanOpenDocument, openDelegatedDocument, refreshDocument, closeDocument, moveDocument, closeContainer, clearSource, clear,
     dispose() { disposed = true; clear(); },
   });
 }

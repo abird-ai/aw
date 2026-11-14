@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import { toolPresentation } from '../web/src/tool-presentation.js';
 
 const css = fs.readFileSync(new URL('../web/src/styles.css', import.meta.url), 'utf8');
+const main = fs.readFileSync(new URL('../web/src/main.jsx', import.meta.url), 'utf8');
+const terminals = fs.readFileSync(new URL('../web/src/terminal-layout.jsx', import.meta.url), 'utf8');
 
 function tokens(selector) {
   const beginning=css.indexOf(selector + ' {');
@@ -68,4 +70,22 @@ test('compact tool visuals preserve words, no color-only result or unbounded unk
   assert.match(css,/\.doc-tab\.active\s*\{[\s\S]*?background:\s*var\(--tab-active\)/);
   assert.match(css,/\.tab-strip\s*\{[\s\S]*?overflow-x:\s*auto/);
   assert.match(css,/\.code-diff\s+\.cm-mergeView/);
+});
+
+test('Build is an explicit terminal-granted saved layout, never an implicit PTY start', () => {
+  assert.match(main,/workspaceSource\(\)\?\.terminals/);
+  assert.match(main,/id:\s*"build-layout",\s*kind:\s*"build-layout",\s*title:\s*"Build"/);
+  assert.match(main,/<BuildLayout[\s\S]*?enabled=\{\(\) => Boolean\(workspaceSource\(\)\?\.terminals\)\}/);
+  assert.match(terminals,/class="[^"]*build-start-terminal[^"]*"[\s\S]*?onClick=\{\(\) => void start\(\)\}/);
+  assert.match(terminals,/class="[^"]*build-add-terminal[^"]*"[\s\S]*?onClick=\{\(\) => void start\(\)\}/);
+  assert.doesNotMatch(terminals,/createEffect\([\s\S]{0,220}?terminal_start/,
+    'reactive presentation must not start a terminal');
+});
+
+test('terminal pane visibility is separate from retained input ownership', () => {
+  assert.match(terminals,/if \(!id \|\| \(!active\(\) && !controlled\(\)\)\) return/);
+  assert.match(terminals,/if \(\(active\(\) \|\| controlled\(\)\) && terminalId\(\)\) void refreshScreen\(\)/);
+  assert.match(terminals,/disabled=\{controlled\(\)\}[\s\S]*?Release input before switching terminals/);
+  assert.match(terminals,/toggleMax=\{\(\) => setMaximizedId\(maximized\(\) \? null : id\)\}/);
+  assert.match(css,/\.build-grid\.max-terminal\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
 });

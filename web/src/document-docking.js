@@ -273,6 +273,246 @@ export function createDocumentDocking({
   });
 }
 
+const surfaceDockPrefix = "#aw-surface-dock=";
+
+export function takeDelegatedSurfaceDockTicket(location, history) {
+  if (!location?.hash?.startsWith(surfaceDockPrefix)) return null;
+  const ticket = location.hash.slice(surfaceDockPrefix.length);
+  history.replaceState(null, "", location.pathname + location.search);
+  return ticketSyntax.test(ticket) ? ticket : null;
+}
+
+export function createDelegatedSurfaceDocking({
+  api, views,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  timeoutMs = MAX_WAIT_MS, onProgress = () => {}, onLinkReady = () => {},
+  onReceiveDocument = () => {}, isRendered = () => true,
+  capture = () => null, restore = async () => true,
+  makeLink = ticket => new URL(surfaceDockPrefix + ticket, location.href).href,
+}) {
+  if (typeof api !== "function" || !views
+    || !["getDocument", "openDelegatedDocument", "refreshDocument", "closeDocument"]
+      .every(name => typeof views[name] === "function")
+    || [sleep, onProgress, onLinkReady, onReceiveDocument, isRendered, capture, restore, makeLink]
+      .some(callback => typeof callback !== "function")) {
+    throw new Error("Delegated File/Review docking needs the read-only document owner.");
+  }
+  let disposed = false;
+  let staged = null;
+  function stage(documentId, { preserveFocus = false } = {}) {
+    let snapshot = capture(documentId);
+    if (preserveFocus && snapshot?.focus === "none" && staged?.documentId === documentId
+      && Date.now() - staged.createdAt <= 60_000
+      && staged.snapshot?.focus && staged.snapshot.focus !== "none") {
+      snapshot = { ...snapshot, focus: staged.snapshot.focus };
+    }
+    staged = { documentId, snapshot, createdAt: Date.now() };
+  }
+  function cancelStage(documentId) {
+    if (staged?.documentId === documentId) staged = null;
+  }
+  const envelope = (window, ticket) => ({
+    window_id: window.window_id, window_proof: window.window_proof, ticket,
+  });
+  const validPath = value => typeof value === "string" && value.length > 0 && value.length <= 4096
+    && !value.startsWith("/") && !value.includes("\\") && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    && value.split("/").every(part => part && part !== "." && part !== "..");
+  const exactTarget = document => {
+    if (!document || document.delegated || !["file", "review"].includes(document.kind)
+      || !document.data || document.pending || document.unavailable || document.error
+      || !document.target || !opaqueIdSyntax.test(document.target.source_id)
+      || !opaqueIdSyntax.test(document.target.scope_id)) return null;
+    if (document.kind === "file") {
+      return validPath(document.target.path) && document.data.path === document.target.path
+        ? { source_id: document.target.source_id, scope_id: document.target.scope_id, path: document.target.path }
+        : null;
+    }
+    return opaqueIdSyntax.test(document.target.review_id)
+      && document.data.kind === "review" && document.data.id === document.target.review_id
+      ? { source_id: document.target.source_id, scope_id: document.target.scope_id, review_id: document.target.review_id }
+      : null;
+  };
+  const sameTarget = (left, right, kind) => left && right
+    && left.source_id === right.source_id && left.scope_id === right.scope_id
+    && (kind === "file" ? left.path === right.path : left.review_id === right.review_id);
+
+  async function send(documentId, recipientId) {
+    const initial = views.getDocument(documentId);
+    const target = exactTarget(initial);
+    if (disposed || !target || !opaqueIdSyntax.test(recipientId)) {
+      throw new Error("Only a loaded owner File or immutable Review can be delegated.");
+    }
+    const kind = initial.kind;
+    const captured = staged?.documentId === documentId
+      && Date.now() - staged.createdAt <= 2000
+      ? staged.snapshot : capture(documentId);
+    staged = null;
+    const sameDocument = () => {
+      const current = views.getDocument(documentId);
+      return current && current === initial && sameTarget(current.target, target, kind)
+        && current.data === initial.data && !current.pending && !current.unavailable && !current.error;
+    };
+    let origin, ticket, released = false, requestedConfirmation = false;
+    onProgress(documentId, true);
+    try {
+      const presentation = captured ? boundedPresentation(kind, {
+        ...captured, version: 1,
+        fingerprint: await documentFingerprint(kind, initial.data),
+      }) : null;
+      if (!sameDocument()) throw new Error("The original document changed before delegation.");
+      origin = await api("/api/dock/surface/register", {});
+      if (!agentIdSyntax.test(origin.store_id) || !agentIdSyntax.test(origin.source_epoch)
+        || !ticketSyntax.test(origin.window_id) || !ticketSyntax.test(origin.window_proof)) {
+        throw new Error("Invalid delegated Surface owner identity.");
+      }
+      const prepared = await api("/api/dock/surface/prepare", {
+        window_id: origin.window_id, window_proof: origin.window_proof,
+        store_id: origin.store_id, source_epoch: origin.source_epoch,
+        source_id: target.source_id, scope_id: target.scope_id, owner_epoch: origin.source_epoch,
+        document_id: documentId, recipient_id: recipientId, kind,
+        ...(kind === "file" ? { path: target.path } : { review_id: target.review_id }),
+        ...(presentation ? { presentation } : {}),
+      });
+      ticket = prepared.ticket;
+      if (!ticketSyntax.test(ticket) || !sameDocument()) {
+        throw new Error("Invalid delegated File/Review handoff identity.");
+      }
+      onLinkReady(documentId, makeLink(ticket));
+      const until = Date.now() + Math.min(Math.max(timeoutMs, 1000), MAX_WAIT_MS);
+      while (Date.now() < until && !disposed) {
+        if (!sameDocument()) break;
+        const result = await api("/api/dock/surface/status", envelope(origin, ticket));
+        if (result.document_id !== documentId) throw new Error("Delegated document target changed.");
+        if (result.state === "confirming") {
+          if (!requestedConfirmation) {
+            const acknowledgement = await api("/api/dock/surface/confirm", envelope(origin, ticket));
+            if (acknowledgement.state !== "confirming") {
+              throw new Error("Delegated recipient confirmation was rejected.");
+            }
+            requestedConfirmation = true;
+          }
+          await sleep(250);
+          continue;
+        }
+        if (result.state === "accepted") {
+          if (!sameDocument()) break;
+          const outcome = await api("/api/dock/surface/release", envelope(origin, ticket));
+          if (outcome.state !== "released" || outcome.document_id !== documentId) {
+            throw new Error("Delegated File/Review handoff was not released by the owner.");
+          }
+          released = true;
+          if (sameDocument()) views.closeDocument(documentId);
+          return true;
+        }
+        if (result.state === "revoked") {
+          throw Object.assign(new Error("Delegated File/Review grant was revoked."), { status: 403 });
+        }
+        if (result.state !== "prepared") break;
+        await sleep(250);
+      }
+      throw new Error("Delegated File/Review handoff not accepted; the original view remains open.");
+    } catch (error) {
+      if (!released && origin && ticket) {
+        try { await api("/api/dock/surface/cancel", envelope(origin, ticket)); } catch {}
+      }
+      throw error;
+    } finally {
+      onLinkReady(documentId, null);
+      onProgress(documentId, false);
+    }
+  }
+
+  async function receive(ticket) {
+    if (disposed || !ticketSyntax.test(ticket)) {
+      throw new Error("Invalid delegated File/Review docking invitation.");
+    }
+    const receiver = await api("/api/dock/surface/receive", { ticket });
+    const resource = receiver?.resource;
+    const kind = ["file", "review"].includes(resource?.kind) ? resource.kind : null;
+    const target = kind === "file" ? {
+      source_id: resource?.source_id, scope_id: resource?.scope_id, path: resource?.path,
+    } : kind === "review" ? {
+      source_id: resource?.source_id, scope_id: resource?.scope_id, review_id: resource?.review_id,
+    } : null;
+    if (!kind || !target || !opaqueIdSyntax.test(target.source_id) || !opaqueIdSyntax.test(target.scope_id)
+      || (kind === "file" ? !validPath(target.path) : !opaqueIdSyntax.test(target.review_id))
+      || !ticketSyntax.test(receiver.window_id) || !ticketSyntax.test(receiver.window_proof)
+      || typeof receiver.grant_generation !== "string"
+      || !/^[1-9][0-9]{0,19}$/u.test(receiver.grant_generation)) {
+      throw new Error("Delegated File/Review source is unavailable in this browser.");
+    }
+    const body = envelope(receiver, ticket);
+    const authorityKey = `delegated-surface:${ticket}:${receiver.grant_generation}`;
+    const reader = async (requested, options = {}) => {
+      const command = requested?.request;
+      const exact = requested?.op === "view"
+        && requested.source_id === target.source_id && requested.scope_id === target.scope_id
+        && (kind === "file"
+          ? command?.op === "file" && command.path === target.path && Object.keys(command).length === 2
+          : command?.op === "review" && command.review_id === target.review_id && Object.keys(command).length === 2);
+      if (!exact) throw Object.assign(new Error("Delegated document target changed."), { status: 403 });
+      return api("/api/dock/surface/read", body, 15000, options);
+    };
+    const documentId = views.openDelegatedDocument(kind, target, reader, authorityKey);
+    onReceiveDocument(documentId, kind, target);
+    let acceptanceAttempted = false;
+    try {
+      if (!await views.refreshDocument(documentId) || !views.getDocument(documentId)?.data) {
+        const error = new Error("Delegated File/Review read failed authorization.");
+        error.status = 403;
+        throw error;
+      }
+      const until = Date.now() + Math.min(Math.max(timeoutMs, 1000), MAX_WAIT_MS);
+      while (Date.now() < until && !disposed) {
+        const item = views.getDocument(documentId);
+        if (!item?.data || !sameTarget(item.target, target, kind) || item.unavailable || item.error) break;
+        if (!isRendered(documentId)) {
+          await sleep(120);
+          continue;
+        }
+        if (receiver.presentation) {
+          const presentation = boundedPresentation(kind, receiver.presentation);
+          const fingerprint = await documentFingerprint(kind, item.data);
+          if (fingerprint !== presentation.fingerprint) {
+            throw new Error("The delegated source content changed during handoff; retry from the source document.");
+          }
+          if (!await restore(documentId, presentation)) {
+            throw new Error("Receiving delegated editor is no longer available to restore.");
+          }
+          const current = views.getDocument(documentId);
+          if (current !== item || !sameTarget(current?.target, target, kind) || !isRendered(documentId)) {
+            throw new Error("Receiving delegated document changed during presentation restoration.");
+          }
+        }
+        acceptanceAttempted = true;
+        const accepted = await api("/api/dock/surface/accept", body);
+        if (accepted.state !== "accepted") {
+          throw Object.assign(new Error("Owner rejected delegated File/Review acceptance."), { status: 409 });
+        }
+        while (Date.now() < until && !disposed) {
+          const document = views.getDocument(documentId);
+          if (!document?.data || !sameTarget(document.target, target, kind)) break;
+          const state = await api("/api/dock/surface/heartbeat", body);
+          if (state.state === "released") return { documentId, kind };
+          if (!["confirming", "accepted"].includes(state.state)) break;
+          await sleep(250);
+        }
+        break;
+      }
+      throw new Error("Delegated File/Review release was not confirmed; receiver remains inspectable until authority expiry.");
+    } catch (error) {
+      const knownFailure = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500;
+      if (!acceptanceAttempted || knownFailure) views.closeDocument(documentId);
+      throw error;
+    }
+  }
+
+  return Object.freeze({
+    stage, cancelStage, send, receive,
+    dispose() { disposed = true; staged = null; },
+  });
+}
+
 const agentDockPrefix = "#aw-agent-dock=";
 
 export function takeAgentDockTicket(location, history) {

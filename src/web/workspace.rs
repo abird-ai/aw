@@ -67,10 +67,10 @@ pub(super) async fn capabilities(State(app): State<AppState>) -> ApiResult<Respo
     if !auth_alive(&app) {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "session expired"));
     }
-    if app.0.surfaces.is_none() {
+    let Some(host) = app.0.surfaces.clone() else {
         return Ok(Json(serde_json::json!({"enabled":false,"instance":lock(&app.0.session.state).snapshot.instance,"hint":"start the owner with --web-workspace to grant human Files/Git views"})).into_response());
-    }
-    execute(&app, Command::Capabilities, true)
+    };
+    execute_with_host(&app, host, Command::Capabilities, true)
         .await
         .map_err(|error| error.error)
 }
@@ -85,14 +85,6 @@ pub(super) async fn action(
             None,
         )
     })?;
-    execute(&app, command, false).await
-}
-
-async fn execute(
-    app: &AppState,
-    command: Command,
-    capabilities: bool,
-) -> std::result::Result<Response, WorkspaceError> {
     let identity = view_identity(&command);
     let host = app.0.surfaces.clone().ok_or_else(|| {
         plain(
@@ -100,9 +92,40 @@ async fn execute(
                 StatusCode::FORBIDDEN,
                 "workspace services were not enabled by the owner",
             ),
-            identity.clone(),
+            identity,
         )
     })?;
+    execute_with_host(&app, host, command, false).await
+}
+
+pub(super) async fn capabilities_with_host(
+    app: &AppState,
+    host: Arc<aw_surfaces::SurfaceHost>,
+) -> Response {
+    match execute_with_host(app, host, Command::Capabilities, true).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+pub(super) async fn action_with_host(
+    app: &AppState,
+    host: Arc<aw_surfaces::SurfaceHost>,
+    command: Command,
+) -> Response {
+    match execute_with_host(app, host, command, false).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn execute_with_host(
+    app: &AppState,
+    host: Arc<aw_surfaces::SurfaceHost>,
+    command: Command,
+    capabilities: bool,
+) -> std::result::Result<Response, WorkspaceError> {
+    let identity = view_identity(&command);
     let permit = app
         .0
         .surface_slots

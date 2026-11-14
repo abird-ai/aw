@@ -433,9 +433,9 @@ fn check_design_manifest(root: &Path, manifest: &DesignManifest) -> Result<(), &
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .map_err(|_| "SQLite snapshot integrity check failed")?;
     // This design-only fixture verifies the current live Store image. Schema
-    // v34 is the remote-Start migration; archived v33 compatibility is tested
-    // separately by composite_staging's V1/V2 compatibility matrix.
-    if store_id != manifest.store_id || schema != 34 || app != 0x41575333 || check != "ok" {
+    // v35 adds the durable remote-view trust lease; archived compatibility is
+    // tested separately by composite_staging's V1/V2 compatibility matrix.
+    if store_id != manifest.store_id || schema != 35 || app != 0x41575333 || check != "ok" {
         return Err("SQLite snapshot identity/schema/content does not match receipt");
     }
     Ok(())

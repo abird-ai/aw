@@ -42,7 +42,7 @@ struct Ticket {
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Presentation {
+pub(super) struct Presentation {
     version: u8,
     fingerprint: String,
     query: String,
@@ -68,7 +68,7 @@ struct PresentationPane {
     left: u32,
 }
 impl Presentation {
-    fn valid_for(&self, resource: &Resource) -> bool {
+    pub(super) fn valid_for(&self, resource: &Resource) -> bool {
         const MAX_OFFSET: u32 = 4 * 1024 * 1024;
         self.version == 1
             && self.fingerprint.len() == 64
@@ -95,6 +95,17 @@ impl Presentation {
                     && pane.top <= 32 * 1024 * 1024
                     && pane.left <= MAX_OFFSET
             })
+    }
+
+    pub(super) fn matches_file_text(&self, text: &str) -> bool {
+        let mut bytes = Vec::with_capacity(5 + text.len());
+        bytes.extend_from_slice(b"file\0");
+        bytes.extend_from_slice(text.as_bytes());
+        hash(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            == self.fingerprint
     }
 }
 
@@ -242,14 +253,7 @@ async fn reauthorize_view(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
             StatusCode::CONFLICT,
             "original File snapshot changed",
         ))?;
-        let mut bytes = Vec::with_capacity(5 + text.len());
-        bytes.extend_from_slice(b"file\0");
-        bytes.extend_from_slice(text.as_bytes());
-        let actual = hash(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        if actual != expected.fingerprint {
+        if !expected.matches_file_text(text) {
             return Err(ApiError(
                 StatusCode::CONFLICT,
                 "original File content changed",

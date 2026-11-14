@@ -1,7 +1,7 @@
 # Delegated browser read authority
 
 Owner: @pvl
-Status: Agent branch complete; File/Review distinct-Actor backend lifecycle complete; File/Review Solid/live acceptance pending
+Status: Agent branch complete; File/Review CLI + Solid delegation complete; presentation + live acceptance pending
 
 ## Boundary
 
@@ -468,3 +468,201 @@ document send/receive integration and exact-grant cache scrubbing, presentation
 state transfer on the distinct-Actor route, and real two-profile Chrome
 acceptance. Those are the next coherent product boundary; do not infer them from
 the backend HTTP proof.
+
+## File + immutable Review CLI/Solid delegation checkpoint — 2026-11-14
+
+The shipping source-selection and browser-controller slice is now implemented on
+top of the committed `c9aaf0e` authority model. It does not redesign grants,
+ticket phases or recipient identity.
+
+### Trusted Team configuration
+
+- `MemberConfig` has an explicit version-1-compatible
+  `delegate_workspace_views` boolean. It defaults to false, so existing Team
+  files retain the prior no-human-surface behavior;
+- opting in changes the existing Team configuration fingerprint, so the normal
+  config watcher stops/revokes an owner if the grant configuration changes;
+- `aw team check` reports the opt-in without exposing a root, endpoint or
+  credential;
+- the Team CLI builds `DelegatedSurfaceSource` only for opted-in participants
+  and uses the already trusted, canonicalized Team `directory` as its read root.
+  The browser cannot choose another root;
+- the CLI source forces terminals off and Sites empty, with Git/shell executable
+  paths coming only from host configuration/environment defaults. The participant
+  Actor is preserved exactly;
+- builds without the `surfaces` feature reject an opted-in configuration instead
+  of silently ignoring it.
+
+### Owner-only source navigator
+
+The granting browser needs a way to choose an exact File/Review without turning
+normal Team Workspace into recipient authority. The Team gateway therefore adds
+two source-owner-only routes:
+
+- `GET /api/team/delegation/surface` — capabilities for that participant's
+  explicitly configured retained host;
+- `POST /api/team/delegation/surface/action` — a bounded typed read-only Surface
+  command routed through the same `workspace.rs` worker/auth/error path.
+
+`workspace.rs` now accepts an explicit trusted host internally so ordinary
+Workspace and this delegated-source navigator share one projection/validation
+implementation. The normal Team `/api/workspace` still reports disabled and
+`/api/workspace/action` remains forbidden for both grantor and recipient.
+
+`/api/team/me` now distinguishes:
+
+- `delegated_surface_views`: this participant owns an explicitly configured
+  source and may choose resources to delegate;
+- `delegated_surface_receive`: this build may receive an exact delegated
+  File/Review even when the participant has no source/root of their own.
+
+### Browser resource lifetime
+
+Distinct-Actor File/Review links use their own correlation fragment,
+`#aw-surface-dock=<ticket>`. It is stripped from history before the first
+protected read and is never treated as resource authority.
+
+The browser `WorkspaceViews` model now supports a document with its own exact
+reader and `authorityKey`, independent of the ordinary Workspace source:
+
+- `openDelegatedDocument` accepts only one exact File path or immutable Review
+  ID plus its per-grant reader;
+- the receiver reader accepts only the exact source/scope/resource request and
+  calls `/api/dock/surface/read`; it cannot issue navigator, search, Git-list,
+  worktree-open or arbitrary sibling File reads;
+- the same resource under grant A and grant B remains two independent cache
+  lifetimes; it is never deduplicated by path/Review ID alone;
+- a 403 on grant A scrubs only A's cached plaintext and marks only that document
+  unavailable. Grant B and an ordinary owner read of the same File survive;
+- browser-auth 401 is stronger and scrubs all ordinary and delegated caches;
+- ordinary Workspace source replacement/reconnect uses `clearSource` and does
+  not erase a still-authorized delegated receiver document;
+- delegated documents cannot be moved into an unrelated local Files/Git
+  navigator scope and expose no re-delegation control.
+
+### Shipping Solid controls
+
+- an opted-in Team source is selected only after ordinary `/api/workspace`
+  remains disabled; ordinary Workspace still wins when explicitly enabled;
+- loaded owner File/Review tabs from the Team delegated source show an explicit
+  recipient chooser and private-link action. No participant is implicitly
+  selected;
+- same-owner popup/paired-browser controls remain limited to ordinary Workspace
+  documents and are not conflated with distinct-Actor grants;
+- received documents are opened directly as read-only tabs, labelled
+  `delegated · read only`, with no navigator/root grant and no re-delegation or
+  local-scope move control;
+- the receiver performs an authorized `/api/dock/surface/read` and renders the
+  exact document before Accept. Confirm/Heartbeat/Release continue to use the
+  shared backend lifecycle;
+- the private URL status explicitly says only the selected Team participant can
+  use the grant.
+
+### Verification
+
+- full authenticated Team module after the owner-navigator addition:
+  **48 passed / 1 intentional ignored**, including the new test that Alice can
+  browse only her configured delegated source while Bob cannot, ordinary Team
+  Workspace stays disabled for both, terminals/Sites stay absent and provider
+  calls remain zero;
+- Team CLI/config tests: **12/12 passed**, including version-1 default-false and
+  fingerprint-rotation coverage;
+- all browser model/controller suites: **187/187 passed**, including source
+  replacement with retained delegated docs, same-resource grant A/B cache
+  isolation, 403 exact-grant scrub, 401 global scrub, exact receiver-only reads,
+  known revoke cleanup and fragment stripping;
+- production Vite build: 174 modules; two consecutive builds produced
+  byte-identical hashes for all **8/8** embedded assets;
+- `cargo clippy --locked -p aw-cli --lib -- -D warnings` and the default CLI
+  binary check passed;
+- reduced Team **library** check passed with only the pre-existing
+  `bind_execution_owner` dead-code warning;
+- the reduced Team **binary** check is not a gate for this slice: it reaches an
+  unrelated existing `src/subagents.rs` feature-boundary error (`Inner.state_dir`
+  absent) before this Team source path is relevant.
+
+Whole-tree `git diff --check` could not be asserted at this checkpoint because a
+concurrent rewrite of `.agents/docs/CURRENT_HANDOFF.md` appeared during the turn
+with trailing whitespace. That concurrent documentation, plus concurrently
+modified `NEXT-AGENT.md`, `TODO.md` and the new comprehensive UX handoff, was
+left untouched. The implementation slice itself is checked separately.
+
+The bounded distinct-Actor presentation transfer is now implemented in the
+current dirty tree and focused green: File Find/result/caret/selection/viewport
+and Review two-pane Find/selection/scroll/focus reuse the existing bounded v1
+presentation envelope; presentation never enters resource/grant identity, and
+mutable File fingerprints are revalidated against the exact owner bytes at
+prepare/Accept/Release. The receiver restores only after its exact delegated
+read/render/fingerprint check and rechecks the target before Accept. The docking
+handoff suite is **16/16**, focused File/Review lifecycles pass, and held-response
+revoke fencing passes.
+
+## File + immutable Review live-browser acceptance — 2026-11-14
+
+The current uncommitted shipping slice is accepted in **real Chrome 157** using
+two independent user-data directories and separate fresh-profile File and Review
+runs at **390×844**.
+
+One real frontend defect was found and fixed during this gate. Cold File/Diff
+navigation could fetch the entire split `chunk-code-surface.js` successfully
+but leave CodeMirror unmounted under the Solid `lazy()` lifecycle boundary.
+The product still keeps that ~1.50 MB editor bundle out of the initial app
+chunk, but now loads it through one cached explicit dynamic import and awaits
+that import before ordinary File/Review admission and both document docking
+receiver paths. The real CodeFile/CodeDiff component is therefore mounted from
+an already-resolved module rather than through the stranded lazy boundary.
+
+Accepted live facts:
+
+- Alice and Bob were distinct Team principals
+  `internal:delegation-live:alice` / `internal:delegation-live:bob`, with
+  distinct HttpOnly session-cookie values in independent Chrome profiles;
+- File granted only exact `source/scope/path=src/private.rs`; Review granted
+  only exact `source/scope/review_id`, never a recipient root or Git context;
+- `#aw-surface-dock=` was removed before every protected
+  receive/read/Accept/heartbeat request;
+- Bob's ordinary `/api/workspace` remained `enabled:false`; a syntactically
+  valid ordinary Git inventory action returned **403**; Bob's delegated-source
+  capability endpoint returned **403**; Files and Git navigator controls stayed
+  disabled;
+- File restored Find/current match, CodeMirror selection and pane focus; Review
+  restored the same plus exact focused second pane. Source and receiver viewport
+  offsets matched; this 390×844 fixture truthfully clamps both to zero, while
+  the focused controller regressions retain nonzero-offset coverage;
+- delegated receivers exposed neither ordinary-scope move nor re-delegation;
+- source File/Review closed only after factual Release;
+- after successful File Release, Alice's exact Revoke returned
+  `state=revoked`; Bob's explicit refresh scrubbed CodeMirror/plaintext and
+  exposed the revoked/unavailable state. A subsequent reload did not issue a
+  second receive or mint another grant;
+- Review recipient logout returned Bob to the pairing screen with no protected
+  Review text;
+- Alice's active private Agent/Session and unsent draft
+  `alice private draft stays` with selection 6..13 were unchanged; Bob's
+  private Agent/Session was unchanged;
+- Alice and Bob each measured 390 px inner/document width, with no page-wide
+  horizontal overflow and **zero uncaught JavaScript exceptions /
+  `console.error`**;
+- synthetic Git HEAD/index stayed
+  `bdf988a82b7be3c9a702b19dfaadb6acffd40cf4` /
+  `38f377619579a0257a9ee604d1fc8b25198ba632`;
+- fake provider count ended at **0**; the private SQLite fixture had exactly
+  **2 expected Sessions** and **0** `runs`, `run_events`,
+  `invocation_receipts`, `pipeline_runs`, `team_runs`,
+  `llm_operations`, `llm_attempts`, and `shared_draft_submissions`.
+
+Post-fix focused product checks:
+
+- `node --test tests/web_docking_handoff.test.mjs tests/web_workspace.test.mjs`
+  — **78/78 passed**;
+- prior focused Rust File/Review lifecycle, held-response publication fencing,
+  reduced Team+Surfaces checks, and lost-Release truthfulness remain green;
+- `cargo fmt --all -- --check` and `git diff --check` — passed;
+- two consecutive production Vite builds transformed 174 modules and were
+  byte-identical across **8/8** emitted assets; final `app.js` SHA-256 is
+  `2ff174edceb39f9b0230fec735facae56f62a2132c13b64a43f686f03a6c89c5`.
+
+This closes local distinct-Actor File/Review browser acceptance. Remote-device
+identity/trust, post-ACK arbitrary partitions, remote/distinct-Actor PTY
+custody, non-Unix custody and broker crash/reboot restoration remain separate
+future gates.

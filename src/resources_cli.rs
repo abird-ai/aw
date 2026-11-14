@@ -5212,6 +5212,7 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                         },
                         domain_id,
                         auth_session_max_ttl,
+                        remote_view_max_ttl: None,
                     },
                 )?;
                 print(&result, o.json)?;
@@ -5281,6 +5282,7 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                         auth_session_ttl: auth_session_out
                             .as_ref()
                             .map(|_| auth_session_ttl.unwrap_or(86_400)),
+                        remote_view: None,
                         signing_key,
                     },
                 )?;
@@ -5780,6 +5782,7 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                         actor,
                         root,
                         git: trusted_git_path()?,
+                        remote_view_workspace_id: None,
                     },
                 )?;
                 print(&result, o.json)?;
@@ -5870,6 +5873,7 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                             lease: Duration::from_secs(lease),
                         },
                         request,
+                        remote_view: None,
                     },
                 )?;
                 print(&result, o.json)?;

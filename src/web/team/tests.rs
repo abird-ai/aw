@@ -383,6 +383,7 @@ async fn prepare_surface_dock(
     recipient_id: &str,
     document_id: &str,
     target: &surface_read::Target,
+    presentation: Option<serde_json::Value>,
 ) -> (serde_json::Value, serde_json::Value) {
     let origin_response = send(
         router,
@@ -415,6 +416,7 @@ async fn prepare_surface_dock(
             "kind":kind,
             "path":path,
             "review_id":review_id,
+            "presentation":presentation,
         }),
         Some(owner_cookie),
     )
@@ -426,6 +428,22 @@ async fn prepare_surface_dock(
         .to_string()
         .contains("team delegated exact file alpha"));
     (origin, prepared)
+}
+
+#[cfg(feature = "surfaces")]
+fn delegated_file_presentation(text: &str) -> serde_json::Value {
+    let digest = hash(format!("file\0{text}").as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    serde_json::json!({
+        "version":1,
+        "fingerprint":digest,
+        "query":"delegated",
+        "selected":0,
+        "focus":"pane0",
+        "panes":[{"anchor":1,"head":4,"from":0,"top":144,"left":7}]
+    })
 }
 
 #[cfg(feature = "surfaces")]
@@ -1449,6 +1467,134 @@ async fn recipient_logout_revokes_incoming_delegated_agent_grant() {
 
 #[cfg(feature = "surfaces")]
 #[tokio::test]
+async fn delegated_surface_source_is_owner_only_navigator_not_team_workspace_authority() {
+    let (router, _team, _, calls, _fixture) = setup_with_delegated_surface();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+
+    let alice_me = data(
+        send(
+            &router,
+            "GET",
+            "/api/team/me",
+            serde_json::Value::Null,
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    let bob_me = data(
+        send(
+            &router,
+            "GET",
+            "/api/team/me",
+            serde_json::Value::Null,
+            Some(&bob_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(alice_me["surfaces"], false);
+    assert_eq!(bob_me["surfaces"], false);
+    assert_eq!(alice_me["delegated_surface_views"], true);
+    assert_eq!(bob_me["delegated_surface_views"], false);
+    assert_eq!(alice_me["delegated_surface_receive"], true);
+    assert_eq!(bob_me["delegated_surface_receive"], true);
+
+    let capabilities_response = send(
+        &router,
+        "GET",
+        "/api/team/delegation/surface",
+        serde_json::Value::Null,
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(capabilities_response.status(), StatusCode::OK);
+    let capabilities = data(capabilities_response).await;
+    assert_eq!(capabilities["enabled"], true);
+    assert_eq!(capabilities["capabilities"]["files"], true);
+    assert_eq!(capabilities["capabilities"]["git_read"], true);
+    assert_eq!(capabilities["capabilities"]["git_write"], false);
+    assert_eq!(capabilities["capabilities"]["terminals"], false);
+    assert_eq!(
+        capabilities["capabilities"]["sites"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    assert_eq!(
+        send(
+            &router,
+            "GET",
+            "/api/team/delegation/surface",
+            serde_json::Value::Null,
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let source_id = capabilities["capabilities"]["source_id"].as_str().unwrap();
+    let scope_id = capabilities["capabilities"]["view_root"]["id"]
+        .as_str()
+        .unwrap();
+    let read = send(
+        &router,
+        "POST",
+        "/api/team/delegation/surface/action",
+        serde_json::json!({
+            "op":"view",
+            "source_id":source_id,
+            "scope_id":scope_id,
+            "request":{"op":"file","path":"sample.rs"}
+        }),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = data(read).await;
+    assert_eq!(read["result"]["text"], "team delegated exact file alpha\n");
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/team/delegation/surface/action",
+            serde_json::json!({
+                "op":"view",
+                "source_id":source_id,
+                "scope_id":scope_id,
+                "request":{"op":"file","path":"sample.rs"}
+            }),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    for cookie in [&alice_cookie, &bob_cookie] {
+        let ordinary = data(
+            send(
+                &router,
+                "GET",
+                "/api/workspace",
+                serde_json::Value::Null,
+                Some(cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(ordinary["enabled"], false);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "surfaces")]
+#[tokio::test]
 async fn delegated_file_lifecycle_keeps_team_workspace_disabled_and_exact() {
     let (router, team, _, calls, _fixture) = setup_with_delegated_surface();
     let alice_cookie = login(&router, ALICE).await;
@@ -1531,6 +1677,9 @@ async fn delegated_file_lifecycle_keeps_team_workspace_disabled_and_exact() {
         "bob",
         "workspace-document-delegated-file",
         &target,
+        Some(delegated_file_presentation(
+            "team delegated exact file alpha\n",
+        )),
     )
     .await;
     let ticket = prepared["ticket"].as_str().unwrap().to_owned();
@@ -1552,6 +1701,10 @@ async fn delegated_file_lifecycle_keeps_team_workspace_disabled_and_exact() {
     assert_eq!(receiver["resource"]["path"], "sample.rs");
     assert_eq!(receiver["resource"]["source_id"], target.source_id);
     assert_eq!(receiver["resource"]["scope_id"], target.scope_id);
+    assert_eq!(
+        receiver["presentation"],
+        delegated_file_presentation("team delegated exact file alpha\n")
+    );
     assert!(!receiver
         .to_string()
         .contains("team delegated exact file alpha"));
@@ -1700,6 +1853,7 @@ async fn delegated_file_revoke_fences_held_response_and_future_reads() {
         "bob",
         "workspace-document-delegated-file-race",
         &target,
+        None,
     )
     .await;
     let ticket = prepared["ticket"].as_str().unwrap().to_owned();
@@ -1794,6 +1948,17 @@ async fn delegated_review_reads_only_exact_retained_review_without_recipient_git
         "bob",
         "workspace-document-delegated-review",
         &target,
+        Some(serde_json::json!({
+            "version":1,
+            "fingerprint":"f".repeat(64),
+            "query":"beta",
+            "selected":0,
+            "focus":"pane1",
+            "panes":[
+                {"anchor":1,"head":3,"from":0,"top":100,"left":0},
+                {"anchor":2,"head":5,"from":0,"top":240,"left":11}
+            ]
+        })),
     )
     .await;
     let ticket = prepared["ticket"].as_str().unwrap().to_owned();
@@ -1801,6 +1966,12 @@ async fn delegated_review_reads_only_exact_retained_review_without_recipient_git
     assert_eq!(receiver["resource"]["kind"], "review");
     assert_eq!(receiver["resource"]["review_id"], review_id);
     assert!(receiver["resource"].get("path").is_none());
+    assert_eq!(receiver["presentation"]["query"], "beta");
+    assert_eq!(receiver["presentation"]["focus"], "pane1");
+    assert_eq!(
+        receiver["presentation"]["panes"].as_array().unwrap().len(),
+        2
+    );
 
     assert_eq!(
         send(

@@ -13,6 +13,8 @@ mod delegated;
 mod multiplayer;
 
 const MAX_PAIR_BYTES: usize = 1024;
+#[cfg(feature = "surfaces")]
+const MAX_DELEGATED_SURFACE_ACTION_BYTES: usize = 16 * 1024;
 const MAX_GATEWAY_INFLIGHT: usize = 16;
 
 /// Trusted Rust embedding API: authenticate users at the gateway, not by passing
@@ -133,7 +135,7 @@ where
             entry.user.id, code
         );
     }
-    eprintln!("Invite-only private conversations by default. Give each code only to its intended user; use separate browser profiles. Shared prompt collaboration is explicit and permissioned; no tools/shell/file views are granted.");
+    eprintln!("Invite-only private conversations by default. Give each code only to its intended user; use separate browser profiles. Agents receive no tools/shell/filesystem authority. Human File/Review delegation exists only for participants explicitly opted in by trusted Team configuration.");
     let watchdog_team = team.clone();
     let watchdog = tokio::spawn(async move {
         loop {
@@ -528,9 +530,63 @@ async fn route(team: &TeamState, request: Request) -> ApiResult<Response> {
         return Ok(Json(serde_json::json!({"mode":"invite-only-team","realm":team.0.realm,
             "participant":{"id":entry.user.id,"display_name":entry.user.display_name,"principal":entry.app.0.session.actor},
             "session_scope":session_scope,"tools":false,"surfaces":false,"peer_sharing":peer_sharing,
-            "delegated_agent_views":true,"delegated_surface_views":delegated_surface_views})).into_response());
+            "delegated_agent_views":true,"delegated_surface_receive":cfg!(feature = "surfaces"),
+            "delegated_surface_views":delegated_surface_views})).into_response());
     }
     let app = entry.app.clone();
+    #[cfg(feature = "surfaces")]
+    if path == "/api/team/delegation/surface" && method == Method::GET {
+        let host = entry.delegated_surface.clone().ok_or(ApiError(
+            StatusCode::FORBIDDEN,
+            "delegated workspace source is not enabled for this participant",
+        ))?;
+        let response = workspace::capabilities_with_host(&app, host).await;
+        if !auth_alive(&app) || team.0.stop.is_cancelled() {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "identity revoked before delegated workspace response",
+            ));
+        }
+        return Ok(response);
+    }
+    #[cfg(feature = "surfaces")]
+    if path == "/api/team/delegation/surface/action" && method == Method::POST {
+        let host = entry.delegated_surface.clone().ok_or(ApiError(
+            StatusCode::FORBIDDEN,
+            "delegated workspace source is not enabled for this participant",
+        ))?;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            to_bytes(request.into_body(), MAX_DELEGATED_SURFACE_ACTION_BYTES),
+        )
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::REQUEST_TIMEOUT,
+                "delegated workspace request timeout",
+            )
+        })?
+        .map_err(|_| {
+            ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "delegated workspace request too large",
+            )
+        })?;
+        let command: aw_surfaces::Command = serde_json::from_slice(&bytes).map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid delegated workspace command",
+            )
+        })?;
+        let response = workspace::action_with_host(&app, host, command).await;
+        if !auth_alive(&app) || team.0.stop.is_cancelled() {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "identity revoked before delegated workspace response",
+            ));
+        }
+        return Ok(response);
+    }
     if path == "/api/team/delegation/recipients" && method == Method::GET {
         let participants = team
             .0
