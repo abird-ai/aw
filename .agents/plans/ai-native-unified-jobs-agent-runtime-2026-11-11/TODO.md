@@ -467,13 +467,15 @@ consolidated product once.
       Native Windows/macOS remain separate release/platform gates and are not claimed from L5;
       Bubblewrap/filesystem sandbox primitives were unchanged by this cutover and were not rerun.
 
-### Final exact cross-repo pin — blocked only on commit/push authorization
-- [ ] Commit and push the reviewed AW implementation first; then repin dotlink's three shared AW
-      dependencies from `9e9ab043...` to that exact new SHA, replace dotlink's temporary local
-      remote-Start argument-digest mirror with `aw_tools::remote_start::arguments_sha256`, regenerate
-      dotlink `Cargo.lock`, and rerun one locked dotlink package/integration + strict-Clippy gate.
-      Never repin to dirty/unpushed AW or use a sibling path. Runtime Checkpoint G is green; this is
-      the remaining repository-finalization dependency.
+### Final exact cross-repo pin
+- [x] Finalized and pushed: AW shared/runtime implementation
+      `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`; dotlink bridge
+      `c90a6603ccef0bbf626ce10d95bedf59877747b8`. dotlink's three AW dependencies pin the exact
+      AW SHA, its temporary argument-digest mirror is removed in favor of
+      `aw_tools::remote_start::arguments_sha256`, and `Cargo.lock` changes only the three Git
+      source revisions. Final locked dotlink qualification is green: all-target/all-feature check,
+      651 active / 1 intentional ignore plus all five integrations, strict Clippy, fmt and diff.
+      No sibling path, `file://`, vendored copy or unpushed SHA remains.
 
 ## Completion
 

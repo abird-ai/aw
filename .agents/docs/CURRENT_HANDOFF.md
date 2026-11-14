@@ -28,90 +28,61 @@ Canonical dotlink checkout: `/home/pvl/spaces/abird/src/dotlink`
 
 - Repo: `/home/pvl/spaces/abird/src/aw`
 - Branch: `main`
-- Current pushed HEAD: `7800c8b832c927960dc6b2b69c0529e89a9999d3`.
 - Normative design authority remains
-  `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`
-  (`Resolve shared Job, replay, wake, and Graph ownership design`).
-- Reviewed/pushed implementation baseline:
-  `9e9ab043410241c3f797f760d93a1cfd9126fdd2`
-  (`Implement unified Jobs and Agent runtime checkpoint`).
-- The current main worktree is intentionally dirty and unstaged with the completed
-  D2/D3/Phase-7 implementation and final qualification fixes. It is newer than
-  `9e9ab043...` and has **not** yet been committed/pushed.
-- Runtime Checkpoints 0/A/B/C/D/E/F/G are reconciled and green. The current
-  unified TODO intentionally has one remaining unchecked repository-finalization
-  item: the exact final cross-repo shared pin.
-- Final AW review/qualification includes:
-  - strict Clippy for changed crates/targets;
-  - stateless/minimal/no_std+alloc + wasm32v1-none boundaries;
-  - DL-150 shared conformance (`aw-tools` 303/303 + AW adapter vectors);
-  - deterministic Read/Graph/Bash-Jobs/Agent model/tool-round fixtures;
-  - live Qwen 3.8 27B first-call/continuation selection on x2;
-  - hard removal of old model/API routes and the production-dead
-    `PolicyGraphRouter` owner.
+  `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`.
+- Final shared/runtime implementation commit:
+  `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
+  (`Complete unified Jobs and Agent runtime`), signed and pushed.
+- Runtime Checkpoints 0/A/B/C/D/E/F/G are reconciled and green.
+- Final AW qualification includes strict changed-crate Clippy, stateless/minimal/
+  no_std+alloc boundaries, wasm32v1-none, DL-150 shared conformance, real
+  Process/Graph/Agent/Jobs flows, hard-cutover cleanup and live Qwen selection.
 - One canonical AW worktree only. Never inspect or touch `.agents/plans/ux/**`;
   another owner reserves it.
-- Nothing is staged.
 
 ### dotlink
 
 - Repo: `/home/pvl/spaces/abird/src/dotlink`
 - Branch: `main`
-- Current pushed HEAD: `01e13a0bf52dc7d6afb3da51a93f533d5aeee34f`.
-- Pushed D1 checkpoint:
-  `3f59bb16b0262f6157351fd28b13167cc1b3e5db`.
-- dotlink currently pins `aw-tools`, `aw-tools-fs-unix`, and
-  `aw-tools-fs-win` exactly to reachable AW
-  `9e9ab043410241c3f797f760d93a1cfd9126fdd2`.
-- The current dirty main worktree contains completed D2/D3/final bridge work.
-  Dotlink Checkpoint 3 is green.
-- Final cross-repo diff review fixed replay-first ordering for remote Graph,
-  shell, and cancel:
-  - exact Graph replay is claimed before mutable Graph preparation/topology checks;
-  - exact shell replay is claimed before current local shell-policy recheck;
-  - exact cancel replay is claimed before current revision recheck.
-- Fresh post-review dotlink qualification:
+- Final unified bridge commit:
+  `c90a6603ccef0bbf626ce10d95bedf59877747b8`
+  (`Finalize dotlink unified Jobs bridge`), signed and pushed.
+- dotlink pins `aw-tools`, `aw-tools-fs-unix`, and `aw-tools-fs-win`
+  exactly to AW `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`.
+- The temporary local remote-Start argument-digest copy is removed; dotlink uses
+  `aw_tools::remote_start::arguments_sha256` from that exact pin.
+- Final locked qualification against the pin:
+  - all-target/all-feature check green;
   - **651 passed / 0 failed / 1 intentional external-fixture ignore**;
-  - integration binaries **1/1, 8/8, 1/1, 12/12, 4/4**;
+  - integrations **1/1, 8/8, 1/1, 12/12, 4/4**;
   - strict all-target/all-feature Clippy green;
-  - rustfmt/diff check green.
+  - rustfmt/diff green.
+- Final replay-first review is regression-locked for remote Graph, shell and
+  cancel; exact redelivery reaches replay claim before mutable
+  topology/policy/revision checks.
 - Existing second worktree:
   `/home/pvl/spaces/abird/src/dotlink-016-fixes`, branch `release/0.16`.
   Do not touch it and do not create another worktree.
-- `docs/CHATGPT_PLUGIN.md` remains unrelated pre-existing dirty work; preserve it.
-- Nothing is staged.
+- `docs/CHATGPT_PLUGIN.md` remains unrelated dirty work and was not included
+  in the final bridge commit.
 
-### Remaining repository-finalization dependency
+### Completion state
 
-Runtime implementation and qualification are complete. The only remaining
-cross-repo finalization step is intentionally blocked on explicit commit/push
-authorization:
+The unified Jobs + Agent runtime implementation is **finalized across both repos**.
+There is no remaining implementation or exact-pin TODO.
 
-1. final AW diff/hygiene review;
-2. commit and push AW first;
-3. capture the exact reachable new AW SHA;
-4. repin dotlink's three shared AW dependencies to that SHA;
-5. replace dotlink's temporary local remote-Start argument-digest mirror with
-   `aw_tools::remote_start::arguments_sha256`;
-6. regenerate dotlink `Cargo.lock`;
-7. run one locked dotlink all-features/integration + strict-Clippy/fmt/diff gate;
-8. commit/push dotlink only if the user explicitly authorizes it.
-
-Never repin dotlink to dirty/unpushed AW and never substitute a sibling path,
-`file://` dependency, or vendored copy.
+Future work should begin from live Git state and a new scoped request. Release,
+tag, deploy, or native platform certification remain separate actions and require
+their own authorization.
 
 ### User process constraints
 
 - Use **dotlink---l5 only** for implementation/source work. Do not use A1.
 - x2 may be used only as an inference host; it is not source authority.
-- Work in the two canonical checkouts above; do not create another worktree.
-- Limit one model/user work turn to roughly **30 minutes**.
-- Aim for the next coherent checkpoint, record state, then pause.
+- Work in the canonical checkouts above; do not create another worktree.
 - Preserve concurrent/unrelated dirty files.
-- No push, version, tag, release, deploy, history rewrite, reset-hard or destructive
-  action without separate explicit authorization.
-- A request to implement is not authorization to commit or push.
-- If asked to commit, commits are signed and only owned paths may be staged.
+- No version/tag/release/deploy/history rewrite or destructive action without
+  separate explicit authorization.
 
 ---
 
@@ -916,9 +887,12 @@ The dotlink TODO records the grouped D1 checkpoint green on L5, including:
 
 ### 5.4 D1 shared dependency boundary closed
 
-dotlink is pinned exactly to reviewed/pushed AW implementation revision:
+D1 originally closed against reviewed/pushed AW implementation revision:
 
 `9e9ab043410241c3f797f760d93a1cfd9126fdd2`
+
+The final unified bridge supersedes that historical D1 pin with exact AW
+`0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`; see Section 6.
 
 That revision exports the reviewed shared finite Job/Graph runtime plus `OperationId`,
 typed `ExecutionRef`, coordination/event primitives and the host-neutral remote-Start
@@ -931,65 +905,58 @@ copied AW source remain. D1's shared-pin prerequisite is complete.
 
 ---
 
-## 6. Exact next boundary: final exact cross-repo pin
+## 6. Final exact cross-repo pin — complete
 
-D1, D2, D3, AW Phase 7, Checkpoint F and runtime Checkpoint G are implemented and
-qualified. Do **not** restart D2, redesign the bridge, reintroduce old routes, or
-repeat unchanged primitive suites.
+D1, D2, D3, AW Phase 7, Checkpoint F, runtime Checkpoint G and repository
+finalization are complete.
 
-The next boundary is repository finalization, and it depends on commit order.
+Final shared AW implementation revision:
 
-### 6.1 Why dotlink cannot be repinned yet
+`0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
 
-dotlink's three shared dependencies still point at the last reachable reviewed AW
-revision:
+Final dotlink bridge revision:
 
-`9e9ab043410241c3f797f760d93a1cfd9126fdd2`
+`c90a6603ccef0bbf626ce10d95bedf59877747b8`
 
-The current AW worktree is newer and includes, among other reviewed changes, the
-shared canonical `aw_tools::remote_start::arguments_sha256` helper. dotlink
-temporarily mirrors that exact digest implementation locally so D2 can be tested
-against the old reachable pin.
+dotlink consumes the exact AW revision through normal Git dependencies for:
 
-That mirror is **temporary by construction**. It should disappear only after AW is
-committed/pushed and dotlink can consume the helper from one exact reviewed Git SHA.
+- `aw-tools`
+- `aw-tools-fs-unix`
+- `aw-tools-fs-win`
 
-### 6.2 Authorized finalization sequence
+`Cargo.lock` changes only those three Git source revisions. No sibling path,
+`file://`, vendored copy or unpushed SHA is used.
 
-Only after explicit user authorization to commit/push:
+The temporary dotlink argument-digest mirror is gone; the bridge now uses
+`aw_tools::remote_start::arguments_sha256` directly.
 
-1. revalidate AW status/diff and run only any ownership-triggered final hygiene;
-2. commit and push the reviewed AW implementation;
-3. record the exact reachable AW SHA;
-4. update dotlink `Cargo.toml` so `aw-tools`, `aw-tools-fs-unix`, and
-   `aw-tools-fs-win` all pin that exact SHA;
-5. replace dotlink's local `arguments_sha256` mirror with
-   `aw_tools::remote_start::arguments_sha256`;
-6. regenerate dotlink `Cargo.lock` from the Git pin, with no path override;
-7. run exactly one locked final dotlink qualification:
-   - `cargo test --offline --locked --all-features`;
-   - strict all-target/all-feature Clippy;
-   - rustfmt + `git diff --check`;
-8. if and only if separately/currently authorized, commit/push dotlink.
+### 6.1 Final remote-Start replay contract
 
-If commit/push remains unauthorized, stop after revalidation and report:
-**runtime-qualified; exact-pin repository finalization pending authorization**.
-
-### 6.3 Final remote-Start replay contract now implemented
-
-The final review confirmed and regression-locked replay-first ordering:
+The final implementation regression-locks replay-first ordering:
 
 - AW redelivery looks up immutable Start attempt identity before current
   ToolBinding/ref resolution and rejects changed semantic request digest.
-- dotlink validates target/op/args/generation, then the concrete effect owner
+- dotlink validates target/op/args/generation and then the concrete effect owner
   claims the Start before mutable local checks/effects.
 - remote Graph claims before Graph preparation/topology revalidation.
 - remote shell claims before current shell-policy revalidation.
 - remote cancel claims before current revision precondition.
-- `jobs_ack`, `jobs_send`, and shared native FS already had claim-first ordering.
+- `jobs_ack`, `jobs_send`, and shared-native FS are claim-first.
 - exact Ready receipt replays after later mutable-state/policy/revision changes.
 - Claimed/Unknown never becomes a fresh effect.
-- new attempts still recheck current dotlink launcher/sandbox/tool/resource authority.
+- genuinely new attempts still recheck current launcher/sandbox/tool/resource authority.
+
+### 6.2 Final qualification against the exact pin
+
+dotlink, locked to AW `0a6c6a0...`:
+
+- `cargo check --offline --locked --all-targets --all-features` — green;
+- `AW_BASH=... cargo test --offline --locked --all-features --quiet` —
+  651 active / 1 intentional ignored fixture plus all five integrations green;
+- strict all-target/all-feature Clippy — green;
+- rustfmt and diff checks — green.
+
+No further unified-runtime implementation step remains.
 
 ---
 
