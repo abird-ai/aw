@@ -112,6 +112,127 @@ fn setup_at(address: SocketAddr) -> (Router, TeamState, SessionStore, Arc<Atomic
         application(roster, runtimes, address, &[ALICE.into(), BOB.into()]).unwrap();
     (router, team, store, calls)
 }
+
+#[cfg(feature = "surfaces")]
+struct TeamSurfaceFixture(std::path::PathBuf);
+
+#[cfg(feature = "surfaces")]
+impl TeamSurfaceFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = std::env::temp_dir().join(format!(
+            "aw-team-delegated-surface-{}",
+            random_token().unwrap()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        std::fs::write(root.join("sample.rs"), "team delegated exact file alpha\n").unwrap();
+        Self(root)
+    }
+}
+
+#[cfg(feature = "surfaces")]
+impl Drop for TeamSurfaceFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(feature = "surfaces")]
+fn setup_with_delegated_surface() -> (
+    Router,
+    TeamState,
+    SessionStore,
+    Arc<AtomicUsize>,
+    TeamSurfaceFixture,
+) {
+    let fixture = TeamSurfaceFixture::new();
+    let store = SessionStore::in_memory().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let roster = Roster::new(
+        "fixture",
+        vec![
+            Participant {
+                id: "alice".into(),
+                display_name: "Alice".into(),
+            },
+            Participant {
+                id: "bob".into(),
+                display_name: "Bob".into(),
+            },
+        ],
+    )
+    .unwrap();
+    let mut runtimes = Vec::new();
+    for id in ["alice", "bob"] {
+        let actor = PrincipalId::new(roster.principal(id).unwrap()).unwrap();
+        let account = format!("{id}-account");
+        let provider = Arc::new(Fake(calls.clone()));
+        let agent = Agent::builder(
+            provider.clone(),
+            AgentOptions::new(account.clone(), "fixture-model"),
+        )
+        .account(descriptor(&account, &actor), actor.clone(), "local")
+        .build()
+        .unwrap();
+        agent
+            .register_provider_account(descriptor("common", &actor), provider)
+            .unwrap();
+        let binding = SessionBinding {
+            working_directory: fixture.0.clone(),
+            tool_root: fixture.0.clone(),
+            system_prompt: String::new(),
+            profile_hint: account,
+            model_hint: "fixture-model".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let persistence =
+            PersistentSession::create(store.clone(), actor, binding, &format!("{id} private"))
+                .unwrap();
+        runtimes.push(ParticipantRuntime {
+            participant_id: id.into(),
+            agent,
+            persistence,
+        });
+    }
+    let options = WorkspaceOptions {
+        root: fixture.0.clone(),
+        git: std::env::var_os("AW_GIT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/bin/git")),
+        bash: std::path::PathBuf::from("/bin/bash"),
+        actor: "browser-must-not-choose-this".into(),
+        allow_terminals: true,
+        sites: vec![aw_surfaces::Site::new(
+            "should-be-cleared",
+            "Should be cleared",
+            "https://example.invalid/",
+        )
+        .unwrap()],
+    };
+    let (router, team) = application_with_delegated_surfaces(
+        roster,
+        runtimes,
+        vec![DelegatedSurfaceSource {
+            participant_id: "alice".into(),
+            options,
+        }],
+        HOST.parse().unwrap(),
+        &[ALICE.into(), BOB.into()],
+    )
+    .unwrap();
+    assert!(team.0.entries[0].app.0.surfaces.is_none());
+    assert!(team.0.entries[1].app.0.surfaces.is_none());
+    let delegated = team.0.entries[0].delegated_surface.as_ref().unwrap();
+    let caps = delegated.capabilities();
+    assert!(!caps.terminals);
+    assert!(caps.sites.is_empty());
+    assert!(team.0.entries[1].delegated_surface.is_none());
+    (router, team, store, calls, fixture)
+}
+
 fn req(method: &str, path: &str, body: serde_json::Value, cookie: Option<&str>) -> Request {
     let mut r = Request::builder()
         .method(method)
@@ -196,6 +317,215 @@ async fn settled(team: &TeamState, id: usize) {
     }
     panic!("fixture run failed to settle");
 }
+
+async fn prepare_agent_dock(
+    router: &Router,
+    team: &TeamState,
+    owner_cookie: &str,
+    owner_index: usize,
+    recipient_id: &str,
+    document_id: &str,
+) -> (serde_json::Value, serde_json::Value, SavedSelection) {
+    let origin_response = send(
+        router,
+        "POST",
+        "/api/dock/agent/register",
+        serde_json::json!({}),
+        Some(owner_cookie),
+    )
+    .await;
+    assert_eq!(origin_response.status(), StatusCode::OK);
+    let origin = data(origin_response).await;
+    let target = saved(team, owner_index);
+    let prepared_response = send(
+        router,
+        "POST",
+        "/api/dock/agent/prepare",
+        serde_json::json!({
+            "window_id":origin["window_id"],
+            "window_proof":origin["window_proof"],
+            "store_id":origin["store_id"],
+            "source_epoch":origin["source_epoch"],
+            "session_id":target.session_id,
+            "branch_id":target.branch_id,
+            "document_id":document_id,
+            "recipient_id":recipient_id,
+        }),
+        Some(owner_cookie),
+    )
+    .await;
+    assert_eq!(prepared_response.status(), StatusCode::OK);
+    let prepared = data(prepared_response).await;
+    (origin, prepared, target)
+}
+
+async fn receive_agent_dock(
+    router: &Router,
+    recipient_cookie: &str,
+    ticket: &str,
+) -> serde_json::Value {
+    let response = send(
+        router,
+        "POST",
+        "/api/dock/agent/receive",
+        serde_json::json!({"ticket":ticket}),
+        Some(recipient_cookie),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    data(response).await
+}
+
+#[cfg(feature = "surfaces")]
+async fn prepare_surface_dock(
+    router: &Router,
+    owner_cookie: &str,
+    recipient_id: &str,
+    document_id: &str,
+    target: &surface_read::Target,
+) -> (serde_json::Value, serde_json::Value) {
+    let origin_response = send(
+        router,
+        "POST",
+        "/api/dock/surface/register",
+        serde_json::json!({}),
+        Some(owner_cookie),
+    )
+    .await;
+    assert_eq!(origin_response.status(), StatusCode::OK);
+    let origin = data(origin_response).await;
+    let (kind, path, review_id) = match &target.resource {
+        surface_read::Resource::File { path } => ("file", Some(path.clone()), None),
+        surface_read::Resource::Review { review_id } => ("review", None, Some(review_id.clone())),
+    };
+    let prepared_response = send(
+        router,
+        "POST",
+        "/api/dock/surface/prepare",
+        serde_json::json!({
+            "window_id":origin["window_id"],
+            "window_proof":origin["window_proof"],
+            "store_id":origin["store_id"],
+            "source_epoch":origin["source_epoch"],
+            "source_id":target.source_id,
+            "scope_id":target.scope_id,
+            "owner_epoch":target.owner_epoch,
+            "document_id":document_id,
+            "recipient_id":recipient_id,
+            "kind":kind,
+            "path":path,
+            "review_id":review_id,
+        }),
+        Some(owner_cookie),
+    )
+    .await;
+    assert_eq!(prepared_response.status(), StatusCode::OK);
+    let prepared = data(prepared_response).await;
+    // The ticket never carries protected File/Review bytes.
+    assert!(!prepared
+        .to_string()
+        .contains("team delegated exact file alpha"));
+    (origin, prepared)
+}
+
+#[cfg(feature = "surfaces")]
+async fn receive_surface_dock(
+    router: &Router,
+    recipient_cookie: &str,
+    ticket: &str,
+) -> serde_json::Value {
+    let response = send(
+        router,
+        "POST",
+        "/api/dock/surface/receive",
+        serde_json::json!({"ticket":ticket}),
+        Some(recipient_cookie),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    data(response).await
+}
+
+#[cfg(feature = "surfaces")]
+fn team_fixture_git(root: &std::path::Path, args: &[&str]) -> String {
+    let git = std::env::var_os("AW_GIT").expect("pinned Nix AW_GIT");
+    let output = std::process::Command::new(git)
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "synthetic Git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[cfg(feature = "surfaces")]
+fn retain_team_review(team: &TeamState, root: &std::path::Path) -> surface_read::Target {
+    team_fixture_git(root, &["init", "-b", "main"]);
+    team_fixture_git(root, &["config", "user.name", "Fixture"]);
+    team_fixture_git(root, &["config", "user.email", "fixture@example.invalid"]);
+    team_fixture_git(root, &["add", "sample.rs"]);
+    team_fixture_git(root, &["commit", "-m", "synthetic baseline"]);
+    std::fs::write(
+        root.join("sample.rs"),
+        "team delegated immutable review beta\n",
+    )
+    .unwrap();
+
+    let owner = &team.0.entries[0];
+    let host = owner.delegated_surface.as_ref().unwrap();
+    let caps = host.capabilities();
+    let actor = owner.app.0.session.actor.as_str();
+    let changes = host
+        .execute(
+            actor,
+            aw_surfaces::Command::View {
+                source_id: caps.source_id.clone(),
+                scope_id: caps.view_root.id.clone(),
+                request: aw_surfaces::ViewRequest::GitList {
+                    mode: aw_surfaces::GitMode::Changes,
+                },
+            },
+        )
+        .unwrap();
+    let inventory_id = changes["result"]["inventory_id"].as_str().unwrap();
+    let item_id = changes["result"]["items"][0]["id"].as_str().unwrap();
+    let opened = host
+        .execute(
+            actor,
+            aw_surfaces::Command::View {
+                source_id: caps.source_id.clone(),
+                scope_id: caps.view_root.id.clone(),
+                request: aw_surfaces::ViewRequest::GitOpen {
+                    inventory_id: inventory_id.into(),
+                    item_id: item_id.into(),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(opened["result"]["kind"], "review");
+    surface_read::Target {
+        source_id: caps.source_id,
+        scope_id: caps.view_root.id,
+        owner_epoch: lock(&owner.app.0.session.state).snapshot.instance.clone(),
+        resource: surface_read::Resource::Review {
+            review_id: opened["result"]["id"].as_str().unwrap().to_owned(),
+        },
+    }
+}
+
+fn dock_envelope(window: &serde_json::Value, ticket: &str) -> serde_json::Value {
+    serde_json::json!({
+        "window_id":window["window_id"],
+        "window_proof":window["window_proof"],
+        "ticket":ticket,
+    })
+}
 #[tokio::test]
 async fn anonymous_has_no_session_or_directory() {
     let (r, _, _, calls) = setup();
@@ -241,6 +571,52 @@ async fn invite_selects_authenticated_principal() {
         assert_eq!(me["tools"], false);
     }
 }
+#[tokio::test]
+async fn delegated_agent_recipient_directory_is_authenticated_metadata_not_authority() {
+    let (router, _, _, calls) = setup();
+    assert_eq!(
+        send(
+            &router,
+            "GET",
+            "/api/team/delegation/recipients",
+            serde_json::Value::Null,
+            None,
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let alice = login(&router, ALICE).await;
+    let me = data(
+        send(
+            &router,
+            "GET",
+            "/api/team/me",
+            serde_json::Value::Null,
+            Some(&alice),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(me["delegated_agent_views"], true);
+    let recipients = data(
+        send(
+            &router,
+            "GET",
+            "/api/team/delegation/recipients",
+            serde_json::Value::Null,
+            Some(&alice),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        recipients,
+        serde_json::json!({"participants":[{"id":"bob","display_name":"Bob"}]})
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn forged_actor_header_cannot_choose_peer() {
     let (r, _, _, _) = setup();
@@ -655,6 +1031,876 @@ async fn tool_and_surface_routes_are_not_granted() {
         StatusCode::FORBIDDEN
     );
 }
+#[tokio::test]
+async fn delegated_agent_docking_is_exact_recipient_read_only_and_ack_gated() {
+    let (router, team, _, calls) = setup();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    let alice_before = saved(&team, 0);
+    let bob_before = saved(&team, 1);
+    let (origin, prepared, target) = prepare_agent_dock(
+        &router,
+        &team,
+        &alice_cookie,
+        0,
+        "bob",
+        "agent-view-delegated-a",
+    )
+    .await;
+    let ticket = prepared["ticket"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/receive",
+            serde_json::json!({"ticket":ticket}),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let receiver = receive_agent_dock(&router, &bob_cookie, &ticket).await;
+    assert_eq!(receiver["resource"]["kind"], "agent_view");
+    assert_eq!(receiver["resource"]["session_id"], target.session_id);
+    assert_eq!(receiver["resource"]["branch_id"], target.branch_id);
+    let receiver_envelope = dock_envelope(&receiver, &ticket);
+    let origin_envelope = dock_envelope(&origin, &ticket);
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/accept",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    let view_response = send(
+        &router,
+        "POST",
+        "/api/dock/agent/read",
+        receiver_envelope.clone(),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(view_response.status(), StatusCode::OK);
+    let view = data(view_response).await;
+    assert_eq!(view["session_id"], target.session_id);
+    assert_eq!(view["branch_id"], target.branch_id);
+    assert_eq!(view["title"], "alice private");
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/accept",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/confirm",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/release",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/heartbeat",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    lock(&team.0.delegated).stale_ack_for_test(&ticket);
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/release",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/heartbeat",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let status = data(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/status",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status["state"], "accepted");
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/release",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    assert_ne!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/receive",
+            serde_json::json!({"ticket":ticket}),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/read",
+            receiver_envelope,
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/cancel",
+            origin_envelope,
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT,
+        "a completed delegated handoff cannot be rolled back by the source"
+    );
+
+    assert_eq!(saved(&team, 0).session_id, alice_before.session_id);
+    assert_eq!(saved(&team, 0).branch_id, alice_before.branch_id);
+    assert_eq!(saved(&team, 1).session_id, bob_before.session_id);
+    assert_eq!(saved(&team, 1).branch_id, bob_before.branch_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn delegated_agent_revoke_fences_held_and_unchanged_response_then_regrant_rotates() {
+    let (router, team, _, calls) = setup();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    let (origin, first, target) = prepare_agent_dock(
+        &router,
+        &team,
+        &alice_cookie,
+        0,
+        "bob",
+        "agent-view-delegated-race-a",
+    )
+    .await;
+    let first_ticket = first["ticket"].as_str().unwrap().to_owned();
+    let first_generation = first["grant_generation"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let receiver = receive_agent_dock(&router, &bob_cookie, &first_ticket).await;
+    let receiver_envelope = dock_envelope(&receiver, &first_ticket);
+    let origin_envelope = dock_envelope(&origin, &first_ticket);
+
+    let initial = send(
+        &router,
+        "POST",
+        "/api/dock/agent/read",
+        receiver_envelope.clone(),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    assert_eq!(data(initial).await["title"], "alice private");
+
+    let hold = lock(&team.0.delegated).hold_next_read();
+    let queued_router = router.clone();
+    let queued_cookie = bob_cookie.clone();
+    let queued_body = receiver_envelope.clone();
+    let queued = tokio::spawn(async move {
+        send(
+            &queued_router,
+            "POST",
+            "/api/dock/agent/read",
+            queued_body,
+            Some(&queued_cookie),
+        )
+        .await
+    });
+    hold.ready().await;
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/revoke",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    hold.release();
+    assert_eq!(queued.await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/read",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let owner_view = send(
+        &router,
+        "POST",
+        "/api/agent-view",
+        serde_json::json!({
+            "store_id":origin["store_id"],
+            "source_epoch":origin["source_epoch"],
+            "session_id":target.session_id,
+            "branch_id":target.branch_id,
+        }),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(owner_view.status(), StatusCode::OK);
+    assert_eq!(data(owner_view).await["title"], "alice private");
+
+    let (second_origin, second, _) = prepare_agent_dock(
+        &router,
+        &team,
+        &alice_cookie,
+        0,
+        "bob",
+        "agent-view-delegated-race-b",
+    )
+    .await;
+    let second_ticket = second["ticket"].as_str().unwrap().to_owned();
+    let second_generation = second["grant_generation"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(second_generation > first_generation);
+    let second_receiver = receive_agent_dock(&router, &bob_cookie, &second_ticket).await;
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/read",
+            dock_envelope(&second_receiver, &second_ticket),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/read",
+            receiver_envelope,
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_ne!(second_origin["window_id"], origin["window_id"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn recipient_logout_revokes_incoming_delegated_agent_grant() {
+    let (router, team, _, calls) = setup();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    let (origin, prepared, _) = prepare_agent_dock(
+        &router,
+        &team,
+        &alice_cookie,
+        0,
+        "bob",
+        "agent-view-delegated-logout",
+    )
+    .await;
+    let ticket = prepared["ticket"].as_str().unwrap().to_owned();
+    let receiver = receive_agent_dock(&router, &bob_cookie, &ticket).await;
+    let receiver_envelope = dock_envelope(&receiver, &ticket);
+    let origin_envelope = dock_envelope(&origin, &ticket);
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/read",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/logout",
+            serde_json::json!({}),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let status = data(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/status",
+            origin_envelope,
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status["state"], "revoked");
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/read",
+            receiver_envelope,
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "surfaces")]
+#[tokio::test]
+async fn delegated_file_lifecycle_keeps_team_workspace_disabled_and_exact() {
+    let (router, team, _, calls, _fixture) = setup_with_delegated_surface();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    let alice_before = saved(&team, 0);
+    let bob_before = saved(&team, 1);
+
+    let alice_me = data(
+        send(
+            &router,
+            "GET",
+            "/api/team/me",
+            serde_json::Value::Null,
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    let bob_me = data(
+        send(
+            &router,
+            "GET",
+            "/api/team/me",
+            serde_json::Value::Null,
+            Some(&bob_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(alice_me["surfaces"], false);
+    assert_eq!(alice_me["delegated_surface_views"], true);
+    assert_eq!(bob_me["surfaces"], false);
+    assert_eq!(bob_me["delegated_surface_views"], false);
+
+    for cookie in [&alice_cookie, &bob_cookie] {
+        let workspace = data(
+            send(
+                &router,
+                "GET",
+                "/api/workspace",
+                serde_json::Value::Null,
+                Some(cookie),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(workspace["enabled"], false);
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                "/api/workspace/action",
+                serde_json::json!({
+                    "op":"view",
+                    "source_id":"forged",
+                    "scope_id":"forged",
+                    "request":{"op":"file","path":"sample.rs"}
+                }),
+                Some(cookie),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    let owner = &team.0.entries[0];
+    let caps = owner.delegated_surface.as_ref().unwrap().capabilities();
+    let target = surface_read::Target {
+        source_id: caps.source_id,
+        scope_id: caps.view_root.id,
+        owner_epoch: lock(&owner.app.0.session.state).snapshot.instance.clone(),
+        resource: surface_read::Resource::File {
+            path: "sample.rs".into(),
+        },
+    };
+    let (origin, prepared) = prepare_surface_dock(
+        &router,
+        &alice_cookie,
+        "bob",
+        "workspace-document-delegated-file",
+        &target,
+    )
+    .await;
+    let ticket = prepared["ticket"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/receive",
+            serde_json::json!({"ticket":ticket}),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let receiver = receive_surface_dock(&router, &bob_cookie, &ticket).await;
+    assert_eq!(receiver["resource"]["kind"], "file");
+    assert_eq!(receiver["resource"]["path"], "sample.rs");
+    assert_eq!(receiver["resource"]["source_id"], target.source_id);
+    assert_eq!(receiver["resource"]["scope_id"], target.scope_id);
+    assert!(!receiver
+        .to_string()
+        .contains("team delegated exact file alpha"));
+
+    let receiver_envelope = dock_envelope(&receiver, &ticket);
+    let origin_envelope = dock_envelope(&origin, &ticket);
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/accept",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN,
+        "resource kind cannot be replayed through Agent lifecycle routes"
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/accept",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    let read = send(
+        &router,
+        "POST",
+        "/api/dock/surface/read",
+        receiver_envelope.clone(),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = data(read).await;
+    assert_eq!(read["scope_id"], target.scope_id);
+    assert_eq!(read["result"]["text"], "team delegated exact file alpha\n");
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/accept",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/confirm",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/heartbeat",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/release",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/read",
+            receiver_envelope,
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+        "release changes source presentation ownership, not grant authority"
+    );
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/cancel",
+            origin_envelope,
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    assert_eq!(saved(&team, 0).session_id, alice_before.session_id);
+    assert_eq!(saved(&team, 0).branch_id, alice_before.branch_id);
+    assert_eq!(saved(&team, 1).session_id, bob_before.session_id);
+    assert_eq!(saved(&team, 1).branch_id, bob_before.branch_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "surfaces")]
+#[tokio::test]
+async fn delegated_file_revoke_fences_held_response_and_future_reads() {
+    let (router, team, _, calls, _fixture) = setup_with_delegated_surface();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    let owner = &team.0.entries[0];
+    let caps = owner.delegated_surface.as_ref().unwrap().capabilities();
+    let target = surface_read::Target {
+        source_id: caps.source_id,
+        scope_id: caps.view_root.id,
+        owner_epoch: lock(&owner.app.0.session.state).snapshot.instance.clone(),
+        resource: surface_read::Resource::File {
+            path: "sample.rs".into(),
+        },
+    };
+    let (origin, prepared) = prepare_surface_dock(
+        &router,
+        &alice_cookie,
+        "bob",
+        "workspace-document-delegated-file-race",
+        &target,
+    )
+    .await;
+    let ticket = prepared["ticket"].as_str().unwrap().to_owned();
+    let receiver = receive_surface_dock(&router, &bob_cookie, &ticket).await;
+    let receiver_envelope = dock_envelope(&receiver, &ticket);
+    let origin_envelope = dock_envelope(&origin, &ticket);
+
+    let first = send(
+        &router,
+        "POST",
+        "/api/dock/surface/read",
+        receiver_envelope.clone(),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        data(first).await["result"]["text"],
+        "team delegated exact file alpha\n"
+    );
+
+    let hold = lock(&team.0.delegated).hold_next_read();
+    let queued_router = router.clone();
+    let queued_cookie = bob_cookie.clone();
+    let queued_body = receiver_envelope.clone();
+    let queued = tokio::spawn(async move {
+        send(
+            &queued_router,
+            "POST",
+            "/api/dock/surface/read",
+            queued_body,
+            Some(&queued_cookie),
+        )
+        .await
+    });
+    hold.ready().await;
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/revoke",
+            origin_envelope.clone(),
+            Some(&alice_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    hold.release();
+    assert_eq!(queued.await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/read",
+            receiver_envelope,
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let status = data(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/status",
+            origin_envelope,
+            Some(&alice_cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status["state"], "revoked");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "surfaces")]
+#[tokio::test]
+async fn delegated_review_reads_only_exact_retained_review_without_recipient_git_inventory() {
+    let (router, team, _, calls, fixture) = setup_with_delegated_surface();
+    let alice_cookie = login(&router, ALICE).await;
+    let bob_cookie = login(&router, BOB).await;
+    let target = retain_team_review(&team, &fixture.0);
+    let review_id = match &target.resource {
+        surface_read::Resource::Review { review_id } => review_id.clone(),
+        _ => unreachable!(),
+    };
+    let (_origin, prepared) = prepare_surface_dock(
+        &router,
+        &alice_cookie,
+        "bob",
+        "workspace-document-delegated-review",
+        &target,
+    )
+    .await;
+    let ticket = prepared["ticket"].as_str().unwrap().to_owned();
+    let receiver = receive_surface_dock(&router, &bob_cookie, &ticket).await;
+    assert_eq!(receiver["resource"]["kind"], "review");
+    assert_eq!(receiver["resource"]["review_id"], review_id);
+    assert!(receiver["resource"].get("path").is_none());
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/workspace/action",
+            serde_json::json!({
+                "op":"view",
+                "source_id":target.source_id,
+                "scope_id":target.scope_id,
+                "request":{"op":"git_list","mode":"changes"}
+            }),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN,
+        "recipient gets no Git inventory authority"
+    );
+
+    let receiver_envelope = dock_envelope(&receiver, &ticket);
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/agent/read",
+            receiver_envelope.clone(),
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let read = send(
+        &router,
+        "POST",
+        "/api/dock/surface/read",
+        receiver_envelope.clone(),
+        Some(&bob_cookie),
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = data(read).await;
+    assert_eq!(read["result"]["kind"], "review");
+    assert_eq!(read["result"]["id"], review_id);
+    assert!(read
+        .to_string()
+        .contains("team delegated immutable review beta"));
+
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/dock/surface/accept",
+            receiver_envelope,
+            Some(&bob_cookie),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let mut forged = target.clone();
+    forged.resource = surface_read::Resource::Review {
+        review_id: "forged_review".into(),
+    };
+    let origin_response = send(
+        &router,
+        "POST",
+        "/api/dock/surface/register",
+        serde_json::json!({}),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(origin_response.status(), StatusCode::OK);
+    let forged_origin = data(origin_response).await;
+    let forged_prepare = send(
+        &router,
+        "POST",
+        "/api/dock/surface/prepare",
+        serde_json::json!({
+            "window_id":forged_origin["window_id"],
+            "window_proof":forged_origin["window_proof"],
+            "store_id":forged_origin["store_id"],
+            "source_epoch":forged_origin["source_epoch"],
+            "source_id":forged.source_id,
+            "scope_id":forged.scope_id,
+            "owner_epoch":forged.owner_epoch,
+            "document_id":"workspace-document-forged-review",
+            "recipient_id":"bob",
+            "kind":"review",
+            "review_id":"forged_review",
+        }),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(forged_prepare.status(), StatusCode::FORBIDDEN);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn logout_is_per_identity() {
     let (r, _, _, _) = setup();

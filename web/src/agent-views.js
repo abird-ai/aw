@@ -199,7 +199,7 @@ export function createAgentViews({ read, onChange = () => {}, now = () => perfor
     onChange();
     let accepted = false;
     try {
-      const reply = await read(entry.view.target, { signal: token.control.signal });
+      const reply = await entry.reader(entry.view.target, { signal: token.control.signal });
       if (disposed || entries.get(id) !== entry || entry.token !== token) return false;
       if (clock() >= token.deadline) {
         discard(entry, "expired", "Read-only reply expired; refresh to revalidate access.");
@@ -236,7 +236,10 @@ export function createAgentViews({ read, onChange = () => {}, now = () => perfor
       } else if (error?.status === 403) {
         const tokens = [];
         for (const other of entries.values()) {
-          if (sameTarget(other.view.target, entry.view.target)) {
+          const sameAuthority = entry.authorityKey === null
+            ? other.authorityKey === null
+            : other.authorityKey === entry.authorityKey;
+          if (sameAuthority && sameTarget(other.view.target, entry.view.target)) {
             tokens.push(invalidate(other, "error", "Read-only Agent access denied; refresh after permission is restored."));
           }
         }
@@ -255,18 +258,29 @@ export function createAgentViews({ read, onChange = () => {}, now = () => perfor
     return accepted;
   }
 
+  function openWithReader(target, reader, authorityKey) {
+    if (disposed) throw new Error("Read-only views have been disposed.");
+    if (typeof reader !== "function") throw new Error("Read-only Agent view needs a reader.");
+    if (authorityKey !== null && (typeof authorityKey !== "string" || !authorityKey
+      || encoder.encode(authorityKey).length > 1024 || controls.test(authorityKey))) {
+      throw new Error("Invalid read-only Agent authority lifetime.");
+    }
+    const exact = targetCopy(target);
+    if (entries.size >= AGENT_VIEW_LIMITS.views) throw new Error("At most 8 read-only Agent views may be open.");
+    const id = `agent-view-${allocate()}`;
+    const view = Object.freeze({ id, target: exact, delegated: authorityKey !== null,
+      snapshot: null, status: "idle", error: "",
+      pending: false, refreshAt: 0, expiresAt: null, find: emptyFind(),
+      viewport: Object.freeze({ top: 0, left: 0, follow: false }), selection: null });
+    entries.set(id, { view, bytes: 0, token: null, reader, authorityKey });
+    onChange();
+    return id;
+  }
+
   return Object.freeze({
-    open(target) {
-      if (disposed) throw new Error("Read-only views have been disposed.");
-      const exact = targetCopy(target);
-      if (entries.size >= AGENT_VIEW_LIMITS.views) throw new Error("At most 8 read-only Agent views may be open.");
-      const id = `agent-view-${allocate()}`;
-      const view = Object.freeze({ id, target: exact, snapshot: null, status: "idle", error: "",
-        pending: false, refreshAt: 0, expiresAt: null, find: emptyFind(),
-        viewport: Object.freeze({ top: 0, left: 0, follow: false }), selection: null });
-      entries.set(id, { view, bytes: 0, token: null });
-      onChange();
-      return id;
+    open(target) { return openWithReader(target, read, null); },
+    openDelegated(target, delegatedRead, authorityKey) {
+      return openWithReader(target, delegatedRead, authorityKey);
     },
     get(id) { expire(); return entries.get(id)?.view || null; },
     list() { expire(); return Object.freeze(Array.from(entries.values(), entry => entry.view)); },

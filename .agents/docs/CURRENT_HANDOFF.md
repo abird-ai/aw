@@ -1,88 +1,102 @@
-# CURRENT HANDOFF — unified Jobs + Agent runtime, AW + dotlink
+# CURRENT HANDOFF — AW project state, workspace-views next
 
 Author: coordinating implementation agent
 Owner: @pvl
 Prepared: 2026-11-14
-Machine: **L5 only**
+Source authority host: **L5 only**
 Canonical AW checkout: `/home/pvl/spaces/abird/src/aw`
 Canonical dotlink checkout: `/home/pvl/spaces/abird/src/dotlink`
 
-> This is the current cross-repo entrypoint for the unified Jobs + Agent runtime
-> implementation. It preserves the historical line, states the current normative
-> design, records the reviewed/pushed implementation checkpoints, and gives the exact next
-> boundary. It does not replace Git, live source/tests, or the authoritative design.
+> Start here for the current AW project state.
 >
-> **Authority order:** live source/tests/executed results > current `AGENTS.md` >
-> current plan index/queue > unified `DESIGN.md` > checkpoint `TODO.md` >
-> this handoff > older handoffs/plans.
+> This handoff deliberately spans the finalized unified Jobs + Agent runtime,
+> release-readiness, and the active workspace-views program. It records the
+> design lineage, implementation checkpoints, permanent decisions, current
+> validation, exact pending work, and next-agent reading order.
 >
-> The large older handoffs remain archival sources for the September–October
-> product/runtime history. Their old "current" statements are snapshots, not present
-> authority.
+> **Authority order:** live source/tests/executed results > `AGENTS.md` >
+> current plan index/queue > selected plan README/TODO/specs > this handoff >
+> older handoffs/history.
+>
+> Never treat historical unchecked milestone-local bullets as current product
+> truth without reconciling them against later commits and the live TODO.
 
 ---
 
-## 0. Immediate state — do not edit before reading
+## 0. Immediate state — read before editing
 
 ### AW
 
 - Repo: `/home/pvl/spaces/abird/src/aw`
 - Branch: `main`
-- Normative design authority remains
-  `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`.
-- Final shared/runtime implementation commit:
+- Current HEAD: `88cd9655d402ea325873470202fd12133b1d8199`
+  - `Record finalized unified runtime pins`
+- Final unified runtime implementation:
   `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
-  (`Complete unified Jobs and Agent runtime`), signed and pushed.
-- Runtime Checkpoints 0/A/B/C/D/E/F/G are reconciled and green.
-- Final AW qualification includes strict changed-crate Clippy, stateless/minimal/
-  no_std+alloc boundaries, wasm32v1-none, DL-150 shared conformance, real
-  Process/Graph/Agent/Jobs flows, hard-cutover cleanup and live Qwen selection.
-- One canonical AW worktree only. Never inspect or touch `.agents/plans/ux/**`;
-  another owner reserves it.
+  - `Complete unified Jobs and Agent runtime`
+- Normative unified-runtime design authority remains:
+  `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`
+- Unified Jobs + Agent runtime is finalized across AW and dotlink. Do not reopen
+  D1/D2/D3, resurrect removed model routes, or repeat those qualification suites
+  unless a changed owner/dependency requires it.
+- Current live protocol/version facts from source: AW 0.15.0, SQLite schema **v34**
+  (`crates/aw-store/src/lib.rs`), JSONL v1, native Workspace layout v4. Historical
+  workspace-view milestones that say SQLite v33 are correct for those commits,
+  not the current Store. The repo guidance still contains an older v33 sentence;
+  live source outranks it. Do not downgrade or rewrite history to make them match.
+- Current active plan queue:
+  - P1 `release-readiness`
+  - P2 `workspace-views`
+  - P2 `dotlink-tool-port` remains listed separately in the queue/lineage; do
+    not conflate that queue entry with the already finalized unified runtime.
+- The next substantive implementation boundary is **workspace-views distinct
+  user/Actor delegation + individually narrowed/revocable browser authority**.
+- At the beginning of this handoff refresh, the only pre-existing owned dirty
+  paths were:
+  - `.agents/plans/workspace-views/TODO.md`
+  - `.agents/plans/workspace-views/LIVE-PTY-MIGRATION.md`
+- This handoff refresh additionally updates/creates:
+  - `.agents/docs/CURRENT_HANDOFF.md`
+  - `.agents/docs/UNIFIED-JOBS-AGENT-FINAL-HANDOFF-2026-11-14.md`
+  - `.agents/plans/workspace-views/NEXT-AGENT.md`
+- Nothing should be staged, committed, pushed, tagged, released or deployed
+  without explicit user authorization.
+- Another owner reserves `.agents/plans/ux/**`. Never list/read/write/stage/
+  reset/stash/commit that subtree or inspect its staged entries.
 
 ### dotlink
 
 - Repo: `/home/pvl/spaces/abird/src/dotlink`
 - Branch: `main`
-- Final unified bridge commit:
+- Final unified bridge:
   `c90a6603ccef0bbf626ce10d95bedf59877747b8`
-  (`Finalize dotlink unified Jobs bridge`), signed and pushed.
+  - `Finalize dotlink unified Jobs bridge`
 - dotlink pins `aw-tools`, `aw-tools-fs-unix`, and `aw-tools-fs-win`
-  exactly to AW `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`.
-- The temporary local remote-Start argument-digest copy is removed; dotlink uses
-  `aw_tools::remote_start::arguments_sha256` from that exact pin.
-- Final locked qualification against the pin:
+  exactly to AW `0a6c6a0...`.
+- Temporary remote-Start digest mirroring is gone; dotlink consumes
+  `aw_tools::remote_start::arguments_sha256` from the exact Git pin.
+- Final locked qualification:
   - all-target/all-feature check green;
-  - **651 passed / 0 failed / 1 intentional external-fixture ignore**;
-  - integrations **1/1, 8/8, 1/1, 12/12, 4/4**;
+  - 651 passed / 0 failed / 1 intentional external-fixture ignore;
+  - integrations 1/1, 8/8, 1/1, 12/12, 4/4;
   - strict all-target/all-feature Clippy green;
-  - rustfmt/diff green.
-- Final replay-first review is regression-locked for remote Graph, shell and
-  cancel; exact redelivery reaches replay claim before mutable
-  topology/policy/revision checks.
-- Existing second worktree:
-  `/home/pvl/spaces/abird/src/dotlink-016-fixes`, branch `release/0.16`.
-  Do not touch it and do not create another worktree.
-- `docs/CHATGPT_PLUGIN.md` remains unrelated dirty work and was not included
-  in the final bridge commit.
+  - fmt/diff green.
+- Only dirty dotlink path is unrelated pre-existing
+  `docs/CHATGPT_PLUGIN.md`; preserve it.
+- Separate worktree `/home/pvl/spaces/abird/src/dotlink-016-fixes` remains
+  untouched. Do not create another worktree.
 
-### Completion state
+### User/process constraints
 
-The unified Jobs + Agent runtime implementation is **finalized across both repos**.
-There is no remaining implementation or exact-pin TODO.
-
-Future work should begin from live Git state and a new scoped request. Release,
-tag, deploy, or native platform certification remain separate actions and require
-their own authorization.
-
-### User process constraints
-
-- Use **dotlink---l5 only** for implementation/source work. Do not use A1.
-- x2 may be used only as an inference host; it is not source authority.
-- Work in the canonical checkouts above; do not create another worktree.
-- Preserve concurrent/unrelated dirty files.
-- No version/tag/release/deploy/history rewrite or destructive action without
-  separate explicit authorization.
+- Use **dotlink---l5 only** for implementation/source work.
+- Do not use A1.
+- x2 may be used as an inference host only; it is not source authority.
+- Preserve other work.
+- Keep each model/user implementation turn near ~30 minutes and stop at a
+  coherent checkpoint.
+- Requalify by changed owner/dependency, not by habit.
+- No destructive Git operation, commit/push/tag/release/deploy without explicit
+  authorization for that action.
 
 ---
 
@@ -90,1165 +104,851 @@ their own authorization.
 
 Do this before editing.
 
-### Both repos
+### Repository/core
 
-1. Read each repo's `AGENTS.md`.
-2. Revalidate:
-   - `git rev-parse HEAD`
-   - `git status --short`
-   - `git diff --cached --name-only`
-   - `git worktree list --porcelain`
-3. Read each repo's `.agents/plans/README.md` and `.agents/plans/TODO.md`.
+1. `AGENTS.md`
+2. `.agents/plans/README.md`
+3. `.agents/plans/TODO.md`
+4. this file
+5. live `git status --short`, HEAD, staged paths and worktrees
 
-### AW
+### Active workspace-views plan
 
-4. Read **this file**.
-5. Read:
-   - `.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/README.md`
-   - **all** of `DESIGN.md`
-   - `TODO.md`
-   - `NEXT-AGENT.md`
-6. Read the two predecessor AI-native plans as design lineage, not current authority:
-   - `ai-native-operations-agents-jobs-transcript-2026-11-10/`
-   - `ai-native-job-control-wake-2026-11-10/`
-7. For older AW product/runtime history read, as needed:
-   - `.agents/docs/HANDOFF.md` — retained full historical synthesis
-   - `.agents/docs/AW-COMPREHENSIVE-HANDOFF-2026-10-19.md`
-8. Read live source/tests for every owner you touch.
+6. `.agents/plans/workspace-views/README.md` — current design and decisions
+7. `.agents/plans/workspace-views/TODO.md` — commit chronology, current scope,
+   test evidence and deferred work
+8. `.agents/plans/workspace-views/NATIVE-PTY-CUSTODY.md` — current Linux
+   original-PTY custody protocol
+9. `.agents/plans/workspace-views/ADOPTED-CHILD-LIFECYCLE.md` — pidfd/parent/
+   reaping/adoption lifecycle
+10. `.agents/plans/workspace-views/LIVE-PTY-MIGRATION.md` — historical
+    prerequisites plus current Linux supersession notes
+11. live source/tests for the exact owner you intend to touch
 
-### dotlink
+### Release readiness
 
-9. Read:
-   - `.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/README.md`
-   - `TODO.md`
-   - the companion current handoff in dotlink `.agents/docs/CURRENT_HANDOFF.md`
-10. For the shared filesystem/Graph/Job lineage read:
-   - `.agents/plans/dotlink-ai-native-filesystem-2026-10-31/README.md`
-   - `TODO.md`
-   - `FULL-COMPREHENSIVE-HANDOFF-2026-11-09.md`
-11. Read live dotlink source/tests before D2.
+12. `.agents/plans/release-readiness/TODO.md`
+13. `.agents/plans/release-readiness/CLI-COMPATIBILITY.md`
+14. `.github/workflows/native-release.yml` only if working on release gates
 
-### Normative lower-level reference
+### Finalized unified runtime lineage
 
-12. Treat DL-150's reviewed filesystem/Graph/result/replay/ACK semantics as inherited
-    unless the unified `DESIGN.md` explicitly supersedes them.
+15. `.agents/docs/UNIFIED-JOBS-AGENT-FINAL-HANDOFF-2026-11-14.md`
+16. `.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/README.md`
+17. all of its `DESIGN.md` and `TODO.md`
+18. predecessor plans only when needed:
+    - `ai-native-operations-agents-jobs-transcript-2026-11-10/`
+    - `ai-native-job-control-wake-2026-11-10/`
+    - `dotlink-tool-port/`
 
----
+### Older product/runtime history
 
-## 2. Historical lineage — why the current design looks like this
-
-This section is a self-contained digest. The older handoffs retain full phase-by-phase
-detail and source maps.
-
-### 2.1 AW foundations, September–October 2026
-
-The original AW program established these permanent decisions:
-
-- one Rust Agent and one user-facing `aw`;
-- one append-only/durable conversation/Turn path;
-- one ToolRegistry/ToolPolicy path;
-- one TurnJournal and one authoritative State/Session owner;
-- Domain → Workspace → Session as the user model;
-- native TUI, browser, headless/RPC and SDK as projections over the same engine;
-- view/layout changes never retarget a running Agent or create execution authority;
-- provider account, payer, credential custody, inference executor, tool executor,
-  Session owner and participant are separate dimensions;
-- journal intent before model/tool effect;
-- preserve paid/factual results even if later branch attachment fails;
-- ambiguous/possibly charged effects remain UNKNOWN and are never silently replayed;
-- no silent provider/account fallback, credential disclosure, listener, tool grant,
-  network permission or command retry;
-- exact Actor/source/site/effect/writer/grant generations are authority, not names.
-
-The historical program then built:
-
-- durable SQLite/JSONL Session/Turn/journal ownership;
-- native Workspace/TUI and real terminal/PTY ownership;
-- Git/file scoped views;
-- browser/local attach and personal-device paths;
-- team/shared-draft/context-flow boundaries;
-- remote Machine/Fleet/Domain authority;
-- writer epochs/failover, signed handoff, device identity and SecretStore;
-- portable/no_std Agent cuts (R0–R14);
-- P6 runtime-management, retry/reconciliation, recovery and provider correctness.
-
-Phases 64/65 (indexing/LSP) and E6 firmware were deliberately parked. Numbered
-historical phases stop at 68. Do not invent a Phase69.
-
-For the detailed chronology and earlier source map see:
-
-- `.agents/docs/HANDOFF.md`
-- `.agents/docs/AW-COMPREHENSIVE-HANDOFF-2026-10-19.md`
-
-### 2.2 dotlink hardening and DL-150, October 2026
-
-dotlink evolved as the concrete local/remote native executor with:
-
-- schema-v10 profile/config authority;
-- private OAuth/ngrok/stdio/http transport boundaries;
-- Linux Bubblewrap sandbox by default; network off unless granted;
-- descriptor-rooted native filesystem authority and protected-path precedence;
-- exact launcher/interpreter/source identity;
-- native Process ownership, bounded retained stdout/stderr, writer quiescence,
-  cancellation and cleanup;
-- replay/request-key dedupe;
-- MCP Task result ownership;
-- raw-byte retained output + explicit ACK release;
-- one canonical Graph/Job runtime.
-
-DL-150 sealed the AI-native filesystem/Graph language:
-
-- compact flat filesystem tools;
-- deterministic `ops` Graph;
-- one JobManager;
-- deterministic NodePlan/footprints;
-- Process/shell Graph nodes;
-- factual statuses/outcomes;
-- pure read vs explicit ACK;
-- no workflow-language drift.
-
-The full 2026-11-09 shared-tools handoff records the filesystem/runtime convergence:
-`.agents/plans/dotlink-ai-native-filesystem-2026-10-31/FULL-COMPREHENSIVE-HANDOFF-2026-11-09.md`.
-
-### 2.3 Shared-tool extraction and crate boundary
-
-The cross-repo convergence established:
-
-- `aw-tools` = canonical shared filesystem/Graph/finite-Job semantics/runtime;
-- `aw-tools-adapter` = AW-specific concrete execution/authority/process bridge;
-- one canonical JobManager, not a second AW workflow engine;
-- `aw-tools-fs-unix/win` only where platform implementation is genuinely shared;
-- dotlink consumes reviewed `aw-tools` revisions rather than copying AW code.
-
-The naming decision was explicitly:
-
-- old `aw-tools-core` → **`aw-tools`**
-- old AW-specific `aw-tools` → **`aw-tools-adapter`**
-
-This is why no new `aw-tools-core` or `aw-actor` crate should be introduced.
-
-### 2.4 November 10 — operation/Agent/Job/transcript plan
-
-`ai-native-operations-agents-jobs-transcript-2026-11-10` established:
-
-- one semantic operation language;
-- flat atomic model tool names;
-- Agent and Job identity separation;
-- one Jobs control plane;
-- Agent transcript/history projection;
-- wake as source event → Agent input, not a second inference engine;
-- dynamic policy without grant issuance;
-- dotlink as a thin concrete executor.
-
-### 2.5 November 10 — Job Control/wake plan
-
-`ai-native-job-control-wake-2026-11-10` refined:
-
-- first-class `Control` ToolEffect;
-- `jobs.send` semantics;
-- source-owned event registration/revision;
-- receiver-owned wake/Input admission;
-- exact-once wake request rather than fictional exactly-once inference;
-- Agent Graph nodes and factual child settlement;
-- no public restart.
-
-### 2.6 November 11–13 — unified successor plan
-
-The current successor is:
-`.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/`.
-
-Important design commits:
-
-- `ae3e826` — finalize unified Jobs/Agent plans
-- `4df93e2` — initial reusable policy/session/host crate foundations
-- `53243b5` — unified policy/sessions/layered runtime design
-- `3c27d20` — checkpointed implementation plan
-- `406bfa5` — resolve Graph/replay/authority/integration design
-- **`890e9a3`** — current authority; resolves shared Job replay/wake and
-  transitive Graph ownership
-
-`890e9a` materially changed acceptance. Do not use pre-`890e9a` assumptions for:
-
-- replay of contextual refs such as `^`;
-- `jobs_subscribe` and constructor `wake`;
-- source-owned event generation/revision and receiver-owned Input;
-- fast-completion constructor ordering;
-- transitive Graph ownership through descendant Agents;
-- nested-`batch` denial while Graph ownership is live.
+19. `.agents/docs/HANDOFF.md`
+20. `.agents/docs/AW-COMPREHENSIVE-HANDOFF-2026-10-19.md`
+21. Git history and the selected plan's committed groups
 
 ---
 
-## 3. Permanent architecture and decision record
-
-These are the constraints the implementation must preserve.
-
-### 3.1 Model-facing tool surface
-
-Maximum model-facing core: **25 flat tools**.
-
-Filesystem (13):
-- the current DL-150 filesystem set.
-
-Constructors:
-- `bash`
-- `pwsh`
-- `powershell`
-- `batch`
-- `agent`
-
-Jobs:
-- `jobs_list`
-- `jobs_get`
-- `jobs_read`
-- `jobs_ack`
-- `jobs_send`
-- `jobs_cancel`
-- `jobs_subscribe`
-
-Do not reintroduce:
-
-- public `agents.*`;
-- grouped `jobs({op})`;
-- `subagent`, `team`, `plan`, `review_release`;
-- `job_start`, `job_restart`;
-- compatibility aliases.
-
-Direct tools and model Graph use the same flat spellings such as `read`, `edit`.
-SDK/internal semantic IDs use namespaces such as `fs.*` and `jobs.*`.
-
-### 3.2 One owner per responsibility
-
-There must remain exactly:
-
-- one Agent/Actor/TurnMachine/TurnJournal runtime;
-- one SessionStore authority;
-- one JobManager/Graph runner;
-- one Process/output/ACK owner;
-- one replay owner for a given effect;
-- one policy-admission owner;
-- one approval/wait owner.
-
-Never create a second:
-
-- Agent engine;
-- Graph scheduler;
-- Session database;
-- policy database;
-- approval engine;
-- collaboration queue;
-- transcript store;
-- event bus.
-
-### 3.3 Identity and refs
-
-Canonical hierarchy is typed `d/i/p/a/t/j/n`.
-
-Rules:
-
-- slash refs are fully resolved;
-- non-slash refs are contextual overlays;
-- structural `:0` defaults are fixed identities, never caller-relative aliases;
-- canonical handles never retarget or reuse;
-- Graph node `n:<coordinate>` is direct 1-based coordinate;
-- Step has no public path segment;
-- an Agent binds one Session+branch once for its lifetime;
-- project `a:0` binds its primary executable Session once and is never
-  sequentially rebound.
-
-### 3.4 Jobs/data/control semantics
-
-Natural reads:
-
-- Process → stdout;
-- Graph → result;
-- Agent → latest committed result.
-
-`jobs_read`:
-- pure;
-- never ACKs;
-- raw offsets remain encoding-independent for retained bytes;
-- Agent views/filter/history are AW-only disclosure projections.
-
-`jobs_ack`:
-- exact ref/view/raw offset;
-- no revision;
-- monotonic/idempotent;
-- cannot release bytes never delivered/owned by that lease.
-
-`jobs_get`:
-- rev is conditional observation/change token.
-
-`jobs_send/cancel/subscribe`:
-- optional rev = compare-and-act;
-- effectful replay claim is established before effect;
-- under `890e9a`, original replay claim is looked up **before contextual ref
-  re-resolution**;
-- the first admission stores the resolved canonical target;
-- retry uses that stored target/receipt even if parent/relation changed.
-
-No restart:
-- rerun means a fresh explicit constructor under current authority.
-
-### 3.5 Event and wake semantics
-
-Event/wake is not a notification broadcast service.
-
-Source owns:
-
-- subscription replacement;
-- subscription generation;
-- event revision;
-- factual event commit.
-
-Receiver owns:
-
-- current Agent/Input authority;
-- causal-work budget;
-- idempotent Input acceptance;
-- wake scheduling.
-
-Rules:
-
-- source registration and event commit serialize under the source owner;
-- constructor `wake` is admitted before exposure/root start;
-- fast completion cannot outrun requested wake registration;
-- repeated result+settled at one factual checkpoint may coalesce when effective
-  mode is the same;
-- source event remains factual even if recipient later denies/revokes;
-- recipient revocation suppresses new Input; it never rewrites source event;
-- dotlink standalone/initial D2 bridge does **not** advertise remote wake.
-
-### 3.6 Agent/Turn authority
-
-Agent is a long-lived stable execution resource.
-
-- one Agent identity ↔ one exact Session/branch;
-- Turn is a generation under that Agent;
-- root send queues future Input;
-- Turn send steer/interrupt remains in the same active Turn;
-- whole-Agent close and Turn cancel are distinct.
-
-Every authenticated Input/control boundary creates immutable
-`AuthoritySegment` evidence in TurnJournal.
-
-Every causally following:
-
-- model Step;
-- tool-result continuation;
-- delegated child;
-- automatic continuation
-
-remains under that segment until another authenticated boundary or Turn end.
-
-Each paid Step records `ModelInvocationAdmission` binding:
-
-- Agent;
-- Turn;
-- Step/ordinal;
-- AuthoritySegment ID/fingerprint;
-- actor/payer/audience/disclosure evidence;
-- existing provider/account `InvocationIdentity`;
-- host invocation ID.
-
-Retries cannot cross authority segments.
-
-If actor/disclosure changes:
-
-- rebuild provider input from authorized public Session/Turn projection;
-- discard previous participant's provider-private continuation/cache/state.
-
-### 3.7 Shared Sessions
-
-AW owns all collaboration semantics.
-
-One shared Session/branch has:
-
-- one Agent coordinator;
-- one input queue;
-- one Turn writer.
-
-Participation predicates are independent:
-
-- View
-- Contribute
-- Submit
-- Control
-- Manage
-
-Never union participant privileges.
-
-Full Session sharing:
-- same owner/Agent/branch;
-- authorized public history only.
-
-Approved-context sharing:
-- creates a **new sanitized Session** in the same Workspace;
-- copies only explicitly approved bounded context;
-- does not copy private Turns, provider-private state, credentials, tool outputs,
-  or original system/provider continuation implicitly.
-
-Writer fencing:
-- `WriterFence = NotApplicable | Epoch(nonzero)`;
-- durable/multi-writer sites require Epoch;
-- stale writer/follower cannot create a second paid Turn/coordinator.
-
-### 3.8 Policy and grants
-
-`aw-policy` is pure:
-
-- constraints;
-- denies;
-- routes;
-- preferences;
-- limits.
-
-It **never issues grants**.
-
-Positive authority comes only from authenticated current grant evidence:
-`ToolPolicy`, `ToolBindingAuthority`, resource/Session stores, writer epochs,
-provider/payer authority.
-
-Guardian/model decisions are advisory evidence only.
-
-Admission guardian:
-- Allow
-- Deny
-- Ask
-- Narrow
-
-After Graph seal, Node policy cannot rewrite:
-
-- OperationId;
-- arguments;
-- topology;
-- `when`;
-- semantic ceilings.
-
-Node-time policy may allow/deny/ask or narrow route/resource/provider/payer/limits.
-
-### 3.9 ExecutionStrategy
-
-AW host owns:
-
-- Local
-- DelegateAgent
-
-ExecutionStrategy is not:
-
-- a model field;
-- a ToolEffect;
-- an OperationId;
-- a Job kind.
-
-DelegateAgent:
-
-- ordinary Agent/Turn;
-- receives a gated original semantic executor;
-- factual success comes only from original executor receipt;
-- cannot widen semantic side effects;
-- disclosure authority is separate from execution authority;
-- self/ancestor/wait cycles must reject before child admission;
-- parent model idles while transparent delegate works;
-- uses same finite causal/payer budget.
-
-### 3.10 Graph determinism
-
-- Graph topology/prepared args immutable after admission.
-- Dynamic Node routing sees only dependency-closed `GraphActivationContext`.
-- DL-150 implicit previous-success dependency counts as dependency.
-- Unrelated parallel completions are invisible to route decisions.
-- Preflight captures union of candidate route footprints.
-- Conflict position is reserved before per-node router/Ask latency.
-- Later conflicting node cannot overtake; non-conflicting work may continue.
-- Model/SDK/host nested `batch` is rejected.
-- AW may expose `agent` as a Graph leaf only with the real Agent adapter.
-- Standalone dotlink never exposes Agent.
-- Under `890e9a`, an Agent/descendant owned by a live Graph node retains that
-  Graph ownership scope transitively; nested `batch` remains denied until the
-  owned subtree settles/unknown and conflict footprint releases.
-
-### 3.11 Crate/layer placement
-
-`aw-agent-kernel`
-- portable Actor/Envelope/capability invariants;
-- tiny WriterFence.
-
-`aw-agent-core`
-- sole Agent/Turn engine;
-- ToolRegistry/ToolPolicy;
-- provider/account identity;
-- AuthoritySegment/ModelInvocationAdmission.
-
-`aw-policy`
-- pure/no_std policy constraints/preferences compiler;
-- no grant issuing/database.
-
-`aw-session`
-- backend-neutral Session/coordinator façade;
-- no second Session DB.
-
-`aw-tools`
-- shared filesystem/Graph/finite-Job core;
-- OperationId;
-- ExecutionRef;
-- Job event value types;
-- coordination/footprint values.
-
-`aw-tools-adapter`
-- concrete AW native/Process/Job execution bridge;
-- no competing Agent/Session/Policy owner.
-
-`aw-host`
-- thin composition/routing/policy host.
-
-dotlink
-- concrete remote/local native Process/Graph executor;
-- no AW Agent/Session/Policy engine.
-
-### 3.12 Performance discipline
-
-Normal Local/single-user path must not gain mandatory:
-
-- collaboration allocations/lookups;
-- team network calls;
-- guardian/router inference;
-- extra Agent queue;
-- generic plugin registry;
-- unnecessary per-tool allocation.
-
-Prefer static dispatch/borrowed values/existing owner callbacks. Share a primitive
-only when two real owners need it.
-
-### 3.13 Hard pre-1.0 cutover
-
-No compatibility surface for removed model APIs.
-
-Do not add:
-
-- legacy route aliases;
-- dual schema;
-- legacy replay service;
-- migration shim solely to keep old vNext model names alive.
-
-Transient old dev/test state may be reset only under the explicit quiescence gate:
-ingress closed, original runtime/supervised children stopped, no live/ambiguous
-external effects, no outstanding replay/Task/output/ACK owners.
+## 2. Current queue and practical priority
+
+### P1 release-readiness
+
+The local/source work is largely complete. Remaining items are genuinely
+external or owner-decision gates:
+
+- execute exact release assets on:
+  - Linux ARM64;
+  - macOS ARM64;
+  - Windows x86_64;
+  - Windows ARM64;
+- decide version/release policy after compatibility review:
+  - source SDK revision pinning;
+  - one-way native layout upgrade;
+  - mixed-version capabilities policy;
+  - 0.16.0 remains a proposal; source is still 0.15.0;
+- configure Developer ID / Authenticode identity signing and notarization;
+- run live-provider/billing compatibility only when separately authorized and
+  configured;
+- obtain independent security review.
+
+Do not simulate these with cross-compilation/emulation and call them complete.
+
+### P2 workspace-views
+
+This is the next substantive implementation program.
+
+Current genuine unimplemented scope:
+
+- distinct user/Actor delegation;
+- individually narrowed and revocable browser grants;
+- remote-device trust;
+- post-ACK browser crash/partition semantics beyond inspect-only state;
+- broker crash/reboot execution-restoration semantics;
+- remote/distinct-Actor PTY custody;
+- macOS/Windows PTY custody/runtime acceptance;
+- actual Windows scoped-directory/DirectoryIdentity filesystem runtime tests;
+- remote views with exact machine/member/revision/expiry/offline authority tests;
+- separately owned live browser screenshot/visual acceptance.
+
+Same-UID Linux live PTY migration is **not** unfinished work.
 
 ---
 
-## 4. Current AW implementation reality
+## 3. Workspace-views: original design
 
-This section describes the **dirty source**, not merely HEAD.
+The accepted design began at `47ee8a0...` with one principle:
 
-### 4.1 Phase 1 foundation implemented in working tree
+> Multiple views/resources inside one Workspace must project existing owners and
+> exact capabilities. A view is never a second runtime and never creates
+> authority from labels, paths, layout state or browser authentication.
 
-Implemented/shared pieces include:
+### 3.1 One current Agent and composer
 
-- canonical `OperationId` + flat-name mapping;
-- typed `ExecutionRef`;
-- first-class `Control` effect;
-- portable `WriterFence`;
-- coordination ancestry/value types;
-- `aw-policy`, `aw-session`, `aw-host` foundations;
-- exact `ToolBindingAuthority` snapshots/generations;
-- Local path preserved.
+- `Conversation` follows the current Agent.
+- Read-only `AgentView` pins exact Store/Session/branch identity.
+- Opening a view does not activate an Agent.
+- Activation remains a separate action and passes the existing busy/recovery/
+  draft checks.
+- An unsaved Agent is not persisted merely to create a view.
+- Closing a view never implicitly stops its Agent or PTY.
 
-### 4.2 Phase 2 finite Jobs implemented
+### 3.2 Read-only projection
 
-Implemented:
+- Reuse the strict Store read path shared with activation.
+- Do not mint a `SessionHandle` for inspection.
+- Reuse authorization, coordination and history validation.
+- Viewing uncertain committed history labels it; it never acknowledges/replays it.
+- Reader refresh revalidates authority even when branch head is unchanged.
+- A denied/revoked view clears plaintext plus derived Find/selection state.
+- Async work carries tab ID + exact target + generation; late/superseded replies
+  are discarded.
 
-- one finite Job/Graph/Process runtime;
-- heterogeneous exposure ordering;
-- `jobs_list/get/read/ack/send/cancel`;
-- Process stdout/stderr/result;
-- Graph result/node reads;
-- exact retention/ACK;
-- interactive Process stdin current-authority checks;
-- background shell/Graph;
-- no restart;
-- replay/lost-receipt fencing;
-- runtime-generation/sessionless identity fencing;
-- source-owned event rule/event revision primitives;
-- constructor wake before roots;
-- `jobs_subscribe`/wake receiver path in AW;
-- replay-before-contextual-ref resolution;
-- same-checkpoint result+settled coalescing.
+### 3.3 Presentation identity is not authority
 
-### 4.3 Phase 3 Agent Job plane implemented
+- Tab/container/pane IDs identify presentation state.
+- Names, labels, positions and paths are never authority.
+- Saved descriptors are requests to recover/reconnect authorization, not grants.
+- View state must not retarget the current Agent.
+- Moving/reparenting preserves exact resource identity.
 
-Implemented:
+### 3.4 Bounded layout/container model
 
-- stable Agent ref + exact Turn ref;
-- immutable Agent↔Session/branch binding;
-- project root `a:0` one-time binding behavior;
-- mixed Agent + finite Job list exposure ordering;
-- Agent `jobs_get/read/send/cancel/subscribe`;
-- root queue, same-Turn steer/interrupt;
-- long-lived Agent constructor;
-- bounded Agent history/filter/cursors;
-- AuthoritySegments;
-- ModelInvocationAdmission;
-- current provider/payer/audience context rebuild;
-- causal continuation/delegation budgets;
-- whole-Agent close vs Turn cancel;
-- replay-before-`^` re-resolution;
-- source/recipient event/wake ownership;
-- active Graph ownership propagated through descendant Agents.
+- Flat stable-ID graph.
+- One parent/container level.
+- Cycle/orphan checks.
+- Global limits:
+  - 8 panes/containers where applicable;
+  - 32 total tabs/documents.
+- Existing layout migrations preserve geometry, IDs, focus and exhausted
+  allocators or fail atomically.
+- Old readers reject newer layout versions rather than silently dropping fields.
 
-### 4.4 Phase 4 policy/delegation implemented
+### 3.5 Publication/concurrency decision
 
-Implemented:
-
-- authenticated grant evidence;
-- pure policy resolution;
-- durable policy admission claim;
-- guardian Allow/Deny/Ask/Narrow;
-- paid guardian replay/crash fencing;
-- PendingApproval/multi-Ask;
-- Local vs DelegateAgent operation router;
-- original factual executor gating;
-- whole-Graph delegate;
-- dynamic per-node delegate;
-- pre-seal Graph Narrow;
-- node-time mutation rejection;
-- conservative route-footprint union;
-- conflict-position ordering under router/Ask latency;
-- Agent Graph node using same JobManager;
-- nested Agent/delegation under one causal/payer budget;
-- Graph-owner descendant lease/unknown settlement.
-
-Recorded one-time fixture measurement in TODO:
-- Local: 0 auxiliary calls;
-- delegated whole Graph: 2 delegate model Steps;
-- reported 8 input / 3 output tokens;
-- cached test wall time ~0.661 s, Local/delegate matrix ~0.631 s.
-
-### 4.5 Phase 5 shared Sessions implemented
-
-Implemented in working tree:
-
-- migration v34 participation store;
-- View/Contribute/Submit/Control/Manage predicates;
-- legacy append remains distinct from Submit/Control;
-- participant-origin immutable evidence;
-- payer/provider/tool/disclosure projection refs;
-- participant Submit under participant identity/payer;
-- cross-participant Control with persistent segment ownership;
-- Carol steering after Bob creates new segment;
-- provider-private continuation discarded on actor/disclosure change;
-- revocation after acceptance fences before paid dispatch;
-- approved-context new sanitized Session;
-- shared-session read projection avoids rebinding another user's live Agent;
-- transcript/history/wake disclosure revalidation;
-- stale writer/failover fencing;
-- WriterFence carried across paid provider/tool boundaries.
-
-### 4.6 Checkpoint status nuance
-
-Current AW TODO shows:
-
-- Checkpoint C: `[x]`
-- Checkpoint D: `[x]`
-- Checkpoint E: `[x]`
-
-But **0/A/B remain formally unchecked**.
-
-The TODO explicitly says checkpoint acceptance is ordered
-`0 → A → B → C → D → E → F → G`. Therefore C/D/E checkmarks represent
-reported implementation evidence, not a final product acceptance while predecessor
-checkpoint formalization/shared-review boundaries remain open.
-
-Do not erase the C/D/E evidence. Do not claim full A–E product qualification yet.
-
-### 4.7 Key executed AW evidence
-
-The working implementation has executed focused regressions for:
-
-Checkpoint C / amended `890e9a`:
-- stable Agent create → first Turn → idle → continuation → close;
-- queue/steer/interrupt/cancel;
-- exact AuthoritySegment persistence;
-- contextless constructor denial;
-- mixed Agent/finite listing;
-- bounded history/disclosure;
-- replay claim before parent `^` re-resolution;
-- constructor wake before fast roots;
-- same-checkpoint event coalescing;
-- transitive Graph ownership / nested-batch denial.
-
-Checkpoint D:
-- Local zero auxiliary calls;
-- single-op DelegateAgent factual executor;
-- stale grant/authority denial;
-- whole-Graph delegate one JobManager;
-- node delegate same JobHost node;
-- conflict-order wait;
-- pre-seal Narrow;
-- node-time mutation rejection;
-- multi-Ask zero roots;
-- approval revocation;
-- guardian crash replay;
-- Agent Graph nested Agent under same delegation root/budget.
-
-Checkpoint E:
-- Alice full Session share to Bob without owner/Agent/branch replacement;
-- Bob Submit uses Bob provider/payer;
-- Bob→Carol Control segments across multiple Steps;
-- unsafe disclosure rejects before provider;
-- revocation-after-acceptance prevents paid dispatch and preserves factual receipt;
-- `a:0` stable binding;
-- writer failover fence;
-- approved-context isolation;
-- revoked participant cannot receive later wake or transcript page;
-- Local no-delegate path stays zero auxiliary model calls.
-
-Do not rerun all of this mechanically. Re-run by ownership/dependency trigger.
+- Prefer the existing `aw_agent_core::publication` only when measured immutable,
+  read-heavy shared state benefits.
+- One publisher, one registered reader per long-lived consumer, owned Arc
+  snapshots outside guards.
+- Never put a registered reader behind another shared Mutex.
+- Keep admission/receipt/PTy/queue/resource locks when their invariants require
+  them.
+- Current single-owner view caches do not justify another publication layer.
+- Browser Session snapshot and multiplayer presence were explicitly selected for
+  measurement before any migration.
 
 ---
 
-## 5. Current dotlink D1 implementation reality
+## 4. Workspace-views implementation chronology
 
-D1 standalone finite Jobs cutover is committed and pushed at
-`3f59bb16b0262f6157351fd28b13167cc1b3e5db`.
+The canonical TODO is the exhaustive record. The milestones below are the
+high-level implementation sequence and why each exists.
 
-Changed paths:
+### 4.1 Native read-only Agent views
 
-- `.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/TODO.md`
-- `docs/CHATGPT_PLUGIN.md` (**unrelated pre-existing change; preserve**)
-- `src/jobs.rs`
-- `src/mcp.rs`
-- `src/mcp/tools/graph.rs`
-- `src/mcp/tools/jobs.rs`
-- `src/mcp/tools/shell.rs`
-- `src/transports/openai.rs`
+- `47ee8a0` — accepted design checkpoint.
+- `1c2ec6e` — native read-only Agent views.
+  - exact Store/Session/branch projection;
+  - independent viewport/Find/selection;
+  - no activation/effect side effects.
+- `2809fa5` — asynchronous Find completion.
+- `3b0dbb5` — Find intent/request lifetimes, including stale completion fencing.
 
-### 5.1 D1 public cutover
+### 4.2 Scoped native Files
 
-Standalone model surface is now:
+- `6b96f01` — retained Windows directory bindings.
+- `3851dbf` — native scoped Files containers.
+  - independent `ScopeId`;
+  - retained `WorkspaceFiles` capability;
+  - explicit external-folder reconnect;
+  - same relative path under different scopes remains distinct;
+  - capability registry owned by UI/Host, not Agent root.
+- Layout v3 migrated earlier layouts without adding SQLite/JSONL schema change.
 
-- `jobs_list`
-- `jobs_get`
-- `jobs_read`
-- `jobs_ack`
-- `jobs_send`
-- `jobs_cancel`
+### 4.3 Native Git containers
 
-Constructors:
-- shell with `background:true`;
-- `batch(..., background:true)`.
+- `491f366` — retained repository identities.
+- `b33a418` — native scoped Git containers.
+  - exact authorized repository/worktree context IDs;
+  - immutable Review targets;
+  - selected-index-only staging;
+  - reconnect/replacement checks;
+  - Files scope and Git context remain independent.
+- Layout v4 retained old Files wire fields and added Git ownership.
 
-Old model routes are unreachable:
+### 4.4 Browser read-only Agent views
 
-- `job_start`
-- `job_restart`
-- old `job_*` names.
+- `a0ffa3e` — browser read-only Agent tabs.
+- `68629d8` — explicit browser draft targets.
+- `94697a7` — reachable draft consent and final browser acceptance.
+- Shipping Solid shell, not the old historical browser reducer, is the product
+  surface.
+- Browser authentication is necessary but never sufficient Store authority.
+- Current Agent/draft/caret and execution counts stay unchanged while browsing.
 
-Standalone intentionally has **no**:
+### 4.5 Scoped browser Files/Git
 
-- Agent;
-- Agent transcript/filter;
-- `jobs_subscribe`;
-- wake;
-- nested `batch`.
+- `57a6059` — scoped browser Files/Git views.
+- `0159f0b` — bounded merged editors and final browser acceptance.
+- Browser scoped requests retain owner lifetime + immutable scope/context.
+- Git inventory handles grant no Files capability.
+- Scoped wrappers are read-only and cannot wrap terminal/mutation commands.
+- Late close/refresh/source replies cannot redirect content into another view.
 
-### 5.2 D1 correctness closed
+### 4.6 Publication measurement
 
-- Graph root `j:<id>` `jobs_read` returns canonical synthesized aggregate
-  `result`.
-- Graph root aggregate is intentionally non-ACKable.
-- Exact node `j:<id>/n:<coord>` output remains ACKable.
-- ACK cannot advance past bytes actually returned by `jobs_read`.
-- Process natural read is stdout.
-- Interactive stdin remains runner-owned and rev-fenced.
-- Current launcher/sandbox/source authority is revalidated before stdin bytes.
-- Revocation blocks before bytes.
-- Runtime generation is fresh per startup.
-- stale finite refs/cursors reject after restart;
-- Job IDs are not reused across runtime generations;
-- no live Process/Graph resurrection;
-- cancellation/unknown settlement preserved;
-- MCP Task/replay/stdio/protected-path ownership preserved.
+- `2c07425` — measured real HTTP publication/shared-draft presence correctness.
+- Real release-mode benchmark compares existing publication implementation with
+  actual Mutex read shapes, multiple reader counts and read/write ratios.
+- Decision remains evidence-driven; publication does not replace fresh authority,
+  TTL or sequence checks.
 
-### 5.3 D1 validation
+### 4.7 Browser docking
 
-The dotlink TODO records the grouped D1 checkpoint green on L5, including:
+- `e06ffa7` — same-window reparenting substrate.
+- `7de8658` — owner-mediated File-only cross-window docking.
+- `00559eb` — immutable Git Review cross-window docking.
+- `41e66c4` — bounded read-only Find/scroll/selection/focus continuity.
+- `e558919` — receiver-confirmed browser docking lifecycle.
+- `0efea351` — explicit same-owner, independent Chrome-profile pairing.
 
-- flat catalog;
-- shell sync/handoff/background;
-- Graph whole/node reads;
-- ACK ownership;
-- authorized→revoked stdin;
-- cancel/unknown;
-- duplicate control replay;
-- runtime restart stale ref/cursor rejection;
-- protocol-clean stdio;
-- representative protected-path/sandbox denial;
-- owner-sensitive MCP Task/OpenAI replay carry-forward.
+Permanent meaning:
 
-### 5.4 D1 shared dependency boundary closed
+- transfer presentation/read authority only;
+- no Agent/execution ownership moves;
+- receiver revalidates exact owner/source/content;
+- short-lived receiver proof is a safety check, not proof of perpetual browser
+  liveness;
+- future distinct-user/Actor work must not reuse same-owner pairing as if it were
+  cross-user delegation.
 
-D1 originally closed against reviewed/pushed AW implementation revision:
+### 4.8 Native same-machine terminal docking and persistent PTYs
 
-`9e9ab043410241c3f797f760d93a1cfd9126fdd2`
+- `c98987a` — same-owner Unix second-terminal docking.
+  - existing Workspace continues to own the PTY;
+  - presentation/control moves temporarily;
+  - same shell PID;
+  - exclusive input.
+- `bd87e5d` — opt-in owner-independent Unix PTY broker for newly launched PTYs.
+  - new broker-owned shell;
+  - survives launcher/frontend exit;
+  - one-use control tickets;
+  - explicit stop.
 
-The final unified bridge supersedes that historical D1 pin with exact AW
-`0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`; see Section 6.
+These were deliberately separate from migration of an already-running
+Workspace-owned PTY.
 
-That revision exports the reviewed shared finite Job/Graph runtime plus `OperationId`,
-typed `ExecutionRef`, coordination/event primitives and the host-neutral remote-Start
-contract. dotlink consumes those shared mechanics without depending on AW Agent,
-Session, Policy or host implementation crates.
+### 4.9 Live migration prerequisites
 
-Standalone `j:<handle>[/n:<coordinate>]` parsing now uses shared `ExecutionRef` typed
-suffixes, and shell names use shared `OperationId`. No sibling path dependency and no
-copied AW source remain. D1's shared-pin prerequisite is complete.
+Historical prerequisite milestones:
 
----
+- `635e1ec` — reversible original reader quiescence.
+- `a1100a9` — atomic PTY master + child pidfd escrow.
+- `2feaa78` — Linux live-migration prerequisites.
+- `207c552` — bounded parser checkpoint + staged owner FD escrow.
+- `62f3735` — exact pidfd exit facts.
+- `7ced795` — guarded local source release/passive parent custody.
+- `2b8d769` — reproducible independent native fixtures.
+- `9f1cc28` — inert adopted PTY reactor.
+- `11999aa` — reader retirement when descendants retain slave.
+- `a0c64c9`, `c51c681` — strict native lint coverage.
 
-## 6. Final exact cross-repo pin — complete
+Their local “production migration still unimplemented” statements were true at
+those commits only and are now historical.
 
-D1, D2, D3, AW Phase 7, Checkpoint F, runtime Checkpoint G and repository
-finalization are complete.
+### 4.10 Same-UID Linux original-shell custody complete
 
-Final shared AW implementation revision:
+- `9d82f1a` — Linux original-shell custody transaction.
+- `65f04ca` — actual different-UID FD admission refusal.
 
-`0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
+Current Linux truth:
 
-Final dotlink bridge revision:
+- `terminal-promote` migrates an already-running Workspace shell.
+- Exact shell PID survives.
+- Full bounded parser state survives.
+- Broker becomes sole reader/controller only after authenticated committed
+  release.
+- No command/input replay.
+- Exact-pidfd signaling; no naked numeric-PID fallback.
+- Source never resumes after committed release.
+- Source crash before release does not authorize receiver activation.
+- Different-UID FD admission is explicitly rejected in an isolated user
+  namespace test.
 
-`c90a6603ccef0bbf626ce10d95bedf59877747b8`
-
-dotlink consumes the exact AW revision through normal Git dependencies for:
-
-- `aw-tools`
-- `aw-tools-fs-unix`
-- `aw-tools-fs-win`
-
-`Cargo.lock` changes only those three Git source revisions. No sibling path,
-`file://`, vendored copy or unpushed SHA is used.
-
-The temporary dotlink argument-digest mirror is gone; the bridge now uses
-`aw_tools::remote_start::arguments_sha256` directly.
-
-### 6.1 Final remote-Start replay contract
-
-The final implementation regression-locks replay-first ordering:
-
-- AW redelivery looks up immutable Start attempt identity before current
-  ToolBinding/ref resolution and rejects changed semantic request digest.
-- dotlink validates target/op/args/generation and then the concrete effect owner
-  claims the Start before mutable local checks/effects.
-- remote Graph claims before Graph preparation/topology revalidation.
-- remote shell claims before current shell-policy revalidation.
-- remote cancel claims before current revision precondition.
-- `jobs_ack`, `jobs_send`, and shared-native FS are claim-first.
-- exact Ready receipt replays after later mutable-state/policy/revision changes.
-- Claimed/Unknown never becomes a fresh effect.
-- genuinely new attempts still recheck current launcher/sandbox/tool/resource authority.
-
-### 6.2 Final qualification against the exact pin
-
-dotlink, locked to AW `0a6c6a0...`:
-
-- `cargo check --offline --locked --all-targets --all-features` — green;
-- `AW_BASH=... cargo test --offline --locked --all-features --quiet` —
-  651 active / 1 intentional ignored fixture plus all five integrations green;
-- strict all-target/all-feature Clippy — green;
-- rustfmt and diff checks — green.
-
-No further unified-runtime implementation step remains.
+Do **not** reopen same-UID Linux migration because earlier prerequisite sections
+contain unchecked historical bullets.
 
 ---
 
-## 7. Runtime completion and final qualification
+## 5. Permanent Files/Git authority decisions
 
-### 7.1 Hard cutover
+### Files
 
-Completed:
+- A `ScopeId` names a requested human binding, not a path grant.
+- Only an explicitly retained `WorkspaceFiles` capability authorizes access.
+- Launch root is retained independently from any Agent resumed elsewhere.
+- External folders require explicit reconnect after restart.
+- Closing the last reference revokes unused external capability.
+- Every read/list/search/highlight result carries scope/path/binding/lifetime.
+- Reconnect invalidates old plaintext/render/Find/selection before new content.
+- Unix relies on retained root descriptor traversal.
+- Windows must retain directory/ancestor handles denying delete sharing; native
+  runtime tests remain open.
 
-- old `job_*`, `job_start`, `job_restart`;
-- grouped jobs/agents compatibility routes;
-- old `subagent`, `team`, `plan`, `review_release` model routes;
-- route-specific dead CLI/module plumbing;
-- production-dead AW `PolicyGraphRouter` / guardian / narrow / approval owner
-  (~1,361 lines / ~57 KiB) and its router-only tests/providers.
+### Git
 
-Retained deliberately:
+- Git context ID names exact authorized checkout identity.
+- Worktree selection mints a new context; it never retargets another context by
+  pathname.
+- Diff retains immutable Review + original context.
+- Fresh staging rechecks exact review/HEAD/binding at serialized owner admission.
+- Reconnect/final-reference closure/restore invalidates queued admission.
+- Existing retained Diff may still stage its exact original checkout if fresh.
+- Already admitted external mutation is not silently cancelled/replayed.
+- Git-derived terminal launch rechecks captured binding before starting shell.
+- These checks do not claim subprocess sandboxing or exclusion of external Git
+  writers.
 
-- one canonical AW Agent/Session/Actor/Turn/Job runtime;
+---
+
+## 6. Browser authority and docking decisions
+
+- Browser authentication does not grant Store, filesystem, Git or execution
+  authority.
+- LocalWeb owns/reuses one owner Store from startup.
+- Browser reads name exact Store/Session/branch identities.
+- Browsing never creates Agent/Session execution bindings or durable effect
+  intent.
+- Unsaved creation uses durable receipt-first semantics.
+- File/Git browser scopes are retained owner capabilities, not client paths.
+- Every long-running response must revalidate source/scope/lifetime before
+  publication.
+- Logout/revocation clears protected content and derived caches.
+- Browser docking tickets transfer bounded presentation/read continuity, not
+  Runtime/Agent/tool authority.
+- Current same-owner pairing is not a distinct-user delegation mechanism.
+- The next design must give another user/Actor individually narrowable,
+  independently revocable authority rather than extending same-owner browser
+  cookies/tickets.
+
+---
+
+## 7. Linux PTY custody — current contract
+
+There are three distinct supported concepts.
+
+### `terminal-dock`
+
+- Moves presentation/control to another terminal.
+- Original Workspace process retains PTY ownership.
+
+### Workspace persistent start
+
+- Launches a **new** broker-owned PTY.
+- It can survive launcher/frontend exit.
+- It is not migration of an existing shell.
+
+### `terminal-promote`
+
+- Deliberately migrates an **already-running** Workspace shell on same-UID Linux.
+- Exact shell PID and parser-visible state survive source exit/SIGKILL.
+- Transaction stages:
+  1. local control fence;
+  2. sole reader quiesced;
+  3. bounded checkpoint + one master/pidfd escrow;
+  4. release pending;
+  5. source reader joined, master/writers closed, guard disarmed into passive
+     parent waiter;
+  6. broker activation only after exact signed release publication.
+
+### Critical failure semantics
+
+- FD receipt/readiness/source death does not grant activation.
+- Pre-release failure can resume the exact source.
+- Pending/Released is irreversible to the caller.
+- Lost/duplicate ACK cannot reactivate source.
+- Death before publication is UNKNOWN.
+- Broker loss never causes input/shell replay or source reactivation.
+- Broker SIGKILL/reboot does **not** currently promise execution restoration.
+- A sibling broker does not become the child's parent.
+- Preserve unknown/unavailable exit status for nonchildren.
+- Source private signing key is ephemeral and zeroized; only public key is
+  staged.
+- Broker never creates Agent/State/provider/tool authority.
+
+---
+
+## 8. Fresh current-HEAD validation on `88cd965`
+
+The current workspace-views revalidation after unified-runtime finalization is
+green for the native/current-owned scope.
+
+### Native layout/focus
+
+Passed:
+
+- `narrow_frame_keeps_desired_layout`
+- `maximize_roundtrip_preserves_layout_draft_and_scroll`
+- `maximizing_another_pane_leaves_the_composer_without_clearing_its_draft`
+- `unified_palette_cancel_and_resize_preserve_invoking_focus_and_editor`
+- `focusing_the_current_agent_preserves_busy_state_and_unsent_input`
+
+Meaning:
+
+- narrow frames preserve intended layout;
+- maximize/restore preserves layout, viewport and draft;
+- maximizing another pane does not clear composer draft;
+- modal/palette cancellation and resize preserve invoking focus/editor;
+- returning focus to current Agent preserves busy state and unsent input.
+
+### Browser docking owner tests
+
+- `AW_GIT=... cargo test --locked -p aw-cli --lib docking`
+- **24/24 passed**
+
+### Real current binary PTY migration
+
+Freshly built current `target/debug/aw` passed all four:
+
+- `parser`
+- `vim`
+- `less`
+- `source-crash`
+
+Verified:
+
+- identical original shell PID;
+- exclusive input/no replay;
+- foreground Ctrl+C;
+- parser state and alternate-screen behavior;
+- recipient terminal restoration;
+- explicit stop;
+- source-crash does not falsely claim source terminal restoration after SIGKILL.
+
+### Not claimed
+
+- live browser visual/screenshot acceptance;
+- macOS/Windows native PTY custody;
+- remote-device custody;
+- broker reboot/SIGKILL restoration;
+- actual Windows retained-directory runtime tests.
+
+---
+
+## 9. Genuine remaining workspace-views implementation scope
+
+### 9.1 Next substantive boundary — distinct user/Actor delegation
+
+Design goal:
+
+A receiver that is not merely another same-owner browser/profile must receive an
+explicit delegated authority bound to exact Actor/user/source/site/resource and
+lifetime.
+
+Requirements:
+
+- delegation must originate from a current authorized owner;
+- exact recipient user/Actor identity;
+- narrow resource set, not all browser capabilities;
+- explicit grant revision/generation;
+- independent revocation;
+- revocation clears protected receiver content/state;
+- stale/held replies cannot resurrect revoked authority;
+- reconnect/reload does not silently regrant;
+- no path/label/ticket fallback;
+- no implicit Agent execution retargeting;
+- no provider/tool authority unless separately and explicitly granted.
+
+### 9.2 Individually narrowed/revocable browser grants
+
+Current same-owner pairing and docking are insufficient for cross-user use.
+
+Need:
+
+- capability records scoped per recipient and resource;
+- grant/revoke lifecycle with exact current authority check;
+- independent File/Review/Agent-view grants;
+- no inherited local Files root just because browser is authenticated;
+- receiver session lifetime and logout/revocation cleanup;
+- post-ACK crash/partition inspection semantics;
+- do not treat recent ACK as perpetual liveness.
+
+### 9.3 Remote-device trust
+
+Still unavailable.
+
+Before enabling remote views:
+
+- exact machine/device identity;
+- user/Actor membership;
+- revision/security epoch;
+- expiry;
+- offline/reconnect behavior;
+- no local fallback;
+- no execution retargeting;
+- held/stale reply tests;
+- device removal/revocation tests.
+
+### 9.4 Remaining PTY/platform acceptance
+
+Still open:
+
+- remote/distinct-Actor PTY custody;
+- macOS live-custody acceptance;
+- Windows live-custody acceptance;
+- broker crash/SIGKILL/reboot execution restoration;
+- arbitrary terminal-application compatibility beyond current fixtures.
+
+### 9.5 Windows scoped-directory runtime
+
+Compilation is green. Actual Windows filesystem execution remains open:
+
+- retained directory handle behavior;
+- directory identity/reparse-point replacement;
+- symlink privilege/Developer Mode case.
+
+### 9.6 Remote views
+
+Remain disabled until exact authority/lifetime matrix exists.
+
+### 9.7 Visual/browser acceptance
+
+The current plan explicitly treats live browser screenshot/visual acceptance as
+separately owned. Do not claim it from Rust/Node/browser-owner logic tests.
+
+---
+
+## 10. Recommended next implementation design
+
+Do not start by changing UI.
+
+Start from authority.
+
+### Phase A — define delegated browser capability
+
+First agree a small typed record, likely at Store/host authority layer, containing:
+
+- grant ID;
+- owner principal;
+- recipient user/Actor;
+- exact source/site;
+- resource kind + immutable resource identity;
+- grant revision/generation;
+- issued/expiry;
+- revocation state;
+- optional parent authority evidence.
+
+Do not use pathname, tab ID, browser cookie or display name as identity.
+
+### Phase B — admission and revalidation
+
+Add one owner-side path:
+
+- owner grants exact receiver capability;
+- every receiver read revalidates current grant;
+- held response revalidates before publish;
+- revoke invalidates receiver caches/content immediately;
+- regrant creates a new generation so stale work cannot regain authority.
+
+Reuse existing generation/revocation patterns where possible rather than
+inventing another replay/authority system.
+
+### Phase C — browser docking integration
+
+Extend existing owner-mediated docking so a different authorized user/Actor can
+receive only the delegated read capability.
+
+Preserve:
+
+- source content hash/identity checks;
+- exact recipient;
+- expiry;
+- bounded one-use transaction semantics;
+- no execution authority;
+- no implicit Store/Files/Git grants.
+
+### Phase D — negative matrix before UI polish
+
+Test:
+
+- wrong recipient;
+- wrong Actor/user;
+- revoked grant;
+- revoke after request but before publish;
+- grant reissued with new generation;
+- browser reload after revoke;
+- receiver crash/partition after ACK;
+- stale ticket;
+- same path under different scope;
+- unchanged resource with revoked authority;
+- logout/global security epoch;
+- no Agent/root/draft/caret/model/tool side effects.
+
+Only then add/adjust user-facing controls.
+
+---
+
+## 11. Source map for the next implementation agent
+
+Read live source before editing; this is a navigation map, not a substitute.
+
+### Browser / HTTP owner
+
+- `src/web.rs`
+- `src/web/dock.rs`
+- `src/web/team/`
+- `src/web/team/multiplayer.rs`
+- browser auth/session boundary in current web modules
+
+### Actor/user/authority
+
+- `src/actor_owner.rs`
+- `src/agent_jobs.rs`
+- `crates/aw-agent-core/src/tool.rs`
+- `crates/aw-agent-core/src/accounts.rs`
+- `crates/aw-store/src/auth_session.rs`
+- `crates/aw-store/src/authority.rs`
+- Store membership/participation/grant code used by current browser/team paths
+
+### Read-only Agent views
+
+- `src/sessions/branch_view.rs`
+- `src/workspace/reader.rs`
+- `src/workspace/ui/agent_views.rs`
+- `crates/aw-surfaces/src/lib.rs`
+- `crates/aw-surfaces/src/contract.rs`
+
+### Files
+
+- `src/workspace/files.rs`
+- `src/workspace/ui/files_views.rs`
+- `src/workspace/ui/async_work.rs`
+- `crates/aw-tools/src/browse.rs`
+- `crates/aw-platform-win/src/scoped_fs.rs`
+
+### Git
+
+- `src/workspace/git.rs`
+- `crates/aw-git/src/lib.rs`
+- `src/workspace/owner.rs`
+
+### Workspace layout/persistence
+
+- `src/workspace/ui.rs`
+- `src/workspace/persistence.rs`
+- `crates/aw-workspace/src/layout.rs`
+
+### Terminal/docking/custody
+
+- `src/workspace/docking.rs`
+- `src/workspace/ui/terminal.rs`
+- `crates/aw-terminal/`
+- `crates/aw-platform-unix/`
+- native migration tests:
+  - `tests/native_live_migration.py`
+  - `tests/native_migration_protocol.py`
+  - `tests/native_persistent_pty.py`
+
+---
+
+## 12. Finalized unified Jobs + Agent runtime — permanent context
+
+The full detailed record is preserved at:
+
+`.agents/docs/UNIFIED-JOBS-AGENT-FINAL-HANDOFF-2026-11-14.md`
+
+Key final pins:
+
+- AW runtime implementation:
+  `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
+- AW handoff/pin sync:
+  `88cd9655d402ea325873470202fd12133b1d8199`
+- dotlink unified bridge:
+  `c90a6603ccef0bbf626ce10d95bedf59877747b8`
+
+Permanent runtime decisions relevant to workspace work:
+
+- one canonical Agent/Session/Actor/Turn/Job runtime;
 - one shared `aw-tools::JobManager`;
-- generic `GraphPolicyRouterSlot` as the independently tested shared JobHost seam;
-- dotlink finite/native Process/Graph ownership only.
+- flat model-facing tools;
+- canonical `agent` constructor;
+- canonical `jobs_list/get/read/ack/send/cancel/subscribe` where host supports them;
+- no old `subagent/team/plan/review_release/job_*` model routes;
+- ToolBinding/capability authority carries source/effect/site + generation;
+- stale revoke/regrant cannot regain authority from matching names;
+- replay owner is checked before mutable current-state rechecks;
+- contextual refs resolve before persistence; persisted facts are canonical;
+- views must not become a second authority/runtime owner.
 
-### 7.2 AW qualification
+Why this matters for workspace-views:
 
-Green evidence includes:
-
-- strict Clippy across all changed crates/targets with no lint suppressions;
-- `aw-tools-adapter` 227/227 at the strict-clean checkpoint;
-- Actor-owner 45/45;
-- policy-runtime 4/4;
-- dock 24/24;
-- canonical subagents 14/14 after final model-first fixtures;
-- `aw-mcp` 15/15;
-- Store library 208/208;
-- stateless 27/110/6 and JSONL-minimal 27/113/6;
-- no_std+alloc kernel/embedded/FFI + wasm32v1-none;
-- independent C11 FFI consumer: 710 checks;
-- `aw-tools --all-features --lib`: 303/303;
-- AW direct-adapter DL-150 conformance vectors green.
-
-### 7.3 Model-first qualification
-
-Deterministic real Agent/effect fixtures on L5:
-
-- direct Read: 2 parent provider rounds / 1 tool;
-- 3-node Graph: 2 / 1;
-- Bash background -> `jobs_get` -> `jobs_read` -> `jobs_ack`: 5 / 4;
-- Agent: 2 parent + 1 child provider round / 1 parent tool.
-
-Live model-selection evidence on **pvl-x2 inference only** used managed ROCm
-Ollama `qwen3.8:27b` with the exact current L5-generated 23-tool AW catalog:
-
-- Read 5/5 -> `read`;
-- Graph 5/5 -> `batch`;
-- Bash 5/5 -> `bash` with `background=true`;
-- Agent 5/5 -> `agent`;
-- read-only Job observation 5/5 -> `jobs_get`;
-- cancellation 5/5 -> `jobs_cancel`.
-
-Total first-call selection/schema/task validity: **30/30**.
-
-Continuation probes:
-
-- `bash -> jobs_get -> jobs_read -> jobs_ack -> final`: 3/3;
-- `agent -> final` with no redundant `jobs_read`: 3/3.
-
-The same representative Qwen Read prompt is 69 prompt tokens without tools and
-3,409 with the full catalog, so the actual provider tool-envelope overhead is
-about **3,340 Qwen/Ollama prompt tokens**.
-
-### 7.4 dotlink qualification
-
-Fresh after the final replay-first review:
-
-- main suite **651 passed / 0 failed / 1 intentional ignore**;
-- all five integrations green;
-- strict all-target/all-feature Clippy green;
-- rustfmt/diff green;
-- old-generation Start rejection green;
-- Process stdin revoke-before-bytes green;
-- standalone no-Agent/no-wake/no-legacy surface green;
-- final Unix standalone catalog: 21 tools / 13,832 serialized MCP bytes.
-
-Checkpoint F's real OAuth/TCP Process and FS/Graph bridge evidence remains
-current; later cleanup did not change that transport owner.
-
-### 7.5 What remains
-
-Only the exact final shared Git pin sequence in Section 6. Runtime behavior and
-qualification are complete; repository finalization is not complete until the
-new AW SHA is reachable and dotlink is repinned/relocated off the temporary digest
-mirror.
+Distinct browser/user delegation should reuse the same exact authority-generation
+and fail-closed principles, not invent a parallel loose browser permission model.
 
 ---
 
-## 8. Validation discipline
+## 13. Release-readiness context
 
-Do not rerun everything after each edit.
+Current external gates only:
 
-During development:
+- native release-asset execution on missing hosts;
+- version/release decision;
+- Developer ID / Authenticode / notarization;
+- live provider/billing compatibility when authorized/configured;
+- independent security review.
 
-- targeted package check/test for touched code;
-- one coherent vertical slice at a time.
+Already completed in that plan include:
 
-At a checkpoint:
+- Linux x86_64 native package/runtime;
+- musl/glibc gates;
+- portable asset/installer checks;
+- five-target build/assembly;
+- macOS CodeDirectory page-hash integrity check;
+- CLI/source compatibility review;
+- prepared native-release workflow;
+- local Linux execution of workflow builder/probe.
 
-- run the grouped user-visible flows/failure boundaries in the TODO;
-- fix until the checkpoint passes as a whole;
-- record concise commands/results in TODO;
-- carry prior green lanes unless their owner/dependency changed.
-
-Re-run earlier checkpoint only when later work changes:
-
-- owning crate/API/schema;
-- authority/replay/concurrency behavior it depends on;
-- source event/wake semantics;
-- shared Graph/Job primitive it relies on.
-
-Do not create evidence-only commits or giant log archives.
-
-dotlink repo final validation guidance remains in its `AGENTS.md`; sandbox-affecting work
-may require `DOTLINK_TEST_BWRAP=1`.
+Do not conflate “cross-target compiled/assembled” with “native host executed.”
 
 ---
 
-## 9. Git and concurrent-work safety
+## 14. Git / plan ownership safety
 
-### AW
-
-- only canonical worktree exists;
-- never inspect/touch `.agents/plans/ux/**`;
-- unified runtime implementation is committed/pushed at `9e9ab043...`;
-- live Git state remains authoritative over this handoff.
-
-### dotlink
-
-- D1 is committed/pushed at `3f59bb16...`;
-- separate `release/0.16` worktree exists; do not touch;
-- do not create a new worktree;
-- `docs/CHATGPT_PLUGIN.md` is unrelated pre-existing dirty work and must remain
-  outside unified-runtime commits unless explicitly requested.
-
-### Both
-
-- preserve signed history;
-- do not disable signing;
-- do not push/tag/release/deploy without explicit permission;
-- before any requested commit inspect exact staged paths/stat;
-- never include unrelated files in a commit.
+- Coordinator owns shared queue reconciliation unless explicitly delegated.
+- Plan owner owns its plan directory.
+- Preserve dirty workspace-view plan edits.
+- Never inspect or touch `.agents/plans/ux/**`.
+- Never include unrelated dotlink `docs/CHATGPT_PLUGIN.md`.
+- Do not touch `dotlink-016-fixes`.
+- Before any commit:
+  - inspect exact owned paths;
+  - inspect staged stat;
+  - stop if foreign paths are staged.
+- Commits are signed.
+- Commit is not push authorization.
+- Push/tag/release/deploy each require explicit authorization.
 
 ---
 
-## 10. Source map for the next implementation agent
+## 15. Validation discipline
 
-### AW shared/runtime
+Do not rerun the world after every edit.
 
-- `crates/aw-tools/src/operation.rs`
-- `crates/aw-tools/src/execution_ref.rs`
-- `crates/aw-tools/src/job_event.rs`
-- `crates/aw-tools/src/coordination.rs`
-- `crates/aw-tools/src/filesystem/{batch,footprint,job_manager,schema}.rs`
-- `crates/aw-tools-adapter/src/{job_host,job_runtime,job_tools,jobs_tools,agent_jobs,operation_router,process,shell}.rs`
+For workspace-views authorization work:
 
-### AW Agent/authority
+1. unit tests for typed grant/revoke state;
+2. Store/owner race tests:
+   - revoke before publish;
+   - regrant generation;
+   - stale held response;
+3. authenticated Rust HTTP owner tests;
+4. Node state tests for receiver cache/lifetime;
+5. real browser acceptance only when that visual/browser owner is in scope;
+6. full product gate only at coherent checkpoint or when a changed dependency
+   invalidates prior evidence.
 
-- `crates/aw-agent-kernel/src/writer_fence.rs`
-- `crates/aw-agent-core/src/{agent,control,journal,runtime,tool,accounts,conversation}.rs`
-- `src/{actor_owner,agent_jobs,subagents,child_actors,policy_runtime}.rs`
+Carry prior green Linux PTY, Files/Git, runtime and dotlink evidence unless the
+owner/dependency changed.
 
-### AW Session/store
+For platform-specific claims:
 
-- `crates/aw-session/src/lib.rs`
-- `crates/aw-store-api/src/lib.rs`
-- `crates/aw-store/src/{lib,journal,actor_admission,actor_control,actor_queue,actor_authority_steer,job_exposure,policy_admission,session_participation,subagents}.rs`
-- `crates/aw-store/src/context/mod.rs`
-- `crates/aw-store/migrations/034_shared_session_participation.sql`
-
-### AW host composition
-
-- `crates/aw-host/src/lib.rs`
-- `crates/aw-policy/src/lib.rs`
-- `src/{main_full,main_minimal,sessions,minimal_sessions}.rs`
-
-### dotlink D1/D2
-
-- `src/jobs.rs`
-- `src/mcp.rs`
-- `src/mcp/tools/{jobs,shell,graph}.rs`
-- `src/transports/openai.rs`
-- `docs/ARCHITECTURE.md`
-- `docs/SECURITY.md`
+- compile is not native execution;
+- cross-build is not host certification;
+- skipped/ignored host gate is not execution;
+- preserve explicit “unavailable/pending” state.
 
 ---
 
-## 11. Known decision boundaries / do not improvise
-
-1. **Reviewed shared pin is fixed for D2.**
-   Use AW `9e9ab043410241c3f797f760d93a1cfd9126fdd2`; do not move the pin,
-   copy AW shared code, or use a sibling path dependency without a new review.
-2. **Remote Start linearization.**
-   Start proof must include target live generation and be claimed before effect.
-3. **Remote wake is not in D2.**
-   Reject it until separately designed/reviewed.
-4. **No Agent engine in dotlink.**
-5. **No nested batch anywhere.**
-6. **No provider/model result may fabricate original native success.**
-7. **No replay may re-resolve a contextual ref before finding the original claim.**
-8. **No participant privilege union.**
-9. **No Session view switch may rebind a live Agent identity.**
-10. **No Graph child may release conflict ownership before all owned descendants settle/unknown.**
-
-If live source proves a contradiction with `890e9a`, update the **owning design layer once**
-and continue. Do not carry two semantic paths.
-
----
-
-## 12. What not to do next
+## 16. What not to do next
 
 Do not:
 
-- redo D1;
-- clean/refactor unrelated dotlink code;
-- migrate `docs/CHATGPT_PLUGIN.md`;
-- copy `OperationId`/`ExecutionRef` into dotlink;
-- add dotlink Agent/Session/Policy code;
-- enable remote wake;
-- broaden Graph model leaves;
-- reintroduce restart;
-- run giant primitive suites after every edit.
+- reimplement Linux `terminal-promote`;
+- treat `207c552` historical unchecked bullets as current Linux TODOs;
+- infer remote/distinct-Actor authority from same-UID FD transfer;
+- make browser cookies/pairing codes into Store/Files/Git authority;
+- grant Files access from a path supplied by browser;
+- retarget a saved scope/context by pathname;
+- let recent docking ACK imply perpetual receiver liveness;
+- auto-replay input or recreate a shell after ambiguous custody failure;
+- promise broker reboot restoration without a durable execution design;
+- revive old `subagent/team/plan/review_release` model surfaces;
+- create another Runtime/Agent owner for views;
+- change SQLite/JSONL/layout versions unless the selected design actually
+  requires it and the migration is explicit;
+- call external release/security/provider gates complete without executing them.
 
 ---
 
-## 13. Next coherent work sequence
+## 17. Next coherent work sequence
 
-1. Revalidate both canonical L5 worktrees, staged files, worktrees and unrelated dirty paths.
-2. Confirm the user has explicitly authorized commit/push. If not, stop and report the exact-pin
-   finalization blocker; do not manufacture a local-only pin.
-3. If authorized, final AW diff/hygiene review, then signed AW commit + push.
-4. Capture the exact reachable AW SHA.
-5. Repin dotlink's three AW Git dependencies to that SHA.
-6. Replace dotlink's temporary remote-Start argument-digest mirror with the shared AW helper.
-7. Regenerate dotlink `Cargo.lock`.
-8. Run one locked dotlink all-features/integration + strict Clippy/fmt/diff qualification.
-9. Commit/push dotlink only if that action is explicitly authorized.
-10. Pause at that exact cross-repo pin checkpoint; do not expand into release/tag/deploy work.
-
----
-
-## 14. Copy/paste prompt for the next agent
-
-Use the current prompt in:
-
-`.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/NEXT-AGENT.md`
-
-It now describes **final exact-pin / commit preparation**, not D2 implementation.
-The dotlink companion prompt says the same thing.
+1. Revalidate L5 HEAD/status and preserve the current workspace-plan edits.
+2. Read workspace-views README/TODO and the three PTY lifecycle specs.
+3. Inspect current browser docking/team/authority source and tests.
+4. Write a short design note for **distinct user/Actor delegated browser read
+   capability**:
+   - resource identity;
+   - recipient identity;
+   - generation/revocation;
+   - expiry;
+   - publish-time revalidation;
+   - cache invalidation;
+   - crash/partition semantics.
+5. Reuse existing Store/Actor/ToolBinding authority patterns where they fit.
+6. Implement the smallest owner-side grant/revoke/read path first.
+7. Add negative/race tests before UI changes.
+8. Integrate with existing browser docking only after owner tests are green.
+9. Checkpoint and pause.
+10. Leave remote-device trust and PTY cross-user custody separate until the
+    delegated browser authority model is proven.
 
 ---
 
-## 15. Archival/reference map
+## 18. Starting prompt
 
-These documents remain valuable history but are not current semantic authority:
+Use the maintained prompt at:
 
-AW:
-- `.agents/docs/HANDOFF.md`
-- `.agents/docs/AW-COMPREHENSIVE-HANDOFF-2026-10-19.md`
-- `.agents/plans/ai-native-operations-agents-jobs-transcript-2026-11-10/`
-- `.agents/plans/ai-native-job-control-wake-2026-11-10/`
+`.agents/plans/workspace-views/NEXT-AGENT.md`
 
-dotlink:
-- `.agents/plans/dotlink-ai-native-filesystem-2026-10-31/FULL-COMPREHENSIVE-HANDOFF-2026-11-09.md`
-- `.agents/plans/dotlink-ai-native-filesystem-2026-10-31/README.md`
-- `.agents/plans/dotlink-ai-native-filesystem-2026-10-31/TODO.md`
-
-Current semantic authority:
-- AW `ai-native-unified-jobs-agent-runtime-2026-11-11/DESIGN.md` at `890e9a`
-- AW checkpoint `TODO.md`
-- dotlink companion README/TODO
-- live source/tests/executed results
+That prompt should be enough to start a new agent without replaying this entire
+conversation.
 
 ---
 
-## 16. Accuracy rule for future handoffs
+## 19. Accuracy rule
 
-When this file is refreshed:
+When prose conflicts:
 
-- never overwrite historical handoffs;
-- update the observed HEADs/dirty state;
-- distinguish committed design from dirty implementation;
-- distinguish reported checkpoint evidence from formally ordered acceptance;
-- preserve unrelated/concurrent work warnings;
-- record only executed validation;
-- keep pending decision boundaries explicit;
-- if D2/D3 advances, update both AW and dotlink current handoffs together.
+1. live source;
+2. executed current tests;
+3. current plan TODO;
+4. current design README/spec;
+5. this handoff;
+6. dated milestone prose.
+
+Historical “not implemented” statements describe their commit unless the current
+plan still carries the item open. Historical schema/version statements likewise
+belong to their commit; current source is AW 0.15.0 / SQLite v34 / JSONL v1 /
+native layout v4.
+
+Likewise, a later green test does not retroactively certify a different host,
+browser, authority model or external release gate.

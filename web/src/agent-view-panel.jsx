@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { Icon } from "./icons.jsx";
 
 // The DOM ranges are local presentation state. They never become API targets.
@@ -15,6 +15,7 @@ export function AgentViewPanel(props) {
   let generation = {};
   const [count, setCount] = createSignal(0);
   const [limited, setLimited] = createSignal(false);
+  const [recipient, setRecipient] = createSignal("");
   const snapshot = createMemo(() => props.snapshot);
   const title = () => props.snapshot?.title || "Read-only view";
   const query = () => props.find?.query || "";
@@ -112,6 +113,10 @@ export function AgentViewPanel(props) {
     search?.select();
   }
 
+  createEffect(() => {
+    const available = props.recipients || [];
+    if (recipient() && !available.some(value => value.id === recipient())) setRecipient("");
+  });
   createEffect(on(snapshot, () => clearDerived()));
   createEffect(() => { if (snapshot()) { void query(); buildMatches(); } });
   createEffect(() => { void props.active; void selected(); highlight(); });
@@ -164,10 +169,29 @@ export function AgentViewPanel(props) {
       <div class="surface-bar pinned-agent-bar">
         <span class="surface-path">{title()}{props.snapshot ? ` · ${props.snapshot.branch_name}` : ""}</span>
         <span class="surface-badge">read only</span>
+        <Show when={props.delegatable && props.recipients?.length}>
+          <select class="agent-delegate-recipient" value={recipient()} onChange={event => setRecipient(event.currentTarget.value)}
+            aria-label={`Recipient for ${title()}`} disabled={props.delegating}>
+            <option value="">Choose recipient</option>
+            <For each={props.recipients}>{person => <option value={person.id}>{person.display_name}</option>}</For>
+          </select>
+          <button class="quiet agent-delegate-button" type="button"
+            disabled={!recipient() || props.delegating || !props.snapshot}
+            onClick={() => props.onDelegate(recipient())}>
+            {props.delegating ? "Waiting…" : "Create read-only link"}
+          </button>
+        </Show>
         <button class="mini-icon" type="button" onClick={props.onRefresh} disabled={props.pending} aria-label={`Refresh ${title()}`} title="Refresh read-only view">
           <Icon name="refresh" size={13} />
         </button>
       </div>
+      <Show when={props.handoffLink}>
+        <div class="agent-delegate-link" role="status">
+          <span>Private recipient link</span>
+          <input type="text" readOnly value={props.handoffLink} aria-label={`Private recipient link for ${title()}`} />
+          <button class="quiet" type="button" onClick={() => props.onCopyLink(props.handoffLink)}>Copy</button>
+        </div>
+      </Show>
       <div class="agent-view-find" role="search" aria-label={`Find in ${title()}`}>
         <input ref={search} type="search" value={query()} onInput={event => changeQuery(event.currentTarget.value)} aria-label={`Find in ${title()}`} placeholder="Find in this view" maxLength={1024}
           onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); jump(event.shiftKey ? -1 : 1); } }} />

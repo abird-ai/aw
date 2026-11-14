@@ -1,8 +1,8 @@
 //! Ephemeral, owner-mediated read-only File/Review handoff between browser
 //! windows. A ticket is correlation only: every receiver read is authorized by
 //! the original SurfaceHost, and no plaintext, grants or execution owner move.
+use super::surface_read::{self, Resource, Target};
 use super::*;
-use aw_surfaces::{Command, ViewRequest};
 use axum::extract::rejection::JsonRejection;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -40,30 +40,6 @@ struct Ticket {
     deadline: Instant,
     phase: Phase,
 }
-#[derive(Clone)]
-enum Resource {
-    File { path: String },
-    Review { review_id: String },
-}
-impl Resource {
-    fn request(&self) -> ViewRequest {
-        match self {
-            Self::File { path } => ViewRequest::File { path: path.clone() },
-            Self::Review { review_id } => ViewRequest::Review {
-                review_id: review_id.clone(),
-            },
-        }
-    }
-    fn descriptor(&self) -> serde_json::Value {
-        match self {
-            Self::File { path } => serde_json::json!({"kind":"file", "path":path}),
-            Self::Review { review_id } => {
-                serde_json::json!({"kind":"review","review_id":review_id})
-            }
-        }
-    }
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Presentation {
@@ -246,139 +222,44 @@ fn enabled(app: &AppState) -> ApiResult<(String, String, String)> {
     let epoch = lock(&app.0.session.state).snapshot.instance.clone();
     Ok((caps.source_id, caps.view_root.id, epoch))
 }
-fn guarded_file_path(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 4096
-        && !value.starts_with('/')
-        && !value.contains('\\')
-        && !value.chars().any(char::is_control)
-        && value
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
-}
-fn current(
-    app: &AppState,
-    source: &str,
-    scope: &str,
-    epoch: &str,
-    root_only: bool,
-) -> ApiResult<()> {
-    let (active, root, actual_epoch) = enabled(app)?;
-    if source != active || epoch != actual_epoch || (root_only && scope != root) {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "docking owner/source changed",
-        ));
-    }
-    Ok(())
-}
-
-/// Check the original, retained read through the bounded SurfaceHost worker.
-/// A Review must be reauthorized by exact source, Git scope and immutable ID;
-/// no inventory selection, browser path or worktree grant is synthesized.
+/// Check the original retained read through the canonical exact SurfaceHost
+/// primitive. Docking adds only presentation continuity; it does not own a
+/// second resource-authorization implementation.
 async fn reauthorize_view(app: &AppState, ticket: &Ticket) -> ApiResult<()> {
-    current(
-        app,
-        &ticket.source_id,
-        &ticket.scope_id,
-        &ticket.owner_epoch,
-        matches!(ticket.resource, Resource::File { .. }),
-    )?;
-    let host = app
-        .0
-        .surfaces
-        .as_ref()
-        .ok_or(ApiError(
-            StatusCode::FORBIDDEN,
-            "human workspace unavailable",
-        ))?
-        .clone();
-    let permit = app
-        .0
-        .surface_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "workspace readers busy"))?;
-    let actor = app.0.session.actor.as_str().to_owned();
-    let source = ticket.source_id.clone();
-    let scope = ticket.scope_id.clone();
-    let resource = ticket.resource.clone();
-    let presentation = ticket.presentation.clone();
-    let owner = app.clone();
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        if !auth_alive(&owner) {
+    let target = Target {
+        source_id: ticket.source_id.clone(),
+        scope_id: ticket.scope_id.clone(),
+        owner_epoch: ticket.owner_epoch.clone(),
+        resource: ticket.resource.clone(),
+    };
+    let projected = surface_read::read(app, &target).await?;
+    // A source that changed after the sender captured its editor must
+    // not release that view merely because the File is still readable.
+    // The comparison is on the authenticated *owner* read, not a browser
+    // label or the receiver's unsupervised assertion.
+    if let (Resource::File { .. }, Some(expected)) = (&ticket.resource, &ticket.presentation) {
+        let text = projected["result"]["text"].as_str().ok_or(ApiError(
+            StatusCode::CONFLICT,
+            "original File snapshot changed",
+        ))?;
+        let mut bytes = Vec::with_capacity(5 + text.len());
+        bytes.extend_from_slice(b"file\0");
+        bytes.extend_from_slice(text.as_bytes());
+        let actual = hash(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if actual != expected.fingerprint {
             return Err(ApiError(
-                StatusCode::UNAUTHORIZED,
-                "browser authorization expired",
-            ));
-        }
-        let projected = host
-            .execute_if(
-                &actor,
-                Command::View {
-                    source_id: source,
-                    scope_id: scope,
-                    request: resource.request(),
-                },
-                || auth_alive(&owner),
-            )
-            .map_err(|_| ApiError(StatusCode::FORBIDDEN, "original view no longer authorized"))?;
-        // A source that changed after the sender captured its editor must
-        // not release that view merely because the File is still readable.
-        // The comparison is on the authenticated *owner* read, not a browser
-        // label or the receiver's unsupervised assertion.
-        if let (Resource::File { .. }, Some(expected)) = (&resource, &presentation) {
-            let text = projected["result"]["text"].as_str().ok_or(ApiError(
                 StatusCode::CONFLICT,
-                "original File snapshot changed",
-            ))?;
-            let mut bytes = Vec::with_capacity(5 + text.len());
-            bytes.extend_from_slice(b"file\0");
-            bytes.extend_from_slice(text.as_bytes());
-            let actual = hash(&bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            if actual != expected.fingerprint {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "original File content changed",
-                ));
-            }
-        }
-        if let Resource::Review { review_id } = &resource {
-            if projected["result"]["kind"] != "review"
-                || projected["result"]["id"].as_str() != Some(review_id.as_str())
-            {
-                return Err(ApiError(
-                    StatusCode::FORBIDDEN,
-                    "retained review identity changed",
-                ));
-            }
-        }
-        if !auth_alive(&owner) {
-            return Err(ApiError(
-                StatusCode::UNAUTHORIZED,
-                "browser authorization expired",
+                "original File content changed",
             ));
         }
-        Ok(())
-    })
-    .await
-    .map_err(|_| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "workspace reader unavailable",
-        )
-    })??;
-    current(
-        app,
-        &ticket.source_id,
-        &ticket.scope_id,
-        &ticket.owner_epoch,
-        matches!(ticket.resource, Resource::File { .. }),
-    )
+    }
+    // Presentation checks are outside the canonical SurfaceHost read. Recheck
+    // the same retained owner/source afterwards so replacement cannot win in
+    // the gap between the shared read and docking's release decision.
+    surface_read::current(app, &target)
 }
 
 pub(super) async fn register(
@@ -476,13 +357,6 @@ pub(super) async fn prepare_review(
     .await
 }
 
-fn bounded_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-}
 async fn prepare_bound(
     app: &AppState,
     origin: PrepareOrigin,
@@ -498,14 +372,11 @@ async fn prepare_bound(
         presentation,
     } = origin;
     if !valid_token(&window_id)
-        || !bounded_id(&scope_id)
-        || !bounded_id(&source_id)
+        || !surface_read::bounded_id(&scope_id)
+        || !surface_read::bounded_id(&source_id)
         || !document_id.starts_with("workspace-document-")
-        || !bounded_id(&document_id)
-        || match &resource {
-            Resource::File { path } => !guarded_file_path(path),
-            Resource::Review { review_id } => !bounded_id(review_id),
-        }
+        || !surface_read::bounded_id(&document_id)
+        || !surface_read::valid_resource(&resource)
         || presentation
             .as_ref()
             .is_some_and(|state| !state.valid_for(&resource))
@@ -515,8 +386,15 @@ async fn prepare_bound(
             "invalid docking document descriptor",
         ));
     }
-    let root_only = matches!(resource, Resource::File { .. });
-    current(app, &source_id, &scope_id, &owner_epoch, root_only)?;
+    surface_read::current(
+        app,
+        &Target {
+            source_id: source_id.clone(),
+            scope_id: scope_id.clone(),
+            owner_epoch: owner_epoch.clone(),
+            resource: resource.clone(),
+        },
+    )?;
     {
         let mut registry = lock(&app.0.dock);
         registry.prune();

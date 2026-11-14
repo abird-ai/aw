@@ -538,6 +538,15 @@ fn projection_matches_snapshot(
 }
 
 impl SessionStore {
+    /// Resolve an already-known stable user without materializing a principal.
+    /// Use this for untrusted recipient names at authorization boundaries.
+    pub fn known_user(&self, actor: &PrincipalId) -> Result<StableUserInfo> {
+        let c = self.connection()?;
+        let user = user_for_principal(&c, actor)?
+            .ok_or(Error::Denied("stable user identity is inactive or unknown"))?;
+        user_row(&c, &user)
+    }
+
     pub fn current_user(&self, actor: &PrincipalId) -> Result<StableUserInfo> {
         let c = self.connection()?;
         let user = ensure_user_for_principal(&c, actor)?;

@@ -103,6 +103,29 @@ fn encode(response: &mut ReadResponse<'_>) -> ApiResult<Vec<u8>> {
     ))
 }
 
+pub(super) fn encode_snapshot(
+    target: &Target,
+    source_epoch: &str,
+    snapshot: &crate::sessions::branch_view::Snapshot,
+) -> ApiResult<Vec<u8>> {
+    let mut response = ReadResponse {
+        store_id: &target.store_id,
+        source_epoch,
+        session_id: &target.session_id,
+        branch_id: &target.branch_id,
+        title: &snapshot.title,
+        branch_name: &snapshot.branch_name,
+        head: &snapshot.head,
+        revision: snapshot.revision.to_string(),
+        turns: snapshot.turns.as_ref(),
+        context_blocks: &snapshot.context_blocks,
+        needs_inspection: snapshot.needs_inspection,
+        retained_bytes: 0,
+        expires_in_ms: EXPIRES_IN_MS,
+    };
+    encode(&mut response)
+}
+
 pub(super) async fn read(
     State(app): State<AppState>,
     payload: std::result::Result<Json<ReadRequest>, axum::extract::rejection::JsonRejection>,
@@ -139,22 +162,7 @@ pub(super) async fn read(
         };
         authorize(&owner, &store, &reader, &target, &request.source_epoch)?;
         let snapshot = reader.read(&target).map_err(api_error)?;
-        let mut response = ReadResponse {
-            store_id: &target.store_id,
-            source_epoch: &request.source_epoch,
-            session_id: &target.session_id,
-            branch_id: &target.branch_id,
-            title: &snapshot.title,
-            branch_name: &snapshot.branch_name,
-            head: &snapshot.head,
-            revision: snapshot.revision.to_string(),
-            turns: snapshot.turns.as_ref(),
-            context_blocks: &snapshot.context_blocks,
-            needs_inspection: snapshot.needs_inspection,
-            retained_bytes: 0,
-            expires_in_ms: EXPIRES_IN_MS,
-        };
-        let encoded = encode(&mut response)?;
+        let encoded = encode_snapshot(&target, &request.source_epoch, &snapshot)?;
         authorize(&owner, &store, &reader, &target, &request.source_epoch)?;
         Ok(encoded)
     })

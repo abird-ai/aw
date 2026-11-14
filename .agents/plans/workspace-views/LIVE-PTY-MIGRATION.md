@@ -20,8 +20,9 @@
   its earlier “unimplemented” notes are superseded for this Linux path.
 
 
-Status: **FD+pidfd escrow, reader quiescence, bounded parser replay and source-bound staging verified; production migration NOT implemented**
-Linux source: `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a`, `a1100a9d344c5835eb73dedc673e55570ad17219`, `635e1ec6e6763caf438999b1551932b5e37bfa81`, `207c55215ec15407946e25c34e0f3aefdbaff345`
+Historical prerequisite status at `207c552`: **FD+pidfd escrow, reader quiescence, bounded parser replay and source-bound staging verified; production migration was not yet implemented**.
+That status is superseded for same-UID Linux by `9d82f1a` plus the different-UID refusal gate `65f04ca`, summarized above. The prerequisite design/checklists below are retained as lineage; their unchecked promotion gates are not current Linux TODOs.
+Linux prerequisite sources: `2feaa78bb4927ed0a3e9d0658fd7eff2cdeb505a`, `a1100a9d344c5835eb73dedc673e55570ad17219`, `635e1ec6e6763caf438999b1551932b5e37bfa81`, `207c55215ec15407946e25c34e0f3aefdbaff345`
 Owner: @pvl (Workspace views)
 
 ## Decision
@@ -105,7 +106,9 @@ crash/UNKNOWN behavior. Before those gates, **do not** expose
 6. **Rollback:** before final release the original process owns the child. Destination must hold transferred FD inert (no reads/writes) until an unambiguous release receipt. A missing, delayed or duplicate receipt remains UNKNOWN and cannot automatically activate a second driver.
 7. **No persistence fiction:** only broker-owned PTYs survive the Workspace frontend. Broker SIGKILL or OS reboot cannot revive process effects without a separately designed durable execution owner.
 
-## Implementation gates
+## Historical implementation gates at the prerequisite checkpoint
+
+These describe what remained after `207c552`. Same-UID Linux adopted custody, signed release, broker activation and deliberate `terminal-promote` were later implemented and accepted at `9d82f1a`; do not reopen them from the unchecked historical bullets below.
 
 - [x] Add reversible Linux single-reader quiescence, deny input/resize, drain queued commands/output/replies before pause ACK and resume on guard drop, failure or timeout. Signed `635e1ec`. **Not yet wired** to the broker adoption or owner-release transaction.
 - [x] Define a bounded **replay-based parser checkpoint** (8 MiB memory journal, up to 48 MiB wire, 32,768 events) and real-PTY/cross-process round trips for main/alternate screen, scrollback, partial sanitizer/UTF-8, color, resize and input modes. Invalid/overflowed history fails closed with original process intact. Replay discards historical device-status responses.
@@ -120,4 +123,4 @@ crash/UNKNOWN behavior. Before those gates, **do not** expose
 
 ## Acceptance criterion
 
-**No migration-complete claim** until a real child started by the legacy Workspace is observed running with the **identical PID** and parser-visible state *after that Workspace process exits*, the new broker is the only reader/controller, and ambiguous failures are fenced without command replay. The Linux descriptor test is a prerequisite, not this acceptance.
+The criterion below is **satisfied for the implemented same-UID Linux path** by `9d82f1a` and the `65f04ca` admission-refusal gate: a real child started by the legacy Workspace keeps the identical PID and parser-visible state after the Workspace exits, the broker becomes the sole reader/controller, and ambiguous failures are fenced without command replay. Remote/distinct-Actor, macOS/Windows custody and broker crash/reboot restoration remain separate acceptance scope.

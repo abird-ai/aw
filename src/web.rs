@@ -42,10 +42,13 @@ use crate::{
 };
 mod agent_view;
 mod context_flow;
+mod delegation;
 #[cfg(feature = "surfaces")]
 mod dock;
 #[cfg(target_os = "linux")]
 mod native;
+#[cfg(feature = "surfaces")]
+mod surface_read;
 #[cfg(all(feature = "team", target_os = "linux"))]
 pub mod team;
 #[cfg(feature = "surfaces")]
@@ -151,6 +154,7 @@ struct AppInner {
     context_recipients: Mutex<BTreeMap<String, String>>,
     local_settings: Option<Mutex<LocalSettingsState>>,
     chatgpt_setup: Mutex<Option<ChatGptSetupState>>,
+    delegation: Mutex<delegation::Registry>,
     #[cfg(feature = "surfaces")]
     dock: Mutex<dock::Registry>,
 }
@@ -541,15 +545,22 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn revoke_delegations(app: &AppState) {
+    lock(&app.0.delegation).revoke_all();
+}
+
 #[cfg(feature = "surfaces")]
 async fn shutdown_surfaces(app: &AppState) {
+    revoke_delegations(app);
     if let Some(host) = app.0.surfaces.clone() {
         let _ = tokio::task::spawn_blocking(move || host.shutdown()).await;
     }
 }
 
 #[cfg(not(feature = "surfaces"))]
-async fn shutdown_surfaces(_app: &AppState) {}
+async fn shutdown_surfaces(app: &AppState) {
+    revoke_delegations(app);
+}
 
 fn hash(value: &[u8]) -> [u8; 32] {
     Sha256::digest(value).into()
@@ -1064,6 +1075,7 @@ fn application_scoped(
             context_recipients: Mutex::new(BTreeMap::new()),
             local_settings: local_settings.map(|value| Mutex::new(value.into())),
             chatgpt_setup: Mutex::new(None),
+            delegation: Mutex::new(delegation::Registry::default()),
             #[cfg(feature = "surfaces")]
             dock: Mutex::new(dock::Registry::default()),
         }),
@@ -3398,6 +3410,11 @@ mod tests {
         include!("web/dock/review_tests.rs");
         include!("web/dock/lifecycle_tests.rs");
     }
+    #[cfg(feature = "surfaces")]
+    mod delegated_surfaces {
+        use super::*;
+        include!("web/delegated_surface_tests.rs");
+    }
     #[cfg(feature = "oidc")]
     mod publication_http_measure {
         use super::*;
@@ -4192,6 +4209,68 @@ mod tests {
                 .unwrap();
         (r, s, calls, persistent)
     }
+    #[tokio::test]
+    async fn logout_revokes_delegated_browser_authority() {
+        let (router, state, _, persistent) = persistent_app();
+        let cookie = paired(&router).await;
+        let recipient = PrincipalId::new("unix:62002").unwrap();
+        persistent.store.current_user(&recipient).unwrap();
+        let session_id = persistent.handle.session_id().to_owned();
+        let branch = persistent.handle.branch().unwrap();
+        let evidence = persistent
+            .store
+            .authorize_session_participation(
+                &persistent.actor,
+                &session_id,
+                aw_store::SessionParticipationAction::View,
+            )
+            .unwrap();
+        let parent = delegation::ParentAuthority::Session {
+            owner_membership_epoch: evidence.membership_epoch,
+            audience_epoch: evidence.audience_epoch,
+        };
+        let binding = delegation::Binding {
+            owner: persistent.actor.clone(),
+            recipient,
+            source_id: persistent.store.store_id().unwrap(),
+            site: "local-web".into(),
+            resource: delegation::Resource::AgentBranch {
+                store_id: persistent.store.store_id().unwrap(),
+                session_id,
+                branch_id: branch.id,
+            },
+            parent: parent.clone(),
+        };
+        let (issued, witness) = {
+            let mut grants = lock(&state.0.delegation);
+            let issued = grants
+                .grant(&persistent.store, binding.clone(), Duration::from_secs(90))
+                .unwrap();
+            let witness = grants
+                .authorize(&persistent.store, &issued.id, &binding)
+                .unwrap();
+            (issued, witness)
+        };
+
+        let response = router
+            .oneshot(request(
+                "POST",
+                "/api/logout",
+                serde_json::json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let grants = lock(&state.0.delegation);
+        assert!(grants
+            .revalidate(&persistent.store, &witness, &parent)
+            .is_err());
+        assert!(grants
+            .authorize(&persistent.store, &issued.id, &binding)
+            .is_err());
+    }
+
     async fn wait_settled(s: &AppState) {
         for _ in 0..300 {
             if lock(&s.0.session.state).snapshot.pending.is_none() {

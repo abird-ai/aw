@@ -7,7 +7,9 @@ import { toolPresentation } from "./tool-presentation.js";
 import { AgentViewPanel } from "./agent-view-panel.jsx";
 import { createAgentViews } from "./agent-views.js";
 import { createWorkspaceViews } from "./workspace-views.js";
-import { createDocumentDocking, takeDocumentDockTicket } from "./document-docking.js";
+import {
+  createAgentDocking, createDocumentDocking, takeAgentDockTicket, takeDocumentDockTicket,
+} from "./document-docking.js";
 import { applyThemePreference, finishBoot } from "./theme.js";
 
 const CodeFile = lazy(() =>
@@ -1791,6 +1793,7 @@ function App() {
   const [account, setAccount] = createSignal(null);
   const [sessions, setSessions] = createSignal([]);
   const [teamInfo, setTeamInfo] = createSignal(null);
+  const [delegationRecipients, setDelegationRecipients] = createSignal([]);
   const [collaborators, setCollaborators] = createSignal([]);
   const [collaboration, setCollaboration] = createSignal(null);
   const [sharedDraft, setSharedDraft] = createSignal(null);
@@ -1800,7 +1803,9 @@ function App() {
   const [nav, setNav] = createSignal("sessions");
   const [mobileNav, setMobileNav] = createSignal(false);
   const [dockingDocument, setDockingDocument] = createSignal(null);
+  const [dockingAgentView, setDockingAgentView] = createSignal(null);
   const [handoffLink, setHandoffLink] = createSignal(null);
+  const [agentHandoffLink, setAgentHandoffLink] = createSignal(null);
   const [pairedBrowserMode, setPairedBrowserMode] = createSignal(false);
   const [browserInvite, setBrowserInvite] = createSignal(null);
   const [settings, setSettings] = createSignal(false);
@@ -1816,6 +1821,7 @@ function App() {
   // The correlation fragment is removed from history before any API request.
   // It is held only in this renderer's memory, never browser storage.
   let pendingDockTicket = takeDocumentDockTicket(window.location, window.history);
+  let pendingAgentDockTicket = pendingDockTicket ? null : takeAgentDockTicket(window.location, window.history);
   let source;
   let observationLifetime = {};
   let workspaceDiscoveryLifetime = {};
@@ -1956,9 +1962,47 @@ function App() {
         for (const tab of removed) tabTargets.delete(tab.id);
         return removed.length ? current.filter(tab => tab.kind !== "agent-view" || live.has(tab.id)) : current;
       });
+      const link = agentHandoffLink();
+      if (link && !live.has(link.viewId)) setAgentHandoffLink(null);
+      const moving = dockingAgentView();
+      if (moving && !live.has(moving)) setDockingAgentView(null);
       if (activeTab().startsWith("agent-view-") && !live.has(activeTab())) setActiveTab("chat");
     },
   });
+  const agentDocking = createAgentDocking({
+    api: async (...args) => {
+      try { return await api(...args); }
+      catch (error) {
+        if (error?.status === 401) expireBrowserAccess();
+        throw error;
+      }
+    },
+    agentViews,
+    popup: () => window.open("about:blank", "_blank"),
+    onProgress: (viewId, active) => setDockingAgentView(active ? viewId : null),
+    onLinkReady: (viewId, url) => setAgentHandoffLink(current =>
+      url ? { viewId, url } : current?.viewId === viewId ? null : current),
+    onReceiveView: viewId => {
+      upsertTab({ id: viewId, kind: "agent-view", title: "Delegated read-only view" });
+      setMobileNav(false);
+    },
+  });
+  async function receivePendingAgentDock() {
+    if (!pendingAgentDockTicket || !paired()) return;
+    const ticket = pendingAgentDockTicket;
+    pendingAgentDockTicket = null;
+    if (!teamInfo()?.delegated_agent_views) {
+      setError("This browser identity cannot receive delegated Agent views. No view was opened.");
+      return;
+    }
+    try { await agentDocking.receive(ticket); }
+    catch (error) { setError(error.message); }
+  }
+  async function delegateAgentView(viewId, recipientId) {
+    setError("");
+    try { return await agentDocking.send(viewId, recipientId, { external: true }); }
+    catch (error) { setError(error.message); return false; }
+  }
   const pinnedIds = createMemo(() => { viewChange(); return agentViews.list().map(view => view.id); });
   const pinnedView = id => { viewChange(); return agentViews.get(id); };
   function clearAgentViews(reason, keepCatalogRequest = false) {
@@ -1976,6 +2020,8 @@ function App() {
     clearWorkspaceViews();
     setBrowserInvite(null);
     setHandoffLink(null);
+    setAgentHandoffLink(null);
+    setDelegationRecipients([]);
     setPairedBrowserMode(false);
     clearTimeout(browserInviteExpiry);
     setPaired(false);
@@ -2104,13 +2150,22 @@ function App() {
     try {
       const info = await api("/api/team/me");
       if (lifetime !== observationLifetime) return null;
+      setTeamInfo(info || null);
+      if (info?.delegated_agent_views) {
+        try {
+          const value = await api("/api/team/delegation/recipients");
+          if (lifetime !== observationLifetime) return null;
+          setDelegationRecipients(value.participants || []);
+        } catch {
+          if (lifetime !== observationLifetime) return null;
+          setDelegationRecipients([]);
+        }
+      } else setDelegationRecipients([]);
       if (!info?.peer_sharing) {
-        setTeamInfo(info || null);
         setCollaborators([]);
         setCollaboration(null);
         return info || null;
       }
-      setTeamInfo(info);
       try {
         const value = await api("/api/team/collaborators");
         if (lifetime !== observationLifetime) return null;
@@ -2123,6 +2178,7 @@ function App() {
     } catch {
       if (lifetime !== observationLifetime) return null;
       setTeamInfo(null);
+      setDelegationRecipients([]);
       setCollaborators([]);
       setCollaboration(null);
       return null;
@@ -2570,11 +2626,15 @@ function App() {
     });
     void loadPresentation();
     finishBoot();
-    void refresh().then(() => void receivePendingDocumentDock());
+    void refresh().then(() => {
+      void receivePendingDocumentDock();
+      void receivePendingAgentDock();
+    });
   });
   onCleanup(() => {
     clearTimeout(browserInviteExpiry);
     documentDocking.dispose();
+    agentDocking.dispose();
     presentationControllers.clear();
     observationLifetime = {};
     const previous = source;
@@ -2596,6 +2656,7 @@ function App() {
       setPairCode("");
       await refresh();
       await receivePendingDocumentDock();
+      await receivePendingAgentDock();
     } catch (e) {
       setError(e.message);
     }
@@ -2897,7 +2958,7 @@ function App() {
           <form class="pair-card" onSubmit={pair}>
             <Mark />
             <h1>Connect to aw</h1>
-            <p>Use the one-time code from your aw owner or an explicitly paired browser. A second browser receives the same owner's access, not a separate account.</p>
+            <p>Use the one-time code from your aw owner or an explicitly paired browser. The code selects the browser identity and its assigned access; it does not grant authority beyond that identity.</p>
             <label class="field">
               <span>Pairing code</span>
               <input type="password" value={pairCode()} onInput={event => setPairCode(event.currentTarget.value)} autocomplete="off" />
@@ -3242,6 +3303,9 @@ function App() {
                 return (
                   <AgentViewPanel id={id} active={activeTab() === id} snapshot={data()} pending={view()?.pending} error={view()?.error}
                     find={view()?.find} viewport={view()?.viewport}
+                    delegatable={!view()?.delegated && Boolean(teamInfo()?.delegated_agent_views)} recipients={delegationRecipients()}
+                    delegating={dockingAgentView() === id} handoffLink={agentHandoffLink()?.viewId === id ? agentHandoffLink().url : null}
+                    onDelegate={recipientId => void delegateAgentView(id, recipientId)} onCopyLink={value => void copyPrivateLink(value)}
                     onFind={find => agentViews.updateView(id, { find })} onViewport={viewport => agentViews.updateView(id, { viewport })}
                     onRefresh={() => void agentViews.refresh(id)} onCheckAccess={() => Boolean(agentViews.get(id)?.snapshot)}>
                     <For each={data()?.turns || []}>

@@ -1411,6 +1411,10 @@ html.aw-theme-resolved .command-menu {
 /* Read-only branch panels retain their own DOM while another tab is selected. */
 .pinned-agent-panel { display: flex; flex: 1; flex-direction: column; min-height: 0; }
 .pinned-agent-bar .mini-icon { margin-left: auto; }
+.agent-delegate-recipient { max-width: 170px; min-width: 110px; height: 24px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--fg); font: inherit; }
+.agent-delegate-button { white-space: nowrap; }
+.agent-delegate-link { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 10px; }
+.agent-delegate-link input { flex: 1; min-width: 0; padding: 5px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--fg); font: 10px/1.25 Geist Mono, ui-monospace, monospace; }
 .agent-view-find { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--border); }
 .agent-view-find input { width: min(300px, 55%); min-width: 80px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
 .agent-view-find [role=status] { min-width: 65px; color: var(--muted); font-size: 10px; }

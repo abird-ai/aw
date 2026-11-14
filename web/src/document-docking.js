@@ -5,6 +5,7 @@
 import { boundedPresentation, documentFingerprint } from "./document-presentation.js";
 const ticketSyntax = /^[a-f0-9]{64}$/u;
 const opaqueIdSyntax = /^[A-Za-z0-9_-]{1,128}$/u;
+const agentIdSyntax = /^[A-Za-z0-9_.:/@-]{1,128}$/u;
 const MAX_WAIT_MS = 90_000;
 
 export function takeDocumentDockTicket(location, history) {
@@ -270,4 +271,170 @@ export function createDocumentDocking({
     stage, cancelStage, send, receive, retire,
     dispose() { retire(); disposed = true; staged = null; },
   });
+}
+
+const agentDockPrefix = "#aw-agent-dock=";
+
+export function takeAgentDockTicket(location, history) {
+  if (!location?.hash?.startsWith(agentDockPrefix)) return null;
+  const ticket = location.hash.slice(agentDockPrefix.length);
+  history.replaceState(null, "", location.pathname + location.search);
+  return ticketSyntax.test(ticket) ? ticket : null;
+}
+
+// Distinct-Actor Agent-view docking uses the same owner-confirmed lifecycle as
+// File/Review docking, but the receiver's only reader is the delegated ticket
+// endpoint. The ticket remains correlation; every refresh is server-authorized.
+export function createAgentDocking({
+  api, agentViews, popup,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  timeoutMs = MAX_WAIT_MS, onProgress = () => {}, onLinkReady = () => {},
+  onReceiveView = () => {},
+  makeLink = ticket => new URL(agentDockPrefix + ticket, location.href).href,
+  navigate = (window, ticket) => {
+    window.opener = null;
+    window.location.replace(new URL(agentDockPrefix + ticket, location.href).href);
+  },
+}) {
+  if (typeof api !== "function" || !agentViews
+    || !["get", "openDelegated", "refresh", "close"].every(name => typeof agentViews[name] === "function")
+    || [popup, sleep, onProgress, onLinkReady, onReceiveView, makeLink, navigate]
+      .some(callback => typeof callback !== "function")) {
+    throw new Error("Delegated Agent docking needs the read-only Agent view owner.");
+  }
+  let disposed = false;
+  const envelope = (window, ticket) => ({
+    window_id: window.window_id, window_proof: window.window_proof, ticket,
+  });
+  const sameTarget = (left, right) => left && right
+    && ["store_id", "source_epoch", "session_id", "branch_id"].every(key => left[key] === right[key]);
+  const validTarget = target => target && Object.keys(target).length === 4
+    && ["store_id", "source_epoch", "session_id", "branch_id"].every(key => agentIdSyntax.test(target[key]));
+  const safeClose = window => {
+    try { window?.close?.(); } catch { /* already closed */ }
+  };
+
+  async function send(viewId, recipientId, { external = false } = {}) {
+    const initial = agentViews.get(viewId);
+    if (disposed || !initial?.snapshot || initial.pending || initial.status !== "ready"
+      || !validTarget(initial.target) || !opaqueIdSyntax.test(recipientId)) {
+      throw new Error("Only a loaded read-only Agent view can be delegated.");
+    }
+    const sameView = () => {
+      const current = agentViews.get(viewId);
+      return current && sameTarget(current.target, initial.target) && current.snapshot === initial.snapshot
+        && current.status === "ready" && !current.pending;
+    };
+    const nextWindow = external ? null : popup();
+    if (!external && !nextWindow) throw new Error("The browser blocked the new window. Allow pop-ups for the local owner.");
+    let origin, ticket, released = false, navigated = false, requestedConfirmation = false;
+    onProgress(viewId, true);
+    try {
+      if (!sameView()) throw new Error("The original Agent view changed during handoff.");
+      origin = await api("/api/dock/agent/register", {});
+      if (origin.store_id !== initial.target.store_id || origin.source_epoch !== initial.target.source_epoch) {
+        throw new Error("Agent source changed before delegated handoff preparation.");
+      }
+      const prepared = await api("/api/dock/agent/prepare", {
+        window_id: origin.window_id, window_proof: origin.window_proof,
+        store_id: initial.target.store_id, source_epoch: initial.target.source_epoch,
+        session_id: initial.target.session_id, branch_id: initial.target.branch_id,
+        document_id: viewId, recipient_id: recipientId,
+      });
+      ticket = prepared.ticket;
+      if (!ticketSyntax.test(ticket) || !sameView()) throw new Error("Invalid delegated Agent handoff identity.");
+      if (external) onLinkReady(viewId, makeLink(ticket));
+      else navigate(nextWindow, ticket);
+      navigated = true;
+      const until = Date.now() + Math.min(Math.max(timeoutMs, 1000), MAX_WAIT_MS);
+      while (Date.now() < until && !disposed) {
+        if (!sameView() || (nextWindow && nextWindow.closed)) break;
+        const result = await api("/api/dock/agent/status", envelope(origin, ticket));
+        if (result.document_id !== viewId) throw new Error("Delegated Agent handoff target changed.");
+        if (result.state === "confirming") {
+          if (!requestedConfirmation) {
+            const acknowledgement = await api("/api/dock/agent/confirm", envelope(origin, ticket));
+            if (acknowledgement.state !== "confirming") throw new Error("Delegated recipient confirmation was rejected.");
+            requestedConfirmation = true;
+          }
+          await sleep(250);
+          continue;
+        }
+        if (result.state === "accepted") {
+          if (!sameView()) break;
+          const outcome = await api("/api/dock/agent/release", envelope(origin, ticket));
+          if (outcome.state !== "released" || outcome.document_id !== viewId) {
+            throw new Error("Delegated Agent handoff was not released by the owner.");
+          }
+          released = true;
+          if (sameView()) agentViews.close(viewId);
+          return true;
+        }
+        if (result.state === "revoked") throw Object.assign(new Error("Delegated Agent grant was revoked."), { status: 403 });
+        if (result.state !== "prepared") break;
+        await sleep(250);
+      }
+      throw new Error("Delegated Agent handoff not accepted; the original view remains open.");
+    } catch (error) {
+      if (!released && origin && ticket) {
+        try { await api("/api/dock/agent/cancel", envelope(origin, ticket)); } catch {}
+      }
+      if (!navigated) safeClose(nextWindow);
+      throw error;
+    } finally {
+      if (external) onLinkReady(viewId, null);
+      onProgress(viewId, false);
+    }
+  }
+
+  async function receive(ticket) {
+    if (disposed || !ticketSyntax.test(ticket)) throw new Error("Invalid delegated Agent docking invitation.");
+    const receiver = await api("/api/dock/agent/receive", { ticket });
+    const target = receiver?.resource?.kind === "agent_view" ? {
+      store_id: receiver.resource.store_id,
+      source_epoch: receiver.resource.source_epoch,
+      session_id: receiver.resource.session_id,
+      branch_id: receiver.resource.branch_id,
+    } : null;
+    if (!validTarget(target) || !ticketSyntax.test(receiver.window_id)
+      || !ticketSyntax.test(receiver.window_proof)
+      || typeof receiver.grant_generation !== "string" || !/^[1-9][0-9]{0,19}$/.test(receiver.grant_generation)) {
+      throw new Error("Delegated Agent source is unavailable in this browser.");
+    }
+    const body = envelope(receiver, ticket);
+    const authorityKey = `delegated:${ticket}:${receiver.grant_generation}`;
+    const reader = async (requested, options = {}) => {
+      if (!sameTarget(requested, target)) throw Object.assign(new Error("Delegated Agent target changed."), { status: 403 });
+      return api("/api/dock/agent/read", body, 15000, options);
+    };
+    const viewId = agentViews.openDelegated(target, reader, authorityKey);
+    onReceiveView(viewId, target);
+    let acceptanceAttempted = false;
+    try {
+      if (!await agentViews.refresh(viewId) || !agentViews.get(viewId)?.snapshot) {
+        const error = new Error("Delegated Agent read failed authorization.");
+        error.status = 403;
+        throw error;
+      }
+      acceptanceAttempted = true;
+      const accepted = await api("/api/dock/agent/accept", body);
+      if (accepted.state !== "accepted") throw Object.assign(new Error("Owner rejected delegated Agent acceptance."), { status: 409 });
+      const until = Date.now() + Math.min(Math.max(timeoutMs, 1000), MAX_WAIT_MS);
+      while (Date.now() < until && !disposed) {
+        const view = agentViews.get(viewId);
+        if (!view?.snapshot || !sameTarget(view.target, target)) break;
+        const state = await api("/api/dock/agent/heartbeat", body);
+        if (state.state === "released") return { viewId };
+        if (!["confirming", "accepted"].includes(state.state)) break;
+        await sleep(250);
+      }
+      throw new Error("Delegated Agent release was not confirmed; receiver remains inspectable until authority expiry.");
+    } catch (error) {
+      const knownFailure = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500;
+      if (!acceptanceAttempted || knownFailure) agentViews.close(viewId);
+      throw error;
+    }
+  }
+
+  return Object.freeze({ send, receive, dispose() { disposed = true; } });
 }

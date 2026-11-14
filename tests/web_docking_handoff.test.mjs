@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDocumentDocking, takeDocumentDockTicket } from '../web/src/document-docking.js';
+import {
+  createAgentDocking, createDocumentDocking, takeAgentDockTicket, takeDocumentDockTicket,
+} from '../web/src/document-docking.js';
+import { createAgentViews } from '../web/src/agent-views.js';
 
 const ticket = 'a'.repeat(64);
 const owner = { source_id: 'source-dock', scope_id: 'root-scope', owner_epoch: 'epoch' };
@@ -109,4 +112,149 @@ test('forged Review cannot bypass receiver source validation', async () => {
   });
   await assert.rejects(docking.receive(ticket), /unavailable/);
   assert.ok(f.calls.every(value => value.path !== '/api/workspace/action'));
+});
+
+const agentTarget = Object.freeze({
+  store_id: 'store-agent', source_epoch: 'epoch-agent',
+  session_id: 'session-agent', branch_id: 'branch-agent',
+});
+const agentPayload = target => ({
+  ...target, title: 'Private delegated Agent', branch_name: 'main', head: 'head-agent',
+  revision: '1', turns: [{ prompt: 'private prompt', answer: 'private answer', tool_records: [] }],
+  context_blocks: [], needs_inspection: false, retained_bytes: 512, expires_in_ms: 15000,
+});
+
+test('distinct-Actor Agent handoff sends only exact target identity and closes source after owner release', async () => {
+  const calls = [];
+  const agentViews = createAgentViews({ read: async target => agentPayload(target) });
+  const viewId = agentViews.open(agentTarget);
+  assert.equal(await agentViews.refresh(viewId), true);
+  let statuses = 0;
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/register')) return {
+      window_id: 'b'.repeat(64), window_proof: 'c'.repeat(64),
+      store_id: agentTarget.store_id, source_epoch: agentTarget.source_epoch,
+    };
+    if (path.endsWith('/prepare')) return { ticket, grant_generation: '9' };
+    if (path.endsWith('/status')) return {
+      state: ++statuses === 1 ? 'confirming' : 'accepted', document_id: viewId,
+    };
+    if (path.endsWith('/confirm')) return { state: 'confirming' };
+    if (path.endsWith('/release')) return { state: 'released', document_id: viewId };
+    if (path.endsWith('/cancel')) return { state: 'cancelled' };
+    throw new Error('Unexpected delegated Agent operation ' + path);
+  };
+  const docking = createAgentDocking({
+    api, agentViews,
+    popup: () => ({ closed: false, opener: null, location: { replace() {} } }),
+    navigate: (_popup, value) => assert.equal(value, ticket),
+    sleep: async () => {},
+  });
+  assert.equal(await docking.send(viewId, 'bob'), true);
+  assert.equal(agentViews.get(viewId), null);
+  const prepared = calls.find(call => call.path.endsWith('/prepare'));
+  assert.deepEqual(prepared.body, {
+    window_id: 'b'.repeat(64), window_proof: 'c'.repeat(64),
+    store_id: agentTarget.store_id, source_epoch: agentTarget.source_epoch,
+    session_id: agentTarget.session_id, branch_id: agentTarget.branch_id,
+    document_id: viewId, recipient_id: 'bob',
+  });
+  const serialized = JSON.stringify(calls);
+  assert.equal(serialized.includes('private prompt'), false);
+  assert.equal(serialized.includes('private answer'), false);
+  assert.ok(calls.every(call => !call.path.includes('/api/workspace')));
+});
+
+test('lost delegated Agent release response preserves the source and cannot cancel a committed handoff', async () => {
+  const calls = [];
+  const agentViews = createAgentViews({ read: async target => agentPayload(target) });
+  const viewId = agentViews.open(agentTarget);
+  assert.equal(await agentViews.refresh(viewId), true);
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/register')) return {
+      window_id: 'b'.repeat(64), window_proof: 'c'.repeat(64),
+      store_id: agentTarget.store_id, source_epoch: agentTarget.source_epoch,
+    };
+    if (path.endsWith('/prepare')) return { ticket, grant_generation: '9' };
+    if (path.endsWith('/status')) return { state: 'accepted', document_id: viewId };
+    if (path.endsWith('/release')) throw Object.assign(new Error('release response lost'), { status: 503 });
+    if (path.endsWith('/cancel')) throw Object.assign(new Error('already released'), { status: 409 });
+    throw new Error('Unexpected delegated Agent operation ' + path);
+  };
+  const docking = createAgentDocking({
+    api, agentViews,
+    popup: () => ({ closed: false, opener: null, location: { replace() {} } }),
+    navigate: () => {}, sleep: async () => {},
+  });
+  await assert.rejects(docking.send(viewId, 'bob'), /release response lost/);
+  assert.equal(agentViews.get(viewId).snapshot.title, 'Private delegated Agent');
+  assert.deepEqual(calls.slice(-2).map(call => call.path), [
+    '/api/dock/agent/release', '/api/dock/agent/cancel',
+  ]);
+});
+
+test('delegated Agent receiver uses only its ticket reader and scrubs on known revoke', async () => {
+  const calls = [];
+  const agentViews = createAgentViews({ read: async () => { throw new Error('owner reader must not be used'); } });
+  const api = async (path, body) => {
+    calls.push({ path, body });
+    if (path.endsWith('/receive')) return {
+      window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64), ticket,
+      resource: { kind: 'agent_view', ...agentTarget }, grant_generation: '4',
+    };
+    if (path.endsWith('/read')) return agentPayload(agentTarget);
+    if (path.endsWith('/accept')) {
+      const [view] = agentViews.list();
+      agentViews.updateView(view.id, {
+        find: { query: 'private', selected: 1 }, selection: { anchor: 1, head: 4 },
+      });
+      return { state: 'accepted' };
+    }
+    if (path.endsWith('/heartbeat')) {
+      const error = new Error('grant revoked'); error.status = 403; throw error;
+    }
+    throw new Error('Unexpected delegated Agent operation ' + path);
+  };
+  const docking = createAgentDocking({ api, agentViews, popup: () => null, sleep: async () => {} });
+  await assert.rejects(docking.receive(ticket), /revoked/);
+  assert.deepEqual(agentViews.list(), []);
+  assert.deepEqual(calls.map(call => call.path), [
+    '/api/dock/agent/receive', '/api/dock/agent/read',
+    '/api/dock/agent/accept', '/api/dock/agent/heartbeat',
+  ]);
+});
+
+test('unknown delegated Agent acceptance outcome remains inspectable but cannot silently re-register', async () => {
+  const agentViews = createAgentViews({ read: async () => { throw new Error('owner reader must not be used'); } });
+  let receives = 0;
+  const api = async path => {
+    if (path.endsWith('/receive')) {
+      receives++;
+      if (receives > 1) throw Object.assign(new Error('ticket already received'), { status: 409 });
+      return {
+        window_id: 'd'.repeat(64), window_proof: 'e'.repeat(64), ticket,
+        resource: { kind: 'agent_view', ...agentTarget }, grant_generation: '7',
+      };
+    }
+    if (path.endsWith('/read')) return agentPayload(agentTarget);
+    if (path.endsWith('/accept')) return { state: 'accepted' };
+    if (path.endsWith('/heartbeat')) throw Object.assign(new Error('response lost'), { status: 503 });
+    throw new Error('Unexpected delegated Agent operation ' + path);
+  };
+  const docking = createAgentDocking({ api, agentViews, popup: () => null, sleep: async () => {} });
+  await assert.rejects(docking.receive(ticket), /response lost/);
+  const [retained] = agentViews.list();
+  assert.equal(retained.snapshot.title, 'Private delegated Agent');
+  await assert.rejects(docking.receive(ticket), /already received/);
+  assert.equal(agentViews.list().length, 1, 'reload/retry cannot silently mint a second delegated view');
+});
+
+test('delegated Agent fragment is correlation-only and stripped before receiver reads', () => {
+  const history = { calls: [], replaceState(...args) { this.calls.push(args); } };
+  const location = { hash: '#aw-agent-dock=' + ticket, pathname: '/app', search: '?mode=agent' };
+  assert.equal(takeAgentDockTicket(location, history), ticket);
+  assert.deepEqual(history.calls, [[null, '', '/app?mode=agent']]);
+  assert.equal(takeAgentDockTicket({ hash: '#aw-agent-dock=bad', pathname: '/' }, history), null);
 });

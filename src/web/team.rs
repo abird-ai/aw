@@ -8,6 +8,7 @@ use aw_identity::{Participant, Roster};
 use axum::body::to_bytes;
 use tower::ServiceExt;
 
+mod delegated;
 #[cfg(feature = "multiplayer")]
 mod multiplayer;
 
@@ -21,11 +22,24 @@ pub struct ParticipantRuntime {
     pub agent: Agent,
     pub persistence: PersistentSession,
 }
+
+/// Explicit trusted owner source for delegated read-only File/Review views.
+/// The participant browser never receives this SurfaceHost as normal workspace
+/// authority; only the delegated lifecycle may use it. Terminals and Sites are
+/// forcibly disabled even if present in `options`.
+#[cfg(feature = "surfaces")]
+pub struct DelegatedSurfaceSource {
+    pub participant_id: String,
+    pub options: WorkspaceOptions,
+}
+
 #[derive(Clone)]
 struct Entry {
     user: Participant,
     app: AppState,
     router: Router,
+    #[cfg(feature = "surfaces")]
+    delegated_surface: Option<Arc<aw_surfaces::SurfaceHost>>,
 }
 #[derive(Clone)]
 struct TeamState(Arc<TeamInner>);
@@ -35,6 +49,7 @@ struct TeamInner {
     pairing_failures: Mutex<Vec<Instant>>,
     requests: Arc<Semaphore>,
     stop: CancellationToken,
+    delegated: Mutex<delegated::Registry>,
     #[cfg(feature = "multiplayer")]
     multiplayer: multiplayer::State,
 }
@@ -50,6 +65,48 @@ pub async fn serve<C>(
 where
     C: Future<Output = ()> + Send + 'static,
 {
+    serve_application(roster, members, address, stop, application).await
+}
+
+#[cfg(feature = "surfaces")]
+pub async fn serve_with_delegated_surfaces<C>(
+    roster: Roster,
+    members: Vec<ParticipantRuntime>,
+    sources: Vec<DelegatedSurfaceSource>,
+    address: SocketAddr,
+    stop: C,
+) -> Result<()>
+where
+    C: Future<Output = ()> + Send + 'static,
+{
+    serve_application(
+        roster,
+        members,
+        address,
+        stop,
+        move |roster, members, address, codes| {
+            application_with_delegated_surfaces(roster, members, sources, address, codes)
+        },
+    )
+    .await
+}
+
+async fn serve_application<C, B>(
+    roster: Roster,
+    members: Vec<ParticipantRuntime>,
+    address: SocketAddr,
+    stop: C,
+    build: B,
+) -> Result<()>
+where
+    C: Future<Output = ()> + Send + 'static,
+    B: FnOnce(
+        Roster,
+        Vec<ParticipantRuntime>,
+        SocketAddr,
+        &[String],
+    ) -> Result<(Router, TeamState)>,
+{
     roster
         .validate()
         .map_err(|_| Error::Config("invalid participant directory".into()))?;
@@ -63,7 +120,7 @@ where
     let codes = (0..members.len())
         .map(|_| random_token())
         .collect::<Result<Vec<_>>>()?;
-    let (router, team) = application(roster, members, address, &codes)?;
+    let (router, team) = build(roster, members, address, &codes)?;
     eprintln!("aw team: http://{address}");
     for (entry, code) in team.0.entries.iter().zip(codes.iter()) {
         eprintln!(
@@ -90,7 +147,7 @@ where
                     auth.cookie_hash.is_some() && !auth_alive_at(&auth)
                 };
                 if expired {
-                    cancel_member(entry);
+                    cancel_member(&watchdog_team, entry);
                 }
             }
         }
@@ -119,8 +176,16 @@ where
     result?;
     Ok(())
 }
-fn cancel_member(entry: &Entry) {
+fn revoke_member_delegations(team: &TeamState, entry: &Entry) {
+    revoke_delegations(&entry.app);
+    let recipient = &entry.app.0.session.actor;
+    for owner in &team.0.entries {
+        lock(&owner.app.0.delegation).revoke_recipient(recipient);
+    }
+}
+fn cancel_member(team: &TeamState, entry: &Entry) {
     lock(&entry.app.0.auth).cookie_hash = None;
+    revoke_member_delegations(team, entry);
     if let Some(token) = &lock(&entry.app.0.session.state).cancel {
         token.cancel();
     }
@@ -134,7 +199,11 @@ fn shutdown(team: &TeamState) {
     team.0.stop.cancel();
     for entry in &team.0.entries {
         entry.app.0.shutdown.cancel();
-        cancel_member(entry);
+        #[cfg(feature = "surfaces")]
+        if let Some(host) = &entry.delegated_surface {
+            host.shutdown();
+        }
+        cancel_member(team, entry);
         // Grants are process-owned. Revocation prevents later model rounds.
         if let Ok(accounts) = entry
             .app
@@ -154,6 +223,55 @@ fn application(
     members: Vec<ParticipantRuntime>,
     address: SocketAddr,
     codes: &[String],
+) -> Result<(Router, TeamState)> {
+    #[cfg(feature = "surfaces")]
+    {
+        application_configured(
+            roster,
+            members,
+            address,
+            codes,
+            std::collections::BTreeMap::new(),
+        )
+    }
+    #[cfg(not(feature = "surfaces"))]
+    {
+        application_configured(roster, members, address, codes)
+    }
+}
+
+#[cfg(feature = "surfaces")]
+fn application_with_delegated_surfaces(
+    roster: Roster,
+    members: Vec<ParticipantRuntime>,
+    sources: Vec<DelegatedSurfaceSource>,
+    address: SocketAddr,
+    codes: &[String],
+) -> Result<(Router, TeamState)> {
+    let mut by_participant = std::collections::BTreeMap::new();
+    for source in sources {
+        if roster.participant(&source.participant_id).is_err()
+            || by_participant
+                .insert(source.participant_id, source.options)
+                .is_some()
+        {
+            return Err(Error::Denied(
+                "delegated Surface source requires one known Team participant",
+            ));
+        }
+    }
+    application_configured(roster, members, address, codes, by_participant)
+}
+
+fn application_configured(
+    roster: Roster,
+    members: Vec<ParticipantRuntime>,
+    address: SocketAddr,
+    codes: &[String],
+    #[cfg(feature = "surfaces")] mut delegated_surfaces: std::collections::BTreeMap<
+        String,
+        WorkspaceOptions,
+    >,
 ) -> Result<(Router, TeamState)> {
     roster
         .validate()
@@ -198,6 +316,18 @@ fn application(
                 "team participant requires its own actor/history and no tool grants",
             ));
         }
+        #[cfg(feature = "surfaces")]
+        let delegated_surface = delegated_surfaces
+            .remove(&user.id)
+            .map(|mut options| {
+                options.actor = actor.to_owned();
+                options.allow_terminals = false;
+                options.sites.clear();
+                aw_surfaces::SurfaceHost::new(options)
+                    .map(Arc::new)
+                    .map_err(|error| Error::Config(error.to_string()))
+            })
+            .transpose()?;
         let (router, app) = application_scoped(
             member.agent,
             Some(member.persistence),
@@ -222,7 +352,13 @@ fn application(
             })
             .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()
             .map_err(|_| Error::Denied("invalid recipient directory"))?;
-        entries.push(Entry { user, app, router });
+        entries.push(Entry {
+            user,
+            app,
+            router,
+            #[cfg(feature = "surfaces")]
+            delegated_surface,
+        });
     }
     let team = TeamState(Arc::new(TeamInner {
         realm: roster.realm().into(),
@@ -230,6 +366,7 @@ fn application(
         pairing_failures: Mutex::new(Vec::new()),
         requests: Arc::new(Semaphore::new(MAX_GATEWAY_INFLIGHT)),
         stop: CancellationToken::new(),
+        delegated: Mutex::new(delegated::Registry::default()),
         #[cfg(feature = "multiplayer")]
         multiplayer: multiplayer::State::default(),
     }));
@@ -379,6 +516,10 @@ async fn route(team: &TeamState, request: Request) -> ApiResult<Response> {
     ))?;
     if path == "/api/team/me" && method == Method::GET {
         let peer_sharing = cfg!(feature = "multiplayer");
+        #[cfg(feature = "surfaces")]
+        let delegated_surface_views = entry.delegated_surface.is_some();
+        #[cfg(not(feature = "surfaces"))]
+        let delegated_surface_views = false;
         let session_scope = if peer_sharing {
             "owned+explicit-shared"
         } else {
@@ -386,9 +527,35 @@ async fn route(team: &TeamState, request: Request) -> ApiResult<Response> {
         };
         return Ok(Json(serde_json::json!({"mode":"invite-only-team","realm":team.0.realm,
             "participant":{"id":entry.user.id,"display_name":entry.user.display_name,"principal":entry.app.0.session.actor},
-            "session_scope":session_scope,"tools":false,"surfaces":false,"peer_sharing":peer_sharing})).into_response());
+            "session_scope":session_scope,"tools":false,"surfaces":false,"peer_sharing":peer_sharing,
+            "delegated_agent_views":true,"delegated_surface_views":delegated_surface_views})).into_response());
     }
     let app = entry.app.clone();
+    if path == "/api/team/delegation/recipients" && method == Method::GET {
+        let participants = team
+            .0
+            .entries
+            .iter()
+            .filter(|candidate| candidate.user.id != entry.user.id)
+            .map(|candidate| {
+                serde_json::json!({
+                    "id":candidate.user.id,
+                    "display_name":candidate.user.display_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        return Ok(Json(serde_json::json!({"participants":participants})).into_response());
+    }
+    if delegated::is_route(&path, &method) {
+        let response = delegated::route(team, &entry, &path, request).await?;
+        if !auth_alive(&app) || team.0.stop.is_cancelled() {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "identity revoked before delegated docking response",
+            ));
+        }
+        return Ok(response);
+    }
     #[cfg(feature = "multiplayer")]
     if multiplayer::is_route(&path, &method) {
         let response = multiplayer::route(team, &entry, &path, request).await?;
@@ -402,7 +569,10 @@ async fn route(team: &TeamState, request: Request) -> ApiResult<Response> {
     }
     #[cfg(feature = "multiplayer")]
     multiplayer::guard_forward(&entry, &path, &method)?;
-    let response = forward(entry.router, request).await?;
+    let response = forward(entry.router.clone(), request).await?;
+    if path == "/api/logout" {
+        revoke_member_delegations(team, &entry);
+    }
     if path != "/api/logout" && (!auth_alive(&app) || team.0.stop.is_cancelled()) {
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,

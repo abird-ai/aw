@@ -151,6 +151,52 @@ test('unchanged-head denial immediately clears every duplicate exact resource', 
   assert.equal(f.state.get(duplicate).snapshot, null);
 });
 
+test('delegated denial scrubs only the exact grant lifetime, including held duplicate work', async () => {
+  let time = 0;
+  const ownerCalls = [], delegatedCalls = [];
+  const state = createAgentViews({ now: () => time, read: (resource, options) => {
+    const reply = deferred(); ownerCalls.push({ resource, ...options, ...reply }); return reply.promise;
+  } });
+  const delegatedRead = (resource, options) => {
+    const reply = deferred(); delegatedCalls.push({ resource, ...options, ...reply }); return reply.promise;
+  };
+  const ordinary = state.open(target());
+  const delegated = state.openDelegated(target(), delegatedRead, 'delegated:grant-a');
+  const duplicate = state.openDelegated(target(), delegatedRead, 'delegated:grant-a');
+  const independent = state.openDelegated(target(), delegatedRead, 'delegated:grant-b');
+
+  let pending = state.refresh(ordinary); ownerCalls.at(-1).resolve(payload(target())); assert.equal(await pending, true);
+  for (const id of [delegated, duplicate, independent]) {
+    pending = state.refresh(id); delegatedCalls.at(-1).resolve(payload(target())); assert.equal(await pending, true);
+  }
+  state.updateView(delegated, { find: { query: 'private' }, selection: { anchor: 1, head: 4 } });
+  state.updateView(duplicate, { find: { query: 'private duplicate' }, selection: { anchor: 2, head: 5 } });
+  state.updateView(independent, { find: { query: 'separate grant' }, selection: { anchor: 3, head: 6 } });
+  state.updateView(ordinary, { find: { query: 'owner access' }, selection: { anchor: 4, head: 7 } });
+
+  const held = state.refresh(duplicate), heldReply = delegatedCalls.at(-1);
+  const denied = state.refresh(delegated), denial = delegatedCalls.at(-1);
+  let protectedAtAbort = true;
+  heldReply.signal.addEventListener('abort', () => {
+    protectedAtAbort = Boolean(state.get(duplicate)?.snapshot);
+  });
+  denial.reject(Object.assign(new Error('delegated grant revoked'), { status: 403 }));
+  assert.equal(await denied, false);
+  assert.equal(heldReply.signal.aborted, true);
+  assert.equal(protectedAtAbort, false, 'same-grant content is scrubbed before abort callbacks');
+  for (const id of [delegated, duplicate]) {
+    assert.equal(state.get(id).snapshot, null);
+    assert.deepEqual(state.get(id).find, { query: '', selected: 0 });
+    assert.equal(state.get(id).selection, null);
+  }
+  assert.equal(state.get(independent).snapshot.title, 'Saved Agent');
+  assert.equal(state.get(independent).find.query, 'separate grant');
+  assert.equal(state.get(ordinary).snapshot.title, 'Saved Agent');
+  assert.equal(state.get(ordinary).find.query, 'owner access');
+  heldReply.resolve(payload(target()));
+  assert.equal(await held, false);
+});
+
 test('closed and reopened exact IDs cannot accept a held real Promise reply', async () => {
   const f = fixture(), old = f.state.open(target());
   const held = f.state.refresh(old), stale = f.calls[0];
