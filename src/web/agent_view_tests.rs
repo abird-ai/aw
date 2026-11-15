@@ -87,6 +87,7 @@ fn read_fixture() -> ReadFixture {
         ApplicationScope {
             workspace_options: None,
             address: HOST.parse().unwrap(),
+            browser: resolve_browser_origin(HOST.parse().unwrap(), None).unwrap(),
             pairing_code: CODE.into(),
             local_owner_uid: context.effective_uid,
             owned_sessions_only: false,
@@ -393,6 +394,7 @@ async fn first_prompt_admits_original_unsaved_target_and_retries_without_another
         ApplicationScope {
             workspace_options: None,
             address: HOST.parse().unwrap(),
+            browser: resolve_browser_origin(HOST.parse().unwrap(), None).unwrap(),
             pairing_code: CODE.into(),
             local_owner_uid: local.context.effective_uid,
             owned_sessions_only: false,

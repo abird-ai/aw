@@ -1,4 +1,4 @@
-# Next agent — delegated File/Review shipping integration
+# Next agent — real two-AwNode remote Workspace acceptance
 
 Use `dotlink---l5` only.
 
@@ -10,350 +10,196 @@ Do not use A1. Do not create another worktree. Preserve all unrelated dirty or
 staged work. Do not commit, push, tag, release or deploy unless explicitly
 authorized.
 
-Keep one model/user implementation turn near ~30 minutes. Aim for the next
-coherent checkpoint, record state, then pause.
-
-## Critical UX authority rule
-
-The user explicitly designated:
-
-`.agents/plans/ux/**`
-
-as the **source of truth for all UI and UX**.
-
-You are explicitly authorized to **read/inspect that subtree** for this task,
-despite older repository/handoff language that said not to inspect it.
-
-You are **not** authorized to modify it.
-
-- never write there;
-- never stage/reset/stash/commit it;
-- do not regenerate its previews/assets;
-- keep implementation plans and acceptance evidence in
-  `.agents/plans/workspace-views/**` or `.agents/docs/**`.
-
-V1.5 is the current UX target.
+Keep each model/user implementation turn near **30 minutes**. Aim for the next
+coherent checkpoint, update durable state, then pause.
 
 ## Read first
 
 1. `AGENTS.md`
 2. `.agents/plans/README.md`
 3. `.agents/plans/TODO.md`
-4. `.agents/docs/WORKSPACE-VIEWS-UX-COMPREHENSIVE-HANDOFF-2026-11-14.md`
+4. `.agents/docs/AW-FULL-COMPREHENSIVE-HANDOFF-2026-11-15.md`
 5. `.agents/docs/CURRENT_HANDOFF.md`
-6. UX authority, read-only:
-   - `.agents/plans/ux/README.md`
-   - `.agents/plans/ux/V1.5-UNIFIED-FOCUS-AND-TABS.md`
-   - `.agents/plans/ux/NAVIGATION-AND-STATE.md`
-   - `.agents/plans/ux/INTERACTIONS-AND-ACCEPTANCE.md`
-   - `.agents/plans/ux/VISUAL-SPEC.md`
-   - `.agents/plans/ux/TERMINAL-V1.5-CELL-STUDY.md`
-   - relevant read-only v1.5 JS/tests when implementing an interaction
-7. `.agents/plans/workspace-views/README.md`
-8. `.agents/plans/workspace-views/TODO.md`
-9. `.agents/plans/workspace-views/DELEGATED-BROWSER-AUTHORITY.md`
-10. `.agents/plans/workspace-views/NATIVE-PTY-CUSTODY.md`
-11. `.agents/plans/workspace-views/ADOPTED-CHILD-LIFECYCLE.md`
-12. `.agents/plans/workspace-views/LIVE-PTY-MIGRATION.md`
-13. live source/tests and the current dirty diff
+6. `.agents/plans/workspace-views/TODO.md`
+7. `.agents/plans/workspace-views/REMOTE-DEVICE-TRUST.md`
+8. `.agents/plans/workspace-views/DELEGATED-BROWSER-AUTHORITY.md`
+9. `.agents/plans/workspace-views/NATIVE-PTY-CUSTODY.md`
+10. `.agents/plans/workspace-views/LIVE-PTY-MIGRATION.md`
+11. live source/tests for the exact owners you touch.
 
-Source/tests/executed results outrank prose.
+For any UI/UX change, read `.agents/plans/ux/**` as **read-only authority**.
+V1.5 is current. Never modify that subtree.
 
-## Current live state
+## Revalidate before editing
 
-AW HEAD:
+- `git rev-parse HEAD`
+- `git rev-parse origin/main`
+- `git status --short --branch`
+- `git diff --cached --name-status`
+- `git worktree list --porcelain`
+- `git diff -- .agents/plans/ux`
+- `git diff --check`
 
-`c9aaf0e0d311ba905f55875147392a071f64b037`
+Expected pushed HEAD:
 
-`Complete delegated browser authority and surface lifecycle`
+`62b8da6babfa729d6bbb9c21e75ac89c228b22b1`
 
-`origin/main` is at the same commit.
+Expected current tree is dirty with the production remote-view server CLI and
+browser-origin/SSH-forward changes recorded in the comprehensive handoff.
+Preserve them.
 
-Nothing is staged.
+## Mission
 
-There are 14 dirty **implementation/test/generated** paths. Preserve them; they
-are one current in-progress product slice:
+Continue the **real production-authorized two durable AwNode proof** from the
+first protected-read transport boundary. Do not restart authority design.
 
-- `src/team.rs`
-- `src/web/dock.rs`
-- `src/web/team.rs`
-- `src/web/team/delegated.rs`
-- `src/web/team/tests.rs`
-- `src/web/workspace.rs`
-- `tests/web_docking_handoff.test.mjs`
-- `tests/web_workspace.test.mjs`
-- `web/dist/app.js`
-- `web/dist/style.css`
-- `web/src/document-docking.js`
-- `web/src/main.jsx`
-- `web/src/styles.css`
-- `web/src/workspace-views.js`
+Use two independent durable state roots on L5.
 
-Do not reset or reconstruct them.
+**Do not hand-author a continuity snapshot or v35 grant.**
 
-## What is already complete
+Use the actual production pairing, Phase-30 continuity, identity-auth and
+Machine-service commands.
 
-### Unified runtime
+### Current executed checkpoint
 
-Finalized and unrelated to the next UI slice:
+The L5 production gate has already established with public `aw` commands:
 
-- AW runtime: `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
-- AW handoff sync: `88cd9655d402ea325873470202fd12133b1d8199`
-- dotlink: `c90a6603ccef0bbf626ce10d95bedf59877747b8`
+- two fresh file-backed durable AwNodes;
+- real direct pair/trust;
+- source Domain/device and explicit target Machine;
+- signed Workspace writer handoff A → B;
+- on the imported replica Domain, explicit registration of only the exact
+  trusted recorded control AwNode as requester remote Machine;
+- real Phase-30 continuity accept + signed sync;
+- requester device proof;
+- target Files+Git remote-view issuance policy;
+- real **server-issued v35 grant**;
+- owner-private `aw web` admission and opaque `rwt_...` browser descriptor;
+- no browser descriptor leakage of peer/room/Domain/Workspace/grant/device-key
+  authority material.
 
-Do not reopen old Jobs/Agent runtime work or resurrect
-`subagent/team/plan/review_release/job_*` model routes.
+The first protected capability read is the current blocker. The HTTP endpoint
+returns factual 503 unavailable. Temporary diagnosis-only logs (already
+removed) established that the direct QUIC connection gets through
+`open_bi/accept_bi`, then the client send half is closed before the first
+RouteHello bytes (`ClosedStream`) and the server sees zero-byte FIN
+(`FinishedEarly(0)`).
 
-### Workspace views
+Isolation already green:
 
-Already implemented/accepted:
+- same-room `net punch` twice consecutively;
+- plain Machine FileRead;
+- identity-auth → same-room Machine FileRead;
+- two sequential same-room one-shot Machine services;
+- real remote-view v3 grant → clean web-owner stop → same durable requester
+  state + same room plain Machine FileRead.
 
-- native read-only Agent views;
-- scoped native Files/Git containers;
-- browser Agent views;
-- browser scoped Files/Git;
-- same-window and cross-window File/Review docking;
-- same-owner independent-browser pairing;
-- same-machine terminal docking;
-- persistent broker-owned PTYs;
-- same-UID Linux original-shell `terminal-promote`;
-- actual different-UID FD admission refusal.
+The remote HTTP path already uses `tokio::task::spawn_blocking`.
 
-Do not reimplement Linux PTY migration.
+**Next engineering target:** isolate and fix only the in-web-owner protected-read
+direct-route/QUIC stream lifecycle/context, then resume the production gate at
+remote target capabilities. Do not weaken v35, owner custody, browser secrecy,
+exact-source pins or no-Local-fallback to make the test pass.
 
-### Distinct user/Actor delegated browser authority
+The current uncommitted support fixes are intentional:
 
-Committed at current HEAD `c9aaf0e`:
+- exact replica-control remote-Machine registration without owner/admin import;
+- replica-only v35 member evidence tied to the exact accepted Phase-30 source;
+- exact local-hosted Workspace lookup for remote service;
+- resident Workspace-bound Machine service retaining one `SurfaceHost`;
+- exact-generation reusable-rendezvous retransmit suppression.
 
-- exact memory-only delegated grant registry with generation/revocation/expiry;
-- Agent-branch distinct-Actor lifecycle and shipping Solid integration;
-- real two-profile Chrome 157 Agent-branch acceptance;
-- exact File/immutable-Review Surface read substrate;
-- opt-in trusted delegated SurfaceHost composition;
-- complete distinct-Actor File/Review backend HTTP lifecycle:
-  register / prepare / receive / read / accept / confirm / heartbeat / release /
-  status / cancel / revoke;
-- ordinary Team `/api/workspace` remains disabled;
-- recipient receives no Files root, Git inventory/context, terminal, Site or
-  execution authority.
+Post-cleanup focused evidence is green: rendezvous **1/1**, v35 **4/4**,
+Phase-30→explicit replica Machine→v35 **1/1**, writer handoff/failback **1/1**,
+formatting and current CLI build.
 
-Read
-`.agents/plans/workspace-views/DELEGATED-BROWSER-AUTHORITY.md`
-for exact evidence.
+### Server grant policy
 
-## Current accepted dirty slice — preserve it, do not redesign it
+The target identity-auth server must opt in explicitly. Current CLI help spells
+the flattened flags with the `--net-` prefix:
 
-The current 14 dirty implementation/test/generated paths are the accepted
-**File/Review shipping integration**. They remain uncommitted.
+`identity-auth-serve --net-remote-view-max-ttl <ttl>
+  --net-remote-view-grant files
+  --net-remote-view-grant git`
 
-### Team CLI/source composition
+Use only the exact surface grants needed.
 
-`src/team.rs`
+### Server read service
 
-- explicit `delegate_workspace_views: bool`, default false;
-- changes configuration fingerprint;
-- opted-in owner gets a trusted read-only delegated source;
-- normal participant Workspace authority remains absent;
-- terminals disabled, Sites empty.
+Serve the exact hosted Workspace/root using:
 
-### Team delegated source routes
+`machine-service-serve ... --net-remote-view-workspace <workspace>
+  --net-root <root>
+  --net-grant identity-authenticate
+  --net-grant file-read
+  --net-grant git-read`
 
-`src/web/team.rs`, `src/web/workspace.rs`
+The selected Workspace must be the exact active hosted Workspace ID on that
+local Machine. Remote-view mode intentionally rejects a simultaneous Domain
+selector.
 
-- narrow delegated source capability/read endpoints;
-- retained owner SurfaceHost only;
-- strict auth/identity revalidation;
-- bounded action body/time;
-- no ordinary recipient `/api/workspace` enablement.
+### Required proof
 
-### Browser document lifetime
+Reach a coherent checkpoint in this order:
 
-`web/src/workspace-views.js`
+1. [established] two independent durable AwNodes exist;
+2. [established] real pairing/trust;
+3. [established] exact Domain/Machine/replica-control relationships;
+4. [established] real Phase-30 identity continuity;
+5. [established] requester device proof;
+6. [established] target issues real v35 grant;
+7. [established] opaque remote target is admitted and browser-visible;
+8. [**current blocker**] at least one protected remote Workspace capability +
+   File/Git read succeeds.
 
-- delegated File/Review document has exact per-grant reader + authority key;
-- ordinary source replacement does not scrub unrelated delegated documents;
-- delegated 403 scrubs only that exact grant/document cache/state;
-- global auth expiry clears all;
-- delegated document cannot move into an unrelated Workspace scope.
+If that boundary is green within the turn, continue only to the next coherent
+step:
 
-### File/Review delegation flow
+9. Files search;
+10. Git inventory;
+11. Git open;
+12. retained immutable Review ID.
 
-`web/src/document-docking.js`
+Leave reconnect/revoke for the following checkpoint if the turn is approaching
+the 30-minute bound.
 
-- `#aw-surface-dock=` correlation fragment;
-- exact File/Review send/receive;
-- recipient read before Accept;
-- confirm/heartbeat/release;
-- no protected bytes in ticket;
-- grant generation bound into receiver lifetime.
+## Preservation assertions
 
-### Shipping Solid
+Before and after remote selection/read, record:
 
-`web/src/main.jsx`, `web/src/styles.css`
+- Agent Session/branch identity;
+- draft/caret;
+- provider/model target;
+- Review/Build PTY IDs;
+- PTY input/resize owner;
+- local Git HEAD/index;
+- provider/model/tool/run/effect rows.
 
-- distinguish ordinary Workspace source vs trusted Team delegated source;
-- explicit recipient selector and private read-only link for owner File/Review;
-- received delegated document is standalone/read-only;
-- no re-delegation or move into unrelated scope;
-- auth expiry scrubs delegated state.
+Target selection must not retarget any of those.
 
-This 14-path File/Review product slice is now an **accepted checkpoint** in the
-working tree. It remains uncommitted.
+## Browser forwarding contract
 
-### Bounded presentation transfer — implemented in this dirty tree
+Preserve the current uncommitted forwarding design:
 
-The new distinct-Actor File/Review route now reuses the existing bounded v1
-presentation envelope:
-
-- File: Find intent/result, caret/selection and viewport/scroll;
-- Review: two-pane Find, selection, scroll and focused pane;
-- presentation remains ticket metadata only and never changes delegated
-  resource/grant/recipient/generation/authority identity;
-- mutable File fingerprints are rechecked against the exact owner read at
-  prepare, receiver Accept and owner Release;
-- receiver read/render/fingerprint/restore/target recheck completes before
-  Accept;
-- recipient chooser/button focus staging preserves the document's presentation
-  focus without granting authority.
-
-Targeted tests already authored in the dirty tree cover:
-- owner-only delegated source capability without ordinary Workspace authority;
-- exact File send/receive with no protected bytes in the ticket;
-- correlation-fragment stripping;
-- revoked receiver document scrub;
-- delegated document surviving ordinary source replacement;
-- distinct-grant cache isolation for the same File;
-- full auth expiry scrubbing ordinary + delegated caches.
-
-The concurrent owner has now recorded this checkpoint green:
-
-- Team module **48 passed / 1 intentional ignored**;
-- Team config **12/12**;
-- browser/controller **187/187**;
-- strict aw-cli library Clippy and default binary check;
-- Vite build 174 modules;
-- two consecutive builds byte-identical for all **8/8** embedded assets.
-
-Additional executed evidence from the presentation checkpoint:
-
-- `node --test tests/web_docking_handoff.test.mjs` — **16/16 passed**;
-- focused delegated File lifecycle — passed;
-- focused immutable Review lifecycle with pinned `AW_GIT` — passed;
-- held-response revoke fencing — passed;
-- reduced Team+Surfaces library check — passed with only the existing
-  `bind_execution_owner` warning;
-- formatting/diff check — passed before durable-doc edits;
-- fresh Vite builds — 174 modules, deterministic **8/8** assets.
-
-Do **not** repeat those gates by habit. Real Chrome 157 now closes the
-File/Review browser boundary. Separate fresh-profile File and Review runs at
-390×844 proved distinct Alice/Bob principals and cookie values, exact resource
-identity, fragment stripping, no recipient Workspace/root/Git authority,
-presentation restore, factual Release, explicit File Revoke scrub, File
-reload/no-replay, Review logout scrub, unchanged source/receiver Agents and
-source draft/caret, zero overflow/page JS errors, unchanged synthetic Git,
-provider count 0 and zero run/model/tool/effect rows.
-
-The live gate also exposed and fixed a real cold editor-mount defect: the full
-split editor chunk could finish downloading while Solid `lazy()` stranded
-CodeMirror lifecycle. The product still code-splits the ~1.50 MB editor module,
-but now uses one cached explicit dynamic import awaited before ordinary
-File/Review admission and both docking receiver paths. Post-fix focused
-browser/controller tests are **78/78** and final Vite output is deterministic
-**8/8**.
-
-## Current remote-device trust checkpoint — backend/protocol accepted, product open
-
-The current uncommitted tree also advances the next separate workspace-view
-boundary. Read [REMOTE-DEVICE-TRUST.md](REMOTE-DEVICE-TRUST.md) before changing
-it.
-
-Implemented and green:
-
-- SQLite schema **v35** durable remote-view grants;
-- exact portable device + stable user + active Domain membership;
-- Domain policy/security epoch fences;
-- trusted peer plus explicitly registered requester remote Machine;
-- requester/target Machine security + capability revisions;
-- exact hosted Workspace revision + policy revision;
-- bounded Files/Git permissions, TTL, explicit revoke and reconnect revalidation;
-- additive Phase-30 identity-auth v3 only for remote-view grant issuance while
-  legacy identity auth stays byte-compatible v2;
-- additive Machine-read v2 only for protected `View*` reads while legacy reads
-  stay byte-compatible v1;
-- fresh device signature per protected read, bound to lease/request/grant/
-  Workspace/request digest;
-- final grant reauthorization immediately before response publication;
-- remote-view server rejects legacy reads and ordinary server rejects `View*`,
-  closing downgrade bypass.
-
-Evidence: Store **4/4**, focused remote-view/wire **5/5**, all AwNet **24/24**,
-`aw-store --lib` **212/212**, composite image **7/7**, strict affected-target Clippy green for `aw-store --lib` and the `aw` net binary with `-D warnings`, formatting/diff green.
-
-Do **not** mark remote views complete yet. Still open: shipping Workspace target/
-lens and exact root/worktree binding, production-authorized two-node continuity
-→ grant → reconnect → protected read → revoke acceptance, remote Agent/member
-view authority, offline/stale native/browser presentation, and live UX
-acceptance. Do not hand-author a continuity snapshot that production export
-would not authorize merely to manufacture the two-node proof.
-
-## V1.5 UX rules the implementation must follow
-
-- exactly two modes: Minimal and Workspace;
-- Minimal is headerless: no topbar/sidebar/tabs, one bottom status;
-- Agent is a Workspace pane/tab, not a third mode;
-- maximize/restore is presentation-only and reversible;
-- File/Diff actions are distinct:
-  - Preview inside contained Files/Git;
-  - Break out to standalone tab;
-  - Maximize current pane;
-- one title owner; no redundant nested headers;
-- standalone File/Diff identity is canonical scope/site/resource, not filename;
-- use the existing Command Palette, not a second Quick Switch;
-- palette prefixes remain `> ! @ # $ / &`;
-- Ctrl+Shift+P/F1 opens palette; Ctrl+P remains composer/PTY-owned;
-- view selection never grants Files/Git/Agent/PTy authority;
-- pane focus != PTY input owner != resize owner;
-- opening/closing delegated File/Review must preserve current Agent,
-  composer draft/caret and PTY ownership.
-
-## Next implementation order
-
-1. Revalidate HEAD/status/staged/worktrees and preserve both accepted current
-   slices: delegated File/Review plus the remote-view backend/protocol checkpoint.
-2. Do not commit, push, tag, release or deploy without explicit user
-   authorization.
-3. Do not reopen delegated File/Review authority/presentation/loader work, or
-   weaken the v35 remote-view trust/wire/downgrade fences, unless new evidence
-   contradicts their acceptance.
-4. The **local V1.5 browser visual matrix, including Build / terminal-grid,
-   is accepted**. Build is a terminal-granted non-closable saved layout over
-   retained real PTYs; selection/maximize starts nothing, explicit start is the
-   only creation path, and a claimed tile retained its exact lease through
-   maximize and a 17-second hidden-tab interval. Review/Build share one terminal
-   custody component. Do not redo these screenshots/custody checks unless source
-   changes.
-5. Product remote views are now at the **live two-node acceptance boundary**. Host plumbing and V1.5 browser ActiveTarget semantics are implemented: Local | opaque remote Machine selector, lazy remote capability discovery, follower Files/Git rebind with navigator presentation preserved, contained previews cleared on target change, exact-source standalone pins with per-document readers, Local Review/Build PTY authority independent of target selection, and no Session/Agent execution retarget. Focused browser/controller gate is **85/85** and full-product check/strict Clippy are green. Next, use a real production-authorized pair of Machines and the real Phase-30 continuity path to run continuity→grant→select remote target→Files/search/Git inventory/open/retained Review→reconnect→re-read→revoke. During that live gate verify Agent Session/draft/caret and PTY inventory/input/resize owner remain unchanged, target loss becomes factual stale/unavailable presentation with **no Local fallback**, and a pinned standalone remote File/Review remains tied to its original source until its exact grant is revoked. Do not hand-author continuity state. Keep remote Agent/member views separate unless that slice explicitly owns them.
-6. Post-ACK arbitrary partitions, remote/distinct-Actor PTY custody,
-   macOS/Windows custody/broker restoration and actual Windows retained-directory
-   runtime acceptance remain separate after that.
-7. Keep V1.5 UX authority read-only and do not reimplement same-UID Linux
-   `terminal-promote`.
-8. Update durable docs and pause at the next coherent checkpoint.
+- `--listen` = backend loopback socket;
+- optional `--browser-origin http://LOOPBACK[:PORT]` = exact browser-visible
+  Host/Origin for SSH forwarding;
+- do not weaken Host/Origin/Sec-Fetch checks;
+- do not accept non-loopback browser origins.
 
 ## Do not do
 
-- do not write to `.agents/plans/ux/**`;
-- do not start another UX design instead of finishing the dirty slice;
-- do not grant a Files root from one delegated File;
-- do not grant Git inventory/write authority from one delegated Review;
-- do not treat Team membership, browser auth, path, label or ticket as resource
-  authority;
-- do not let a delegated document move into an unrelated ordinary scope;
-- do not make same-owner pairing equivalent to distinct-user delegation;
-- do not retarget current Agent or execution site from a view;
+- do not modify `.agents/plans/ux/**`;
 - do not reimplement `terminal-promote`;
-- do not claim **shipping remote views** merely because the v35 trust/protocol
-  backend is green; product integration and live two-node/UI acceptance remain;
-- do not claim macOS/Windows/broker-reboot restoration without those separate
-  gates.
+- do not resurrect retired job/subagent routes;
+- do not grant Files root from one File;
+- do not grant Git inventory/write from one Review;
+- do not treat pairing/browser auth/path/label/tab/ticket as resource authority;
+- do not expose route/grant/key material to browser state;
+- do not retarget Agent/model/provider/PTY from ActiveTarget;
+- do not silently fall back Local after remote loss;
+- do not auto-start or claim a PTY from view selection;
+- do not claim the two-node gate unless the production flow actually ran.
+
+Update `REMOTE-DEVICE-TRUST.md`, Workspace `TODO.md`, this file and
+`CURRENT_HANDOFF.md` with exact factual evidence at the checkpoint.

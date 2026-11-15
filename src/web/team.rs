@@ -336,6 +336,7 @@ fn application_configured(
             super::ApplicationScope {
                 workspace_options: None,
                 address,
+                browser: super::resolve_browser_origin(address, None)?,
                 pairing_code: code.to_owned(),
                 local_owner_uid: None,
                 owned_sessions_only: true,

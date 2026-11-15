@@ -6,7 +6,7 @@ use aw_store::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 fn binding() -> SessionBinding {
     SessionBinding {
@@ -2135,6 +2135,20 @@ fn identity_continuity_authenticates_same_stable_user_across_workspace_replica()
     );
     assert_eq!(workspace_applied.writer.writer_node_id, target_node);
 
+    let requester_machine = target
+        .register_remote_machine(
+            &actor,
+            Some(&domain.id),
+            &source_node,
+            Some("identity-source"),
+        )
+        .unwrap();
+    assert_eq!(requester_machine.node_id, source_node);
+    assert_eq!(
+        requester_machine.owning_domain_id.as_deref(),
+        Some(domain.id.as_str())
+    );
+
     let grant = target
         .identity_continuity_accept(&actor, &domain.id, &source_node)
         .unwrap();
@@ -2168,6 +2182,37 @@ fn identity_continuity_authenticates_same_stable_user_across_workspace_replica()
     assert_eq!(authenticated.user_id, source_user.user_id);
     assert_eq!(authenticated.stable_principal, stable_actor.as_str());
     let authenticated_actor = PrincipalId::new(authenticated.stable_principal.clone()).unwrap();
+    let remote_view = target
+        .issue_remote_view_grant(
+            &authenticated,
+            &source_node,
+            &workspace.id,
+            BTreeSet::from([
+                aw_store::RemoteViewPermission::Files,
+                aw_store::RemoteViewPermission::Git,
+            ]),
+            60,
+        )
+        .unwrap();
+    assert_eq!(remote_view.requester_machine_node_id, source_node);
+    assert_eq!(remote_view.target_machine_node_id, target_node);
+    assert_eq!(remote_view.workspace_id, workspace.id);
+    target
+        .authorize_remote_view(
+            &remote_view.grant_id,
+            &authenticated,
+            &source_node,
+            aw_store::RemoteViewPermission::Files,
+        )
+        .unwrap();
+    target
+        .authorize_remote_view(
+            &remote_view.grant_id,
+            &authenticated,
+            &source_node,
+            aw_store::RemoteViewPermission::Git,
+        )
+        .unwrap();
     assert_eq!(
         target
             .session(&authenticated_actor, &session.id)

@@ -22,6 +22,41 @@ const RENDEZVOUS_RETRY: Duration = Duration::from_millis(250);
 const PUNCH_ROUNDS: usize = 8;
 const PUNCH_DELAY: Duration = Duration::from_millis(20);
 
+#[derive(Clone, Debug)]
+struct RecentRendezvousMatch {
+    first_node_id: String,
+    first_nonce: String,
+    second_node_id: String,
+    second_nonce: String,
+    expires_at: u64,
+}
+
+impl RecentRendezvousMatch {
+    fn contains(&self, registration: &RendezvousRegistration) -> bool {
+        (registration.node_id == self.first_node_id && registration.nonce == self.first_nonce)
+            || (registration.node_id == self.second_node_id
+                && registration.nonce == self.second_nonce)
+    }
+}
+
+fn remember_recent_rendezvous_match(
+    recent: &mut HashMap<String, RecentRendezvousMatch>,
+    max_rooms: usize,
+    room: String,
+    matched: RecentRendezvousMatch,
+) {
+    if !recent.contains_key(&room) && recent.len() >= max_rooms {
+        if let Some(oldest) = recent
+            .iter()
+            .min_by_key(|(_, matched)| matched.expires_at)
+            .map(|(room, _)| room.clone())
+        {
+            recent.remove(&oldest);
+        }
+    }
+    recent.insert(room, matched);
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateKind {
@@ -583,6 +618,15 @@ where
         })?;
         let deadline = tokio::time::Instant::now() + opts.lifetime;
         let mut rooms: HashMap<String, (SocketAddr, RendezvousRegistration, u64)> = HashMap::new();
+        // A registration is retransmitted every RENDEZVOUS_RETRY while its
+        // caller waits for a peer. After a successful match, one already-sent
+        // duplicate may still arrive. Without an exact-generation tombstone,
+        // that stale datagram can become the first side of the next reuse of
+        // the same room and pair a fresh service with an old connection
+        // attempt. Keep only the exact signed (node, nonce) registrations from
+        // recent matches; a fresh registration has a fresh nonce and remains
+        // immediately eligible to reuse the room.
+        let mut recent_matches: HashMap<String, RecentRendezvousMatch> = HashMap::new();
         let mut buffer = vec![0u8; MAX_RENDEZVOUS_PACKET];
         let mut registrations = 0u64;
         let mut rooms_created = 0u64;
@@ -596,6 +640,7 @@ where
             rooms.retain(|_, (_, entry, expires)| {
                 *expires > now_epoch && entry.expires_at > now_epoch
             });
+            recent_matches.retain(|_, matched| matched.expires_at > now_epoch);
             rooms_expired = rooms_expired.saturating_add((before - rooms.len()) as u64);
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -630,6 +675,12 @@ where
                 continue;
             }
             registrations = registrations.saturating_add(1);
+            if recent_matches
+                .get(&registration.room)
+                .is_some_and(|matched| matched.contains(&registration))
+            {
+                continue;
+            }
             if let Some((first_addr, first, _)) = rooms.remove(&registration.room) {
                 if first.node_id == registration.node_id {
                     let expires = registration
@@ -667,6 +718,19 @@ where
                     .send_to(&second_bytes, source)
                     .await
                     .map_err(|_| Error::Transport("reusable rendezvous send failed"))?;
+                let recent_expires = now_secs().saturating_add(opts.room_ttl.as_secs());
+                remember_recent_rendezvous_match(
+                    &mut recent_matches,
+                    opts.max_rooms,
+                    registration.room.clone(),
+                    RecentRendezvousMatch {
+                        first_node_id: first.node_id.clone(),
+                        first_nonce: first.nonce.clone(),
+                        second_node_id: registration.node_id.clone(),
+                        second_nonce: registration.nonce.clone(),
+                        expires_at: recent_expires,
+                    },
+                );
                 pairs_matched = pairs_matched.saturating_add(1);
                 continue;
             }
@@ -1089,5 +1153,33 @@ mod tests {
         assert!(validate_room(&"a".repeat(64)).is_ok());
         assert!(validate_room(&"A".repeat(64)).is_err());
         assert!(validate_room("short").is_err());
+    }
+
+    #[test]
+    fn recent_rendezvous_match_ignores_only_exact_retransmits() {
+        let registration = |node_id: &str, nonce: &str| RendezvousRegistration {
+            version: RENDEZVOUS_VERSION,
+            room: "a".repeat(64),
+            node_id: node_id.into(),
+            public_key: "00".repeat(32),
+            cert_der: "certificate".into(),
+            nonce: nonce.into(),
+            expires_at: 100,
+            candidates: Vec::new(),
+            signature: "signature".into(),
+        };
+        let matched = RecentRendezvousMatch {
+            first_node_id: "node_a".into(),
+            first_nonce: "nonce_a1".into(),
+            second_node_id: "node_b".into(),
+            second_nonce: "nonce_b1".into(),
+            expires_at: 100,
+        };
+
+        assert!(matched.contains(&registration("node_a", "nonce_a1")));
+        assert!(matched.contains(&registration("node_b", "nonce_b1")));
+        assert!(!matched.contains(&registration("node_a", "nonce_a2")));
+        assert!(!matched.contains(&registration("node_b", "nonce_b2")));
+        assert!(!matched.contains(&registration("node_c", "nonce_a1")));
     }
 }

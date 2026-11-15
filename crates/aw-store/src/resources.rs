@@ -882,6 +882,36 @@ impl SessionStore {
         }
         workspace_row(&c, &ids[0])
     }
+    /// Resolve one exact active Workspace hosted by this store's local Machine.
+    ///
+    /// This is a Machine-owner lookup, not user/Domain authorization: it exists
+    /// for services that are separately capability-bound to a locally hosted
+    /// Workspace. Display names are intentionally not accepted.
+    pub fn local_hosted_workspace_exact(&self, workspace_id: &str) -> Result<WorkspaceInfo> {
+        let c = self.connection()?;
+        let local_machine: String = db(c.query_row(
+            "SELECT value FROM store_meta WHERE key='local_machine_id'",
+            [],
+            |r| r.get(0),
+        ))?;
+        let found: bool = db(c.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM workspaces
+                 WHERE workspace_id=?1
+                   AND host_machine_id=?2
+                   AND kind='hosted'
+                   AND archived_at IS NULL
+             )",
+            params![workspace_id, local_machine],
+            |r| r.get(0),
+        ))?;
+        if !found {
+            return Err(Error::Denied(
+                "exact Workspace is not active and hosted by this local Machine",
+            ));
+        }
+        workspace_row(&c, workspace_id)
+    }
     pub fn local_workspace(
         &self,
         actor: &PrincipalId,
@@ -1030,16 +1060,39 @@ impl SessionStore {
         peer_node_id: &str,
         display_name: Option<&str>,
     ) -> Result<MachineInfo> {
-        let domain = match domain_selector {
-            Some(selector) => self.domain(actor, selector)?,
-            None => self.default_domain(actor)?,
-        };
         let peer = self.awnet_peer_by_node_id(peer_node_id)?;
         if peer.trust_state != "trusted" {
             return Err(Error::Denied(
                 "remote Machine peer is not currently trusted",
             ));
         }
+        // Imported Workspace-replica Domains deliberately carry no local Domain
+        // membership/authority projection. They may still explicitly register the
+        // exact authenticated control AwNode as a local remote-Machine projection;
+        // labels and unrelated peers remain insufficient.
+        let replica_domain = if let Some(selector) = domain_selector {
+            let c = self.connection()?;
+            db(c.query_row(
+                "SELECT d.domain_id
+                   FROM domains d
+                   JOIN workspace_replica_domains r ON r.domain_id=d.domain_id
+                  WHERE d.domain_id=?1 AND d.status='active' AND r.source_node_id=?2",
+                params![selector, peer.node_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional())?
+        } else {
+            None
+        };
+        let domain = if let Some(domain_id) = replica_domain.as_deref() {
+            let c = self.connection()?;
+            domain_row(&c, domain_id)?
+        } else {
+            match domain_selector {
+                Some(selector) => self.domain(actor, selector)?,
+                None => self.default_domain(actor)?,
+            }
+        };
         let local = self.local_machine()?;
         if local.node_id == peer.node_id {
             return Err(Error::Denied(
@@ -1059,12 +1112,22 @@ impl SessionStore {
                 |r| r.get(0),
             )
             .optional())?;
-        if !matches!(role.as_deref(), Some("owner" | "admin")) {
+        let replica_control: bool = db(tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM workspace_replica_domains
+                WHERE domain_id=?1 AND source_node_id=?2
+             )",
+            params![domain.id, peer.node_id],
+            |r| r.get(0),
+        ))?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) && !replica_control {
             return Err(Error::Denied(
                 "remote Machine registration requires Domain owner/admin authority",
             ));
         }
-        authority::require_domain_authority_write(&tx, &domain.id)?;
+        if !replica_control {
+            authority::require_domain_authority_write(&tx, &domain.id)?;
+        }
 
         let existing: Option<(String, Option<String>, String, String)> = db(tx
             .query_row(
@@ -1125,7 +1188,8 @@ impl SessionStore {
                 "domain_id":domain.id,
                 "machine_id":machine_id,
                 "peer_id":peer.id,
-                "node_id":peer.node_id
+                "node_id":peer.node_id,
+                "replica_control":replica_control
             }),
         )?;
         db(tx.commit())?;

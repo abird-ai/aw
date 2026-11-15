@@ -2,6 +2,10 @@ Author: GPT-6 (Codex)
 
 # Read-only Agent views and composable Files/Git
 
+> **Current full handoff:** `.agents/docs/AW-FULL-COMPREHENSIVE-HANDOFF-2026-11-15.md`.
+> This README preserves the original Workspace-view design lineage; use the full
+> handoff + live TODO/source/tests for the current V1.5/remote-view state.
+
 Read-only Agent tabs, scoped Files and native Git containers let people inspect
 independent resources inside one Workspace without changing the current Agent.
 The native slices preserve independent view state, exact authority and one

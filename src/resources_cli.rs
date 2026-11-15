@@ -3596,6 +3596,12 @@ pub(crate) enum MachineReadArg {
     Sessions,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub(crate) enum RemoteViewGrantArg {
+    Files,
+    Git,
+}
+
 #[cfg(feature = "net")]
 fn trusted_git_path() -> Result<PathBuf> {
     let path = std::env::var_os("AW_GIT")
@@ -3920,6 +3926,12 @@ pub(crate) enum NetCommand {
         /// Explicitly allow verified device proofs to mint native auth sessions up to this TTL.
         #[arg(long)]
         auth_session_max_ttl: Option<u64>,
+        /// Explicitly allow verified portable device proofs to mint remote Workspace read grants up to this TTL.
+        #[arg(long, requires = "remote_view_grant")]
+        remote_view_max_ttl: Option<u64>,
+        /// Exact read surfaces this identity-auth server may grant. Repeatable.
+        #[arg(long = "remote-view-grant", value_enum, requires = "remote_view_max_ttl")]
+        remote_view_grant: Vec<RemoteViewGrantArg>,
         #[arg(long, default_value = "0.0.0.0:0")]
         listen: SocketAddr,
         #[arg(long = "stun")]
@@ -4112,7 +4124,12 @@ pub(crate) enum NetCommand {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
-    /// Serve one capability-bound typed read-only Machine service request.
+    /// Serve capability-bound typed read-only Machine service requests.
+    ///
+    /// Ordinary Machine reads remain one-shot. An explicitly Workspace-bound
+    /// remote-view service stays resident so one SurfaceHost owns a stable
+    /// source/scope plus retained Git inventories/Reviews across fresh
+    /// MachineLink transports; timeout while idle is not authority loss.
     MachineServiceServe {
         peer: String,
         #[arg(long)]
@@ -4126,6 +4143,10 @@ pub(crate) enum NetCommand {
         /// Locally chosen exported root. The remote peer cannot replace this path.
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Bind this serve instance to one exact hosted Workspace for v35 remote-view reads.
+        #[cfg(feature = "surfaces")]
+        #[arg(long = "remote-view-workspace")]
+        remote_view_workspace: Option<String>,
         #[arg(long, default_value_t = 60)]
         lease: u64,
         #[arg(long, default_value = "0.0.0.0:0")]
@@ -5166,6 +5187,8 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
             store: o,
             lease,
             auth_session_max_ttl,
+            remote_view_max_ttl,
+            remote_view_grant,
             listen,
             stun,
             timeout,
@@ -5180,6 +5203,8 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                     o,
                     lease,
                     auth_session_max_ttl,
+                    remote_view_max_ttl,
+                    remote_view_grant,
                     listen,
                     stun,
                     timeout,
@@ -5192,6 +5217,14 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
             {
                 let dir = identity_store_dir(&o)?;
                 let (s, _) = identity_store_and_actor(&o)?;
+                let mut allowed =
+                    BTreeSet::from([crate::awnet::MachineCapability::IdentityAuthenticate]);
+                for grant in remote_view_grant {
+                    allowed.insert(match grant {
+                        RemoteViewGrantArg::Files => crate::awnet::MachineCapability::FileRead,
+                        RemoteViewGrantArg::Git => crate::awnet::MachineCapability::GitRead,
+                    });
+                }
                 let result = crate::awnet::serve_identity_auth(
                     &s,
                     &dir,
@@ -5205,14 +5238,12 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                                 stun,
                                 timeout: Duration::from_secs(timeout),
                             },
-                            allowed: BTreeSet::from([
-                                crate::awnet::MachineCapability::IdentityAuthenticate,
-                            ]),
+                            allowed,
                             lease: Duration::from_secs(lease),
                         },
                         domain_id,
                         auth_session_max_ttl,
-                        remote_view_max_ttl: None,
+                        remote_view_max_ttl,
                     },
                 )?;
                 print(&result, o.json)?;
@@ -5741,6 +5772,8 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
             store: o,
             grant,
             root,
+            #[cfg(feature = "surfaces")]
+            remote_view_workspace,
             lease,
             listen,
             stun,
@@ -5749,7 +5782,10 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
             #[cfg(not(feature = "net"))]
             {
                 let _ = (
-                    peer, room, rendezvous, o, grant, root, lease, listen, stun, timeout,
+                    peer, room, rendezvous, o, grant, root,
+                    #[cfg(feature = "surfaces")]
+                    remote_view_workspace,
+                    lease, listen, stun, timeout,
                 );
                 return Err(Error::Config(
                     "this build disabled the AwNet QUIC feature".into(),
@@ -5763,30 +5799,87 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                     .collect::<Result<BTreeSet<_>>>()?;
                 let dir = store_dir(&o)?;
                 let (s, actor) = store_and_actor(&o)?;
-                let result = crate::awnet::serve_machine_service(
-                    &s,
-                    &dir,
-                    crate::awnet::MachineServiceServeOptions {
-                        link: crate::awnet::MachineLinkServeOptions {
-                            route: crate::awnet::PunchOptions {
-                                peer_node_id: peer,
-                                room,
-                                rendezvous,
-                                listen,
-                                stun,
-                                timeout: Duration::from_secs(timeout),
-                            },
-                            allowed,
-                            lease: Duration::from_secs(lease),
+                let git = trusted_git_path()?;
+                #[cfg(feature = "surfaces")]
+                let (remote_view_workspace_id, remote_workspace) =
+                    if let Some(selector) = remote_view_workspace {
+                        if !allowed.contains(&crate::awnet::MachineCapability::IdentityAuthenticate)
+                            || (!allowed.contains(&crate::awnet::MachineCapability::FileRead)
+                                && !allowed.contains(&crate::awnet::MachineCapability::GitRead))
+                        {
+                            return Err(Error::Config(
+                                "--remote-view-workspace requires --grant identity-authenticate and file-read and/or git-read"
+                                    .into(),
+                            ));
+                        }
+                        if o.domain.is_some() {
+                            return Err(Error::Config(
+                                "--remote-view-workspace is an exact Machine-hosted Workspace ID; --domain-id is not accepted in this mode"
+                                    .into(),
+                            ));
+                        }
+                        let workspace = s.local_hosted_workspace_exact(&selector)?;
+                        let host = std::sync::Arc::new(
+                            aw_surfaces::SurfaceHost::new(aw_surfaces::Options {
+                                root: root.clone(),
+                                git: git.clone(),
+                                bash: PathBuf::new(),
+                                actor: actor.as_str().to_owned(),
+                                allow_terminals: false,
+                                sites: Vec::new(),
+                            })
+                            .map_err(|_| {
+                                Error::Config(
+                                    "remote-view Workspace root could not be opened as a read-only surface"
+                                        .into(),
+                                )
+                            })?,
+                        );
+                        let projection: std::sync::Arc<
+                            dyn crate::awnet::RemoteWorkspaceProjection,
+                        > = std::sync::Arc::new(
+                            crate::awnet::remote_workspace_surface::SurfaceRemoteWorkspaceProjection::new(
+                                host,
+                                actor.as_str().to_owned(),
+                            ),
+                        );
+                        (Some(workspace.id), Some(projection))
+                    } else {
+                        (None, None)
+                    };
+                #[cfg(not(feature = "surfaces"))]
+                let (remote_view_workspace_id, remote_workspace) = (None, None);
+                let service = crate::awnet::MachineServiceServeOptions {
+                    link: crate::awnet::MachineLinkServeOptions {
+                        route: crate::awnet::PunchOptions {
+                            peer_node_id: peer,
+                            room,
+                            rendezvous,
+                            listen,
+                            stun,
+                            timeout: Duration::from_secs(timeout),
                         },
-                        actor,
-                        root,
-                        git: trusted_git_path()?,
-                        remote_view_workspace_id: None,
-                        remote_workspace: None,
+                        allowed,
+                        lease: Duration::from_secs(lease),
                     },
-                )?;
-                print(&result, o.json)?;
+                    actor,
+                    root,
+                    git,
+                    remote_view_workspace_id,
+                    remote_workspace,
+                };
+                if service.remote_view_workspace_id.is_some() {
+                    loop {
+                        match crate::awnet::serve_machine_service(&s, &dir, service.clone()) {
+                            Ok(result) => print(&result, o.json)?,
+                            Err(Error::Timeout) => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                } else {
+                    let result = crate::awnet::serve_machine_service(&s, &dir, service)?;
+                    print(&result, o.json)?;
+                }
             }
         }
         NetCommand::MachineRead {

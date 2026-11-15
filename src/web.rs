@@ -650,6 +650,75 @@ fn safe_json(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.split(';').next().unwrap_or("").trim() == "application/json")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserOrigin {
+    authority: String,
+    origin: String,
+    cookie_name: String,
+}
+
+fn resolve_browser_origin(address: SocketAddr, configured: Option<&str>) -> Result<BrowserOrigin> {
+    let authority = if let Some(value) = configured {
+        let uri = value.parse::<axum::http::Uri>().map_err(|_| {
+            Error::Config("--browser-origin must be an absolute http:// loopback origin".into())
+        })?;
+        if uri.scheme_str() != Some("http")
+            || uri.authority().is_none()
+            || uri
+                .path_and_query()
+                .is_some_and(|value| value.as_str() != "/")
+        {
+            return Err(Error::Config(
+                "--browser-origin must be exactly http://LOOPBACK[:PORT] with no path/query/fragment"
+                    .into(),
+            ));
+        }
+        let raw = uri.authority().expect("checked authority").as_str();
+        if raw.contains('@') {
+            return Err(Error::Config(
+                "--browser-origin must not contain credentials".into(),
+            ));
+        }
+        let parsed = uri.authority().expect("checked authority");
+        let host = parsed.host().trim_matches(['[', ']']);
+        let canonical_host = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) if ip.is_loopback() => match ip {
+                std::net::IpAddr::V4(_) => ip.to_string(),
+                std::net::IpAddr::V6(_) => format!("[{ip}]"),
+            },
+            Ok(_) => {
+                return Err(Error::Config(
+                    "--browser-origin host must be loopback".into(),
+                ))
+            }
+            Err(_) if host.eq_ignore_ascii_case("localhost") => "localhost".into(),
+            Err(_) => {
+                return Err(Error::Config(
+                    "--browser-origin host must be localhost or a loopback IP".into(),
+                ))
+            }
+        };
+        match parsed.port_u16() {
+            Some(port) => format!("{canonical_host}:{port}"),
+            None => canonical_host,
+        }
+    } else {
+        address.to_string()
+    };
+    let origin = format!("http://{authority}");
+    let digest = Sha256::digest(authority.as_bytes());
+    let suffix = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(BrowserOrigin {
+        authority,
+        origin,
+        cookie_name: format!("aw_session_{suffix}"),
+    })
+}
+
 /// Explicit ephemeral owner for SDK tests/consumers. The normal CLI uses
 /// serve_with_state unless --no-state was explicitly selected.
 pub async fn serve<C>(agent: Agent, listen: SocketAddr, shutdown: C) -> Result<()>
@@ -680,6 +749,20 @@ pub async fn serve_with_workspace<C>(
 where
     C: Future<Output = ()> + Send + 'static,
 {
+    serve_with_workspace_origin(agent, persistence, options, listen, None, shutdown).await
+}
+
+pub async fn serve_with_workspace_origin<C>(
+    agent: Agent,
+    persistence: Option<PersistentSession>,
+    options: Option<WorkspaceOptions>,
+    listen: SocketAddr,
+    configured_browser_origin: Option<String>,
+    shutdown: C,
+) -> Result<()>
+where
+    C: Future<Output = ()> + Send + 'static,
+{
     if !listen.ip().is_loopback() {
         return Err(Error::Config(
             "web binds only to a numeric loopback address".into(),
@@ -687,11 +770,22 @@ where
     }
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let address = listener.local_addr()?;
+    let browser = resolve_browser_origin(address, configured_browser_origin.as_deref())?;
     let pairing_code = random_token()?;
     let durable = persistence.is_some();
-    let (router, app) =
-        application_with_workspace(agent, persistence, options, address, &pairing_code)?;
-    eprintln!("aw web: http://{address}");
+    let (router, app) = application_with_workspace_origin(
+        agent,
+        persistence,
+        options,
+        address,
+        &pairing_code,
+        Some(browser.clone()),
+    )?;
+    if browser.origin == format!("http://{address}") {
+        eprintln!("aw web: {}", browser.origin);
+    } else {
+        eprintln!("aw web: {} (listening on http://{address})", browser.origin);
+    }
     eprintln!("Pairing code (one use, expires in 5 minutes): {pairing_code}");
     eprintln!("Private loopback owner · {}. Current accounts/tools only; browser provider keys are never collected.",if durable{"durable history"}else{"explicit memory-only mode"});
     // Expired browser authority cannot leave a shell control surface live.
@@ -751,6 +845,21 @@ pub async fn serve_single_user<C>(
 where
     C: Future<Output = ()> + Send + 'static,
 {
+    serve_single_user_origin(agent, persistence, options, local, listen, None, shutdown).await
+}
+
+pub async fn serve_single_user_origin<C>(
+    agent: Agent,
+    persistence: Option<PersistentSession>,
+    options: Option<WorkspaceOptions>,
+    local: LocalWebOptions,
+    listen: SocketAddr,
+    configured_browser_origin: Option<String>,
+    shutdown: C,
+) -> Result<()>
+where
+    C: Future<Output = ()> + Send + 'static,
+{
     if !listen.ip().is_loopback() {
         return Err(Error::Config(
             "web binds only to a numeric loopback address".into(),
@@ -758,6 +867,7 @@ where
     }
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let address = listener.local_addr()?;
+    let browser = resolve_browser_origin(address, configured_browser_origin.as_deref())?;
     let code = random_token()?; // retained only for shared router construction; never shown/used.
     let uid = local.context.effective_uid;
     let (router, app) = application_scoped(
@@ -766,6 +876,7 @@ where
         ApplicationScope {
             workspace_options: options,
             address,
+            browser: browser.clone(),
             pairing_code: code,
             local_owner_uid: uid,
             owned_sessions_only: false,
@@ -773,7 +884,11 @@ where
             local_settings: Some(local),
         },
     )?;
-    eprintln!("aw web: http://{address}");
+    if browser.origin == format!("http://{address}") {
+        eprintln!("aw web: {}", browser.origin);
+    } else {
+        eprintln!("aw web: {} (listening on http://{address})", browser.origin);
+    }
     eprintln!("Local single-user mode · no pairing · configure providers/models in Settings.");
     let stop = app.clone();
     axum::serve(listener, router)
@@ -805,6 +920,22 @@ pub async fn serve_local_owner<C>(
 where
     C: Future<Output = ()> + Send + 'static,
 {
+    serve_local_owner_origin(agent, persistence, options, socket, http, None, shutdown).await
+}
+
+#[cfg(target_os = "linux")]
+pub async fn serve_local_owner_origin<C>(
+    agent: Agent,
+    persistence: Option<PersistentSession>,
+    options: Option<WorkspaceOptions>,
+    socket: &std::path::Path,
+    http: Option<SocketAddr>,
+    configured_browser_origin: Option<String>,
+    shutdown: C,
+) -> Result<()>
+where
+    C: Future<Output = ()> + Send + 'static,
+{
     let uid = aw_client::local::effective_uid().map_err(|e| Error::Config(e.to_string()))?;
     if agent.actor().as_str() != format!("unix:{uid}") {
         return Err(Error::Denied(
@@ -827,13 +958,30 @@ where
         Some(l) => l.local_addr()?,
         None => SocketAddr::from(([127, 0, 0, 1], 0)),
     };
+    if listener.is_none() && configured_browser_origin.is_some() {
+        return Err(Error::Config(
+            "browser origin requires an enabled owner HTTP listener".into(),
+        ));
+    }
+    let browser = resolve_browser_origin(address, configured_browser_origin.as_deref())?;
     let code = random_token()?;
-    let (router, app) =
-        application_configured(agent, persistence, options, address, &code, Some(uid))?;
+    let (router, app) = application_configured_origin(
+        agent,
+        persistence,
+        options,
+        address,
+        &code,
+        Some(browser.clone()),
+        Some(uid),
+    )?;
     eprintln!("aw owner: {} · unix:{uid}", socket.display());
     eprintln!("Attach uses explicitly configured OWNER accounts/tools; no client credentials are uploaded or inferred.");
     if listener.is_some() {
-        eprintln!("aw web: http://{address}");
+        if browser.origin == format!("http://{address}") {
+            eprintln!("aw web: {}", browser.origin);
+        } else {
+            eprintln!("aw web: {} (listening on http://{address})", browser.origin);
+        }
         eprintln!("Pairing code (one use, expires in 5 minutes): {code}");
         eprintln!("EXPLICIT GRANT: pairing this browser uses the same Unix-owner principal, saved-session access and configured account authority.");
     }
@@ -910,6 +1058,7 @@ fn application_with_state(
 struct ApplicationScope {
     workspace_options: Option<WorkspaceOptions>,
     address: SocketAddr,
+    browser: BrowserOrigin,
     pairing_code: String,
     local_owner_uid: Option<u32>,
     owned_sessions_only: bool,
@@ -917,6 +1066,7 @@ struct ApplicationScope {
     local_settings: Option<LocalWebOptions>,
 }
 
+#[cfg(test)]
 fn application_with_workspace(
     agent: Agent,
     persistence: Option<PersistentSession>,
@@ -924,7 +1074,7 @@ fn application_with_workspace(
     address: SocketAddr,
     pairing_code: &str,
 ) -> Result<(Router, AppState)> {
-    application_configured(
+    application_with_workspace_origin(
         agent,
         persistence,
         workspace_options,
@@ -933,6 +1083,25 @@ fn application_with_workspace(
         None,
     )
 }
+fn application_with_workspace_origin(
+    agent: Agent,
+    persistence: Option<PersistentSession>,
+    workspace_options: Option<WorkspaceOptions>,
+    address: SocketAddr,
+    pairing_code: &str,
+    browser: Option<BrowserOrigin>,
+) -> Result<(Router, AppState)> {
+    application_configured_origin(
+        agent,
+        persistence,
+        workspace_options,
+        address,
+        pairing_code,
+        browser,
+        None,
+    )
+}
+#[cfg(test)]
 fn application_configured(
     agent: Agent,
     persistence: Option<PersistentSession>,
@@ -941,12 +1110,32 @@ fn application_configured(
     pairing_code: &str,
     local_owner_uid: Option<u32>,
 ) -> Result<(Router, AppState)> {
+    application_configured_origin(
+        agent,
+        persistence,
+        workspace_options,
+        address,
+        pairing_code,
+        None,
+        local_owner_uid,
+    )
+}
+fn application_configured_origin(
+    agent: Agent,
+    persistence: Option<PersistentSession>,
+    workspace_options: Option<WorkspaceOptions>,
+    address: SocketAddr,
+    pairing_code: &str,
+    browser: Option<BrowserOrigin>,
+    local_owner_uid: Option<u32>,
+) -> Result<(Router, AppState)> {
     application_scoped(
         agent,
         persistence,
         ApplicationScope {
             workspace_options,
             address,
+            browser: browser.unwrap_or(resolve_browser_origin(address, None)?),
             pairing_code: pairing_code.to_owned(),
             local_owner_uid,
             owned_sessions_only: false,
@@ -1001,6 +1190,7 @@ fn application_scoped(
     let ApplicationScope {
         workspace_options,
         address,
+        browser,
         pairing_code,
         local_owner_uid,
         owned_sessions_only,
@@ -1083,9 +1273,9 @@ fn application_scoped(
         Arc::new(AppInner {
             local_owner_uid,
             owned_sessions_only,
-            authority: address.to_string(),
-            origin: format!("http://{address}"),
-            cookie_name: format!("aw_session_{}", address.port()),
+            authority: browser.authority,
+            origin: browser.origin,
+            cookie_name: browser.cookie_name,
             auth: Mutex::new(Auth {
                 pairing_hash: hash(pairing_code.as_bytes()),
                 pairing_expires: Instant::now() + PAIR_TTL,
@@ -3610,6 +3800,12 @@ mod tests {
         }
     }
     fn app() -> (Router, AppState, Arc<AtomicUsize>) {
+        app_with_browser_origin(None)
+    }
+
+    fn app_with_browser_origin(
+        configured_origin: Option<&str>,
+    ) -> (Router, AppState, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let agent = Agent::builder(
             Arc::new(Echo(calls.clone())),
@@ -3617,7 +3813,11 @@ mod tests {
         )
         .build()
         .unwrap();
-        let (r, s) = application(agent, HOST.parse().unwrap(), CODE).unwrap();
+        let address = HOST.parse().unwrap();
+        let browser =
+            configured_origin.map(|origin| resolve_browser_origin(address, Some(origin)).unwrap());
+        let (r, s) =
+            application_with_workspace_origin(agent, None, None, address, CODE, browser).unwrap();
         (r, s, calls)
     }
     fn local_app() -> (Router, AppState, PathBuf) {
@@ -3689,6 +3889,7 @@ mod tests {
             ApplicationScope {
                 workspace_options: None,
                 address: HOST.parse().unwrap(),
+                browser: resolve_browser_origin(HOST.parse().unwrap(), None).unwrap(),
                 pairing_code: CODE.to_owned(),
                 local_owner_uid: uid,
                 owned_sessions_only: false,
@@ -3701,11 +3902,24 @@ mod tests {
     }
 
     fn request(method: &str, path: &str, body: serde_json::Value, cookie: Option<&str>) -> Request {
+        request_at_origin(method, path, body, cookie, &format!("http://{HOST}"))
+    }
+
+    fn request_at_origin(
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+        cookie: Option<&str>,
+        origin: &str,
+    ) -> Request {
+        let authority = origin
+            .strip_prefix("http://")
+            .expect("test browser origin must be http");
         let mut b = Request::builder()
             .method(method)
             .uri(path)
-            .header("host", HOST)
-            .header("origin", format!("http://{HOST}"))
+            .header("host", authority)
+            .header("origin", origin)
             .header("content-type", "application/json");
         if let Some(cookie) = cookie {
             b = b.header("cookie", cookie);
@@ -4132,6 +4346,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn browser_origin_accepts_only_exact_loopback_http_origins() {
+        let address: SocketAddr = HOST.parse().unwrap();
+        let default = resolve_browser_origin(address, None).unwrap();
+        assert_eq!(default.authority, HOST);
+        assert_eq!(default.origin, format!("http://{HOST}"));
+
+        let forwarded = resolve_browser_origin(address, Some("http://127.0.0.1:18787")).unwrap();
+        assert_eq!(forwarded.authority, "127.0.0.1:18787");
+        assert_eq!(forwarded.origin, "http://127.0.0.1:18787");
+        assert_ne!(forwarded.cookie_name, default.cookie_name);
+
+        let localhost = resolve_browser_origin(address, Some("http://LOCALHOST:18787/")).unwrap();
+        assert_eq!(localhost.authority, "localhost:18787");
+        assert_eq!(localhost.origin, "http://localhost:18787");
+
+        for value in [
+            "https://127.0.0.1:18787",
+            "http://192.168.1.10:18787",
+            "http://user@127.0.0.1:18787",
+            "http://127.0.0.1:18787/path",
+            "http://127.0.0.1:18787/?query=1",
+        ] {
+            assert!(
+                resolve_browser_origin(address, Some(value)).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_browser_origin_supports_different_ssh_forward_port() {
+        const FORWARDED: &str = "http://127.0.0.1:18787";
+        let (router, state, _) = app_with_browser_origin(Some(FORWARDED));
+        assert_eq!(state.0.authority, "127.0.0.1:18787");
+        assert_eq!(state.0.origin, FORWARDED);
+
+        let response = router
+            .clone()
+            .oneshot(request_at_origin(
+                "GET",
+                "/",
+                serde_json::Value::Null,
+                None,
+                FORWARDED,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .clone()
+            .oneshot(request("GET", "/", serde_json::Value::Null, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "listener authority must not remain accepted after explicit browser-origin override"
+        );
+
+        let response = router
+            .oneshot(request_at_origin(
+                "POST",
+                "/api/pair",
+                serde_json::json!({"code":CODE}),
+                None,
+                FORWARDED,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .starts_with(&format!("{}=", state.0.cookie_name)));
     }
 
     #[tokio::test]

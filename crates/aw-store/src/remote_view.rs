@@ -338,20 +338,6 @@ fn validate_authenticated_device(
         ));
     }
 
-    let member: bool = db(c.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM domain_memberships
-            WHERE domain_id=?1 AND user_id=?2 AND status='active'
-         )",
-        params![authenticated.domain_id, authenticated.user_id],
-        |r| r.get(0),
-    ))?;
-    if !member {
-        return Err(Error::Denied(
-            "remote-view user is no longer an active Domain member",
-        ));
-    }
-
     let binding: Option<(
         Option<String>,
         Option<String>,
@@ -390,7 +376,7 @@ fn validate_authenticated_device(
     let Some((
         Some(device_id),
         Some(public_key),
-        _source,
+        source_node_id,
         user_epoch,
         domain_epoch,
         binding_state,
@@ -408,6 +394,37 @@ fn validate_authenticated_device(
     {
         return Err(Error::Denied(
             "remote-view device binding is stale or revoked",
+        ));
+    }
+    let local_member: bool = db(c.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM domain_memberships
+            WHERE domain_id=?1 AND user_id=?2 AND status='active'
+         )",
+        params![authenticated.domain_id, authenticated.user_id],
+        |r| r.get(0),
+    ))?;
+    // Workspace replicas intentionally do not import local Domain roles. For that
+    // replica-only case, the latest active Phase-30 binding from the exact
+    // recorded control AwNode is the conservative read-only membership
+    // projection: source export includes only active Domain members, resync
+    // revokes bindings absent from the next signed snapshot, and no owner/admin
+    // role is materialized locally.
+    let replica_member: bool = if local_member {
+        false
+    } else {
+        db(c.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM workspace_replica_domains
+                WHERE domain_id=?1 AND source_node_id=?2
+             )",
+            params![authenticated.domain_id, source_node_id],
+            |r| r.get(0),
+        ))?
+    };
+    if !local_member && !replica_member {
+        return Err(Error::Denied(
+            "remote-view user is no longer an active Domain member",
         ));
     }
 

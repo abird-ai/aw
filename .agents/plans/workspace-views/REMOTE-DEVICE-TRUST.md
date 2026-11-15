@@ -287,9 +287,26 @@ The current uncommitted tree now consumes the opaque target registry in the V1.5
 
 A fresh embedded Chrome render for this new selector was not established in this turn: the L5 synchronous build wrapper repeatedly terminated during final linking before `target/debug/aw` was replaced, with no compiler diagnostic. The previous V1.5 screenshot matrix remains valid for its previously accepted states but is **not** evidence of live remote-target switching.
 
-The remaining product boundary is the real production-authorized two-node continuity→grant→remote target selection→Files/Git/Review→reconnect→revoke acceptance plus offline/stale presentation. No hand-authored continuity snapshot may substitute for that gate.
+## 9. Production server CLI enablement — 2026-11-15
 
-## 9. Still open before remote views are a product feature
+The current uncommitted tree now exposes the already-implemented grant/projection backend through explicit production server commands:
+
+- `identity-auth-serve` gains `--remote-view-max-ttl SECONDS` plus repeatable typed `--remote-view-grant files|git`;
+- TTL and surface policy require each other, so there is no half-enabled remote-view grant mode;
+- the identity-auth MachineLink always grants `identity-authenticate` and adds only the explicitly configured File/Git read capabilities;
+- `machine-service-serve` gains optional `--remote-view-workspace WORKSPACE`;
+- remote-view serve mode requires explicit `identity-authenticate` plus file-read and/or git-read grants;
+- remote-view Machine service accepts only the exact Workspace ID, rejects a simultaneous Domain selector, and requires that Workspace to be active, hosted, and bound to this exact local Machine;
+- the server then creates one retained read-only `SurfaceHost` over the host-selected `--root`, wires `SurfaceRemoteWorkspaceProjection` into Machine service v3, and remains resident across fresh MachineLink transports so retained inventory/Review IDs keep one exact source/scope lifetime;
+- absent these flags, legacy identity-auth and ordinary Machine-read behavior is unchanged;
+- `SurfaceHost::new` now requires an absolute shell only when `allow_terminals=true`; read-only hosts no longer need a fake shell path;
+- focused CLI opt-in, exact capability, and downgrade-fence tests pass;
+- full `aw-surfaces` with trusted test environment: **35/35**;
+- isolated full-product `cargo check` and strict Clippy `-D warnings`, format and diff checks pass.
+
+The remaining product boundary is now purely the real production-authorized two-node continuity→grant→remote target selection→Files/Git/Review→reconnect→revoke acceptance plus offline/stale presentation. No hand-authored continuity snapshot may substitute for that gate.
+
+## 10. Still open before remote views are a product feature
 
 This checkpoint does **not** claim completed remote views.
 
@@ -316,3 +333,106 @@ Phase-30 continuity path when the product remote-view integration supplies both
 actual Machines/Domain context.
 
 No remote view may locally fall back or retarget an existing Session/Agent.
+
+## 11. Real two-AwNode production gate checkpoint — 2026-11-15
+
+The production path has now been exercised on L5 with two fresh independent
+file-backed durable state roots and public `aw` commands only. No SQLite
+authority, continuity state or v35 grant was hand-authored.
+
+### 11.1 Production authority established
+
+The executed path reached:
+
+1. direct QUIC pair/trust;
+2. source Domain/device creation and explicit target remote-Machine
+   registration;
+3. signed Workspace writer handoff A → B;
+4. target replica explicitly registering the exact trusted recorded control
+   AwNode as requester remote Machine;
+5. real Phase-30 continuity accept + signed sync;
+6. requester device-key proof;
+7. identity-auth server explicit Files+Git remote-view policy;
+8. real **server-issued v35 grant**;
+9. owner-private `aw web --web-remote-target ...` admission;
+10. opaque `rwt_...` descriptor visible to browser state with peer/room/
+    Domain/Workspace/grant/device-key material absent.
+
+The replica bootstrap required two narrow production fixes, without importing
+Domain-admin authority:
+
+- `register_remote_machine` may operate on an imported replica Domain only for
+  the exact trusted `workspace_replica_domains.source_node_id`; ordinary
+  Domains still require owner/admin + Domain-authority write;
+- v35's active-member fence on a replica-only Domain may use only the active
+  portable Phase-30 binding from that exact recorded source. Local authoritative
+  Domains continue to require a real active `domain_memberships` row.
+
+Focused regression extends the existing continuity/Workspace-replica flow
+through explicit Machine registration and real Files+Git grant issue/
+authorization. Post-cleanup evidence: v35 **4/4**, Phase-30 → explicit replica
+Machine → v35 **1/1**, writer handoff/failback **1/1**.
+
+### 11.2 Protected service lifetime and rendezvous hardening
+
+The live gate also exposed and fixed two independent production issues:
+
+- a Workspace-bound remote Machine service must remain resident: one retained
+  `SurfaceHost` now owns stable source/scope and retained immutable Git
+  inventory/Review IDs across fresh MachineLink transports; ordinary Machine
+  service remains one-shot;
+- reusable rendezvous now remembers only exact recently matched
+  `(node_id, nonce)` generations and ignores late retransmits from those exact
+  generations. A new nonce is immediately eligible to reuse the room.
+
+The exact-generation regression passes **1/1**. Same-room live isolation also
+proves two consecutive `net punch` routes and two consecutive one-shot Machine
+services succeed.
+
+### 11.3 Current blocker: first protected read from live web owner
+
+The gate is **not complete**. The first
+`POST /api/workspace/target/capabilities` returns HTTP **503** while the same
+`aw web` process owns the requester store.
+
+Diagnosis-only logging was added temporarily and removed before this checkpoint.
+It established:
+
+- rendezvous/QUIC gets far enough for client `connection.open_bi()` and server
+  `connection.accept_bi()`;
+- the client send half is already closed before writing the first 4-byte
+  RouteHello length: Quinn `ClosedStream`;
+- the server receives a zero-byte FIN: `FinishedEarly(0)`;
+- browser-facing output remains the intended bounded generic
+  `remote Workspace target unavailable`.
+
+Isolation evidence:
+
+- plain Machine FileRead on the same two durable nodes succeeds;
+- identity-auth followed by same-room plain Machine FileRead succeeds;
+- two sequential same-room one-shot Machine services succeed;
+- real remote-view v3 grant issuance succeeds; after cleanly stopping the
+  `aw web` owner, the same durable requester state + same room performs a plain
+  Machine FileRead successfully;
+- the remote HTTP worker already uses `tokio::task::spawn_blocking`, so the
+  defect is not simply blocking network I/O directly on an async HTTP task.
+
+The remaining engineering target is therefore the **in-web-owner protected-read
+direct-route/QUIC stream lifecycle/context**. Do not weaken:
+
+- v35 grant/device/member/Machine fences;
+- local owner lock/custody;
+- opaque browser target secrecy;
+- exact-source retained File/Review semantics;
+- no-Local-fallback behavior.
+
+### 11.4 Not yet accepted
+
+Because the first protected read is blocked, do not claim:
+
+- production Files/search/File read;
+- Git inventory/open/retained immutable Review;
+- reconnect/re-read of an exact retained source;
+- revoke → stale/unavailable/no Local fallback after a successful protected
+  read;
+- live non-empty draft/caret and PTY preservation during remote selection.

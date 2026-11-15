@@ -151,9 +151,12 @@ impl SurfaceHost {
             .root
             .canonicalize()
             .map_err(|_| Error::Invalid("workspace root"))?;
-        if !options.root.is_dir() || !options.git.is_absolute() || !options.bash.is_absolute() {
+        if !options.root.is_dir()
+            || !options.git.is_absolute()
+            || (options.allow_terminals && !options.bash.is_absolute())
+        {
             return Err(Error::Invalid(
-                "explicit root and absolute programs required",
+                "explicit root/Git and absolute shell when terminals are enabled required",
             ));
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -402,6 +405,19 @@ mod tests {
             sites: vec![],
         }
     }
+    #[test]
+    fn read_only_host_does_not_require_a_shell_program() {
+        let mut opts = options();
+        opts.bash = PathBuf::new();
+        opts.allow_terminals = false;
+        assert!(SurfaceHost::new(opts).is_ok());
+
+        let mut opts = options();
+        opts.bash = PathBuf::new();
+        opts.allow_terminals = true;
+        assert!(SurfaceHost::new(opts).is_err());
+    }
+
     #[test]
     fn creation_launches_nothing() {
         let h = SurfaceHost::new(options()).unwrap();

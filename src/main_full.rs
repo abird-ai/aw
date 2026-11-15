@@ -572,6 +572,10 @@ pub(crate) struct WebCliArgs {
     /// Browser listener address; in agent mode requires --serve-web.
     #[arg(long)]
     listen: Option<SocketAddr>,
+    /// Exact browser-visible loopback origin, e.g. http://127.0.0.1:18787 for an SSH forward.
+    /// Defaults to the listener's actual http://host:port.
+    #[arg(long = "browser-origin", value_name = "HTTP_LOOPBACK_ORIGIN")]
+    browser_origin: Option<String>,
     /// Explicitly allow browser-originated model turns to use current tool grants.
     #[arg(long)]
     allow_web_tools: bool,
@@ -979,6 +983,7 @@ pub(crate) struct RunArgs {
     #[cfg(feature = "workspace")]
     workspace_layout: Option<PathBuf>,
     listen: Option<SocketAddr>,
+    browser_origin: Option<String>,
     profile: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
@@ -1111,6 +1116,7 @@ impl RunArgs {
             #[cfg(feature = "workspace")]
             workspace_layout,
             listen: web_options.listen,
+            browser_origin: web_options.browser_origin,
             profile: provider.profile,
             model: provider.model,
             base_url: provider.base_url,
@@ -1698,8 +1704,10 @@ fn run_agent(args: RunArgs) -> Result<u8> {
     if wants_workspace && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
         return Err(Error::Config("aw workspace open requires a terminal; use aw --workspace-id NAME --output-print for one-shot runs".into()));
     }
-    if args.listen.is_some() && !wants_web {
-        return Err(Error::Config("--web-listen requires web mode".into()));
+    if (args.listen.is_some() || args.browser_origin.is_some()) && !wants_web {
+        return Err(Error::Config(
+            "--listen/--browser-origin require web mode".into(),
+        ));
     }
     if args.web && !args.prompt.is_empty() {
         return Err(Error::Config(
@@ -2430,13 +2438,14 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     #[cfg(feature = "surfaces")]
                     remote_workspace_router,
                 };
-                runtime()?.block_on(aw::web::serve_single_user(
+                runtime()?.block_on(aw::web::serve_single_user_origin(
                     agent,
                     persistent,
                     workspace,
                     local,
                     args.listen
                         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8787))),
+                    args.browser_origin.clone(),
                     interrupt(),
                 ))?;
                 return Ok(0);
@@ -2670,12 +2679,13 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                             let token = stop.clone();
                             tasks.push(tokio::spawn(async move { listener.run(token).await }));
                         }
-                        let result = aw::web::serve_local_owner(
+                        let result = aw::web::serve_local_owner_origin(
                             agent,
                             host.persistent,
                             workspace,
                             &owner_socket,
                             http,
+                            args.browser_origin.clone(),
                             interrupt(),
                         )
                         .await;
@@ -2702,12 +2712,13 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     }
                     #[cfg(not(feature = "device"))]
                     {
-                        let result = aw::web::serve_local_owner(
+                        let result = aw::web::serve_local_owner_origin(
                             agent,
                             host.persistent,
                             workspace,
                             &owner_socket,
                             http,
+                            args.browser_origin.clone(),
                             interrupt(),
                         )
                         .await;
@@ -2725,12 +2736,13 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                 })?;
                 return Ok(0);
             }
-            runtime()?.block_on(aw::web::serve_with_workspace(
+            runtime()?.block_on(aw::web::serve_with_workspace_origin(
                 agent,
                 host.persistent,
                 workspace,
                 args.listen
                     .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8787))),
+                args.browser_origin.clone(),
                 interrupt(),
             ))?;
             return Ok(0);
@@ -6074,6 +6086,41 @@ mod phase54_cli_tests {
         }
     }
 
+    #[cfg(feature = "web")]
+    #[test]
+    fn web_listener_and_browser_origin_are_independent_optional_inputs() {
+        let cli = parse(&[
+            "aw",
+            "web",
+            "--listen",
+            "127.0.0.1:8787",
+            "--browser-origin",
+            "http://127.0.0.1:18787",
+        ]);
+        match cli.command {
+            Some(TopCommand::Web { args }) => {
+                assert_eq!(
+                    args.web_options.listen,
+                    Some("127.0.0.1:8787".parse().unwrap())
+                );
+                assert_eq!(
+                    args.web_options.browser_origin.as_deref(),
+                    Some("http://127.0.0.1:18787")
+                );
+            }
+            _ => panic!("web listener/browser origin must remain typed web inputs"),
+        }
+
+        let cli = parse(&["aw", "web"]);
+        match cli.command {
+            Some(TopCommand::Web { args }) => {
+                assert!(args.web_options.listen.is_none());
+                assert!(args.web_options.browser_origin.is_none());
+            }
+            _ => panic!("web defaults must leave listener/origin derivation to runtime"),
+        }
+    }
+
     #[cfg(all(feature = "net", feature = "surfaces"))]
     #[test]
     fn web_remote_target_configs_are_repeatable_owner_private_paths() {
@@ -6096,6 +6143,82 @@ mod phase54_cli_tests {
                 );
             }
             _ => panic!("web remote target configs must remain typed web-owner inputs"),
+        }
+    }
+
+    #[cfg(all(feature = "net", feature = "surfaces"))]
+    #[test]
+    fn remote_workspace_server_opt_ins_are_explicit_and_typed() {
+        let cli = parse(&[
+            "aw",
+            "net",
+            "identity-auth-serve",
+            "node_requester",
+            "dom_fixture",
+            "--room",
+            "ab",
+            "--rendezvous",
+            "127.0.0.1:40000",
+            "--remote-view-max-ttl",
+            "600",
+            "--remote-view-grant",
+            "files",
+            "--remote-view-grant",
+            "git",
+        ]);
+        match cli.command {
+            Some(TopCommand::Net {
+                command:
+                    resources_cli::NetCommand::IdentityAuthServe {
+                        remote_view_max_ttl,
+                        remote_view_grant,
+                        ..
+                    },
+            }) => {
+                assert_eq!(remote_view_max_ttl, Some(600));
+                assert_eq!(
+                    remote_view_grant,
+                    vec![
+                        resources_cli::RemoteViewGrantArg::Files,
+                        resources_cli::RemoteViewGrantArg::Git,
+                    ]
+                );
+            }
+            _ => panic!("identity auth serve must retain explicit remote-view grant policy"),
+        }
+
+        let cli = parse(&[
+            "aw",
+            "net",
+            "machine-service-serve",
+            "node_requester",
+            "--room",
+            "ab",
+            "--rendezvous",
+            "127.0.0.1:40000",
+            "--grant",
+            "identity-authenticate",
+            "--grant",
+            "file-read",
+            "--remote-view-workspace",
+            "ws_fixture",
+            "--root",
+            "/tmp",
+        ]);
+        match cli.command {
+            Some(TopCommand::Net {
+                command:
+                    resources_cli::NetCommand::MachineServiceServe {
+                        remote_view_workspace,
+                        grant,
+                        ..
+                    },
+            }) => {
+                assert_eq!(remote_view_workspace.as_deref(), Some("ws_fixture"));
+                assert!(grant.iter().any(|value| value == "identity-authenticate"));
+                assert!(grant.iter().any(|value| value == "file-read"));
+            }
+            _ => panic!("Machine service must retain exact remote-view Workspace binding"),
         }
     }
 
