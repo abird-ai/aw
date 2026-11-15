@@ -2692,7 +2692,7 @@ fn decode_user_device_seed(value: &str) -> Result<[u8; 32]> {
 }
 
 #[cfg(feature = "net")]
-fn load_user_device_key(path: &std::path::Path) -> Result<ed25519_dalek::SigningKey> {
+pub(crate) fn load_user_device_key(path: &std::path::Path) -> Result<ed25519_dalek::SigningKey> {
     let mut file = aw_platform::open_private_existing(path, false).map_err(|_| {
         Error::Denied("user-device key requires platform-verified owner-only custody")
     })?;
@@ -5783,6 +5783,7 @@ pub(crate) fn net(command: NetCommand) -> Result<u8> {
                         root,
                         git: trusted_git_path()?,
                         remote_view_workspace_id: None,
+                        remote_workspace: None,
                     },
                 )?;
                 print(&result, o.json)?;

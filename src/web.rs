@@ -89,6 +89,26 @@ mod workspace {
         ))
     }
 
+    pub(super) async fn remote_capabilities(
+        State(app): State<AppState>,
+        _payload: std::result::Result<
+            Json<serde_json::Value>,
+            axum::extract::rejection::JsonRejection,
+        >,
+    ) -> ApiResult<Json<serde_json::Value>> {
+        action(State(app), _payload).await
+    }
+
+    pub(super) async fn remote_action(
+        State(app): State<AppState>,
+        _payload: std::result::Result<
+            Json<serde_json::Value>,
+            axum::extract::rejection::JsonRejection,
+        >,
+    ) -> ApiResult<Json<serde_json::Value>> {
+        action(State(app), _payload).await
+    }
+
     pub(super) async fn script() -> impl IntoResponse {
         (
             [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
@@ -149,6 +169,8 @@ struct AppInner {
     surfaces: Option<Arc<aw_surfaces::SurfaceHost>>,
     #[cfg(feature = "surfaces")]
     surface_slots: Arc<Semaphore>,
+    #[cfg(feature = "surfaces")]
+    remote_workspace_router: Option<Arc<dyn RemoteWorkspaceTargetRouter>>,
     csp: String,
     context_job: Mutex<Option<context_flow::Job>>,
     context_recipients: Mutex<BTreeMap<String, String>>,
@@ -158,6 +180,52 @@ struct AppInner {
     #[cfg(feature = "surfaces")]
     dock: Mutex<dock::Registry>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteWorkspaceTargetDescriptor {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub files: bool,
+    pub git: bool,
+    pub expires_at: i64,
+}
+
+#[cfg(feature = "surfaces")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteWorkspaceTargetErrorCode {
+    SourceChanged,
+    ScopeChanged,
+    Denied,
+    Invalid,
+    Conflict,
+    Limit,
+    Unavailable,
+}
+
+#[cfg(feature = "surfaces")]
+#[derive(Clone, Debug)]
+pub struct RemoteWorkspaceTargetError {
+    pub code: RemoteWorkspaceTargetErrorCode,
+    pub message: &'static str,
+    pub source_id: Option<String>,
+    pub scope_id: Option<String>,
+}
+
+#[cfg(feature = "surfaces")]
+pub trait RemoteWorkspaceTargetRouter: Send + Sync {
+    fn descriptors(&self) -> Vec<RemoteWorkspaceTargetDescriptor>;
+    fn capabilities(
+        &self,
+        target_id: &str,
+    ) -> std::result::Result<serde_json::Value, RemoteWorkspaceTargetError>;
+    fn execute(
+        &self,
+        target_id: &str,
+        command: aw_surfaces::Command,
+    ) -> std::result::Result<serde_json::Value, RemoteWorkspaceTargetError>;
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ResourceSummary {
     #[serde(default)]
@@ -181,6 +249,8 @@ pub struct LocalWebOptions {
     pub domain_selector: Option<String>,
     pub workspace_selector: Option<String>,
     pub resources: ResourceSummary,
+    #[cfg(feature = "surfaces")]
+    pub remote_workspace_router: Option<Arc<dyn RemoteWorkspaceTargetRouter>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -923,6 +993,11 @@ fn application_scoped(
         .as_ref()
         .map(|settings| settings.resources.clone())
         .unwrap_or_default();
+    #[cfg(feature = "surfaces")]
+    let remote_workspace_router = scope
+        .local_settings
+        .as_ref()
+        .and_then(|settings| settings.remote_workspace_router.clone());
     let ApplicationScope {
         workspace_options,
         address,
@@ -1070,6 +1145,8 @@ fn application_scoped(
             surfaces,
             #[cfg(feature = "surfaces")]
             surface_slots: Arc::new(Semaphore::new(4)),
+            #[cfg(feature = "surfaces")]
+            remote_workspace_router,
             csp,
             context_job: Mutex::new(None),
             context_recipients: Mutex::new(BTreeMap::new()),
@@ -1103,6 +1180,8 @@ fn application_scoped(
         .route("/workspace.css",get(workspace::styles))
         .route("/api/workspace",get(workspace::capabilities))
         .route("/api/workspace/action",post(workspace::action))
+        .route("/api/workspace/target/capabilities",post(workspace::remote_capabilities))
+        .route("/api/workspace/target/action",post(workspace::remote_action))
         .route("/api/settings",get(settings_view))
         .route("/api/settings/profile",post(settings_profile))
         .route("/api/settings/profile/remove",post(settings_profile_remove))
@@ -3440,6 +3519,78 @@ mod tests {
         assert!(value.get("text").is_none());
     }
 
+    #[cfg(feature = "surfaces")]
+    #[derive(Debug)]
+    struct FixtureRemoteRouter {
+        targets: Vec<RemoteWorkspaceTargetDescriptor>,
+    }
+    #[cfg(feature = "surfaces")]
+    impl RemoteWorkspaceTargetRouter for FixtureRemoteRouter {
+        fn descriptors(&self) -> Vec<RemoteWorkspaceTargetDescriptor> {
+            self.targets.clone()
+        }
+
+        fn capabilities(
+            &self,
+            target_id: &str,
+        ) -> std::result::Result<serde_json::Value, RemoteWorkspaceTargetError> {
+            if self.targets.iter().any(|target| target.id == target_id) {
+                Ok(serde_json::json!({
+                    "schema":1,
+                    "root":"remote",
+                    "source_id":"surface_remote_fixture",
+                    "view_root":{"id":"scope_remote_fixture","label":"remote"},
+                    "files":true,
+                    "git_read":true,
+                    "git_write":false,
+                    "terminals":false,
+                    "sites":[],
+                    "max_terminals":0,
+                    "terminal_lease_seconds":0
+                }))
+            } else {
+                Err(RemoteWorkspaceTargetError {
+                    code: RemoteWorkspaceTargetErrorCode::Denied,
+                    message: "remote Workspace target unavailable",
+                    source_id: None,
+                    scope_id: None,
+                })
+            }
+        }
+
+        fn execute(
+            &self,
+            target_id: &str,
+            command: aw_surfaces::Command,
+        ) -> std::result::Result<serde_json::Value, RemoteWorkspaceTargetError> {
+            if !self.targets.iter().any(|target| target.id == target_id) {
+                return Err(RemoteWorkspaceTargetError {
+                    code: RemoteWorkspaceTargetErrorCode::Denied,
+                    message: "remote Workspace target unavailable",
+                    source_id: None,
+                    scope_id: None,
+                });
+            }
+            match command {
+                aw_surfaces::Command::View {
+                    source_id,
+                    scope_id,
+                    request,
+                } => Ok(serde_json::json!({
+                    "source_id":source_id,
+                    "scope_id":scope_id,
+                    "result":{"kind":"fixture","request":request}
+                })),
+                _ => Err(RemoteWorkspaceTargetError {
+                    code: RemoteWorkspaceTargetErrorCode::Denied,
+                    message: "remote Workspace target accepts read-only View commands only",
+                    source_id: None,
+                    scope_id: None,
+                }),
+            }
+        }
+    }
+
     struct Echo(Arc<AtomicUsize>);
     impl Provider for Echo {
         fn stream<'a>(
@@ -3470,6 +3621,12 @@ mod tests {
         (r, s, calls)
     }
     fn local_app() -> (Router, AppState, PathBuf) {
+        local_app_with_targets(Vec::new())
+    }
+
+    fn local_app_with_targets(
+        remote_workspace_targets: Vec<RemoteWorkspaceTargetDescriptor>,
+    ) -> (Router, AppState, PathBuf) {
         let root =
             std::env::temp_dir().join(format!("aw-local-web-test-{}", random_token().unwrap()));
         std::fs::create_dir_all(&root).unwrap();
@@ -3515,7 +3672,17 @@ mod tests {
             domain_selector: None,
             workspace_selector: None,
             resources: ResourceSummary::default(),
+            #[cfg(feature = "surfaces")]
+            remote_workspace_router: if remote_workspace_targets.is_empty() {
+                None
+            } else {
+                Some(Arc::new(FixtureRemoteRouter {
+                    targets: remote_workspace_targets.clone(),
+                }))
+            },
         };
+        #[cfg(not(feature = "surfaces"))]
+        let _ = remote_workspace_targets;
         let (router, state) = application_scoped(
             agent,
             None,
@@ -3639,6 +3806,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pair.status(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_workspace_capabilities_expose_only_opaque_remote_target_descriptors() {
+        let descriptor = RemoteWorkspaceTargetDescriptor {
+            id: "rwt_public_fixture".into(),
+            kind: "machine".into(),
+            label: "Remote build host".into(),
+            files: true,
+            git: true,
+            expires_at: 123456789,
+        };
+        let (router, _, root) = local_app_with_targets(vec![descriptor.clone()]);
+        let response = router
+            .oneshot(request(
+                "GET",
+                "/api/workspace",
+                serde_json::Value::Null,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["targets"], serde_json::json!([descriptor]));
+        let room = "ab".repeat(32);
+        let device_key = "22".repeat(32);
+        for secret in [
+            "node_private_fixture",
+            room.as_str(),
+            "rvg_private_fixture",
+            "ws_private_fixture",
+            device_key.as_str(),
+        ] {
+            assert!(!text.contains(secret));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "surfaces")]
+    #[tokio::test]
+    async fn local_remote_workspace_routes_only_typed_target_reads() {
+        let descriptor = RemoteWorkspaceTargetDescriptor {
+            id: "rwt_public_fixture".into(),
+            kind: "machine".into(),
+            label: "Remote build host".into(),
+            files: true,
+            git: true,
+            expires_at: 123456789,
+        };
+        let (router, _, root) = local_app_with_targets(vec![descriptor.clone()]);
+
+        let response = router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/workspace/target/capabilities",
+                serde_json::json!({"target_id":descriptor.id}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let caps: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(caps["source_id"], "surface_remote_fixture");
+        assert_eq!(caps["view_root"]["id"], "scope_remote_fixture");
+        assert_eq!(caps["git_write"], false);
+        assert_eq!(caps["terminals"], false);
+
+        let response = router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/workspace/target/action",
+                serde_json::json!({
+                    "target_id":"rwt_public_fixture",
+                    "command":{
+                        "op":"view",
+                        "source_id":"surface_remote_fixture",
+                        "scope_id":"scope_remote_fixture",
+                        "request":{"op":"file","path":"src/lib.rs"}
+                    }
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["source_id"], "surface_remote_fixture");
+        assert_eq!(value["scope_id"], "scope_remote_fixture");
+        assert_eq!(value["result"]["kind"], "fixture");
+
+        let response = router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/workspace/target/action",
+                serde_json::json!({
+                    "target_id":"rwt_public_fixture",
+                    "command":{"op":"capabilities"}
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = router
+            .oneshot(request(
+                "POST",
+                "/api/workspace/target/capabilities",
+                serde_json::json!({
+                    "target_id":"rwt_public_fixture",
+                    "room":"forged-browser-route"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let _ = std::fs::remove_dir_all(root);
     }
 

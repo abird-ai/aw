@@ -43,6 +43,12 @@ mod reachability;
 #[cfg(target_os = "linux")]
 mod remote_control;
 mod remote_sessions;
+#[cfg(all(feature = "web", feature = "surfaces"))]
+pub(crate) mod remote_workspace_registry;
+#[cfg(feature = "surfaces")]
+#[allow(dead_code)] // Serving-side SurfaceHost adapter is consumed by remote Workspace hosting.
+pub(crate) mod remote_workspace_surface;
+pub(crate) mod remote_workspace_target;
 mod routes;
 mod services;
 mod workspace_replica;

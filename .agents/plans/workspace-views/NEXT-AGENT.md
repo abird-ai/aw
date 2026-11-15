@@ -333,12 +333,7 @@ would not authorize merely to manufacture the two-node proof.
    maximize and a 17-second hidden-tab interval. Review/Build share one terminal
    custody component. Do not redo these screenshots/custody checks unless source
    changes.
-5. Product remote views remain the next open workspace-view slice: wire the
-   existing V1.5 Workspace target/lens and exact registered root/worktree views
-   to the v35 grant + protected AwNet read path, then run a real
-   production-authorized two-node continuity→grant→reconnect→read→revoke gate.
-   Keep Agent/member remote views separate unless that slice explicitly owns
-   them.
+5. Product remote views are now at the **live two-node acceptance boundary**. Host plumbing and V1.5 browser ActiveTarget semantics are implemented: Local | opaque remote Machine selector, lazy remote capability discovery, follower Files/Git rebind with navigator presentation preserved, contained previews cleared on target change, exact-source standalone pins with per-document readers, Local Review/Build PTY authority independent of target selection, and no Session/Agent execution retarget. Focused browser/controller gate is **85/85** and full-product check/strict Clippy are green. Next, use a real production-authorized pair of Machines and the real Phase-30 continuity path to run continuity→grant→select remote target→Files/search/Git inventory/open/retained Review→reconnect→re-read→revoke. During that live gate verify Agent Session/draft/caret and PTY inventory/input/resize owner remain unchanged, target loss becomes factual stale/unavailable presentation with **no Local fallback**, and a pinned standalone remote File/Review remains tied to its original source until its exact grant is revoked. Do not hand-author continuity state. Keep remote Agent/member views separate unless that slice explicitly owns them.
 6. Post-ACK arbitrary partitions, remote/distinct-Actor PTY custody,
    macOS/Windows custody/broker restoration and actual Windows retained-directory
    runtime acceptance remain separate after that.

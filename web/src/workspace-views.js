@@ -229,9 +229,9 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
       if (entry.reader && error?.status === 401) {
         clear();
       } else if (entry.reader && error?.status === 403) {
-        // Delegated cache lifetime is the exact grant lifetime. Never scrub an
-        // ordinary owner read or another grant for the same resource.
-        removeCache(entry, slot); publish(entry, { error: message, unavailable: true }); refreshValue(entry); emit("delegated-denied");
+        // Independent readers (delegated grants or explicit target pins) own
+        // their exact authority lifetime. Never scrub a follower on another source.
+        removeCache(entry, slot); publish(entry, { error: message, unavailable: true }); refreshValue(entry); emit("independent-denied");
       } else if (error?.status === 401 || (error?.status === 403 && error.code === "source_changed"
         && error.source_id === target.source_id && error.scope_id === target.scope_id)) clearSource();
       else if (error?.status === 403 && error.code === "scope_denied" && error.source_id === target.source_id && error.scope_id === target.scope_id) denyScope(target.scope_id, message);
@@ -299,11 +299,48 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
       || (a.origin && b.origin && a.origin.inventory_id === b.origin.inventory_id
         && a.origin.item_id === b.origin.item_id);
   }
+  function pinDocument(documentId, reader, authorityKey) {
+    ready();
+    const entry = documents.get(documentId);
+    if (!entry || entry.value.delegated || entry.reader || typeof reader !== "function"
+      || !text(authorityKey, 512) || entry.value.target.source_id !== source.source_id
+      || !scopes.has(entry.value.target.scope_id)) {
+      throw new Error("Pinned document requires the exact current Workspace source and reader.");
+    }
+    const tokens = cancelAll(entry);
+    entry.reader = reader;
+    entry.authorityKey = authorityKey;
+    publish(entry, { pinned: true, authorityKey });
+    refreshValue(entry);
+    emit("pin-document");
+    for (const token of tokens) token.control.abort();
+    if (!entry.value.data) void refreshDocument(documentId);
+    return true;
+  }
+  function unpinDocument(documentId) {
+    ready();
+    const entry = documents.get(documentId);
+    if (!entry || entry.value.delegated || !entry.value.pinned || !entry.reader
+      || entry.value.target.source_id !== source.source_id
+      || !entry.value.containerId || !containers.has(entry.value.containerId)
+      || !scopes.has(entry.value.target.scope_id)) {
+      return false;
+    }
+    const tokens = cancelAll(entry);
+    entry.reader = null;
+    entry.authorityKey = null;
+    publish(entry, { pinned: false, authorityKey: null });
+    refreshValue(entry);
+    emit("unpin-document");
+    for (const token of tokens) token.control.abort();
+    if (!entry.value.data) void refreshDocument(documentId);
+    return true;
+  }
   function moveDocument(documentId, destinationId) {
     ready();
     const document = documents.get(documentId);
     if (!document) throw new Error("Document is no longer open.");
-    if (document.reader) throw new Error("A delegated document cannot be moved into an unrelated Workspace scope.");
+    if (document.reader) throw new Error("An independently pinned/delegated document cannot move into a follower Workspace scope.");
     const destination = container(destinationId);
     const kind = document.value.kind === "file" ? "files" : "git";
     if (destination.value.kind !== kind || destination.value.unavailable || document.value.unavailable) {
@@ -323,7 +360,8 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
   }
   function closeContainer(containerId) {
     const entry = containers.get(containerId); if (!entry) return false;
-    const owned = [...documents.values()].filter(document => document.value.containerId === containerId);
+    const owned = [...documents.values()].filter(document =>
+      document.value.containerId === containerId && !document.reader);
     const tokens = [];
     for (const item of [entry, ...owned]) { tokens.push(...cancelAll(item)); scrub(item); }
     containers.delete(containerId);
@@ -430,7 +468,8 @@ export function createWorkspaceViews({ request, onChange = () => {}, externalDoc
       } });
       return Boolean(result);
     },
-    assertCanOpenDocument, openDelegatedDocument, refreshDocument, closeDocument, moveDocument, closeContainer, clearSource, clear,
+    assertCanOpenDocument, openDelegatedDocument, pinDocument, unpinDocument,
+    refreshDocument, closeDocument, moveDocument, closeContainer, clearSource, clear,
     dispose() { disposed = true; clear(); },
   });
 }

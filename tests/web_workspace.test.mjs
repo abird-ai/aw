@@ -294,6 +294,39 @@ test('source replacement clears same-named scopes, pending data and metadata bef
   await wsSettleFile(f, fresh, 'new source');
 });
 
+test('explicitly pinned breakout survives follower source replacement on its exact reader', async () => {
+  const f = wsFixture(), owner = f.state.openContainer('files');
+  const id = f.state.openFile(owner, 'src/lib.rs');
+  const original = await wsSettleFile(f, id, 'local pinned bytes');
+  const pinnedCalls = [];
+  const pinnedReader = (body, options) => new Promise((resolve, reject) =>
+    pinnedCalls.push({ body, ...options, resolve, reject }));
+  assert.equal(f.state.pinDocument(id, pinnedReader, 'active-target:local:surface-owner'), true);
+  assert.equal(f.state.getDocument(id).pinned, true);
+  assert.equal(f.state.getDocument(id).data, original);
+  assert.equal(f.state.getDocument(id).containerId, owner);
+
+  f.state.setSource({ source_id: 'surface-remote', view_root: { id: 'remote-root', label: '/remote' } });
+  assert.equal(f.state.listContainers().length, 0, 'followers are discarded for explicit rebind');
+  assert.equal(f.state.getDocument(id).data, original, 'pinned snapshot stays on its original source');
+  assert.deepEqual(f.state.getDocument(id).target,
+    { source_id: 'surface-owner', scope_id: 'launch-scope', path: 'src/lib.rs' });
+
+  const refresh = f.state.refreshDocument(id);
+  const call = pinnedCalls.at(-1);
+  assert.deepEqual(call.body, {
+    op: 'view', source_id: 'surface-owner', scope_id: 'launch-scope',
+    request: { op: 'file', path: 'src/lib.rs' },
+  });
+  call.resolve({ source_id: 'surface-owner', scope_id: 'launch-scope',
+    result: { context: 'launch-scope', path: 'src/lib.rs', text: 'still local', read_only: true } });
+  assert.equal(await refresh, true);
+  assert.equal(f.state.getDocument(id).data.text, 'still local');
+  assert.equal(f.state.unpinDocument(id), false, 'cannot silently rebind a pin after its follower container is gone');
+  const replacement = f.state.openContainer('files');
+  assert.throws(() => f.state.moveDocument(id, replacement), /independently pinned/);
+});
+
 test('delegated document survives ordinary source replacement and cannot move into a navigator scope', async () => {
   const f = wsFixture(), owner = f.state.openContainer('files');
   const ordinary = f.state.openFile(owner, 'src/lib.rs'); await wsSettleFile(f, ordinary, 'ordinary bytes');

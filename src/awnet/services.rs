@@ -11,10 +11,107 @@ use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 const MACHINE_SERVICE_VERSION: u16 = 1;
 const REMOTE_VIEW_SERVICE_VERSION: u16 = 2;
+const REMOTE_WORKSPACE_SERVICE_VERSION: u16 = 3;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteWorkspaceGitMode {
+    Changes,
+    Worktrees,
+    Branches,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteWorkspaceViewRequest {
+    Files { path: String },
+    FileSearch { query: String, limit: usize },
+    File { path: String },
+    GitList { mode: RemoteWorkspaceGitMode },
+    GitOpen { inventory_id: String, item_id: String },
+    Review { review_id: String },
+}
+
+impl RemoteWorkspaceViewRequest {
+    pub fn permission(&self) -> RemoteViewPermission {
+        match self {
+            Self::Files { .. } | Self::FileSearch { .. } | Self::File { .. } => {
+                RemoteViewPermission::Files
+            }
+            Self::GitList { .. } | Self::GitOpen { .. } | Self::Review { .. } => {
+                RemoteViewPermission::Git
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteWorkspaceRequest {
+    Capabilities { permission: RemoteViewPermission },
+    View {
+        source_id: String,
+        scope_id: String,
+        request: RemoteWorkspaceViewRequest,
+    },
+}
+
+impl RemoteWorkspaceRequest {
+    pub fn permission(&self) -> RemoteViewPermission {
+        match self {
+            Self::Capabilities { permission } => *permission,
+            Self::View { request, .. } => request.permission(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteWorkspaceErrorCode {
+    SourceChanged,
+    ScopeChanged,
+    Denied,
+    Invalid,
+    Conflict,
+    Limit,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteWorkspaceProjectionError {
+    pub code: RemoteWorkspaceErrorCode,
+    pub message: &'static str,
+}
+
+pub trait RemoteWorkspaceProjection: Send + Sync + std::fmt::Debug {
+    fn capabilities(
+        &self,
+        permission: RemoteViewPermission,
+    ) -> std::result::Result<serde_json::Value, RemoteWorkspaceProjectionError>;
+    fn view(
+        &self,
+        source_id: &str,
+        scope_id: &str,
+        request: &RemoteWorkspaceViewRequest,
+    ) -> std::result::Result<serde_json::Value, RemoteWorkspaceProjectionError>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteWorkspaceResponse {
+    Capabilities { capabilities: serde_json::Value },
+    View { envelope: serde_json::Value },
+    Error {
+        source_id: Option<String>,
+        scope_id: Option<String>,
+        code: RemoteWorkspaceErrorCode,
+        message: String,
+    },
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -28,6 +125,7 @@ pub enum MachineReadRequest {
     ViewFileList { path: String },
     ViewFileRead { path: String },
     ViewGitStatus,
+    RemoteWorkspace { workspace: RemoteWorkspaceRequest },
 }
 
 impl MachineReadRequest {
@@ -40,6 +138,10 @@ impl MachineReadRequest {
             | Self::ViewFileList { .. }
             | Self::ViewFileRead { .. } => MachineCapability::FileRead,
             Self::GitStatus | Self::ViewGitStatus => MachineCapability::GitRead,
+            Self::RemoteWorkspace { workspace } => match workspace.permission() {
+                RemoteViewPermission::Files => MachineCapability::FileRead,
+                RemoteViewPermission::Git => MachineCapability::GitRead,
+            },
             Self::Sessions => MachineCapability::SessionRead,
         }
     }
@@ -50,6 +152,7 @@ impl MachineReadRequest {
                 Some(RemoteViewPermission::Files)
             }
             Self::ViewGitStatus => Some(RemoteViewPermission::Git),
+            Self::RemoteWorkspace { workspace } => Some(workspace.permission()),
             _ => None,
         }
     }
@@ -116,6 +219,9 @@ pub enum MachineReadResponse {
     Sessions {
         sessions: Vec<RemoteSessionInfo>,
     },
+    RemoteWorkspace {
+        workspace: RemoteWorkspaceResponse,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +231,7 @@ pub struct MachineServiceServeOptions {
     pub root: PathBuf,
     pub git: PathBuf,
     pub remote_view_workspace_id: Option<String>,
+    pub remote_workspace: Option<Arc<dyn RemoteWorkspaceProjection>>,
 }
 
 #[derive(Clone, Debug)]
@@ -203,10 +310,10 @@ struct ServiceResponseEnvelope {
 }
 
 fn machine_service_version(request: &MachineReadRequest) -> u16 {
-    if request.remote_view_permission().is_some() {
-        REMOTE_VIEW_SERVICE_VERSION
-    } else {
-        MACHINE_SERVICE_VERSION
+    match request {
+        MachineReadRequest::RemoteWorkspace { .. } => REMOTE_WORKSPACE_SERVICE_VERSION,
+        _ if request.remote_view_permission().is_some() => REMOTE_VIEW_SERVICE_VERSION,
+        _ => MACHINE_SERVICE_VERSION,
     }
 }
 
@@ -294,7 +401,10 @@ fn authenticate_remote_view_read(
     challenge: &RemoteViewReadChallenge,
     proof: &RemoteViewReadProof,
 ) -> Result<AuthenticatedStableUser> {
-    if proof.version != REMOTE_VIEW_SERVICE_VERSION
+    if !matches!(
+        challenge.version,
+        REMOTE_VIEW_SERVICE_VERSION | REMOTE_WORKSPACE_SERVICE_VERSION
+    ) || proof.version != challenge.version
         || proof.lease_id != challenge.lease_id
         || proof.request_id != challenge.request_id
         || proof.grant_id != challenge.grant_id
@@ -327,6 +437,42 @@ fn authenticate_remote_view_read(
     Ok(authenticated)
 }
 
+fn remote_workspace_response(
+    projection: Option<&dyn RemoteWorkspaceProjection>,
+    request: &RemoteWorkspaceRequest,
+) -> Result<MachineReadResponse> {
+    let projection = projection.ok_or(Error::Denied(
+        "remote Workspace projection was not enabled by the serving host",
+    ))?;
+    let workspace = match request {
+        RemoteWorkspaceRequest::Capabilities { permission } => {
+            match projection.capabilities(*permission) {
+                Ok(capabilities) => RemoteWorkspaceResponse::Capabilities { capabilities },
+                Err(error) => RemoteWorkspaceResponse::Error {
+                    source_id: None,
+                    scope_id: None,
+                    code: error.code,
+                    message: error.message.into(),
+                },
+            }
+        }
+        RemoteWorkspaceRequest::View {
+            source_id,
+            scope_id,
+            request,
+        } => match projection.view(source_id, scope_id, request) {
+            Ok(envelope) => RemoteWorkspaceResponse::View { envelope },
+            Err(error) => RemoteWorkspaceResponse::Error {
+                source_id: Some(source_id.clone()),
+                scope_id: Some(scope_id.clone()),
+                code: error.code,
+                message: error.message.into(),
+            },
+        },
+    };
+    Ok(MachineReadResponse::RemoteWorkspace { workspace })
+}
+
 fn execute_read_request(
     store: &SessionStore,
     actor: &PrincipalId,
@@ -334,6 +480,7 @@ fn execute_read_request(
     git: &Path,
     lease: &MachineLinkLease,
     request: &MachineReadRequest,
+    remote_workspace: Option<&dyn RemoteWorkspaceProjection>,
 ) -> Result<MachineReadResponse> {
     if lease.expires_at <= now_secs() {
         return Err(Error::Denied("MachineLink lease expired"));
@@ -415,6 +562,9 @@ fn execute_read_request(
                 .map_err(|_| Error::Denied("Git status is unavailable for the exported root"))?;
             Ok(MachineReadResponse::GitStatus { status })
         }
+        MachineReadRequest::RemoteWorkspace { workspace } => {
+            remote_workspace_response(remote_workspace, workspace)
+        }
         MachineReadRequest::Sessions => {
             let sessions = store
                 .list(actor)?
@@ -486,7 +636,7 @@ pub fn serve_machine_service(
                 "Machine service did not bind this exported root to a remote-view Workspace",
             ))?;
             let challenge = RemoteViewReadChallenge {
-                version: REMOTE_VIEW_SERVICE_VERSION,
+                version: protocol_version,
                 lease_id: lease.lease_id.clone(),
                 request_id: envelope.request_id.clone(),
                 grant_id: hello.grant_id.clone(),
@@ -530,6 +680,7 @@ pub fn serve_machine_service(
             &opts.git,
             &lease,
             &envelope.request,
+            opts.remote_workspace.as_deref(),
         )?;
         if let Some((authenticated, permission, grant_id, workspace_id)) = &remote_authorization {
             let grant = store.authorize_remote_view(
@@ -662,7 +813,7 @@ pub fn request_machine_service(
         .await?;
         if let Some(remote) = &opts.remote_view {
             let challenge: RemoteViewReadChallenge = read_frame(&mut recv).await?;
-            if challenge.version != REMOTE_VIEW_SERVICE_VERSION
+            if challenge.version != protocol_version
                 || challenge.lease_id != lease.lease_id
                 || challenge.request_id != request_id
                 || challenge.grant_id != remote.grant.grant_id
@@ -689,7 +840,7 @@ pub fn request_machine_service(
             write_frame(
                 &mut send,
                 &RemoteViewReadProof {
-                    version: REMOTE_VIEW_SERVICE_VERSION,
+                    version: protocol_version,
                     lease_id: lease.lease_id.clone(),
                     request_id: request_id.clone(),
                     grant_id: remote.grant.grant_id.clone(),
@@ -767,6 +918,41 @@ mod tests {
             .remote_view_permission(),
             None
         );
+        let remote_files = MachineReadRequest::RemoteWorkspace {
+            workspace: RemoteWorkspaceRequest::View {
+                source_id: "surface_fixture".into(),
+                scope_id: "scope_fixture".into(),
+                request: RemoteWorkspaceViewRequest::File {
+                    path: "a.txt".into(),
+                },
+            },
+        };
+        assert_eq!(
+            remote_files.required_capability(),
+            MachineCapability::FileRead
+        );
+        assert_eq!(
+            remote_files.remote_view_permission(),
+            Some(RemoteViewPermission::Files)
+        );
+        assert_eq!(
+            machine_service_version(&remote_files),
+            REMOTE_WORKSPACE_SERVICE_VERSION
+        );
+        let remote_git = MachineReadRequest::RemoteWorkspace {
+            workspace: RemoteWorkspaceRequest::View {
+                source_id: "surface_fixture".into(),
+                scope_id: "scope_fixture".into(),
+                request: RemoteWorkspaceViewRequest::GitList {
+                    mode: RemoteWorkspaceGitMode::Changes,
+                },
+            },
+        };
+        assert_eq!(remote_git.required_capability(), MachineCapability::GitRead);
+        assert_eq!(
+            remote_git.remote_view_permission(),
+            Some(RemoteViewPermission::Git)
+        );
     }
 
     #[test]
@@ -808,6 +994,117 @@ mod tests {
         };
         let json = serde_json::to_value(&envelope).unwrap();
         assert!(json.get("remote_view").is_none());
+    }
+
+    #[derive(Debug)]
+    struct Projection;
+
+    impl RemoteWorkspaceProjection for Projection {
+        fn capabilities(
+            &self,
+            permission: RemoteViewPermission,
+        ) -> std::result::Result<serde_json::Value, RemoteWorkspaceProjectionError> {
+            Ok(serde_json::json!({
+                "source_id":"surface_fixture",
+                "view_root":{"id":"scope_fixture","label":"remote"},
+                "files": permission == RemoteViewPermission::Files,
+                "git_read": permission == RemoteViewPermission::Git
+            }))
+        }
+
+        fn view(
+            &self,
+            source_id: &str,
+            scope_id: &str,
+            request: &RemoteWorkspaceViewRequest,
+        ) -> std::result::Result<serde_json::Value, RemoteWorkspaceProjectionError> {
+            if source_id != "surface_fixture" {
+                return Err(RemoteWorkspaceProjectionError {
+                    code: RemoteWorkspaceErrorCode::SourceChanged,
+                    message: "source changed",
+                });
+            }
+            Ok(serde_json::json!({
+                "source_id": source_id,
+                "scope_id": scope_id,
+                "result": {"request": request}
+            }))
+        }
+    }
+
+    #[test]
+    fn remote_workspace_projection_preserves_typed_errors_as_read_results() {
+        let projection = Projection;
+        let capabilities = remote_workspace_response(
+            Some(&projection),
+            &RemoteWorkspaceRequest::Capabilities {
+                permission: RemoteViewPermission::Files,
+            },
+        )
+        .unwrap();
+        match capabilities {
+            MachineReadResponse::RemoteWorkspace {
+                workspace: RemoteWorkspaceResponse::Capabilities { capabilities },
+            } => {
+                assert_eq!(capabilities["files"], true);
+                assert_eq!(capabilities["git_read"], false);
+            }
+            other => panic!("unexpected capabilities response: {other:?}"),
+        }
+
+        let denied = remote_workspace_response(
+            Some(&projection),
+            &RemoteWorkspaceRequest::View {
+                source_id: "surface_wrong".into(),
+                scope_id: "scope_fixture".into(),
+                request: RemoteWorkspaceViewRequest::File {
+                    path: "src/lib.rs".into(),
+                },
+            },
+        )
+        .unwrap();
+        match denied {
+            MachineReadResponse::RemoteWorkspace {
+                workspace:
+                    RemoteWorkspaceResponse::Error {
+                        source_id,
+                        scope_id,
+                        code,
+                        ..
+                    },
+            } => {
+                assert_eq!(source_id.as_deref(), Some("surface_wrong"));
+                assert_eq!(scope_id.as_deref(), Some("scope_fixture"));
+                assert_eq!(code, RemoteWorkspaceErrorCode::SourceChanged);
+            }
+            other => panic!("unexpected error response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_workspace_v3_request_hash_binds_full_git_operation() {
+        let a = MachineReadRequest::RemoteWorkspace {
+            workspace: RemoteWorkspaceRequest::View {
+                source_id: "surface_fixture".into(),
+                scope_id: "scope_fixture".into(),
+                request: RemoteWorkspaceViewRequest::GitOpen {
+                    inventory_id: "inventory_fixture".into(),
+                    item_id: "item_a".into(),
+                },
+            },
+        };
+        let b = MachineReadRequest::RemoteWorkspace {
+            workspace: RemoteWorkspaceRequest::View {
+                source_id: "surface_fixture".into(),
+                scope_id: "scope_fixture".into(),
+                request: RemoteWorkspaceViewRequest::GitOpen {
+                    inventory_id: "inventory_fixture".into(),
+                    item_id: "item_b".into(),
+                },
+            },
+        };
+        assert_eq!(machine_service_version(&a), REMOTE_WORKSPACE_SERVICE_VERSION);
+        assert_ne!(request_sha256(&a).unwrap(), request_sha256(&b).unwrap());
     }
 
     #[test]

@@ -583,6 +583,10 @@ pub(crate) struct WebCliArgs {
     allow_web_terminals: bool,
     #[arg(long = "web-site")]
     web_sites: Vec<String>,
+    /// Owner-private JSON definition for one remote read-only Workspace target. Repeatable.
+    #[cfg(all(feature = "net", feature = "surfaces"))]
+    #[arg(long = "web-remote-target", value_name = "OWNER_PRIVATE_JSON")]
+    web_remote_targets: Vec<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1007,6 +1011,8 @@ pub(crate) struct RunArgs {
     web_workspace: bool,
     allow_web_terminals: bool,
     web_sites: Vec<String>,
+    #[cfg(all(feature = "net", feature = "surfaces"))]
+    web_remote_targets: Vec<PathBuf>,
     shared_profiles: Vec<String>,
     directory: Option<PathBuf>,
     system: Option<String>,
@@ -1145,6 +1151,8 @@ impl RunArgs {
             web_workspace: web_options.web_workspace,
             allow_web_terminals: web_options.allow_web_terminals,
             web_sites: web_options.web_sites,
+            #[cfg(all(feature = "net", feature = "surfaces"))]
+            web_remote_targets: web_options.web_remote_targets,
             shared_profiles: provider.shared_profiles,
             directory: target.directory,
             system: provider.system,
@@ -1816,6 +1824,20 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             "enable --web-workspace explicitly first".into(),
         ));
     }
+    #[cfg(all(feature = "net", feature = "surfaces"))]
+    if !args.web_remote_targets.is_empty() {
+        if !local_single_web {
+            return Err(Error::Config(
+                "--web-remote-target is currently supported only by local single-user aw web"
+                    .into(),
+            ));
+        }
+        if args.no_state {
+            return Err(Error::Config(
+                "--web-remote-target requires durable owner state".into(),
+            ));
+        }
+    }
     if let Some(message) = args.resources.action(
         args.config.as_deref(), args.directory.as_deref().unwrap_or(Path::new(".")),
     )? {
@@ -2331,6 +2353,34 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     }
                 }
                 #[cfg(feature = "surfaces")]
+                let remote_workspace_router: Option<Arc<dyn aw::web::RemoteWorkspaceTargetRouter>> = {
+                    #[cfg(feature = "net")]
+                    {
+                        if args.web_remote_targets.is_empty() {
+                            None
+                        } else {
+                            let owned_store = local_web_store.clone().ok_or(Error::Denied(
+                                "remote Workspace targets require durable local owner state",
+                            ))?;
+                            let state_dir = directory.clone().ok_or(Error::Denied(
+                                "remote Workspace targets require an owner state directory",
+                            ))?;
+                            let registry =
+                                awnet::remote_workspace_registry::RemoteWorkspaceTargetRegistry::connect_private_configs(
+                                    owned_store,
+                                    agent.actor().clone(),
+                                    state_dir,
+                                    &args.web_remote_targets,
+                                )?;
+                            Some(registry)
+                        }
+                    }
+                    #[cfg(not(feature = "net"))]
+                    {
+                        None
+                    }
+                };
+                #[cfg(feature = "surfaces")]
                 let workspace = {
                     let mut sites = Vec::new();
                     for (n, value) in args.web_sites.iter().enumerate() {
@@ -2377,6 +2427,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                         context: loaded_resources.context().iter().map(|resource| resource.label()).collect(),
                         skills: loaded_resources.skills().iter().map(|resource| resource.label()).collect(),
                     },
+                    #[cfg(feature = "surfaces")]
+                    remote_workspace_router,
                 };
                 runtime()?.block_on(aw::web::serve_single_user(
                     agent,
@@ -6019,6 +6071,31 @@ mod phase54_cli_tests {
                 cli.command,
                 Some(TopCommand::Workspace { command: None })
             ));
+        }
+    }
+
+    #[cfg(all(feature = "net", feature = "surfaces"))]
+    #[test]
+    fn web_remote_target_configs_are_repeatable_owner_private_paths() {
+        let cli = parse(&[
+            "aw",
+            "web",
+            "--web-remote-target",
+            "/private/remote-a.json",
+            "--web-remote-target",
+            "/private/remote-b.json",
+        ]);
+        match cli.command {
+            Some(TopCommand::Web { args }) => {
+                assert_eq!(
+                    args.web_options.web_remote_targets,
+                    vec![
+                        PathBuf::from("/private/remote-a.json"),
+                        PathBuf::from("/private/remote-b.json"),
+                    ]
+                );
+            }
+            _ => panic!("web remote target configs must remain typed web-owner inputs"),
         }
     }
 

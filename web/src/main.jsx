@@ -2024,7 +2024,12 @@ function App() {
   const [workspaceChange, setWorkspaceChange] = createSignal(null);
   const [workspaceSource, setWorkspaceSource] = createSignal(null);
   const [workspaceSourceMode, setWorkspaceSourceMode] = createSignal(null);
+  const [workspaceTargets, setWorkspaceTargets] = createSignal([]);
+  const [workspaceLocalSource, setWorkspaceLocalSource] = createSignal(null);
+  const [activeWorkspaceTarget, setActiveWorkspaceTarget] = createSignal(null);
   const [workspaceToken, setWorkspaceToken] = createSignal({});
+  let workspaceTargetRequest = 0;
+  let workspaceRetargeting = false;
   const [selectedContainers, setSelectedContainers] = createSignal({ files: null, git: null });
   const [containedDocuments, setContainedDocuments] = createSignal({});
   const [brokenOutDocuments, setBrokenOutDocuments] = createSignal(new Set());
@@ -2039,18 +2044,42 @@ function App() {
     if (controller) presentationControllers.set(documentId, controller);
     else presentationControllers.delete(documentId);
   };
-  const workspaceViews = createWorkspaceViews({
-    request: async (body, { signal }) => {
-      const lifetime = observationLifetime;
-      try {
-        return workspaceSourceMode() === "team-delegated"
-          ? await api("/api/team/delegation/surface/action", body, 15000, { signal })
-          : await workspaceAction(body, { signal });
-      } catch (error) {
-        if (lifetime === observationLifetime && error.status === 401) expireBrowserAccess();
-        throw error;
+  function normalizeWorkspaceTargets(value) {
+    if (!Array.isArray(value)) return Object.freeze([]);
+    const targets = value.map(target => {
+      if (!target || Object.keys(target).some(key => !["id", "kind", "label", "files", "git", "expires_at"].includes(key))
+        || typeof target.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(target.id)
+        || target.kind !== "machine" || typeof target.label !== "string" || target.label.length < 1
+        || target.label.length > 256 || /[\u0000-\u001f\u007f-\u009f]/u.test(target.label)
+        || typeof target.files !== "boolean" || typeof target.git !== "boolean"
+        || !Number.isSafeInteger(target.expires_at) || target.expires_at < 0) {
+        throw new Error("Invalid remote Workspace target descriptor.");
       }
-    },
+      return Object.freeze({ ...target });
+    });
+    if (new Set(targets.map(target => target.id)).size !== targets.length) {
+      throw new Error("Duplicate remote Workspace target descriptor.");
+    }
+    return Object.freeze(targets);
+  }
+  const workspaceReaderFor = (mode, targetId) => async (body, { signal } = {}) => {
+    const lifetime = observationLifetime;
+    try {
+      if (mode === "team-delegated") {
+        return await api("/api/team/delegation/surface/action", body, 15000, { signal });
+      }
+      if (mode === "remote") {
+        if (!targetId || targetId === "local") throw new Error("Remote Workspace target unavailable.");
+        return await api("/api/workspace/target/action", { target_id: targetId, command: body }, 15000, { signal });
+      }
+      return await workspaceAction(body, { signal });
+    } catch (error) {
+      if (lifetime === observationLifetime && error.status === 401) expireBrowserAccess();
+      throw error;
+    }
+  };
+  const workspaceViews = createWorkspaceViews({
+    request: (body, options) => workspaceReaderFor(workspaceSourceMode(), activeWorkspaceTarget())(body, options),
     externalDocumentCount: () => tabs().filter(tab => tab.kind !== "file" && tab.kind !== "review").length,
     onChange: event => untrack(() => {
       if (event.type === "clear") presentationControllers.clear();
@@ -2097,7 +2126,7 @@ function App() {
         containers.some(container => container.id === current[kind] && container.kind === kind)
           ? current[kind] : containers.find(container => container.kind === kind)?.id || null])));
       if (["clear", "source", "source-clear", "scope-denied", "refresh", "close-container"].includes(event.type)) setWorkspaceToken({});
-      if (event.type === "clear" || event.type === "source-clear") {
+      if (event.type === "clear" || (event.type === "source-clear" && !workspaceRetargeting)) {
         workspaceDiscoveryLifetime = {};
         setWorkspaceSource(null);
         setWorkspaceSourceMode(null);
@@ -2125,7 +2154,8 @@ function App() {
     return document?.kind === "review" ? document : null;
   });
   createEffect(() => {
-    const ordinary = workspaceEnabled() && workspaceSourceMode() === "ordinary" && workspaceSource();
+    const ordinary = workspaceEnabled()
+      && ["ordinary", "remote"].includes(workspaceSourceMode()) && workspaceSource();
     if (!ordinary) {
       reviewDefaulted = false;
       setReviewMaximizedPane(null);
@@ -2145,7 +2175,7 @@ function App() {
       try { ensureWorkspaceContainer(kind); }
       catch (error) { setError(error.message); }
     }
-    const terminals = Boolean(workspaceSource()?.terminals);
+    const terminals = Boolean(workspaceLocalSource()?.terminals);
     setTabs(current => {
       const withoutBuild = current.filter(tab => tab.id !== "build-layout");
       return terminals
@@ -2154,6 +2184,87 @@ function App() {
     });
     if (!terminals && activeTab() === "build-layout") setActiveTab("review-layout");
   });
+  function followerSnapshot() {
+    return workspaceViews.listContainers().map(container => ({
+      id: container.id,
+      kind: container.kind,
+      navigator: {
+        ...container.navigator,
+        expanded: [...container.navigator.expanded],
+        collapsed: [...container.navigator.collapsed],
+        selected: null,
+      },
+    }));
+  }
+  function installWorkspaceSource(capabilities, mode, targetId, followers = followerSnapshot()) {
+    const oldActive = activeTab();
+    const oldContainerId = oldActive.startsWith("workspace-container-tab-")
+      ? oldActive.slice("workspace-container-tab-".length) : null;
+    const replacements = new Map();
+    workspaceRetargeting = true;
+    try {
+      const changed = workspaceViews.setSource(capabilities);
+      if (changed) {
+        for (const follower of followers) {
+          const allowed = follower.kind === "files" ? Boolean(capabilities.files) : Boolean(capabilities.git_read);
+          if (!allowed) continue;
+          const next = workspaceViews.openContainer(follower.kind);
+          workspaceViews.patchNavigator(next, follower.navigator);
+          replacements.set(follower.id, next);
+        }
+      }
+    } finally {
+      workspaceRetargeting = false;
+    }
+    setWorkspaceSourceMode(mode);
+    setWorkspaceSource({ ...capabilities });
+    setWorkspaceEnabled(true);
+    setActiveWorkspaceTarget(targetId);
+    if (oldContainerId && replacements.has(oldContainerId)) {
+      setActiveTab(containerTabId(replacements.get(oldContainerId)));
+    }
+    return replacements;
+  }
+  async function selectWorkspaceTarget(targetId, { lifetime = observationLifetime } = {}) {
+    const ticket = ++workspaceTargetRequest;
+    const followers = followerSnapshot();
+    if (targetId === "local") {
+      const capabilities = workspaceLocalSource();
+      if (!capabilities) throw new Error("Local Workspace target is unavailable.");
+      if (ticket !== workspaceTargetRequest || lifetime !== observationLifetime) return false;
+      installWorkspaceSource(capabilities, "ordinary", "local", followers);
+      return true;
+    }
+    const target = workspaceTargets().find(item => item.id === targetId);
+    if (!target) throw new Error("Remote Workspace target is unavailable.");
+    if (target.expires_at <= Date.now() * 1000) throw new Error("Remote Workspace target grant expired; reconnect the owner.");
+    try {
+      const capabilities = await api("/api/workspace/target/capabilities", { target_id: target.id });
+      if (ticket !== workspaceTargetRequest || lifetime !== observationLifetime
+        || !workspaceTargets().some(item => item.id === target.id)) return false;
+      installWorkspaceSource(capabilities, "remote", target.id, followers);
+      return true;
+    } catch (error) {
+      if (ticket === workspaceTargetRequest && lifetime === observationLifetime) {
+        if (error.status === 401) expireBrowserAccess();
+        else setError(error.message || "Remote Workspace target unavailable.");
+      }
+      return false;
+    }
+  }
+  function pinWorkspaceDocument(documentId) {
+    const document = workspaceViews.getDocument(documentId);
+    if (!document || document.delegated || document.pinned) return Boolean(document);
+    const mode = workspaceSourceMode();
+    const targetId = activeWorkspaceTarget();
+    if (!mode || (mode === "remote" && !targetId)) return false;
+    const reader = workspaceReaderFor(mode, targetId);
+    return workspaceViews.pinDocument(
+      documentId,
+      reader,
+      `workspace-pin:${mode}:${targetId || "delegated"}:${document.target.source_id}`,
+    );
+  }
   async function workspaceTerminalRequest(body) {
     try { return await workspaceAction(body); }
     catch (error) {
@@ -2172,6 +2283,9 @@ function App() {
     setWorkspaceSource(null);
     setWorkspaceSourceMode(null);
     setWorkspaceEnabled(false);
+    setWorkspaceLocalSource(null);
+    setWorkspaceTargets([]);
+    setActiveWorkspaceTarget(null);
   }
   const captureDocumentPresentation = documentId => presentationControllers.get(documentId)?.capture() || null;
   const restoreDocumentPresentation = (documentId, state) => presentationControllers.get(documentId)?.restore(state) || false;
@@ -2584,26 +2698,59 @@ function App() {
     const owner = snapshot()?.instance;
     const discovery = workspaceDiscoveryLifetime;
     try {
-      let value = await api("/api/workspace");
-      let mode = "ordinary";
-      if (!value?.enabled && teamInfo()?.delegated_surface_views) {
-        value = await api("/api/team/delegation/surface");
-        mode = "team-delegated";
-      }
+      const local = await api("/api/workspace");
       if (lifetime !== observationLifetime || discovery !== workspaceDiscoveryLifetime || owner !== snapshot()?.instance) return;
-      const enabled = Boolean(value?.enabled);
-      if (enabled) {
-        if (value.instance !== owner) return;
-        workspaceViews.setSource(value.capabilities);
-        setWorkspaceSourceMode(mode);
-        setWorkspaceSource({ ...value.capabilities });
-      } else clearWorkspaceSource();
-      setWorkspaceEnabled(enabled);
-      if (!enabled && nav() !== "sessions") setNav("sessions");
+      if (local?.enabled && local.instance !== owner) return;
+      const targets = normalizeWorkspaceTargets(local?.targets);
+      const localCapabilities = local?.enabled ? Object.freeze({ ...local.capabilities }) : null;
+      setWorkspaceTargets(targets);
+      setWorkspaceLocalSource(localCapabilities);
+
+      const selected = activeWorkspaceTarget();
+      if (selected && selected !== "local") {
+        if (!targets.some(target => target.id === selected)) {
+          ++workspaceTargetRequest;
+          workspaceRetargeting = true;
+          try { workspaceViews.clearSource(); } finally { workspaceRetargeting = false; }
+          setWorkspaceSource(null);
+          setWorkspaceSourceMode(null);
+          setWorkspaceEnabled(false);
+          setActiveWorkspaceTarget(null);
+          setError("The selected remote Workspace target is no longer admitted.");
+          if (nav() !== "sessions") setNav("sessions");
+          return;
+        }
+        await selectWorkspaceTarget(selected, { lifetime });
+        return;
+      }
+
+      if (localCapabilities) {
+        installWorkspaceSource(localCapabilities, "ordinary", "local");
+        return;
+      }
+
+      if (teamInfo()?.delegated_surface_views) {
+        const delegated = await api("/api/team/delegation/surface");
+        if (lifetime !== observationLifetime || discovery !== workspaceDiscoveryLifetime || owner !== snapshot()?.instance) return;
+        if (delegated?.enabled) {
+          workspaceRetargeting = true;
+          try { workspaceViews.setSource(delegated.capabilities); } finally { workspaceRetargeting = false; }
+          setWorkspaceSourceMode("team-delegated");
+          setWorkspaceSource({ ...delegated.capabilities });
+          setWorkspaceEnabled(true);
+          setActiveWorkspaceTarget(null);
+          return;
+        }
+      }
+
+      clearWorkspaceSource();
+      setActiveWorkspaceTarget(null);
+      if (nav() !== "sessions") setNav("sessions");
     } catch (error) {
       if (lifetime !== observationLifetime || discovery !== workspaceDiscoveryLifetime || owner !== snapshot()?.instance) return;
       if (error.status === 401) expireBrowserAccess();
       else if (error.status === 403) clearWorkspaceSource();
+      else setError(error.message || "Workspace source unavailable.");
       if (!workspaceEnabled() && nav() !== "sessions") setNav("sessions");
     }
   }
@@ -3125,6 +3272,10 @@ function App() {
   function breakOutDocument(id) {
     const document = workspaceViews.getDocument(id);
     if (!document) return false;
+    if (!document.delegated && !document.pinned && !pinWorkspaceDocument(id)) {
+      setError("Could not pin this document to its exact Workspace target.");
+      return false;
+    }
     setBrokenOutDocuments(current => {
       const next = new Set(current);
       next.add(id);
@@ -3162,6 +3313,7 @@ function App() {
       ? document.containerId : null;
     if (document) {
       if (containedOwner) {
+        workspaceViews.unpinDocument(id);
         setBrokenOutDocuments(currentSet => {
           const nextSet = new Set(currentSet);
           nextSet.delete(id);
@@ -3397,6 +3549,7 @@ function App() {
     try {
       await preloadCodeSurfaces();
       const id = workspaceViews.openFile(containerId, path);
+      if (!pinWorkspaceDocument(id)) throw new Error("Could not pin this File to its exact Workspace target.");
       setBrokenOutDocuments(current => {
         const next = new Set(current);
         next.add(id);
@@ -3412,6 +3565,18 @@ function App() {
   }
 
   const title = createMemo(() => snapshot()?.saved?.title || "New Agent");
+  const activeWorkspaceTargetLabel = createMemo(() => {
+    const id = activeWorkspaceTarget();
+    if (id === "local") return "local";
+    return workspaceTargets().find(target => target.id === id)?.label
+      || (workspaceSourceMode() === "team-delegated" ? "delegated" : "target");
+  });
+  const workspaceTargetChoices = createMemo(() => {
+    const choices = [];
+    if (workspaceLocalSource()) choices.push({ id: "local", label: "Local" });
+    for (const target of workspaceTargets()) choices.push({ id: target.id, label: target.label });
+    return choices;
+  });
   const projectLabel = createMemo(() => {
     const root = workspaceSource()?.view_root?.label || snapshot()?.saved?.directory || "";
     return basename(root) || "workspace";
@@ -3458,7 +3623,7 @@ function App() {
               <div class="project-branch">
                 <Icon name="branch" size={12} />
                 <span>{branchLabel()}</span>
-                <span class="project-site">· local</span>
+                <span class="project-site">· {activeWorkspaceTargetLabel()}</span>
               </div>
             </div>
           </section>
@@ -3573,7 +3738,15 @@ function App() {
                 <button class="icon-button mobile-nav" onClick={() => setMobileNav(true)} aria-label="Open Explorer">☰</button>
                 <strong class="workspace-wordmark">aw</strong>
                 <span class="breadcrumb-sep">/</span>
-                <span>local</span>
+                <Show when={workspaceTargetChoices().length > 1 || workspaceTargets().length > 0}
+                  fallback={<span>{activeWorkspaceTargetLabel()}</span>}>
+                  <select class="workspace-target-switch" aria-label="Workspace target"
+                    value={activeWorkspaceTarget() || ""}
+                    onChange={event => void selectWorkspaceTarget(event.currentTarget.value)}>
+                    <Show when={!activeWorkspaceTarget()}><option value="" disabled>Choose target</option></Show>
+                    <For each={workspaceTargetChoices()}>{target => <option value={target.id}>{target.label}</option>}</For>
+                  </select>
+                </Show>
                 <span class="breadcrumb-sep">/</span>
                 <strong>{projectLabel()}</strong>
                 <span class="branch-mark">◆</span>
@@ -3812,14 +3985,14 @@ function App() {
               posting={posting}
               setPrompt={setPrompt}
               send={send}
-              terminals={() => Boolean(workspaceSource()?.terminals)}
+              terminals={() => Boolean(workspaceLocalSource()?.terminals)}
               request={workspaceTerminalRequest}
               toggleMax={toggleReviewMax}
             />
 
             <BuildLayout
               active={() => activeTab() === "build-layout"}
-              enabled={() => Boolean(workspaceSource()?.terminals)}
+              enabled={() => Boolean(workspaceLocalSource()?.terminals)}
               request={workspaceTerminalRequest}
             />
 

@@ -72,14 +72,28 @@ test('compact tool visuals preserve words, no color-only result or unbounded unk
   assert.match(css,/\.code-diff\s+\.cm-mergeView/);
 });
 
-test('Build is an explicit terminal-granted saved layout, never an implicit PTY start', () => {
-  assert.match(main,/workspaceSource\(\)\?\.terminals/);
+test('Build is an explicit local-terminal saved layout, independent of the active Files/Git target', () => {
+  assert.match(main,/workspaceLocalSource\(\)\?\.terminals/);
   assert.match(main,/id:\s*"build-layout",\s*kind:\s*"build-layout",\s*title:\s*"Build"/);
-  assert.match(main,/<BuildLayout[\s\S]*?enabled=\{\(\) => Boolean\(workspaceSource\(\)\?\.terminals\)\}/);
+  assert.match(main,/<BuildLayout[\s\S]*?enabled=\{\(\) => Boolean\(workspaceLocalSource\(\)\?\.terminals\)\}/);
   assert.match(terminals,/class="[^"]*build-start-terminal[^"]*"[\s\S]*?onClick=\{\(\) => void start\(\)\}/);
   assert.match(terminals,/class="[^"]*build-add-terminal[^"]*"[\s\S]*?onClick=\{\(\) => void start\(\)\}/);
   assert.doesNotMatch(terminals,/createEffect\([\s\S]{0,220}?terminal_start/,
     'reactive presentation must not start a terminal');
+});
+
+test('ActiveTarget retargets only follower Workspace reads while breakout becomes an exact-source pin', () => {
+  assert.match(main,/api\("\/api\/workspace\/target\/capabilities",\s*\{\s*target_id:\s*target\.id\s*\}\)/);
+  assert.match(main,/api\("\/api\/workspace\/target\/action",\s*\{\s*target_id:\s*targetId,\s*command:\s*body\s*\}/);
+  assert.match(main,/function installWorkspaceSource\([\s\S]*?followerSnapshot\(\)/);
+  assert.match(main,/workspaceViews\.pinDocument\([\s\S]*?workspace-pin:/);
+  assert.match(main,/if \(!document\.delegated && !document\.pinned && !pinWorkspaceDocument\(id\)\)/);
+  assert.match(main,/workspaceViews\.unpinDocument\(id\)/);
+  assert.match(main,/workspace-target-switch/);
+  assert.doesNotMatch(main,/selectWorkspaceTarget[\s\S]{0,1600}?openSession\(/,
+    'target selection must not retarget the Agent Session');
+  assert.doesNotMatch(main,/selectWorkspaceTarget[\s\S]{0,1600}?terminal_(?:start|claim|input)/,
+    'target selection must not take PTY effects');
 });
 
 test('terminal pane visibility is separate from retained input ownership', () => {

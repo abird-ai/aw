@@ -582,6 +582,23 @@ body.resizing-sidebar {
   text-overflow: ellipsis;
 }
 .workspace-wordmark { flex: none; letter-spacing: -.02em; }
+.workspace-target-switch {
+  min-width: 0;
+  max-width: 150px;
+  height: 23px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+.workspace-target-switch:hover,
+.workspace-target-switch:focus-visible {
+  background: var(--hover);
+  color: var(--fg);
+}
 .breadcrumb-sep { color: var(--faint); }
 .branch-mark { color: var(--purple); font-size: 9px; }
 .workspace-actions {

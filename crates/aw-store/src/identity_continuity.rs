@@ -553,6 +553,29 @@ impl SessionStore {
         user_row(&c, &user)
     }
 
+    pub fn identity_device_key(
+        &self,
+        actor: &PrincipalId,
+        public_key: &str,
+    ) -> Result<UserDeviceKeyInfo> {
+        let public_key = canonical_public_key(public_key)?;
+        let c = self.connection()?;
+        let user = user_for_principal(&c, actor)?.ok_or(Error::Denied(
+            "identity device lookup requires an active known user",
+        ))?;
+        let device_id: String = db(c
+            .query_row(
+                "SELECT device_id FROM user_devices
+                 WHERE user_id=?1 AND public_key=?2 AND status='active'
+                 ORDER BY registered_at LIMIT 1",
+                params![user, public_key],
+                |r| r.get(0),
+            )
+            .optional())?
+        .ok_or(Error::Denied("active identity device key unavailable"))?;
+        device_row(&c, &device_id)
+    }
+
     pub fn register_identity_device_key(
         &self,
         actor: &PrincipalId,

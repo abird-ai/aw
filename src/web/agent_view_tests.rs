@@ -78,6 +78,8 @@ fn read_fixture() -> ReadFixture {
         domain_selector: None,
         workspace_selector: None,
         resources: ResourceSummary::default(),
+        #[cfg(feature = "surfaces")]
+        remote_workspace_router: None,
     };
     let (router, state) = application_scoped(
         agent,
@@ -366,6 +368,8 @@ async fn first_prompt_admits_original_unsaved_target_and_retries_without_another
             domain_selector: None,
             workspace_selector: None,
             resources: ResourceSummary::default(),
+            #[cfg(feature = "surfaces")]
+        remote_workspace_router: None,
         }
     };
     let mut options = AgentOptions::new("ollama", "test-model");
