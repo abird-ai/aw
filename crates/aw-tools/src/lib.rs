@@ -20,7 +20,11 @@ pub mod execution_ref;
 pub mod filesystem;
 pub mod job_event;
 pub mod operation;
+#[cfg(feature = "read")]
+pub mod receipt;
 pub mod remote_start;
+#[cfg(feature = "read")]
+pub mod toolset;
 pub use operation::{ExecutionClass, OperationId};
 #[cfg(feature = "write")]
 pub mod matching;

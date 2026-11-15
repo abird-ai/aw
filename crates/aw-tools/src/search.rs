@@ -148,7 +148,7 @@ pub fn content_path_label(path: &str) -> String {
 }
 
 pub const MAX_GREP_HITS: usize = 200;
-pub const MAX_GREP_CONTEXT: usize = 8;
+pub use crate::filesystem::schema::MAX_GREP_CONTEXT;
 pub const MAX_GREP_PATTERN: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -159,8 +159,10 @@ pub enum GrepMode {
     Count,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrepLimits {
+    /// Runtime cap for each side's context, independent of the engine maximum.
+    pub context_max: usize,
     pub candidates: usize,
     pub scan_bytes: usize,
     pub scan_files: usize,
@@ -171,6 +173,7 @@ pub struct GrepLimits {
 impl Default for GrepLimits {
     fn default() -> Self {
         Self {
+            context_max: MAX_GREP_CONTEXT,
             candidates: 4096,
             scan_bytes: 32 * 1024 * 1024,
             scan_files: 4096,
@@ -245,7 +248,10 @@ fn compile_query(options: &GrepOptions<'_>) -> Result<CompiledQuery, QueryError>
     if options.depth == 0 || options.depth > filesystem::MAX_WALK_DEPTH {
         return Err(QueryError::InvalidDepth);
     }
-    if options.before > MAX_GREP_CONTEXT || options.after > MAX_GREP_CONTEXT {
+    if options.limits.context_max > MAX_GREP_CONTEXT
+        || options.before > options.limits.context_max
+        || options.after > options.limits.context_max
+    {
         return Err(QueryError::InvalidContext);
     }
     if !(1..=MAX_GREP_HITS).contains(&options.limit)
@@ -927,6 +933,42 @@ mod tests {
         );
         assert!(!page.content.contains("nested"));
     }
+    #[test]
+    fn wide_asymmetric_context_is_bounded_and_supports_direct_file() {
+        let text = (1..=300)
+            .map(|i| {
+                if i == 151 {
+                    "hit".to_owned()
+                } else {
+                    format!("line-{i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let fs = FakeFs {
+            dirs: Default::default(),
+            files: std::collections::BTreeMap::from([("one.txt".into(), text.into_bytes())]),
+        };
+        let mut query = options("hit");
+        query.path = "one.txt";
+        query.before = 128;
+        query.after = 0;
+        let page = grep(&fs, query, &|| false).unwrap();
+        assert!(
+            page.content.contains("one.txt-23-line-23"),
+            "{}",
+            page.content
+        );
+        assert!(page.content.contains("one.txt:151:hit"), "{}", page.content);
+        assert!(!page.content.contains("one.txt-152-line-152"));
+        query.before = 129;
+        assert!(matches!(
+            grep(&fs, query, &|| false),
+            Err(GrepError::Query(QueryError::InvalidContext))
+        ));
+    }
+
     #[test]
     fn grep_page_clips_unselected_matching_context_and_advances_by_primary() {
         let fs = FakeFs {

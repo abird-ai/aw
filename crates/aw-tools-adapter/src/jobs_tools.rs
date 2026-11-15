@@ -11,9 +11,8 @@ use crate::{
 };
 use aw_agent_core::{Tool, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSpec};
 use aw_tools::{
-    filesystem::{
-        job::{Lifecycle, NodeState},
-        job_manager::{FiniteJobKind, OutputPage, OutputStream, Snapshot, MAX_JOB_LIST_PAGE},
+    filesystem::job_manager::{
+        FiniteJobKind, OutputPage, OutputPosition, OutputStream, Snapshot, MAX_JOB_LIST_PAGE,
     },
     job_event::{EventRule, EventRuleSet, JobEventKind, JobWakeMode},
 };
@@ -68,6 +67,14 @@ pub(crate) enum JobsKind {
     Send,
     Cancel,
     Subscribe,
+}
+
+struct TailRequest<'a> {
+    id: &'a str,
+    node: Option<usize>,
+    kind: FiniteJobKind,
+    requested: Option<u64>,
+    budget: usize,
 }
 
 #[derive(Clone)]
@@ -257,40 +264,17 @@ impl JobsTool {
         }
     }
 
-    fn state_label(snapshot: &Snapshot) -> &'static str {
-        match snapshot.lifecycle {
-            Lifecycle::Running => "running",
-            Lifecycle::Cancelling | Lifecycle::Revoking => "cancelling",
-            Lifecycle::Terminal if snapshot.stop_reason.is_some() => "cancelled",
-            Lifecycle::Terminal => "settled",
-        }
-    }
-
-    fn render_snapshot(reference: &str, snapshot: &Snapshot) -> String {
-        let mut line = format!(
-            "{reference} {} {} rev={}",
-            snapshot.label,
-            Self::state_label(snapshot),
-            snapshot.sequence
-        );
-        if snapshot.lifecycle != Lifecycle::Terminal && snapshot.total > 1 {
-            line.push_str(&format!(" {}/{}", snapshot.finished, snapshot.total));
-        }
-        if snapshot.lifecycle == Lifecycle::Terminal {
-            let outcome = snapshot
-                .summary
-                .map_or("unknown", |summary| summary.0.as_str());
-            line.push_str(&format!(" outcome={outcome}"));
-            if let Some((_, more, incomplete)) = snapshot.summary {
-                if more {
-                    line.push_str(" more");
-                }
-                if incomplete {
-                    line.push_str(" incomplete");
-                }
-            }
-        }
-        line
+    fn render_snapshot(reference: &str, snapshot: &Snapshot) -> Result<String> {
+        aw_tools::receipt::render_plain(
+            aw_tools::receipt::Receipt::JobStatus {
+                reference,
+                snapshot,
+                terminal: None,
+                next: None,
+            },
+            aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+        )
+        .map_err(|_| Error::Protocol("cannot render typed compact Job status"))
     }
 
     fn control_fingerprint(
@@ -397,7 +381,7 @@ impl JobsTool {
         offset: u64,
         encoding: &str,
         budget: usize,
-    ) -> Result<String> {
+    ) -> Result<(String, usize)> {
         let render = |bytes: &[u8]| -> Result<String> {
             let next = offset
                 .checked_add(bytes.len() as u64)
@@ -430,7 +414,7 @@ impl JobsTool {
         if page.bytes.is_empty() {
             let rendered = render(&[])?;
             return (rendered.len() <= budget)
-                .then_some(rendered)
+                .then_some((rendered, 0))
                 .ok_or(Error::Limit(
                     "Job output metadata exceeds configured result ceiling",
                 ));
@@ -458,7 +442,7 @@ impl JobsTool {
                 "one Job output byte cannot fit configured result ceiling",
             ));
         }
-        Ok(rendered)
+        Ok((rendered, kept))
     }
 
     fn stream_for(
@@ -526,6 +510,7 @@ impl JobsTool {
             .ok_or(Error::Denied("jobs_read offset is past Graph result"))?;
         let end = start.saturating_add(limit).min(bytes.len());
         let page = OutputPage {
+            offset: 0,
             bytes: bytes[start..end].to_vec(),
             next_offset: (end < bytes.len()).then_some(end as u64),
             writer_finished: true,
@@ -533,7 +518,7 @@ impl JobsTool {
             total_bytes: bytes.len() as u64,
             retained_bytes: bytes.len() as u64,
         };
-        Self::render_output_page(&page, offset, encoding, budget)
+        Ok(Self::render_output_page(&page, offset, encoding, budget)?.0)
     }
 
     async fn conditional_snapshot(
@@ -568,10 +553,139 @@ impl JobsTool {
         Ok(snapshot)
     }
 
+    fn read_position(arguments: &Value) -> OutputPosition {
+        match arguments.get("offset") {
+            Some(Value::Number(number)) if number.as_i64().is_some_and(|n| n < 0) => {
+                OutputPosition::Tail(number.as_i64().unwrap().unsigned_abs())
+            }
+            Some(Value::Number(number)) => OutputPosition::Absolute(number.as_u64().unwrap_or(0)),
+            _ => OutputPosition::Absolute(0),
+        }
+    }
+
+    /// Only real Process streams can carry a status tail. A Graph root
+    /// retains a compact node/status tree, not a concatenation of logs.
+    fn process_tail_coordinate(
+        manager: &aw_tools::filesystem::job_manager::JobManager,
+        id: &str,
+        node: Option<usize>,
+        kind: FiniteJobKind,
+    ) -> Result<Option<usize>> {
+        if kind == FiniteJobKind::Process && node.is_none() {
+            return Ok(Some(1));
+        }
+        if let Some(node) = node {
+            let plans = manager
+                .plans(id)
+                .map_err(|_| Error::Denied("Job plan unavailable"))?;
+            if plans
+                .get(node.saturating_sub(1))
+                .is_some_and(|plan| plan.tool().is_shell())
+            {
+                return Ok(Some(node));
+            }
+        }
+        Ok(None)
+    }
+
+    fn append_process_tail(
+        &self,
+        ctx: &ToolContext,
+        host: &crate::job_host::JobHost,
+        request: TailRequest<'_>,
+        content: &mut String,
+    ) -> Result<()> {
+        let TailRequest {
+            id,
+            node,
+            kind,
+            requested,
+            budget,
+        } = request;
+        let tail = requested.unwrap_or(self.runtime.job_profile().get_tail_default as u64) as usize;
+        if tail == 0 {
+            return Ok(());
+        }
+        let Some(coordinate) = Self::process_tail_coordinate(host.manager(), id, node, kind)?
+        else {
+            if requested.is_some() {
+                return Err(Error::Denied(
+                    "tail is supported only by Process Job streams",
+                ));
+            }
+            return Ok(());
+        };
+        if !self.runtime.payload_read_authorized(ctx) || !host.payload_authorized(&ctx.actor, id) {
+            if requested.is_some() {
+                return Err(Error::Denied("Job output tail is not currently authorized"));
+            }
+            content.push_str("\ntail=denied");
+            return Ok(());
+        }
+        // Lossy UTF-8 can expand up to threefold. Reserve status/markers first;
+        // a small budget gives a truthful marker rather than an invalid reply.
+        let capacity = budget.saturating_sub(content.len().saturating_add(128)) / 3;
+        let take = tail.min(capacity);
+        if take == 0 {
+            content.push_str("\ntail=budget");
+            return Ok(());
+        }
+        let owner = host
+            .manager()
+            .job_output_owner(id)
+            .map_err(|_| Error::Denied("Job output owner unavailable"))?;
+        let output = host
+            .manager()
+            .process_tail_for_owner(id, coordinate, owner, take);
+        // Hold secret bytes in a local projection until the last live Actor
+        // Envelope and producer grant check. Never append before rechecking.
+        let mut projected = String::new();
+        match output {
+            Ok((stdout, stderr)) => {
+                for (stream, page) in [("stdout", stdout), ("stderr", stderr)] {
+                    if let Some(page) = page {
+                        let end = page.offset + page.bytes.len() as u64;
+                        projected.push_str(&format!(
+                            "\n{stream} [{}..{}]{}:",
+                            page.offset,
+                            end,
+                            if page.writer_finished { " eof" } else { "" }
+                        ));
+                        projected.push('\n');
+                        projected.push_str(&String::from_utf8_lossy(&page.bytes));
+                    }
+                }
+            }
+            Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {
+                projected.push_str("\ntail=released");
+            }
+            Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
+                projected.push_str("\ntail=unavailable");
+            }
+            Err(_) => return Err(Error::Denied("Job output tail unavailable")),
+        }
+        if take < tail {
+            projected.push_str("\ntail=capped");
+        }
+        if !self.runtime.payload_read_authorized(ctx) || !host.payload_authorized(&ctx.actor, id) {
+            if requested.is_some() {
+                return Err(Error::Denied("Job output tail revoked before delivery"));
+            }
+            content.push_str("\ntail=denied");
+            return Ok(());
+        }
+        if content.len().saturating_add(projected.len()) > budget {
+            return Err(Error::Limit("Job status and tail exceed result budget"));
+        }
+        content.push_str(&projected);
+        Ok(())
+    }
+
     fn spec_for(&self) -> ToolSpec {
+        let profile = self.runtime.job_profile();
         let ref_schema = json!({"type":"string","minLength":1,"maxLength":2048});
         let rev_schema = json!({"type":["integer","null"],"minimum":1});
-        match self.kind {
+        let spec = match self.kind {
             JobsKind::List => ToolSpec {
                 name: "jobs_list".into(),
                 description: "List recent exposed Jobs newest first with stable opaque cursor paging. Status only; never reads or acknowledges retained output.".into(),
@@ -583,11 +697,12 @@ impl JobsTool {
             },
             JobsKind::Get => ToolSpec {
                 name: "jobs_get".into(),
-                description: "Observe one Job/ref and revision. rev is a conditional observation token; wait_ms may long-poll for a different revision without acknowledging output.".into(),
+                description: "Get compact Job status and, for Process output, the last 512 raw bytes total across stdout/stderr. tail=0 disables output; explicit tail caps at 1024 combined. Never ACKs.".into(),
                 parameters: json!({"type":"object","properties":{
                     "ref":ref_schema,
                     "rev":rev_schema,
-                    "wait_ms":{"type":["integer","null"],"minimum":0,"maximum":MAX_WAIT_MS}
+                    "wait_ms":{"type":["integer","null"],"minimum":0,"maximum":MAX_WAIT_MS},
+                    "tail":{"type":["integer","null"],"minimum":0,"maximum":1024}
                 },"additionalProperties":false}),
                 effect: ToolEffect::Read,
             },
@@ -608,7 +723,7 @@ impl JobsTool {
                         {"type":"null"}
                     ]},
                     "cursor":{"type":["string","null"],"minLength":1,"maxLength":512},
-                    "offset":{"type":["integer","null"],"minimum":0},
+                    "offset":{"type":["integer","null"]},
                     "limit":{"type":["integer","null"],"minimum":1,"maximum":self.runtime.result_limit().min(aw_tools::task_ops::MAX_TASK_OUTPUT_PAGE)},
                     "encoding":{"type":["string","null"],"enum":["text","base64",null]},
                     "wait_ms":{"type":["integer","null"],"minimum":0,"maximum":MAX_WAIT_MS}
@@ -617,12 +732,12 @@ impl JobsTool {
             },
             JobsKind::Ack => ToolSpec {
                 name: "jobs_ack".into(),
-                description: "Explicitly ACK an exact ref/view through a raw byte offset after safe receipt. No revision token; ACK is monotonic and never implied by read.".into(),
+                description: "Finish this caller's terminal Job output with ref alone, including unread bytes; offset explicitly ACKs only an already-delivered contiguous raw prefix. Never ACKs another owner.".into(),
                 parameters: json!({"type":"object","properties":{
                     "ref":ref_schema,
                     "view":{"type":["string","null"],"enum":["result","stdout","stderr",null]},
                     "offset":{"type":"integer","minimum":0}
-                },"required":["ref","offset"],"additionalProperties":false}),
+                },"required":["ref"],"additionalProperties":false}),
                 effect: ToolEffect::Control,
             },
             JobsKind::Send => ToolSpec {
@@ -670,6 +785,31 @@ impl JobsTool {
                 },"required":["ref","events"],"additionalProperties":false}),
                 effect: ToolEffect::Control,
             },
+        };
+        // The model descriptor comes from the same validated tool profile
+        // as dispatch limits. AW alone supplies Agent-history specialization.
+        let factory = aw_tools::toolset::Toolset::builder()
+            .jobs(profile)
+            .only([])
+            .build()
+            .expect("validated AW Jobs profile");
+        let operation = match self.kind {
+            JobsKind::List => aw_tools::OperationId::JobsList,
+            JobsKind::Get => aw_tools::OperationId::JobsGet,
+            JobsKind::Read => aw_tools::OperationId::JobsRead,
+            JobsKind::Ack => aw_tools::OperationId::JobsAck,
+            JobsKind::Send => aw_tools::OperationId::JobsSend,
+            JobsKind::Cancel => aw_tools::OperationId::JobsCancel,
+            JobsKind::Subscribe => aw_tools::OperationId::JobsSubscribe,
+        };
+        let descriptor = factory
+            .describe_operation(operation, spec.parameters, &spec.description)
+            .expect("AW Jobs schema is a configured object");
+        ToolSpec {
+            name: descriptor.name.into(),
+            description: descriptor.description,
+            parameters: descriptor.parameters,
+            effect: spec.effect,
         }
     }
 }
@@ -700,11 +840,26 @@ impl Tool for JobsTool {
                 }
             }
             JobsKind::Get => {
-                Self::object(arguments, &["ref", "rev", "wait_ms"])?;
+                Self::object(arguments, &["ref", "rev", "wait_ms", "tail"])?;
                 let _ = Self::reference(arguments, true)?;
                 let _ = Self::revision(arguments)?;
+                if arguments
+                    .get("tail")
+                    .filter(|value| !value.is_null())
+                    .is_some_and(|tail| {
+                        tail.as_u64()
+                            .is_none_or(|n| n > self.runtime.job_profile().get_tail_max as u64)
+                    })
+                {
+                    return Err(Error::Denied(
+                        "jobs_get tail must be 0..1024 combined bytes",
+                    ));
+                }
                 if let Some(wait) = arguments.get("wait_ms").filter(|value| !value.is_null()) {
-                    if wait.as_u64().is_none_or(|value| value > MAX_WAIT_MS) {
+                    if wait
+                        .as_u64()
+                        .is_none_or(|value| value > self.runtime.job_profile().get_wait_max_ms)
+                    {
                         return Err(Error::Denied("wait_ms exceeds 30 seconds"));
                     }
                 }
@@ -736,24 +891,32 @@ impl Tool for JobsTool {
                 if arguments
                     .get("wait_ms")
                     .filter(|value| !value.is_null())
-                    .is_some_and(|wait| wait.as_u64().is_none_or(|value| value > MAX_WAIT_MS))
+                    .is_some_and(|wait| {
+                        wait.as_u64()
+                            .is_none_or(|value| value > self.runtime.job_profile().read_wait_max_ms)
+                    })
                 {
                     return Err(Error::Denied("wait_ms exceeds 30 seconds"));
                 }
                 if arguments
                     .get("offset")
                     .filter(|value| !value.is_null())
-                    .is_some_and(|value| value.as_u64().is_none())
+                    .is_some_and(|value| value.as_i64().is_none() && value.as_u64().is_none())
                 {
-                    return Err(Error::Denied("offset must be a non-negative integer"));
+                    return Err(Error::Denied("offset must be a signed byte integer"));
                 }
             }
             JobsKind::Ack => {
                 Self::object(arguments, &["ref", "view", "offset"])?;
                 let _ = Self::reference(arguments, false)?;
                 let _ = Self::view(arguments)?;
-                if arguments.get("offset").and_then(Value::as_u64).is_none() {
-                    return Err(Error::Denied("jobs_ack requires raw offset"));
+                if arguments
+                    .get("offset")
+                    .is_some_and(|v| v.as_u64().is_none())
+                {
+                    return Err(Error::Denied(
+                        "jobs_ack offset must be an absolute nonnegative byte count",
+                    ));
                 }
             }
             JobsKind::Send => {
@@ -810,6 +973,10 @@ impl Tool for JobsTool {
             self.validate(arguments)?;
             let budget = ctx.result_budget(self.runtime.result_limit())?;
             let host = self.runtime.host_for(&ctx)?;
+            // Mark delivery only after the *entire* tool response validates.
+            // A tail/status peek never mints ACKable byte proof.
+            let mut delivered = None;
+            let mut finite_read_id = None;
             let output = match self.kind {
                 JobsKind::List => {
                     let limit = arguments
@@ -858,7 +1025,7 @@ impl Tool for JobsTool {
                                                 Ok(snapshot) => Some(Self::render_snapshot(
                                                     &item.reference,
                                                     &snapshot,
-                                                )),
+                                                )?),
                                                 Err(_) => None,
                                             },
                                             Ok((_, Some(_))) => return Err(Error::Protocol(
@@ -909,7 +1076,7 @@ impl Tool for JobsTool {
                     let mut rows = Vec::new();
                     for snapshot in jobs {
                         let reference = host.execution_ref(&snapshot.id, None)?.canonical();
-                        let row = Self::render_snapshot(&reference, &snapshot);
+                        let row = Self::render_snapshot(&reference, &snapshot)?;
                         let mut candidate = rows.clone();
                         candidate.push(row.clone());
                         if let Some(cursor) = &next {
@@ -949,10 +1116,19 @@ impl Tool for JobsTool {
                             )
                             .await?
                         {
+                            if arguments.get("tail").and_then(Value::as_u64).unwrap_or(0) != 0 {
+                                return Err(Error::Denied(
+                                    "Agent/Turn status does not have Process tails",
+                                ));
+                            }
                             return Ok(output);
                         }
                     }
                     let (id, node) = host.resolve_job_ref(&reference)?;
+                    let kind = host
+                        .manager()
+                        .finite_kind(&id)
+                        .map_err(|_| Error::Denied("Job kind unavailable"))?;
                     let snapshot =
                         Self::conditional_snapshot(&host, &id, revision, wait_ms).await?;
                     let reference = host.execution_ref(&id, node)?.canonical();
@@ -966,39 +1142,66 @@ impl Tool for JobsTool {
                             .ok_or(Error::Denied("Job node is unavailable"))?
                             .tool()
                             .name();
-                        match host
+                        let state = host
                             .manager()
                             .node_state(&id, node)
-                            .map_err(|_| Error::Denied("Job node is unavailable"))?
-                        {
-                            NodeState::Pending => {
-                                format!("{reference} {kind} waiting rev={}", snapshot.sequence)
-                            }
-                            NodeState::Claimed { .. } | NodeState::Running { .. } => {
-                                format!("{reference} {kind} running rev={}", snapshot.sequence)
-                            }
-                            NodeState::Terminal { status, .. } => {
-                                let mut line = format!(
-                                    "{reference} {kind} settled rev={} outcome={}",
-                                    snapshot.sequence,
-                                    status.primary.as_str()
-                                );
-                                if status.more {
-                                    line.push_str(" more");
-                                }
-                                if status.incomplete {
-                                    line.push_str(" incomplete");
-                                }
-                                line
-                            }
-                        }
+                            .map_err(|_| Error::Denied("Job node is unavailable"))?;
+                        aw_tools::receipt::render_plain(
+                            aw_tools::receipt::Receipt::NodeStatus {
+                                reference: &reference,
+                                tool: kind,
+                                revision: snapshot.sequence,
+                                state,
+                                terminal: if matches!(
+                                    state,
+                                    aw_tools::filesystem::job::NodeState::Terminal { .. }
+                                ) {
+                                    host.manager().process_terminal(&id, node).map_err(|_| {
+                                        Error::Protocol("Job Process terminal facts unavailable")
+                                    })?
+                                } else {
+                                    None
+                                },
+                            },
+                            aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+                        )
+                        .map_err(|_| Error::Protocol("cannot render typed compact node status"))?
+                    } else if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal
+                        && snapshot.total == 1
+                    {
+                        aw_tools::receipt::render_plain(
+                            aw_tools::receipt::Receipt::JobStatus {
+                                reference: &reference,
+                                snapshot: &snapshot,
+                                terminal: host.manager().process_terminal(&id, 1).map_err(
+                                    |_| Error::Protocol("Job Process terminal facts unavailable"),
+                                )?,
+                                next: None,
+                            },
+                            aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+                        )
+                        .map_err(|_| Error::Protocol("cannot render typed compact Job status"))?
                     } else {
-                        Self::render_snapshot(&reference, &snapshot)
+                        Self::render_snapshot(&reference, &snapshot)?
                     };
+                    let mut content = content;
+                    self.append_process_tail(
+                        &ctx,
+                        &host,
+                        TailRequest {
+                            id: &id,
+                            node,
+                            kind,
+                            requested: arguments.get("tail").and_then(Value::as_u64),
+                            budget,
+                        },
+                        &mut content,
+                    )?;
                     ToolOutput::text(content)
                 }
                 JobsKind::Read => {
                     let reference = Self::reference(arguments, true)?.to_owned();
+                    let position = Self::read_position(arguments);
                     let view = Self::view(arguments)?.map(str::to_owned);
                     let filter = Self::filter(arguments)?;
                     let cursor = arguments
@@ -1033,6 +1236,11 @@ impl Tool for JobsTool {
                             )
                             .await?
                         {
+                            if matches!(position, OutputPosition::Tail(_)) {
+                                return Err(Error::Denied(
+                                    "Agent history uses cursors, not negative offsets",
+                                ));
+                            }
                             return Ok(output);
                         }
                     }
@@ -1048,17 +1256,24 @@ impl Tool for JobsTool {
                         ));
                     }
                     let (id, node) = host.resolve_job_ref(&reference)?;
-                    if !host.payload_authorized(&ctx.actor, &id) {
+                    finite_read_id = Some(id.clone());
+                    if !self.runtime.payload_read_authorized(&ctx)
+                        || !host.payload_authorized(&ctx.actor, &id)
+                    {
                         return Err(Error::Denied("Job payload authority is not live"));
                     }
                     let kind = host
                         .manager()
                         .finite_kind(&id)
                         .map_err(|_| Error::Denied("Job kind is unavailable"))?;
-                    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0);
                     let encoding = Self::encoding(arguments)?;
                     let view = view.as_deref();
                     let content = if kind == FiniteJobKind::Graph && node.is_none() {
+                        let OutputPosition::Absolute(offset) = position else {
+                            return Err(Error::Denied(
+                                "Graph aggregate result needs an absolute offset",
+                            ));
+                        };
                         if view.is_some_and(|view| view != "result") {
                             return Err(Error::Denied(
                                 "Graph root exposes only the result view; use n:<coordinate> for streams",
@@ -1081,47 +1296,89 @@ impl Tool for JobsTool {
                             .map_err(|_| Error::Denied("Job output owner is unavailable"))?;
                         let page = host
                             .manager()
-                            .output_page_for_owner(&id, coordinate, stream, owner, offset, limit)
+                            .output_page_for_owner_at(
+                                &id, coordinate, stream, owner, position, limit,
+                            )
                             .map_err(|_| Error::Denied("Job output view is unavailable"))?;
-                        Self::render_output_page(&page, offset, encoding, budget)?
+                        let (rendered, credited) =
+                            Self::render_output_page(&page, page.offset, encoding, budget)?;
+                        delivered = Some((id, coordinate, stream, owner, page.offset, credited));
+                        rendered
                     };
                     ToolOutput::text(content)
                 }
                 JobsKind::Ack => {
                     let (id, node) = host.resolve_job_ref(Self::reference(arguments, false)?)?;
-                    if !host.payload_authorized(&ctx.actor, &id) {
-                        return Err(Error::Denied("Job payload authority is not live"));
+                    if !self.runtime.control_authorized(&ctx, "jobs_ack")
+                        || !host.payload_authorized(&ctx.actor, &id)
+                    {
+                        return Err(Error::Denied("Job ACK Control authority is not live"));
                     }
                     let kind = host
                         .manager()
                         .finite_kind(&id)
                         .map_err(|_| Error::Denied("Job kind is unavailable"))?;
                     let view = Self::view(arguments)?;
-                    let through = arguments
-                        .get("offset")
-                        .and_then(Value::as_u64)
-                        .ok_or(Error::Denied("jobs_ack requires raw offset"))?;
+                    let offset = arguments.get("offset").and_then(Value::as_u64);
                     let owner = host
                         .manager()
                         .job_output_owner(&id)
                         .map_err(|_| Error::Denied("Job output owner is unavailable"))?;
-                    if kind == FiniteJobKind::Graph && node.is_none() {
-                        return Err(Error::Denied(
-                            "Graph root result is a synthesized aggregate; ACK an exact n:<coordinate> retained result instead",
-                        ));
-                    }
-                    let (coordinate, stream) =
-                        Self::stream_for(host.manager(), &id, kind, node, view)?;
-                    let ack = host
-                        .manager()
-                        .acknowledge_delivered_output(&id, coordinate, stream, owner, through)
-                        .map_err(|_| {
-                            Error::Denied("Job ACK exceeds bytes delivered to this output owner")
+                    let ack = if let Some(through) = offset {
+                        if kind == FiniteJobKind::Graph && node.is_none() {
+                            return Err(Error::Denied(
+                                "Graph root result is synthesized; ACK exact node output offsets",
+                            ));
+                        }
+                        let (coordinate, stream) =
+                            Self::stream_for(host.manager(), &id, kind, node, view)?;
+                        self.runtime.with_control_commit(&ctx, "jobs_ack", || {
+                            host.manager()
+                                .acknowledge_delivered_output(&id, coordinate, stream, owner, through)
+                                .map_err(|_| Error::Denied(
+                                    "Job ACK exceeds the contiguous delivered prefix for this owner",
+                                ))
+                        })?
+                    } else {
+                        let stream = match view {
+                            None => None,
+                            Some("result") => Some(OutputStream::Result),
+                            Some("stdout") => Some(OutputStream::Stdout),
+                            Some("stderr") => Some(OutputStream::Stderr),
+                            _ => return Err(Error::Denied("invalid retained Job ACK view")),
+                        };
+                        if kind == FiniteJobKind::Graph && node.is_none() && stream.is_some() {
+                            return Err(Error::Denied(
+                                "Graph root has no ACKable aggregate stream; omit view to finish owned node outputs",
+                            ));
+                        }
+                        let ack = self.runtime.with_control_commit(&ctx, "jobs_ack", || {
+                            host.manager()
+                                .finish_output_for_owner(&id, node, stream, owner)
+                                .map_err(|error| match error {
+                                    aw_tools::filesystem::job_manager::Error::Busy => {
+                                        Error::Conflict("Job output is not yet terminal")
+                                    }
+                                    aw_tools::filesystem::job_manager::Error::ReplayUnknown => {
+                                        Error::Conflict(
+                                            "Job effect is unknown; reconcile before finishing output",
+                                        )
+                                    }
+                                    _ => Error::Denied(
+                                        "Job output cannot be finished under the current owner",
+                                    ),
+                                })
                         })?;
-                    let (changed, released) = (ack.changed, ack.released);
+                        return Ok(ToolOutput::text(format!(
+                            "{} ack=all released={}",
+                            if ack.changed { "ok" } else { "unchanged" },
+                            ack.released
+                        )));
+                    };
                     ToolOutput::text(format!(
-                        "{} released={released}",
-                        if changed { "ok" } else { "unchanged" }
+                        "{} released={}",
+                        if ack.changed { "ok" } else { "unchanged" },
+                        ack.released
                     ))
                 }
                 JobsKind::Send => {
@@ -1633,7 +1890,77 @@ impl Tool for JobsTool {
                 }
             };
             output.validate()?;
+            // Synthetic Graph-root projections also need a final live check:
+            // no delivery ledger entry exists for their synthesized result.
+            if let Some(id) = finite_read_id.as_deref() {
+                if !self.runtime.payload_read_authorized(&ctx)
+                    || !host.payload_authorized(&ctx.actor, id)
+                {
+                    return Err(Error::Denied(
+                        "Job output authority revoked before delivery",
+                    ));
+                }
+            }
+            if let Some((id, coordinate, stream, owner, start, count)) = delivered {
+                if !self.runtime.payload_read_authorized(&ctx)
+                    || !host.payload_authorized(&ctx.actor, &id)
+                {
+                    return Err(Error::Denied(
+                        "Job output authority revoked before delivery",
+                    ));
+                }
+                host.manager()
+                    .record_delivered_output(&id, coordinate, stream, owner, start, count)
+                    .map_err(|_| {
+                        Error::Denied("Job output owner cannot record this delivered prefix")
+                    })?;
+            }
             Ok(output)
         })
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_projection_returns_exact_raw_prefix_for_delivery_credit() {
+        let page = OutputPage {
+            offset: 0,
+            bytes: vec![0xff; 700],
+            next_offset: None,
+            writer_finished: true,
+            truncated: false,
+            total_bytes: 700,
+            retained_bytes: 700,
+        };
+        let (lossy, used) = JobsTool::render_output_page(&page, 0, "text", 512).unwrap();
+        assert!(used > 0 && used < page.bytes.len());
+        assert!(lossy.len() <= 512);
+        assert!(lossy.contains(&format!("more offset={used}")));
+        assert!(!lossy.contains("more offset=700"));
+        let (b64, raw) = JobsTool::render_output_page(&page, 0, "base64", 512).unwrap();
+        assert!(raw > used && raw < page.bytes.len());
+        assert!(b64.len() <= 512);
+        assert!(b64.contains(&format!("more offset={raw}")));
+        assert!(JobsTool::render_output_page(&page, 0, "base64", 0).is_err());
+    }
+
+    #[test]
+    fn empty_page_carries_no_raw_credit_even_if_metadata_fits() {
+        let page = OutputPage {
+            offset: 0,
+            bytes: Vec::new(),
+            next_offset: None,
+            writer_finished: true,
+            truncated: true,
+            total_bytes: 100,
+            retained_bytes: 0,
+        };
+        let (rendered, used) = JobsTool::render_output_page(&page, 0, "text", 512).unwrap();
+        assert_eq!(used, 0);
+        assert_eq!(rendered, "truncated retained=0 total=100");
+        assert!(JobsTool::render_output_page(&page, 0, "text", 0).is_err());
     }
 }

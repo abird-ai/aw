@@ -24,7 +24,8 @@ impl Primary {
     }
 }
 /// One classification for a Job/Graph or any multi-object operation.
-///// Structural skips do not change material outcome family.
+/// Unresolved effects dominate known results; mixed means heterogeneous,
+/// settled outcomes only. Structural skips do not change material results.
 pub fn aggregate(components: impl IntoIterator<Item = Primary>) -> Primary {
     let mut saw_success = false;
     let mut saw_changed = false;
@@ -44,11 +45,10 @@ pub fn aggregate(components: impl IntoIterator<Item = Primary>) -> Primary {
             Primary::Skip => {}
         }
     }
-    let types = u8::from(saw_success) + u8::from(saw_failure) + u8::from(saw_unknown);
-    if saw_mixed || types > 1 {
-        Primary::Mixed
-    } else if saw_unknown {
+    if saw_unknown {
         Primary::Unknown
+    } else if saw_mixed || (saw_success && saw_failure) {
+        Primary::Mixed
     } else if saw_failure {
         Primary::Fail
     } else if saw_success {
@@ -101,9 +101,13 @@ mod tests {
         assert_eq!(aggregate([P::Ok, P::Unchanged]), P::Ok);
         assert_eq!(aggregate([P::Fail, P::Fail]), P::Fail);
         assert_eq!(aggregate([P::Unknown, P::Unknown]), P::Unknown);
-        assert_eq!(aggregate([P::Fail, P::Unknown]), P::Mixed);
-        assert_eq!(aggregate([P::Unknown, P::Ok]), P::Mixed);
+        assert_eq!(aggregate([P::Fail, P::Unknown]), P::Unknown);
+        assert_eq!(aggregate([P::Unknown, P::Ok]), P::Unknown);
+        assert_eq!(aggregate([P::Mixed, P::Unknown]), P::Unknown);
+        assert_eq!(aggregate([P::Unknown, P::Skip]), P::Unknown);
         assert_eq!(aggregate([P::Mixed, P::Skip]), P::Mixed);
+        assert_eq!(aggregate([P::Fail, P::Ok]), P::Mixed);
+        assert_eq!(aggregate([P::Mixed, P::Unchanged]), P::Mixed);
         assert_eq!(aggregate([P::Skip, P::Fail]), P::Fail);
     }
     #[test]

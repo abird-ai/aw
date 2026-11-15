@@ -36,11 +36,12 @@ fn core_spec(
     tool: aw_tools::filesystem::schema::Tool,
     caps: aw_tools::filesystem::schema::SchemaCaps,
 ) -> ToolSpec {
-    use aw_tools::filesystem::access::Action;
-    let core = aw_tools::filesystem::schema::spec(tool, caps);
-    let effect = match core.action {
-        Action::Read => ToolEffect::Read,
-        Action::Shell => ToolEffect::Process,
+    // Registered tools were already validated at host admission. Describe
+    // dormant tools without forcing their intentionally disabled caps valid.
+    let core = aw_tools::toolset::Toolset::describe_filesystem(tool, caps);
+    let effect = match core.effect {
+        aw_tools::ToolEffect::Read => ToolEffect::Read,
+        aw_tools::ToolEffect::Process => ToolEffect::Process,
         _ => ToolEffect::Write,
     };
     ToolSpec {
@@ -97,7 +98,7 @@ fn canonical_direct_limits(
         text_write_bytes: 1024 * 1024,
         binary_file_bytes: aw_tools::MAX_READ_WINDOW_BYTES,
         binary_default_window: 24 * 1024,
-        grep: aw_tools::search::GrepLimits::default(),
+        grep: limits.grep_work,
     }
 }
 
@@ -496,6 +497,10 @@ const DEFAULT_LOCAL_RESULT_BYTES: usize = 96 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalToolLimits {
     pub schema: aw_tools::filesystem::schema::SchemaCaps,
+    /// Shared configured grep work budget, consistent with schema context.
+    pub grep_work: aw_tools::search::GrepLimits,
+    /// Shared model-facing Job defaults and ceilings, independent of JobManager quota.
+    pub job_profile: aw_tools::toolset::JobProfile,
     /// Semantic native-tool result ceiling. Direct paged tools and retained
     /// native Job results share this bound; outer Agent presentation may be tighter.
     pub result_bytes: usize,
@@ -518,6 +523,8 @@ impl Default for LocalToolLimits {
                 parallel_reads: true,
                 ..Default::default()
             },
+            grep_work: aw_tools::search::GrepLimits::default(),
+            job_profile: aw_tools::toolset::JobProfile::default(),
             result_bytes: DEFAULT_LOCAL_RESULT_BYTES,
             shell_stream_bytes: 48 * 1024,
             edit_text_bytes: 48 * 1024,
@@ -527,6 +534,16 @@ impl Default for LocalToolLimits {
     }
 }
 impl LocalToolLimits {
+    /// Compose a validated shared factory with AW-specific resource ceilings.
+    /// This never issues ToolPolicy/Envelope authority and cannot widen AW's
+    /// built-in safety defaults; normal host validation still runs at configure.
+    pub fn with_toolset(mut self, set: &aw_tools::toolset::Toolset) -> Self {
+        self.schema = set.schema_caps();
+        self.grep_work = set.grep_limits();
+        self.job_profile = set.jobs_profile();
+        self
+    }
+
     pub(crate) fn validate_job_runtime_capacity(
         self,
         graph_width: usize,
@@ -649,7 +666,43 @@ impl LocalToolLimits {
                 "enabled decoded binary limit must stay within AW built-in bounds".into(),
             ));
         }
+        if tools.contains(&T::Grep)
+            && (self.grep_work.context_max != self.schema.grep_context_max
+                || self.grep_work.scan_bytes > aw_tools::search::GrepLimits::default().scan_bytes
+                || self.grep_work.scan_files > aw_tools::search::GrepLimits::default().scan_files
+                || self.grep_work.candidates > aw_tools::search::GrepLimits::default().candidates
+                || self.grep_work.text_file_bytes
+                    > aw_tools::search::GrepLimits::default().text_file_bytes
+                || self.grep_work.duration > aw_tools::search::GrepLimits::default().duration
+                || self.grep_work.output_bytes
+                    > aw_tools::search::GrepLimits::default().output_bytes)
+        {
+            return Err(Error::Config(
+                "grep host limits must narrow shared defaults".into(),
+            ));
+        }
         if jobs {
+            let factory = aw_tools::toolset::Toolset::builder()
+                .filesystem(self.schema)
+                .grep(aw_tools::toolset::GrepProfile {
+                    max_context: self.schema.grep_context_max,
+                    default_context: self.schema.grep_context_default,
+                    limits: self.grep_work,
+                })
+                .jobs(self.job_profile)
+                .only(tools.iter().copied())
+                .build()
+                .map_err(|error| Error::Config(error.to_string()))?;
+            let _ = factory;
+            if self.job_profile.get_tail_max > defaults.job_profile.get_tail_max
+                || self.job_profile.get_wait_max_ms > defaults.job_profile.get_wait_max_ms
+                || self.job_profile.read_wait_max_ms > defaults.job_profile.read_wait_max_ms
+                || self.job_profile.list_page_max > defaults.job_profile.list_page_max
+            {
+                return Err(Error::Config(
+                    "AW Job profile must narrow its built-in ceilings".into(),
+                ));
+            }
             self.jobs
                 .validate()
                 .map_err(|_| Error::Config("invalid shared JobManager limits".into()))?;
@@ -757,6 +810,11 @@ pub struct LocalToolOptions {
     pub limits: LocalToolLimits,
 }
 impl LocalToolOptions {
+    pub fn with_toolset(mut self, toolset: &aw_tools::toolset::Toolset) -> Self {
+        self.limits = self.limits.with_toolset(toolset);
+        self
+    }
+
     pub fn new(root: impl Into<PathBuf>, mode: ToolMode) -> Self {
         Self {
             root: root.into(),
@@ -795,49 +853,90 @@ impl ToolPolicyLifecycle for ParallelismCeiling {
     }
 }
 
+/// Adapter-only metadata projection. The original Tool retains all
+/// authority checks, argument validation, scheduling and execution.
+struct DescribedTool {
+    tool: Arc<dyn Tool>,
+    spec: ToolSpec,
+}
+impl Tool for DescribedTool {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+    fn is_available(&self) -> bool {
+        self.tool.is_available()
+    }
+    fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+        self.tool.validate(arguments)
+    }
+    fn can_run_parallel(&self, first: &serde_json::Value, second: &serde_json::Value) -> bool {
+        self.tool.can_run_parallel(first, second)
+    }
+    fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        self.tool.execute(ctx, arguments)
+    }
+}
+
 fn routed_tool(
     tool: Arc<dyn Tool>,
     router: &Arc<operation_router::OperationRouterSlot>,
+    catalog: Option<&aw_tools::toolset::Toolset>,
 ) -> Result<Arc<dyn Tool>> {
+    let tool = match catalog {
+        Some(catalog) => {
+            let mut spec = tool.spec();
+            let operation = aw_tools::OperationId::from_model_name(&spec.name)
+                .ok_or_else(|| Error::Config("unknown canonical tool metadata target".into()))?;
+            if !catalog.has_text_override(operation) {
+                tool
+            } else {
+                let mut title = aw_tools::toolset::operation_title(operation).to_owned();
+                catalog
+                    .override_descriptions(
+                        operation,
+                        &mut title,
+                        &mut spec.description,
+                        &mut spec.parameters,
+                    )
+                    .map_err(|err| Error::Config(err.to_string()))?;
+                Arc::new(DescribedTool { tool, spec })
+            }
+        }
+        None => tool,
+    };
     Ok(Arc::new(operation_router::RoutedTool::new(
         tool,
         router.clone(),
     )?))
 }
 
+struct OfferContext<'a, 'b> {
+    selected: &'a BTreeSet<&'b str>,
+    available: &'a mut BTreeSet<String>,
+    policy: &'a mut ToolPolicy,
+    actor: &'a PrincipalId,
+    router: &'a Arc<operation_router::OperationRouterSlot>,
+    catalog: Option<&'a aw_tools::toolset::Toolset>,
+}
 fn offer<T: Tool + 'static>(
     builder: AgentBuilder,
     tool: T,
-    selected: &BTreeSet<&str>,
-    available: &mut BTreeSet<String>,
-    policy: &mut ToolPolicy,
-    actor: &PrincipalId,
-    router: &Arc<operation_router::OperationRouterSlot>,
+    context: &mut OfferContext<'_, '_>,
 ) -> Result<AgentBuilder> {
-    offer_shared(
-        builder,
-        Arc::new(tool),
-        selected,
-        available,
-        policy,
-        actor,
-        router,
-    )
+    offer_shared(builder, Arc::new(tool), context)
 }
 fn offer_shared(
     builder: AgentBuilder,
     tool: Arc<dyn Tool>,
-    selected: &BTreeSet<&str>,
-    available: &mut BTreeSet<String>,
-    policy: &mut ToolPolicy,
-    actor: &PrincipalId,
-    router: &Arc<operation_router::OperationRouterSlot>,
+    context: &mut OfferContext<'_, '_>,
 ) -> Result<AgentBuilder> {
     let spec = tool.spec();
-    available.insert(spec.name.clone());
-    if selected.is_empty() || selected.contains(spec.name.as_str()) {
-        policy.permit_host(actor.clone(), &spec.name, &spec.effect)?;
-        Ok(builder.shared_tool(routed_tool(tool, router)?))
+    context.available.insert(spec.name.clone());
+    if context.selected.is_empty() || context.selected.contains(spec.name.as_str()) {
+        context
+            .policy
+            .permit_host(context.actor.clone(), &spec.name, &spec.effect)?;
+        Ok(builder.shared_tool(routed_tool(tool, context.router, context.catalog)?))
     } else {
         Ok(builder)
     }
@@ -845,26 +944,50 @@ fn offer_shared(
 fn offer_required<T: Tool + 'static>(
     builder: AgentBuilder,
     tool: T,
-    selection: (&BTreeSet<&str>, bool),
-    available: &mut BTreeSet<String>,
-    policy: &mut ToolPolicy,
-    actor: &PrincipalId,
-    router: &Arc<operation_router::OperationRouterSlot>,
+    required: bool,
+    context: &mut OfferContext<'_, '_>,
 ) -> Result<AgentBuilder> {
-    let (selected, required) = selection;
     let spec = tool.spec();
-    available.insert(spec.name.clone());
-    if required || selected.is_empty() || selected.contains(spec.name.as_str()) {
-        policy.permit_host(actor.clone(), &spec.name, &spec.effect)?;
-        Ok(builder.shared_tool(routed_tool(Arc::new(tool), router)?))
+    context.available.insert(spec.name.clone());
+    if required || context.selected.is_empty() || context.selected.contains(spec.name.as_str()) {
+        context
+            .policy
+            .permit_host(context.actor.clone(), &spec.name, &spec.effect)?;
+        Ok(builder.shared_tool(routed_tool(
+            Arc::new(tool),
+            context.router,
+            context.catalog,
+        )?))
     } else {
         Ok(builder)
     }
 }
+/// Existing host composition remains unchanged when no toolset is supplied.
 pub fn configure(
+    builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+) -> Result<AgentBuilder> {
+    configure_inner(builder, actor, options, None)
+}
+
+/// Apply metadata hooks and configured limits through the original AW Agent
+/// tool registry. Catalog metadata never grants tools or changes effects.
+pub fn configure_with_toolset(
+    builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+    toolset: &aw_tools::toolset::Toolset,
+) -> Result<AgentBuilder> {
+    let mut configured = options.clone();
+    configured.limits = options.limits.with_toolset(toolset);
+    configure_inner(builder, actor, &configured, Some(toolset))
+}
+fn configure_inner(
     mut builder: AgentBuilder,
     actor: PrincipalId,
     options: &LocalToolOptions,
+    catalog: Option<&aw_tools::toolset::Toolset>,
 ) -> Result<AgentBuilder> {
     if options.mode == ToolMode::Off {
         if options.selected_tools.is_empty() {
@@ -917,6 +1040,7 @@ pub fn configure(
     let wants_jobs = selected.is_empty() || constructor_selected || control_selected;
     let active_tools = aw_tools::filesystem::schema::Tool::ALL
         .into_iter()
+        .filter(|tool| catalog.is_none_or(|catalog| catalog.tools().contains(tool)))
         .filter(|tool| options.mode.access().permits(tool.action()))
         .filter(|tool| selected.is_empty() || selected.contains(tool.name()))
         .collect::<Vec<_>>();
@@ -984,6 +1108,7 @@ pub fn configure(
     };
     let graph_native_tools = aw_tools::filesystem::schema::Tool::GRAPH_NATIVE
         .into_iter()
+        .filter(|tool| catalog.is_none_or(|catalog| catalog.tools().contains(tool)))
         .filter(|tool| options.mode.access().permits(tool.action()))
         .filter(|tool| *tool != aw_tools::filesystem::schema::Tool::Remove || durable_remove)
         .filter(|tool| selected.is_empty() || selected.contains(tool.name()))
@@ -1021,6 +1146,14 @@ pub fn configure(
             graph_shell_available,
         )?;
     }
+    let mut offered = OfferContext {
+        selected: &selected,
+        available: &mut available,
+        policy: &mut policy,
+        actor: &actor,
+        router: &options.operation_router,
+        catalog,
+    };
     let job_runtime = if wants_jobs {
         let runtime = job_runtime::JobRuntime::new_with_native_tools_bounded(
             root.clone(),
@@ -1052,20 +1185,21 @@ pub fn configure(
             builder = offer_required(
                 builder,
                 jobs_tools::JobsTool::new(runtime.clone(), kind),
-                (&selected, constructor_selected),
-                &mut available,
-                &mut policy,
-                &actor,
-                &options.operation_router,
+                constructor_selected,
+                &mut offered,
             )?;
         }
         Some(runtime)
     } else {
-        available.extend(JOB_TOOL_NAMES.iter().map(|name| (*name).to_owned()));
+        offered
+            .available
+            .extend(JOB_TOOL_NAMES.iter().map(|name| (*name).to_owned()));
         None
     };
     for core in aw_tools::filesystem::schema::Tool::ALL {
-        if !options.mode.access().permits(core.action()) {
+        if catalog.is_some_and(|catalog| !catalog.tools().contains(&core))
+            || !options.mode.access().permits(core.action())
+        {
             continue;
         }
         if core == aw_tools::filesystem::schema::Tool::Remove && !durable_remove {
@@ -1074,11 +1208,7 @@ pub fn configure(
         builder = offer_shared(
             builder,
             Arc::new(CanonicalFilesystemTool::new(root.clone(), core, limits)),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-            &options.operation_router,
+            &mut offered,
         )?;
     }
     if options
@@ -1111,17 +1241,9 @@ pub fn configure(
                 } else {
                     shell
                 };
-                builder = offer_shared(
-                    builder,
-                    direct,
-                    &selected,
-                    &mut available,
-                    &mut policy,
-                    &actor,
-                    &options.operation_router,
-                )?;
+                builder = offer_shared(builder, direct, &mut offered)?;
             } else {
-                available.insert("bash".into());
+                offered.available.insert("bash".into());
             }
         }
         #[cfg(windows)]
@@ -1152,15 +1274,7 @@ pub fn configure(
                 } else {
                     shell
                 };
-                builder = offer_shared(
-                    builder,
-                    direct,
-                    &selected,
-                    &mut available,
-                    &mut policy,
-                    &actor,
-                    &options.operation_router,
-                )?;
+                builder = offer_shared(builder, direct, &mut offered)?;
             } else {
                 // No shell requested in this selected-tool subset.
             }
@@ -1174,14 +1288,13 @@ pub fn configure(
         builder = offer(
             builder,
             job_tools::Batch::new(runtime.clone()),
-            &selected,
-            &mut available,
-            &mut policy,
-            &actor,
-            &options.operation_router,
+            &mut offered,
         )?;
     }
-    if selected.iter().any(|name| !available.contains(*name)) {
+    if selected
+        .iter()
+        .any(|name| !offered.available.contains(*name))
+    {
         return Err(Error::Denied(
             "selected tool is unavailable under the current tool mode",
         ));

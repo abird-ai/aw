@@ -207,6 +207,9 @@ pub struct Grep {
     pub mode: GrepOutput,
     #[serde(default)]
     pub context: usize,
+    /// Overrides the symmetric `context` on the respective side.
+    pub before: Option<usize>,
+    pub after: Option<usize>,
     #[serde(default)]
     pub hidden: bool,
     #[serde(default)]
@@ -724,7 +727,7 @@ pub fn parse(tool: Tool, value: &Value, limits: Limits) -> Result<Request, Error
     let kind = match tool {
         Tool::Ls => parse_ls(value).map(RequestKind::Ls),
         Tool::Find => parse_find(value).map(RequestKind::Find),
-        Tool::Grep => parse_grep(value).map(RequestKind::Grep),
+        Tool::Grep => parse_grep(value, limits.schema).map(RequestKind::Grep),
         Tool::Read => parse_read(value, limits).map(RequestKind::Read),
         Tool::Write => parse_write(value, limits).map(RequestKind::Write),
         Tool::Edit => parse_edit(value, limits).map(RequestKind::Edit),
@@ -768,9 +771,27 @@ fn parse_find(value: &Value) -> Result<Find, Error> {
     .map_err(Error::Invalid)?;
     Ok(request)
 }
-fn parse_grep(value: &Value) -> Result<Grep, Error> {
-    let request: Grep = decode(value, "invalid grep arguments")?;
+fn parse_grep(value: &Value, caps: SchemaCaps) -> Result<Grep, Error> {
+    let mut request: Grep = decode(value, "invalid grep arguments")?;
     validate_discovery_path(&request.path)?;
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("context"))
+    {
+        request.context = caps.grep_context_default;
+    }
+    // Validate every supplied field, not only effective sides. Overrides do
+    // not make an otherwise invalid explicit context acceptable.
+    if request.context > caps.grep_context_max
+        || request
+            .before
+            .is_some_and(|value| value > caps.grep_context_max)
+        || request
+            .after
+            .is_some_and(|value| value > caps.grep_context_max)
+    {
+        return Err(Error::Invalid("invalid grep context"));
+    }
     let context = request.context;
     let options = GrepOptions {
         pattern: &request.pattern,
@@ -785,8 +806,8 @@ fn parse_grep(value: &Value) -> Result<Grep, Error> {
         literal: request.literal,
         ignore_case: request.ignore_case,
         mode: request.mode.into(),
-        before: context,
-        after: context,
+        before: request.before.unwrap_or(context),
+        after: request.after.unwrap_or(context),
         hidden: request.hidden,
         gitignore: request.gitignore,
         offset: request.offset,
@@ -796,6 +817,7 @@ fn parse_grep(value: &Value) -> Result<Grep, Error> {
         // execution time; use the shared engine render maximum only to satisfy
         // the bounded grep-query invariant here.
         limits: GrepLimits {
+            context_max: caps.grep_context_max,
             output_bytes: super::MAX_RENDER_BYTES,
             ..Default::default()
         },
@@ -1220,6 +1242,33 @@ mod tests {
         assert_eq!(grep.context, 0);
         assert_eq!(grep.limit, 200);
         assert_eq!(grep.path, ".");
+    }
+
+    #[test]
+    fn grep_context_side_overrides_match_shared_schema() {
+        let caps = Limits::default();
+        let request = parse(
+            Tool::Grep,
+            &json!({"pattern":"needle","context":12,"before":128,"after":0}),
+            caps,
+        )
+        .unwrap();
+        let RequestKind::Grep(grep) = request.kind() else {
+            panic!("grep request")
+        };
+        assert_eq!(
+            (grep.context, grep.before, grep.after),
+            (12, Some(128), Some(0))
+        );
+        let schema = crate::filesystem::schema::spec(Tool::Grep, caps.schema);
+        for key in ["context", "before", "after"] {
+            assert_eq!(schema.parameters["properties"][key]["maximum"], 128);
+        }
+        assert!(parse(Tool::Grep, &json!({"pattern":"x","before":129}), caps).is_err());
+        assert!(parse(Tool::Grep, &json!({"pattern":"x","after":129}), caps).is_err());
+        assert!(parse(Tool::Grep, &json!({"pattern":"x","context":129}), caps).is_err());
+        assert!(parse(Tool::Grep, &json!({"pattern":"x","before":-1}), caps).is_err());
+        assert!(parse(Tool::Grep, &json!({"pattern":"x","beforee":1}), caps).is_err());
     }
 
     #[test]

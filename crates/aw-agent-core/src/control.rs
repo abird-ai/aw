@@ -29,6 +29,15 @@ pub enum AgentGatePoint {
     BeforeToolBatch,
 }
 pub trait AgentStepGate: Send + Sync {
+    /// Share this *live* host-owned gate with the in-flight ToolContext.
+    /// Custom gates must explicitly opt in; no cached allow list or grant.
+    /// A gated tool dispatch fails closed if it cannot clone its gate.
+    fn shared_gate(&self) -> Result<Arc<dyn AgentStepGate>> {
+        Err(Error::Denied(
+            "Actor tool gate cannot be safely shared with tool dispatch",
+        ))
+    }
+
     /// Current authenticated authority boundary for this exact Turn. This is
     /// evidence only; ToolPolicy/Envelope/Session checks remain authoritative.
     fn authority_segment(&self, _turn_id: u64) -> Result<Option<crate::AuthoritySegment>> {
@@ -63,6 +72,21 @@ pub trait AgentStepGate: Send + Sync {
         source: &crate::ToolSource,
         effect: &crate::ToolEffect,
     ) -> Result<()>;
+
+    /// Synchronous effect commit under the current Actor's authority lock.
+    /// Default fails closed: a check-then-commit fallback would race revocation.
+    /// No awaiting or cross-service callbacks may occur inside this closure.
+    fn with_authorized_tool_commit(
+        &self,
+        _name: &str,
+        _source: &crate::ToolSource,
+        _effect: &crate::ToolEffect,
+        _commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::Denied(
+            "Actor gate cannot serialize this effect with revocation",
+        ))
+    }
 }
 
 /// Optional host-only live owner epoch fence. The implementation must query
@@ -670,6 +694,10 @@ impl crate::hooks::HookContinuationPort for AgentSessionController {
     }
 }
 impl AgentStepGate for AgentSessionController {
+    fn shared_gate(&self) -> Result<Arc<dyn AgentStepGate>> {
+        Ok(Arc::new(self.clone()))
+    }
+
     fn authority_segment(&self, turn_id: u64) -> Result<Option<crate::AuthoritySegment>> {
         self.verify_writer_fence()?;
         self.with_runtime(|runtime| {
@@ -712,6 +740,27 @@ impl AgentStepGate for AgentSessionController {
             }
         })
     }
+    fn with_authorized_tool_commit(
+        &self,
+        name: &str,
+        source: &crate::ToolSource,
+        effect: &crate::ToolEffect,
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.verify_writer_fence()?;
+        // The same Actor runtime mutex guards Envelope updates and Actor
+        // release. Commit is synchronous and must not re-enter this controller.
+        self.with_runtime(|runtime| {
+            let env = runtime.envelope(&self.principal, self.actor, self.writer_epoch)?;
+            if !crate::tool::envelope_permits_tool(env, name, source, effect) {
+                return Err(Error::Denied(
+                    "Actor Envelope revoked or lacks exact tool authority",
+                ));
+            }
+            commit()
+        })
+    }
+
     fn checkpoint<'a>(
         &'a self,
         turn_id: u64,
@@ -861,6 +910,117 @@ mod tests {
             actor,
         )
     }
+    #[test]
+    fn shared_step_gate_rechecks_exact_live_actor_envelope() {
+        let (controller, _) = runtime_with_scope(false);
+        let gate = AgentStepGate::shared_gate(&controller).unwrap();
+        let source = crate::ToolSource::trusted_host();
+        assert!(gate
+            .allow_tool("count", &source, &crate::ToolEffect::Read)
+            .is_ok());
+        assert!(gate
+            .allow_tool("count", &source, &crate::ToolEffect::Control)
+            .is_err());
+        assert!(gate
+            .allow_tool("jobs_read", &source, &crate::ToolEffect::Read)
+            .is_err());
+        assert!(gate
+            .allow_tool("jobs_ack", &source, &crate::ToolEffect::Control)
+            .is_err());
+    }
+
+    #[test]
+    fn actor_runtime_release_serializes_with_exact_control_commit() {
+        use aw_agent_kernel::actor::ActorState;
+        use std::sync::mpsc;
+
+        let (controller, actor) = runtime_with_scope(false);
+        let gate = AgentStepGate::shared_gate(&controller).unwrap();
+        let source = crate::ToolSource::trusted_host();
+        let committed = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let controller_for_release = controller.clone();
+        let committed_for_release = committed.clone();
+        let released_for_release = released.clone();
+        let release = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            attempt_tx.send(()).unwrap();
+            controller_for_release
+                .with_runtime(|runtime| {
+                    assert!(
+                        committed_for_release.load(Ordering::SeqCst),
+                        "Actor release cannot enter the runtime before authorized commit"
+                    );
+                    runtime.record_state(&principal(), actor, None, ActorState::Running)?;
+                    runtime.record_state(&principal(), actor, None, ActorState::Settled)?;
+                    runtime.release(&principal(), actor, None)?;
+                    released_for_release.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+        });
+        let mut action = || {
+            started_tx.send(()).unwrap();
+            attempt_rx.recv().unwrap();
+            assert!(!released.load(Ordering::SeqCst));
+            committed.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        gate.with_authorized_tool_commit(
+            "interrupt_request",
+            &source,
+            &ToolEffect::Control,
+            &mut action,
+        )
+        .unwrap();
+        release.join().unwrap();
+        assert!(released.load(Ordering::SeqCst));
+
+        let mut illegal = || panic!("revoked Actor cannot commit another effect");
+        assert!(gate
+            .with_authorized_tool_commit(
+                "interrupt_request",
+                &source,
+                &ToolEffect::Control,
+                &mut illegal,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn exact_control_commit_denies_ungranted_effect_before_callback() {
+        let (controller, _) = runtime_with_scope(false);
+        let gate = AgentStepGate::shared_gate(&controller).unwrap();
+        let source = crate::ToolSource::trusted_host();
+        let count = std::cell::Cell::new(0usize);
+        let mut action = || {
+            count.set(count.get() + 1);
+            Ok(())
+        };
+        assert!(gate
+            .with_authorized_tool_commit(
+                "interrupt_request",
+                &source,
+                &ToolEffect::Read,
+                &mut action,
+            )
+            .is_err());
+        assert!(gate
+            .with_authorized_tool_commit("missing", &source, &ToolEffect::Control, &mut action,)
+            .is_err());
+        assert_eq!(count.get(), 0);
+        gate.with_authorized_tool_commit(
+            "interrupt_request",
+            &source,
+            &ToolEffect::Control,
+            &mut action,
+        )
+        .unwrap();
+        assert_eq!(count.get(), 1);
+    }
+
     fn input(actor: ActorKey, id: u64, priority: i8, text: &str) -> ActorMessage {
         ActorMessage {
             id,

@@ -740,13 +740,17 @@ where
                     literal: args.literal,
                     ignore_case: args.ignore_case,
                     mode: args.mode.into(),
-                    before: args.context,
-                    after: args.context,
+                    before: args.before.unwrap_or(args.context),
+                    after: args.after.unwrap_or(args.context),
                     hidden: args.hidden,
                     gitignore: args.gitignore,
                     offset: args.offset,
                     limit: args.limit,
                     limits: GrepLimits {
+                        context_max: limits
+                            .grep
+                            .context_max
+                            .min(limits.request.schema.grep_context_max),
                         text_file_bytes: limits.grep.text_file_bytes,
                         output_bytes: limits.result_bytes,
                         ..limits.grep

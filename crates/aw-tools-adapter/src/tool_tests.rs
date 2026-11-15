@@ -123,6 +123,7 @@ fn context() -> ToolContext {
             .unwrap(),
         ),
         execution_scope: None,
+        live_step_gate: None,
     }
 }
 async fn call<T: Tool>(tool: &T, arguments: Value) -> ToolOutput {
@@ -2133,6 +2134,8 @@ fn tool_schemas_cover_dl150_ai_native_surface() {
                 "ignore_case",
                 "mode",
                 "context",
+                "before",
+                "after",
                 "hidden",
                 "gitignore",
                 "offset",
@@ -3155,6 +3158,208 @@ async fn lifecycle_delete_preflights_all_roots_and_does_not_follow_links() {
     assert!(!left.iter().any(|name| name.starts_with(".aw-trash-")));
 }
 
+#[test]
+fn toolset_description_hooks_flow_into_registered_aw_catalog_without_grants() {
+    use aw_tools::filesystem::schema::Tool as FsTool;
+    use aw_tools::{
+        toolset::{GrepProfile, ToolText, Toolset},
+        OperationId,
+    };
+
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let toolset = Toolset::builder()
+        .grep(GrepProfile {
+            max_context: 8,
+            ..Default::default()
+        })
+        .only([FsTool::Grep, FsTool::Read])
+        .tool_text(
+            OperationId::Fs(FsTool::Grep),
+            ToolText::new()
+                .title("Grep project")
+                .description_suffix("Custom search limit: ${grep.max_context}.")
+                .argument("pattern", "A custom pattern to match."),
+        )
+        .tool_text(
+            OperationId::Fs(FsTool::Write),
+            ToolText::new().description("A disabled tool cannot become available."),
+        )
+        .build()
+        .unwrap();
+
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::ReadOnly);
+    options.selected_tools = vec!["grep".into(), "read".into()];
+    let agent = configure_with_toolset(builder, actor, &options, &toolset)
+        .unwrap()
+        .build()
+        .unwrap();
+    let specs = agent.tool_specs();
+    assert_eq!(specs.len(), 2);
+    let grep = specs.iter().find(|s| s.name == "grep").unwrap();
+    assert_eq!(grep.effect, ToolEffect::Read);
+    assert!(grep.description.contains("Custom search limit: 8."));
+    assert_eq!(
+        grep.parameters["properties"]["pattern"]["description"],
+        "A custom pattern to match."
+    );
+    assert_eq!(grep.parameters["properties"]["context"]["maximum"], 8);
+    assert!(specs.iter().all(|s| s.name != "write"));
+    // A toolset's .only() narrows AW native availability as well as the Graph.
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    let mut excluded = options.clone();
+    excluded.selected_tools = vec!["write".into()];
+    assert!(configure_with_toolset(
+        builder,
+        PrincipalId::new("local").unwrap(),
+        &excluded,
+        &toolset
+    )
+    .is_err());
+}
+
+#[test]
+fn toolset_host_jobs_and_batch_metadata_hooks_share_original_authority() {
+    use aw_tools::{
+        toolset::{ToolText, Toolset},
+        OperationId,
+    };
+    struct ProviderFixture;
+    impl Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("provider unused")) })
+        }
+    }
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    let toolset = Toolset::builder()
+        .tool_text(
+            OperationId::Batch,
+            ToolText::new().description_suffix("One Job coordinates all leaf edits."),
+        )
+        .tool_text(
+            OperationId::JobsGet,
+            ToolText::new()
+                .description_suffix("Custom status guidance.")
+                .argument("tail", "Model-facing combined tail budget."),
+        )
+        .build()
+        .unwrap();
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::ReadOnly);
+    options.selected_tools = vec!["read".into(), "batch".into()];
+    let agent = configure_with_toolset(builder, actor, &options, &toolset)
+        .unwrap()
+        .build()
+        .unwrap();
+    let specs = agent.tool_specs();
+    let batch = specs.iter().find(|s| s.name == "batch").unwrap();
+    assert_eq!(batch.effect, ToolEffect::Control);
+    assert!(batch
+        .description
+        .contains("One Job coordinates all leaf edits."));
+    assert_eq!(batch.parameters["properties"]["ops"]["type"], "array");
+    let get = specs.iter().find(|s| s.name == "jobs_get").unwrap();
+    assert_eq!(get.effect, ToolEffect::Read);
+    assert!(get.description.contains("Custom status guidance."));
+    assert_eq!(
+        get.parameters["properties"]["tail"]["description"],
+        "Model-facing combined tail budget."
+    );
+    assert!(
+        specs.iter().all(|s| s.name != "write"),
+        "Tool metadata must not widen the read-only mode"
+    );
+
+    // Host-supplied argument schemas are checked at actual registration.
+    let invalid = Toolset::builder()
+        .tool_text(
+            OperationId::JobsGet,
+            ToolText::new().argument("misspelled_tail", "No such field."),
+        )
+        .build()
+        .unwrap();
+    let builder = Agent::builder(
+        Arc::new(ProviderFixture),
+        AgentOptions::new("fixture", "model"),
+    );
+    assert!(configure_with_toolset(
+        builder,
+        PrincipalId::new("local").unwrap(),
+        &options,
+        &invalid
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn toolset_builder_narrows_direct_grep_schema_and_execution_together() {
+    use aw_tools::toolset::{GrepProfile, JobProfile, Toolset};
+    let tree = Tree::new();
+    fs::write(tree.path("sample.txt"), "before\nhit\nafter\n").unwrap();
+    let factory = Toolset::builder()
+        .grep(GrepProfile {
+            default_context: 1,
+            max_context: 2,
+            ..Default::default()
+        })
+        .jobs(JobProfile {
+            get_tail_default: 256,
+            get_tail_max: 384,
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
+    let options = LocalToolOptions::new(&tree.0, ToolMode::ReadOnly).with_toolset(&factory);
+    let limits = options
+        .limits
+        .validate_for_names(&["grep"], false, false)
+        .unwrap();
+    let grep = search::Search::with_limits(tree.root(), search::Operation::Grep, limits);
+    assert_eq!(
+        grep.spec().parameters["properties"]["context"]["maximum"],
+        2
+    );
+    assert_eq!(
+        grep.spec().parameters["properties"]["context"]["default"],
+        1
+    );
+    let found = call(&grep, json!({"pattern":"hit","path":"sample.txt"})).await;
+    assert!(!found.is_error, "{}", found.content);
+    assert!(found.content.contains("before"), "{}", found.content);
+    assert!(found.content.contains("after"), "{}", found.content);
+    assert!(grep
+        .validate(&json!({"pattern":"hit","context":3,"before":0,"after":0}))
+        .is_err());
+    assert!(grep.validate(&json!({"pattern":"hit","before":3})).is_err());
+}
+
 #[tokio::test]
 async fn sealed_grep_context_and_copy_recursive_default() {
     let tree = Tree::new();
@@ -3180,8 +3385,22 @@ async fn sealed_grep_context_and_copy_recursive_default() {
     assert!(cp.spec().parameters["properties"]
         .get("recursive")
         .is_none());
-    assert!(find.spec().parameters["properties"].get("before").is_none());
-    assert!(find.spec().parameters["properties"].get("after").is_none());
+    assert_eq!(
+        find.spec().parameters["properties"]["before"]["maximum"],
+        128
+    );
+    assert_eq!(
+        find.spec().parameters["properties"]["after"]["maximum"],
+        128
+    );
+    let exact = call(
+        &find,
+        json!({"path":"source/sub/f.rs","pattern":"match","before":1,"after":0}),
+    )
+    .await;
+    assert!(!exact.is_error, "{}", exact.content);
+    assert!(exact.content.contains("before"), "{}", exact.content);
+    assert!(!exact.content.contains("after"), "{}", exact.content);
     let patch = patch::Patch::new(tree.root());
     assert!(patch.spec().parameters["properties"]
         .get("best_effort")

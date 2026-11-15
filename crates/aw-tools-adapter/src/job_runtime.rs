@@ -262,6 +262,73 @@ impl JobRuntime {
         }))
     }
 
+    /// Status access never grants retained-output access. Check the actual
+    /// current jobs_read binding AND the same Actor's live Envelope. A
+    /// jobs_get grant alone is never enough for its optional output tail.
+    pub(crate) fn payload_read_authorized(&self, ctx: &ToolContext) -> bool {
+        self.live_auxiliary_tool(ctx, "jobs_read", aw_agent_core::ToolEffect::Read)
+    }
+
+    /// Control effects need their own current exact ToolPolicy and live Actor
+    /// Envelope grant, even if the caller already knows the Job's reference.
+    pub(crate) fn control_authorized(&self, ctx: &ToolContext, name: &str) -> bool {
+        self.live_auxiliary_tool(ctx, name, aw_agent_core::ToolEffect::Control)
+    }
+
+    /// Serialize exact Control grant and current Actor Envelope revocation
+    /// against one synchronous Job ACK/Finish mutation. Lock order:
+    /// ToolBindingAuthority -> Actor runtime -> JobManager. No awaits.
+    pub(crate) fn with_control_commit<T>(
+        &self,
+        ctx: &ToolContext,
+        name: &str,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let binding = self
+            .authority
+            .permitted_binding(&ctx.actor, name)
+            .map_err(|_| Error::Denied("Job Control grant is no longer live"))?;
+        if binding.effect != aw_agent_core::ToolEffect::Control
+            || binding.execution_site != ctx.execution_site
+        {
+            return Err(Error::Denied("Job Control source/effect/site changed"));
+        }
+        let mut outcome = None;
+        let guarded = self
+            .authority
+            .with_revalidated_binding(&ctx.actor, &binding, || {
+                ctx.with_peer_tool_commit(&binding, || {
+                    outcome = Some(commit());
+                    Ok(())
+                })
+            });
+        if guarded.is_err() {
+            // A faulty host gate could return an error AFTER invoking the
+            // effect. Never tell the caller a no-effect Denied is certain.
+            return Err(if outcome.is_some() {
+                Error::Transport("Job Control outcome uncertain; inspect before retry")
+            } else {
+                Error::Denied("Job Control or Actor Envelope revoked before commit")
+            });
+        }
+        outcome.ok_or(Error::Protocol(
+            "Job Control gate returned without executing its commit",
+        ))?
+    }
+
+    fn live_auxiliary_tool(
+        &self,
+        ctx: &ToolContext,
+        name: &str,
+        effect: aw_agent_core::ToolEffect,
+    ) -> bool {
+        self.authority
+            .permitted_binding(&ctx.actor, name)
+            .is_ok_and(|binding| {
+                binding.effect == effect && ctx.authorize_peer_tool(&binding).is_ok()
+            })
+    }
+
     fn control_replay_key(generation: u64, ctx: &ToolContext, operation: &str) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"aw-job-control-invocation-v1\0");
@@ -508,10 +575,15 @@ impl JobRuntime {
         router.revalidate_wake_recipient(ctx, &wake.recipient)
     }
 
+    pub(crate) fn job_profile(&self) -> aw_tools::toolset::JobProfile {
+        self.tool_limits.job_profile
+    }
+
     pub(crate) fn job_list_limit(&self) -> usize {
         self.tool_limits
             .jobs
             .max_exposed_jobs
+            .min(self.tool_limits.job_profile.list_page_max)
             .min(aw_tools::filesystem::job_manager::MAX_JOB_LIST_PAGE)
     }
     pub(crate) fn result_limit(&self) -> usize {
@@ -1366,6 +1438,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         let tool =
             crate::jobs_tools::JobsTool::new(runtime, crate::jobs_tools::JobsKind::Subscribe);
@@ -1458,6 +1531,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         let host = runtime.host_for(&ctx).unwrap();
         let graph = serde_json::json!({
@@ -1577,6 +1651,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         let graph = serde_json::json!({
             "ops":[["read",{"path":"fast.txt","numbered":false}]]
@@ -1699,6 +1774,7 @@ mod tests {
             ),
             result_budget_bytes: crate::LocalToolLimits::default().result_bytes,
             execution_scope: None,
+            live_step_gate: None,
         };
         let graph = serde_json::json!({"ops":[["read",{"path":"a.txt","numbered":false}]]});
         let host = runtime.host_for(&ctx).unwrap();
@@ -1760,6 +1836,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         let started = runtime
             .start_graph(
@@ -1899,6 +1976,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         (root, agent, runtime, ctx)
     }
@@ -2505,6 +2583,7 @@ mod graph_policy_tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         (runtime, agent, ctx)
     }

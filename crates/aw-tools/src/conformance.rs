@@ -234,14 +234,22 @@ pub fn aggregates() -> Vec<AggregateVector> {
         },
         AggregateVector {
             components: vec![P::Fail, P::Unknown],
-            expected: P::Mixed,
+            expected: P::Unknown,
         },
         AggregateVector {
             components: vec![P::Unknown, P::Ok],
-            expected: P::Mixed,
+            expected: P::Unknown,
         },
         AggregateVector {
             components: vec![P::Mixed, P::Skip],
+            expected: P::Mixed,
+        },
+        AggregateVector {
+            components: vec![P::Mixed, P::Unknown],
+            expected: P::Unknown,
+        },
+        AggregateVector {
+            components: vec![P::Ok, P::Fail],
             expected: P::Mixed,
         },
     ]

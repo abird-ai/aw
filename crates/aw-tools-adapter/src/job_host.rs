@@ -2588,6 +2588,7 @@ impl JobHost {
             scope: ctx.scope.clone(),
             execution_owner: ctx.execution_owner.clone(),
             execution_scope: Some(ownership.clone()),
+            live_step_gate: None,
         };
 
         let output = tool.execute(node_ctx, plan.arguments()).await;
@@ -3322,6 +3323,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         }
     }
 

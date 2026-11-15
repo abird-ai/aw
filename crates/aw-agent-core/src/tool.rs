@@ -319,8 +319,61 @@ pub struct ToolContext {
     /// the stable Agent execution owner, this is temporary work ownership and
     /// must not survive into a later independently admitted Turn.
     pub execution_scope: Option<ExecutionOwnershipScope>,
+    /// Live Actor Envelope gate captured by trusted Agent dispatch. A direct
+    /// SDK/host call without an Actor continues to rely on ToolPolicy.
+    /// Never deserialize or synthesize this from model arguments.
+    pub live_step_gate: Option<Arc<dyn crate::control::AgentStepGate>>,
 }
 impl ToolContext {
+    /// An auxiliary operation must pass the exact current Actor Envelope,
+    /// independent of the already-authorized tool being executed. The caller
+    /// must first capture its exact current ToolBindingAuthority snapshot.
+    pub fn authorize_peer_tool(&self, binding: &ToolBindingSnapshot) -> Result<()> {
+        if binding.execution_site != self.execution_site {
+            return Err(Error::Denied("peer tool binding execution site changed"));
+        }
+        if let Some(gate) = &self.live_step_gate {
+            gate.allow_tool(&binding.name, &binding.source, &binding.effect)?;
+        }
+        Ok(())
+    }
+
+    /// Short synchronous commit against the same Actor Envelope used to
+    /// dispatch this call. The host must also serialize exact ToolPolicy
+    /// revocation with ToolBindingAuthority::with_revalidated_binding.
+    pub fn with_peer_tool_commit<T>(
+        &self,
+        binding: &ToolBindingSnapshot,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if binding.execution_site != self.execution_site {
+            return Err(Error::Denied("peer tool binding execution site changed"));
+        }
+        let Some(gate) = &self.live_step_gate else {
+            // A direct SDK host has no controlled Actor, but must still hold
+            // the current exact ToolBindingAuthority grant at its call site.
+            return commit();
+        };
+        let mut operation = Some(commit);
+        let mut result = None;
+        let mut guarded_commit = || {
+            let operation = operation.take().ok_or(Error::Protocol(
+                "Actor authority commit cannot execute more than once",
+            ))?;
+            result = Some(operation()?);
+            Ok(())
+        };
+        gate.with_authorized_tool_commit(
+            &binding.name,
+            &binding.source,
+            &binding.effect,
+            &mut guarded_commit,
+        )?;
+        result.ok_or(Error::Protocol(
+            "Actor authority gate returned without executing its commit",
+        ))
+    }
+
     pub fn result_budget(&self, ceiling: usize) -> Result<usize> {
         let budget = self
             .result_budget_bytes

@@ -1,0 +1,95 @@
+# Design — compact Job output + grep (approved 2026-11-15)
+
+## User-facing contract
+
+Existing `jobs_list/get/read/ack/send/cancel/subscribe` names, flat model namespace and semantic operation IDs remain unchanged.
+
+```text
+jobs_get({ref?, rev?, wait_ms?, tail?})       # tail: *aggregate raw bytes* across Process stdout/stderr
+jobs_read({ref?, view?, filter?, cursor?, offset?, limit?, encoding?, wait_ms?})
+jobs_ack({ref, view?, offset?})
+grep({pattern, path?, glob?, depth?, context?, before?, after?, ...})
+```
+
+### Live Actor authority gate — implemented AW slice 2026-11-15
+
+- A tool admitted through the real controlled Agent carries a **live, clonable** `AgentStepGate` in its trusted `ToolContext`; the actual controller rechecks the authenticated Actor Envelope and writer fence. Custom gates that cannot be shared fail closed. Direct SDK hosts without an Actor gate still require existing live ToolPolicy grants. No model parameter can opt into or modify this gate.
+- `jobs_get` must recheck an *independent* current `jobs_read` binding and its exact source/effect/site in the Actor Envelope, in addition to Job producer payload authority. Omitted tail with denied read capability yields status plus `tail=denied`; explicit nonzero tail fails, `tail=0` remains status-only. Recheck after tail projection before appending any retained bytes to the return.
+- Finite `jobs_read` rechecks read+payload grants after whole bounded projection, even for synthesized Graph-root output. The previously implemented two-phase delivery proof remains limited to exact raw bytes actually represented in successful retained-stream responses.
+- `jobs_ack` separately requires live Control authority and producer payload grant and rechecks Control immediately before invoking shared effect. Do not infer Control from a Job ref, `jobs_get` or `jobs_read` permission. Other control verbs are **not** covered by this slice.
+- **Atomic finite ACK/Finish commit (2026-11-15):** the original `ToolBindingAuthority::with_revalidated_binding` and the live `AgentSessionController::with_authorized_tool_commit` compose **in that order**, holding their original ToolPolicy and Actor-runtime locks through precisely one synchronous `JobManager` ACK/Finish mutation. If either revocation precedes the guard, deny before any effect; otherwise, the commit precedes that revocation. Custom gates without a safe commit method fail closed. A post-effect gate failure yields `unknown`/inspect semantics instead of claiming a no-effect denial. This closes the narrow Actor Envelope and Control-grant check→ACK race, not external writer-epoch, producer-source policy or other Control verbs.
+
+### Get
+
+- Read effect always; status disclosure and retained-output disclosure are **separate** current checks. No dynamic switch to Control. Host must honor current exact original tool/source/site/Actor policy *and* current Job producer payload authority for a tail. For implicit tail without payload access return status with `tail=denied`; for explicit nonzero tail fail before revealing bytes. `tail=0` forces status only.
+- Process/Process-backed Graph-node `jobs_get`: omitted tail selects at most **512 bytes total** across stdout + stderr, **both running and terminal**. Explicit `tail` 0..1024, still one aggregate budget. For a default tail reserve 256 bytes per stream, then redistribute unused share to the other; for an explicit tail use the same aggregate half-split and redistribution rule; do not extrapolate or expand past the raw selected byte cap. Text is UTF-8-lossy with factual byte spans and partial-first-line boundary indicator, never guessed full-line text. Record immutable truncated/EOF facts.
+- Graph root: compact Graph state/progress/node references, no accidental multi-node tail concatenation. Agent/Turn: state only; explicit nonzero `tail` on unsupported kinds rejects; omitted tail never exposes provider-private state.
+- When appropriate the model may decide from default status+tail that no more output is needed and directly `jobs_ack`. Get itself never ACKs. Preserve status on payload-denied default.
+- `jobs_get.wait_ms` waits **only** for the Job to settle or its wait deadline. It returns immediately on terminal settlement and must NOT wake early for stdout/stderr bytes or mere revision changes. A returned `rev` is useful status metadata, not a mandatory input conditional. Event-driven lost-wakeup-safe Job settlement observation must replace the current 10ms polling loop; no duplicate scheduler or execution-timeout change. Transport response windows may clamp only this observation wait.
+- `jobs_read.wait_ms=0` is the nonblocking byte read/peek; positive waits at nonnegative absolute stream offsets observe new bytes or EOF/settlement. Negative `-N` offsets snapshot newest N bytes **without waiting**; positive waits with negative offsets are invalid.
+
+### Read
+
+- `offset` is a signed raw **byte** position on retained Process/Graph-node streams: >=0 absolute; -N means select most recent N bytes from an immutable stream-size snapshot. `offset=0` starts at 0. Negative and positive offsets use the same bounded page reader, exact resolved absolute begin and next, truthful `more/eof/truncated`; no `tail_bytes` alias. `limit` is the selected response/page cap; when requested tail exceeds that cap retain *newest* bytes and return their actual absolute begin.
+- Only byte streams accept negative offsets. Agent history retains opaque record cursors and separate `limit` semantics; synthesized Graph root results retain existing safe paging and should explicitly reject negative offsets unless separately supported. Authorize exact source/view before reading.
+- UTF-8-lossy presentation cannot change raw cursor advancement; base64 remains byte-exact. Avoid unbounded scans/copies, enforce semantic byte and transport framing ceilings *before* output/replay. `jobs_read` never ACKs.
+
+### Delivered output proof — accepted slice 2026-11-15
+
+- `output_page_for_owner_at` / `process_tail_for_owner` only read authorized retained bytes; **never** mutate delivery/ACK state. A shared host invokes `record_delivered_output` with the exact owner, stream, absolute byte start and **final projected raw byte count**, after validating its whole bounded reply. Truncated text/base64 projection must not grant the full originally-read range; lossy UTF-8 credit is counted in source bytes, never expanded UTF-8 characters. Graph root synthesized results and `jobs_get` peeks grant no prefix proof.
+- An attested segment advances the shared prefix only if it begins at/before the already contiguous delivered watermark; out-of-order segments do not bridge gaps. Bounds/overflow/owner/release checks remain in `aw-tools`. The host must recheck current payload disclosure before committing credit. This is projected-to-model evidence, **not** confirmation of eventual transport receipt; replay/task delivery is separately owned by each transport.
+- Model/SDK callers cannot directly authorize the proof hook; the adapter is the trusted projector. Explicit terminal `Finish` is a separate intentional Control action and never depends on prefix delivery.
+- **Consumer audience decision (2026-11-15):** AW's live finite-Job namespace is owned by **one Agent execution binding**; the original Actor's node-plan binding is independently revalidated before retained payload reads. Multiple turns of that same Agent share one **Job-audience** output lease, not one lease per turn/tool call. Another Agent cannot rebind the namespace and another Actor cannot reuse the producer's payload grant. Do not claim per-turn ACK isolation for AW: it is deliberately one Agent audience.
+- **Opt-in independent host consumers:** `JobManager::consumer_output_owner(id, host_scope:[u8;32])` hashes the Job binding and a **trusted, stable authenticated consumer scope** with domain separation from the initial Job/Task owners. The hash is identity, not access. A host that genuinely allows multiple independent consumers must authorize that consumer first, then call `enroll_output_consumer(id, node?, view?, owner)` for each existing selected stream set. Enrollment is idempotent, all-or-none across multiple streams, limited to 16 owners per stream, and never resurrects released bytes. An output stream attached later needs separate enrollment. A consuming host must not mint leases based on model-controlled IDs or per-turn call IDs.
+- **Isolation/release:** every enrolled owner has its own delivered/ACK watermark; producer quick-Finish and another consumer's acknowledged output cannot release bytes until **all** retained owners have acknowledged. This does not add an output store, authority engine, implicit ACK, automatic subscription or unbounded retention. Separate Task/replay consumers preserve their own exact retention contracts. Actual dotlink multi-client enrollment is a later host integration decision and must revalidate source/Actor/Task permissions before any join.
+
+### Ack
+
+- `jobs_ack({ref})` means **Finish**: after the exact Job is terminal, all retained streams owned by the **current authorized output audience** are explicitly acknowledged, including unread bytes. AW currently has one stable Agent/Job audience; independent multi-consumer hosts use distinct enrolled leases. Optional `view` narrows to one stream. An exact completed Graph root can finish its own retained node outputs (not independent child Jobs/Agents); an exact node targets only its outputs. No `discard`, `release_all` or extra tool.
+- `jobs_ack({ref,view?,offset:N})` means **Through(N)**: an explicit raw absolute offset, allowed during execution, cannot exceed the **contiguous** byte prefix actually made available to this exact output owner; out-of-order reads do not turn unobserved gaps into delivered prefix. Repeated ACK is idempotent, even after physical compaction. `offset=0` is explicit prefix ACK, NOT Finish.
+- **Both modes require Control** and current exact output-owner/Job authorization; neither is conferred merely by Job status access. Explicit Finish does not require prior reads, but must reject active/unsealed streams and unreconciled unknown effects, and must not destroy other owners' replay/MCP Task/Agent evidence. Preflight the complete multi-stream finish before changing any ACKs; release only after all exact retention leases settle.
+- A finished owner's ACK of terminal output must not mask immutable output status, truncation, or an unknown effect. An expired/revoked owner returns a truthful error/status without reopening private content.
+
+### Compact DL-150 model results
+
+Examples; bytes and counts are illustrative, not protocol JSON:
+
+```text
+bash({command:"cargo test -q",background:true}) -> j:7 bash running rev=1
+jobs_get({ref:"j:7",wait_ms:30000})
+j:7 bash ok rev=4 exit=0 out=842 err=0
+stdout [0..842] eof
+test result: ok. 664 passed
+jobs_ack({ref:"j:7"}) -> j:7 ok ack=all
+```
+
+Status/header first; short contextual refs where safe; only factual progress and markers. Shared layer returns typed data/status; AW host chooses compact text model projection or structured SDK projection, dotlink uses MCP framing. Never introduce mandatory per-line JSON wrappers or duplicate view metadata. Apply `ToolContext.result_budget_bytes`/transport caps to **whole result**, including status, tails and markers; drop/narrow tails *truthfully* when budget is small. A caller must not be forced to read output merely to ACK.
+
+### Graph / batch
+
+- **Outcome decision (2026-11-15):** `unknown` dominates whenever any node effect is unresolved; `mixed` is reserved for heterogeneous **known/settled** outcomes. The compact Graph summary retains `ok=N`, `fail=N`, `unknown=N` and orthogonal `more/incomplete` where relevant. Root quick Finish preflights every node (and rejects unresolved journal ambiguity) before updating any owner; known child nodes may independently Finish only their own output when no global uncertainty exists.
+- Graph constructors and execution stay on the single immutable shared Graph/Job runtime. Root `jobs_get` reports bounded progress, node refs, outcome. Native/Process nodes use exactly the same get/read/ack semantics and output-owner leases as direct Jobs. A settled Graph-root quick ACK can release only its own exact retained node outputs; no cascading into unrelated child Agent/Job resources.
+- Model-facing `batch` keeps DL-150 compact tuples `[tool,args,when?]`, established eligible native/shell/host-approved Agent leaves, and **no nested batch**. `jobs_*` leaves remain explicit *SDK/host opt-in* until exact owner/control/wait-cycle conformance; no implicit model-facing Graph `jobs_*` exposure. Preserve one tool name/semantic registry across direct and eligible Graph leaves.
+- Complete Graph node effects and local user-visible errors before a root can report successfully settled; partial/unknown never silently becomes `ok` or discardable.
+
+### Grep
+
+- **Both files and directories already supported** by shared secured `grep_backend_path`: exact file skips traversal, directory walks recursively under depth and work budgets; symlink resolution obeys the secured backend.
+- Canonical args support `context?` (symmetric shorthand), plus independent `before?` and `after?`; keep `context` for existing callers. Each side defaults to `context` or 0; explicit side wins. Enforce **128 lines maximum per side**, with nonnegative integer validation and schema/execution parity for direct and Graph.
+- Do not silently accept field typos. No unbounded output: retain hit count, per-file/work/scan, cumulative output-byte, glob, ignored/unreadable/incomplete and pagination constraints. Coalesce overlapping context within selected hits and keep advancing offsets; ensure very wide context cannot make output-budget failures lie about complete search. No duplicated search implementation in AW/dotlink.
+- Keep `mode: content|files|count` with exact file and directory behavior unchanged.
+
+### Ownership / ordering
+
+1. **Shared `aw-tools`:** bounded owner delivery ledger, output snapshot/byte-range and terminal Finish, Job observation primitive, grep schema/parser/engine.
+2. **`aw-tools-adapter`:** AW exact policy+payload checks, Process/Graph/Agent distinctions, compact model/SDK output, existing Agent history, Job replay, Graph integration.
+3. **dotlink (after AW checkpoint):** same shared APIs under machine policy; validate standalone `jobs_*` MCP forms, transport response windows/replay/Task owner and grep; no backward `job_*` compatibility import or private JobManager fork.
+
+## Acceptance
+
+- Two Process streams with 512 aggregate implicit, 0/256/1024 explicit, running/terminal, very long lines, invalid UTF-8, output budgets, unauthorized default/explicit tail.
+- Signed offset nonnegative/negative, empty/live/terminal stream, exact absolute continuation, large requested tail capped to response budget, incomplete/truncated representation.
+- Explicit prefix ACK with gaps/out-of-order pages, idempotence, lost receipts, concurrent/multi-owner/replay retention, quick Finish only after terminal and on exact authorized owner, Graph all-node preflight/no partial cleanup, unknown/revoked owners.
+- Finite revision wait and byte wait do not miss immediate finish or arrival, never extend execution/transport deadlines; no busy loop.
+- Shared grep exact file/directory, symmetric/asymmetric 0/128/over-limit, consistent direct/Graph and shared parser/schema, exact output/incomplete markers and pagination.
+- AW direct + Graph + sessionless/local + Agent/Turn views, dotlink MCP + remote Start/replay/Task wire where affected, strict Clippy, no_std/minimal boundaries, and affected platform build gates only. Validate coherent end-user flows at checkpoints, not repeated unchanged primitives.

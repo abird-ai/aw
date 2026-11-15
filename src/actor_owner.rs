@@ -7599,6 +7599,7 @@ mod tests {
             scope: f.agent.journal_scope().unwrap(),
             execution_owner: None,
             execution_scope: None,
+            live_step_gate: None,
         };
         assert!(
             f.owner.verify_model_observation(&context).is_err(),
@@ -7827,6 +7828,7 @@ mod tests {
             scope: fixture.agent.journal_scope().unwrap(),
             execution_owner: fixture.agent.execution_binding().cloned(),
             execution_scope: None,
+            live_step_gate: None,
         };
 
         let mut agent = fixture.agent;
@@ -7922,6 +7924,7 @@ mod tests {
             scope,
             execution_owner,
             execution_scope: None,
+            live_step_gate: None,
         };
 
         let running = owner.clone();
@@ -8246,6 +8249,7 @@ mod tests {
             scope: fixture.agent.journal_scope().unwrap(),
             execution_owner: None,
             execution_scope: None,
+            live_step_gate: None,
         };
         assert!(
             owner.verify_model_observation(&ctx).is_err(),

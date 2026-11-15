@@ -4961,6 +4961,7 @@ mod tests {
             }),
             execution_owner: None,
             execution_scope: None,
+            live_step_gate: None,
         };
         // Host Step authorization never starts a paid decision, and requires
         // a real existing SQLite active parent Turn.
@@ -5172,6 +5173,7 @@ mod tests {
             }),
             execution_owner: Some(execution_owner),
             execution_scope: None,
+            live_step_gate: None,
         };
 
         let local_policy = aw_policy::Policy {
@@ -5715,6 +5717,7 @@ mod tests {
             }),
             execution_owner: Some(parent_owner.clone()),
             execution_scope: None,
+            live_step_gate: None,
         };
         let output = constructor
             .execute(
@@ -5826,6 +5829,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         let event_recipient =
             aw_tools_adapter::agent_jobs::AgentJobRouter::wake_recipient(
@@ -5928,6 +5932,7 @@ mod tests {
             }),
             execution_owner: Some(parent_owner.clone()),
             execution_scope: None,
+            live_step_gate: None,
         };
         let send = aw_tools_adapter::agent_jobs::AgentJobRouter::send(
             router.as_ref(),
@@ -6049,6 +6054,7 @@ mod tests {
                 }),
                 execution_owner: Some(parent_owner),
                 execution_scope: None,
+                live_step_gate: None,
             },
             aw_tools_adapter::agent_jobs::AgentJobGet {
                 reference: canonical,
@@ -6161,6 +6167,7 @@ mod tests {
                     }),
                     execution_owner: None,
                     execution_scope: None,
+                    live_step_gate: None,
                 },
                 &json!({"task":"level1 task","title":"First child","background":false}),
             )
@@ -6311,6 +6318,7 @@ mod tests {
                     }),
                     execution_owner: None,
                     execution_scope: None,
+                    live_step_gate: None,
                 },
                 &json!({
                     "task":"workspace task",
@@ -6465,6 +6473,7 @@ mod tests {
                     }),
                     execution_owner: None,
                     execution_scope: None,
+                    live_step_gate: None,
                 },
                 &json!({"task":"read task","background":false}),
             )

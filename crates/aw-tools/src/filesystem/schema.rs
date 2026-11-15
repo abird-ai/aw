@@ -107,6 +107,8 @@ impl Tool {
 /// Shortest valid canonical patch: `*** Begin Patch\n*** Add File: x\n*** End Patch`.
 /// A lower advertised maxLength would make the enabled patch tool unusable.
 pub const MIN_PATCH_BYTES: usize = 45;
+/// Engine-safety context ceiling; available even when search is not compiled.
+pub const MAX_GREP_CONTEXT: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaCaps {
@@ -119,6 +121,10 @@ pub struct SchemaCaps {
     /// Base64/hex byte-window ceiling; encoded output expands in transport.
     pub binary_encoded_read_bytes: usize,
     pub read_line_limit: usize,
+    /// Configured per-side grep context ceiling, no wider than the engine limit.
+    pub grep_context_max: usize,
+    /// Context applied when callers omit `context`, `before`, and `after`.
+    pub grep_context_default: usize,
     pub parallel_reads: bool,
     pub typed_media: bool,
 }
@@ -132,6 +138,8 @@ impl Default for SchemaCaps {
             binary_read_bytes: 65_536,
             binary_encoded_read_bytes: 24 * 1024,
             read_line_limit: 65_536,
+            grep_context_max: MAX_GREP_CONTEXT,
+            grep_context_default: 0,
             parallel_reads: false,
             typed_media: false,
         }
@@ -166,13 +174,11 @@ impl SchemaCaps {
                     || self.binary_edit_ranges == 0
                     || self.binary_edit_ranges > crate::MAX_BINARY_EDIT_RANGES
             }
-            Tool::Ls
-            | Tool::Find
-            | Tool::Grep
-            | Tool::Edit
-            | Tool::Copy
-            | Tool::Move
-            | Tool::Remove => false,
+            Tool::Grep => {
+                self.grep_context_max > MAX_GREP_CONTEXT
+                    || self.grep_context_default > self.grep_context_max
+            }
+            Tool::Ls | Tool::Find | Tool::Edit | Tool::Copy | Tool::Move | Tool::Remove => false,
         };
         if invalid {
             return Err("schema caps exceed shared engine safety/semantic bounds");
@@ -232,7 +238,9 @@ pub fn spec(tool: Tool, caps: SchemaCaps) -> Schema {
                 "glob":{"type":"string"},"depth":{"type":"integer","minimum":1,"maximum":128},
                 "literal":{"type":"boolean"},"ignore_case":{"type":"boolean"},
                 "mode":{"type":"string","enum":["content","files","count"]},
-                "context":{"type":"integer","minimum":0,"maximum":8},
+                "context":{"type":"integer","minimum":0,"maximum":caps.grep_context_max,"default":caps.grep_context_default},
+                "before":{"type":"integer","minimum":0,"maximum":caps.grep_context_max},
+                "after":{"type":"integer","minimum":0,"maximum":caps.grep_context_max},
                 "hidden":{"type":"boolean"},"gitignore":{"type":"boolean"},
                 "offset":{"type":"integer","minimum":0},
                 "limit":{"type":"integer","minimum":1,"maximum":200}

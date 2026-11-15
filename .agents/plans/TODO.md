@@ -7,6 +7,10 @@
 
 - [~] P2 dotlink-tool-port — @pvl — Dotlink-native filesystem tools under AW authorization and model-directed execution — [details](dotlink-tool-port/README.md)
 
+- [~] P2 ai-native-tool-output-grep-2026-11-15 — @pvl — Shared compact Job get/read/ACK and grep context parity, AW first — [details](ai-native-tool-output-grep-2026-11-15/README.md)
+
+- [~] P2 ai-native-toolset-builder-2026-11-15 — @pvl — Canonical configurable toolset factory before product-specific choices — [details](ai-native-toolset-builder-2026-11-15/README.md)
+
 ## Icebox
 
 - [ ] embedded-platforms — [details](embedded-platforms/TODO.md)

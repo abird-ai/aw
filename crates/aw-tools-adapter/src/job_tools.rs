@@ -61,28 +61,24 @@ fn handoff_receipt(
     snapshot: &aw_tools::filesystem::job_manager::Snapshot,
 ) -> Result<ToolOutput> {
     let reference = host.execution_ref(id, None)?.canonical();
-    let state = match snapshot.lifecycle {
-        aw_tools::filesystem::job::Lifecycle::Running => "running",
-        aw_tools::filesystem::job::Lifecycle::Cancelling
-        | aw_tools::filesystem::job::Lifecycle::Revoking => "cancelling",
-        aw_tools::filesystem::job::Lifecycle::Terminal if snapshot.stop_reason.is_some() => {
-            "cancelled"
-        }
-        aw_tools::filesystem::job::Lifecycle::Terminal => "settled",
-    };
-    let mut content = format!(
-        "{reference} {} {state} rev={}",
-        snapshot.label, snapshot.sequence
-    );
-    if snapshot.lifecycle != aw_tools::filesystem::job::Lifecycle::Terminal && snapshot.total > 1 {
-        content.push_str(&format!(" {}/{}", snapshot.finished, snapshot.total));
-    }
-    if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal {
-        let outcome = snapshot
-            .summary
-            .map_or("unknown", |summary| summary.0.as_str());
-        content.push_str(&format!(" outcome={outcome}"));
-    }
+    let content = aw_tools::receipt::render_plain(
+        aw_tools::receipt::Receipt::JobStatus {
+            reference: &reference,
+            snapshot,
+            terminal: if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal
+                && snapshot.total == 1
+            {
+                host.manager()
+                    .process_terminal(id, 1)
+                    .map_err(|_| Error::Protocol("Job Process terminal facts unavailable"))?
+            } else {
+                None
+            },
+            next: Some(aw_tools::receipt::NextAction::ObserveJob),
+        },
+        aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+    )
+    .map_err(|_| Error::Protocol("cannot render typed compact handoff receipt"))?;
     Ok(ToolOutput {
         content,
         is_error: snapshot
@@ -1264,6 +1260,7 @@ mod tests {
     fn job_output_projection_fits_budget_and_keeps_raw_offsets() {
         use aw_tools::filesystem::job_manager::OutputPage;
         let page = OutputPage {
+            offset: 0,
             bytes: vec![0xff; 100],
             next_offset: None,
             writer_finished: true,
@@ -1359,6 +1356,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         (root, agent, runtime, ctx)
     }
@@ -1429,6 +1427,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         (root, agent, runtime, ctx, shell)
     }
@@ -2015,6 +2014,7 @@ mod tests {
             std::env::temp_dir().join(format!("aw-batch-replay-{}-{suffix}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.txt"), "old").unwrap();
+        fs::write(root.join("b.txt"), "left").unwrap();
         let actor = PrincipalId::new("local").unwrap();
         let builder = Agent::builder(
             Arc::new(UnusedProvider),
@@ -2052,19 +2052,524 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         };
         let batch = Batch::new(runtime);
-        let args = json!({"ops":[["edit",{
-            "path":"a.txt",
-            "edits":[["old","new"]]
-        }]]});
+        let args = json!({"ops":[
+            ["edit",{"path":"a.txt","edits":[["old","new"]]}],
+            ["edit",{"path":"b.txt","edits":[["left","right"]]}]
+        ]});
         let first = batch.execute(ctx.clone(), &args).await.unwrap();
         assert!(!first.is_error, "{}", first.content);
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "right");
         let second = batch.execute(ctx, &args).await.unwrap();
         assert!(second.is_error);
         assert!(second.content.starts_with("unknown batch Job admission"));
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "right");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An authenticated Actor can narrow a peer tool without revoking the
+    /// registered current ToolPolicy grant. It remains live after capture.
+    struct LiveEnvelopeGate {
+        read: std::sync::atomic::AtomicBool,
+        ack: std::sync::atomic::AtomicBool,
+    }
+    impl aw_agent_core::control::AgentStepGate for LiveEnvelopeGate {
+        fn with_authorized_tool_commit(
+            &self,
+            name: &str,
+            source: &aw_agent_core::ToolSource,
+            effect: &aw_agent_core::ToolEffect,
+            commit: &mut dyn FnMut() -> aw_agent_core::Result<()>,
+        ) -> aw_agent_core::Result<()> {
+            // Test-only live permission switch; production controller holds
+            // the authoritative Actor runtime mutex for the whole effect.
+            self.allow_tool(name, source, effect)?;
+            commit()
+        }
+
+        fn checkpoint<'a>(
+            &'a self,
+            _turn_id: u64,
+            _round: u32,
+            _point: aw_agent_core::control::AgentGatePoint,
+        ) -> aw_agent_core::JournalFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn allow_tool(
+            &self,
+            name: &str,
+            _source: &aw_agent_core::ToolSource,
+            effect: &aw_agent_core::ToolEffect,
+        ) -> aw_agent_core::Result<()> {
+            use std::sync::atomic::Ordering;
+            let ok = match name {
+                "jobs_read" if *effect == ToolEffect::Read => self.read.load(Ordering::Acquire),
+                "jobs_ack" if *effect == ToolEffect::Control => self.ack.load(Ordering::Acquire),
+                _ => false,
+            };
+            ok.then_some(()).ok_or(aw_agent_core::Error::Denied(
+                "current Actor Envelope forbids this exact peer tool",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_get_tail_requires_independent_live_read_envelope() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (root, _agent, runtime, mut ctx, shell) = shell_fixture();
+        ctx.call_id = "opaque-shell-receipt".into();
+        let handoff = JobShell::new(runtime.clone(), shell)
+            .execute(
+                ctx.clone(),
+                &json!({"command":"printf SECRET_OUTPUT_12345", "background":true}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&handoff.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let canonical = host.execution_ref(&id, None).unwrap().canonical();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if host.manager().get(&id).unwrap().lifecycle
+                    == aw_tools::filesystem::job::Lifecycle::Terminal
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(runtime.payload_read_authorized(&ctx));
+        let gate = Arc::new(LiveEnvelopeGate {
+            read: AtomicBool::new(false),
+            ack: AtomicBool::new(true),
+        });
+        ctx.live_step_gate = Some(gate.clone());
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        let default = get
+            .execute(ctx.clone(), &json!({"ref":canonical}))
+            .await
+            .unwrap();
+        assert!(
+            !default.content.contains("SECRET_OUTPUT"),
+            "{}",
+            default.content
+        );
+        assert!(
+            default.content.contains("tail=denied"),
+            "{}",
+            default.content
+        );
+        assert!(matches!(
+            get.execute(ctx.clone(), &json!({"ref":canonical,"tail":64}))
+                .await,
+            Err(Error::Denied("Job output tail is not currently authorized"))
+        ));
+        let status = get
+            .execute(ctx.clone(), &json!({"ref":canonical,"tail":0}))
+            .await
+            .unwrap();
+        assert!(!status.content.contains("tail=denied"));
+        assert!(!status.content.contains("SECRET_OUTPUT"));
+
+        gate.read.store(true, Ordering::Release);
+        let allowed = get
+            .execute(ctx.clone(), &json!({"ref":canonical,"tail":64}))
+            .await
+            .unwrap();
+        assert!(
+            allowed.content.contains("SECRET_OUTPUT_12345"),
+            "{}",
+            allowed.content
+        );
+        gate.read.store(false, Ordering::Release);
+        assert!(!runtime.payload_read_authorized(&ctx));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn job_control_commit_orders_exact_policy_revocation_and_rejects_stale_grant() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        let (root, mut agent, runtime, ctx) = fixture();
+        assert!(runtime.control_authorized(&ctx, "jobs_ack"));
+        let (start_tx, start_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let executed = Arc::new(AtomicBool::new(false));
+        let executed_for_revocation = executed.clone();
+        let actor = ctx.actor.clone();
+        let change = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            attempt_tx.send(()).unwrap();
+            agent
+                .revoke_registered_source_tool(&actor, "jobs_ack", &ToolSource::trusted_host())
+                .unwrap();
+            assert!(
+                executed_for_revocation.load(Ordering::SeqCst),
+                "Control grant publication must wait for in-flight effect"
+            );
+        });
+        let value = runtime
+            .with_control_commit(&ctx, "jobs_ack", || {
+                start_tx.send(()).unwrap();
+                attempt_rx.recv().unwrap();
+                executed.store(true, Ordering::SeqCst);
+                Ok(42)
+            })
+            .unwrap();
+        assert_eq!(value, 42);
+        change.join().unwrap();
+        assert!(!runtime.control_authorized(&ctx, "jobs_ack"));
+        assert!(matches!(
+            runtime.with_control_commit(&ctx, "jobs_ack", || -> Result<()> {
+                panic!("revoked grant executed")
+            }),
+            Err(Error::Denied(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn control_gate_failing_after_effect_reports_uncertain_not_denied() {
+        struct FaultAfterCommit;
+        impl aw_agent_core::control::AgentStepGate for FaultAfterCommit {
+            fn checkpoint<'a>(
+                &'a self,
+                _: u64,
+                _: u32,
+                _: aw_agent_core::control::AgentGatePoint,
+            ) -> aw_agent_core::JournalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn allow_tool(
+                &self,
+                _: &str,
+                _: &ToolSource,
+                _: &ToolEffect,
+            ) -> aw_agent_core::Result<()> {
+                Ok(())
+            }
+            fn with_authorized_tool_commit(
+                &self,
+                _: &str,
+                _: &ToolSource,
+                _: &ToolEffect,
+                commit: &mut dyn FnMut() -> aw_agent_core::Result<()>,
+            ) -> aw_agent_core::Result<()> {
+                commit()?;
+                Err(aw_agent_core::Error::Denied(
+                    "injected post-effect gate failure",
+                ))
+            }
+        }
+        let (root, _agent, runtime, mut ctx) = fixture();
+        ctx.live_step_gate = Some(Arc::new(FaultAfterCommit));
+        let executed = std::cell::Cell::new(0usize);
+        assert!(matches!(
+            runtime.with_control_commit(&ctx, "jobs_ack", || {
+                executed.set(executed.get() + 1);
+                Ok(7)
+            }),
+            Err(Error::Transport(
+                "Job Control outcome uncertain; inspect before retry"
+            ))
+        ));
+        assert_eq!(
+            executed.get(),
+            1,
+            "no implicit retry after an uncertain effect"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn live_envelope_independently_gates_finite_read_and_ack() {
+        use aw_tools::filesystem::job_manager::OutputStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (root, _agent, runtime, mut ctx) = fixture();
+        fs::write(root.join("a.txt"), "x".repeat(2048)).unwrap();
+        ctx.result_budget_bytes = 512;
+        ctx.call_id = "live-envelope-job".into();
+        let handoff = Batch::new(runtime.clone())
+            .execute(
+                ctx.clone(),
+                &json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&handoff.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let reference = host.execution_ref(&id, Some(1)).unwrap().canonical();
+        let original = host
+            .manager()
+            .output_summary(&id, 1, OutputStream::Result)
+            .unwrap()
+            .0;
+        assert!(original.retained_bytes > 512);
+
+        // The original ToolPolicy grants both, but the captured Actor gate
+        // can independently and live-revocably deny either operation.
+        assert!(runtime.payload_read_authorized(&ctx));
+        assert!(runtime.control_authorized(&ctx, "jobs_ack"));
+        let gate = Arc::new(LiveEnvelopeGate {
+            read: AtomicBool::new(false),
+            ack: AtomicBool::new(false),
+        });
+        ctx.live_step_gate = Some(gate.clone());
+        assert!(!runtime.payload_read_authorized(&ctx));
+        assert!(!runtime.control_authorized(&ctx, "jobs_ack"));
+
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        assert!(matches!(
+            read.execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"result","offset":0,"limit":100
+                })
+            )
+            .await,
+            Err(Error::Denied("Job payload authority is not live"))
+        ));
+        let ack =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Ack);
+        assert!(matches!(
+            ack.execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference
+                })
+            )
+            .await,
+            Err(Error::Denied("Job ACK Control authority is not live"))
+        ));
+        assert_eq!(
+            host.manager()
+                .output_summary(&id, 1, OutputStream::Result)
+                .unwrap()
+                .0
+                .retained_bytes,
+            original.retained_bytes,
+            "denied read/Control must not consume or release the original payload"
+        );
+
+        gate.read.store(true, Ordering::Release);
+        assert!(runtime.payload_read_authorized(&ctx));
+        let page = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"result","offset":0,"limit":100
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!page.is_error);
+        gate.read.store(false, Ordering::Release);
+        assert!(!runtime.payload_read_authorized(&ctx));
+
+        gate.ack.store(true, Ordering::Release);
+        assert!(runtime.control_authorized(&ctx, "jobs_ack"));
+        let released = ack
+            .execute(ctx.clone(), &json!({"ref":reference}))
+            .await
+            .unwrap();
+        assert!(released.content.contains("ack=all"), "{}", released.content);
+        assert!(host
+            .manager()
+            .output_summary(&id, 1, OutputStream::Result)
+            .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn finite_job_namespace_is_single_agent_audience_and_actor_bound() {
+        let (root, _agent, runtime, mut ctx) = fixture();
+        fs::write(root.join("a.txt"), "x".repeat(2048)).unwrap();
+        ctx.call_id = "single-audience".into();
+        ctx.result_budget_bytes = 512;
+        let receipt = Batch::new(runtime.clone())
+            .execute(
+                ctx.clone(),
+                &json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&receipt.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        assert!(host.payload_authorized(&ctx.actor, &id));
+
+        let (session, branch) = runtime.test_scope_identity();
+        let mut other_agent = ctx.clone();
+        other_agent.execution_owner = Some(
+            aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:1",
+                &session,
+                &branch,
+            )
+            .unwrap(),
+        );
+        assert!(
+            matches!(
+                runtime.host_for(&other_agent),
+                Err(Error::Conflict(
+                    "live Job namespace cannot be rebound to another Agent"
+                ))
+            ),
+            "another Agent's Job controls must not reuse this Job namespace"
+        );
+
+        let mut other_actor = ctx.clone();
+        other_actor.actor = PrincipalId::new("different-actor").unwrap();
+        let same_host = runtime.host_for(&other_actor).unwrap();
+        assert!(
+            !same_host.payload_authorized(&other_actor.actor, &id),
+            "a second Actor cannot inherit the producing Actor's result read"
+        );
+        assert!(
+            host.manager().job_output_owner(&id).is_ok(),
+            "the existing single-Agent audience retains the stable Job lease"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn finite_jobs_read_only_credits_the_final_bounded_page() {
+        use aw_tools::filesystem::job_manager::OutputStream;
+        let (root, _agent, runtime, mut ctx) = fixture();
+        fs::write(root.join("a.txt"), "x".repeat(2048)).unwrap();
+        ctx.call_id = "credit-batch".into();
+        ctx.result_budget_bytes = 512;
+        // Use the canonical finite-Graph constructor, not the legacy
+        // JobControl::Start projection with no FiniteJobKind metadata.
+        let batch = Batch::new(runtime.clone());
+        let started = batch
+            .execute(
+                ctx.clone(),
+                &json!({"ops":[
+                    ["read",{"path":"a.txt","numbered":false,"lines":4}]
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert!(started
+            .content
+            .contains(" next=jobs_get|jobs_read no-rerun"));
+        let id = handoff_job_id(&started.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let owner = host.manager().job_output_owner(&id).unwrap();
+        // A Graph root synthesizes an aggregate result (not an owned byte
+        // stream). Node ref n:1 targets the exact retained result lease.
+        let reference = host.execution_ref(&id, Some(1)).unwrap().canonical();
+        let summary = host
+            .manager()
+            .output_summary(&id, 1, OutputStream::Result)
+            .unwrap()
+            .0;
+        assert!(summary.retained_bytes > 512);
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        assert_eq!(
+            host.manager()
+                .acknowledge_delivered_output(&id, 1, OutputStream::Result, owner, 1),
+            Err(aw_tools::filesystem::job_manager::Error::InvalidOutput),
+            "unconsumed native result has no delivered proof"
+        );
+        ctx.result_budget_bytes = 512;
+        let page = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"result","offset":0,"limit":4096,"encoding":"base64"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!page.is_error, "{}", page.content);
+        assert!(page.content.len() <= 512);
+        let next: u64 = page
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("more offset="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(next > 0 && next < summary.retained_bytes);
+        assert_eq!(
+            host.manager().acknowledge_delivered_output(
+                &id,
+                1,
+                OutputStream::Result,
+                owner,
+                next + 1
+            ),
+            Err(aw_tools::filesystem::job_manager::Error::InvalidOutput),
+            "bytes fetched but omitted by the final projector are not ACKable"
+        );
+        let acknowledged = host
+            .manager()
+            .acknowledge_delivered_output(&id, 1, OutputStream::Result, owner, next)
+            .unwrap();
+        assert!(acknowledged.changed && !acknowledged.released);
+
+        // A later successfully rendered page still cannot advance the prefix
+        // across unread bytes.
+        let skipped = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"result","offset":next+100,
+                    "limit":80,"encoding":"base64"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!skipped.is_error);
+        assert_eq!(
+            host.manager().acknowledge_delivered_output(
+                &id,
+                1,
+                OutputStream::Result,
+                owner,
+                next + 101
+            ),
+            Err(aw_tools::filesystem::job_manager::Error::InvalidOutput)
+        );
+        // Only the next contiguous page extends the ACKable prefix.
+        let contiguous = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"result","offset":next,
+                    "limit":80,"encoding":"base64"
+                }),
+            )
+            .await
+            .unwrap();
+        let next_contiguous: u64 = contiguous
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("more offset="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(next_contiguous > next);
+        host.manager()
+            .acknowledge_delivered_output(&id, 1, OutputStream::Result, owner, next_contiguous)
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2355,8 +2860,85 @@ mod tests {
     }
 
     #[test]
+    fn shared_toolset_builder_configures_real_aw_job_catalog() {
+        use aw_tools::toolset::{JobProfile, Toolset};
+        let (root, agent, _, _) = fixture();
+        let factory = Toolset::builder()
+            .jobs(JobProfile {
+                get_tail_default: 256,
+                get_tail_max: 384,
+                get_wait_max_ms: 1200,
+                read_wait_max_ms: 0,
+                list_page_max: 10,
+            })
+            .build()
+            .unwrap();
+        let limits = crate::LocalToolLimits::default()
+            .with_toolset(&factory)
+            .validate()
+            .unwrap();
+        let runtime = JobRuntime::new_with_native_tools(
+            Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),
+            agent.tool_binding_authority(),
+            limits,
+            crate::LocalToolConcurrency::default(),
+            aw_tools::filesystem::schema::Tool::GRAPH_NATIVE.to_vec(),
+        )
+        .unwrap();
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        let list = crate::jobs_tools::JobsTool::new(runtime, crate::jobs_tools::JobsKind::List);
+        assert_eq!(get.spec().parameters["properties"]["tail"]["default"], 256);
+        assert_eq!(get.spec().parameters["properties"]["tail"]["maximum"], 384);
+        assert_eq!(
+            get.spec().parameters["properties"]["wait_ms"]["maximum"],
+            1200
+        );
+        assert_eq!(
+            read.spec().parameters["properties"]["wait_ms"]["maximum"],
+            0
+        );
+        assert_eq!(list.spec().parameters["properties"]["limit"]["maximum"], 10);
+        assert!(get.spec().description.contains("256 raw bytes combined"));
+        get.validate(&json!({"tail":384,"wait_ms":1200})).unwrap();
+        assert!(get.validate(&json!({"tail":385})).is_err());
+        assert!(get.validate(&json!({"wait_ms":1201})).is_err());
+        assert!(read.validate(&json!({"wait_ms":1})).is_err());
+    }
+
+    #[test]
+    fn compact_get_read_ack_models_expose_bounded_tail_and_quick_finish() {
+        let (_, _, runtime, _) = fixture();
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        let ack = crate::jobs_tools::JobsTool::new(runtime, crate::jobs_tools::JobsKind::Ack);
+        assert_eq!(get.spec().parameters["properties"]["tail"]["maximum"], 1024);
+        get.validate(&json!({})).unwrap();
+        get.validate(&json!({"tail":0})).unwrap();
+        get.validate(&json!({"tail":1024})).unwrap();
+        assert!(get.validate(&json!({"tail":1025})).is_err());
+        assert!(get.validate(&json!({"tail":-1})).is_err());
+        assert!(get.validate(&json!({"tail_bytes":512})).is_err());
+        assert!(read.spec().parameters["properties"]["offset"]
+            .get("minimum")
+            .is_none());
+        read.validate(&json!({"offset":-512})).unwrap();
+        read.validate(&json!({"offset":0})).unwrap();
+        assert!(read.validate(&json!({"offset":"-512"})).is_err());
+        assert_eq!(ack.spec().parameters["required"], json!(["ref"]));
+        ack.validate(&json!({"ref":"j:1"})).unwrap();
+        ack.validate(&json!({"ref":"j:1","offset":0})).unwrap();
+        assert!(ack.validate(&json!({"ref":"j:1","offset":-1})).is_err());
+    }
+
+    #[test]
     fn base64_output_fitter_checks_complete_page_before_continuation_overhead() {
         let page = aw_tools::filesystem::job_manager::OutputPage {
+            offset: 0,
             bytes: b"x".to_vec(),
             next_offset: None,
             writer_finished: true,
@@ -2375,6 +2957,7 @@ mod tests {
         let mut bytes = vec![b'a'; 510];
         bytes.extend_from_slice("é".as_bytes());
         let page = aw_tools::filesystem::job_manager::OutputPage {
+            offset: 0,
             bytes,
             next_offset: None,
             writer_finished: true,

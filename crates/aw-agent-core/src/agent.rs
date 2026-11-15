@@ -2459,6 +2459,7 @@ impl Agent {
                                             scope,
                                             execution_owner,
                                             execution_scope,
+                                            live_step_gate: step_gate.map(|gate| gate.shared_gate()).transpose()?,
                                         },
                                         &call.arguments,
                                     ),
@@ -2775,6 +2776,7 @@ impl Agent {
                                     scope: invocation_context.scope.clone(),
                                     execution_owner: self.execution_binding.clone(),
                                     execution_scope: self.execution_scope.clone(),
+                                    live_step_gate: step_gate.map(|gate| gate.shared_gate()).transpose()?,
                                 },
                                 &call.arguments,
                             )

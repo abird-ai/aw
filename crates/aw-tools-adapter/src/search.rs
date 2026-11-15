@@ -270,8 +270,9 @@ fn grep_options<'a>(
     start: &'a str,
     backend_path: Option<&'a str>,
     output_bytes: usize,
+    limits: crate::LocalToolLimits,
 ) -> aw_tools::search::GrepOptions<'a> {
-    let context = args.context.unwrap_or(0);
+    let context = args.context.unwrap_or(limits.schema.grep_context_default);
     aw_tools::search::GrepOptions {
         pattern: &args.pattern,
         path: start,
@@ -288,8 +289,8 @@ fn grep_options<'a>(
         offset: args.offset,
         limit: args.limit,
         limits: aw_tools::search::GrepLimits {
-            output_bytes,
-            ..Default::default()
+            output_bytes: output_bytes.min(limits.grep_work.output_bytes),
+            ..limits.grep_work
         },
     }
 }
@@ -336,12 +337,13 @@ fn grep(
     args: &GrepArgs,
     cancel: &CancellationToken,
     output_bytes: usize,
+    limits: crate::LocalToolLimits,
 ) -> Result<ToolOutput> {
     let start = path(&args.path)?;
     let backend_path = search_backend_path(root, start)?;
     let page = aw_tools::search::grep(
         root,
-        grep_options(args, start, Some(&backend_path), output_bytes),
+        grep_options(args, start, Some(&backend_path), output_bytes, limits),
         &|| cancel.is_cancelled(),
     )
     .map_err(grep_error)?;
@@ -393,14 +395,19 @@ impl Tool for Search {
             Operation::Grep => {
                 let a: GrepArgs = parse(value)?;
                 let start = path(&a.path)?;
-                if a.context.is_some() && (a.before.is_some() || a.after.is_some()) {
-                    return Err(Error::Denied("invalid grep limit/depth/context"));
+                let max = self.limits.schema.grep_context_max;
+                if a.context.is_some_and(|n| n > max)
+                    || a.before.is_some_and(|n| n > max)
+                    || a.after.is_some_and(|n| n > max)
+                {
+                    return Err(Error::Denied("grep context exceeds configured limit"));
                 }
                 aw_tools::search::validate_grep(&grep_options(
                     &a,
                     start,
                     None,
                     self.limits.result_bytes,
+                    self.limits,
                 ))
                 .map_err(grep_query_error)?;
                 let _ = a.parallel;
@@ -416,10 +423,17 @@ impl Tool for Search {
             let op = self.op;
             let token = ctx.cancellation.clone();
             let output_bytes = ctx.result_budget(self.limits.result_bytes)?;
+            let limits = self.limits;
             let answer = aw_tools::asynchronous::run_blocking(move || match op {
                 Operation::Ls => list(&root, &parse::<LsArgs>(&request)?, &token, output_bytes),
                 Operation::Find => find(&root, &parse::<FindArgs>(&request)?, &token, output_bytes),
-                Operation::Grep => grep(&root, &parse::<GrepArgs>(&request)?, &token, output_bytes),
+                Operation::Grep => grep(
+                    &root,
+                    &parse::<GrepArgs>(&request)?,
+                    &token,
+                    output_bytes,
+                    limits,
+                ),
             })
             .await
             .map_err(|_| Error::Protocol("search worker failed"))?;

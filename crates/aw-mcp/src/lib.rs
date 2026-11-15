@@ -1358,6 +1358,7 @@ mod tests {
             scope: None,
             execution_owner: None,
             execution_scope: None,
+            live_step_gate: None,
         }
     }
 

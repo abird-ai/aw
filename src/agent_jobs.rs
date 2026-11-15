@@ -1784,6 +1784,7 @@ mod tests {
             }),
             execution_owner: Some(owner),
             execution_scope: None,
+            live_step_gate: None,
         }
     }
 

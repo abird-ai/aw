@@ -384,6 +384,7 @@ impl OutputOwner {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputPage {
+    pub offset: u64,
     pub bytes: Vec<u8>,
     pub next_offset: Option<u64>,
     pub writer_finished: bool,
@@ -392,6 +393,13 @@ pub struct OutputPage {
     pub truncated: bool,
     pub total_bytes: u64,
     pub retained_bytes: u64,
+}
+
+/// Single raw stream addressing model shared by get/read and hosts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputPosition {
+    Absolute(u64),
+    Tail(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -478,6 +486,7 @@ impl OutputStore {
 struct OwnerAck {
     through: u64,
     acknowledged: bool,
+    /// Only the continuously delivered [0, delivered_through) prefix is ACKable.
     delivered_through: u64,
     delivered_once: bool,
 }
@@ -592,6 +601,75 @@ impl OwnedOutput {
             Err(Error::OutputFailure) if self.writer_finished => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    fn read_for_owner(
+        &mut self,
+        owner: OutputOwner,
+        position: OutputPosition,
+        limit: usize,
+    ) -> Result<OutputPage, Error> {
+        if !self.owners.contains_key(&owner) {
+            return Err(Error::InvalidOutput);
+        }
+        self.read_page(position, limit)
+    }
+
+    /// Trusted host attestation *after* bounded final projection succeeds.
+    /// The host must mark only the raw prefix represented by its response.
+    /// Reading or peeking never creates ACKable delivery evidence.
+    fn mark_delivered_for_owner(
+        &mut self,
+        owner: OutputOwner,
+        start: u64,
+        count: usize,
+    ) -> Result<(), Error> {
+        if self.released {
+            return Err(Error::OutputReleased);
+        }
+        let end = start
+            .checked_add(count as u64)
+            .ok_or(Error::InvalidOutput)?;
+        if end > self.spool.retained_bytes() {
+            return Err(Error::InvalidOutput);
+        }
+        let lease = self.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+        if start <= lease.delivered_through {
+            lease.delivered_through = lease.delivered_through.max(end);
+            lease.delivered_once = true;
+        }
+        Ok(())
+    }
+
+    fn read_page(&mut self, position: OutputPosition, limit: usize) -> Result<OutputPage, Error> {
+        if limit == 0 || limit > MAX_SPOOL_PAGE_BYTES {
+            return Err(Error::InvalidOutput);
+        }
+        if self.released {
+            return Err(Error::OutputReleased);
+        }
+        let summary = self.spool.summary();
+        let offset = match position {
+            OutputPosition::Absolute(offset) => offset,
+            // If the requested tail exceeds a page, retain the newest bytes.
+            OutputPosition::Tail(count) => summary
+                .retained_bytes
+                .saturating_sub(count.min(limit as u64)),
+        };
+        if offset > summary.retained_bytes || offset.checked_add(limit as u64).is_none() {
+            return Err(Error::InvalidOutput);
+        }
+        let bytes = self.spool.read_retained_page(offset, limit)?;
+        let next = offset + bytes.len() as u64;
+        Ok(OutputPage {
+            offset,
+            bytes,
+            next_offset: (next < summary.retained_bytes).then_some(next),
+            writer_finished: self.writer_finished,
+            truncated: summary.truncated,
+            total_bytes: summary.total_bytes,
+            retained_bytes: summary.retained_bytes,
+        })
     }
 
     fn maybe_release(&mut self) -> Result<bool, Error> {
@@ -1898,6 +1976,26 @@ impl JobManager {
         OutputOwner::new(hash.finalize().into())
     }
 
+    /// Host-scoped model/SDK consumer lease. Hosts must hash an authenticated,
+    /// stable consumer identity into `scope` (not a per-call/turn ID or a model
+    /// argument), and independently authorize every read/ACK. The original
+    /// Job owner and Task result owners remain separate domains.
+    ///
+    /// Derivation alone grants nothing: enroll_output_consumer must first
+    /// register this owner against each currently retained stream.
+    pub fn consumer_output_owner(&self, id: &str, scope: [u8; 32]) -> Result<OutputOwner, Error> {
+        if scope == [0; 32] {
+            return Err(Error::InvalidOutput);
+        }
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+        let mut hash = Sha256::new();
+        hash.update(b"aw-tools-consumer-output-owner-v1 ");
+        hash.update(managed.job.binding());
+        hash.update(scope);
+        OutputOwner::new(hash.finalize().into())
+    }
+
     pub fn task_result_owner(&self, id: &str, coordinate: usize) -> Result<OutputOwner, Error> {
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
@@ -2543,6 +2641,69 @@ impl JobManager {
         Ok(())
     }
 
+    /// Enroll an *already-authorized* consumer into all currently selected
+    /// retained streams. No output disclosure/authority is conferred here.
+    /// Multi-stream preflight is all-or-none; repeated enrollment is
+    /// idempotent, and released output cannot be resurrected. Newly attached
+    /// streams require a later explicit enrollment by the host.
+    ///
+    /// The caller must supply the stable consumer-derived OutputOwner, never
+    /// a model-selected key. A maximum of 16 owners per stream prevents
+    /// unbounded lease pinning.
+    pub fn enroll_output_consumer(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        view: Option<OutputStream>,
+        owner: OutputOwner,
+    ) -> Result<bool, Error> {
+        if owner.0 == [0; 32] {
+            return Err(Error::InvalidOutput);
+        }
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+        if !managed.visibility.is_exposed() {
+            return Err(Error::NotExposed);
+        }
+        if node.is_some_and(|node| !(1..=managed.job.total()).contains(&node)) {
+            return Err(Error::InvalidOutput);
+        }
+        let handles = managed
+            .outputs
+            .iter()
+            .filter(|((coordinate, stream), _)| {
+                node.is_none_or(|node| node == *coordinate)
+                    && view.is_none_or(|view| view == *stream)
+            })
+            .map(|(_, output)| Arc::clone(output))
+            .collect::<Vec<_>>();
+        if handles.is_empty() {
+            return Err(Error::OutputMissing);
+        }
+        // Lock order is Job state then stable node/stream-ordered outputs,
+        // matching whole-Job Finish. No owner change until all checks pass.
+        let mut outputs = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            outputs.push(handle.lock().map_err(|_| Error::Poisoned)?);
+        }
+        for output in &outputs {
+            if output.released {
+                return Err(Error::OutputReleased);
+            }
+            if !output.owners.contains_key(&owner) && output.owners.len() >= 16 {
+                return Err(Error::Capacity);
+            }
+        }
+        let mut changed = false;
+        for output in &mut outputs {
+            if let std::collections::btree_map::Entry::Vacant(entry) = output.owners.entry(owner) {
+                entry.insert(OwnerAck::default());
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn append_output(
         &self,
         id: &str,
@@ -2606,26 +2767,9 @@ impl JobManager {
         offset: u64,
         limit: usize,
     ) -> Result<OutputPage, Error> {
-        if limit == 0 || limit > MAX_SPOOL_PAGE_BYTES || offset.checked_add(limit as u64).is_none()
-        {
-            return Err(Error::InvalidOutput);
-        }
         let output = self.output_handle(id, coordinate, stream)?;
         let mut output = output.lock().map_err(|_| Error::Poisoned)?;
-        if output.released {
-            return Err(Error::OutputReleased);
-        }
-        let summary = output.spool.summary();
-        let bytes = output.spool.read_retained_page(offset, limit)?;
-        let next = offset + bytes.len() as u64;
-        Ok(OutputPage {
-            bytes,
-            next_offset: (next < summary.retained_bytes).then_some(next),
-            writer_finished: output.writer_finished,
-            truncated: summary.truncated,
-            total_bytes: summary.total_bytes,
-            retained_bytes: summary.retained_bytes,
-        })
+        output.read_page(OutputPosition::Absolute(offset), limit)
     }
 
     /// Shrink a finished retained stream to the exact prefix still required by
@@ -2686,8 +2830,23 @@ impl JobManager {
         })
     }
 
-    /// Public/SDK lease read for one exact retained owner. Unlike host-internal
-    /// observation, this advances only that owner's delivered watermark.
+    /// Exact owner-read: authorize and return bytes with NO delivery credit.
+    /// The host projects and validates its final response before explicitly
+    /// marking the represented prefix with record_delivered_output.
+    pub fn output_page_for_owner_at(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        owner: OutputOwner,
+        position: OutputPosition,
+        limit: usize,
+    ) -> Result<OutputPage, Error> {
+        let output = self.output_handle(id, coordinate, stream)?;
+        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
+        output.read_for_owner(owner, position, limit)
+    }
+
     pub fn output_page_for_owner(
         &self,
         id: &str,
@@ -2697,37 +2856,214 @@ impl JobManager {
         offset: u64,
         limit: usize,
     ) -> Result<OutputPage, Error> {
-        if limit == 0 || limit > MAX_SPOOL_PAGE_BYTES || offset.checked_add(limit as u64).is_none()
-        {
-            return Err(Error::InvalidOutput);
-        }
-        let output = self.output_handle(id, coordinate, stream)?;
-        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
-        if output.released {
-            return Err(Error::OutputReleased);
-        }
-        if !output.owners.contains_key(&owner) {
-            return Err(Error::InvalidOutput);
-        }
-        let summary = output.spool.summary();
-        let bytes = output.spool.read_retained_page(offset, limit)?;
-        let next = offset + bytes.len() as u64;
-        let lease = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
-        lease.delivered_through = lease.delivered_through.max(next);
-        lease.delivered_once = true;
-        Ok(OutputPage {
-            bytes,
-            next_offset: (next < summary.retained_bytes).then_some(next),
-            writer_finished: output.writer_finished,
-            truncated: summary.truncated,
-            total_bytes: summary.total_bytes,
-            retained_bytes: summary.retained_bytes,
-        })
+        self.output_page_for_owner_at(
+            id,
+            coordinate,
+            stream,
+            owner,
+            OutputPosition::Absolute(offset),
+            limit,
+        )
     }
 
-    /// Strict public ACK: an owner cannot acknowledge bytes it has not actually
-    /// received through output_page_for_owner. Empty output still requires one
-    /// owner read before offset zero is ACKable.
+    /// Trusted final-projection delivery proof for an exact output owner.
+    /// A host must first authorize the view, read it and produce a complete
+    /// bounded reply; `start/count` are raw bytes *included* in that reply,
+    /// not bytes fetched into an intermediate buffer. This does not ACK.
+    /// An out-of-order delivered range is not merged across unseen gaps.
+    pub fn record_delivered_output(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        owner: OutputOwner,
+        start: u64,
+        count: usize,
+    ) -> Result<(), Error> {
+        let output = self.output_handle(id, coordinate, stream)?;
+        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
+        output.mark_delivered_for_owner(owner, start, count)
+    }
+
+    /// One combined byte budget for stdout and stderr of a Process node.
+    /// Reserve half each; transfer any unused share to the other stream.
+    /// Both stream snapshots use retained-byte positions, never guessed lines.
+    pub fn process_tail_for_owner(
+        &self,
+        id: &str,
+        coordinate: usize,
+        owner: OutputOwner,
+        limit: usize,
+    ) -> Result<(Option<OutputPage>, Option<OutputPage>), Error> {
+        if limit == 0 {
+            return Ok((None, None));
+        }
+        if limit > MAX_SPOOL_PAGE_BYTES {
+            return Err(Error::InvalidOutput);
+        }
+        let (stdout, stderr) = {
+            let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+            let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+            if !managed.visibility.is_exposed() {
+                return Err(Error::NotExposed);
+            }
+            if !(1..=managed.job.total()).contains(&coordinate) {
+                return Err(Error::InvalidOutput);
+            }
+            (
+                managed
+                    .outputs
+                    .get(&(coordinate, OutputStream::Stdout))
+                    .cloned(),
+                managed
+                    .outputs
+                    .get(&(coordinate, OutputStream::Stderr))
+                    .cloned(),
+            )
+        };
+        let mut stdout = stdout
+            .as_ref()
+            .map(|output| output.lock().map_err(|_| Error::Poisoned))
+            .transpose()?;
+        let mut stderr = stderr
+            .as_ref()
+            .map(|output| output.lock().map_err(|_| Error::Poisoned))
+            .transpose()?;
+        if stdout.is_none() && stderr.is_none() {
+            return Ok((None, None));
+        }
+        for stream in stdout.iter().chain(stderr.iter()) {
+            if !stream.owners.contains_key(&owner) {
+                return Err(Error::InvalidOutput);
+            }
+            if stream.released {
+                return Err(Error::OutputReleased);
+            }
+        }
+        let available_out = stdout.as_ref().map_or(0, |out| out.spool.retained_bytes());
+        let available_err = stderr.as_ref().map_or(0, |err| err.spool.retained_bytes());
+        let total = limit as u64;
+        let mut out = available_out.min(total / 2 + total % 2);
+        let mut err = available_err.min(total / 2);
+        let unused = total - out - err;
+        let extra_out = (available_out - out).min(unused);
+        out += extra_out;
+        err += (available_err - err).min(unused - extra_out);
+        let out = if out != 0 {
+            Some(
+                stdout
+                    .as_mut()
+                    .ok_or(Error::OutputMissing)?
+                    .read_for_owner(owner, OutputPosition::Tail(out), out as usize)?,
+            )
+        } else {
+            None
+        };
+        let err = if err != 0 {
+            Some(
+                stderr
+                    .as_mut()
+                    .ok_or(Error::OutputMissing)?
+                    .read_for_owner(owner, OutputPosition::Tail(err), err as usize)?,
+            )
+        } else {
+            None
+        };
+        Ok((out, err))
+    }
+
+    /// Explicit release of unread retained output for one authorized lease.
+    /// The caller must have independently authorized this Control operation.
+    /// Root means every stream owned by this Job, not independent child Jobs.
+    /// Validate ALL targets before updating ANY logical ACK.
+    pub fn finish_output_for_owner(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        view: Option<OutputStream>,
+        owner: OutputOwner,
+    ) -> Result<OutputAck, Error> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+        if !managed.visibility.is_exposed() {
+            return Err(Error::NotExposed);
+        }
+        if managed.job.journal_ambiguous() {
+            return Err(Error::ReplayUnknown);
+        }
+        if let Some(node) = node {
+            match managed.job.state(node) {
+                Some(NodeState::Terminal { status, .. }) if status.primary != Primary::Unknown => {}
+                Some(NodeState::Terminal { .. }) => return Err(Error::ReplayUnknown),
+                Some(_) => return Err(Error::Busy),
+                None => return Err(Error::InvalidOutput),
+            }
+        } else if managed.job.lifecycle() != Lifecycle::Terminal {
+            return Err(Error::Busy);
+        } else if (1..=managed.job.total()).any(|coordinate| {
+            !matches!(
+                managed.job.state(coordinate),
+                Some(NodeState::Terminal { status, .. }) if status.primary != Primary::Unknown
+            )
+        }) {
+            // A mixed/summary label is not proof that every effect is known.
+            return Err(Error::ReplayUnknown);
+        }
+        let handles = managed
+            .outputs
+            .iter()
+            .filter(|((coordinate, stream), _)| {
+                node.is_none_or(|node| node == *coordinate)
+                    && view.is_none_or(|view| view == *stream)
+            })
+            .map(|(_, output)| Arc::clone(output))
+            .collect::<Vec<_>>();
+        if handles.is_empty() {
+            return Err(Error::OutputMissing);
+        }
+        // Output handles are in stable node/stream order. The Job state lock
+        // prevents a concurrent restart from swapping the output namespace
+        // before the logical owner commit.
+        let mut outputs = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            outputs.push(handle.lock().map_err(|_| Error::Poisoned)?);
+        }
+        for output in &outputs {
+            if !output.writer_finished {
+                return Err(Error::Busy);
+            }
+            if !output.owners.contains_key(&owner) {
+                return Err(Error::InvalidOutput);
+            }
+        }
+        let mut changed = false;
+        for output in &mut outputs {
+            if output.released {
+                continue;
+            }
+            let through = output.spool.retained_bytes();
+            let ack = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+            if !ack.acknowledged || ack.through < through {
+                ack.through = through;
+                ack.acknowledged = true;
+                changed = true;
+            }
+        }
+        drop(state);
+        // Physical cleanup may fail; logical owner ACKs remain committed and
+        // retries may finish cleanup without resurrecting discarded bytes.
+        let mut released = true;
+        for output in &mut outputs {
+            output.maybe_release()?;
+            released &= output.released;
+        }
+        Ok(OutputAck { changed, released })
+    }
+
+    /// Strict public ACK: an owner cannot acknowledge bytes not credited by a
+    /// trusted host's record_delivered_output after final response projection.
+    /// Empty output still requires an explicit zero-byte delivery mark before
+    /// offset zero is ACKable.
     pub fn acknowledge_delivered_output(
         &self,
         id: &str,
@@ -2881,7 +3217,7 @@ impl JobManager {
         }
         let mut line = primary.as_str().to_owned();
         let mut fields = Vec::new();
-        if primary == Primary::Mixed && success_complete != 0 {
+        if matches!(primary, Primary::Mixed | Primary::Unknown) && success_complete != 0 {
             fields.push(format!("ok={success_complete}"));
         }
         if more != 0 {
@@ -2890,7 +3226,7 @@ impl JobManager {
         if incomplete != 0 {
             fields.push(format!("incomplete={incomplete}"));
         }
-        if primary == Primary::Mixed {
+        if matches!(primary, Primary::Mixed | Primary::Unknown) {
             if fail != 0 {
                 fields.push(format!("fail={fail}"));
             }
@@ -5754,6 +6090,559 @@ mod tests {
         ));
         assert_eq!(manager.spool_usage().unwrap().0, 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    fn two_node_terminal_output_job(
+        id: &str,
+        second_primary: Primary,
+    ) -> (JobManager, OutputOwner) {
+        let graph = Graph::compile(
+            &json!({"ops":[
+                ["read",{"path":"a"}],
+                ["read",{"path":"b"}]
+            ]}),
+            |_, _| true,
+        )
+        .unwrap();
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(NodePolicy {
+                budget: SemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 32,
+                },
+                footprint: Footprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        let manager = manager(2);
+        manager
+            .admit_runtime(
+                graph,
+                plans,
+                RuntimeAdmission {
+                    id,
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 2,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        let owner = manager.job_output_owner(id).unwrap();
+        manager.claim(id, 1, true, 2, |_, _| Ok(())).unwrap();
+        manager
+            .attach_output_memory(id, 1, OutputStream::Result, [owner])
+            .unwrap();
+        let writer = manager.output_writer(id, 1, OutputStream::Result).unwrap();
+        writer.append(b"done").unwrap();
+        writer.finish().unwrap();
+        manager
+            .start(
+                id,
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager
+            .settle(
+                id,
+                1,
+                NodeState::Running { sequence: 3 },
+                Status {
+                    primary: Primary::Ok,
+                    more: false,
+                    incomplete: false,
+                },
+                4,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager.claim(id, 2, true, 5, |_, _| Ok(())).unwrap();
+        manager
+            .start(
+                id,
+                StartRequest {
+                    coordinate: 2,
+                    claimed_sequence: 5,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 6,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager
+            .settle(
+                id,
+                2,
+                NodeState::Running { sequence: 6 },
+                Status {
+                    primary: second_primary,
+                    more: false,
+                    incomplete: false,
+                },
+                7,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().lifecycle, Lifecycle::Terminal);
+        (manager, owner)
+    }
+
+    #[test]
+    fn terminal_graph_with_unknown_node_preserves_known_results_and_blocks_root_finish() {
+        let (manager, owner) = two_node_terminal_output_job("unknown-graph", Primary::Unknown);
+        let snapshot = manager.get("unknown-graph").unwrap();
+        assert_eq!(snapshot.summary, Some((Primary::Unknown, false, false)));
+        assert_eq!(snapshot.status_label(), "unknown");
+        let summary = manager
+            .render_graph_result("unknown-graph", 4096)
+            .unwrap()
+            .expect("compact Graph summary fits");
+        assert!(summary.contains("unknown ok=1"), "{summary}");
+        assert!(summary.contains("unknown=1"), "{summary}");
+        let before = manager
+            .output_owner_state("unknown-graph", 1, OutputStream::Result, owner)
+            .unwrap();
+        assert_eq!(before.through, 0);
+        assert!(!before.acknowledged && !before.released);
+        assert_eq!(
+            manager.finish_output_for_owner("unknown-graph", None, None, owner),
+            Err(Error::ReplayUnknown)
+        );
+        assert_eq!(
+            manager.finish_output_for_owner("unknown-graph", Some(2), None, owner),
+            Err(Error::ReplayUnknown)
+        );
+        assert_eq!(
+            manager
+                .output_owner_state("unknown-graph", 1, OutputStream::Result, owner)
+                .unwrap(),
+            before,
+            "an unknown component must never partially release known retained data"
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 4);
+
+        // A known node can be finished independently: this is an explicit
+        // scoped Control action, not whole-Graph cleanup or an implicit ACK.
+        let ack = manager
+            .finish_output_for_owner("unknown-graph", Some(1), None, owner)
+            .unwrap();
+        assert!(ack.changed && ack.released);
+    }
+
+    #[test]
+    fn fully_settled_heterogeneous_graph_remains_mixed_and_allows_explicit_finish() {
+        let (manager, owner) = two_node_terminal_output_job("known-mixed", Primary::Fail);
+        let snapshot = manager.get("known-mixed").unwrap();
+        assert_eq!(snapshot.summary, Some((Primary::Mixed, false, false)));
+        let summary = manager
+            .render_graph_result("known-mixed", 4096)
+            .unwrap()
+            .expect("mixed Graph summary fits");
+        assert!(summary.contains("mixed ok=1 fail=1"), "{summary}");
+        let ack = manager
+            .finish_output_for_owner("known-mixed", None, None, owner)
+            .unwrap();
+        assert!(ack.changed && ack.released);
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+        let again = manager
+            .finish_output_for_owner("known-mixed", None, None, owner)
+            .unwrap();
+        assert!(!again.changed && again.released);
+    }
+
+    #[test]
+    fn tail_peek_cannot_ack_unread_prefix_and_forward_paging_recovers() {
+        let (manager, owner) = claimed_output_job("owner-gaps", 1024);
+        let (file, path) = output_file();
+        manager
+            .attach_output("owner-gaps", 1, OutputStream::Stdout, file, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("owner-gaps", 1, OutputStream::Stdout)
+            .unwrap();
+        writer.append(b"abcdefghij").unwrap();
+        writer.finish().unwrap();
+        let tail = manager
+            .output_page_for_owner_at(
+                "owner-gaps",
+                1,
+                OutputStream::Stdout,
+                owner,
+                OutputPosition::Tail(3),
+                3,
+            )
+            .unwrap();
+        assert_eq!((tail.offset, tail.bytes.as_slice()), (7, b"hij".as_slice()));
+        assert_eq!(
+            manager.acknowledge_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 10),
+            Err(Error::InvalidOutput)
+        );
+        let first = manager
+            .output_page_for_owner("owner-gaps", 1, OutputStream::Stdout, owner, 0, 4)
+            .unwrap();
+        assert_eq!(
+            (first.offset, first.bytes.as_slice()),
+            (0, b"abcd".as_slice())
+        );
+        // Fetching bytes creates no proof. Only the host can mark the exact
+        // prefix it actually included in its bounded final response.
+        assert_eq!(
+            manager.acknowledge_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 4),
+            Err(Error::InvalidOutput)
+        );
+        assert_eq!(
+            manager.record_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 0, 11),
+            Err(Error::InvalidOutput),
+            "host cannot credit bytes beyond the retained spool"
+        );
+        manager
+            .record_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 0, 4)
+            .unwrap();
+        manager
+            .acknowledge_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 4)
+            .unwrap();
+        assert_eq!(
+            manager.acknowledge_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 10),
+            Err(Error::InvalidOutput)
+        );
+        // A later out-of-order read, even when explicitly projected,
+        // does not pre-authorize a gap.
+        manager
+            .output_page_for_owner("owner-gaps", 1, OutputStream::Stdout, owner, 8, 2)
+            .unwrap();
+        manager
+            .record_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 8, 2)
+            .unwrap();
+        assert_eq!(
+            manager.acknowledge_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 10),
+            Err(Error::InvalidOutput)
+        );
+        manager
+            .output_page_for_owner("owner-gaps", 1, OutputStream::Stdout, owner, 4, 6)
+            .unwrap();
+        manager
+            .record_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 4, 6)
+            .unwrap();
+        assert!(
+            manager
+                .acknowledge_delivered_output("owner-gaps", 1, OutputStream::Stdout, owner, 10)
+                .unwrap()
+                .released
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn process_tail_is_aggregate_and_quick_finish_waits_for_settlement_and_every_owner() {
+        let (manager, owner) = claimed_output_job("owner-tail", 4096);
+        let second = OutputOwner::new([0xA7; 32]).unwrap();
+        let (stdout_file, stdout_path) = output_file();
+        let (stderr_file, stderr_path) = output_file();
+        let (stdout, stderr) = manager
+            .attach_process_output_files(
+                "owner-tail",
+                1,
+                [owner, second],
+                ShellOutputFiles {
+                    stdout: stdout_file,
+                    stderr: stderr_file,
+                    stream_capacity: 1024,
+                },
+            )
+            .unwrap();
+        stdout.append(&vec![b'a'; 900]).unwrap();
+        stderr.append(&[b'b'; 100]).unwrap();
+        let (out, err) = manager
+            .process_tail_for_owner("owner-tail", 1, owner, 512)
+            .unwrap();
+        let (out, err) = (out.unwrap(), err.unwrap());
+        assert_eq!((out.bytes.len(), err.bytes.len()), (412, 100));
+        assert_eq!((out.offset, err.offset), (488, 0));
+        assert_eq!(
+            manager.acknowledge_delivered_output("owner-tail", 1, OutputStream::Stdout, owner, 900),
+            Err(Error::InvalidOutput)
+        );
+        assert_eq!(
+            manager.acknowledge_delivered_output("owner-tail", 1, OutputStream::Stderr, owner, 0),
+            Err(Error::InvalidOutput),
+            "jobs_get tail must not credit even a zero-byte prefix"
+        );
+        let (out, err) = manager
+            .process_tail_for_owner("owner-tail", 1, owner, 1024)
+            .unwrap();
+        assert_eq!(
+            (out.unwrap().bytes.len(), err.unwrap().bytes.len()),
+            (900, 100)
+        );
+        stdout.finish().unwrap();
+        stderr.finish().unwrap();
+        assert_eq!(
+            manager.finish_output_for_owner("owner-tail", None, None, owner),
+            Err(Error::Busy)
+        );
+        manager
+            .start(
+                "owner-tail",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager
+            .settle(
+                "owner-tail",
+                1,
+                NodeState::Running { sequence: 3 },
+                Status {
+                    primary: Primary::Ok,
+                    more: false,
+                    incomplete: false,
+                },
+                4,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let first = manager
+            .finish_output_for_owner("owner-tail", None, None, owner)
+            .unwrap();
+        assert!(first.changed && !first.released);
+        assert_eq!(manager.spool_usage().unwrap().0, 1000);
+        let second_ack = manager
+            .finish_output_for_owner("owner-tail", None, None, second)
+            .unwrap();
+        assert!(second_ack.changed && second_ack.released);
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+        let repeat = manager
+            .finish_output_for_owner("owner-tail", None, None, owner)
+            .unwrap();
+        assert!(!repeat.changed && repeat.released);
+        let _ = std::fs::remove_file(stdout_path);
+        let _ = std::fs::remove_file(stderr_path);
+    }
+
+    #[test]
+    fn consumer_lease_scope_is_job_bound_and_all_streams_are_independent() {
+        let (manager, producer) = claimed_output_job("consumer-scope", 1024);
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            manager
+                .attach_output_memory("consumer-scope", 1, stream, [producer])
+                .unwrap();
+            let writer = manager.output_writer("consumer-scope", 1, stream).unwrap();
+            writer.append(b"abcdef").unwrap();
+            writer.finish().unwrap();
+        }
+        let alpha = manager
+            .consumer_output_owner("consumer-scope", [0xA1; 32])
+            .unwrap();
+        let beta = manager
+            .consumer_output_owner("consumer-scope", [0xB2; 32])
+            .unwrap();
+        assert_ne!(alpha, beta);
+        assert_ne!(alpha, producer);
+        assert_ne!(beta, producer);
+        assert_eq!(
+            manager.consumer_output_owner("consumer-scope", [0; 32]),
+            Err(Error::InvalidOutput)
+        );
+
+        // Identity alone is never a grant: the owner must be explicitly
+        // enrolled in the exact retained streams by the authorized host.
+        assert_eq!(
+            manager.output_page_for_owner("consumer-scope", 1, OutputStream::Stdout, alpha, 0, 6),
+            Err(Error::InvalidOutput)
+        );
+        assert!(manager
+            .enroll_output_consumer("consumer-scope", Some(1), None, alpha)
+            .unwrap());
+        assert!(
+            !manager
+                .enroll_output_consumer("consumer-scope", Some(1), None, alpha)
+                .unwrap(),
+            "stable consumer enrollment is idempotent"
+        );
+        assert!(manager
+            .enroll_output_consumer("consumer-scope", None, None, beta)
+            .unwrap());
+
+        manager
+            .start(
+                "consumer-scope",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager
+            .settle(
+                "consumer-scope",
+                1,
+                NodeState::Running { sequence: 3 },
+                Status {
+                    primary: Primary::Ok,
+                    more: false,
+                    incomplete: false,
+                },
+                4,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+
+        // Each consumer has a separate delivered/ACK watermark. Producer
+        // Finish cannot discard the other two independently held leases.
+        let producer_ack = manager
+            .finish_output_for_owner("consumer-scope", None, None, producer)
+            .unwrap();
+        assert!(producer_ack.changed && !producer_ack.released);
+        assert_eq!(manager.spool_usage().unwrap().0, 12);
+
+        let a_page = manager
+            .output_page_for_owner("consumer-scope", 1, OutputStream::Stdout, alpha, 0, 6)
+            .unwrap();
+        assert_eq!(a_page.bytes, b"abcdef");
+        manager
+            .record_delivered_output("consumer-scope", 1, OutputStream::Stdout, alpha, 0, 6)
+            .unwrap();
+        assert_eq!(
+            manager.acknowledge_delivered_output(
+                "consumer-scope",
+                1,
+                OutputStream::Stdout,
+                beta,
+                1
+            ),
+            Err(Error::InvalidOutput),
+            "another consumer's delivery is not this consumer's proof"
+        );
+        manager
+            .acknowledge_delivered_output("consumer-scope", 1, OutputStream::Stdout, alpha, 6)
+            .unwrap();
+        let a_ack = manager
+            .finish_output_for_owner("consumer-scope", None, None, alpha)
+            .unwrap();
+        assert!(a_ack.changed && !a_ack.released);
+        assert_eq!(manager.spool_usage().unwrap().0, 12);
+
+        let b_page = manager
+            .output_page_for_owner("consumer-scope", 1, OutputStream::Stderr, beta, 0, 3)
+            .unwrap();
+        assert_eq!(b_page.bytes, b"abc");
+        manager
+            .record_delivered_output("consumer-scope", 1, OutputStream::Stderr, beta, 0, 3)
+            .unwrap();
+        assert_eq!(
+            manager.acknowledge_delivered_output(
+                "consumer-scope",
+                1,
+                OutputStream::Stderr,
+                beta,
+                4
+            ),
+            Err(Error::InvalidOutput)
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 12);
+        let released = manager
+            .finish_output_for_owner("consumer-scope", None, None, beta)
+            .unwrap();
+        assert!(released.changed && released.released);
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+        assert_eq!(
+            manager.enroll_output_consumer(
+                "consumer-scope",
+                None,
+                None,
+                manager
+                    .consumer_output_owner("consumer-scope", [0xC3; 32])
+                    .unwrap()
+            ),
+            Err(Error::OutputReleased),
+            "released bytes are not resurrected by a later consumer"
+        );
+
+        let (other_manager, _) = claimed_output_job("other-job", 128);
+        assert_ne!(
+            other_manager
+                .consumer_output_owner("other-job", [0xA1; 32])
+                .unwrap(),
+            alpha,
+            "the same host consumer in another Job is a different lease"
+        );
+    }
+
+    #[test]
+    fn consumer_enrollment_preflights_all_streams_before_minting_any_lease() {
+        let (manager, producer) = claimed_output_job("owner-capacity", 512);
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            manager
+                .attach_output_memory("owner-capacity", 1, stream, [producer])
+                .unwrap();
+        }
+        // Saturate only stderr; stdout still has room. An aggregate enrolment
+        // must not leave an orphaned stdout lease when stderr admission fails.
+        for index in 1..16u8 {
+            manager
+                .add_output_owner(
+                    "owner-capacity",
+                    1,
+                    OutputStream::Stderr,
+                    OutputOwner::new([index; 32]).unwrap(),
+                )
+                .unwrap();
+        }
+        let extra = manager
+            .consumer_output_owner("owner-capacity", [0xEE; 32])
+            .unwrap();
+        assert_eq!(
+            manager.enroll_output_consumer("owner-capacity", None, None, extra),
+            Err(Error::Capacity)
+        );
+        assert_eq!(
+            manager.output_owner_state("owner-capacity", 1, OutputStream::Stdout, extra),
+            Err(Error::InvalidOutput),
+            "no partial enrollment despite earlier stream being available"
+        );
+        assert!(manager
+            .enroll_output_consumer("owner-capacity", Some(1), Some(OutputStream::Stdout), extra)
+            .unwrap());
+        assert!(!manager
+            .enroll_output_consumer("owner-capacity", Some(1), Some(OutputStream::Stdout), extra)
+            .unwrap());
+        assert_eq!(
+            manager.enroll_output_consumer("owner-capacity", Some(7), None, extra),
+            Err(Error::InvalidOutput)
+        );
+        assert_eq!(
+            manager.enroll_output_consumer(
+                "owner-capacity",
+                Some(1),
+                Some(OutputStream::Result),
+                extra
+            ),
+            Err(Error::OutputMissing)
+        );
     }
 
     #[test]

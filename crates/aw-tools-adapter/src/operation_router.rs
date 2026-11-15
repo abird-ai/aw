@@ -598,6 +598,7 @@ mod tests {
                 .unwrap(),
             ),
             execution_scope: None,
+            live_step_gate: None,
         }
     }
 
