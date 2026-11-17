@@ -3231,11 +3231,7 @@ impl JobManager {
             if let Some(ack) = output.released_ack(owner, through)? {
                 return Ok(ack);
             }
-            let retained = output.spool.retained_bytes();
-            if through > retained {
-                return Err(Error::InvalidOutput);
-            }
-            let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+            let current = output.owners.get(&owner).ok_or(Error::InvalidOutput)?;
             if !current.delivered_once || through > current.delivered_through {
                 return Err(Error::InvalidOutput);
             }
@@ -3245,6 +3241,11 @@ impl JobManager {
                     released: false,
                 });
             }
+            let retained = output.spool.retained_bytes();
+            if through > retained {
+                return Err(Error::InvalidOutput);
+            }
+            let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
             current.through = current.through.max(through);
             current.acknowledged = true;
             let released = output.maybe_release()?;
@@ -5974,9 +5975,21 @@ mod tests {
             Err(Error::Busy),
             "the Job owner still needs the historical tail"
         );
+        manager
+            .record_delivered_output("compact-owner", 1, OutputStream::Stdout, job_owner, 0, 8)
+            .unwrap();
+        manager
+            .record_delivered_output("compact-owner", 1, OutputStream::Stdout, task_owner, 0, 8)
+            .unwrap();
         assert!(
             !manager
-                .acknowledge_output("compact-owner", 1, OutputStream::Stdout, job_owner, 8,)
+                .acknowledge_delivered_output(
+                    "compact-owner",
+                    1,
+                    OutputStream::Stdout,
+                    job_owner,
+                    8,
+                )
                 .unwrap()
                 .released
         );
@@ -6001,7 +6014,13 @@ mod tests {
         assert_eq!(manager.spool_usage().unwrap().0, 4);
         assert_eq!(
             manager
-                .acknowledge_output("compact-owner", 1, OutputStream::Stdout, job_owner, 8,)
+                .acknowledge_delivered_output(
+                    "compact-owner",
+                    1,
+                    OutputStream::Stdout,
+                    job_owner,
+                    8,
+                )
                 .unwrap(),
             OutputAck {
                 changed: false,
@@ -6010,13 +6029,25 @@ mod tests {
             "lost ACK replay keeps its original logical high-water mark"
         );
         assert_eq!(
-            manager.acknowledge_output("compact-owner", 1, OutputStream::Stdout, task_owner, 5,),
+            manager.acknowledge_delivered_output(
+                "compact-owner",
+                1,
+                OutputStream::Stdout,
+                task_owner,
+                5,
+            ),
             Err(Error::InvalidOutput),
-            "an owner cannot newly acknowledge bytes removed by compaction"
+            "an owner cannot newly acknowledge delivered bytes removed by compaction"
         );
         assert!(
             manager
-                .acknowledge_output("compact-owner", 1, OutputStream::Stdout, task_owner, 4,)
+                .acknowledge_delivered_output(
+                    "compact-owner",
+                    1,
+                    OutputStream::Stdout,
+                    task_owner,
+                    4,
+                )
                 .unwrap()
                 .released
         );

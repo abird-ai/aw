@@ -12,23 +12,41 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
 
-## Latest AW-tools signed local checkpoint — 2026-11-17
+## Latest AW-tools published checkpoint — 2026-11-17
 
 - Shared-runtime implementation commit:
   `be6d48db552fd44b9dd85364cd8734454109ce68`
-  — `Harden shared Job output and journal uncertainty`.
-- Parent/review base: `7d09d5f3c882894cd46b427a89fa75280223115a`.
-- Git reports a **Good ED25519 signature** for key fingerprint
-  `SHA256:4aB+NvRb1shCx4xjtZDr2Y7FzfHGph80eFtpF+pHuCI`; L5 has no
-  `allowed_signers` principal file, so local trust status is `U` rather than a
-  principal-mapped `G`.
-- `origin/main` remains `7d09d5f`; the signed implementation commit is local
-  only. No push, release, version change or dotlink dependency repin is
-  authorized by this record.
-- Final implementation qualification before commit: `aw-tools` **339/339**,
+  — `Harden shared Job output and journal uncertainty`; docs/status follow-up
+  `403eb8473498454a97871702ff37aaedb1de9ee1` is the current AW `main` tip.
+- `HEAD == origin/main == 403eb8473498454a97871702ff37aaedb1de9ee1` at the
+  start of the current D1 follow-up. Dotlink D0 consumes `be6d48d` in signed
+  commit `d0a392234e918bd4ec9f0fbd7ab6fe771e1eb696`.
+- Git reports **Good ED25519 signatures** for the published AW commits using key
+  fingerprint `SHA256:4aB+NvRb1shCx4xjtZDr2Y7FzfHGph80eFtpF+pHuCI`; L5 has
+  no `allowed_signers` principal file, so local trust status is `U` rather than
+  a principal-mapped `G`.
+- Published implementation qualification: `aw-tools` **339/339**,
   `aw-tools-adapter` **251/251**, read-only shared **110/110**, strict
   all-target/all-feature Clippy, formatting/diff checks, minimal shared build,
   MCP, minimal CLI and full CLI all green.
+
+## Current uncommitted D1 shared prerequisite — 2026-11-17
+
+- Dotlink's first D1 delegation removed its duplicate shared delivery watermark
+  and exposed one shared bug: strict `acknowledge_delivered_output` rejected a
+  lost-response replay of an already-ACKed owner watermark after another owner
+  legitimately compacted the physical retained prefix below it.
+- The live AW fix validates exact owner + delivery history first, accepts only an
+  already-committed `through <= owner.through` replay, and still requires current
+  retained bytes for every **new** ACK advance. Foreign owners and new ACKs into
+  compacted-away bytes remain rejected.
+- The owner-aware compaction regression now exercises the strict API for both the
+  replaying Job owner and independent Task owner. Full shared **339/339** and
+  minimal Job-runtime **200/200** tests pass; strict all-target/all-feature
+  `aw-tools` Clippy, format and diff checks pass.
+- This follow-up is not committed or pushed. Dotlink must not path-patch or add a
+  host-side bypass; finish D1 only after the normal signed AW commit/push/repin
+  sequence is explicitly authorized.
 
 ## Repository state before this review
 

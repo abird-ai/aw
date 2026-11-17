@@ -101,6 +101,8 @@ Status/header first; short contextual refs where safe; only factual progress and
 2. **`aw-tools-adapter`:** AW exact policy+payload checks, Process/Graph/Agent distinctions, compact model/SDK output, existing Agent history, Job replay, Graph integration.
 3. **dotlink (after AW checkpoint):** same shared APIs under machine policy; validate standalone `jobs_*` MCP forms, transport response windows/replay/Task owner and grep; no backward `job_*` compatibility import or private JobManager fork.
 
+- **Logical ACK history survives physical compaction by another owner.** Once one exact owner has received and acknowledged a contiguous watermark, replay of that same acknowledged watermark remains an idempotent no-op even if another still-live owner has since compacted the physical retained prefix below it. This is replay of already-committed owner history, not permission to acknowledge missing bytes: a new ACK advance still requires both recorded delivery proof and a currently retained prefix covering the new watermark. Foreign owners and offsets beyond the same owner's delivered/ACK history remain invalid.
+
 ## Acceptance
 
 - Two Process streams with 512 aggregate implicit, 0/256/1024 explicit, running/terminal, very long lines, invalid UTF-8, output budgets, unauthorized default/explicit tail.
