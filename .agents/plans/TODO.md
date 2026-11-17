@@ -11,6 +11,8 @@
 
 - [~] P2 ai-native-toolset-builder-2026-11-15 — @pvl — Canonical configurable toolset factory before product-specific choices — [details](ai-native-toolset-builder-2026-11-15/README.md)
 
+- [~] P2 pre-017-shared-convergence-2026-11-18 — @pvl — Shared-first pre-v0.17 receipt metadata, Job page defaults and dotlink parity — [details](pre-017-shared-convergence-2026-11-18/README.md)
+
 ## Icebox
 
 - [ ] embedded-platforms — [details](embedded-platforms/TODO.md)

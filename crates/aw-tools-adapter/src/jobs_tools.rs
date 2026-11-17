@@ -822,7 +822,7 @@ impl JobsTool {
                     ]},
                     "cursor":{"type":["string","null"],"minLength":1,"maxLength":512},
                     "offset":{"type":["integer","null"]},
-                    "limit":{"type":["integer","null"],"minimum":1,"maximum":self.runtime.result_limit().min(aw_tools::task_ops::MAX_TASK_OUTPUT_PAGE)},
+                    "limit":{"type":["integer","null"],"minimum":1,"maximum":self.runtime.job_profile().read_page_max_bytes},
                     "encoding":{"type":["string","null"],"enum":["text","base64",null]},
                     "wait_ms":{"type":["integer","null"],"minimum":0,"maximum":MAX_WAIT_MS}
                 },"additionalProperties":false}),
@@ -989,6 +989,22 @@ impl Tool for JobsTool {
                     return Err(Error::Denied("invalid jobs_read cursor"));
                 }
                 if arguments
+                    .get("limit")
+                    .filter(|value| !value.is_null())
+                    .is_some_and(|limit| {
+                        limit
+                            .as_u64()
+                            .and_then(|value| usize::try_from(value).ok())
+                            .is_none_or(|value| {
+                                value == 0 || value > self.runtime.job_profile().read_page_max_bytes
+                            })
+                    })
+                {
+                    return Err(Error::Denied(
+                        "jobs_read limit exceeds configured Job page ceiling",
+                    ));
+                }
+                if arguments
                     .get("wait_ms")
                     .filter(|value| !value.is_null())
                     .is_some_and(|wait| {
@@ -1073,7 +1089,12 @@ impl Tool for JobsTool {
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
             self.validate(arguments)?;
-            let budget = ctx.result_budget(self.runtime.result_limit())?;
+            let result_ceiling = if self.kind == JobsKind::Read {
+                self.runtime.job_profile().read_page_max_bytes
+            } else {
+                self.runtime.result_limit()
+            };
+            let budget = ctx.result_budget(result_ceiling)?;
             let host = self.runtime.host_for(&ctx)?;
             // Mark delivery only after the *entire* tool response validates.
             // A tail/status peek never mints ACKable byte proof.
@@ -1322,11 +1343,7 @@ impl Tool for JobsTool {
                         .get("limit")
                         .and_then(Value::as_u64)
                         .and_then(|value| usize::try_from(value).ok())
-                        .unwrap_or_else(|| {
-                            self.runtime
-                                .result_limit()
-                                .min(aw_tools::task_ops::MAX_TASK_OUTPUT_PAGE)
-                        });
+                        .unwrap_or(self.runtime.job_profile().read_page_default_bytes);
                     let wait_ms = arguments
                         .get("wait_ms")
                         .and_then(Value::as_u64)

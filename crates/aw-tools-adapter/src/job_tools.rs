@@ -3204,6 +3204,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_jobs_read_omitted_limit_uses_shared_page_default() {
+        use aw_tools::toolset::JobProfile;
+        let (root, agent, _default_runtime, mut ctx) = fixture();
+        let line = format!("{}\n", "x".repeat(20));
+        fs::write(root.join("large.txt"), line.repeat(100)).unwrap();
+        let limits = crate::LocalToolLimits {
+            job_profile: JobProfile {
+                read_page_default_bytes: 512,
+                read_page_max_bytes: 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime = JobRuntime::new_with_native_tools(
+            Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),
+            agent.tool_binding_authority(),
+            limits,
+            crate::LocalToolConcurrency::default(),
+            aw_tools::filesystem::schema::Tool::GRAPH_NATIVE.to_vec(),
+        )
+        .unwrap();
+        let (session, branch) = runtime.test_scope_identity();
+        ctx.execution_owner = Some(
+            aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:0",
+                session,
+                branch,
+            )
+            .unwrap(),
+        );
+        ctx.call_id = "default-page-batch".into();
+        // Force durable handoff; retained output is much larger than this
+        // deliberately tiny configured read-page default.
+        ctx.result_budget_bytes = 512;
+        let started = Batch::new(runtime.clone())
+            .execute(
+                ctx.clone(),
+                &json!({"ops":[
+                    ["read",{"path":"large.txt","numbered":false,"lines":200}]
+                ]}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&started.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        ctx.result_budget_bytes = aw_agent_core::tool::MAX_TOOL_RESULT_BYTES;
+        let reference = host.execution_ref(&id, Some(1)).unwrap().canonical();
+        let read = crate::jobs_tools::JobsTool::new(runtime, crate::jobs_tools::JobsKind::Read);
+        let page = read
+            .execute(
+                ctx,
+                &json!({"ref":reference,"view":"result","offset":0,"encoding":"text"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.content.lines().last(),
+            Some("more offset=512"),
+            "omitted limit must use JobProfile.read_page_default_bytes"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn job_controls_cover_start_list_get_output_ack_cancel_and_restart() {
         let (root, _agent, runtime, mut ctx) = fixture();
         ctx.call_id = "start-call".into();
@@ -3498,6 +3562,8 @@ mod tests {
                 get_tail_default: 256,
                 get_tail_max: 384,
                 get_wait_max_ms: 1200,
+                read_page_default_bytes: 512,
+                read_page_max_bytes: 2048,
                 read_wait_max_ms: 0,
                 list_page_max: 10,
             })
@@ -3530,12 +3596,22 @@ mod tests {
             read.spec().parameters["properties"]["wait_ms"]["maximum"],
             0
         );
+        assert_eq!(
+            read.spec().parameters["properties"]["limit"]["default"],
+            512
+        );
+        assert_eq!(
+            read.spec().parameters["properties"]["limit"]["maximum"],
+            2048
+        );
         assert_eq!(list.spec().parameters["properties"]["limit"]["maximum"], 10);
         assert!(get.spec().description.contains("256 raw bytes combined"));
         get.validate(&json!({"tail":384,"wait_ms":1200})).unwrap();
         assert!(get.validate(&json!({"tail":385})).is_err());
         assert!(get.validate(&json!({"wait_ms":1201})).is_err());
         assert!(read.validate(&json!({"wait_ms":1})).is_err());
+        read.validate(&json!({"limit":2048})).unwrap();
+        assert!(read.validate(&json!({"limit":2049})).is_err());
     }
 
     #[test]

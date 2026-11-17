@@ -35,6 +35,8 @@ pub struct JobProfile {
     pub get_tail_default: usize,
     pub get_tail_max: usize,
     pub get_wait_max_ms: u64,
+    pub read_page_default_bytes: usize,
+    pub read_page_max_bytes: usize,
     pub read_wait_max_ms: u64,
     pub list_page_max: usize,
 }
@@ -44,21 +46,173 @@ impl Default for JobProfile {
             get_tail_default: 512,
             get_tail_max: 1024,
             get_wait_max_ms: 30_000,
+            read_page_default_bytes: 256 * 1024,
+            read_page_max_bytes: 256 * 1024,
             read_wait_max_ms: 30_000,
             list_page_max: 256,
         }
     }
 }
 pub const MAX_GET_TAIL_BYTES: usize = 64 * 1024;
+pub const MAX_JOB_READ_PAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_JOB_WAIT_MS: u64 = 300_000;
 pub const MAX_JOB_LIST_PAGE: usize = 256;
 
-/// Optional *model receipt* metadata, never inserted into raw output pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptCategory {
+    Filesystem,
+    Process,
+    Batch,
+    Jobs,
+    Agent,
+}
+impl ReceiptCategory {
+    const fn bit(self) -> u8 {
+        1 << match self {
+            Self::Filesystem => 0,
+            Self::Process => 1,
+            Self::Batch => 2,
+            Self::Jobs => 3,
+            Self::Agent => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiptScope {
+    categories: u8,
+    include: u64,
+    exclude: u64,
+}
+impl ReceiptScope {
+    const ALL_CATEGORIES: u8 = (1 << 5) - 1;
+    const FILESYSTEM_OPERATIONS: u64 = (1 << 13) - 1;
+    const PROCESS_OPERATIONS: u64 = (1 << 13) | (1 << 14) | (1 << 15);
+    const BATCH_OPERATIONS: u64 = 1 << 16;
+    const AGENT_OPERATIONS: u64 = 1 << 17;
+    const JOB_OPERATIONS: u64 = ((1 << 7) - 1) << 18;
+
+    pub const fn none() -> Self {
+        Self {
+            categories: 0,
+            include: 0,
+            exclude: 0,
+        }
+    }
+    pub const fn all() -> Self {
+        Self {
+            categories: Self::ALL_CATEGORIES,
+            include: 0,
+            exclude: 0,
+        }
+    }
+    pub const fn with_category(mut self, category: ReceiptCategory) -> Self {
+        self.categories |= category.bit();
+        self
+    }
+    pub const fn include(mut self, operation: OperationId) -> Self {
+        self.include |= operation_bit(operation);
+        self
+    }
+    pub const fn exclude(mut self, operation: OperationId) -> Self {
+        self.exclude |= operation_bit(operation);
+        self
+    }
+    pub const fn contains(self, operation: OperationId) -> bool {
+        let bit = operation_bit(operation);
+        self.exclude & bit == 0
+            && (self.include & bit != 0
+                || self.categories & operation_category(operation).bit() != 0)
+    }
+    pub const fn is_empty(self) -> bool {
+        self.effective_operations() == 0
+    }
+    const fn effective_operations(self) -> u64 {
+        let mut selected = self.include;
+        if self.categories & ReceiptCategory::Filesystem.bit() != 0 {
+            selected |= Self::FILESYSTEM_OPERATIONS;
+        }
+        if self.categories & ReceiptCategory::Process.bit() != 0 {
+            selected |= Self::PROCESS_OPERATIONS;
+        }
+        if self.categories & ReceiptCategory::Batch.bit() != 0 {
+            selected |= Self::BATCH_OPERATIONS;
+        }
+        if self.categories & ReceiptCategory::Jobs.bit() != 0 {
+            selected |= Self::JOB_OPERATIONS;
+        }
+        if self.categories & ReceiptCategory::Agent.bit() != 0 {
+            selected |= Self::AGENT_OPERATIONS;
+        }
+        selected & !self.exclude
+    }
+}
+impl Default for ReceiptScope {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+const fn operation_category(operation: OperationId) -> ReceiptCategory {
+    match operation {
+        OperationId::Fs(_) => ReceiptCategory::Filesystem,
+        OperationId::Bash | OperationId::Pwsh | OperationId::Powershell => ReceiptCategory::Process,
+        OperationId::Batch => ReceiptCategory::Batch,
+        OperationId::Agent => ReceiptCategory::Agent,
+        OperationId::JobsList
+        | OperationId::JobsGet
+        | OperationId::JobsRead
+        | OperationId::JobsAck
+        | OperationId::JobsSend
+        | OperationId::JobsCancel
+        | OperationId::JobsSubscribe => ReceiptCategory::Jobs,
+    }
+}
+
+const fn operation_bit(operation: OperationId) -> u64 {
+    let index = match operation {
+        OperationId::Fs(Tool::Ls) => 0,
+        OperationId::Fs(Tool::Find) => 1,
+        OperationId::Fs(Tool::Grep) => 2,
+        OperationId::Fs(Tool::Read) => 3,
+        OperationId::Fs(Tool::Write) => 4,
+        OperationId::Fs(Tool::Edit) => 5,
+        OperationId::Fs(Tool::Patch) => 6,
+        OperationId::Fs(Tool::Copy) => 7,
+        OperationId::Fs(Tool::Move) => 8,
+        OperationId::Fs(Tool::Remove) => 9,
+        OperationId::Fs(Tool::Bread) => 10,
+        OperationId::Fs(Tool::Bwrite) => 11,
+        OperationId::Fs(Tool::Bedit) => 12,
+        OperationId::Bash => 13,
+        OperationId::Pwsh => 14,
+        OperationId::Powershell => 15,
+        OperationId::Batch => 16,
+        OperationId::Agent => 17,
+        OperationId::JobsList => 18,
+        OperationId::JobsGet => 19,
+        OperationId::JobsRead => 20,
+        OperationId::JobsAck => 21,
+        OperationId::JobsSend => 22,
+        OperationId::JobsCancel => 23,
+        OperationId::JobsSubscribe => 24,
+    };
+    1u64 << index
+}
+const _: () = assert!(OperationId::MODEL_SURFACE_MAX <= 64);
+
+/// Optional model/result receipt metadata, never parsed out of raw payloads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReceiptProfile {
     pub unix_ts: bool,
     /// Host-selected advisory turn checkpoint; never a process/Job deadline.
     pub checkpoint_minutes: Option<u16>,
+    pub scope: ReceiptScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiptMetadata {
+    pub ts: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,6 +339,14 @@ fn expand_text(input: &str, schema: SchemaCaps, jobs: JobProfile) -> Result<Stri
         ),
         ("${jobs.get_tail_max}", jobs.get_tail_max.to_string()),
         ("${jobs.get_wait_max_ms}", jobs.get_wait_max_ms.to_string()),
+        (
+            "${jobs.read_page_default_bytes}",
+            jobs.read_page_default_bytes.to_string(),
+        ),
+        (
+            "${jobs.read_page_max_bytes}",
+            jobs.read_page_max_bytes.to_string(),
+        ),
         (
             "${jobs.read_wait_max_ms}",
             jobs.read_wait_max_ms.to_string(),
@@ -347,6 +509,9 @@ impl ToolsetBuilder {
         if self.jobs.get_tail_default > self.jobs.get_tail_max
             || self.jobs.get_tail_max > MAX_GET_TAIL_BYTES
             || self.jobs.get_wait_max_ms > MAX_JOB_WAIT_MS
+            || self.jobs.read_page_default_bytes == 0
+            || self.jobs.read_page_default_bytes > self.jobs.read_page_max_bytes
+            || self.jobs.read_page_max_bytes > MAX_JOB_READ_PAGE_BYTES
             || self.jobs.read_wait_max_ms > MAX_JOB_WAIT_MS
             || self.jobs.list_page_max == 0
             || self.jobs.list_page_max > MAX_JOB_LIST_PAGE
@@ -358,6 +523,7 @@ impl ToolsetBuilder {
             .checkpoint_minutes
             .is_some_and(|min| min == 0 || min > 240)
             || (self.receipts.checkpoint_minutes.is_some() && !self.receipts.unix_ts)
+            || (self.receipts.checkpoint_minutes.is_some() && self.receipts.scope.is_empty())
         {
             return Err(ToolsetError::Invalid(
                 "turn guidance requires a timestamped receipt",
@@ -443,6 +609,14 @@ impl Toolset {
         Ok(())
     }
 
+    fn append_receipt_description(&self, operation: OperationId, description: &mut String) {
+        if self.receipts.unix_ts && self.receipts.scope.contains(operation) {
+            description.push_str(
+                " Results include receipt ts (UTC Unix seconds) when the host supplies it.",
+            );
+        }
+    }
+
     #[cfg(feature = "rw")]
     pub fn parse_filesystem(
         &self,
@@ -470,6 +644,7 @@ impl Toolset {
                 &mut descriptor.parameters,
             )
             .expect("filesystem field overrides were validated at build");
+            self.append_receipt_description(OperationId::Fs(tool), &mut descriptor.description);
             descriptor
         })
     }
@@ -536,11 +711,18 @@ impl Toolset {
             OperationId::JobsRead => {
                 set_bound(
                     &mut parameters,
+                    "limit",
+                    self.jobs.read_page_max_bytes,
+                    Some(self.jobs.read_page_default_bytes),
+                );
+                set_bound(
+                    &mut parameters,
                     "wait_ms",
                     self.jobs.read_wait_max_ms as usize,
                     None,
                 );
-                format!("{host_description} Signed retained-byte offsets use -N for an immediate end snapshot; wait_ms=0 is nonblocking.")
+                format!("{host_description} Pages default to {} raw bytes (maximum {}); signed retained-byte offsets use -N for an immediate end snapshot; wait_ms=0 is nonblocking.",
+                    self.jobs.read_page_default_bytes, self.jobs.read_page_max_bytes)
             }
             OperationId::JobsList => {
                 set_bound(&mut parameters, "limit", self.jobs.list_page_max, None);
@@ -549,24 +731,6 @@ impl Toolset {
             }
             _ => host_description.to_owned(),
         };
-        let mut description = description;
-        if self.receipts.unix_ts
-            && matches!(
-                op,
-                OperationId::Bash
-                    | OperationId::Pwsh
-                    | OperationId::Powershell
-                    | OperationId::Batch
-                    | OperationId::JobsList
-                    | OperationId::JobsGet
-                    | OperationId::JobsAck
-                    | OperationId::JobsCancel
-            )
-        {
-            description.push_str(
-                " Compact receipts include ts (UTC Unix seconds) when the host supplies it.",
-            );
-        }
         let mut descriptor = Descriptor {
             name: op.model_name(),
             title: operation_title(op).to_owned(),
@@ -597,31 +761,40 @@ impl Toolset {
         if descriptor.description.trim().is_empty() {
             return Err(ToolsetError::Invalid("tool description is empty"));
         }
+        self.append_receipt_description(op, &mut descriptor.description);
         Ok(descriptor)
     }
     /// Host can pass these instructions to its model. No timer is scheduled.
     pub fn model_instructions(&self) -> Option<String> {
         let minutes = self.receipts.checkpoint_minutes?;
         Some(format!(
-            "Compact shell/Job receipts include ts=UTC Unix seconds. Use the first ts in a user turn as its anchor; aim to checkpoint after about {minutes} minutes at a coherent boundary, recording what is done and pending. This is advisory, not an execution timeout."
+            "Selected tool receipts include ts=UTC Unix seconds. Use the first ts in a user turn as its anchor; aim to checkpoint after about {minutes} minutes at a coherent boundary, recording what is done and pending. This is advisory, not an execution timeout."
         ))
+    }
+    pub fn receipt_metadata(
+        &self,
+        operation: OperationId,
+        now_unix: Option<u64>,
+    ) -> Result<Option<ReceiptMetadata>, ToolsetError> {
+        if !self.receipts.unix_ts || !self.receipts.scope.contains(operation) {
+            return Ok(None);
+        }
+        Ok(Some(ReceiptMetadata {
+            ts: now_unix.ok_or(ToolsetError::MissingTimestamp)?,
+        }))
     }
     /// Render a *typed* factual receipt, never arbitrary raw tool output.
     /// The host supplies UTC epoch seconds; the factory has no clock.
     pub fn render_receipt(
         &self,
+        operation: OperationId,
         receipt: crate::receipt::Receipt<'_>,
         now_unix: Option<u64>,
         budget: usize,
     ) -> Result<String, ToolsetError> {
-        let footer = if self.receipts.unix_ts {
-            Some(format!(
-                "ts={}",
-                now_unix.ok_or(ToolsetError::MissingTimestamp)?
-            ))
-        } else {
-            None
-        };
+        let footer = self
+            .receipt_metadata(operation, now_unix)?
+            .map(|metadata| format!("ts={}", metadata.ts));
         let reserved = footer.as_ref().map_or(0, |value| value.len() + 1);
         let body_budget = budget
             .checked_sub(reserved)
@@ -813,6 +986,25 @@ mod tests {
         assert_eq!(get.parameters["properties"]["tail"]["default"], 256);
         assert_eq!(get.parameters["properties"]["tail"]["maximum"], 800);
         assert!(get.description.contains("256 raw bytes combined"));
+        let read = compact
+            .describe_operation(
+                OperationId::JobsRead,
+                json!({"type":"object","properties":{
+                    "limit":{"type":["integer","null"],"minimum":1},
+                    "wait_ms":{"type":["integer","null"],"minimum":0}
+                }}),
+                "Read retained output.",
+            )
+            .unwrap();
+        assert_eq!(
+            read.parameters["properties"]["limit"]["default"],
+            256 * 1024
+        );
+        assert_eq!(
+            read.parameters["properties"]["limit"]["maximum"],
+            256 * 1024
+        );
+        assert!(read.description.contains("262144 raw bytes"));
         let list = compact
             .describe_operation(
                 OperationId::JobsList,
@@ -1136,17 +1328,127 @@ mod tests {
             .build()
             .is_err());
         assert!(Toolset::builder()
+            .jobs(JobProfile {
+                read_page_default_bytes: 2,
+                read_page_max_bytes: 1,
+                ..Default::default()
+            })
+            .build()
+            .is_err());
+        assert!(Toolset::builder()
+            .jobs(JobProfile {
+                read_page_max_bytes: MAX_JOB_READ_PAGE_BYTES + 1,
+                ..Default::default()
+            })
+            .build()
+            .is_err());
+        assert!(Toolset::builder()
             .only([Tool::Grep, Tool::Grep])
             .build()
             .is_err());
         assert!(Toolset::builder()
             .receipts(ReceiptProfile {
                 unix_ts: false,
-                checkpoint_minutes: Some(35)
+                checkpoint_minutes: Some(35),
+                ..Default::default()
             })
             .build()
             .is_err());
         assert!(Toolset::builder().only([]).build().is_ok());
+    }
+
+    #[test]
+    fn receipt_scope_is_category_first_then_include_then_exclude() {
+        let scope = ReceiptScope::none()
+            .with_category(ReceiptCategory::Jobs)
+            .include(OperationId::Fs(Tool::Read))
+            .exclude(OperationId::JobsRead);
+        assert!(scope.contains(OperationId::JobsGet));
+        assert!(scope.contains(OperationId::Fs(Tool::Read)));
+        assert!(!scope.contains(OperationId::JobsRead));
+        assert!(!scope.contains(OperationId::Bash));
+
+        let tools = Toolset::builder()
+            .receipts(ReceiptProfile {
+                unix_ts: true,
+                checkpoint_minutes: Some(30),
+                scope,
+            })
+            .build()
+            .unwrap();
+        assert_eq!(
+            tools
+                .receipt_metadata(OperationId::JobsGet, Some(77))
+                .unwrap(),
+            Some(ReceiptMetadata { ts: 77 })
+        );
+        assert_eq!(
+            tools.receipt_metadata(OperationId::JobsRead, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            tools
+                .receipt_metadata(OperationId::Fs(Tool::Read), Some(91))
+                .unwrap(),
+            Some(ReceiptMetadata { ts: 91 })
+        );
+        assert_eq!(
+            tools.receipt_metadata(OperationId::Bash, None).unwrap(),
+            None
+        );
+        assert!(tools
+            .filesystem_descriptor(Tool::Read)
+            .unwrap()
+            .description
+            .contains("receipt ts"));
+        let get = tools
+            .describe_operation(
+                OperationId::JobsGet,
+                json!({"type":"object","properties":{
+                    "tail":{"type":"integer"},"wait_ms":{"type":"integer"}
+                }}),
+                "Inspect Job.",
+            )
+            .unwrap();
+        assert!(get.description.contains("receipt ts"));
+        let read = tools
+            .describe_operation(
+                OperationId::JobsRead,
+                json!({"type":"object","properties":{
+                    "limit":{"type":"integer"},"wait_ms":{"type":"integer"}
+                }}),
+                "Read Job output.",
+            )
+            .unwrap();
+        assert!(!read.description.contains("receipt ts"));
+        assert!(tools.model_instructions().unwrap().contains("30 minutes"));
+
+        assert!(Toolset::builder()
+            .receipts(ReceiptProfile {
+                unix_ts: true,
+                checkpoint_minutes: Some(30),
+                scope: ReceiptScope::none(),
+            })
+            .build()
+            .is_err());
+        let no_jobs = ReceiptScope::none()
+            .with_category(ReceiptCategory::Jobs)
+            .exclude(OperationId::JobsList)
+            .exclude(OperationId::JobsGet)
+            .exclude(OperationId::JobsRead)
+            .exclude(OperationId::JobsAck)
+            .exclude(OperationId::JobsSend)
+            .exclude(OperationId::JobsCancel)
+            .exclude(OperationId::JobsSubscribe);
+        assert!(no_jobs.is_empty());
+        assert!(Toolset::builder()
+            .receipts(ReceiptProfile {
+                unix_ts: true,
+                checkpoint_minutes: Some(30),
+                scope: no_jobs,
+            })
+            .build()
+            .is_err());
     }
 
     #[test]
@@ -1214,24 +1516,37 @@ mod tests {
             .receipts(ReceiptProfile {
                 unix_ts: true,
                 checkpoint_minutes: Some(35),
+                ..Default::default()
             })
             .build()
             .unwrap();
         let expected = format!("{base}\nts=1794737000");
         assert_eq!(
             tools
-                .render_receipt(receipt, Some(1_794_737_000), expected.len())
+                .render_receipt(
+                    OperationId::JobsGet,
+                    receipt,
+                    Some(1_794_737_000),
+                    expected.len(),
+                )
                 .unwrap(),
             expected
         );
         assert_eq!(
-            tools.render_receipt(receipt, Some(1_794_737_000), expected.len() - 1),
+            tools.render_receipt(
+                OperationId::JobsGet,
+                receipt,
+                Some(1_794_737_000),
+                expected.len() - 1,
+            ),
             Err(ToolsetError::ResultLimit),
         );
         // A plain consumer remains byte-for-byte identical and requires no clock.
         let plain = Toolset::builder().build().unwrap();
         assert_eq!(
-            plain.render_receipt(receipt, None, base.len()).unwrap(),
+            plain
+                .render_receipt(OperationId::JobsGet, receipt, None, base.len())
+                .unwrap(),
             base
         );
     }
@@ -1242,6 +1557,7 @@ mod tests {
             .receipts(ReceiptProfile {
                 unix_ts: true,
                 checkpoint_minutes: Some(35),
+                ..Default::default()
             })
             .build()
             .unwrap();
@@ -1255,21 +1571,23 @@ mod tests {
         let body = "j:4 ok ack=all released=false";
         assert_eq!(
             tools
-                .render_receipt(receipt, Some(1_794_720_000), 128)
+                .render_receipt(OperationId::JobsAck, receipt, Some(1_794_720_000), 128)
                 .unwrap(),
             format!("{body}\nts=1794720000")
         );
         assert_eq!(
-            tools.render_receipt(receipt, None, 128),
+            tools.render_receipt(OperationId::JobsAck, receipt, None, 128),
             Err(ToolsetError::MissingTimestamp)
         );
         assert_eq!(
-            tools.render_receipt(receipt, Some(15), 10),
+            tools.render_receipt(OperationId::JobsAck, receipt, Some(15), 10),
             Err(ToolsetError::ResultLimit)
         );
         let plain = Toolset::builder().build().unwrap();
         assert_eq!(
-            plain.render_receipt(receipt, None, body.len()).unwrap(),
+            plain
+                .render_receipt(OperationId::JobsAck, receipt, None, body.len())
+                .unwrap(),
             body
         );
         assert_eq!(plain.model_instructions(), None);
