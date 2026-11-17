@@ -1166,6 +1166,7 @@ mod tests {
             label: "bash".into(),
             lifecycle: Lifecycle::Terminal,
             stop_reason: None,
+            journal_unknown: false,
             sequence: 5,
             finished: 1,
             total: 1,

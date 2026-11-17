@@ -685,9 +685,11 @@ impl JobRuntime {
             if let Some(scope) = ownership_scope.as_ref() {
                 match host_for_task.manager().runtime_snapshot(&runner_id) {
                     Ok(snapshot)
-                        if snapshot.summary.is_some_and(|(primary, _, incomplete)| {
-                            primary == aw_tools::filesystem::status::Primary::Unknown || incomplete
-                        }) =>
+                        if snapshot.journal_unknown
+                            || snapshot.summary.is_some_and(|(primary, _, incomplete)| {
+                                primary == aw_tools::filesystem::status::Primary::Unknown
+                                    || incomplete
+                            }) =>
                     {
                         scope.mark_unresolved();
                     }

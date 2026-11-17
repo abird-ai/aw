@@ -4,6 +4,8 @@ Author: Prasanna Loganathar
 Co-authors: ChatGPT GPT-6
 Owner: @pvl
 
+**Current cross-repository context:** [AW–dotlink full comprehensive handoff (2026-11-17)](../../docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md). Includes the historical initial designs, complete implementation checkpoint index, exact Git/pin state, unresolved gates and next-agent prompt. Source and current plan TODO outrank dated handoff prose.
+
 Implement the approved DL-150 model-first output workflow in canonical shared AW tools, **before** adapting dotlink. One `jobs_*` interface, existing Agent/ToolPolicy/TurnJournal and JobManager; no new execution, ownership or policy engine.
 
 - **Design:** [DESIGN.md](DESIGN.md), approved 2026-11-15 decision superseding *only* conflicting get/read/ack and grep limits in the earlier [unified Jobs design](../ai-native-unified-jobs-agent-runtime-2026-11-11/DESIGN.md).

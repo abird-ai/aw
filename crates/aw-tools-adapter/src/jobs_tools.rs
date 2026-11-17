@@ -498,6 +498,9 @@ impl JobsTool {
                 aw_tools::filesystem::job_manager::Error::Busy => {
                     Error::Conflict("Graph result is not terminal")
                 }
+                aw_tools::filesystem::job_manager::Error::ReplayUnknown => Error::Conflict(
+                    "Graph result journal outcome unknown; reconcile before reading aggregate output",
+                ),
                 _ => Error::Protocol("Graph result projection failed"),
             })?
             .ok_or(Error::Limit(
@@ -521,36 +524,131 @@ impl JobsTool {
         Ok(Self::render_output_page(&page, offset, encoding, budget)?.0)
     }
 
+    /// Finite Job waits are settle-or-deadline, never revision-triggered.
+    /// Subscribe before reading; the watch generation is an invalidation
+    /// signal only. The JobManager remains the source of truth.
     async fn conditional_snapshot(
         host: &crate::job_host::JobHost,
         id: &str,
-        observed: Option<u64>,
+        node: Option<usize>,
+        _observed: Option<u64>,
         wait_ms: u64,
+        cancellation: &aw_agent_core::CancellationToken,
     ) -> Result<Snapshot> {
-        let mut snapshot = host
-            .manager()
-            .get(id)
-            .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
-        let baseline = observed.unwrap_or(snapshot.sequence);
-        if snapshot.sequence != baseline || wait_ms == 0 {
-            return Ok(snapshot);
+        let manager = host.manager();
+        if wait_ms == 0 {
+            return manager
+                .get(id)
+                .map_err(|_| Error::Denied("Job is not exposed or missing"));
         }
-        let started = std::time::Instant::now();
-        let wait = Duration::from_millis(wait_ms);
-        while started.elapsed() < wait {
-            tokio::time::sleep(
-                Duration::from_millis(10).min(wait.saturating_sub(started.elapsed())),
-            )
-            .await;
-            snapshot = host
-                .manager()
+        let mut changes = manager
+            .subscribe_changes(id)
+            .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            let _ = *changes.borrow_and_update();
+            let snapshot = manager
                 .get(id)
                 .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
-            if snapshot.sequence != baseline {
-                break;
+            let settled = if let Some(node) = node {
+                match manager.node_state(id, node) {
+                    Ok(aw_tools::filesystem::job::NodeState::Terminal { .. }) => true,
+                    Ok(_) => false,
+                    Err(_) => return Err(Error::Denied("Job node is unavailable")),
+                }
+            } else {
+                snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal
+            };
+            // A journal-unknown Job cannot publish trustworthy new lifecycle
+            // transitions until its original host reconciles the journal.
+            // End observation promptly, without claiming execution terminality.
+            if settled || snapshot.journal_unknown || tokio::time::Instant::now() >= deadline {
+                return Ok(snapshot);
+            }
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return Err(Error::Protocol("Job notification source closed"));
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return manager.get(id).map_err(|_| Error::Denied(
+                        "Job is not exposed or missing"
+                    ));
+                }
+                _ = cancellation.cancelled() => return Err(Error::Cancelled),
             }
         }
-        Ok(snapshot)
+    }
+
+    /// Byte-aware finite-stream observation. A revision alone never completes
+    /// this wait. Subscribe before inspecting retained bytes so publication
+    /// between the check and await is observed without polling.
+    async fn wait_for_output(
+        host: &crate::job_host::JobHost,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        offset: u64,
+        wait_ms: u64,
+        cancellation: &aw_agent_core::CancellationToken,
+    ) -> Result<()> {
+        if wait_ms == 0 {
+            return Ok(());
+        }
+        let manager = host.manager();
+        let mut changes = manager
+            .subscribe_changes(id)
+            .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            let _ = *changes.borrow_and_update();
+            match manager.output_summary(id, coordinate, stream) {
+                Ok((summary, finished)) => {
+                    if summary.retained_bytes > offset || finished || summary.truncated {
+                        return Ok(());
+                    }
+                }
+                Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
+                    // The Process node may not have attached its spool yet.
+                }
+                Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {
+                    return Ok(());
+                }
+                Err(_) => return Err(Error::Denied("Job output view is unavailable")),
+            }
+            // A Graph node may settle skipped/failed without ever attaching
+            // an output stream. Do not keep its reader waiting for siblings.
+            match manager.node_state(id, coordinate) {
+                Ok(aw_tools::filesystem::job::NodeState::Terminal { .. }) => return Ok(()),
+                Ok(_) => {}
+                Err(_) => return Err(Error::Denied("Job node is unavailable")),
+            }
+            let snapshot = manager
+                .get(id)
+                .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
+            // When no requested bytes are ready, do not wait until the caller
+            // deadline on a journal-fenced stream; do not fabricate EOF.
+            if snapshot.journal_unknown {
+                return Err(Error::Conflict(
+                    "Job journal outcome unknown; reconcile before waiting for output",
+                ));
+            }
+            if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Ok(());
+            }
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return Err(Error::Protocol("Job output notification source closed"));
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Ok(()),
+                _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            }
+        }
     }
 
     fn read_position(arguments: &Value) -> OutputPosition {
@@ -852,7 +950,7 @@ impl Tool for JobsTool {
                     })
                 {
                     return Err(Error::Denied(
-                        "jobs_get tail must be 0..1024 combined bytes",
+                        "jobs_get tail exceeds configured combined-byte ceiling",
                     ));
                 }
                 if let Some(wait) = arguments.get("wait_ms").filter(|value| !value.is_null()) {
@@ -860,7 +958,9 @@ impl Tool for JobsTool {
                         .as_u64()
                         .is_none_or(|value| value > self.runtime.job_profile().get_wait_max_ms)
                     {
-                        return Err(Error::Denied("wait_ms exceeds 30 seconds"));
+                        return Err(Error::Denied(
+                            "jobs_get wait_ms exceeds configured Job wait ceiling",
+                        ));
                     }
                 }
             }
@@ -896,7 +996,9 @@ impl Tool for JobsTool {
                             .is_none_or(|value| value > self.runtime.job_profile().read_wait_max_ms)
                     })
                 {
-                    return Err(Error::Denied("wait_ms exceeds 30 seconds"));
+                    return Err(Error::Denied(
+                        "jobs_read wait_ms exceeds configured Job wait ceiling",
+                    ));
                 }
                 if arguments
                     .get("offset")
@@ -1129,8 +1231,15 @@ impl Tool for JobsTool {
                         .manager()
                         .finite_kind(&id)
                         .map_err(|_| Error::Denied("Job kind unavailable"))?;
-                    let snapshot =
-                        Self::conditional_snapshot(&host, &id, revision, wait_ms).await?;
+                    let snapshot = Self::conditional_snapshot(
+                        &host,
+                        &id,
+                        node,
+                        revision,
+                        wait_ms,
+                        &ctx.cancellation,
+                    )
+                    .await?;
                     let reference = host.execution_ref(&id, node)?.canonical();
                     let content = if let Some(node) = node {
                         let plans = host
@@ -1152,6 +1261,7 @@ impl Tool for JobsTool {
                                 tool: kind,
                                 revision: snapshot.sequence,
                                 state,
+                                journal_unknown: snapshot.journal_unknown,
                                 terminal: if matches!(
                                     state,
                                     aw_tools::filesystem::job::NodeState::Terminal { .. }
@@ -1246,13 +1356,17 @@ impl Tool for JobsTool {
                     }
                     if filter.is_some()
                         || cursor.is_some()
-                        || wait_ms != 0
                         || view.as_deref().is_some_and(|view| {
                             matches!(view, "messages" | "tool_calls" | "tool_outputs" | "trace")
                         })
                     {
                         return Err(Error::Denied(
                             "Agent history fields are invalid for finite Job output",
+                        ));
+                    }
+                    if wait_ms != 0 && matches!(position, OutputPosition::Tail(_)) {
+                        return Err(Error::Denied(
+                            "negative-offset jobs_read is an immediate tail snapshot",
                         ));
                     }
                     let (id, node) = host.resolve_job_ref(&reference)?;
@@ -1279,6 +1393,17 @@ impl Tool for JobsTool {
                                 "Graph root exposes only the result view; use n:<coordinate> for streams",
                             ));
                         }
+                        if wait_ms != 0 {
+                            let _ = Self::conditional_snapshot(
+                                &host,
+                                &id,
+                                None,
+                                None,
+                                wait_ms,
+                                &ctx.cancellation,
+                            )
+                            .await?;
+                        }
                         Self::graph_result_page(
                             host.manager(),
                             &id,
@@ -1290,6 +1415,25 @@ impl Tool for JobsTool {
                     } else {
                         let (coordinate, stream) =
                             Self::stream_for(host.manager(), &id, kind, node, view)?;
+                        if let OutputPosition::Absolute(offset) = position {
+                            Self::wait_for_output(
+                                &host,
+                                &id,
+                                coordinate,
+                                stream,
+                                offset,
+                                wait_ms,
+                                &ctx.cancellation,
+                            )
+                            .await?;
+                        }
+                        if !self.runtime.payload_read_authorized(&ctx)
+                            || !host.payload_authorized(&ctx.actor, &id)
+                        {
+                            return Err(Error::Denied(
+                                "Job payload authority revoked while waiting",
+                            ));
+                        }
                         let owner = host
                             .manager()
                             .job_output_owner(&id)

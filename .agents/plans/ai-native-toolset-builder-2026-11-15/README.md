@@ -4,6 +4,8 @@ Author: Prasanna Loganathar
 Co-authors: ChatGPT GPT-6
 Owner: @pvl
 
+**Current cross-repository context:** [AW–dotlink full comprehensive handoff (2026-11-17)](../../docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md). Includes the historical initial designs, complete implementation checkpoint index, exact Git/pin state, unresolved gates and next-agent prompt. Source and current plan TODO outrank dated handoff prose.
+
 Establish the **reusable, configurable tool catalog and presentation contract** in canonical `aw-tools` before deciding AW/dotlink-specific variants of edit, grep, status receipts, transports or defaults.
 
 - [Design](DESIGN.md) is normative for this new builder/factory layer.

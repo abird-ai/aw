@@ -28,6 +28,8 @@ use std::{
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
 };
+#[cfg(feature = "async")]
+use tokio::sync::watch;
 
 pub const DEFAULT_MAX_RETAINED_JOBS: usize = 256;
 pub const DEFAULT_MAX_EXPOSED_JOBS: usize = DEFAULT_MAX_RETAINED_JOBS;
@@ -497,8 +499,17 @@ struct OwnedOutput {
     owners: BTreeMap<OutputOwner, OwnerAck>,
     writer_finished: bool,
     released: bool,
+    #[cfg(feature = "async")]
+    change: Option<watch::Sender<u64>>,
 }
 impl OwnedOutput {
+    #[cfg(feature = "async")]
+    fn signal(&self) {
+        if let Some(change) = &self.change {
+            change.send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
     fn owners(
         owners: impl IntoIterator<Item = OutputOwner>,
     ) -> Result<BTreeMap<OutputOwner, OwnerAck>, Error> {
@@ -531,6 +542,8 @@ impl OwnedOutput {
             owners: owner_set,
             writer_finished: false,
             released: false,
+            #[cfg(feature = "async")]
+            change: None,
         })
     }
 
@@ -550,6 +563,8 @@ impl OwnedOutput {
             owners: owner_set,
             writer_finished: false,
             released: false,
+            #[cfg(feature = "async")]
+            change: None,
         })
     }
 
@@ -569,6 +584,8 @@ impl OwnedOutput {
             owners: owner_set,
             writer_finished: false,
             released: false,
+            #[cfg(feature = "async")]
+            change: None,
         })
     }
 
@@ -586,6 +603,8 @@ impl OwnedOutput {
         }
         self.writer_finished = true;
         let release_result = self.maybe_release();
+        #[cfg(feature = "async")]
+        self.signal();
         spool_result?;
         let _ = release_result?;
         Ok(())
@@ -672,6 +691,22 @@ impl OwnedOutput {
         })
     }
 
+    /// Released output retains logical ACK history, not an open grant.
+    /// A replay may repeat only this exact owner's previously ACKed prefix.
+    fn released_ack(&self, owner: OutputOwner, through: u64) -> Result<Option<OutputAck>, Error> {
+        if !self.released {
+            return Ok(None);
+        }
+        let ack = self.owners.get(&owner).ok_or(Error::InvalidOutput)?;
+        if !ack.acknowledged || through > ack.through {
+            return Err(Error::InvalidOutput);
+        }
+        Ok(Some(OutputAck {
+            changed: false,
+            released: true,
+        }))
+    }
+
     fn maybe_release(&mut self) -> Result<bool, Error> {
         if self.released || !self.writer_finished {
             return Ok(false);
@@ -686,6 +721,8 @@ impl OwnedOutput {
         }
         self.spool.compact_retained(0)?;
         self.released = true;
+        #[cfg(feature = "async")]
+        self.signal();
         Ok(true)
     }
 }
@@ -705,11 +742,17 @@ pub struct OutputWriter {
 }
 impl OutputWriter {
     pub fn discard_if_full(&self, seen: u64) -> Result<bool, Error> {
-        self.output
-            .lock()
-            .map_err(|_| Error::Poisoned)?
-            .spool
-            .discard_if_full(seen)
+        let mut output = self.output.lock().map_err(|_| Error::Poisoned)?;
+        #[cfg(feature = "async")]
+        let was_truncated = output.spool.summary().truncated;
+        let discarded = output.spool.discard_if_full(seen)?;
+        #[cfg(feature = "async")]
+        if !was_truncated && output.spool.summary().truncated {
+            // Only the first truncation changes read readiness. Later
+            // discarded chunks update totals without waking every waiter.
+            output.signal();
+        }
+        Ok(discarded)
     }
 
     pub fn append(&self, bytes: &[u8]) -> Result<usize, Error> {
@@ -717,23 +760,38 @@ impl OutputWriter {
         if output.writer_finished || output.released {
             return Err(Error::InvalidOutput);
         }
-        output.spool.append(bytes)
+        #[cfg(feature = "async")]
+        let was_truncated = output.spool.summary().truncated;
+        let result = output.spool.append(bytes);
+        #[cfg(feature = "async")]
+        if result.is_err()
+            || result.as_ref().is_ok_and(|written| *written != 0)
+            || (!was_truncated && output.spool.summary().truncated)
+        {
+            // A failed write may publish a new failure state without bytes.
+            // Later dropped chunks update totals without waking every reader.
+            output.signal();
+        }
+        result
     }
 
     pub fn observe_after_failure(&self, seen: u64) -> Result<(), Error> {
-        self.output
-            .lock()
-            .map_err(|_| Error::Poisoned)?
-            .spool
-            .observe_after_failure(seen)
+        let mut output = self.output.lock().map_err(|_| Error::Poisoned)?;
+        #[cfg(feature = "async")]
+        let was_truncated = output.spool.summary().truncated;
+        output.spool.observe_after_failure(seen)?;
+        #[cfg(feature = "async")]
+        if !was_truncated && output.spool.summary().truncated {
+            output.signal();
+        }
+        Ok(())
     }
 
     pub fn mark_failed(&self) -> Result<(), Error> {
-        self.output
-            .lock()
-            .map_err(|_| Error::Poisoned)?
-            .spool
-            .mark_writer_failed();
+        let mut output = self.output.lock().map_err(|_| Error::Poisoned)?;
+        output.spool.mark_writer_failed();
+        #[cfg(feature = "async")]
+        output.signal();
         Ok(())
     }
 
@@ -763,6 +821,9 @@ pub struct Snapshot {
     pub label: String,
     pub lifecycle: Lifecycle,
     pub stop_reason: Option<StopReason>,
+    /// An unreconciled host-journal transition makes the Job outcome unknown
+    /// without claiming the underlying Process or Graph has settled.
+    pub journal_unknown: bool,
     pub sequence: u64,
     pub finished: usize,
     pub total: usize,
@@ -771,10 +832,17 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn is_known_terminal(&self) -> bool {
+        self.lifecycle == Lifecycle::Terminal && !self.journal_unknown
+    }
+
     /// Canonical user-facing Job status. Terminal uncertainty dominates a
     /// cancellation/revocation request because intent is not proof that an
     /// already-launched external effect stopped.
     pub fn status_label(&self) -> &'static str {
+        if self.journal_unknown {
+            return "unknown";
+        }
         match self.lifecycle {
             Lifecycle::Running => "running",
             Lifecycle::Cancelling => "cancelling",
@@ -899,12 +967,21 @@ struct ManagedJob {
     outputs: BTreeMap<(usize, OutputStream), Arc<Mutex<OwnedOutput>>>,
     process_terminals: BTreeMap<usize, ProcessTerminal>,
     task_binding: Option<TaskIdentity>,
+    #[cfg(feature = "async")]
+    change: watch::Sender<u64>,
 }
 
 impl ManagedJob {
+    #[cfg(feature = "async")]
+    fn signal(&self) {
+        self.change
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
     fn retention_releasable(&self) -> bool {
         if !self.visibility.is_exposed()
             || self.job.lifecycle() != Lifecycle::Terminal
+            || self.job.journal_ambiguous()
             || self.transition_inflight.is_some()
         {
             return false;
@@ -1056,6 +1133,9 @@ impl JobManager {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         if let Some(source_id) = protected {
             let source = state.jobs.get(source_id).ok_or(Error::NotFound)?;
+            if source.job.journal_ambiguous() {
+                return Err(Error::ReplayUnknown);
+            }
             if source.job.lifecycle() != Lifecycle::Terminal || source.transition_inflight.is_some()
             {
                 return Err(Error::RestartNotTerminal);
@@ -1094,6 +1174,8 @@ impl JobManager {
                 outputs: BTreeMap::new(),
                 process_terminals: BTreeMap::new(),
                 task_binding,
+                #[cfg(feature = "async")]
+                change: watch::channel(0u64).0,
             },
         );
         state.active_nodes += restored_active;
@@ -1188,6 +1270,8 @@ impl JobManager {
                 outputs: BTreeMap::new(),
                 process_terminals: BTreeMap::new(),
                 task_binding: Some(admission.task.clone()),
+                #[cfg(feature = "async")]
+                change: watch::channel(0u64).0,
             },
         );
         state.active_nodes += restored_active;
@@ -1460,6 +1544,7 @@ impl JobManager {
             label,
             lifecycle: managed.job.lifecycle(),
             stop_reason: managed.job.stop_reason(),
+            journal_unknown: managed.job.journal_ambiguous(),
             sequence: managed.revision,
             finished: managed.job.finished(),
             total: managed.job.total(),
@@ -1640,6 +1725,20 @@ impl JobManager {
         Ok(rendered)
     }
 
+    /// One bounded notification stream per Job, shared by state transitions,
+    /// retained output arrival/EOF and late stream attachment. Subscribe before
+    /// reading state; the host then rechecks authoritative Job/output facts
+    /// after every notification. Works across stdout/stderr and all Graph nodes.
+    #[cfg(feature = "async")]
+    pub fn subscribe_changes(&self, id: &str) -> Result<watch::Receiver<u64>, Error> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+        if !managed.visibility.is_exposed() {
+            return Err(Error::NotExposed);
+        }
+        Ok(managed.change.subscribe())
+    }
+
     pub fn get(&self, id: &str) -> Result<Snapshot, Error> {
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
@@ -1659,10 +1758,11 @@ impl JobManager {
 
     pub fn has_nonterminal_jobs(&self) -> Result<bool, Error> {
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;
-        Ok(state
-            .jobs
-            .values()
-            .any(|managed| managed.job.lifecycle() != Lifecycle::Terminal))
+        Ok(state.jobs.values().any(|managed| {
+            managed.job.lifecycle() != Lifecycle::Terminal
+                || managed.job.journal_ambiguous()
+                || managed.transition_inflight.is_some()
+        }))
     }
 
     /// Host-authorized retention expiry. This is intentionally clock-free:
@@ -1674,6 +1774,7 @@ impl JobManager {
         let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
         if managed.job.lifecycle() != Lifecycle::Terminal
+            || managed.job.journal_ambiguous()
             || managed.transition_inflight.is_some()
             || managed
                 .outputs
@@ -1700,6 +1801,7 @@ impl JobManager {
             let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
             !managed.visibility.is_exposed()
                 && managed.job.lifecycle() == Lifecycle::Running
+                && !managed.job.journal_ambiguous()
                 && managed.job.active() == 0
                 && managed.job.finished() == 0
                 && managed.transition_inflight.is_none()
@@ -1726,6 +1828,8 @@ impl JobManager {
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
         if managed.visibility != Visibility::Hidden
             || managed.job.lifecycle() != Lifecycle::Terminal
+            || managed.job.journal_ambiguous()
+            || managed.transition_inflight.is_some()
         {
             return Err(Error::Busy);
         }
@@ -1913,6 +2017,8 @@ impl JobManager {
             if let Some(managed) = state.jobs.get_mut(id) {
                 managed.job.fence_journal_unknown();
                 managed.transition_inflight = None;
+                #[cfg(feature = "async")]
+                managed.signal();
             }
             return Err(Error::Job(JobError::JournalUnknown));
         }
@@ -1931,14 +2037,14 @@ impl JobManager {
                     result
                 };
                 if applied.is_err() {
-                    state
-                        .jobs
-                        .get_mut(id)
-                        .expect("checked manager entry")
-                        .job
-                        .fence_journal_unknown();
+                    let managed = state.jobs.get_mut(id).expect("checked manager entry");
+                    managed.job.fence_journal_unknown();
+                    #[cfg(feature = "async")]
+                    managed.signal();
                     return Err(Error::Job(JobError::JournalUnknown));
                 }
+                #[cfg(feature = "async")]
+                state.jobs.get(id).expect("checked manager entry").signal();
                 if release_permit_on_commit {
                     state.active_nodes = state.active_nodes.saturating_sub(1);
                 }
@@ -1959,6 +2065,8 @@ impl JobManager {
                 let managed = state.jobs.get_mut(id).expect("checked manager entry");
                 managed.transition_inflight = None;
                 managed.job.fence_journal_unknown();
+                #[cfg(feature = "async")]
+                managed.signal();
                 // A possibly committed Claim continues consuming its reserved
                 // global slot; a possibly committed terminal does not release a
                 // slot until authoritative reconstruction proves it terminal.
@@ -1990,7 +2098,7 @@ impl JobManager {
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;
         let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
         let mut hash = Sha256::new();
-        hash.update(b"aw-tools-consumer-output-owner-v1 ");
+        hash.update(b"aw-tools-consumer-output-owner-v1\0");
         hash.update(managed.job.binding());
         hash.update(scope);
         OutputOwner::new(hash.finalize().into())
@@ -2321,6 +2429,35 @@ impl JobManager {
             .ok_or(Error::OutputMissing)
     }
 
+    /// Journal fencing and destructive output changes share the same lock.
+    /// Retained output readers/writers never take the manager lock while
+    /// holding an output lock; preserve manager -> output lock order.
+    fn with_known_output_mutation<T>(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: OutputStream,
+        commit: impl FnOnce(&mut OwnedOutput) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+        if managed.job.journal_ambiguous() {
+            return Err(Error::ReplayUnknown);
+        }
+        if managed.transition_inflight.is_some() {
+            return Err(Error::Busy);
+        }
+        if !(1..=managed.job.total()).contains(&coordinate) {
+            return Err(Error::InvalidOutput);
+        }
+        let handle = managed
+            .outputs
+            .get(&(coordinate, stream))
+            .ok_or(Error::OutputMissing)?;
+        let mut output = handle.lock().map_err(|_| Error::Poisoned)?;
+        commit(&mut output)
+    }
+
     fn insert_outputs<const N: usize>(
         &self,
         id: &str,
@@ -2351,8 +2488,14 @@ impl JobManager {
             return Err(Error::InvalidOutput);
         }
         for (stream, output) in outputs {
+            #[cfg(feature = "async")]
+            {
+                output.lock().map_err(|_| Error::Poisoned)?.change = Some(managed.change.clone());
+            }
             managed.outputs.insert((coordinate, stream), output);
         }
+        #[cfg(feature = "async")]
+        managed.signal();
         Ok(())
     }
 
@@ -2727,6 +2870,8 @@ impl JobManager {
         if observed_after_failure != 0 {
             output.spool.observe_after_failure(observed_after_failure)?;
         }
+        #[cfg(feature = "async")]
+        output.signal();
         Ok(())
     }
 
@@ -2784,29 +2929,29 @@ impl JobManager {
         owner: OutputOwner,
         keep: u64,
     ) -> Result<u64, Error> {
-        let output = self.output_handle(id, coordinate, stream)?;
-        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
-        if output.released {
-            return Err(Error::OutputReleased);
-        }
-        if !output.writer_finished {
-            return Err(Error::Busy);
-        }
-        let retained = output.spool.retained_bytes();
-        if keep > retained || !output.owners.contains_key(&owner) {
-            return Err(Error::InvalidOutput);
-        }
-        if output.owners.iter().any(|(candidate, ack)| {
-            *candidate != owner && (!ack.acknowledged || ack.through < retained)
-        }) {
-            return Err(Error::Busy);
-        }
-        output.spool.compact_retained(keep)?;
-        let _ = output.maybe_release()?;
-        Ok(if output.released {
-            0
-        } else {
-            output.spool.retained_bytes()
+        self.with_known_output_mutation(id, coordinate, stream, |output| {
+            if output.released {
+                return Err(Error::OutputReleased);
+            }
+            if !output.writer_finished {
+                return Err(Error::Busy);
+            }
+            let retained = output.spool.retained_bytes();
+            if keep > retained || !output.owners.contains_key(&owner) {
+                return Err(Error::InvalidOutput);
+            }
+            if output.owners.iter().any(|(candidate, ack)| {
+                *candidate != owner && (!ack.acknowledged || ack.through < retained)
+            }) {
+                return Err(Error::Busy);
+            }
+            output.spool.compact_retained(keep)?;
+            let _ = output.maybe_release()?;
+            Ok(if output.released {
+                0
+            } else {
+                output.spool.retained_bytes()
+            })
         })
     }
 
@@ -3019,7 +3164,17 @@ impl JobManager {
             .map(|(_, output)| Arc::clone(output))
             .collect::<Vec<_>>();
         if handles.is_empty() {
-            return Err(Error::OutputMissing);
+            // A settled Skip (or wholly output-free Graph) has nothing to
+            // release. Finish is idempotent for an unqualified output scope;
+            // an explicitly requested nonexistent stream remains invalid.
+            return if view.is_none() {
+                Ok(OutputAck {
+                    changed: false,
+                    released: true,
+                })
+            } else {
+                Err(Error::OutputMissing)
+            };
         }
         // Output handles are in stable node/stream order. The Job state lock
         // prevents a concurrent restart from swapping the output namespace
@@ -3072,34 +3227,31 @@ impl JobManager {
         owner: OutputOwner,
         through: u64,
     ) -> Result<OutputAck, Error> {
-        let output = self.output_handle(id, coordinate, stream)?;
-        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
-        if output.released {
-            return Ok(OutputAck {
-                changed: false,
-                released: true,
-            });
-        }
-        let retained = output.spool.retained_bytes();
-        if through > retained {
-            return Err(Error::InvalidOutput);
-        }
-        let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
-        if !current.delivered_once || through > current.delivered_through {
-            return Err(Error::InvalidOutput);
-        }
-        if current.acknowledged && through <= current.through {
-            return Ok(OutputAck {
-                changed: false,
-                released: false,
-            });
-        }
-        current.through = current.through.max(through);
-        current.acknowledged = true;
-        let released = output.maybe_release()?;
-        Ok(OutputAck {
-            changed: true,
-            released,
+        self.with_known_output_mutation(id, coordinate, stream, |output| {
+            if let Some(ack) = output.released_ack(owner, through)? {
+                return Ok(ack);
+            }
+            let retained = output.spool.retained_bytes();
+            if through > retained {
+                return Err(Error::InvalidOutput);
+            }
+            let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+            if !current.delivered_once || through > current.delivered_through {
+                return Err(Error::InvalidOutput);
+            }
+            if current.acknowledged && through <= current.through {
+                return Ok(OutputAck {
+                    changed: false,
+                    released: false,
+                });
+            }
+            current.through = current.through.max(through);
+            current.acknowledged = true;
+            let released = output.maybe_release()?;
+            Ok(OutputAck {
+                changed: true,
+                released,
+            })
         })
     }
 
@@ -3114,35 +3266,32 @@ impl JobManager {
         owner: OutputOwner,
         through: u64,
     ) -> Result<OutputAck, Error> {
-        let output = self.output_handle(id, coordinate, stream)?;
-        let mut output = output.lock().map_err(|_| Error::Poisoned)?;
-        if output.released {
-            return Ok(OutputAck {
-                changed: false,
-                released: true,
-            });
-        }
-        let retained = output.spool.retained_bytes();
-        let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
-        // Physical prefix compaction never rewrites an owner's logical ACK
-        // history. A lost response may therefore replay a watermark beyond the
-        // now-retained prefix, but only up to that exact owner's already-recorded
-        // high-water mark. New acknowledgements still cannot skip absent bytes.
-        if current.acknowledged && through <= current.through {
-            return Ok(OutputAck {
-                changed: false,
-                released: false,
-            });
-        }
-        if through > retained {
-            return Err(Error::InvalidOutput);
-        }
-        current.through = current.through.max(through);
-        current.acknowledged = true;
-        let released = output.maybe_release()?;
-        Ok(OutputAck {
-            changed: true,
-            released,
+        self.with_known_output_mutation(id, coordinate, stream, |output| {
+            if let Some(ack) = output.released_ack(owner, through)? {
+                return Ok(ack);
+            }
+            let retained = output.spool.retained_bytes();
+            let current = output.owners.get_mut(&owner).ok_or(Error::InvalidOutput)?;
+            // Physical prefix compaction never rewrites an owner's logical ACK
+            // history. A lost response may therefore replay a watermark beyond the
+            // now-retained prefix, but only up to that exact owner's already-recorded
+            // high-water mark. New acknowledgements still cannot skip absent bytes.
+            if current.acknowledged && through <= current.through {
+                return Ok(OutputAck {
+                    changed: false,
+                    released: false,
+                });
+            }
+            if through > retained {
+                return Err(Error::InvalidOutput);
+            }
+            current.through = current.through.max(through);
+            current.acknowledged = true;
+            let released = output.maybe_release()?;
+            Ok(OutputAck {
+                changed: true,
+                released,
+            })
         })
     }
 
@@ -3257,6 +3406,9 @@ impl JobManager {
         let (states, summary) = {
             let state = self.state.lock().map_err(|_| Error::Poisoned)?;
             let managed = state.jobs.get(id).ok_or(Error::NotFound)?;
+            if managed.job.journal_ambiguous() {
+                return Err(Error::ReplayUnknown);
+            }
             if managed.job.lifecycle() != Lifecycle::Terminal {
                 return Err(Error::Busy);
             }
@@ -4167,6 +4319,59 @@ mod tests {
         assert!(reentered.load(Ordering::SeqCst));
     }
 
+    #[cfg(feature = "async")]
+    #[test]
+    fn mismatched_journal_transition_wakes_observers_on_unknown_fence() {
+        let graph = graph();
+        let manager = manager(8);
+        manager
+            .admit_runtime(
+                graph.clone(),
+                plans(&graph),
+                RuntimeAdmission {
+                    id: "mismatched-watch",
+                    runtime_session: "session",
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width: 8,
+                    exposed: true,
+                },
+            )
+            .unwrap();
+        let mut watch = manager.subscribe_changes("mismatched-watch").unwrap();
+        watch.borrow_and_update();
+        assert_eq!(
+            manager.claim("mismatched-watch", 1, true, 2, |_, proposed| {
+                assert_eq!(proposed.action, Action::Claim);
+                // Simulates the defensive mismatch path when the in-flight
+                // proposal is no longer the one the journal callback returns.
+                manager
+                    .state
+                    .lock()
+                    .unwrap()
+                    .jobs
+                    .get_mut("mismatched-watch")
+                    .unwrap()
+                    .transition_inflight = None;
+                Ok(())
+            }),
+            Err(Error::Job(JobError::JournalUnknown))
+        );
+        assert!(manager
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .get("mismatched-watch")
+            .unwrap()
+            .job
+            .journal_ambiguous());
+        assert!(
+            watch.has_changed().unwrap(),
+            "a newly unknown journal must notify existing finite observers"
+        );
+    }
+
     #[test]
     fn unknown_claim_fences_job_and_keeps_global_permit_reserved() {
         let graph = graph();
@@ -4191,6 +4396,24 @@ mod tests {
         );
         assert_eq!(manager.active_nodes(), 1);
         assert!(manager.runnable("j").unwrap().is_empty());
+        let snapshot = manager.get("j").unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            Lifecycle::Running,
+            "journal ambiguity is not terminal"
+        );
+        assert_eq!(
+            snapshot.status_label(),
+            "unknown",
+            "an ambiguous journal cannot be presented as an ordinary running Job"
+        );
+        assert!(
+            manager
+                .render_job_status("j")
+                .unwrap()
+                .starts_with("unknown graph"),
+            "read-only status must disclose the unknown outcome"
+        );
     }
 
     #[test]
@@ -4377,7 +4600,7 @@ mod tests {
             .unwrap();
     }
 
-    fn terminal_no_output(manager: &JobManager, id: &str) {
+    fn terminal_no_output_with_visibility(manager: &JobManager, id: &str, exposed: bool) {
         let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
         let plans = plan_graph(&graph, |_, _| {
             Ok::<_, ()>(NodePolicy {
@@ -4403,7 +4626,7 @@ mod tests {
                     epoch: 1,
                     admission_sequence: 1,
                     width: 1,
-                    exposed: true,
+                    exposed,
                 },
             )
             .unwrap();
@@ -4435,6 +4658,10 @@ mod tests {
                 |_, _| Ok(()),
             )
             .unwrap();
+    }
+
+    fn terminal_no_output(manager: &JobManager, id: &str) {
+        terminal_no_output_with_visibility(manager, id, true);
     }
 
     #[test]
@@ -4751,6 +4978,176 @@ mod tests {
             manager.runtime_snapshot("restart"),
             Err(Error::NotFound)
         ));
+    }
+
+    #[test]
+    fn journal_unknown_terminal_cannot_expire_or_be_capacity_evicted() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        terminal_no_output(&manager, "uncertain");
+        terminal_no_output(&manager, "known");
+        {
+            let mut state = manager.state.lock().unwrap();
+            state
+                .jobs
+                .get_mut("uncertain")
+                .unwrap()
+                .job
+                .fence_journal_unknown();
+        }
+        let snapshot = manager.get("uncertain").unwrap();
+        assert_eq!(snapshot.lifecycle, Lifecycle::Terminal);
+        assert!(snapshot.journal_unknown);
+        assert!(!snapshot.is_known_terminal());
+        assert!(manager.get("known").unwrap().is_known_terminal());
+        assert_eq!(
+            manager.render_graph_result("uncertain", 1024),
+            Err(Error::ReplayUnknown),
+            "journal-unknown terminal state cannot render as a completed Graph result"
+        );
+        assert!(
+            manager.has_nonterminal_jobs().unwrap(),
+            "journal-unknown terminal work remains live until reconciliation"
+        );
+        assert_eq!(
+            manager.expire_terminal("uncertain"),
+            Err(Error::Busy),
+            "host expiry cannot erase journal-unknown evidence"
+        );
+        let graph = manager.graph("uncertain").unwrap();
+        let fresh = manager.plans("uncertain").unwrap();
+        assert_eq!(
+            manager.restart_runtime(
+                "uncertain",
+                graph,
+                fresh,
+                RuntimeAdmission {
+                    id: "uncertain-restart",
+                    runtime_session: "session",
+                    epoch: 2,
+                    admission_sequence: 1,
+                    width: 1,
+                    exposed: true,
+                },
+            ),
+            Err(Error::ReplayUnknown),
+            "an unresolved journal must never become a restart source"
+        );
+        assert!(matches!(
+            manager.runtime_snapshot("uncertain-restart"),
+            Err(Error::NotFound)
+        ));
+        terminal_no_output(&manager, "new");
+        assert!(
+            manager.get("uncertain").unwrap().journal_unknown,
+            "capacity pressure may reclaim known terminal history, not uncertain history"
+        );
+        assert!(matches!(manager.get("known"), Err(Error::NotFound)));
+        assert!(manager.get("new").is_ok());
+
+        // With no other safe candidate, pressure must fail rather than
+        // drop the last journal-unknown Job.
+        let solo = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 1,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        terminal_no_output(&solo, "uncertain");
+        {
+            solo.state
+                .lock()
+                .unwrap()
+                .jobs
+                .get_mut("uncertain")
+                .unwrap()
+                .job
+                .fence_journal_unknown();
+        }
+        assert_eq!(
+            solo.reserve_task_admission("pending", true),
+            Err(Error::Capacity)
+        );
+        assert!(solo.get("uncertain").unwrap().journal_unknown);
+
+        let hidden = JobManager::new(Limits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 2,
+            max_hidden_jobs: 2,
+            max_active_nodes: 2,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        terminal_no_output_with_visibility(&hidden, "hidden-uncertain", false);
+        {
+            hidden
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .get_mut("hidden-uncertain")
+                .unwrap()
+                .job
+                .fence_journal_unknown();
+        }
+        assert_eq!(
+            hidden.discard_unexposed_terminal("hidden-uncertain"),
+            Err(Error::Busy),
+            "optimistic hidden cleanup cannot erase journal-unknown evidence"
+        );
+        assert!(
+            hidden
+                .runtime_snapshot("hidden-uncertain")
+                .unwrap()
+                .journal_unknown
+        );
+    }
+
+    #[test]
+    fn journal_unknown_claim_cannot_be_discarded_as_unstarted() {
+        let manager = manager(2);
+        admit_simple(&manager, "unknown-claim", false);
+        assert_eq!(
+            manager.claim("unknown-claim", 1, true, 2, |_, _| {
+                Err(JournalError::OutcomeUnknown)
+            }),
+            Err(Error::Job(JobError::JournalUnknown))
+        );
+        let snapshot = manager.runtime_snapshot("unknown-claim").unwrap();
+        assert_eq!(snapshot.lifecycle, Lifecycle::Running);
+        assert!(snapshot.journal_unknown);
+        assert_eq!(
+            manager.runner_load("unknown-claim").unwrap().global_active,
+            1
+        );
+        assert_eq!(
+            manager.discard_unstarted("unknown-claim"),
+            Err(Error::Busy),
+            "a possibly committed Claim must retain its Job record"
+        );
+        assert!(
+            manager
+                .runtime_snapshot("unknown-claim")
+                .unwrap()
+                .journal_unknown
+        );
+        assert_eq!(
+            manager.runner_load("unknown-claim").unwrap().global_active,
+            1,
+            "the reserved permit stays fenced until reconciliation"
+        );
+        assert!(manager.has_nonterminal_jobs().unwrap());
     }
 
     #[test]
@@ -6243,6 +6640,55 @@ mod tests {
     }
 
     #[test]
+    fn terminal_skipped_node_without_stream_has_idempotent_noop_finish() {
+        let (manager, owner) = claimed_output_job("skip-no-output", 1024);
+        assert_eq!(
+            manager.finish_output_for_owner("skip-no-output", None, None, owner),
+            Err(Error::Busy),
+            "an unsettled Job cannot be finished even with no output attached"
+        );
+        manager
+            .settle_unlaunched(
+                "skip-no-output",
+                1,
+                2,
+                3,
+                |_, observed_claim| {
+                    assert_eq!(observed_claim, 2);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get("skip-no-output").unwrap().lifecycle,
+            Lifecycle::Terminal
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+
+        for target in [Some(1), None] {
+            assert_eq!(
+                manager.finish_output_for_owner("skip-no-output", target, None, owner),
+                Ok(OutputAck {
+                    changed: false,
+                    released: true,
+                }),
+                "an empty terminal output scope has nothing left to release"
+            );
+        }
+        assert_eq!(
+            manager.finish_output_for_owner(
+                "skip-no-output",
+                Some(1),
+                Some(OutputStream::Result),
+                owner,
+            ),
+            Err(Error::OutputMissing),
+            "an explicit nonexistent stream is still an invalid target"
+        );
+    }
+
+    #[test]
     fn fully_settled_heterogeneous_graph_remains_mixed_and_allows_explicit_finish() {
         let (manager, owner) = two_node_terminal_output_job("known-mixed", Primary::Fail);
         let snapshot = manager.get("known-mixed").unwrap();
@@ -6261,6 +6707,303 @@ mod tests {
             .finish_output_for_owner("known-mixed", None, None, owner)
             .unwrap();
         assert!(!again.changed && again.released);
+        assert_eq!(
+            manager.acknowledge_delivered_output("known-mixed", 1, OutputStream::Result, owner, 4),
+            Ok(OutputAck {
+                changed: false,
+                released: true
+            }),
+            "a terminal Finish must preserve the legitimate owner's replay history"
+        );
+        assert_eq!(
+            manager.acknowledge_delivered_output(
+                "known-mixed",
+                1,
+                OutputStream::Result,
+                OutputOwner::new([0xF1; 32]).unwrap(),
+                0
+            ),
+            Err(Error::InvalidOutput),
+            "terminal Finish must not authorize strangers after release"
+        );
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn discard_if_full_notifies_waiting_reader_of_truncation_without_eof_or_ack() {
+        let (manager, owner) = claimed_output_job("discard-watch", 8);
+        manager
+            .attach_output_memory("discard-watch", 1, OutputStream::Stdout, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("discard-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(writer.append(b"12345678").unwrap(), 8);
+        let mut watch = manager.subscribe_changes("discard-watch").unwrap();
+        watch.borrow_and_update();
+
+        assert!(writer.discard_if_full(3).unwrap(), "the quota is exhausted");
+        let (summary, finished) = manager
+            .output_summary("discard-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        assert!(summary.truncated);
+        assert_eq!(summary.total_bytes, 11);
+        assert_eq!(summary.retained_bytes, 8);
+        assert!(!finished, "the producer is still running");
+        assert!(
+            watch.has_changed().unwrap(),
+            "truncation is a read-wait wake condition even without new retained bytes"
+        );
+        watch.borrow_and_update();
+        assert!(writer.discard_if_full(2).unwrap());
+        let (after, finished) = manager
+            .output_summary("discard-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(after.total_bytes, 13);
+        assert!(after.truncated && !finished);
+        assert!(
+            !watch.has_changed().unwrap(),
+            "discarding further chunks must not repeatedly wake readers"
+        );
+        assert_eq!(
+            manager.acknowledge_delivered_output(
+                "discard-watch",
+                1,
+                OutputStream::Stdout,
+                owner,
+                8
+            ),
+            Err(Error::InvalidOutput),
+            "a writer notification must not grant delivery proof"
+        );
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn append_after_truncation_counts_bytes_without_repeated_wakeups() {
+        let (manager, owner) = claimed_output_job("append-truncated-watch", 8);
+        manager
+            .attach_output_memory("append-truncated-watch", 1, OutputStream::Stdout, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("append-truncated-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        let mut watch = manager.subscribe_changes("append-truncated-watch").unwrap();
+        watch.borrow_and_update();
+
+        assert_eq!(writer.append(b"12345678").unwrap(), 8);
+        assert!(
+            watch.has_changed().unwrap(),
+            "new retained bytes must wake readers"
+        );
+        watch.borrow_and_update();
+        assert_eq!(writer.append(b"9").unwrap(), 0);
+        assert!(
+            watch.has_changed().unwrap(),
+            "first truncation must wake readers"
+        );
+        watch.borrow_and_update();
+
+        for _ in 0..16 {
+            assert_eq!(writer.append(b"later").unwrap(), 0);
+        }
+        let (summary, finished) = manager
+            .output_summary("append-truncated-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!(summary.retained_bytes, 8);
+        assert_eq!(summary.total_bytes, 89);
+        assert!(summary.truncated && !finished);
+        assert!(
+            !watch.has_changed().unwrap(),
+            "later dropped chunks must not repeatedly wake a known-truncated stream"
+        );
+        assert_eq!(
+            manager.acknowledge_delivered_output(
+                "append-truncated-watch",
+                1,
+                OutputStream::Stdout,
+                owner,
+                8,
+            ),
+            Err(Error::InvalidOutput),
+            "append and watch events never authorize raw output ACK"
+        );
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn failed_writer_drain_accounts_bytes_without_repeated_change_wakes() {
+        let (manager, owner) = claimed_output_job("writer-failure-watch", 64);
+        manager
+            .attach_output_memory("writer-failure-watch", 1, OutputStream::Stdout, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("writer-failure-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        let mut watch = manager.subscribe_changes("writer-failure-watch").unwrap();
+        watch.borrow_and_update();
+        assert_eq!(writer.append(b"abc").unwrap(), 3);
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+
+        writer.mark_failed().unwrap();
+        assert!(
+            watch.has_changed().unwrap(),
+            "first output failure must notify readers"
+        );
+        watch.borrow_and_update();
+        writer.observe_after_failure(5).unwrap();
+        assert!(
+            watch.has_changed().unwrap(),
+            "the first discarded bytes publish truncation"
+        );
+        watch.borrow_and_update();
+        for _ in 0..15 {
+            writer.observe_after_failure(5).unwrap();
+        }
+        let (summary, finished) = manager
+            .output_summary("writer-failure-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!((summary.retained_bytes, summary.total_bytes), (3, 83));
+        assert!(!finished, "the writer is still draining");
+        assert!(
+            !watch.has_changed().unwrap(),
+            "subsequent source accounting cannot change retained bytes or failure readiness"
+        );
+        assert_eq!(writer.finish(), Err(Error::OutputFailure));
+        assert!(watch.has_changed().unwrap(), "final EOF must notify");
+        assert_eq!(
+            manager.acknowledge_delivered_output(
+                "writer-failure-watch",
+                1,
+                OutputStream::Stdout,
+                owner,
+                3
+            ),
+            Err(Error::InvalidOutput),
+            "failure updates cannot grant delivery credit"
+        );
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn failed_append_notifies_before_eof_without_granting_delivery() {
+        let (manager, owner) = claimed_output_job("failed-append-watch", 64);
+        manager
+            .attach_output_memory("failed-append-watch", 1, OutputStream::Stdout, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("failed-append-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        // Simulate a spool that failed internally before a producer notices.
+        writer.output.lock().unwrap().spool.mark_writer_failed();
+        let mut watch = manager.subscribe_changes("failed-append-watch").unwrap();
+        watch.borrow_and_update();
+        assert_eq!(writer.append(b"failed bytes"), Err(Error::OutputFailure));
+        assert!(
+            watch.has_changed().unwrap(),
+            "a write error must wake output observers"
+        );
+        let (summary, finished) = manager
+            .output_summary("failed-append-watch", 1, OutputStream::Stdout)
+            .unwrap();
+        assert_eq!((summary.retained_bytes, summary.total_bytes), (0, 0));
+        assert!(!finished);
+        assert_eq!(
+            manager.acknowledge_delivered_output(
+                "failed-append-watch",
+                1,
+                OutputStream::Stdout,
+                owner,
+                0
+            ),
+            Err(Error::InvalidOutput)
+        );
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn one_job_change_watch_covers_late_stream_attach_bytes_and_terminal() {
+        let (manager, owner) = claimed_output_job("watch-events", 1024);
+        let mut changes = manager.subscribe_changes("watch-events").unwrap();
+        let initial = *changes.borrow_and_update();
+        manager
+            .attach_output_memory("watch-events", 1, OutputStream::Stdout, [owner])
+            .unwrap();
+        assert!(
+            changes.has_changed().unwrap(),
+            "late stream attachment must notify"
+        );
+        assert_ne!(*changes.borrow_and_update(), initial);
+        let writer = manager
+            .output_writer("watch-events", 1, OutputStream::Stdout)
+            .unwrap();
+        writer.append(b"hello").unwrap();
+        assert!(
+            changes.has_changed().unwrap(),
+            "new retained bytes must notify"
+        );
+        changes.borrow_and_update();
+        writer.finish().unwrap();
+        assert!(
+            changes.has_changed().unwrap(),
+            "EOF must notify even without bytes"
+        );
+        changes.borrow_and_update();
+        manager
+            .start(
+                "watch-events",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert!(
+            changes.has_changed().unwrap(),
+            "start may notify, but is not settlement"
+        );
+        changes.borrow_and_update();
+        assert_eq!(
+            manager.get("watch-events").unwrap().lifecycle,
+            Lifecycle::Running
+        );
+        manager
+            .settle(
+                "watch-events",
+                1,
+                NodeState::Running { sequence: 3 },
+                Status {
+                    primary: Primary::Ok,
+                    more: false,
+                    incomplete: false,
+                },
+                4,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert!(changes.has_changed().unwrap(), "settled Job must notify");
+        assert_eq!(
+            manager.get("watch-events").unwrap().lifecycle,
+            Lifecycle::Terminal
+        );
+        assert_eq!(
+            manager
+                .output_page_for_owner("watch-events", 1, OutputStream::Stdout, owner, 0, 16)
+                .unwrap()
+                .bytes,
+            b"hello"
+        );
+        // Notification is not an ACK. Subscriber observations cannot
+        // authorize a prefix without a successful final output projection.
+        assert_eq!(
+            manager.acknowledge_delivered_output("watch-events", 1, OutputStream::Stdout, owner, 5),
+            Err(Error::InvalidOutput)
+        );
     }
 
     #[test]
@@ -6642,6 +7385,167 @@ mod tests {
                 extra
             ),
             Err(Error::OutputMissing)
+        );
+    }
+
+    #[test]
+    fn released_stream_ack_requires_original_owner_and_known_offset() {
+        let (manager, owner) = claimed_output_job("released-owner", 1024);
+        let stranger = OutputOwner::new([0xEA; 32]).unwrap();
+        let stream = OutputStream::Stdout;
+        manager
+            .attach_output_memory("released-owner", 1, stream, [owner])
+            .unwrap();
+        let writer = manager.output_writer("released-owner", 1, stream).unwrap();
+        assert_eq!(writer.append(b"abcdef").unwrap(), 6);
+        writer.finish().unwrap();
+        manager
+            .record_delivered_output("released-owner", 1, stream, owner, 0, 6)
+            .unwrap();
+        assert_eq!(
+            manager.acknowledge_delivered_output("released-owner", 1, stream, owner, 6),
+            Ok(OutputAck {
+                changed: true,
+                released: true
+            }),
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+
+        // Physical release is not a universal grant; owner and exact range
+        // remain enforceable after compaction and even for zero-byte ACKs.
+        for offset in [0, 6, 7] {
+            assert_eq!(
+                manager
+                    .acknowledge_delivered_output("released-owner", 1, stream, stranger, offset,),
+                Err(Error::InvalidOutput),
+            );
+            assert_eq!(
+                manager.acknowledge_output("released-owner", 1, stream, stranger, offset),
+                Err(Error::InvalidOutput),
+            );
+        }
+        for offset in [7, u64::MAX] {
+            assert_eq!(
+                manager.acknowledge_delivered_output("released-owner", 1, stream, owner, offset),
+                Err(Error::InvalidOutput),
+            );
+            assert_eq!(
+                manager.acknowledge_output("released-owner", 1, stream, owner, offset),
+                Err(Error::InvalidOutput),
+            );
+        }
+
+        // Replaying a previously acknowledged range by the correct owner
+        // remains a no-op, including after the physical spool is gone.
+        for offset in [0, 6] {
+            assert_eq!(
+                manager.acknowledge_delivered_output("released-owner", 1, stream, owner, offset),
+                Ok(OutputAck {
+                    changed: false,
+                    released: true
+                }),
+            );
+            assert_eq!(
+                manager.acknowledge_output("released-owner", 1, stream, owner, offset),
+                Ok(OutputAck {
+                    changed: false,
+                    released: true
+                }),
+            );
+        }
+        assert_eq!(manager.spool_usage().unwrap().0, 0);
+    }
+
+    #[test]
+    fn journal_unknown_fences_both_output_ack_paths_before_release() {
+        let (manager, owner) = claimed_output_job("journal-unknown-ack", 1024);
+        let stream = OutputStream::Stdout;
+        manager
+            .attach_output_memory("journal-unknown-ack", 1, stream, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("journal-unknown-ack", 1, stream)
+            .unwrap();
+        writer.append(b"secret").unwrap();
+        writer.finish().unwrap();
+        manager
+            .record_delivered_output("journal-unknown-ack", 1, stream, owner, 0, 6)
+            .unwrap();
+
+        assert_eq!(
+            manager.start(
+                "journal-unknown-ack",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| {
+                    // Persistence runs outside the manager mutex. No output
+                    // mutation may race this unresolved host journal commit.
+                    assert_eq!(
+                        manager.acknowledge_delivered_output(
+                            "journal-unknown-ack",
+                            1,
+                            stream,
+                            owner,
+                            6
+                        ),
+                        Err(Error::Busy)
+                    );
+                    assert_eq!(
+                        manager.acknowledge_output("journal-unknown-ack", 1, stream, owner, 6),
+                        Err(Error::Busy)
+                    );
+                    assert_eq!(
+                        manager.compact_output_for_owner(
+                            "journal-unknown-ack",
+                            1,
+                            stream,
+                            owner,
+                            0
+                        ),
+                        Err(Error::Busy)
+                    );
+                    assert_eq!(manager.spool_usage().unwrap().0, 6);
+                    Err(JournalError::OutcomeUnknown)
+                }
+            ),
+            Err(Error::Job(JobError::JournalUnknown)),
+        );
+        assert!(manager.get("journal-unknown-ack").unwrap().journal_unknown);
+        for ack in [
+            manager.acknowledge_delivered_output("journal-unknown-ack", 1, stream, owner, 6),
+            manager.acknowledge_output("journal-unknown-ack", 1, stream, owner, 6),
+        ] {
+            assert_eq!(
+                ack,
+                Err(Error::ReplayUnknown),
+                "journal-fenced output must be retained for reconciliation"
+            );
+        }
+        assert_eq!(
+            manager
+                .output_owner_state("journal-unknown-ack", 1, stream, owner)
+                .unwrap(),
+            OutputOwnerState {
+                through: 0,
+                acknowledged: false,
+                released: false,
+            }
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 6);
+        assert_eq!(
+            manager.compact_output_for_owner("journal-unknown-ack", 1, stream, owner, 0),
+            Err(Error::ReplayUnknown),
+            "trusted compaction must not discard a journal-unknown spool either"
+        );
+        assert_eq!(manager.spool_usage().unwrap().0, 6);
+        assert_eq!(
+            manager.finish_output_for_owner("journal-unknown-ack", None, None, owner),
+            Err(Error::ReplayUnknown)
         );
     }
 

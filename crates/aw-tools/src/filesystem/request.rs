@@ -326,7 +326,9 @@ fn decode_hex(data: &str) -> Result<Vec<u8>, Error> {
         return Err(Error::Invalid("invalid hex payload"));
     }
     data.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_nibble(pair[0]).ok_or(Error::Invalid("invalid hex payload"))?;
             let low = hex_nibble(pair[1]).ok_or(Error::Invalid("invalid hex payload"))?;

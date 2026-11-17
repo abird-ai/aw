@@ -1,163 +1,141 @@
-# CURRENT HANDOFF — AW current implementation state
+# CURRENT HANDOFF — AW live state
 
 Author: coordinating implementation agent
 Owner: @pvl
-Prepared: 2026-11-15
+Updated: 2026-11-16
 Source authority host: **L5 only**
 Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 
-> **Full current handoff:** read
-> `.agents/docs/AW-FULL-COMPREHENSIVE-HANDOFF-2026-11-15.md`.
->
-> That file integrates the original AW architecture, shared tools/dotlink
-> convergence, unified Jobs + Agent runtime, Workspace/PTY/browser history,
-> delegated authority, V1.5 UX/Build, remote trust/projection/admission/
-> ActiveTarget, the current uncommitted production server/browser-origin work,
-> exact validation evidence and the live next gate.
->
 > Authority order: live source/tests/executed results > direct user instruction >
-> read-only UX authority > active plan/TODO/spec > comprehensive handoff > older
-> dated prose.
+> active plan/TODO/spec > dated comprehensive handoffs.
+>
+> The November 15 comprehensive handoff is historical context for the Workspace
+> continuation. It is not the current Git-state record.
 
-## Immediate state
+## Repository state before this review
 
 - Branch: `main`
 - HEAD / `origin/main`:
-  `62b8da6babfa729d6bbb9c21e75ac89c228b22b1`
-  — `Complete remote Workspace target integration`
-- Nothing staged.
-- One worktree.
-- `.agents/plans/ux/**` remains read-only and has no diff.
+  `7d09d5f3c882894cd46b427a89fa75280223115a`
+  — `Advance workspace views, remote resources and handoff`
+- Previous AW-tools merge:
+  `0d2b4e3`
+  — `Build configurable toolset and harden shared Job control`
+- The worktree was clean, nothing staged, with one worktree.
+- `.agents/plans/ux/**` had no worktree or staged diff.
 - Use `dotlink---l5` only. Do not use A1.
 - Do not create another worktree.
 - Do not commit/push/tag/release/deploy without explicit authorization.
-- Keep implementation turns near 30 minutes; checkpoint and pause.
+- Keep implementation turns near 30 minutes and checkpoint coherently.
 
-## Current uncommitted paths
+## AW tools merge review — 2026-11-16
 
-Preserve all of these:
+The merged boundary remains sound:
+
+- `aw-tools` owns canonical transport-neutral filesystem, Graph, finite-Job,
+  Toolset metadata/limits and typed receipt semantics.
+- `aw-tools-adapter` remains AW projection/compatibility glue. It does not own a
+  second filesystem engine, JobManager, scheduler or authority source.
+- `Toolset::only` constrains both direct filesystem registration and Graph
+  native leaves.
+- Tool metadata overrides are presentation-only: the thin described-tool wrapper
+  delegates availability, validation, parallelism and execution to the original
+  Tool and cannot change name/effect/schema shape/grants.
+- AW `ToolMode`, selected tool names, ToolPolicy, execution site and live Actor
+  Envelope remain independent positive authority gates.
+- finite `jobs_get` output disclosure independently rechecks live
+  `jobs_read` authority before retained bytes are appended.
+- finite `jobs_ack` composes current `ToolBindingAuthority` and live
+  `AgentStepGate` commit guards around exactly one synchronous JobManager
+  ACK/Finish mutation. The established lock order remains
+  ToolBindingAuthority → Actor runtime → JobManager.
+- shared delivered-output proof credits only raw bytes actually represented by a
+  successfully validated finite projection.
+- Graph `unknown` remains dominant over mixed known outcomes; explicit Finish
+  refuses unresolved effects.
+- canonical grep parser/schema/engine remain shared by direct and Graph
+  execution.
+
+### Review fixes currently uncommitted
+
+Only narrow merge-quality corrections were required:
+
+- update four hex/digest parsing loops to the Rust 1.98 strict-Clippy-preferred
+  `slice::as_chunks::<2>()`; behavior is unchanged and the repository MSRV
+  remains Rust 1.88, where this API is available;
+- replace stale hard-coded `jobs_get tail 0..1024` / `wait_ms 30 seconds`
+  validation messages with truthful configured-ceiling messages. Enforcement
+  already used the configured `JobProfile`; only the diagnostics were stale;
+- reconcile the toolset-builder and Job-output/grep TODOs with the actual merged
+  commit `0d2b4e3`;
+- clarify in the dotlink-tool-port plan that its November 9 AW revisions are
+  historical consumer pins, not evidence that dotlink already consumes the
+  newer Toolset/Job-control merge.
+
+### Still open — do not claim complete
+
+The approved Job-output contract still has two intentionally unfinished
+observation semantics:
+
+1. finite `jobs_get.wait_ms` must become lost-wakeup-safe and event-driven,
+   waiting **only for settlement or deadline**. Current code still polls at
+   10 ms and can return on any revision change.
+2. finite `jobs_read.wait_ms > 0` must wait for new bytes or EOF/settlement at
+   a nonnegative absolute stream offset. Current finite-Job path still rejects a
+   nonzero wait; negative offsets remain nonblocking snapshots.
+
+These belong to
+`.agents/plans/ai-native-tool-output-grep-2026-11-15/` and are the next shared
+Job semantics work. Do not hide them by marking the whole plan complete.
+
+Before dotlink adopts configurable grep work profiles above AW defaults, B6
+should also decide/document explicit product-neutral shared grep safety maxima
+rather than inventing host-independent caps ad hoc. AW itself already prevents
+widening beyond its configured/default product ceilings.
+
+## Current uncommitted review paths
+
+Preserve exactly these review changes unless the user asks otherwise:
 
 - `.agents/docs/CURRENT_HANDOFF.md`
-- `.agents/docs/AW-FULL-COMPREHENSIVE-HANDOFF-2026-11-15.md`
-- `.agents/plans/workspace-views/README.md`
-- `.agents/plans/workspace-views/NEXT-AGENT.md`
-- `.agents/plans/workspace-views/REMOTE-DEVICE-TRUST.md`
-- `.agents/plans/workspace-views/TODO.md`
-- `crates/aw-store/src/remote_view.rs`
-- `crates/aw-store/src/resources.rs`
-- `crates/aw-store/tests/resources.rs`
-- `crates/aw-surfaces/src/lib.rs`
-- `src/awnet/reachability.rs`
-- `src/main_full.rs`
-- `src/resources_cli.rs`
-- `src/web.rs`
-- `src/web/agent_view_tests.rs`
-- `src/web/team.rs`
+- `.agents/plans/ai-native-toolset-builder-2026-11-15/TODO.md`
+- `.agents/plans/ai-native-tool-output-grep-2026-11-15/TODO.md`
+- `.agents/plans/dotlink-tool-port/TODO.md`
+- `crates/aw-tools/src/filesystem/direct.rs`
+- `crates/aw-tools/src/filesystem/request.rs`
+- `crates/aw-tools-adapter/src/binary.rs`
+- `crates/aw-tools-adapter/src/jobs_tools.rs`
 
-The uncommitted implementation contains:
+Nothing should be staged or committed without explicit authorization.
 
-1. production remote-view server CLI enablement:
-   - `identity-auth-serve --remote-view-max-ttl ... --remote-view-grant files|git`
-   - `machine-service-serve --remote-view-workspace WORKSPACE`
-   - exact server MachineLink/read policy and hosted-Workspace preflight;
-   - retained read-only SurfaceHost projection;
-   - read-only SurfaceHost no longer needs a fake shell path.
-2. SSH-forwarded browser authority:
-   - `--listen` = backend loopback socket;
-   - `--browser-origin http://LOOPBACK[:PORT]` = exact browser-visible authority;
-   - exact Host/Origin/Sec-Fetch policy retained;
-   - browser-authority-scoped cookie names.
+## Validation at this checkpoint
 
-## Current accepted major checkpoints
+Fresh review gate after the code fixes:
 
-- unified Jobs/Agent runtime: `0a6c6a0` / handoff `88cd965`
-- delegated browser authority: `c9aaf0e`
-- V1.5 Workspace UX + remote trust: `aaab161`
-- remote Workspace target integration: `62b8da6`
+- `aw-tools --all-features --lib`: **327/327**;
+- `aw-tools-adapter --all-features --lib`: **242/242**;
+- `aw-agent-core --lib`: **90 passed, 1 ignored**;
+- read-only Toolset tests: **9/9**;
+- `aw-tools --no-default-features`: green;
+- strict affected-crate all-target/all-feature Clippy with `-D warnings`: green;
+- formatting: green.
+- downstream `aw-mcp`, `aw-host`, and `aw-cli --lib` checks: green.
+- `git verify-commit 0d2b4e3` reported a good ED25519 signature, but L5 lacks
+  the configured `allowed_signers` file, so principal trust resolution is
+  environment-incomplete rather than fully verified here.
 
-## Latest production two-AwNode checkpoint
+Run the final stable-tree diff/staging/UX audit before handing off.
 
-The real L5 production gate has now been executed from two fresh file-backed
-durable AwNode state roots using public `aw` commands only. No continuity state,
-v35 grant or SQLite authority was hand-authored.
+## Other active work
 
-Established through production commands:
+Workspace/remote-view state moved in `7d09d5f`; use the live
+`.agents/plans/workspace-views/TODO.md`,
+`REMOTE-DEVICE-TRUST.md`, and `NEXT-AGENT.md` for that continuation. Do not
+infer its current gate from the older November 15 snapshot prose.
 
-- direct QUIC pair/trust;
-- source Domain/device setup and explicit target Machine registration;
-- signed Workspace writer handoff A → B;
-- on the replica host, explicit registration of the exact trusted recorded
-  control AwNode as the requester remote Machine;
-- real Phase-30 continuity accept + signed sync;
-- real device-key identity authentication;
-- target identity-auth server explicitly opted into Files+Git v35 issuance;
-- **server-issued v35 remote-view grant succeeded**;
-- `aw web` admitted the grant and exposed only a fresh opaque `rwt_...` target;
-  the browser descriptor contained no peer/room/Domain/Workspace/grant/key
-  authority material.
+Release-readiness and platform-native external gates remain separate from this
+AW-tools review.
 
-The first protected remote capability read is still blocked. While the same
-`aw web` owner is live, the direct-route stream for the Machine-service request
-opens but closes before the first RouteHello bytes are written. Temporary local
-diagnostics (removed before this checkpoint) observed Quinn
-`ClosedStream` on the client and `FinishedEarly(0)` on the server; the web API
-correctly collapsed this to HTTP 503 `remote Workspace target unavailable`.
+## 2026-11-17 AW–dotlink tools handoff update
 
-Isolation evidence rules out the broad authority/rendezvous/MachineLink paths:
-
-- same-room `net punch` succeeds twice consecutively;
-- plain Machine service FileRead succeeds;
-- identity-auth → same-room plain Machine service succeeds;
-- two sequential same-room one-shot Machine-service connections succeed;
-- real remote-view v3 grant issuance followed by clean `aw web` owner shutdown
-  and same-state/same-room plain Machine read succeeds.
-
-Therefore the remaining core gate is specifically the in-web-owner
-protected-read direct-route/QUIC stream lifecycle. Do not weaken v35, owner
-custody, browser secrecy or exact-source pinning to bypass it.
-
-Current uncommitted fixes supporting the production path also include:
-
-- imported replica Domains may explicitly register only their exact trusted
-  recorded control AwNode as a remote Machine; ordinary Domains still require
-  owner/admin + Domain-authority write;
-- replica-only v35 membership evidence is accepted only from the exact active
-  Phase-30 binding source recorded for that replica Domain; no owner/admin role
-  is materialized;
-- remote Machine service resolves only an exact active hosted Workspace ID
-  owned by the local Machine in remote-view mode;
-- Workspace-bound remote Machine service remains resident across fresh
-  MachineLink transports so one retained `SurfaceHost` owns a stable source/
-  scope and immutable inventory/Review pins;
-- reusable rendezvous ignores only exact recently matched `(node_id, nonce)`
-  retransmits; fresh generations reuse the room immediately.
-
-Focused post-cleanup evidence is green: rendezvous generation regression **1/1**,
-v35 authority **4/4**, Phase-30 → explicit replica Machine → v35 **1/1**,
-Workspace writer handoff/failback **1/1**, formatting, and current CLI build.
-
-Still not established and must not be claimed:
-
-- production Files/search/Git inventory/open/retained Review;
-- reconnect/re-read of those exact-source resources;
-- revoke → stale/unavailable/no-Local-fallback after an actual protected read;
-- live non-empty draft/caret and PTY preservation across remote selection.
-
-When the transport defect is fixed, resume the same production path at explicit
-remote ActiveTarget capability/read, then prove target selection/reconnect/
-revoke does not change:
-
-- current Agent Session/branch;
-- unsent draft/caret;
-- provider/model execution target;
-- local Review/Build PTY inventory;
-- PTY input/resize owner;
-- local Git HEAD/index;
-- model/provider/tool/run/effect rows.
-
-No silent Local fallback is allowed when the remote target disappears.
-Standalone pinned File/Review must remain on its original source until its exact
-authority is revoked.
-
-For the exact production commands, invariants, source map and test history read
-the comprehensive handoff.
+The newer, comprehensive **shared-toolset/Job-output** handoff is [AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md](AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md). It supersedes this dated file for the post-merge Job wait, owner/ACK, journal and dotlink migration state. Keep this file for its original AW merge review and broader Workspace context; live code/tests and the active owning plan take precedence.

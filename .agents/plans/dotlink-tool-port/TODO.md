@@ -4,6 +4,25 @@ Base AW: `53206b2`; dotlink: `fc53fc9` plus uncommitted tool-hardening tree.
 
 Design/decisions: [README.md](README.md).
 
+## AW post-merge status — 2026-11-16
+
+- Current AW `main` is `7d09d5f`; the newer shared-tool merge is
+  `0d2b4e3` (`Build configurable toolset and harden shared Job control`).
+- The 2026-11-09 `4a23e92` / `55d93db` entries below remain historical
+  **dotlink consumer pins**, not the current AW shared-tool implementation.
+- `0d2b4e3` adds the validated Toolset/metadata/receipt layer and hardens
+  finite Job output ownership, delivery proof, Actor read authority and atomic
+  ACK/Finish commit without introducing a second executor/policy/runtime.
+- Fresh AW-only review on `7d09d5f`: direct and Graph filesystem vocabulary
+  both honor the same Toolset subset; metadata wrappers delegate validation and
+  execution unchanged; ToolPolicy + live Actor gates remain independent from
+  catalog metadata.
+- Dotlink must **not** be assumed current with these post-2026-11-09 additions
+  until its dependent plan explicitly consumes/reviews the newer AW revision.
+- Still-open shared semantics before calling the newer Job-output contract
+  complete: event-driven settlement-only `jobs_get.wait_ms` and byte/EOF-aware
+  finite `jobs_read.wait_ms`.
+
 ## Current convergence status — 2026-11-09
 
 The current source and this status block supersede unchecked boxes in older

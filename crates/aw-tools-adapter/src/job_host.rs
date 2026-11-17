@@ -643,7 +643,7 @@ impl JobHost {
             .manager
             .runtime_snapshot(id)
             .map_err(|_| Error::Denied("Job event source is unavailable"))?;
-        if snapshot.lifecycle != aw_tools::filesystem::job::Lifecycle::Terminal {
+        if !snapshot.is_known_terminal() {
             return Ok(Vec::new());
         }
         let canonical = self.execution_ref(id, None)?.canonical();
@@ -817,13 +817,13 @@ impl JobHost {
 
     fn discard_unstarted_with_exposure(&self, id: &str) -> Result<()> {
         let (owner, reference) = self.finite_exposure_for_id(id)?;
+        self.manager
+            .discard_unstarted(id)
+            .map_err(|_| Error::Protocol("provisional Job cleanup failed"))?;
         if let Ok(mut events) = self.events.lock() {
             events.sources.remove(&reference);
             events.terminal_committed.remove(&reference);
         }
-        self.manager
-            .discard_unstarted(id)
-            .map_err(|_| Error::Protocol("provisional Job cleanup failed"))?;
         self.release_unpublished_finite_exposure(id, &owner, &reference)
     }
 
@@ -1592,13 +1592,13 @@ impl JobHost {
 
     pub fn discard_unexposed_terminal(&self, id: &str) -> Result<()> {
         let (owner, reference) = self.finite_exposure_for_id(id)?;
+        self.manager
+            .discard_unexposed_terminal(id)
+            .map_err(|_| Error::Protocol("cannot retire completed hidden Job"))?;
         if let Ok(mut events) = self.events.lock() {
             events.sources.remove(&reference);
             events.terminal_committed.remove(&reference);
         }
-        self.manager
-            .discard_unexposed_terminal(id)
-            .map_err(|_| Error::Protocol("cannot retire completed hidden Job"))?;
         self.release_unpublished_finite_exposure(id, &owner, &reference)
     }
 
@@ -1610,6 +1610,11 @@ impl JobHost {
             .manager
             .get(source_id)
             .map_err(|_| Error::Denied("restart source Job is not exposed or missing"))?;
+        if source.journal_unknown {
+            return Err(Error::Protocol(
+                "restart source journal outcome unknown; reconcile before retry",
+            ));
+        }
         if source.lifecycle != aw_tools::filesystem::job::Lifecycle::Terminal {
             return Err(Error::Denied("running Job cannot restart; cancel first"));
         }

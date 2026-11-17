@@ -42,6 +42,7 @@ pub enum Receipt<'a> {
         tool: &'a str,
         revision: u64,
         state: NodeState,
+        journal_unknown: bool,
         terminal: Option<ProcessTerminal>,
     },
     Ack {
@@ -111,11 +112,15 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
             {
                 return Err(ToolsetError::Invalid("invalid compact Job status"));
             }
-            let state = match snapshot.lifecycle {
-                Lifecycle::Running => "running",
-                Lifecycle::Cancelling | Lifecycle::Revoking => "cancelling",
-                Lifecycle::Terminal if snapshot.stop_reason.is_some() => "cancelled",
-                Lifecycle::Terminal => "settled",
+            let state = if snapshot.journal_unknown {
+                "unknown"
+            } else {
+                match snapshot.lifecycle {
+                    Lifecycle::Running => "running",
+                    Lifecycle::Cancelling | Lifecycle::Revoking => "cancelling",
+                    Lifecycle::Terminal if snapshot.stop_reason.is_some() => "cancelled",
+                    Lifecycle::Terminal => "settled",
+                }
             };
             write!(
                 content,
@@ -146,6 +151,9 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
                     }
                 }
             }
+            if snapshot.journal_unknown {
+                content.push_str(" journal=unknown");
+            }
             if let Some(terminal) = terminal {
                 append_terminal(&mut content, terminal);
             }
@@ -159,6 +167,7 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
             tool,
             revision,
             state,
+            journal_unknown,
             terminal,
         } => {
             validate_reference(reference)?;
@@ -193,6 +202,9 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
                         content.push_str(" incomplete");
                     }
                 }
+            }
+            if journal_unknown {
+                content.push_str(" journal=unknown");
             }
             if let Some(terminal) = terminal {
                 append_terminal(&mut content, terminal);
@@ -292,6 +304,7 @@ mod tests {
             label: "bash".into(),
             lifecycle: Lifecycle::Terminal,
             stop_reason: None,
+            journal_unknown: false,
             sequence: 4,
             finished: 1,
             total: 1,
@@ -340,6 +353,7 @@ mod tests {
                     incomplete: true,
                 },
             },
+            journal_unknown: false,
             terminal: Some(unknown_terminal),
         };
         assert_eq!(render_plain(node, 512).unwrap(),
@@ -349,6 +363,7 @@ mod tests {
             tool: "bash",
             revision: 4,
             state: NodeState::Running { sequence: 10 },
+            journal_unknown: false,
             terminal: Some(unknown_terminal),
         };
         assert!(render_plain(invalid, 512).is_err());
@@ -368,6 +383,67 @@ mod tests {
 
     #[cfg(all(feature = "durable", feature = "batch"))]
     #[test]
+    fn journal_unknown_receipts_cannot_imply_running_or_settled_execution() {
+        use crate::filesystem::{job::Lifecycle, job::NodeState, job_manager::Snapshot};
+        let snapshot = Snapshot {
+            id: "unknown-1".into(),
+            label: "bash".into(),
+            lifecycle: Lifecycle::Running,
+            stop_reason: None,
+            journal_unknown: true,
+            sequence: 3,
+            finished: 0,
+            total: 1,
+            summary: None,
+            detail: None,
+        };
+        assert_eq!(
+            render_plain(
+                Receipt::JobStatus {
+                    reference: "j:unknown-1",
+                    snapshot: &snapshot,
+                    terminal: None,
+                    next: None,
+                },
+                512
+            )
+            .unwrap(),
+            "j:unknown-1 bash unknown rev=3 journal=unknown"
+        );
+        assert_eq!(
+            render_plain(
+                Receipt::NodeStatus {
+                    reference: "j:unknown-1/n:1",
+                    tool: "bash",
+                    revision: 3,
+                    state: NodeState::Running { sequence: 2 },
+                    journal_unknown: true,
+                    terminal: None,
+                },
+                512
+            )
+            .unwrap(),
+            "j:unknown-1/n:1 bash running rev=3 journal=unknown"
+        );
+        assert_eq!(
+            render_plain(
+                Receipt::NodeStatus {
+                    reference: "j:unknown-1/n:1",
+                    tool: "bash",
+                    revision: 3,
+                    state: NodeState::Pending,
+                    journal_unknown: true,
+                    terminal: None,
+                },
+                512
+            )
+            .unwrap(),
+            "j:unknown-1/n:1 bash waiting rev=3 journal=unknown"
+        );
+    }
+
+    #[cfg(all(feature = "durable", feature = "batch"))]
+    #[test]
     fn graph_node_receipt_preserves_exact_typed_state() {
         use crate::filesystem::{batch::Status, job::NodeState, status::Primary};
         let show = |state| {
@@ -377,6 +453,7 @@ mod tests {
                     tool: "bash",
                     revision: 9,
                     state,
+                    journal_unknown: false,
                     terminal: None,
                 },
                 512,
@@ -406,6 +483,7 @@ mod tests {
                 tool: "bash\nspoof",
                 revision: 9,
                 state: terminal,
+                journal_unknown: false,
                 terminal: None,
             },
             512
@@ -422,6 +500,7 @@ mod tests {
             label: "bash".into(),
             lifecycle: Lifecycle::Running,
             stop_reason: None,
+            journal_unknown: false,
             sequence: 3,
             finished: 0,
             total: 1,

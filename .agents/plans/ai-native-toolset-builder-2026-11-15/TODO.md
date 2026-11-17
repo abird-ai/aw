@@ -2,19 +2,24 @@
 
 Base AW: `62b8da6babfa729d6bbb9c21e75ac89c228b22b1`
 Authoritative design: [DESIGN.md](DESIGN.md)
+Merged implementation: `0d2b4e3` — `Build configurable toolset and harden shared Job control`.
+Current review HEAD: `7d09d5f`.
 
 ## Committed
 
-None.
+- [x] `0d2b4e3`: B1–B5, B7–B10, R1–R4 and P1–P4 are merged on
+  `main`. The historical checkpoint sections below intentionally retain their
+  pre-merge wording as provenance; they are not evidence that those slices are
+  still uncommitted.
 
-## Uncommitted
+## Open
 
-- [ ] B1. Implement immutable `Toolset::builder()` with small typed profiles, validated coherent defaults and engine ceiling checks, no dependency on host frameworks.
-- [ ] B2. One configured filesystem schema + request/grep engine source of truth, including per-field context validation and independent before/after; preserve direct/Graph parity.
-- [ ] B3. Canonical tool titles/descriptions, documented field metadata and configured limits, without copying execution logic or introducing generated aliases.
-- [ ] B4. Host-supplied timestamp and advisory checkpoint configuration for budgeted compact model **receipts**; typed results and raw outputs remain unchanged.
-- [ ] B5. Wire the shared factory into AW's canonical native tool descriptions and limits through existing adapter boundaries, without touching live Job ACK/authority flows.
 - [ ] B6. Targeted qualification and exact implementation handoff; then revisit AW/dotlink-specific public options and compact receipt grammar before dotlink cutover.
+- [ ] Product-specific receipt/timestamp/turn-horizon defaults and MCP metadata
+  adoption remain host decisions; the shared renderer must stay clock-free and
+  authority-free.
+- [ ] Job observation waits remain owned by the Job output/grep plan:
+  `jobs_get` settlement-only event wait and finite `jobs_read` byte/EOF wait.
 
 ## Working checkpoint — 2026-11-15 (uncommitted)
 
@@ -29,10 +34,10 @@ None.
 
 ## Current implementation extension — 2026-11-15
 
-- [ ] B7. Add builder-only `ToolText` overrides for title, main description, suffix and root/nested argument descriptions keyed by immutable `OperationId`; typed placeholder expansion from already-validated toolset limits.
-- [ ] B8. Reject malformed metadata and unknown argument paths; no schema/effect/name/authority mutations, no hidden tools made available.
-- [ ] B9. Wire per-tool metadata through real AW `LocalToolOptions::with_toolset` registration and delegate all execution/validation to the original Tool; confirm direct/Job/batch/shell descriptions are customized without changing tool results.
-- [ ] B10. Confirm single-file `edit` + existing Graph/multi-node composition, no new multi-file edit API; focused catalog and subset tests.
+- [x] B7. Add builder-only `ToolText` overrides for title, main description, suffix and root/nested argument descriptions keyed by immutable `OperationId`; typed placeholder expansion from already-validated toolset limits.
+- [x] B8. Reject malformed metadata and unknown argument paths; no schema/effect/name/authority mutations, no hidden tools made available.
+- [x] B9. Wire per-tool metadata through real AW `configure_with_toolset` registration and delegate all execution/validation to the original Tool; confirm direct/Job/batch/shell descriptions are customized without changing tool results.
+- [x] B10. Confirm single-file `edit` + existing Graph/multi-node composition, no new multi-file edit API; focused catalog and subset tests.
 
 ## Metadata hook checkpoint — 2026-11-15 (uncommitted)
 
@@ -46,10 +51,10 @@ None.
 
 ## Compact receipt phase — 2026-11-15
 
-- [ ] R1. Closed typed shared `Receipt` projection with Job snapshot + ACK fact variants; no arbitrary raw text receipt API or alternate Job state.
-- [ ] R2. Budget-safe optional `ts` via host-supplied UTC Unix seconds and immutable `ReceiptProfile`; no clock or raw-output decoration.
-- [ ] R3. Use the same formatter in AW `jobs_list/get` and appropriate constructor handoffs; no change to authority, replay, exact Job state or output delivery.
-- [ ] R4. End-to-end adjacent status/receipt tests, strict affected-crate lint, minimal feature build; checkpoint and stop before security/wait/ACK changes or dotlink implementation.
+- [x] R1. Closed typed shared `Receipt` projection with Job snapshot + ACK fact variants; no arbitrary raw text receipt API or alternate Job state.
+- [x] R2. Budget-safe optional `ts` via host-supplied UTC Unix seconds and immutable `ReceiptProfile`; no clock or raw-output decoration.
+- [x] R3. Use the same formatter in AW `jobs_list/get` and appropriate constructor handoffs; no change to authority, replay, exact Job state or output delivery.
+- [x] R4. End-to-end adjacent status/receipt tests, strict affected-crate lint and minimal feature build.
 
 ## Typed receipt checkpoint — 2026-11-15 (uncommitted)
 
@@ -71,9 +76,33 @@ None.
 
 ## Tests and verification
 
-- [ ] Validate preset/default/narrowed/invalid profiles and no feature/authority expansion.
-- [ ] Direct/Graph shared grep/schema parity and output-limit continuity.
-- [ ] Exact docs/title fields, including dynamic numbers and no undocumented properties/placeholder drift.
-- [ ] Factual timestamp/turn guidance and receipt-size/disabled-mode tests; no raw payload decoration.
-- [ ] `cargo fmt --check`, strict `aw-tools` Clippy, targeted `aw-tools` + `aw-tools-adapter` relevant suites, feature builds.
-- [ ] Verify independent existing dirty work untouched; no commit/push/version/pin change.
+- [x] Validate preset/default/narrowed/invalid profiles and no feature/authority expansion.
+- [x] Direct/Graph shared grep/schema parity and output-limit continuity.
+- [x] Exact docs/title fields, including dynamic numbers and no undocumented properties/placeholder drift.
+- [~] Shared receipt timestamp/size/disabled-mode behavior is qualified; actual
+  product timestamp/turn-horizon selection remains open above.
+- [x] `cargo fmt --check`, strict affected-crate Clippy, targeted
+  `aw-tools` + `aw-tools-adapter` suites and minimal feature build.
+- [x] Merge review preserves independent work; no push/version/pin change.
+
+## Post-merge review — 2026-11-16
+
+- [x] Revalidated merged commit `0d2b4e3` from current `7d09d5f`: Toolset
+  subsets constrain both direct registration and Graph native leaves; metadata
+  wrappers remain projection-only and delegate original validation/execution;
+  AW ToolMode/selection/ToolPolicy/Actor authority remain independent.
+- [x] Fixed four Rust-1.98 strict-Clippy `chunks_exact(2)` findings in shared
+  hex/digest parsing using `slice::as_chunks::<2>()`. Rust documents that API
+  as stable since 1.88, matching the declared repository MSRV.
+- [x] Fixed stale hard-coded Job-profile diagnostics: tail and wait validation
+  already used configured ceilings but no longer falsely reports fixed
+  1024-byte/30-second limits.
+- [x] Fresh stable-tree gates: `aw-tools` **327/327**,
+  `aw-tools-adapter` **242/242**, Agent core **90 passed / 1 ignored**,
+  read-only Toolset **9/9**, minimal `aw-tools`, strict affected-crate
+  all-target/all-feature Clippy, rustfmt, plus downstream `aw-mcp`,
+  `aw-host` and `aw-cli --lib` checks.
+- [ ] B6 still owns cross-product product defaults and dotlink adoption. In
+  particular, define/document product-neutral shared grep hard maxima before a
+  consumer intentionally configures work budgets above AW's default ceilings;
+  do not invent those caps in an AW-only review.

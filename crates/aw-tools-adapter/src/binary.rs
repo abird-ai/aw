@@ -53,7 +53,9 @@ impl Encoding {
                     return Err(Error::Denied("invalid hex"));
                 }
                 data.as_bytes()
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| {
                         let text =
                             std::str::from_utf8(pair).map_err(|_| Error::Denied("invalid hex"))?;
@@ -308,7 +310,7 @@ fn parse_sha256(value: &str) -> Result<[u8; 32]> {
         return Err(Error::Denied("sha256 must be 64 hexadecimal characters"));
     }
     let mut digest = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair =
             std::str::from_utf8(pair).map_err(|_| Error::Denied("sha256 must be hexadecimal"))?;
         digest[index] = u8::from_str_radix(pair, 16)

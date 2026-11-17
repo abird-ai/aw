@@ -42,6 +42,11 @@ impl HandoffGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
+    fn retire_inline(&mut self) -> Result<()> {
+        self.host.discard_unexposed_terminal(&self.id)?;
+        self.disarm();
+        Ok(())
+    }
 }
 impl Drop for HandoffGuard {
     fn drop(&mut self) {
@@ -322,6 +327,10 @@ impl Tool for JobShell {
                     ));
                 }
             };
+            if snapshot.journal_unknown {
+                handoff.expose()?;
+                return handoff_receipt(&started.host, &started.id, &snapshot);
+            }
             let (result, _) =
                 Self::retained_text(&started.host, &started.id, OutputStream::Result)?;
             let (stdout, stdout_truncated) =
@@ -354,8 +363,7 @@ impl Tool for JobShell {
                 }
                 _ => {
                     direct.validate()?;
-                    handoff.disarm();
-                    started.host.discard_unexposed_terminal(&started.id)?;
+                    handoff.retire_inline()?;
                     Ok(direct)
                 }
             }
@@ -485,6 +493,10 @@ impl Tool for Batch {
                     ));
                 }
             };
+            if snapshot.journal_unknown {
+                handoff.expose()?;
+                return handoff_receipt(&started.host, &started.id, &snapshot);
+            }
             let rendered = started
                 .host
                 .manager()
@@ -500,8 +512,7 @@ impl Tool for Batch {
                     truncated: false,
                 };
                 output.validate()?;
-                handoff.disarm();
-                started.host.discard_unexposed_terminal(&started.id)?;
+                handoff.retire_inline()?;
                 return Ok(output);
             }
             handoff.expose()?;
@@ -1224,6 +1235,7 @@ mod tests {
             label: "graph".into(),
             lifecycle: Lifecycle::Running,
             stop_reason: None,
+            journal_unknown: false,
             sequence: 1,
             finished: 1,
             total: 4,
@@ -1359,6 +1371,36 @@ mod tests {
             live_step_gate: None,
         };
         (root, agent, runtime, ctx)
+    }
+
+    #[test]
+    fn failed_inline_retirement_keeps_handoff_guard_armed_and_exposes_same_job() {
+        let (root, _agent, runtime, ctx) = fixture();
+        let host = runtime.host_for(&ctx).unwrap();
+        let prepared = host
+            .prepare(
+                &ctx,
+                &json!({"ops":[["read",{"path":"a.txt","numbered":false}]]}),
+            )
+            .unwrap();
+        let id = host.admit(prepared).unwrap();
+        assert!(matches!(
+            host.manager().get(&id),
+            Err(aw_tools::filesystem::job_manager::Error::NotExposed)
+        ));
+        {
+            let mut handoff = HandoffGuard::new(host.clone(), id.clone());
+            assert!(
+                handoff.retire_inline().is_err(),
+                "a running hidden Job is not eligible for optimistic retirement"
+            );
+        }
+        let snapshot = host.manager().get(&id).unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Running
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -2116,6 +2158,594 @@ mod tests {
                 "current Actor Envelope forbids this exact peer tool",
             ))
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unknown_journal_get_returns_promptly_and_read_wait_does_not_claim_eof() {
+        use aw_tools::filesystem::{
+            job::{JournalError, NodeState},
+            job_manager::Error as SharedError,
+        };
+        let (root, _agent, runtime, mut ctx, shell) = shell_fixture();
+        ctx.call_id = "unknown-journal-observer".into();
+        let started = JobShell::new(runtime.clone(), shell)
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "command":"sleep 0.90; printf late", "background":true
+                }),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&started.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let reference = host.execution_ref(&id, None).unwrap().canonical();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        loop {
+            if matches!(
+                host.manager().node_state(&id, 1).unwrap(),
+                NodeState::Running { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Process did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let current = host.manager().get(&id).unwrap();
+        assert_eq!(
+            host.manager().cancel(&id, current.sequence + 1, |_, _| Err(
+                JournalError::OutcomeUnknown
+            ),),
+            Err(SharedError::Job(
+                aw_tools::filesystem::job::Error::JournalUnknown
+            ))
+        );
+        assert!(host.manager().get(&id).unwrap().journal_unknown);
+        assert_eq!(
+            host.manager().get(&id).unwrap().lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Running,
+            "journal uncertainty cannot claim terminal execution"
+        );
+
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(350),
+            get.execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"tail":0,"wait_ms":1200
+                }),
+            ),
+        )
+        .await
+        .expect("journal-fenced get must not wait for settlement")
+        .unwrap();
+        assert!(result.content.contains("unknown"), "{}", result.content);
+        assert!(
+            result.content.contains("journal=unknown"),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains("settled"), "{}", result.content);
+
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        let rejected = tokio::time::timeout(
+            std::time::Duration::from_millis(350),
+            read.execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"stdout","offset":0,"limit":128,"wait_ms":1200
+                }),
+            ),
+        )
+        .await
+        .expect("unready output must not wait to deadline after journal fence");
+        assert!(
+            matches!(
+                rejected,
+                Err(Error::Conflict(
+                    "Job journal outcome unknown; reconcile before waiting for output"
+                ))
+            ),
+            "{rejected:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(950)).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finite_jobs_get_waits_for_settlement_not_output_or_revision() {
+        let (root, _agent, runtime, mut ctx, shell) = shell_fixture();
+        ctx.call_id = "wait-settlement".into();
+        let handoff = JobShell::new(runtime.clone(), shell)
+            .execute(
+                ctx.clone(),
+                &json!({"command":"printf early; sleep 0.30; printf late", "background":true}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&handoff.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let reference = host.execution_ref(&id, None).unwrap().canonical();
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        // A short deadline returns the current status, even if output arrived
+        // and the original rev=1 is stale. It is not a revision wait.
+        let deadline = get
+            .execute(
+                ctx.clone(),
+                &json!({"ref":reference,"rev":1,"wait_ms":35,"tail":0}),
+            )
+            .await
+            .unwrap();
+        assert!(deadline.content.contains("running"), "{}", deadline.content);
+
+        let settled = get
+            .execute(
+                ctx.clone(),
+                &json!({"ref":reference,"rev":1,"wait_ms":1500,"tail":0}),
+            )
+            .await
+            .unwrap();
+        assert!(settled.content.contains("settled"), "{}", settled.content);
+        assert_eq!(
+            host.manager().get(&id).unwrap().lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finite_job_wait_cancellation_does_not_cancel_the_underlying_process() {
+        let (root, _agent, runtime, mut ctx, shell) = shell_fixture();
+        ctx.call_id = "wait-cancel".into();
+        let handoff = JobShell::new(runtime.clone(), shell)
+            .execute(
+                ctx.clone(),
+                &json!({"command":"sleep 0.55; printf survived", "background":true}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&handoff.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let reference = host.execution_ref(&id, None).unwrap().canonical();
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+
+        let mut observer = ctx.clone();
+        observer.cancellation = CancellationToken::new();
+        let cancel = observer.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            cancel.cancel();
+        });
+        assert!(matches!(
+            get.execute(
+                observer,
+                &json!({
+                    "ref":reference, "tail":0, "wait_ms":1100,
+                })
+            )
+            .await,
+            Err(Error::Cancelled)
+        ));
+
+        let mut observer = ctx.clone();
+        observer.cancellation = CancellationToken::new();
+        let cancel = observer.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            cancel.cancel();
+        });
+        assert!(matches!(
+            read.execute(
+                observer,
+                &json!({
+                    "ref":reference, "view":"stdout", "offset":0,
+                    "limit":64, "wait_ms":1100,
+                })
+            )
+            .await,
+            Err(Error::Cancelled)
+        ));
+        // A separate observer's cancellation must not cancel or ACK the
+        // actual Process. The original execution still settles normally.
+        let complete = get
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference, "tail":0, "wait_ms":1100
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(complete.content.contains("settled"), "{}", complete.content);
+        let data = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference, "view":"stdout", "offset":0,
+                    "limit":64, "wait_ms":0,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(data.content, "survived");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn node_get_waits_for_its_own_settlement_without_waiting_for_graph_root() {
+        let (root, _agent, runtime, mut ctx, _shell) = shell_fixture();
+        ctx.call_id = "wait-graph-node".into();
+        let handoff = Batch::new(runtime.clone())
+            .execute(
+                ctx.clone(),
+                &json!({"ops":[
+                ["bash",{"command":"printf first"},"*"],
+                ["bash",{"command":"sleep 0.65; printf second"},"*"]
+            ],"background":true}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&handoff.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let node = host.execution_ref(&id, Some(1)).unwrap().canonical();
+        let root_ref = host.execution_ref(&id, None).unwrap().canonical();
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        let first = get
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":node,"rev":1,"wait_ms":1500,"tail":0
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(first.content.contains("settled"), "{}", first.content);
+        assert_eq!(
+            host.manager().get(&id).unwrap().lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Running,
+            "a settled node should not require unrelated sibling settlement"
+        );
+        let whole = get
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":root_ref,"rev":1,"wait_ms":1500,"tail":0
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(whole.content.contains("settled"), "{}", whole.content);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skipped_node_read_does_not_wait_for_sibling() {
+        let (root, _agent, runtime, mut ctx, _shell) = shell_fixture();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        ctx.call_id = "skipped-node-read".into();
+        let started = Batch::new(runtime.clone())
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ops":[
+                        ["bash", {"command":"false"}, "*"],
+                        ["read", {"path":"a.txt","numbered":false}, "1.ok"],
+                        ["bash", {"command":"sleep 1.2; printf sibling"}, "*"]
+                    ],
+                    "background":true
+                }),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&started.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let node = host.execution_ref(&id, Some(2)).unwrap().canonical();
+        let get =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Get);
+        let status = get
+            .execute(ctx.clone(), &json!({"ref":node,"tail":0,"wait_ms":1000}))
+            .await
+            .unwrap();
+        assert!(status.content.contains("settled"), "{}", status.content);
+        assert_eq!(
+            host.manager().get(&id).unwrap().lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Running
+        );
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            read.execute(
+                ctx.clone(),
+                &json!({
+                    "ref":node,"view":"result","offset":0,"limit":64,"wait_ms":1200
+                }),
+            ),
+        )
+        .await
+        .expect("settled node read must not wait for sibling");
+        assert!(matches!(
+            outcome,
+            Err(Error::Denied("Job output view is unavailable"))
+        ));
+        assert_eq!(
+            host.manager().get(&id).unwrap().lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Running
+        );
+        // Finish an exact settled Skip with no output streams while its
+        // independent sibling still runs. No false missing-output error.
+        let ack =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Ack);
+        let finished = ack
+            .execute(ctx.clone(), &json!({"ref":node}))
+            .await
+            .unwrap();
+        assert_eq!(finished.content, "unchanged ack=all released=true");
+        let again = ack
+            .execute(ctx.clone(), &json!({"ref":node}))
+            .await
+            .unwrap();
+        assert_eq!(again.content, finished.content);
+        assert!(
+            ack.execute(ctx.clone(), &json!({"ref":node,"view":"result"}))
+                .await
+                .is_err(),
+            "an explicit nonexistent output stream is still invalid"
+        );
+        let root_ref = host.execution_ref(&id, None).unwrap().canonical();
+        let whole = get
+            .execute(
+                ctx.clone(),
+                &json!({"ref":root_ref,"tail":0,"wait_ms":1500}),
+            )
+            .await
+            .unwrap();
+        assert!(whole.content.contains("settled"), "{}", whole.content);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_attached_graph_result_wakes_reader_and_only_credits_delivery() {
+        use aw_tools::filesystem::job_manager::OutputStream;
+        let (root, _agent, runtime, mut ctx, _shell) = shell_fixture();
+        fs::write(root.join("a.txt"), "late-result").unwrap();
+        ctx.call_id = "late-attach-graph".into();
+        let started = Batch::new(runtime.clone())
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ops":[
+                        ["bash",{"command":"sleep 0.30"},"*"],
+                        ["read",{"path":"a.txt","numbered":false},"1.ok"]
+                    ],"background":true
+                }),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&started.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let node = host.execution_ref(&id, Some(2)).unwrap().canonical();
+        assert!(
+            matches!(
+                host.manager().output_summary(&id, 2, OutputStream::Result),
+                Err(aw_tools::filesystem::job_manager::Error::OutputMissing)
+            ),
+            "dependent result must not be attached before predecessor completes"
+        );
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read.execute(
+                ctx.clone(),
+                &json!({
+                    "ref":node,"view":"result","offset":0,"limit":128,"wait_ms":1500
+                }),
+            ),
+        )
+        .await
+        .expect("late output attachment must wake the reader")
+        .unwrap();
+        assert_eq!(output.content, "late-result");
+        let owner = host.manager().job_output_owner(&id).unwrap();
+        let state = host
+            .manager()
+            .output_owner_state(&id, 2, OutputStream::Result, owner)
+            .unwrap();
+        assert_eq!(state.through, 0, "delivery is not an ACK");
+        assert!(!state.acknowledged);
+        // A successful page makes exactly its projected raw prefix eligible
+        // for an *explicit* ACK; the page itself does not acknowledge.
+        host.manager()
+            .acknowledge_delivered_output(
+                &id,
+                2,
+                OutputStream::Result,
+                owner,
+                b"late-result".len() as u64,
+            )
+            .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revoking_read_during_stream_wait_prevents_secret_delivery_or_credit() {
+        use aw_tools::filesystem::job_manager::OutputStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (root, _agent, runtime, mut ctx, shell) = shell_fixture();
+        ctx.call_id = "revoke-mid-wait".into();
+        let started = JobShell::new(runtime.clone(), shell)
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "command":"sleep 0.35; printf NEVER_DELIVER",
+                    "background":true
+                }),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&started.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let reference = host.execution_ref(&id, None).unwrap().canonical();
+        let gate = Arc::new(LiveEnvelopeGate {
+            read: AtomicBool::new(true),
+            ack: AtomicBool::new(false),
+        });
+        ctx.live_step_gate = Some(gate.clone());
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        let observer = tokio::spawn(async move {
+            read.execute(
+                ctx,
+                &json!({
+                    "ref":reference,"view":"stdout","offset":0,"limit":128,"wait_ms":1500
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        gate.read.store(false, Ordering::Release);
+        let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), observer)
+            .await
+            .expect("read wait must finish on byte arrival")
+            .unwrap();
+        assert!(
+            matches!(
+                rejected,
+                Err(Error::Denied("Job payload authority revoked while waiting"))
+                    | Err(Error::Denied(
+                        "Job output authority revoked before delivery"
+                    ))
+                    | Err(Error::Denied("Job payload authority is not live"))
+            ),
+            "{rejected:?}"
+        );
+        let owner = host.manager().job_output_owner(&id).unwrap();
+        let state = host
+            .manager()
+            .output_owner_state(&id, 1, OutputStream::Stdout, owner)
+            .unwrap();
+        assert_eq!(state.through, 0);
+        assert!(!state.acknowledged);
+        assert_eq!(
+            host.manager()
+                .acknowledge_delivered_output(&id, 1, OutputStream::Stdout, owner, 1),
+            Err(aw_tools::filesystem::job_manager::Error::InvalidOutput),
+            "revoked waiting read never certifies any secret byte",
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finite_jobs_read_waits_for_bytes_then_eof_without_ack() {
+        use aw_tools::filesystem::job_manager::OutputStream;
+        let (root, _agent, runtime, mut ctx, shell) = shell_fixture();
+        ctx.call_id = "wait-stream".into();
+        let handoff = JobShell::new(runtime.clone(), shell)
+            .execute(
+                ctx.clone(),
+                &json!({"command":"sleep 0.10; printf chunk-one; sleep 0.28", "background":true}),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&handoff.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let reference = host.execution_ref(&id, None).unwrap().canonical();
+        let owner = host.manager().job_output_owner(&id).unwrap();
+        let read =
+            crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
+        let first = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"stdout","offset":0,
+                    "limit":64,"wait_ms":1000
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !first.is_error && first.content.contains("chunk-one"),
+            "{}",
+            first.content
+        );
+        // Waiting/reading does not ACK; only the bounded result projection
+        // grants its exact retained prefix.
+        let span = b"chunk-one".len() as u64;
+        let ack = host.manager().acknowledge_delivered_output(
+            &id,
+            1,
+            OutputStream::Stdout,
+            owner,
+            span + 1,
+        );
+        assert!(ack.is_err());
+
+        let eof = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"stdout","offset":span,
+                    "limit":64,"wait_ms":1000
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!eof.is_error, "{}", eof.content);
+        assert_eq!(eof.content, "");
+        assert!(
+            host.manager()
+                .output_summary(&id, 1, OutputStream::Stdout,)
+                .unwrap()
+                .1,
+            "writer must have closed before byte wait finishes"
+        );
+        assert!(matches!(
+            read.execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"stdout","offset":-3,
+                    "limit":64,"wait_ms":1
+                })
+            )
+            .await,
+            Err(Error::Denied(
+                "negative-offset jobs_read is an immediate tail snapshot"
+            ))
+        ));
+        let tail = read
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ref":reference,"view":"stdout","offset":-3,
+                    "limit":64,"wait_ms":0
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tail.content, "one");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
