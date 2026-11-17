@@ -4,10 +4,11 @@ Base AW: `53206b2`; dotlink: `fc53fc9` plus uncommitted tool-hardening tree.
 
 Design/decisions: [README.md](README.md).
 
-## AW post-merge status — 2026-11-16
+## AW post-merge status — 2026-11-18
 
-- Current AW `main` is `7d09d5f`; the newer shared-tool merge is
-  `0d2b4e3` (`Build configurable toolset and harden shared Job control`).
+- Current AW `main` is `7e6fe20`; the shared-tool merge is
+  `0d2b4e3` (`Build configurable toolset and harden shared Job control`) with
+  reviewed follow-ups through `7e6fe20` (`Align shared Job list metadata`).
 - The 2026-11-09 `4a23e92` / `55d93db` entries below remain historical
   **dotlink consumer pins**, not the current AW shared-tool implementation.
 - `0d2b4e3` adds the validated Toolset/metadata/receipt layer and hardens
@@ -17,11 +18,15 @@ Design/decisions: [README.md](README.md).
   both honor the same Toolset subset; metadata wrappers delegate validation and
   execution unchanged; ToolPolicy + live Actor gates remain independent from
   catalog metadata.
-- Dotlink must **not** be assumed current with these post-2026-11-09 additions
-  until its dependent plan explicitly consumes/reviews the newer AW revision.
-- Still-open shared semantics before calling the newer Job-output contract
-  complete: event-driven settlement-only `jobs_get.wait_ms` and byte/EOF-aware
-  finite `jobs_read.wait_ms`.
+- Dotlink `main` is published at `5381729` (`Complete shared Toolset metadata
+  adoption`) and consumes exact AW `7e6fe20`; D1-D4 and B6 are qualified.
+- Event-driven settlement-only `jobs_get.wait_ms`, byte/EOF-aware finite
+  `jobs_read.wait_ms`, output-owner ACK/Finish and Toolset metadata convergence
+  are complete. Do not re-open them from older unchecked boxes below.
+- Typed MCP **wire/result preservation** is now complete in `aw-mcp`: bounded
+  `McpToolResult` preserves Text/Image/Audio/Resource/ResourceLink blocks while
+  the ordinary Agent `ToolOutput` path still rejects non-text blocks. Provider-
+  native media delivery/consent remains a separate feature.
 
 ## Current convergence status — 2026-11-09
 
@@ -53,8 +58,9 @@ It points to the full dotlink-owned handoff.
 - [!] Fresh Windows cross verification is environment-blocked before AW source
   by a dangling cached Windows std sysroot; native Windows/macOS remain release
   gates.
-- [ ] Typed provider/MCP media and separately authorized sandbox runtime remain
-  separate features, not blockers for shared filesystem convergence.
+- [~] Provider-native Agent media delivery and separately authorized sandbox
+  runtime remain separate features, not blockers for shared filesystem
+  convergence. MCP wire/media preservation itself is complete below.
 
 ## Committed
 
@@ -78,10 +84,12 @@ It points to the full dotlink-owned handoff.
 
 - [ ] Native Windows compile/tests including DACL preservation/recovery (no
   Windows target in current environment)
-- [ ] Typed media `bread` transport/ToolOutput support (requires separate
-  kernel-safe media contract; not part of native text tools)
-- [ ] Dotlink wire interoperability fixtures through AW's `aw-mcp` client
-  (separate external-source authorization remains mandatory)
+- [~] Typed media `bread` transport is complete through bounded `aw-mcp`
+  `McpToolResult`; ordinary Agent `ToolOutput` remains intentionally text-only
+  pending a separate kernel/provider media-consent contract.
+- [x] Dotlink wire interoperability fixture through AW's `aw-mcp` client:
+  real stdio `bread(format=mcp)` preserves PNG image, WAV audio and PDF embedded
+  resource blocks; separate external-source authorization remains mandatory.
 
 ## Tests and verification
 
@@ -115,14 +123,41 @@ It points to the full dotlink-owned handoff.
 - [x] Linux mandatory no-symlink/no-cross-mount `openat2`; Windows named
   kernel mutex coordination and ACL-preserving staged publication source.
 - [x] Additional source-level compatibility and adversarial regression tests.
-- [ ] Typed `bread` MCP ContentBlock media, distinct from encoded native JSON
-  (requires explicit Agent/provider data contract; preserve existing policy).
+- [~] Typed `bread` MCP ContentBlock wire/result preservation is implemented
+  and qualified; actual Agent/provider media delivery still requires an
+  explicit data/consent contract and must preserve existing policy.
 - [ ] Host-selected sandbox execution separate from `trusted` Process:
   Bubblewrap mounts/network/security require dedicated platform validation.
 - [ ] Windows/macOS native compile/runtime, ACL/recovery, process/mutex and
   unsupported platform checks.
-- [ ] Cross-repo live MCP wire/media interoperability under AW's exact-source
-  authorization, not remote read-only hints.
+- [x] Cross-repo live MCP wire/media interoperability: AW `aw-mcp` connected to
+  exact published dotlink `5381729` over real stdio and preserved typed PNG,
+  WAV and PDF/resource blocks. The text-only Agent path rejects the same
+  non-text result instead of flattening it; no remote read-only hint grants
+  authority.
+
+## Typed MCP wire/media checkpoint — 2026-11-18
+
+- [x] Added bounded public `aw_mcp::McpToolResult` with
+  `TryFrom<CallToolResponse>` for complete MCP results. It preserves current
+  RMCP Text/Image/Audio/Resource/ResourceLink blocks plus structured content,
+  caps block count at 32 and semantic payload at the existing 128 KiB tool
+  result ceiling, and independently caps block metadata overhead.
+- [x] Existing text-only conversion is factored through the bounded parser and
+  remains fail-closed on any non-text block. `RemoteTool::execute` therefore
+  does **not** start sending media to the Agent/provider as a side effect of
+  this wire-level work.
+- [x] Synthetic regressions prove typed image preservation, text-path media
+  rejection, excess block rejection and oversized media rejection.
+- [x] Real L5 cross-repo stdio regression uses a private temporary dotlink
+  profile and exact dotlink `5381729` binary. `bread(format=mcp)` preserves
+  PNG `image/png`, WAV `audio/wav`, and PDF embedded-resource
+  `application/pdf` blocks through the AW MCP client.
+- [x] Qualification: `aw-mcp` **18/18**, strict all-target Clippy `-D warnings`,
+  `cargo check -p aw-cli --lib`, rustfmt and `git diff --check` green.
+- [ ] Provider-native/model-visible media content, durable media receipts and
+  explicit provider/device consent remain separate. Do not put media into
+  `ToolOutput`/conversation history until that design is authorized.
 
 ## Parity validation
 

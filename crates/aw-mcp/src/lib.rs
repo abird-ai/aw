@@ -22,7 +22,7 @@ use aw_tools::{
 use futures_util::StreamExt as _;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, ClientConfig, ContentBlock,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientConfig, ContentBlock,
         PaginatedRequestParams, ProtocolVersion, RequestMetaObject,
     },
     service::RunningService,
@@ -49,6 +49,8 @@ use zeroize::Zeroizing;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_START_META_KEY: &str = "io.abird.aw/remoteStart";
+const MAX_MCP_RESULT_BLOCKS: usize = 32;
+const MAX_MCP_BLOCK_METADATA_BYTES: usize = 16 * 1024;
 
 fn label(s: &str, max: usize) -> bool {
     !s.is_empty()
@@ -396,46 +398,119 @@ impl Drop for Connection {
         }
     }
 }
-fn tool_output_from_response(response: CallToolResponse) -> Result<ToolOutput> {
-    let response = match response {
-        CallToolResponse::Complete(response) => response,
-        _ => {
-            return Err(Error::Denied(
-                "MCP interactive/task result needs separate authorization",
-            ));
-        }
-    };
-    let mut content = String::new();
-    for item in response.content {
-        let ContentBlock::Text(text) = item else {
-            return Err(Error::Denied(
-                "non-text MCP tool output requires explicit media handler",
-            ));
+
+/// Bounded raw MCP result, preserving provider-native content blocks without
+/// granting them to AW's text-only Agent/tool-result path.
+#[derive(Clone, Debug)]
+pub struct McpToolResult {
+    pub content: Vec<ContentBlock>,
+    pub structured_content: Option<Value>,
+    pub is_error: bool,
+}
+
+impl McpToolResult {
+    fn payload_len(block: &ContentBlock) -> Result<usize> {
+        let primary = match block {
+            ContentBlock::Text(text) => text.text.len(),
+            ContentBlock::Image(image) => image.data.len().saturating_add(image.mime_type.len()),
+            ContentBlock::Audio(audio) => audio.data.len().saturating_add(audio.mime_type.len()),
+            ContentBlock::Resource(resource) => serde_json::to_vec(resource)
+                .map(|bytes| bytes.len())
+                .map_err(|_| Error::Protocol("invalid embedded MCP resource result"))?,
+            ContentBlock::ResourceLink(resource) => serde_json::to_vec(resource)
+                .map(|bytes| bytes.len())
+                .map_err(|_| Error::Protocol("invalid MCP resource-link result"))?,
+            _ => return Err(Error::Denied("unsupported MCP tool result content block")),
         };
-        if content.len().saturating_add(text.text.len() + 1) > MAX_TOOL_RESULT_BYTES {
-            return Err(Error::Limit("MCP response exceeds 128 KiB"));
+        let encoded = serde_json::to_vec(block)
+            .map_err(|_| Error::Protocol("invalid MCP tool result content block"))?
+            .len();
+        if encoded > primary.saturating_add(MAX_MCP_BLOCK_METADATA_BYTES) {
+            return Err(Error::Limit("MCP content-block metadata exceeds 16 KiB"));
         }
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(&text.text);
+        Ok(primary)
     }
-    if let Some(value) = response.structured_content {
-        let text = serde_json::to_string(&value)
-            .map_err(|_| Error::Protocol("invalid structured MCP result"))?;
-        if content.len().saturating_add(text.len() + 1) > MAX_TOOL_RESULT_BYTES {
-            return Err(Error::Limit("MCP structured output too large"));
+
+    fn from_complete(response: CallToolResult) -> Result<Self> {
+        if response.content.len() > MAX_MCP_RESULT_BLOCKS {
+            return Err(Error::Limit("too many MCP tool result content blocks"));
         }
-        if !content.is_empty() {
-            content.push('\n');
+        let mut total = 0usize;
+        for block in &response.content {
+            total = total
+                .checked_add(Self::payload_len(block)?)
+                .ok_or(Error::Limit("MCP tool result size overflow"))?;
+            if total > MAX_TOOL_RESULT_BYTES {
+                return Err(Error::Limit("MCP response exceeds 128 KiB"));
+            }
         }
-        content.push_str(&text);
+        if let Some(value) = &response.structured_content {
+            let structured = serde_json::to_vec(value)
+                .map_err(|_| Error::Protocol("invalid structured MCP result"))?;
+            total = total
+                .checked_add(structured.len())
+                .ok_or(Error::Limit("MCP tool result size overflow"))?;
+            if total > MAX_TOOL_RESULT_BYTES {
+                return Err(Error::Limit("MCP structured output too large"));
+            }
+        }
+        Ok(Self {
+            content: response.content,
+            structured_content: response.structured_content,
+            is_error: response.is_error.unwrap_or(false),
+        })
     }
-    Ok(ToolOutput {
-        content,
-        is_error: response.is_error.unwrap_or(false),
-        truncated: false,
-    })
+
+    fn into_text_output(self) -> Result<ToolOutput> {
+        let mut content = String::new();
+        for item in self.content {
+            let ContentBlock::Text(text) = item else {
+                return Err(Error::Denied(
+                    "non-text MCP tool output requires explicit media handler",
+                ));
+            };
+            if content.len().saturating_add(text.text.len() + 1) > MAX_TOOL_RESULT_BYTES {
+                return Err(Error::Limit("MCP response exceeds 128 KiB"));
+            }
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&text.text);
+        }
+        if let Some(value) = self.structured_content {
+            let text = serde_json::to_string(&value)
+                .map_err(|_| Error::Protocol("invalid structured MCP result"))?;
+            if content.len().saturating_add(text.len() + 1) > MAX_TOOL_RESULT_BYTES {
+                return Err(Error::Limit("MCP structured output too large"));
+            }
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&text);
+        }
+        Ok(ToolOutput {
+            content,
+            is_error: self.is_error,
+            truncated: false,
+        })
+    }
+}
+
+impl TryFrom<CallToolResponse> for McpToolResult {
+    type Error = Error;
+
+    fn try_from(response: CallToolResponse) -> Result<Self> {
+        match response {
+            CallToolResponse::Complete(response) => Self::from_complete(response),
+            _ => Err(Error::Denied(
+                "MCP interactive/task result needs separate authorization",
+            )),
+        }
+    }
+}
+
+fn tool_output_from_response(response: CallToolResponse) -> Result<ToolOutput> {
+    McpToolResult::try_from(response)?.into_text_output()
 }
 
 #[derive(Clone)]
@@ -666,45 +741,7 @@ impl Tool for RemoteTool {
             // Notifications during a remote call invalidate its cached
             // descriptor, rather than silently applying it after the fact.
             self.validate(args)?;
-            let response = match response {
-                CallToolResponse::Complete(response) => response,
-                _ => {
-                    return Err(Error::Denied(
-                        "MCP interactive/task result needs separate authorization",
-                    ))
-                }
-            };
-            let mut content = String::new();
-            for item in response.content {
-                let ContentBlock::Text(text) = item else {
-                    return Err(Error::Denied(
-                        "non-text MCP tool output requires explicit media handler",
-                    ));
-                };
-                if content.len().saturating_add(text.text.len() + 1) > MAX_TOOL_RESULT_BYTES {
-                    return Err(Error::Limit("MCP response exceeds 128 KiB"));
-                }
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&text.text);
-            }
-            if let Some(value) = response.structured_content {
-                let text = serde_json::to_string(&value)
-                    .map_err(|_| Error::Protocol("invalid structured MCP result"))?;
-                if content.len().saturating_add(text.len() + 1) > MAX_TOOL_RESULT_BYTES {
-                    return Err(Error::Limit("MCP structured output too large"));
-                }
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&text);
-            }
-            Ok(ToolOutput {
-                content,
-                is_error: response.is_error.unwrap_or(false),
-                truncated: false,
-            })
+            tool_output_from_response(response)
         })
     }
 }
@@ -1332,6 +1369,191 @@ mod tests {
         },
     };
     use serde_json::json;
+
+    #[test]
+    fn typed_mcp_results_preserve_media_while_text_tool_output_fails_closed() {
+        let image = CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::image(
+            "aW1hZ2U=",
+            "image/png",
+        )]));
+        let typed = McpToolResult::try_from(image).unwrap();
+        assert_eq!(typed.content.len(), 1);
+        let ContentBlock::Image(image) = &typed.content[0] else {
+            panic!("expected image block");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.data, "aW1hZ2U=");
+
+        let media = CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::audio(
+            "YXVkaW8=",
+            "audio/wav",
+        )]));
+        assert!(
+            tool_output_from_response(media).is_err(),
+            "text-only Agent path must not silently flatten typed media"
+        );
+    }
+
+    #[test]
+    fn typed_mcp_results_are_bounded_before_host_media_handling() {
+        let too_many = CallToolResponse::Complete(CallToolResult::success(
+            (0..=MAX_MCP_RESULT_BLOCKS)
+                .map(|_| ContentBlock::text("x"))
+                .collect(),
+        ));
+        assert!(McpToolResult::try_from(too_many).is_err());
+
+        let oversized =
+            CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::image(
+                "x".repeat(MAX_TOOL_RESULT_BYTES),
+                "image/png",
+            )]));
+        assert!(McpToolResult::try_from(oversized).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_dotlink_stdio_preserves_typed_bread_media_outside_agent_path() {
+        use rmcp::model::ResourceContents;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let Some(dotlink) = std::env::var_os("AW_DOTLINK_STDIO_TEST_BIN") else {
+            return;
+        };
+        let dotlink = PathBuf::from(dotlink);
+        assert!(
+            dotlink.is_absolute() && dotlink.is_file(),
+            "dotlink test binary"
+        );
+
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "aw-mcp-dotlink-media-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(nonce)
+        ));
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        let cleanup = Cleanup(root.clone());
+
+        let config = root.join("config.jsonc");
+        let config_json = json!({
+            "version": 10,
+            "transports": {
+                "openai": false, "stdio": true, "http": false,
+                "http_bind": "127.0.0.1:3000", "http_ephemeral_url": false,
+                "ngrok": false, "ngrok_domain": null, "ngrok_ephemeral_url": false
+            },
+            "oauth": {"enabled": false, "public_url": null},
+            "permissions": {
+                "default_allow": false,
+                "allow_read": [root.to_string_lossy()],
+                "allow_write": [], "allow_rw": [],
+                "deny_read": [], "deny_write": [], "deny_rw": [],
+                "allow_shell": false, "allow_network": false
+            },
+            "caches": [],
+            "tunnel_id": null,
+            "organization_id": null,
+            "base_url": "https://api.openai.com",
+            "max_shell_timeout_secs": 30,
+            "max_output_bytes": 65536,
+            "max_read_bytes": 65536,
+            "max_write_bytes": 65536
+        });
+        std::fs::write(&config, serde_json::to_vec(&config_json).unwrap()).unwrap();
+        let mut permissions = std::fs::metadata(&config).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&config, permissions).unwrap();
+
+        std::fs::write(root.join("tiny.png"), b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        std::fs::write(root.join("tiny.wav"), b"RIFF\0\0\0\0WAVEfixture").unwrap();
+        std::fs::write(root.join("tiny.pdf"), b"%PDF-1.7\nfixture").unwrap();
+
+        let env_program = ["/usr/bin/env", "/run/current-system/sw/bin/env"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+            .expect("env executable");
+        let home = root.join("home");
+        let endpoint = Endpoint::Stdio {
+            id: "dotlink-media".into(),
+            program: env_program,
+            args: vec![
+                "-C".into(),
+                root.to_string_lossy().into_owned(),
+                format!("HOME={}", home.display()),
+                format!("XDG_CONFIG_HOME={}", home.join(".config").display()),
+                format!("XDG_STATE_HOME={}", home.join(".state").display()),
+                format!("XDG_DATA_HOME={}", home.join(".data").display()),
+                format!("XDG_CACHE_HOME={}", home.join(".cache").display()),
+                format!("DOTLINK_CONFIG_FILE={}", config.display()),
+                dotlink.to_string_lossy().into_owned(),
+                "--stdio".into(),
+            ],
+            pass_env: vec![],
+        };
+        let conn = connect(&endpoint).await.unwrap();
+
+        for (path, expected) in [
+            ("tiny.png", "image/png"),
+            ("tiny.wav", "audio/wav"),
+            ("tiny.pdf", "application/pdf"),
+        ] {
+            let response = conn
+                .peer
+                .lock()
+                .await
+                .call_tool_once(
+                    CallToolRequestParams::new("bread").with_arguments(
+                        json!({"path":path,"format":"mcp"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            let typed = McpToolResult::try_from(response).unwrap();
+            assert!(!typed.is_error);
+            assert_eq!(typed.content.len(), 1);
+            match (&typed.content[0], expected) {
+                (ContentBlock::Image(image), "image/png") => {
+                    assert_eq!(image.mime_type, expected);
+                    assert!(!image.data.is_empty());
+                }
+                (ContentBlock::Audio(audio), "audio/wav") => {
+                    assert_eq!(audio.mime_type, expected);
+                    assert!(!audio.data.is_empty());
+                }
+                (ContentBlock::Resource(resource), "application/pdf") => {
+                    let ResourceContents::BlobResourceContents {
+                        uri,
+                        mime_type,
+                        blob,
+                        ..
+                    } = &resource.resource
+                    else {
+                        panic!("expected blob resource");
+                    };
+                    assert_eq!(mime_type.as_deref(), Some(expected));
+                    assert!(uri.ends_with("/tiny.pdf"), "{uri}");
+                    assert!(!blob.is_empty());
+                }
+                other => panic!("unexpected typed MCP result: {other:?}"),
+            }
+        }
+
+        drop(conn);
+        drop(cleanup);
+    }
 
     fn live_bridge_context() -> ToolContext {
         let actor = PrincipalId::new("local:bridge-test").unwrap();
