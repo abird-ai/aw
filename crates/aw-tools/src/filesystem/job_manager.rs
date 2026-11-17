@@ -978,11 +978,18 @@ impl ManagedJob {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
+    fn writers_quiesced(&self) -> bool {
+        self.outputs
+            .values()
+            .all(|output| output.lock().is_ok_and(|output| output.writer_finished))
+    }
+
     fn retention_releasable(&self) -> bool {
         if !self.visibility.is_exposed()
             || self.job.lifecycle() != Lifecycle::Terminal
             || self.job.journal_ambiguous()
             || self.transition_inflight.is_some()
+            || !self.writers_quiesced()
         {
             return false;
         }
@@ -1762,6 +1769,7 @@ impl JobManager {
             managed.job.lifecycle() != Lifecycle::Terminal
                 || managed.job.journal_ambiguous()
                 || managed.transition_inflight.is_some()
+                || !managed.writers_quiesced()
         }))
     }
 
@@ -1776,10 +1784,7 @@ impl JobManager {
         if managed.job.lifecycle() != Lifecycle::Terminal
             || managed.job.journal_ambiguous()
             || managed.transition_inflight.is_some()
-            || managed
-                .outputs
-                .values()
-                .any(|output| output.lock().map_or(true, |output| !output.writer_finished))
+            || !managed.writers_quiesced()
             || state
                 .replays
                 .values()
@@ -1830,6 +1835,7 @@ impl JobManager {
             || managed.job.lifecycle() != Lifecycle::Terminal
             || managed.job.journal_ambiguous()
             || managed.transition_inflight.is_some()
+            || !managed.writers_quiesced()
         {
             return Err(Error::Busy);
         }
@@ -5149,6 +5155,129 @@ mod tests {
             "the reserved permit stays fenced until reconciliation"
         );
         assert!(manager.has_nonterminal_jobs().unwrap());
+    }
+
+    #[test]
+    fn hidden_terminal_cannot_retire_while_output_writer_is_live() {
+        let manager = manager(2);
+        admit_simple(&manager, "hidden-live-writer", false);
+        manager
+            .claim("hidden-live-writer", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        let owner = manager.job_output_owner("hidden-live-writer").unwrap();
+        manager
+            .attach_output_memory("hidden-live-writer", 1, OutputStream::Result, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("hidden-live-writer", 1, OutputStream::Result)
+            .unwrap();
+        manager
+            .start(
+                "hidden-live-writer",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager
+            .settle(
+                "hidden-live-writer",
+                1,
+                NodeState::Running { sequence: 3 },
+                Status {
+                    primary: Primary::Ok,
+                    more: false,
+                    incomplete: false,
+                },
+                4,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+
+        assert!(
+            manager.has_nonterminal_jobs().unwrap(),
+            "an open retained writer keeps the Job runtime live after local settlement"
+        );
+        assert_eq!(
+            manager.discard_unexposed_terminal("hidden-live-writer"),
+            Err(Error::Busy),
+            "optimistic retirement must not erase a Job while an output writer is still live"
+        );
+        writer.finish().unwrap();
+        assert!(!manager.has_nonterminal_jobs().unwrap());
+        manager
+            .discard_unexposed_terminal("hidden-live-writer")
+            .unwrap();
+    }
+
+    #[test]
+    fn capacity_prune_cannot_retire_terminal_job_with_live_output_writer() {
+        let manager = JobManager::new(Limits {
+            max_retained_jobs: 1,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 1,
+            max_active_nodes: 1,
+            max_hidden_replays: 1,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        admit_simple(&manager, "live-writer-capacity", true);
+        manager
+            .claim("live-writer-capacity", 1, true, 2, |_, _| Ok(()))
+            .unwrap();
+        let owner = manager.job_output_owner("live-writer-capacity").unwrap();
+        manager
+            .attach_output_memory("live-writer-capacity", 1, OutputStream::Result, [owner])
+            .unwrap();
+        let writer = manager
+            .output_writer("live-writer-capacity", 1, OutputStream::Result)
+            .unwrap();
+        manager
+            .start(
+                "live-writer-capacity",
+                StartRequest {
+                    coordinate: 1,
+                    claimed_sequence: 2,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: 3,
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        manager
+            .settle(
+                "live-writer-capacity",
+                1,
+                NodeState::Running { sequence: 3 },
+                Status {
+                    primary: Primary::Ok,
+                    more: false,
+                    incomplete: false,
+                },
+                4,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.reserve_task_admission("next", true),
+            Err(Error::Capacity),
+            "capacity pressure must not erase a terminal Job while an output writer is live"
+        );
+        assert!(manager.get("live-writer-capacity").is_ok());
+
+        writer.finish().unwrap();
+        manager.reserve_task_admission("next", true).unwrap();
+        assert!(matches!(
+            manager.get("live-writer-capacity"),
+            Err(Error::NotFound)
+        ));
     }
 
     #[test]
