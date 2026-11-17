@@ -30,23 +30,26 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
   all-target/all-feature Clippy, formatting/diff checks, minimal shared build,
   MCP, minimal CLI and full CLI all green.
 
-## Current uncommitted D1 shared prerequisite — 2026-11-17
+## Current D1 shared prerequisite — 2026-11-17
 
+- Signed implementation commit `26a8c788d6dc7e0a7fe16995f8057fb332440978`
+  — `Preserve strict output ACK replay across compaction` — contains the shared
+  fix discovered by dotlink D1.
 - Dotlink's first D1 delegation removed its duplicate shared delivery watermark
   and exposed one shared bug: strict `acknowledge_delivered_output` rejected a
   lost-response replay of an already-ACKed owner watermark after another owner
   legitimately compacted the physical retained prefix below it.
-- The live AW fix validates exact owner + delivery history first, accepts only an
+- The fix validates exact owner + delivery history first, accepts only an
   already-committed `through <= owner.through` replay, and still requires current
   retained bytes for every **new** ACK advance. Foreign owners and new ACKs into
   compacted-away bytes remain rejected.
-- The owner-aware compaction regression now exercises the strict API for both the
+- The owner-aware compaction regression exercises the strict API for both the
   replaying Job owner and independent Task owner. Full shared **339/339** and
   minimal Job-runtime **200/200** tests pass; strict all-target/all-feature
   `aw-tools` Clippy, format and diff checks pass.
-- This follow-up is not committed or pushed. Dotlink must not path-patch or add a
-  host-side bypass; finish D1 only after the normal signed AW commit/push/repin
-  sequence is explicitly authorized.
+- At this status sync `26a8c78` is signed locally but not yet the dotlink pin;
+  finish D1 only after remote availability is verified and all three dotlink AW
+  dependencies move together. Do not path-patch or add a host-side bypass.
 
 ## Repository state before this review
 

@@ -16,10 +16,12 @@ Review base before the signed follow-up: `7d09d5f`.
   checkpoint containing the event-driven Job waits, delivery/owner/Finish
   hardening, journal-uncertainty retention/publication fixes, typed receipt
   updates and the commit-readiness regressions recorded below. It is published
-  on AW `main` as the parent of `403eb84`, and dotlink D0 consumed it in
-  signed commit `d0a3922`. Historical
-  checkpoint headings below retain their original “uncommitted” wording as
-  chronology, not current Git status.
+  on AW `main` as the parent of `403eb84`, and dotlink D0 consumed it in signed
+  commit `d0a3922`. Historical checkpoint headings below retain their original
+  “uncommitted” wording as chronology, not current Git status.
+- [x] `26a8c788d6dc7e0a7fe16995f8057fb332440978` — signed D1 shared follow-up
+  fixing strict delivered-ACK replay after independent owner compaction while
+  preserving the prohibition on new ACK advances into compacted-away bytes.
 
 ## Current status
 
@@ -214,13 +216,13 @@ Review base before the signed follow-up: `7d09d5f`.
 - **Qualified:** `aw-tools --all-features --lib` **339/339**, `aw-tools-adapter --all-features --lib` **251/251**, read-only shared **110/110**. Strict all-target/all-feature Clippy `-D warnings` passes independently for both affected crates; `cargo fmt --check` and scoped `git diff --check` pass. Minimal `aw-tools --no-default-features`, `aw-mcp`, minimal `aw-cli --no-default-features --lib`, and full `aw-cli --lib` all compile. One initial grouped full-suite attempt was externally terminated during shared compilation without a Rust diagnostic; isolated low-parallelism reruns completed green.
 - **Boundary:** no new scheduler, recovery engine, owner ledger, event kind, public tool/schema or automatic reconciliation. Journal uncertainty remains owner-reconciled rather than guessed. Dotlink is still on `0a6c6a0`; no commit, push, dependency repin, release, new worktree or reserved UX edit.
 
-## Strict delivered-ACK replay after owner compaction — 2026-11-17 (uncommitted follow-up)
+## Strict delivered-ACK replay after owner compaction — 2026-11-17 (`26a8c78`)
 
 - **D1 integration exposed a shared replay defect:** dotlink switched its shared `jobs_read`/Through-ACK path from a temporary host `delivered_through` map to canonical `output_page_for_owner → record_delivered_output → acknowledge_delivered_output`. Its existing independent native MCP Task regression then reproduced a lost-response case: the Job/model owner had already received and ACKed stdout through byte 8, the Task owner legitimately compacted the physical retained prefix to byte 4, and replaying the same model ACK through 8 incorrectly returned `InvalidOutput`.
 - **Root cause and shared fix:** strict `acknowledge_delivered_output` validated `through <= current retained bytes` before recognizing that the exact owner had already committed the same logical high-water mark. Reorder the checks so exact owner + recorded delivery proof are validated first; an already-acknowledged `through <= owner.through` is an idempotent no-op even after partial compaction. Only a **new** ACK advance is required to remain within the currently retained prefix. This matches the existing trusted-ACK invariant without weakening public delivery proof.
 - **Regression upgraded at the source:** `owner_aware_compaction_requires_every_other_owner_to_release_the_tail` now records exact delivery for the Job owner, uses strict `acknowledge_delivered_output`, compacts to the Task owner's four-byte retained prefix, and proves replay of the Job owner's prior byte-8 ACK succeeds unchanged. The same test still proves the Task owner cannot newly acknowledge byte 5 after compaction and can release only its retained byte-4 prefix.
 - **Qualified:** focused red/green regression passes; full `aw-tools --all-features --lib` **339/339** and minimal Job-runtime `batch,durable` **200/200** pass. Strict all-target/all-feature `aw-tools` Clippy with `-D warnings`, `cargo fmt --check`, and scoped `git diff --check` are green.
-- **Cross-repo boundary:** this is a tiny shared semantic correction discovered by correct dotlink D1 delegation. Do **not** restore a dotlink-side ACK exception or path-patch AW. Dotlink's D1 source migration remains pending this follow-up through the normal signed AW commit/push/repin sequence. No commit, push, repin, version, release, new worktree or reserved UX edit was performed in this checkpoint.
+- **Cross-repo boundary:** this is a tiny shared semantic correction discovered by correct dotlink D1 delegation, signed in `26a8c78`. Do **not** restore a dotlink-side ACK exception or path-patch AW. Dotlink's D1 source migration remains pending remote availability plus the normal all-three-dependency repin. No version, release, new worktree or reserved UX edit was performed in this checkpoint.
 
 ## Tests and verification
 
