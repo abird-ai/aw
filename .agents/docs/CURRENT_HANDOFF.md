@@ -47,9 +47,11 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
   replaying Job owner and independent Task owner. Full shared **339/339** and
   minimal Job-runtime **200/200** tests pass; strict all-target/all-feature
   `aw-tools` Clippy, format and diff checks pass.
-- At this status sync `26a8c78` is signed locally but not yet the dotlink pin;
-  finish D1 only after remote availability is verified and all three dotlink AW
-  dependencies move together. Do not path-patch or add a host-side bypass.
+- `26a8c78` is published and the current uncommitted dotlink D1 worktree pins all
+  three AW dependencies/lock records to it. The previously red Task/model ACK
+  replay gate is green, and dotlink shared delivery proof + Through-ACK +
+  omitted-offset Finish are qualified. The next D1 slice is aggregate
+  `jobs_get.tail`; do not path-patch or add a host-side bypass.
 
 ## Repository state before this review
 

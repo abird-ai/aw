@@ -39,11 +39,11 @@ Review base before the signed follow-up: `7d09d5f`.
     the merged checkpoints below.
 - [x] E. Shared grep symmetric/asymmetric context up to 128 in schema/request/search, exact file/dir, output budgets and direct/Graph conformance.
 - [x] F. Catalog/description limits and unified tests for shared direct/Graph surface; no new generic registry or hidden model-facing `jobs_*` leaves.
-- [~] G. The reviewed signed AW shared-runtime implementation checkpoint
-  `be6d48d` is published and consumed by dotlink. D1 adoption exposed one
-  strict delivered-ACK replay gap after multi-owner physical compaction; the
-  focused shared fix below now requires one follow-up signed AW pin before D1
-  can complete without a dotlink-side bypass.
+- [~] G. The reviewed shared checkpoints `be6d48d` and strict-ACK follow-up
+  `26a8c78` are published; the current uncommitted dotlink D1 worktree consumes
+  `26a8c78`. Shared read delivery proof, Through-ACK and omitted-offset Finish
+  are qualified there with no duplicate shared watermark. Remaining D1 is
+  aggregate `jobs_get.tail`; D2–D4 remain separate.
 
 ## Working checkpoint — 2026-11-15 (uncommitted)
 
