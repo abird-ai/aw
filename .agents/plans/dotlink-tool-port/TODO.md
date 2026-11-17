@@ -6,9 +6,11 @@ Design/decisions: [README.md](README.md).
 
 ## AW post-merge status — 2026-11-18
 
-- Current AW `main` is `7e6fe20`; the shared-tool merge is
-  `0d2b4e3` (`Build configurable toolset and harden shared Job control`) with
-  reviewed follow-ups through `7e6fe20` (`Align shared Job list metadata`).
+- Published AW baseline before this typed-media checkpoint is `7e6fe20`; the
+  local signed checkpoint advances `main` beyond it and is not yet published.
+  The shared-tool merge is `0d2b4e3` (`Build configurable toolset and harden
+  shared Job control`) with reviewed published follow-ups through `7e6fe20`
+  (`Align shared Job list metadata`).
 - The 2026-11-09 `4a23e92` / `55d93db` entries below remain historical
   **dotlink consumer pins**, not the current AW shared-tool implementation.
 - `0d2b4e3` adds the validated Toolset/metadata/receipt layer and hardens
