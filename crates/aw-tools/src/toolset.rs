@@ -544,6 +544,7 @@ impl Toolset {
             }
             OperationId::JobsList => {
                 set_bound(&mut parameters, "limit", self.jobs.list_page_max, None);
+                set_minimum(&mut parameters, "limit", 1);
                 host_description.to_owned()
             }
             _ => host_description.to_owned(),
@@ -651,6 +652,23 @@ fn set_bound(parameters: &mut Value, name: &str, max: usize, default: Option<usi
         if let Some(default) = default {
             property.insert("default".into(), json!(default.min(effective)));
         }
+    }
+}
+
+fn set_minimum(parameters: &mut Value, name: &str, minimum: usize) {
+    if let Some(property) = parameters
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut(name))
+        .and_then(Value::as_object_mut)
+    {
+        let effective = property
+            .get("minimum")
+            .and_then(Value::as_u64)
+            .map_or(minimum, |existing| {
+                minimum.max(usize::try_from(existing).unwrap_or(usize::MAX))
+            });
+        property.insert("minimum".into(), json!(effective));
     }
 }
 
@@ -795,6 +813,17 @@ mod tests {
         assert_eq!(get.parameters["properties"]["tail"]["default"], 256);
         assert_eq!(get.parameters["properties"]["tail"]["maximum"], 800);
         assert!(get.description.contains("256 raw bytes combined"));
+        let list = compact
+            .describe_operation(
+                OperationId::JobsList,
+                json!({"type":"object","properties":{
+                    "limit":{"type":"integer","minimum":0,"maximum":4096}
+                }}),
+                "List recent Jobs.",
+            )
+            .unwrap();
+        assert_eq!(list.parameters["properties"]["limit"]["minimum"], 1);
+        assert_eq!(list.parameters["properties"]["limit"]["maximum"], 256);
         let all = Toolset::builder().build().unwrap();
         assert_eq!(all.tools().len(), 13);
         assert_eq!(all.jobs_profile().get_tail_default, 512);
