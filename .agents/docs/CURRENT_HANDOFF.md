@@ -2,7 +2,7 @@
 
 Author: coordinating implementation agent
 Owner: @pvl
-Updated: 2026-11-16
+Updated: 2026-11-17
 Source authority host: **L5 only**
 Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 
@@ -11,6 +11,24 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 >
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
+
+## Latest AW-tools signed local checkpoint — 2026-11-17
+
+- Shared-runtime implementation commit:
+  `be6d48db552fd44b9dd85364cd8734454109ce68`
+  — `Harden shared Job output and journal uncertainty`.
+- Parent/review base: `7d09d5f3c882894cd46b427a89fa75280223115a`.
+- Git reports a **Good ED25519 signature** for key fingerprint
+  `SHA256:4aB+NvRb1shCx4xjtZDr2Y7FzfHGph80eFtpF+pHuCI`; L5 has no
+  `allowed_signers` principal file, so local trust status is `U` rather than a
+  principal-mapped `G`.
+- `origin/main` remains `7d09d5f`; the signed implementation commit is local
+  only. No push, release, version change or dotlink dependency repin is
+  authorized by this record.
+- Final implementation qualification before commit: `aw-tools` **339/339**,
+  `aw-tools-adapter` **251/251**, read-only shared **110/110**, strict
+  all-target/all-feature Clippy, formatting/diff checks, minimal shared build,
+  MCP, minimal CLI and full CLI all green.
 
 ## Repository state before this review
 

@@ -3,7 +3,7 @@
 Base AW: `62b8da6babfa729d6bbb9c21e75ac89c228b22b1`
 Source: [DESIGN.md](DESIGN.md). Dotlink dependent plan will reference this AW-first work.
 Merged implementation: `0d2b4e3` — `Build configurable toolset and harden shared Job control`.
-Current review HEAD: `7d09d5f`.
+Review base before the signed follow-up: `7d09d5f`.
 
 ## Committed
 
@@ -12,6 +12,14 @@ Current review HEAD: `7d09d5f`.
   current Actor read gate, atomic finite ACK/Finish commit, shared grep
   context/parser/engine parity and compact Job projection are merged on
   `main`.
+- [x] `be6d48db552fd44b9dd85364cd8734454109ce68` — signed local shared-runtime
+  checkpoint containing the event-driven Job waits, delivery/owner/Finish
+  hardening, journal-uncertainty retention/publication fixes, typed receipt
+  updates and the commit-readiness regressions recorded below. Its parent is
+  `7d09d5f`; it is **not yet pushed**, so dotlink must not repin to it until
+  remote availability is separately authorized and verified. Historical
+  checkpoint headings below retain their original “uncommitted” wording as
+  chronology, not current Git status.
 
 ## Current status
 
@@ -29,8 +37,9 @@ Current review HEAD: `7d09d5f`.
     the merged checkpoints below.
 - [x] E. Shared grep symmetric/asymmetric context up to 128 in schema/request/search, exact file/dir, output budgets and direct/Graph conformance.
 - [x] F. Catalog/description limits and unified tests for shared direct/Graph surface; no new generic registry or hidden model-facing `jobs_*` leaves.
-- [~] G. The grouped AW implementation checkpoint is now `0d2b4e3`; the
-  dependent dotlink adoption/repin remains a separate cross-repo step.
+- [~] G. The reviewed signed AW shared-runtime implementation checkpoint is
+  `be6d48d`; **remote availability** plus dependent dotlink adoption/repin remain
+  separate cross-repo steps requiring explicit authorization.
 
 ## Working checkpoint — 2026-11-15 (uncommitted)
 

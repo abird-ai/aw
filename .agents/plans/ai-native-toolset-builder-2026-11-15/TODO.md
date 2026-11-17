@@ -3,7 +3,7 @@
 Base AW: `62b8da6babfa729d6bbb9c21e75ac89c228b22b1`
 Authoritative design: [DESIGN.md](DESIGN.md)
 Merged implementation: `0d2b4e3` — `Build configurable toolset and harden shared Job control`.
-Current review HEAD: `7d09d5f`.
+Review base before the signed follow-up: `7d09d5f`.
 
 ## Committed
 
@@ -11,6 +11,11 @@ Current review HEAD: `7d09d5f`.
   `main`. The historical checkpoint sections below intentionally retain their
   pre-merge wording as provenance; they are not evidence that those slices are
   still uncommitted.
+- [x] `be6d48db552fd44b9dd85364cd8734454109ce68`: signed local follow-up keeps the
+  shared Toolset/receipt contract aligned with the hardened Job runtime
+  (`journal_unknown` typed facts and async watch support). It adds no second
+  builder/authority surface. This SHA is not yet pushed or consumable by
+  dotlink.
 
 ## Open
 

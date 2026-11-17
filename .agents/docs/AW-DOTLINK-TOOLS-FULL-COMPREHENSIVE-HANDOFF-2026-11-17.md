@@ -6,6 +6,8 @@ Scope: AW canonical toolset, filesystem/Graph/Job runtime, typed receipts, finit
 Status: **handoff/documentation only; no code, dependency, Git, release or deployment action authorized by this document.**
 
 > **Reading priority:** current live source + actual tests + Git status > AGENTS.md / active plan TODO and design > this cross-repo synthesis > older dated handoffs. This file is a navigation/reasoning aid, not a replacement for normative source or plan checklists. Revalidate the state when resuming; the below SHA and test counts are as observed on 2026-11-17.
+>
+> **Post-snapshot update:** the reviewed AW shared-runtime wave below was subsequently committed locally as signed implementation commit `be6d48db552fd44b9dd85364cd8734454109ce68` (`Harden shared Job output and journal uncertainty`), parent `7d09d5f`. Final implementation qualification was 339 shared / 251 adapter / 110 read-only tests plus strict affected Clippy and host compile gates. `origin/main` still remained at `7d09d5f`; therefore D0 has a signed **local** implementation SHA but is not yet a remotely consumable dotlink pin. The historical snapshot/“uncommitted” wording below is preserved as chronology; live Git and the owning Job/output TODO supersede it.
 
 ## 0. First ten minutes — exact sequence
 
