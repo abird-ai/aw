@@ -9,8 +9,8 @@ Authoritative release: dotlink `v0.17.4 @ fd1cdb6`.
 | # | Capability | Owner | Phase | Status |
 |---|---|---|---|---|
 | 1 | Physical `Code/Signal(n)/Unknown` | AW core | P0 | done in `796225e` |
-| 2 | Cancellation origin | AW core | P1 | open |
-| 3 | Stop cause/attempt/outcome | AW core | P1 | open |
+| 2 | Cancellation origin | AW core | P1 | implemented locally |
+| 3 | Stop cause/attempt/outcome | AW core | P1 | implemented locally |
 | 4 | Evidence-preserving managed process-tree guard | AW platform/adapter | P2 | open |
 | 5 | Stop evidence in `ProcessTerminal` / JobManager | AW core | P3 | open |
 | 6 | Typed Task terminal/failure detail | AW core | P3 | open |

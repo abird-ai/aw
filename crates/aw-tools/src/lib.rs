@@ -17,6 +17,7 @@ pub mod binary;
 pub mod conformance;
 pub mod coordination;
 pub mod execution_ref;
+pub mod execution_stop;
 pub mod filesystem;
 pub mod job_event;
 pub mod operation;

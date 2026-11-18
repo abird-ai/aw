@@ -144,9 +144,11 @@ Therefore AW owns both:
 
 ### Cancellation origin is portable
 
-Caller cancellation, runtime shutdown and authority withdrawal have different
-meaning. AW owns the typed origin. Dotlink may collapse richer AW origins into
-its v0.17.4 compatibility spellings `cancel` and `shutdown`.
+Caller cancellation, parent-to-child cancellation, runtime shutdown and authority
+withdrawal have different meaning. AW owns the typed origin. Parent is distinct
+because AW has explicit parent-cancellation flow for child/subagent execution.
+Dotlink may collapse richer AW origins into its v0.17.4 compatibility spellings
+`cancel` and `shutdown`.
 
 ### Execution lifecycle events are not Job wake events
 

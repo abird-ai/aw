@@ -21,12 +21,12 @@ Dotlink reference: `v0.17.4 @ fd1cdb6429a341a4e3d27805cae0bec288fc26df`
 
 ### Phase P1 — shared cancellation and stop value types
 
-- [ ] Add bounded/Copy `CancellationOrigin`.
-- [ ] Audit caller/runtime/authority/parent cancellation paths before freezing variants.
-- [ ] Add `ProcessStopCause`.
-- [ ] Add `StopAttemptReason`, `StopOutcome`, `StopAttempt`.
-- [ ] Define conversion rule: only delivered, claimable attempt can become terminal stop cause.
-- [ ] Unit tests for cleanup/drop/already-gone/failed never becoming terminal stop claims.
+- [x] Add bounded/Copy `CancellationOrigin` with Caller/Parent/Runtime/Authority.
+- [x] Audit caller/runtime/authority/parent cancellation paths; explicit parent-cancel flow makes Parent a distinct origin.
+- [x] Add `ProcessStopCause`.
+- [x] Add `StopAttemptReason`, `StopOutcome`, `StopAttempt`.
+- [x] Define conversion rule: only delivered, claimable attempt can become terminal stop cause.
+- [x] Unit tests prove cleanup/drop/already-gone/failed never become terminal stop claims.
 
 ### Phase P2 — platform evidence + managed process-tree guard
 
@@ -130,7 +130,7 @@ Owned by dotlink companion plan.
 - [x] `AW_BASH="$(command -v bash)" cargo test --offline --locked -p aw-tools-adapter --all-features --lib` — **253/253**, `796225e`.
 - [x] strict affected Clippy — `796225e`.
 - [x] downstream aw-mcp/aw-host/aw-cli checks — `796225e`.
-- [ ] P1 value-type tests.
+- [x] P1 value-type tests — focused 4/4 plus full `aw-tools` **346/346**, strict Clippy, no-default build and downstream adapter check.
 - [ ] P2 native process-stop evidence tests.
 - [ ] P3 Job/Task/event propagation tests.
 - [ ] P4 budget-separation tests.

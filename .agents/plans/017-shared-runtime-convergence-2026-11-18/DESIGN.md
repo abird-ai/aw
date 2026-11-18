@@ -21,23 +21,22 @@ termination never invents a signal number.
 
 ### 1.2 Cancellation origin
 
-Add one portable origin type. Initial design:
+The parent/subagent audit found an explicit, observably distinct parent-cancel
+path, so freeze four portable origins:
 
 ```rust
 pub enum CancellationOrigin {
     Caller,
+    Parent,
     Runtime,
     Authority,
 }
 ```
 
-Before freezing the enum, audit parent/subagent cancellation paths. Add a
-separate `Parent` variant only if those paths are observably distinct and
-cannot truthfully map to `Runtime`.
-
 Meaning:
 
 - `Caller`: explicit owner/user/model-facing control request;
+- `Parent`: a parent execution cancels a child/subagent execution;
 - `Runtime`: host shutdown, restart, runtime replacement or owner teardown;
 - `Authority`: grant/source/policy revocation or replacement.
 
@@ -429,7 +428,7 @@ Final dotlink v0.17.4 wire mapping:
 ```text
 ProcessExit::Signal(n)          -> signal: n
 ProcessStopCause::Timeout      -> stopped_by: "timeout"
-Cancelled(Caller)              -> stopped_by: "cancel"
+Cancelled(Caller|Parent)       -> stopped_by: "cancel"
 Cancelled(Runtime|Authority)   -> stopped_by: "shutdown"
 ProcessStopCause::Failed       -> stopped_by: "failed"
 ```
