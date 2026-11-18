@@ -3,7 +3,7 @@
 ## Active
 
 - [~] P1 release-readiness — @pvl — [details](release-readiness/TODO.md)
-- [~] P1 017-stop-provenance-2026-11-18 — @pvl — Shared physical signal identity first, then dotlink stop provenance — [details](017-stop-provenance-2026-11-18/README.md)
+- [~] P1 017-shared-runtime-convergence-2026-11-18 — @pvl — Shared-first process/Job/Task/MCP convergence for dotlink v0.17.4; sandbox explicitly deferred — [details](017-shared-runtime-convergence-2026-11-18/README.md)
 - [~] P2 workspace-views — @pvl — [details](workspace-views/TODO.md)
 
 - [~] P2 dotlink-tool-port — @pvl — Dotlink-native filesystem tools under AW authorization and model-directed execution — [details](dotlink-tool-port/README.md)
@@ -16,11 +16,13 @@
 
 ## Icebox
 
+- [ ] 017-sandbox-mount-convergence-2026-11-18 — @pvl — Designed/frozen shared sandbox mount + dotlink config-v13 convergence; do not implement until explicitly promoted — [details](017-sandbox-mount-convergence-2026-11-18/README.md)
 - [ ] embedded-platforms — [details](embedded-platforms/TODO.md)
 - [ ] restored-state-authority — [details](restored-state-authority/TODO.md)
 
 ## Closed
 
+- [x] 017-stop-provenance-2026-11-18 — `796225e` — 2026-11-18 — physical signal identity/lifecycle separation; remaining work absorbed by shared runtime master plan
 - [x] accepted-history — `47ee8a0` — 2026-10-18
 - [x] handoff-process — 2026-10-18
 - [x] ux-convergence — 2026-10-18 — visual/interaction scope
