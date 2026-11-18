@@ -1585,7 +1585,7 @@ mod tests {
         let get = JobControl::new(runtime.clone(), JobToolKind::Get);
         assert_eq!(
             wait_terminal(&get, ctx.clone(), &id).await,
-            "cancelled bash exit=cancelled"
+            "cancelled bash exit=unknown"
         );
         let _ = fs::remove_dir_all(root);
     }

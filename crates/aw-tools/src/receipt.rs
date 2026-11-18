@@ -68,9 +68,7 @@ fn append_terminal(content: &mut String, terminal: ProcessTerminal) {
     content.push_str(" exit=");
     match terminal.exit {
         ProcessExit::Code(code) => write!(content, "{code}"),
-        ProcessExit::Signal => content.write_str("signal"),
-        ProcessExit::Cancelled => content.write_str("cancelled"),
-        ProcessExit::DeadlineExceeded => content.write_str("deadline"),
+        ProcessExit::Signal(signal) => write!(content, "signal:{signal}"),
         ProcessExit::Unknown => content.write_str("unknown"),
     }
     .expect("writing into a String never fails");

@@ -2198,6 +2198,7 @@ impl JobHost {
                 let stop = process.terminate().await;
                 let (terminal, primary) = match stop {
                     Ok(receipt) => {
+                        let primary = receipt.runner_status().primary;
                         let observed = receipt.runner_terminal();
                         let terminal = self.retained_process_terminal(
                             id,
@@ -2205,12 +2206,6 @@ impl JobHost {
                             observed.exit,
                             observed.output.complete,
                         )?;
-                        let primary =
-                            if terminal.exit == ProcessExit::Unknown || !terminal.output.complete {
-                                Primary::Unknown
-                            } else {
-                                Primary::Fail
-                            };
                         (terminal, primary)
                     }
                     Err(_) => (
@@ -2280,6 +2275,7 @@ impl JobHost {
         } else {
             process.wait(stop_signal, prepared.timeout).await
         };
+        let status = receipt.runner_status();
         let observed = receipt.runner_terminal();
         let terminal = self.retained_process_terminal(
             id,
@@ -2287,7 +2283,6 @@ impl JobHost {
             observed.exit,
             observed.output.complete,
         )?;
-        let status = terminal.status();
         self.settle_shell_result(
             id,
             coordinate,

@@ -840,7 +840,7 @@ impl ProcessOutputCursor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Exited(i32),
-    ExitedBySignal,
+    ExitedBySignal(i32),
     Cancelled,
     DeadlineExceeded,
     Unknown,
@@ -855,15 +855,17 @@ pub struct ProcessReceipt {
 }
 impl ProcessReceipt {
     pub fn finished(&self) -> bool {
-        matches!(self.outcome, Outcome::Exited(_) | Outcome::ExitedBySignal) && self.output_complete
+        matches!(
+            self.outcome,
+            Outcome::Exited(_) | Outcome::ExitedBySignal(_)
+        ) && self.output_complete
     }
 
     pub fn runner_terminal(&self) -> ProcessTerminal {
         let exit = match self.outcome {
             Outcome::Exited(code) => RunnerExit::Code(code),
-            Outcome::ExitedBySignal => RunnerExit::Signal,
-            Outcome::Cancelled => RunnerExit::Cancelled,
-            Outcome::DeadlineExceeded => RunnerExit::DeadlineExceeded,
+            Outcome::ExitedBySignal(signal) => RunnerExit::Signal(signal),
+            Outcome::Cancelled | Outcome::DeadlineExceeded => RunnerExit::Unknown,
             Outcome::Unknown => RunnerExit::Unknown,
         };
         ProcessTerminal {
@@ -875,6 +877,27 @@ impl ProcessReceipt {
                 stderr_truncated: self.output.stderr.truncated,
                 complete: self.output_complete,
             },
+        }
+    }
+
+    pub fn runner_status(&self) -> aw_tools::filesystem::batch::Status {
+        use aw_tools::filesystem::status::Primary;
+        let primary = if !self.output_complete {
+            Primary::Unknown
+        } else {
+            match self.outcome {
+                Outcome::Exited(0) => Primary::Ok,
+                Outcome::Exited(_)
+                | Outcome::ExitedBySignal(_)
+                | Outcome::Cancelled
+                | Outcome::DeadlineExceeded => Primary::Fail,
+                Outcome::Unknown => Primary::Unknown,
+            }
+        };
+        aw_tools::filesystem::batch::Status {
+            primary,
+            more: false,
+            incomplete: false,
         }
     }
 
@@ -1316,9 +1339,17 @@ impl PipeProcess {
         }
     }
     fn status_outcome(status: ExitStatus) -> Outcome {
-        status
-            .code()
-            .map_or(Outcome::ExitedBySignal, Outcome::Exited)
+        if let Some(code) = status.code() {
+            return Outcome::Exited(code);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            if let Some(signal) = status.signal() {
+                return Outcome::ExitedBySignal(signal);
+            }
+        }
+        Outcome::Unknown
     }
 }
 impl Drop for PipeProcess {
@@ -1428,6 +1459,31 @@ mod tests {
             process.terminate().await.is_err(),
             "post-settlement original Process must never receive a second signal"
         );
+        assert_eq!(receipt.runner_terminal().exit, RunnerExit::Unknown);
+        assert_eq!(
+            receipt.runner_status().primary,
+            aw_tools::filesystem::status::Primary::Fail
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_signal_identity_survives_into_shared_process_terminal() {
+        async fn signalled(command: &str) -> (Outcome, RunnerExit) {
+            let process = PipeProcess::spawn(spec(command)).await.unwrap();
+            let receipt = process.wait(pending::<()>(), Duration::from_secs(5)).await;
+            let terminal = receipt.runner_terminal();
+            (receipt.outcome, terminal.exit)
+        }
+
+        let killed = signalled("kill -KILL $$").await;
+        let crashed = signalled("kill -SEGV $$").await;
+        assert_eq!(killed, (Outcome::ExitedBySignal(9), RunnerExit::Signal(9)));
+        assert_eq!(
+            crashed,
+            (Outcome::ExitedBySignal(11), RunnerExit::Signal(11))
+        );
+        assert_ne!(killed.1, crashed.1);
     }
     fn host_spool_file(label: &str) -> (File, std::path::PathBuf) {
         use std::{

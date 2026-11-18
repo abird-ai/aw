@@ -412,7 +412,7 @@ impl Tool for NativeShell {
             }
             let (code, is_error) = match receipt.outcome {
                 ProcessOutcome::Exited(status) => (status.to_string(), status != 0),
-                ProcessOutcome::ExitedBySignal => ("signal".into(), true),
+                ProcessOutcome::ExitedBySignal(signal) => (format!("signal:{signal}"), true),
                 ProcessOutcome::Cancelled => return Err(Error::Cancelled),
                 ProcessOutcome::DeadlineExceeded => return Err(Error::Timeout),
                 ProcessOutcome::Unknown => {

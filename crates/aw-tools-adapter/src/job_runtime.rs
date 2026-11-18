@@ -2352,7 +2352,7 @@ mod tests {
             .manager()
             .render_job_status(&id)
             .unwrap()
-            .starts_with("revoked bash exit=cancelled"));
+            .starts_with("revoked bash exit=unknown"));
         let _ = fs::remove_dir_all(root);
     }
 

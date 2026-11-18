@@ -9,11 +9,9 @@ use super::{batch::Status, status::Primary};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessExit {
     Code(i32),
-    Signal,
-    /// Host proved the process tree stopped in response to cancellation.
-    Cancelled,
-    /// Host proved the process tree stopped after the deadline elapsed.
-    DeadlineExceeded,
+    /// Signal that ended the waited process. This is physical exit evidence,
+    /// not a claim about who sent it or why.
+    Signal(i32),
     /// Exit/stop/reattachment could not be proven.
     Unknown,
 }
@@ -42,10 +40,7 @@ impl ProcessTerminal {
         } else {
             match self.exit {
                 ProcessExit::Code(0) => Primary::Ok,
-                ProcessExit::Code(_)
-                | ProcessExit::Signal
-                | ProcessExit::Cancelled
-                | ProcessExit::DeadlineExceeded => Primary::Fail,
+                ProcessExit::Code(_) | ProcessExit::Signal(_) => Primary::Fail,
                 ProcessExit::Unknown => unreachable!("handled above"),
             }
         };
@@ -60,9 +55,7 @@ impl ProcessTerminal {
     pub fn status_detail(self) -> String {
         let mut fields = vec![match self.exit {
             ProcessExit::Code(code) => format!("exit={code}"),
-            ProcessExit::Signal => "exit=signal".into(),
-            ProcessExit::Cancelled => "exit=cancelled".into(),
-            ProcessExit::DeadlineExceeded => "exit=deadline".into(),
+            ProcessExit::Signal(signal) => format!("exit=signal:{signal}"),
             ProcessExit::Unknown => "exit=unknown".into(),
         }];
         if self.output.stdout_truncated {
@@ -82,9 +75,7 @@ impl ProcessTerminal {
     pub fn compact_result(self) -> String {
         let exit = match self.exit {
             ProcessExit::Code(code) => format!("exit={code}"),
-            ProcessExit::Signal => "exit=signal".into(),
-            ProcessExit::Cancelled => "exit=cancelled".into(),
-            ProcessExit::DeadlineExceeded => "exit=deadline".into(),
+            ProcessExit::Signal(signal) => format!("exit=signal:{signal}"),
             ProcessExit::Unknown => "exit=unknown".into(),
         };
         format!(
@@ -164,13 +155,8 @@ mod tests {
     }
 
     #[test]
-    fn known_nonzero_signal_cancel_and_deadline_are_fail() {
-        for exit in [
-            ProcessExit::Code(9),
-            ProcessExit::Signal,
-            ProcessExit::Cancelled,
-            ProcessExit::DeadlineExceeded,
-        ] {
+    fn known_nonzero_and_signal_are_fail() {
+        for exit in [ProcessExit::Code(9), ProcessExit::Signal(9)] {
             assert_eq!(
                 ProcessTerminal {
                     exit,
@@ -181,6 +167,12 @@ mod tests {
                 Primary::Fail
             );
         }
+        let signal = ProcessTerminal {
+            exit: ProcessExit::Signal(11),
+            output: output(true, false),
+        };
+        assert!(signal.status_detail().contains("exit=signal:11"));
+        assert!(signal.compact_result().contains("exit=signal:11"));
     }
 
     #[test]

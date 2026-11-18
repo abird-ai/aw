@@ -3,6 +3,7 @@
 ## Active
 
 - [~] P1 release-readiness — @pvl — [details](release-readiness/TODO.md)
+- [~] P1 017-stop-provenance-2026-11-18 — @pvl — Shared physical signal identity first, then dotlink stop provenance — [details](017-stop-provenance-2026-11-18/README.md)
 - [~] P2 workspace-views — @pvl — [details](workspace-views/TODO.md)
 
 - [~] P2 dotlink-tool-port — @pvl — Dotlink-native filesystem tools under AW authorization and model-directed execution — [details](dotlink-tool-port/README.md)
