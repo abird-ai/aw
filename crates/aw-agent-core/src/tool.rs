@@ -18,7 +18,12 @@ use std::{
 pub const MAX_TOOL_CALLS_PER_ROUND: usize = aw_agent_kernel::turn::MAX_BATCH;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 pub const MIN_TOOL_RESULT_BYTES: usize = 512;
+/// Ordinary tool-result ceiling. Tools remain here unless trusted host code
+/// explicitly opts into the larger Agent-only ceiling below.
 pub const MAX_TOOL_RESULT_BYTES: usize = 128 * 1024;
+/// Absolute model-visible ceiling for a trusted registered tool. This does not
+/// widen MCP/extensions/direct ToolOutput validation by itself.
+pub const MAX_AGENT_TOOL_RESULT_BYTES: usize = 256 * 1024;
 pub const MAX_TRACE_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -123,7 +128,13 @@ impl ToolOutput {
         }
     }
     pub fn validate(&self) -> Result<()> {
-        if self.content.len() > MAX_TOOL_RESULT_BYTES {
+        self.validate_with_limit(MAX_TOOL_RESULT_BYTES)
+    }
+    pub fn validate_with_limit(&self, max_bytes: usize) -> Result<()> {
+        if !(MIN_TOOL_RESULT_BYTES..=MAX_AGENT_TOOL_RESULT_BYTES).contains(&max_bytes) {
+            return Err(Error::Config("invalid tool result ceiling".into()));
+        }
+        if self.content.len() > max_bytes {
             Err(Error::Limit("tool output too large"))
         } else {
             Ok(())
@@ -379,6 +390,18 @@ impl ToolContext {
             .result_budget_bytes
             .min(ceiling)
             .min(MAX_TOOL_RESULT_BYTES);
+        Self::validate_result_budget(budget)
+    }
+    /// Trusted tools with a registration-time extended result ceiling may use
+    /// this path. The caller's captured invocation budget remains authoritative.
+    pub fn extended_result_budget(&self, ceiling: usize) -> Result<usize> {
+        let budget = self
+            .result_budget_bytes
+            .min(ceiling)
+            .min(MAX_AGENT_TOOL_RESULT_BYTES);
+        Self::validate_result_budget(budget)
+    }
+    fn validate_result_budget(budget: usize) -> Result<usize> {
         if budget < MIN_TOOL_RESULT_BYTES {
             Err(Error::Config(
                 "tool result budget must reserve at least 512 bytes".into(),
@@ -392,6 +415,11 @@ impl ToolContext {
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>>;
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Trusted host-selected model-visible result ceiling captured at tool
+    /// registration. This is resource/presentation metadata, never authority.
+    fn result_ceiling_bytes(&self) -> usize {
+        MAX_TOOL_RESULT_BYTES
+    }
     /// Current source liveness only, never an authority grant. Once a remote
     /// source fails closed its tool can disappear from advertised specs and
     /// fails the same authorization recheck just before effect execution.
@@ -682,6 +710,7 @@ pub(crate) struct RegisteredTool {
     tool: Arc<dyn Tool>,
     spec: ToolSpec,
     source: ToolSource,
+    result_ceiling_bytes: usize,
     registered_revision: u64,
 }
 impl RegisteredTool {
@@ -714,6 +743,17 @@ impl ToolRegistry {
         source: ToolSource,
     ) -> Result<String> {
         let spec = tool.spec();
+        let result_ceiling_bytes = tool.result_ceiling_bytes();
+        let max_result_ceiling = if source.kind == SourceKind::Host {
+            MAX_AGENT_TOOL_RESULT_BYTES
+        } else {
+            MAX_TOOL_RESULT_BYTES
+        };
+        if !(MIN_TOOL_RESULT_BYTES..=max_result_ceiling).contains(&result_ceiling_bytes) {
+            return Err(Error::Config(
+                "invalid registered tool result ceiling".into(),
+            ));
+        }
         let candidate =
             Capability::new(&spec.name, source.as_kernel()?, kernel_effect(&spec.effect))
                 .map_err(|_| Error::Config("invalid tool definition or source".into()))?;
@@ -754,6 +794,7 @@ impl ToolRegistry {
                 tool,
                 spec,
                 source,
+                result_ceiling_bytes,
                 registered_revision: next_revision,
             },
         );
@@ -800,6 +841,9 @@ impl ToolRegistry {
     }
     pub fn effect_of(&self, name: &str) -> Option<&ToolEffect> {
         self.tools.get(name).map(|item| &item.spec.effect)
+    }
+    pub(crate) fn result_ceiling_of(&self, name: &str) -> Option<usize> {
+        self.tools.get(name).map(|item| item.result_ceiling_bytes)
     }
     /// Always use the exact spec captured when the tool was admitted. A tool
     /// implementation cannot change its effect/schema by later mutating spec().
@@ -1220,6 +1264,78 @@ mod binding_authority_tests {
         fn execute<'a>(&'a self, _: ToolContext, _: &'a Value) -> ToolFuture<'a> {
             Box::pin(async { Ok(ToolOutput::text("ok")) })
         }
+    }
+
+    struct CeilingTool {
+        name: &'static str,
+        ceiling: Arc<AtomicUsize>,
+    }
+    impl Tool for CeilingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "fixture".into(),
+                parameters: serde_json::json!({"type":"object"}),
+                effect: ToolEffect::Read,
+            }
+        }
+        fn result_ceiling_bytes(&self) -> usize {
+            self.ceiling.load(Ordering::SeqCst)
+        }
+        fn validate(&self, _: &Value) -> Result<()> {
+            Ok(())
+        }
+        fn execute<'a>(&'a self, _: ToolContext, _: &'a Value) -> ToolFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::text("ok")) })
+        }
+    }
+
+    #[test]
+    fn result_ceiling_is_validated_and_captured_at_registration() {
+        let ceiling = Arc::new(AtomicUsize::new(MAX_TOOL_RESULT_BYTES));
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(Arc::new(CeilingTool {
+                name: "bounded",
+                ceiling: ceiling.clone(),
+            }))
+            .unwrap();
+        assert_eq!(
+            registry.result_ceiling_of("bounded"),
+            Some(MAX_TOOL_RESULT_BYTES)
+        );
+        ceiling.store(MAX_AGENT_TOOL_RESULT_BYTES, Ordering::SeqCst);
+        assert_eq!(
+            registry.result_ceiling_of("bounded"),
+            Some(MAX_TOOL_RESULT_BYTES),
+            "registration snapshots the resource ceiling"
+        );
+
+        let mut too_large = ToolRegistry::default();
+        assert!(too_large
+            .register(Arc::new(CeilingTool {
+                name: "too_large",
+                ceiling: Arc::new(AtomicUsize::new(MAX_AGENT_TOOL_RESULT_BYTES + 1)),
+            }))
+            .is_err());
+        let mut too_small = ToolRegistry::default();
+        assert!(too_small
+            .register(Arc::new(CeilingTool {
+                name: "too_small",
+                ceiling: Arc::new(AtomicUsize::new(MIN_TOOL_RESULT_BYTES - 1)),
+            }))
+            .is_err());
+
+        let mut external = ToolRegistry::default();
+        assert!(external
+            .register_from(
+                Arc::new(CeilingTool {
+                    name: "external",
+                    ceiling: Arc::new(AtomicUsize::new(MAX_AGENT_TOOL_RESULT_BYTES)),
+                }),
+                ToolSource::new(SourceKind::Mcp, "mcp-source", 1).unwrap(),
+            )
+            .is_err());
     }
 
     #[test]

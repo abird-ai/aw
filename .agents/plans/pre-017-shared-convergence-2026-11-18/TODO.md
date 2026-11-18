@@ -72,11 +72,13 @@ Commit accounting: [AUDIT.md](AUDIT.md)
 - [x] AW `jobs_read` consumes the shared 256 KiB default and configured read max.
 - [x] Add/choose an AW profile/config path for Job read maximum; do not conflate
       it with filesystem/search result defaults.
-- [ ] Qualify the Agent/context/result hard ceiling needed to realize a 256 KiB
-      Job page when context permits. Do not globally widen unrelated tool
-      defaults merely to satisfy Jobs. Current 128 KiB Agent hard envelope
-      truthfully narrows the otherwise-256 KiB request; raising it affects MCP,
-      extensions and subagents and is intentionally deferred to the next slice.
+- [x] Qualify the Agent/context/result hard ceiling needed to realize a 256 KiB
+      Job page when context permits without globally widening unrelated tools:
+      ordinary registered tools remain 128 KiB; trusted Host tools may opt into
+      an absolute 256 KiB Agent ceiling captured at registration; external
+      MCP/extension sources cannot self-widen beyond 128 KiB. `jobs_read` opts
+      into `min(read_page_max_bytes, 256 KiB)` and batch fair-share accounting
+      still narrows each call independently.
 - [x] Preserve Agent history cursor semantics and finite Process/Graph raw-byte
       semantics under the new page profile.
 - [x] Re-run shared/adapter/read-only/minimal/no_std/strict-Clippy/downstream MCP
@@ -92,8 +94,17 @@ Commit accounting: [AUDIT.md](AUDIT.md)
       read-only shared **111/111**, `aw-mcp` **18/18**, minimal aw-tools,
       downstream `aw-host` + `aw-cli --lib`, strict all-target/all-feature
       Clippy, rustfmt and `git diff --check` green.
-- [ ] Next AW slice: design/qualify a Job-specific 256 KiB Agent presentation
-      envelope without widening unrelated MCP/extensions/subagent defaults.
+- [x] Job-specific 256 KiB Agent presentation envelope implemented and
+      qualified. `ToolOutput::validate()` stays 128 KiB for ordinary direct/
+      MCP/extension use; Agent dispatch uses the immutable registered ceiling.
+      Hook structural validation permits the absolute 256 KiB ceiling, while
+      post-hook publication still enforces the exact per-call budget.
+- [x] Additional qualification: `aw-agent-core` **92 passed / 1 ignored**;
+      registration captures the ceiling and rejects non-Host widening;
+      end-to-end Agent regression proves ordinary=128 KiB and extended Host=
+      256 KiB with a pass-through extension installed; adapter remains
+      **252/252**, shared **342/342**, MCP **18/18**, strict Clippy/downstream
+      host+CLI/minimal/fmt/diff gates green.
 
 ## E. Signed shared checkpoint / dotlink repin
 

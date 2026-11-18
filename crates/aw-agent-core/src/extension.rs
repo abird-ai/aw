@@ -178,7 +178,12 @@ impl HookEvent {
                         "tool result hook cannot change factual receipt/status",
                     ));
                 }
-                w.validate()
+                // The owning Agent enforces the exact registered per-tool
+                // result budget after hooks. Hook validation only needs the
+                // absolute trusted-Agent structural ceiling so an unchanged
+                // extended host result is not rejected merely for crossing the
+                // ordinary 128 KiB default.
+                w.validate_with_limit(crate::tool::MAX_AGENT_TOOL_RESULT_BYTES)
             }
             (
                 Self::Step {

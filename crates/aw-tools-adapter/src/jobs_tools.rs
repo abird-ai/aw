@@ -917,6 +917,17 @@ impl Tool for JobsTool {
         self.spec_for()
     }
 
+    fn result_ceiling_bytes(&self) -> usize {
+        if self.kind == JobsKind::Read {
+            self.runtime
+                .job_profile()
+                .read_page_max_bytes
+                .min(aw_agent_core::tool::MAX_AGENT_TOOL_RESULT_BYTES)
+        } else {
+            aw_agent_core::tool::MAX_TOOL_RESULT_BYTES
+        }
+    }
+
     fn validate(&self, arguments: &Value) -> Result<()> {
         match self.kind {
             JobsKind::List => {
@@ -1089,12 +1100,11 @@ impl Tool for JobsTool {
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
             self.validate(arguments)?;
-            let result_ceiling = if self.kind == JobsKind::Read {
-                self.runtime.job_profile().read_page_max_bytes
+            let budget = if self.kind == JobsKind::Read {
+                ctx.extended_result_budget(self.runtime.job_profile().read_page_max_bytes)?
             } else {
-                self.runtime.result_limit()
+                ctx.result_budget(self.runtime.result_limit())?
             };
-            let budget = ctx.result_budget(result_ceiling)?;
             let host = self.runtime.host_for(&ctx)?;
             // Mark delivery only after the *entire* tool response validates.
             // A tail/status peek never mints ACKable byte proof.

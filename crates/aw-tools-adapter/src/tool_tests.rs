@@ -1260,6 +1260,14 @@ fn local_tool_limits_reject_caller_owned_schema_capability_flags() {
     let mut limits = crate::LocalToolLimits::default();
     limits.schema.typed_media = true;
     assert!(limits.validate().is_err());
+
+    let mut limits = crate::LocalToolLimits::default();
+    limits.job_profile.read_page_default_bytes = 511;
+    limits.job_profile.read_page_max_bytes = 511;
+    assert!(
+        limits.validate().is_err(),
+        "AW Agent jobs_read needs at least one factual 512-byte result envelope"
+    );
 }
 
 #[tokio::test]

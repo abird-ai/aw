@@ -3604,6 +3604,7 @@ mod tests {
             read.spec().parameters["properties"]["limit"]["maximum"],
             2048
         );
+        assert_eq!(read.result_ceiling_bytes(), 2048);
         assert_eq!(list.spec().parameters["properties"]["limit"]["maximum"], 10);
         assert!(get.spec().description.contains("256 raw bytes combined"));
         get.validate(&json!({"tail":384,"wait_ms":1200})).unwrap();
@@ -3623,6 +3624,14 @@ mod tests {
             crate::jobs_tools::JobsTool::new(runtime.clone(), crate::jobs_tools::JobsKind::Read);
         let ack = crate::jobs_tools::JobsTool::new(runtime, crate::jobs_tools::JobsKind::Ack);
         assert_eq!(get.spec().parameters["properties"]["tail"]["maximum"], 1024);
+        assert_eq!(
+            read.result_ceiling_bytes(),
+            aw_agent_core::tool::MAX_AGENT_TOOL_RESULT_BYTES
+        );
+        assert_eq!(
+            get.result_ceiling_bytes(),
+            aw_agent_core::tool::MAX_TOOL_RESULT_BYTES
+        );
         get.validate(&json!({})).unwrap();
         get.validate(&json!({"tail":0})).unwrap();
         get.validate(&json!({"tail":1024})).unwrap();

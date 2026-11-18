@@ -2077,7 +2077,7 @@ impl Agent {
                     .map(Message::context_bytes)
                     .sum::<usize>()
                     .saturating_add(proposed_bytes);
-                let per_tool_output_bytes = per_tool_result_budget(
+                let fair_tool_output_bytes = per_tool_result_fair_share(
                     limits::MAX_CONTEXT_BYTES.saturating_sub(context_used),
                     tool::MAX_TRACE_BYTES.saturating_sub(trace_used),
                     batch.len(),
@@ -2378,6 +2378,12 @@ impl Agent {
                         let mut tokens = Vec::with_capacity(wave_size);
                         let jobs = FuturesUnordered::new();
                         for (ordinal, (call, tool, _)) in wave.iter().enumerate() {
+                            let result_ceiling = self
+                                .tools
+                                .result_ceiling_of(&call.name)
+                                .ok_or(Error::Denied("tool result ceiling missing at dispatch"))?;
+                            let result_budget =
+                                per_tool_result_budget(fair_tool_output_bytes, result_ceiling)?;
                             let token = CancellationToken::new();
                             tokens.push(CancelOnDrop(token.clone()));
                             let call = call.clone();
@@ -2454,7 +2460,7 @@ impl Agent {
                                                 .clone(),
                                             execution_site: policy.execution_site.clone(),
                                             cancellation: token,
-                                            result_budget_bytes: per_tool_output_bytes,
+                                            result_budget_bytes: result_budget,
                                             identity: identity.clone(),
                                             scope,
                                             execution_owner,
@@ -2466,10 +2472,10 @@ impl Agent {
                                 )
                                 .await
                                 .map_err(|_| Error::Timeout)??;
-                                output.validate()?;
+                                output.validate_with_limit(result_ceiling)?;
                                 Ok::<_, Error>((
                                     ordinal,
-                                    bounded_tool_output(output, per_tool_output_bytes),
+                                    bounded_tool_output(output, result_budget),
                                 ))
                             });
                         }
@@ -2606,6 +2612,12 @@ impl Agent {
                                 .as_ref()
                                 .ok_or(Error::Protocol("missing completed read wave result"))?;
                             let (call, _, spec) = &wave[ordinal];
+                            let result_ceiling = self
+                                .tools
+                                .result_ceiling_of(&call.name)
+                                .ok_or(Error::Denied("tool result ceiling missing before publication"))?;
+                            let result_budget =
+                                per_tool_result_budget(fair_tool_output_bytes, result_ceiling)?;
                             if let Some((original, source, effect)) = revisions.get(&call.id) {
                                 self.revalidate_tool_revision(
                                     RevisionEvidence {
@@ -2649,7 +2661,7 @@ impl Agent {
                             // new result quota. An extension cannot inflate a
                             // bounded, already-receipted result past the
                             // original per-call fair context share.
-                            if public.content.len() > per_tool_output_bytes {
+                            if public.content.len() > result_budget {
                                 return Err(Error::Limit(
                                     "tool hook projection exceeded per-call context budget",
                                 ));
@@ -2679,6 +2691,12 @@ impl Agent {
                     // Barrier or singleton path preserves the original
                     // exact journal/tool events and portable E2 trace.
                     let (call, tool, spec) = batch[cursor].clone();
+                    let result_ceiling = self
+                        .tools
+                        .result_ceiling_of(&call.name)
+                        .ok_or(Error::Denied("tool result ceiling missing at dispatch"))?;
+                    let result_budget =
+                        per_tool_result_budget(fair_tool_output_bytes, result_ceiling)?;
                     cursor += 1;
                     selection_reader.revalidate()?; // account revocation also stops further paid/tool work
                     let index = turn.tool_records.len();
@@ -2771,7 +2789,7 @@ impl Agent {
                                         .clone(),
                                     execution_site: self.tool_policy.execution_site.clone(),
                                     cancellation: token,
-                                    result_budget_bytes: per_tool_output_bytes,
+                                    result_budget_bytes: result_budget,
                                     identity: identity.clone(),
                                     scope: invocation_context.scope.clone(),
                                     execution_owner: self.execution_binding.clone(),
@@ -2789,8 +2807,8 @@ impl Agent {
                     drop(guard);
                     match output {
                         Ok(output) => {
-                            output.validate()?;
-                            let output = bounded_tool_output(output, per_tool_output_bytes);
+                            output.validate_with_limit(result_ceiling)?;
+                            let output = bounded_tool_output(output, result_budget);
                             portable_trace.push(portable_step(machine.settle_effect())?);
                             turn.tool_records[index].status = if output.is_error {
                                 ToolStatus::Failed
@@ -2837,7 +2855,7 @@ impl Agent {
                             // new result quota. An extension cannot inflate a
                             // bounded, already-receipted result past the
                             // original per-call fair context share.
-                            if public.content.len() > per_tool_output_bytes {
+                            if public.content.len() > result_budget {
                                 return Err(Error::Limit(
                                     "tool hook projection exceeded per-call context budget",
                                 ));
@@ -3047,7 +3065,7 @@ fn portable_step<T>(result: std::result::Result<T, aw_agent_kernel::turn::Error>
 /// The persisted receipt and model-visible projection both mark truncation.
 const TOOL_RESULT_OVERHEAD_BYTES: usize = 512;
 
-fn per_tool_result_budget(
+fn per_tool_result_fair_share(
     context_remaining: usize,
     trace_remaining: usize,
     calls: usize,
@@ -3060,7 +3078,22 @@ fn per_tool_result_budget(
     let per_call_capacity = context_remaining.min(trace_remaining) / calls;
     let budget = per_call_capacity
         .saturating_sub(TOOL_RESULT_OVERHEAD_BYTES)
-        .min(tool::MAX_TOOL_RESULT_BYTES);
+        .min(tool::MAX_AGENT_TOOL_RESULT_BYTES);
+    if budget < tool::MIN_TOOL_RESULT_BYTES {
+        return Err(Error::Limit(
+            "insufficient context budget for factual tool receipts; no tools executed",
+        ));
+    }
+    Ok(budget)
+}
+
+fn per_tool_result_budget(fair_share: usize, registered_ceiling: usize) -> Result<usize> {
+    if !(tool::MIN_TOOL_RESULT_BYTES..=tool::MAX_AGENT_TOOL_RESULT_BYTES)
+        .contains(&registered_ceiling)
+    {
+        return Err(Error::Protocol("registered tool result ceiling is invalid"));
+    }
+    let budget = fair_share.min(registered_ceiling);
     if budget < tool::MIN_TOOL_RESULT_BYTES {
         return Err(Error::Limit(
             "insufficient context budget for factual tool receipts; no tools executed",
@@ -3169,6 +3202,175 @@ where
 #[cfg(test)]
 mod output_projection_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OneToolProvider {
+        name: &'static str,
+        calls: AtomicUsize,
+    }
+    impl Provider for OneToolProvider {
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn stream<'a>(
+            &'a self,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(Error::Protocol("test requires typed tool invocation")) })
+        }
+        fn stream_tools<'a>(
+            &'a self,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a [ToolSpec],
+            sink: &'a mut DeltaSink<'_>,
+        ) -> crate::provider::ModelFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok(crate::provider::ModelReply {
+                        meta: CompletionMeta {
+                            finish_reason: "tool_calls".into(),
+                            usage: crate::Usage {
+                                input_tokens: Some(1),
+                                output_tokens: Some(1),
+                            },
+                        },
+                        tool_calls: vec![ToolCall {
+                            id: "budget-call".into(),
+                            name: self.name.into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        provider_context: None,
+                    })
+                } else {
+                    sink("done")?;
+                    Ok(crate::provider::ModelReply {
+                        meta: CompletionMeta {
+                            finish_reason: "stop".into(),
+                            usage: crate::Usage {
+                                input_tokens: Some(1),
+                                output_tokens: Some(1),
+                            },
+                        },
+                        tool_calls: Vec::new(),
+                        provider_context: None,
+                    })
+                }
+            })
+        }
+    }
+
+    struct BudgetProbeTool {
+        name: &'static str,
+        ceiling: usize,
+        payload_bytes: usize,
+        observed_budget: Arc<AtomicUsize>,
+    }
+    impl Tool for BudgetProbeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "result-budget fixture".into(),
+                parameters: serde_json::json!({"type":"object","additionalProperties":false}),
+                effect: ToolEffect::Read,
+            }
+        }
+        fn result_ceiling_bytes(&self) -> usize {
+            self.ceiling
+        }
+        fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+            if arguments
+                .as_object()
+                .is_some_and(|object| object.is_empty())
+            {
+                Ok(())
+            } else {
+                Err(Error::Denied("expected empty arguments"))
+            }
+        }
+        fn execute<'a>(&'a self, ctx: ToolContext, _: &'a serde_json::Value) -> ToolFuture<'a> {
+            Box::pin(async move {
+                self.observed_budget
+                    .store(ctx.result_budget_bytes, Ordering::SeqCst);
+                Ok(ToolOutput::text(
+                    "x".repeat(self.payload_bytes.min(ctx.result_budget_bytes)),
+                ))
+            })
+        }
+    }
+    struct PassThroughExtension;
+    impl crate::Extension for PassThroughExtension {
+        fn name(&self) -> &str {
+            "budget-pass-through"
+        }
+    }
+
+    async fn run_budget_probe(name: &'static str, ceiling: usize) -> (Turn, usize) {
+        let observed_budget = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(OneToolProvider {
+            name,
+            calls: AtomicUsize::new(0),
+        });
+        let mut agent = Agent::builder(provider, AgentOptions::new("fixture", "model"))
+            .extension(PassThroughExtension)
+            .build()
+            .unwrap();
+        agent
+            .register_host_tool(Arc::new(BudgetProbeTool {
+                name,
+                ceiling,
+                payload_bytes: 192 * 1024,
+                observed_budget: observed_budget.clone(),
+            }))
+            .unwrap();
+        let turn = agent
+            .prompt("run", std::future::pending::<()>(), |_| Ok(()))
+            .await
+            .unwrap();
+        (turn, observed_budget.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn extended_tool_result_ceiling_is_per_tool_not_global() {
+        let (ordinary, ordinary_budget) =
+            run_budget_probe("ordinary_result", tool::MAX_TOOL_RESULT_BYTES).await;
+        assert_eq!(ordinary_budget, tool::MAX_TOOL_RESULT_BYTES);
+        assert_eq!(
+            ordinary.tool_records[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .content
+                .len(),
+            tool::MAX_TOOL_RESULT_BYTES
+        );
+
+        let (extended, extended_budget) =
+            run_budget_probe("extended_result", tool::MAX_AGENT_TOOL_RESULT_BYTES).await;
+        assert_eq!(extended_budget, tool::MAX_AGENT_TOOL_RESULT_BYTES);
+        assert_eq!(
+            extended.tool_records[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .content
+                .len(),
+            192 * 1024
+        );
+        assert!(
+            extended.tool_records[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .content
+                .len()
+                > tool::MAX_TOOL_RESULT_BYTES
+        );
+    }
+
     struct ParallelPolicyProvider;
     impl Provider for ParallelPolicyProvider {
         fn stream<'a>(
@@ -3308,15 +3510,36 @@ mod output_projection_tests {
     fn tool_result_budget_reserves_a_factual_receipt_before_effect_admission() {
         let exact = TOOL_RESULT_OVERHEAD_BYTES + tool::MIN_TOOL_RESULT_BYTES;
         assert_eq!(
-            per_tool_result_budget(exact, exact, 1).unwrap(),
+            per_tool_result_fair_share(exact, exact, 1).unwrap(),
             tool::MIN_TOOL_RESULT_BYTES
         );
-        assert!(per_tool_result_budget(exact - 1, exact - 1, 1).is_err());
+        assert!(per_tool_result_fair_share(exact - 1, exact - 1, 1).is_err());
         assert_eq!(
-            per_tool_result_budget(usize::MAX, usize::MAX, 1).unwrap(),
+            per_tool_result_fair_share(usize::MAX, usize::MAX, 1).unwrap(),
+            tool::MAX_AGENT_TOOL_RESULT_BYTES
+        );
+        assert!(per_tool_result_fair_share(exact, exact, 0).is_err());
+        assert_eq!(
+            per_tool_result_budget(
+                tool::MAX_AGENT_TOOL_RESULT_BYTES,
+                tool::MAX_TOOL_RESULT_BYTES,
+            )
+            .unwrap(),
             tool::MAX_TOOL_RESULT_BYTES
         );
-        assert!(per_tool_result_budget(exact, exact, 0).is_err());
+        assert_eq!(
+            per_tool_result_budget(
+                tool::MAX_AGENT_TOOL_RESULT_BYTES,
+                tool::MAX_AGENT_TOOL_RESULT_BYTES,
+            )
+            .unwrap(),
+            tool::MAX_AGENT_TOOL_RESULT_BYTES
+        );
+        assert!(per_tool_result_budget(
+            tool::MAX_AGENT_TOOL_RESULT_BYTES,
+            tool::MAX_AGENT_TOOL_RESULT_BYTES + 1,
+        )
+        .is_err());
     }
 
     #[test]
