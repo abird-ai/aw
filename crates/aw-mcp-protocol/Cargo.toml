@@ -10,11 +10,11 @@ description = "Transport-neutral MCP result, receipt and progress projection hel
 [dependencies]
 aw-tools = { version = "=0.15.0", path = "../aw-tools", default-features = false }
 rmcp = { version = "=3.5.0", default-features = false }
-serde_json = { workspace = true }
-tokio = { version = "=1.48.0", features = ["time", "macros"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "=1.48.0", features = ["time", "macros", "rt"] }
+tokio = { version = "1", features = ["time", "macros", "rt"] }
 
 [lints.rust]
 unsafe_code = "forbid"
