@@ -26,7 +26,7 @@ strengthens platform-owned signal-label testing.
 | 14 | MCP serialized result fitter | aw-mcp-protocol | P6 | text-only fitting with mandatory marker; immutable typed/structured facts fail explicitly; `aw-mcp` re-exports |
 | 15 | MCP heartbeat/progress adapter | aw-mcp-protocol | P7 | no client/server transport dependency; token-gated no-total heartbeat, concurrent bounded delivery, RAII summary observer, semantic progress adapter |
 | 16 | Signal/exit platform facts | aw-platform | P2 | `signal_name` plus allocation-free `exit_signal(&ExitStatus)` implemented; AW adapter consumes the same exit-signal helper; Unix green, Windows projections are correctly None with native assertion authored |
-| 17 | Cross-repo shared checkpoint | AW + dotlink plan boundary | P8 | fresh-review implementation signed at `7c7de6c9...`; publish/repin explicitly authorized this turn; native Windows test remains external |
+| 17 | Cross-repo shared checkpoint | AW + dotlink plan boundary | P8 | fresh-review source `7c7de6c9...` plus downstream-range follow-up `1a5d0f65...`; final pin is `1a5d0f65...`; native Windows test remains external |
 
 ## v0.17.x release disposition
 

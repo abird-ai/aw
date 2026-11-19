@@ -18,10 +18,11 @@ This section supersedes older state summaries below where they conflict.
 
 Current Git boundary:
 
-- authoritative fresh-review AW implementation checkpoint:
-  `7c7de6c9aeedf714adbe67b17ac863f27697e90e`
-  (`Fix shared 0.17 projection boundaries`), signed and selected as
-  `AW_IMPL_SHA`;
+- authoritative fresh-review AW implementation pin:
+  `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`
+  (`Relax shared MCP protocol dependency ranges`), signed and selected as
+  `AW_IMPL_SHA`; it follows source checkpoint `7c7de6c9...` and prevents the
+  protocol crate from downgrading compatible downstream Tokio/serde_json;
 - previous source checkpoint `eb325b31...` is historical and must not be used
   for the dotlink repin;
 - `origin/main` is still `792f0b38...` at this docs-edit instant; the user has
@@ -102,7 +103,7 @@ The native Windows Job Object / exit-signal assertions remain authored but
 unexecuted on L5 because its Windows Rust std target is unavailable.
 
 The publish/repin gate is explicitly authorized in the current turn.
-`AW_IMPL_SHA` is fixed at `7c7de6c9aeedf714adbe67b17ac863f27697e90e`.
+`AW_IMPL_SHA` is fixed at `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`.
 The direct dotlink AW set to repin atomically is:
 
 - `aw-tools`;

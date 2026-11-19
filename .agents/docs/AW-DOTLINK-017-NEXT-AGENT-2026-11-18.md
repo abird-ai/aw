@@ -37,9 +37,10 @@ point, update durable docs, then pause.
 
 Authoritative fresh-review implementation pin:
 
-    AW_IMPL_SHA 7c7de6c9aeedf714adbe67b17ac863f27697e90e
+    AW_IMPL_SHA 1a5d0f65208e4a05b737c804a55a3aaad3e2fa59
 
-It is signed and supersedes historical source checkpoint `eb325b31...`.
+It is signed, follows `7c7de6c9...`, preserves downstream compatible
+Tokio/serde_json versions, and supersedes historical checkpoint `eb325b31...`.
 At this docs-edit instant `origin/main` is still `792f0b38...`; the current user
 turn explicitly authorizes publishing AW and atomically repinning dotlink.
 
@@ -313,7 +314,8 @@ regressions pass against the shared protocol crate.
 Do not publish or repin without explicit user authorization.
 
 The final fresh-review implementation pin is
-`7c7de6c9aeedf714adbe67b17ac863f27697e90e`; do not pin `eb325b31`.
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; do not pin `eb325b31` or
+intermediate `7c7de6c9`.
 
 The eventual direct dotlink AW dependency set is exactly:
 

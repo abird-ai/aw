@@ -173,9 +173,9 @@ Dotlink reference: `release/0.17 @ 887401398da297c458ffa2a152a07e1b85870c35`
       the Windows Rust std target is unavailable.
 - [x] Initial signed P1-P8 implementation checkpoint exists at `eb325b31` and
       docs checkpoint at `61ed065d` per explicit user authorization.
-- [x] Fresh-review follow-up implementation checkpoint — signed at
-      `7c7de6c9aeedf714adbe67b17ac863f27697e90e`; this is the final
-      dependency pin and supersedes `eb325b31`.
+- [x] Fresh-review implementation checkpoint `7c7de6c9...` plus downstream
+      dependency-range follow-up `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`;
+      the latter is the final dependency pin and supersedes `eb325b31`/`7c7de6c9`.
 - [ ] Publish — explicitly authorized in the current user turn; push and remote
       verification are the next actions.
 - [ ] Dotlink companion repin — blocked until an exact AW implementation commit

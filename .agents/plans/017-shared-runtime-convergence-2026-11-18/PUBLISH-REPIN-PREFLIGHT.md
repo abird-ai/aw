@@ -12,7 +12,7 @@ document unless the user explicitly authorizes that action.
 
 AW implementation pin selected for this publish:
 
-    AW_IMPL_SHA 7c7de6c9aeedf714adbe67b17ac863f27697e90e
+    AW_IMPL_SHA 1a5d0f65208e4a05b737c804a55a3aaad3e2fa59
     origin/main 792f0b38d104659264b70c31736655df1a46b60f  # before current push
 
 Signed local commits above origin/main include:
@@ -23,9 +23,11 @@ Signed local commits above origin/main include:
     eb325b31d393e4d30c8aa2ff3d9e00bf5c506d2f  Complete shared 0.17 runtime convergence
     61ed065dbaf88ef6365d2ecb890e0df940e250f4  Record shared 0.17 convergence handoff
     7c7de6c9aeedf714adbe67b17ac863f27697e90e  Fix shared 0.17 projection boundaries
+    1a5d0f65208e4a05b737c804a55a3aaad3e2fa59  Relax shared MCP protocol dependency ranges
 
-Fresh-review projection fixes are now signed in `AW_IMPL_SHA`. They supersede
-`eb325b31` for dependency use.
+`1a5d0f65...` is the final `AW_IMPL_SHA`: it keeps the fresh-review semantics
+from `7c7de6c9...` while allowing compatible downstream Tokio/serde_json
+versions. It supersedes `eb325b31` and intermediate `7c7de6c9` for dependency use.
 
 The new lightweight shared surface is `crates/aw-mcp-protocol/**`; `aw-mcp`
 depends on and re-exports it for AW client users.
@@ -36,14 +38,16 @@ diff.
 ## 2. Commit partition when explicitly authorized
 
 The initial source/docs pair exists at `eb325b31` / `61ed065d` and the
-fresh-review source checkpoint is now signed at `7c7de6c9...`. Only the docs
-sync and remote publication remain before the atomic dotlink repin.
+fresh-review source checkpoint is signed at `7c7de6c9...`; the downstream-range
+follow-up is signed at `1a5d0f65...` and is the final pin. Only docs sync and
+remote publication of that follow-up remain before the atomic dotlink repin.
 
 ### A. Fresh-review source checkpoint
 
-Completed signed source checkpoint:
+Completed signed source checkpoints:
 
     7c7de6c9aeedf714adbe67b17ac863f27697e90e  Fix shared 0.17 projection boundaries
+    1a5d0f65208e4a05b737c804a55a3aaad3e2fa59  Relax shared MCP protocol dependency ranges
 
 The committed source/test set is:
 
@@ -61,7 +65,8 @@ The committed source/test set is:
     crates/aw-tools/src/receipt_policy.rs
     crates/aw-tools/src/toolset.rs
 
-This exact signed commit, not `eb325b31`, is the dependency pin SHA.
+The final signed `1a5d0f65...` commit, not `eb325b31` or intermediate
+`7c7de6c9`, is the dependency pin SHA.
 
 Do not stage .agents/plans/ux/** or any frozen sandbox/config-v13 path.
 

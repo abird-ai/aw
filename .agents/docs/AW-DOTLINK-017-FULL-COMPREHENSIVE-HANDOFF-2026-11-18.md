@@ -24,9 +24,11 @@ Current committed refs:
     dotlink origin/main 5381729cd469eda54691e540deb3fee13e9f3e3e
 
 Historical AW source/docs checkpoints `eb325b31` / `61ed065d` are signed.
-Fresh-review shared fixes are now signed at
-`7c7de6c9aeedf714adbe67b17ac863f27697e90e` (`AW_IMPL_SHA`) and supersede
-`eb325b31` for dependency use. Dotlink still has small pre-repin parity fixes
+Fresh-review shared fixes are signed at `7c7de6c9...`; a dependency-range
+follow-up is signed at `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`
+and is the final `AW_IMPL_SHA`. It preserves compatible downstream
+Tokio/serde_json versions and supersedes `eb325b31`/`7c7de6c9` for dependency use.
+Dotlink still has small pre-repin parity fixes
 that will be committed before the atomic repin.
 
 Current read-only release reference:
@@ -194,7 +196,8 @@ no Windows Rust std target.
 Do not publish or repin without explicit user authorization.
 
 The final fresh-review dependency pin is
-`7c7de6c9aeedf714adbe67b17ac863f27697e90e`; `eb325b31` is historical only.
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; `eb325b31` and `7c7de6c9`
+are historical/intermediate only.
 
 The eventual direct dotlink AW dependency set is exactly:
 
