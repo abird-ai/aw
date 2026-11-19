@@ -12,86 +12,106 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
 
-## Latest 0.17 shared-runtime convergence checkpoint — P8, 2026-11-18
+## LIVE 0.17 fresh-review convergence checkpoint — 2026-11-19
 
 This section supersedes older state summaries below where they conflict.
 
-- AW local HEAD remains
-  `021b8cec7b9122a6f6acaf5ef9137fb31f0a6659`;
+Current Git boundary:
+
+- authoritative fresh-review AW implementation checkpoint:
+  `7c7de6c9aeedf714adbe67b17ac863f27697e90e`
+  (`Fix shared 0.17 projection boundaries`), signed and selected as
+  `AW_IMPL_SHA`;
+- previous source checkpoint `eb325b31...` is historical and must not be used
+  for the dotlink repin;
+- `origin/main` is still `792f0b38...` at this docs-edit instant; the user has
+  explicitly authorized publishing this checkpoint in the current turn;
+- dotlink committed HEAD is
+  `8e14ee2b8575c35bc3d5a7204ac15c121410c751`;
   `origin/main` remains
-  `792f0b38d104659264b70c31736655df1a46b60f`.
-- The accumulated P1-P8 implementation is intentionally uncommitted and
-  unstaged; the user has not authorized staging/commit/push.
-- dotlink local HEAD remains
-  `6598de605a006a75473a2043de3f60db384b0d02`;
-  `origin/main` remains
-  `5381729cd469eda54691e540deb3fee13e9f3e3e`.
-- dotlink has not consumed the unpublished P1-P8 shared APIs and has no
-  sibling/path override. Its working tree now contains only independently
-  valid pre-repin product hardening/compatibility prerequisites plus the 017
-  consumer docs; those changes must be preserved through the cutover.
-- The authority-gated publish/repin sequence is frozen in
-  `.agents/plans/017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`:
-  dotlink must pin the signed **source implementation** commit, not the later
-  docs-only checkpoint, and atomically converge `aw-tools`, both direct
-  `aw-tools-fs-*` pins, new `aw-platform`, and new `aw-mcp` on that same SHA.
-- release authority remains
-  `887401398da297c458ffa2a152a07e1b85870c35`.
+  `5381729cd469eda54691e540deb3fee13e9f3e3e`;
+- dotlink also has small uncommitted pre-repin parity fixes from this review;
+- nothing is staged or pushed;
+- the read-only release reference is now fully published at
+  `release/0.17 = origin/release/0.17 = v0.17.5 =`
+  `3995448d7bf33794ef84c7bb51150d77cc260ada`. This worktree was not modified
+  by this agent.
 
-Implemented shared contracts:
+Fresh-review shared corrections:
 
-- minimal process stop core:
-  `StopReason::{Timeout,Cancelled,RuntimeError}`,
-  `StopEvidence::{Stopped,NoTarget,Unknown}`,
-  `StopRecord { reason: Option<StopReason>, evidence }`;
-- orthogonal physical `ProcessExit::{Code,Signal,Unknown}`;
-- evidence-preserving cross-platform `ManagedProcessGuard`;
-- `ProcessTerminal { exit, stop, output }`;
-- compact `TaskTerminalDetail { exit, stop }`;
-- optional `ExecutionLifecycleEvent::ProcessStop` sink;
-- `RawPageBytes` vs `SerializedResultBytes`;
-- flat bounded finite `JobRef = j:<handle>[/n:<coordinate>]`;
-- shared finite receipt grammar
-  `JobStatus/NodeStatus/Handoff/Cancel/Ack`;
-- shared 16 KiB UTF-8-safe diagnostic bounding;
-- bounded MCP result-level `_meta`, replay-stable
-  `io.abird/receipt.ts`, complete-result fitting that only shrinks text;
-- shared token-gated MCP heartbeat/progress adapter with independently bounded
-  sends and no detached queue/task;
-- platform signal-name projection plus shared factual
-  `exit_signal(&ExitStatus) -> Option<i32>`; the process adapter consumes the
-  same helper, removing the last D1 pre-publish Unix signal-extraction gap.
+- `StopReason::as_str()` is the single shared
+  `timeout|cancelled|runtime_error` spelling;
+- zero-cost `StopTracker` owns Unknown -> retry reason preservation;
+- `ProcessReceipt::stop_record()` exposes the final factual logical stop while
+  `ExecutionLifecycleEvent::ProcessStop` remains attempt-level diagnostics;
+- v0.17.5 outside-signal projection remains product-only: physical
+  `ProcessExit::Signal(n)` plus no reasoned final stop record may become one
+  `LOG job exit ... from=outside`; no new AW outside/provenance enum is needed;
+- `ProcessTerminal` remains minimal `{exit, stop, output}` terminal truth;
+- typed Job/Node receipts now preserve `ProcessTerminal.stop`;
+- Job receipt lifecycle distinguishes `revoking`, terminal `revoked`,
+  `cancelling`, terminal `cancelled`, and ordinary `settled`;
+- physical exit remains
+  `ProcessExit::{Code(i32),Signal(i32),Unknown}`, with shared
+  `aw_platform::exit_signal(&ExitStatus)` and `signal_name(...)`;
+- `JobRef` remains flat/bounded with private fields and typed accessors;
+- `RawPageBytes` and `SerializedResultBytes` remain orthogonal;
+- bounded diagnostics and typed Job receipt grammar remain shared.
 
-P8 host-available validation is green:
+MCP projection is now split cleanly:
 
-- `aw-tools --all-features --lib`: **354/354**
-- `aw-tools-adapter --all-features --lib`: **256/256**
-- `aw-mcp --all-features --lib`: **33/33**
-- `aw-platform-unix`: **13/13**, live PTY integrations **4/4**
-- cross-UID Unix fixture intentionally ignored
-- `aw-terminal --lib`: **20/20**
-- strict all-target/all-feature Clippy for all touched crates
-- no-default/minimal feature checks
-- downstream `aw-host` / `aw-cli`
-- full workspace all-feature compile
-- rustfmt / `git diff --check`
+- **`aw-mcp-protocol`** owns generic MCP model shaping:
+  result validation, 16 KiB result/block metadata bounds, replay-stable receipt
+  timestamps, text-only serialized fitting, receipt sidecar reservation,
+  heartbeat/progress projection and observer summaries;
+- it depends on `aw-tools` with **no aw-tools features**, rmcp model types,
+  `serde_json` and Tokio timing/macros — no Agent runtime, reqwest, jsonschema,
+  clap or MCP transport stack; receipt decoration takes a feature-neutral
+  copyable `ReceiptProfile` and no longer clones whole results just to reserve
+  a visible marker;
+- the full **`aw-mcp`** client adapter depends on and re-exports that surface;
+  it no longer carries a second implementation;
+- fitting never silently truncates: the generic marker is mandatory, and
+  immutable typed/structured facts fail explicitly when they cannot fit;
+- decoration first fits against the full envelope, so a visible stored `ts=`
+  that survives fitting never pays an unnecessary sidecar reserve;
+- receipt timestamp mutation preserves existing fields under
+  `io.abird/receipt` and fails transactionally if the reserved value is not an
+  object;
+- at the 32-block MCP limit, an existing text block can carry the timestamp
+  marker; an all-typed full block set fails explicitly.
 
-P8 API review additionally made `ProgressHeartbeatConfig` and `JobRef`
-fields private behind validated constructors/accessors.
+Fresh AW validation:
 
-Still open by authority/environment, not implementation drift:
+- `aw-tools --all-features --lib`: **357/357**;
+- `aw-tools-adapter --all-features --lib`: **255/255**;
+- `aw-mcp-protocol`: **12/12**;
+- `aw-mcp --all-features --lib`: **20/20**;
+- `aw-platform-unix`: **13/13**;
+- Unix live PTY integrations: **4/4**;
+- cross-UID fixture: **1 intentionally ignored**;
+- `aw-terminal --lib`: **20/20**;
+- all relevant no-default/minimal checks: green;
+- host-side `aw-platform-win` check: green;
+- downstream `aw-host` / `aw-cli` and full workspace all-feature check:
+  green;
+- strict Clippy for core/adapter/protocol/client/platform/terminal: green;
+- rustfmt and `git diff --check`: green.
 
-- native Windows Job Object test is authored but L5 has no Windows Rust std target;
-- signed AW implementation checkpoint requires explicit user authorization;
-- publish/push requires separate explicit authorization;
-- dotlink dependency repin is blocked until an exact AW commit is authorized and
-  published.
+The native Windows Job Object / exit-signal assertions remain authored but
+unexecuted on L5 because its Windows Rust std target is unavailable.
 
-**Next implementation phase is P9: dotlink thin-consumer conversion.** Do not
-redo P1-P8. Do not resurrect the rejected `StopOrigin/Cleanup/Dropped`
-taxonomy.
+The publish/repin gate is explicitly authorized in the current turn.
+`AW_IMPL_SHA` is fixed at `7c7de6c9aeedf714adbe67b17ac863f27697e90e`.
+The direct dotlink AW set to repin atomically is:
 
-Frozen sandbox/mount work remains untouched and deferred.
+- `aw-tools`;
+- `aw-tools-fs-unix`;
+- `aw-tools-fs-win`;
+- `aw-platform`;
+- **`aw-mcp-protocol`** (not the full `aw-mcp` client adapter).
+
+Frozen sandbox/config-v13 work remains untouched and deferred.
 
 ## Latest AW-tools published checkpoint — 2026-11-18
 

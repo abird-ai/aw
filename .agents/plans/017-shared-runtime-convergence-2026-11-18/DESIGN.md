@@ -173,7 +173,8 @@ adapter owns only semantic stop state around it:
 
 - platform guard owns active/disarmed state and the final fail-safe termination;
 - adapter maps platform evidence into `StopEvidence`;
-- adapter retains a semantic `StopReason` only across an Unknown retry;
+- shared zero-cost `StopTracker` retains the original semantic `StopReason` only
+  across an Unknown retry and resets after Stopped/NoTarget;
 - housekeeping uses no reason;
 - typed `StopRecord` is produced at each adapter stop boundary;
 - Drop retry preserves the original semantic reason rather than inventing a
@@ -221,15 +222,31 @@ A normal/external process exit may still produce a reason-less housekeeping
 `ProcessStop` when the RAII guard checks/cleans descendants. Consumers must not
 turn `record.reason=None` into a semantic stop claim.
 
-Dotlink sink mapping:
+`ProcessStop` is attempt-level evidence: one logical stop may emit graceful,
+forced and housekeeping observations. The adapter therefore also exposes one
+final factual `ProcessReceipt::stop_record()` after escalation/output cleanup;
+terminal semantics are derived from the same record rather than duplicated.
+Products must not print one operator line per event.
+
+Dotlink final lifecycle mapping:
 
 ```text
-ProcessStop { record }
-  -> LOG job stop id=<ref> reason=<product context> outcome=<evidence>
+reasoned ProcessReceipt::stop_record()
+  -> exactly one LOG job stop id=<ref> reason=<product context> outcome=<evidence>
+
+ProcessTerminal.exit = Signal(n)
++ final stop record has no semantic reason
+  -> exactly one LOG job exit id=<ref> signal=<name-or-number> from=outside
 ```
 
-The exact `LOG` string, stderr/journald destination and quiet-mode policy stay
-dotlink-owned.
+The second rule is the v0.17.5 product projection. `from=outside` means only
+that dotlink did not enter a semantic stop sequence; it is not canonical AW
+provenance and never identifies the sender. A reasoned final stop record
+suppresses the outside projection even when evidence is NoTarget/Unknown,
+because a direct-child fallback may have delivered the physical signal.
+
+The exact `LOG` strings, stderr/journald destination and quiet-mode policy stay
+dotlink-owned. The event stream remains available for diagnostics/metrics.
 
 Because the sink can be invoked from Drop, dotlink's logger must use fallible
 non-panicking writes as v0.17.4 does.
@@ -303,7 +320,9 @@ the actual deadline fact already lives in the process stop reason.
 Consumers that do not expose process Tasks leave detail absent. Bounded error
 text remains separate from typed facts; there is no generic metadata/JSON bag.
 
-`aw-mcp` can project this typed detail into MCP error `data` in its owning phase.
+Product/transport layers can project this typed detail into MCP error `data`;
+`aw-mcp-protocol` owns only generic MCP shaping, not product `stopped_by`
+vocabulary or Task-specific policy.
 
 ## 6. Flat Job/Node references and bounded diagnostics
 
@@ -313,8 +332,8 @@ P5 adds the shared finite-Job surface type:
 
 ```rust
 pub struct JobRef {
-    pub job: Handle,
-    pub node: Option<NodeCoordinate>,
+    job: Handle,
+    node: Option<NodeCoordinate>,
 }
 ```
 
@@ -429,12 +448,13 @@ Responsibilities are now explicit.
 - only the raw prefix actually included in the fully validated response becomes
   delivery credit.
 
-`aw-mcp`:
+`aw-mcp-protocol`:
 
 - owns the serialized `CallToolResult` ceiling and validates complete MCP
   payloads against `SerializedResultBytes`;
-- P6 still owns the richer generic complete-result fitter, metadata reservation
-  and receipt decoration. P4 does not pull that work forward.
+- P6 owns the richer generic complete-result fitter, metadata reservation and
+  receipt decoration. The full `aw-mcp` client adapter re-exports this surface
+  without duplicating it. P4 does not pull that work forward.
 
 Executed invariant:
 
@@ -467,7 +487,8 @@ size, including framing, content metadata, structured content and result
 
 ### 9.2 Shared receipt decorator
 
-P6 adds these public `aw-mcp` receipt helpers:
+P6 adds these public `aw-mcp-protocol` receipt helpers. The full `aw-mcp`
+client adapter re-exports them for existing AW client users:
 
 ```text
 stored_receipt_timestamp(...)
@@ -480,7 +501,11 @@ The namespaced metadata key is `io.abird/receipt`.
 
 The decorator:
 
-- inspects the shared `Toolset::ReceiptProfile`;
+- accepts the shared copyable `receipt_policy::ReceiptProfile` directly;
+- does not depend on the full Toolset/catalog or any filesystem feature;
+- fits once, appends the visible marker in place, and only further shrinks that
+  already-fitted body when marker reserve is needed; it does not clone a whole
+  media/structured result merely to test sidecar fit;
 - accepts a host-supplied timestamp but first checks stored result metadata;
 - treats an existing stored `io.abird/receipt.ts` as immutable replay state,
   so it wins over a fresh host observation timestamp;
@@ -492,12 +517,12 @@ The decorator:
   metadata atomic with the response;
 - requires the host timestamp only for a fresh selected operation.
 
-Neither `aw-tools` nor `aw-mcp` reads the wall clock. The host chooses the
+Neither `aw-tools` nor `aw-mcp-protocol` reads the wall clock. The host chooses the
 fresh observation timestamp; replayed results retain their stored timestamp.
 
 ### 9.3 Serialized result fitter
 
-P6 implements public `fit_complete_result(...)` in `aw-mcp`.
+P6 implements public `fit_complete_result(...)` in `aw-mcp-protocol`.
 
 The fitter preserves, byte/shape-for-byte where applicable:
 
@@ -519,10 +544,11 @@ shared fitter and delete that semantics-changing local fallback after parity.
 
 ## 10. MCP progress/heartbeat
 
-The semantic filesystem progress type remains transport-independent. P7 adds a
-transport adapter in `aw-mcp` without enabling rmcp's server feature in the
-shared crate. Dotlink/other server hosts supply their request peer as a send
-closure.
+The semantic filesystem progress type remains transport-independent. P7 puts
+MCP model projection in `aw-mcp-protocol`, which has no client/server transport
+feature at all. Dotlink and other server hosts supply their request peer as a
+send closure; the full `aw-mcp` client adapter depends on and re-exports the
+same protocol surface.
 
 Implemented heartbeat surface:
 

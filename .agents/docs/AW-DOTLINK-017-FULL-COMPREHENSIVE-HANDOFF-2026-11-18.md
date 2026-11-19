@@ -11,170 +11,206 @@ This document is the durable context package for the current AW-first / dotlink-
 
 For this workstream, it supersedes older dated handoffs as the current state summary. Older comprehensive handoffs remain historical evidence and should still be read when a detail predates this document.
 
-## 0A. LIVE P8 SUPERSEDING UPDATE — 2026-11-18
+## 0A. LIVE FRESH-REVIEW SUPERSEDING UPDATE — 2026-11-19
 
-This section supersedes any later historical prose in this file that still
-describes P1/P2 as pending or mentions the rejected transitional
-`StopOrigin/Cleanup/Dropped` design. Do **not** follow any later "first task"
-instruction that conflicts with this section or the active plan.
+This section supersedes later historical prose in this file where it conflicts.
 
-P1 through P7 are implemented in the current AW working tree. P8's
-host-available technical checkpoint is green. P9 (dotlink thin-consumer
-conversion) is the next implementation phase.
+Current committed refs:
 
-Current AW refs remain:
+    AW HEAD        61ed065dbaf88ef6365d2ecb890e0df940e250f4
+    AW origin/main 792f0b38d104659264b70c31736655df1a46b60f
 
-    HEAD        021b8cec7b9122a6f6acaf5ef9137fb31f0a6659
-    origin/main 792f0b38d104659264b70c31736655df1a46b60f
+    dotlink HEAD        8e14ee2b8575c35bc3d5a7204ac15c121410c751
+    dotlink origin/main 5381729cd469eda54691e540deb3fee13e9f3e3e
 
-The accumulated P1-P8 implementation is intentionally **uncommitted** and
-nothing is staged because the user has not authorized staging/commit/push in
-this workstream.
+Historical AW source/docs checkpoints `eb325b31` / `61ed065d` are signed.
+Fresh-review shared fixes are now signed at
+`7c7de6c9aeedf714adbe67b17ac863f27697e90e` (`AW_IMPL_SHA`) and supersede
+`eb325b31` for dependency use. Dotlink still has small pre-repin parity fixes
+that will be committed before the atomic repin.
 
-Current dotlink refs remain:
+Current read-only release reference:
 
-    HEAD        6598de605a006a75473a2043de3f60db384b0d02
-    origin/main 5381729cd469eda54691e540deb3fee13e9f3e3e
+    local release/0.17  3995448d7bf33794ef84c7bb51150d77cc260ada
+    origin/release/0.17 3995448d7bf33794ef84c7bb51150d77cc260ada
+    v0.17.5              3995448d7bf33794ef84c7bb51150d77cc260ada
+    v0.17.4              fd1cdb6429a341a4e3d27805cae0bec288fc26df
 
-Dotlink source is still untouched by P1-P8. Only its companion consumer-plan
-README/TODO are dirty.
+The release worktree advanced concurrently and is read-only for this workstream.
 
-Release authority remains:
+### Final shared process model after fresh review
 
-    release/0.17 = 887401398da297c458ffa2a152a07e1b85870c35
-    v0.17.4 tag baseline = fd1cdb6429a341a4e3d27805cae0bec288fc26df
-
-### Final shared semantics implemented in AW
-
-Process stop core:
+    ProcessExit::{Code(i32), Signal(i32), Unknown}
 
     StopReason::{Timeout, Cancelled, RuntimeError}
     StopEvidence::{Stopped, NoTarget, Unknown}
-    StopRecord {
-        reason: Option<StopReason>,
-        evidence: StopEvidence,
-    }
+    StopRecord { reason: Option<StopReason>, evidence }
 
-There is no `StopOrigin`, `Cleanup`, or `Dropped` canonical stop reason.
-`reason=None` is housekeeping. Only `Stopped + Some(reason)` can contribute
-a terminal semantic stop cause. Physical `ProcessExit::{Code,Signal,Unknown}`
-remains orthogonal and no stop request invents a signal number.
+StopReason::as_str() owns the shared timeout|cancelled|runtime_error spelling.
 
-Platform stop evidence:
+StopTracker is a tiny Copy escalation state. Unknown retains the original
+semantic reason for a fail-safe retry; Stopped/NoTarget conclude the sequence.
+Reason-less later cleanup is housekeeping.
 
-    aw-platform-* -> io::Result<bool>
-      Ok(true)  = proven live target reached/stopped
-      Ok(false) = positive NoTarget
-      Err       = Unknown
+Platform facts:
 
-The adapter maps this once to `StopEvidence`. Cross-platform
-`ManagedProcessGuard` disarms on Stopped/NoTarget and stays armed on Unknown.
-A later pre-publish D1 source audit found and resolved the last platform fact
-gap: `aw_platform::exit_signal(&ExitStatus) -> Option<i32>` now owns Unix
-physical signal extraction (Windows returns `None`), and AW's process adapter
-consumes that same helper rather than its own cfg-sensitive branch. Fresh gates:
-Unix platform **13/13 + 4/4 PTY**, adapter **256/256**, terminal **20/20**, strict
-affected Clippy, minimal configs, downstream host/CLI and workspace all-feature
-compile. Native Windows Job Object/exit-signal assertions remain authored but
-unexecuted because L5 has no Windows Rust std target installed.
+    ManagedProcessGuard
+    exit_signal(&ExitStatus) -> Option<i32>
+    signal_name(i32) -> Option<&'static str>
 
-Process/Task/event propagation:
+NoTarget remains positive absence; Unknown remains unresolved.
 
-- `ProcessTerminal { exit, stop, output }` retains physical and semantic facts.
-- `TaskTerminalDetail { exit, stop }` is the compact Task projection.
-- `ExecutionLifecycleEvent::ProcessStop { record }` is separate from Job wake
-  events.
-- optional `ExecutionEventSink` records stop attempts; reason-less
-  housekeeping cannot become a semantic terminal cause.
+Canonical terminal state stays minimal:
 
-Budget split:
+    ProcessTerminal { exit, stop, output }
+    TaskTerminalDetail { exit, stop }
+
+The adapter additionally exposes:
+
+    ProcessReceipt::stop_record() -> Option<StopRecord>
+
+That is the final factual record for one logical stop sequence.
+ExecutionLifecycleEvent::ProcessStop remains attempt-level evidence and may fire
+for graceful, forced and housekeeping attempts. Products must not render one
+operator line per event.
+
+Dotlink D2 through local release 0.17.5 uses mutually exclusive product
+projections:
+
+    reasoned final stop_record()
+      -> LOG job stop id=<id> reason=<reason> outcome=<delivered|gone|failed>
+
+    ProcessTerminal.exit = Signal(n)
+      + final stop record has no semantic reason
+      -> LOG job exit id=<id> signal=<name-or-number> from=outside
+
+`from=outside` says only that dotlink did not enter a semantic stop sequence; a
+reasoned final record suppresses it even for NoTarget/Unknown evidence because
+direct-child fallback may have delivered the physical signal. No new canonical
+AW outside/provenance enum is required.
+
+### Shared Job/receipt corrections
+
+Finite refs remain:
+
+    JobRef = j:<handle>[/n:<positive-coordinate>]
+
+Fields are private behind validated constructors/accessors. Hierarchical
+ExecutionRef remains internal ownership/Agent-routing identity.
+
+Budget split remains:
 
     RawPageBytes
     SerializedResultBytes
 
-`JobProfile::resolve_read_page` owns raw retained-page bytes.
-`SerializedResultBytes` owns actual serialized result envelopes. A one-byte
-raw page can live inside a normal larger MCP response envelope.
+JobProfile::resolve_read_page rejects zero; one raw byte is valid inside a
+larger serialized envelope.
 
-Finite Jobs refs/receipts:
+Typed Job/Node receipts now preserve:
 
-    JobRef = j:<handle>[/n:<coordinate>]
+- process stop=timeout|cancelled|runtime_error;
+- Job running;
+- cancelling;
+- revoking;
+- ordinary terminal settled;
+- terminal cancelled;
+- terminal revoked.
 
-Finite model/product output uses `JobRef`; hierarchical `ExecutionRef`
-remains internal ownership/Agent-routing identity. Shared finite receipt grammar
-is `JobStatus / NodeStatus / Handoff / Cancel / Ack(Finish|Through)`.
-`render_handoff` may reduce richness under a tight budget but always names the
-same durable Job and keeps explicit `no-rerun` semantics.
+Job lifecycle Cancelled/Revoked remains separate from process StopReason.
 
-Bounded diagnostics:
+### Lightweight MCP protocol boundary
 
-- shared UTF-8-safe `bounded_diagnostic`, 16 KiB;
-- Task diagnostic bounding reuses it.
+Generic MCP model projection moved to new **aw-mcp-protocol**.
 
-MCP result metadata/fitting:
+It depends only on:
 
-- `McpToolResult` preserves bounded result-level `_meta`;
-- `io.abird/receipt.ts` is the shared stored receipt timestamp;
-- stored replay timestamp wins over a fresh host timestamp;
-- visible `ts=` sidecar is added only when absent;
-- `fit_complete_result` measures actual serialized `CallToolResult` bytes;
+- aw-tools with default features disabled and no aw-tools feature enabled;
+- rmcp model types with default features disabled;
+- serde_json;
+- Tokio timing/macros/runtime.
+
+It does not pull Agent crates, reqwest, jsonschema, clap, or MCP client/server
+transport features. The full aw-mcp client adapter depends on and re-exports
+this protocol surface.
+
+The protocol crate owns:
+
+- complete CallToolResult validation;
+- 16 KiB result/block metadata bounds;
+- stored/visible receipt timestamp helpers;
+- text-only serialized result fitting;
+- atomic receipt decoration;
+- ProgressHeartbeat and its observer/config;
+- bounded semantic-progress projection.
+
+Important corrected semantics:
+
+- receipt timestamp mutation merges into the existing io.abird/receipt object
+  instead of replacing it;
+- malformed reserved metadata fails transactionally;
 - only text may shrink;
-- media/resources, structured JSON, result metadata, result type, error class,
-  block order and per-block metadata remain immutable;
-- if immutable facts cannot fit, fitting fails explicitly instead of rewriting
-  a typed result as prose.
+- truncation always carries an explicit generic marker;
+- typed media/resources, structured JSON, result metadata/type/error class,
+  block order and block metadata are immutable;
+- fitting first uses the full envelope; if a visible stored ts= survives,
+  no unnecessary sidecar reserve is charged;
+- at the 32-block limit an existing text block may carry the timestamp marker;
+  an all-typed full block set fails explicitly;
+- heartbeat backpressure never owns/delays operation completion and no detached
+  sender/task survives.
 
-MCP progress/heartbeat:
+### Fresh validation
 
-- `ProgressHeartbeatConfig`, `ProgressHeartbeat`,
-  `ProgressHeartbeatSummary`, `ProgressHeartbeatObserver`;
-- `await_with_progress_heartbeat` emits monotonic unknown-total/no-message
-  ticks only when a request token exists;
-- each send is independently bounded;
-- the underlying operation remains polled while a send is backpressured;
-- no detached queue/task;
-- observer summary is emitted via RAII on normal return or wrapper cancellation;
-- real semantic progress uses the existing
-  `filesystem::progress::End::{Known,Unknown}` through
-  `semantic_progress_notification` / `notify_semantic_progress_bounded`.
+AW:
 
-### P8 validation state
+- aw-tools: **357/357**
+- aw-tools-adapter: **255/255**
+- aw-mcp-protocol: **12/12**
+- aw-mcp: **20/20**
+- aw-platform-unix: **13/13**
+- live PTY: **4/4**
+- cross-UID fixture: **1 intentional ignore**
+- aw-terminal: **20/20**
+- no-default/minimal checks: green
+- host-side Windows platform check: green
+- downstream host/CLI/workspace all-feature checks: green
+- strict Clippy for touched crates: green
+- rustfmt / diff check: green
 
-Green on L5:
+Dotlink after pre-repin fresh-review parity fixes:
 
-- `aw-tools --all-features --lib`: **354/354**
-- `aw-tools-adapter --all-features --lib`: **256/256**
-- `aw-mcp --all-features --lib`: **33/33**
-- `aw-platform-unix`: **13/13**, live PTY integrations **4/4**, cross-UID
-  fixture intentionally ignored
-- `aw-terminal --lib`: **20/20**
-- strict all-target/all-feature Clippy for every touched crate
-- no-default `aw-tools`
-- batch-only `aw-tools`
-- no-default adapter
-- no-default Unix platform
-- host-side Windows platform check
-- downstream `aw-host` and `aw-cli`
-- full workspace all-feature compile
-- rustfmt and `git diff --check`
+- main binary: **698 passed / 0 failed / 1 intentional ignored**
+- integrations: **40/40**
+- all-target/all-feature check + strict Clippy: green
+- rustfmt / diff check: green
+- Markdown lint: green
+- NixOS module check: green
 
-P8 API review tightened two surfaces:
+Native Windows Job Object/exit-signal execution remains external because L5 has
+no Windows Rust std target.
 
-- `ProgressHeartbeatConfig` fields are private so callers cannot bypass the
-  positive-duration validating constructor; getters remain available.
-- `JobRef` fields are private behind its typed constructor/accessors.
+### Publish/repin boundary
 
-Still authorization-gated:
+Do not publish or repin without explicit user authorization.
 
-- stage/sign/commit accumulated AW P1-P8 implementation;
-- publish/push;
-- repin dotlink to an exact published AW commit.
+The final fresh-review dependency pin is
+`7c7de6c9aeedf714adbe67b17ac863f27697e90e`; `eb325b31` is historical only.
 
-Do not perform any of those without explicit user authorization.
+The eventual direct dotlink AW dependency set is exactly:
 
-Frozen sandbox scope remains untouched:
-`.agents/plans/017-sandbox-mount-convergence-2026-11-18` plus sandbox source
-paths have no diff.
+    aw-tools
+    aw-tools-fs-unix
+    aw-tools-fs-win
+    aw-platform
+    aw-mcp-protocol
+
+All five plus every transitive AW Git package in Cargo.lock must resolve to the
+same exact published AW_IMPL_SHA.
+
+Do not add the full aw-mcp client adapter to dotlink.
+Do not use sibling/path overrides.
+
+Frozen sandbox/config-v13 scope remains untouched and deferred.
 
 ## 0. Authority order
 

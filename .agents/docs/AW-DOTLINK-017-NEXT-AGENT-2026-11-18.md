@@ -1,88 +1,74 @@
-# AW + dotlink 0.17 shared-runtime next-agent entrypoint — P9
+# AW + dotlink 0.17 shared-runtime next-agent entrypoint
 
-Use **dotlink---l5 only**.
+Use dotlink---l5 only.
 
-Continue in:
+Work in:
 
-    /home/pvl/spaces/abird/src/aw
+    AW:      /home/pvl/spaces/abird/src/aw
+    dotlink: /home/pvl/spaces/abird/src/dotlink
+    release: /home/pvl/spaces/abird/src/dotlink-017-mounts
 
-Dotlink main:
+Do not use A1/X2 or create another worktree. Preserve unrelated work.
+AW .agents/plans/ux/** is reserved by another owner: do not read, list, stage,
+reset, stash or inspect its staging. The 017 sandbox/config-v13 plan is frozen;
+do not implement it unless the user explicitly promotes it.
 
-    /home/pvl/spaces/abird/src/dotlink
-
-Release reference:
-
-    /home/pvl/spaces/abird/src/dotlink-017-mounts
-    release/0.17 @ 887401398da297c458ffa2a152a07e1b85870c35
-
-Do not use A1/X2. Do not create another worktree. Preserve unrelated dirty or
-staged work. Do not stage, commit, push, tag, release, deploy or publish unless
-the user explicitly authorizes it.
-
-Keep each implementation turn near 30 minutes. Aim for one coherent technical
-checkpoint, update durable docs, then pause.
+Keep implementation turns near 30 minutes, checkpoint at the next coherent
+point, update durable docs, then pause.
 
 ## Read first
 
-1. `/home/pvl/spaces/abird/src/aw/AGENTS.md`
-2. `/home/pvl/spaces/abird/src/aw/.agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-18.md`
-3. `/home/pvl/spaces/abird/src/aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/README.md`
-4. `/home/pvl/spaces/abird/src/aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/DESIGN.md`
-5. `/home/pvl/spaces/abird/src/aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/AUDIT.md`
-6. `/home/pvl/spaces/abird/src/aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/TODO.md`
-7. `/home/pvl/spaces/abird/src/dotlink/AGENTS.md`
-8. `/home/pvl/spaces/abird/src/dotlink/.agents/plans/017-main-shared-consumer-backport-2026-11-18/README.md`
-9. `/home/pvl/spaces/abird/src/dotlink/.agents/plans/017-main-shared-consumer-backport-2026-11-18/TODO.md`
-10. live source/tests for every owner you touch.
+1. AW AGENTS.md
+2. AW .agents/docs/CURRENT_HANDOFF.md
+3. AW .agents/plans/017-shared-runtime-convergence-2026-11-18/README.md
+4. AW .agents/plans/017-shared-runtime-convergence-2026-11-18/DESIGN.md
+5. AW .agents/plans/017-shared-runtime-convergence-2026-11-18/AUDIT.md
+6. AW .agents/plans/017-shared-runtime-convergence-2026-11-18/TODO.md
+7. AW .agents/plans/017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md
+8. dotlink AGENTS.md
+9. dotlink .agents/docs/CURRENT_HANDOFF.md
+10. dotlink .agents/plans/017-main-shared-consumer-backport-2026-11-18/README.md
+11. dotlink .agents/plans/017-main-shared-consumer-backport-2026-11-18/TODO.md
+12. dotlink .agents/plans/017-main-shared-consumer-backport-2026-11-18/D1-D3-SOURCE-CUTOVER-MAP.md
+13. dotlink .agents/plans/017-main-shared-consumer-backport-2026-11-18/D4-D7-SOURCE-CUTOVER-MAP.md
+14. live source/tests for every owner touched.
 
-The frozen sandbox plan may be read for context only:
+## Current refs
 
-    /home/pvl/spaces/abird/src/aw/.agents/plans/017-sandbox-mount-convergence-2026-11-18/README.md
+Authoritative fresh-review implementation pin:
 
-Do **not** implement sandbox/mount/config-v13 work unless the user explicitly
-promotes it.
+    AW_IMPL_SHA 7c7de6c9aeedf714adbe67b17ac863f27697e90e
 
-## Exact expected refs
+It is signed and supersedes historical source checkpoint `eb325b31...`.
+At this docs-edit instant `origin/main` is still `792f0b38...`; the current user
+turn explicitly authorizes publishing AW and atomically repinning dotlink.
 
-AW:
+Dotlink committed baseline:
 
-    HEAD        021b8cec7b9122a6f6acaf5ef9137fb31f0a6659
-    origin/main 792f0b38d104659264b70c31736655df1a46b60f
-
-Dotlink main:
-
-    HEAD        6598de605a006a75473a2043de3f60db384b0d02
+    HEAD        8e14ee2b8575c35bc3d5a7204ac15c121410c751
     origin/main 5381729cd469eda54691e540deb3fee13e9f3e3e
 
-Release authority:
+Dotlink also has small uncommitted pre-repin parity fixes.
 
-    release/0.17 = 887401398da297c458ffa2a152a07e1b85870c35
-    v0.17.4 tag = fd1cdb6429a341a4e3d27805cae0bec288fc26df
+Current read-only release reference:
 
-Nothing should be staged. Dotlink source should still have no diff; only its
-017 consumer-plan README/TODO should be dirty.
+    local release/0.17  3995448d7bf33794ef84c7bb51150d77cc260ada
+    origin/release/0.17 3995448d7bf33794ef84c7bb51150d77cc260ada
+    v0.17.5              3995448d7bf33794ef84c7bb51150d77cc260ada
+    v0.17.4              fd1cdb6429a341a4e3d27805cae0bec288fc26df
 
-Before editing, revalidate:
+The release worktree advanced concurrently; do not reset or modify it from this
+workstream.
 
-- HEAD/origin for all three checkouts;
-- `git status`;
-- staged files;
-- `git diff --check`;
-- frozen sandbox paths have no worktree or staged diff;
-- dotlink source/Cargo files remain untouched.
+Nothing should be staged or pushed.
 
-## Current phase
+## Shared process contracts
 
-**P1-P7 are implemented in the AW working tree. P8 host-available technical
-validation is complete. Start P9 only.**
+Physical exit:
 
-Do not redo P1/P2. In particular, ignore historical text describing
-`StopOrigin`, `Cleanup`, `Dropped`, `ProcessStopCause`,
-`StopAttemptReason`, `StopOutcome` or `StopAttempt`. Those are obsolete.
+    ProcessExit::{Code(i32), Signal(i32), Unknown}
 
-## Canonical shared contracts to consume
-
-### Process stop
+Semantic stop:
 
     StopReason::{Timeout, Cancelled, RuntimeError}
     StopEvidence::{Stopped, NoTarget, Unknown}
@@ -92,33 +78,36 @@ Do not redo P1/P2. In particular, ignore historical text describing
         evidence: StopEvidence,
     }
 
-`reason=None` means housekeeping. Only `Stopped + Some(reason)` may become a
-terminal semantic stop cause.
+reason=None is housekeeping. Only Stopped + Some(reason) may become a terminal
+semantic stop.
 
-Physical exit remains orthogonal:
+StopReason::as_str() is the canonical shared spelling:
 
-    ProcessExit::{Code(i32), Signal(i32), Unknown}
+    timeout
+    cancelled
+    runtime_error
 
-Never synthesize a signal number from a stop request.
+StopTracker is the zero-cost logical-stop escalation state:
 
-Platform stop proof is below aw-tools:
+- Unknown retains the original semantic reason for a retry;
+- Stopped/NoTarget conclude the sequence and clear it;
+- later unrelated cleanup is reason-less.
 
-    aw-platform-* -> io::Result<bool>
-      Ok(true)  => Stopped
-      Ok(false) => NoTarget
-      Err       => Unknown
+Platform facts:
 
-`ManagedProcessGuard` disarms on Stopped/NoTarget and stays armed on Unknown.
-The final pre-publish D1 platform fact is also implemented:
-`aw_platform::exit_signal(&ExitStatus) -> Option<i32>` owns Unix physical
-signal extraction (Windows returns `None`), and the AW process adapter consumes
-the same helper. Fresh qualification is Unix platform **13/13 + 4/4 PTY**,
-adapter **256/256**, terminal **20/20**, strict affected Clippy, minimal configs,
-downstream host/CLI and workspace all-feature compile. The native Windows Job
-Object/exit-signal assertions are authored but cannot run on L5 because the
-Windows Rust std target is not installed.
+    ManagedProcessGuard
+    exit_signal(&ExitStatus) -> Option<i32>
+    signal_name(i32) -> Option<&'static str>
 
-### Process terminal / Task detail / events
+Guard evidence:
+
+    Ok(true)  -> Stopped
+    Ok(false) -> NoTarget
+    Err       -> Unknown
+
+NoTarget is positive absence. Unknown is unresolved. Never collapse them.
+
+Terminal truth remains minimal:
 
     ProcessTerminal {
         exit: ProcessExit,
@@ -126,81 +115,113 @@ Windows Rust std target is not installed.
         output: ProcessOutputMeta,
     }
 
+Task failure detail:
+
     TaskTerminalDetail {
         exit: ProcessExit,
         stop: Option<StopReason>,
     }
 
-    ExecutionLifecycleEvent::ProcessStop { record }
+The adapter also exposes:
 
-Do not conflate Job cancellation/revocation with physical process exit.
+    ProcessReceipt::stop_record() -> Option<StopRecord>
 
-### Budgets
+This is the final factual record for one logical stop sequence.
+
+ExecutionLifecycleEvent::ProcessStop { record } is different: it is attempt-level
+evidence and may fire for graceful, forced and housekeeping attempts. Products
+must not emit one operator line per event.
+
+Dotlink D2 rules through local release 0.17.5:
+
+    reasoned final ProcessReceipt::stop_record()
+      + product cancel-vs-shutdown context
+      -> exactly one
+         LOG job stop id=<id> reason=<reason> outcome=<delivered|gone|failed>
+
+    ProcessTerminal.exit = Signal(n)
+      + final stop record has no semantic reason
+      -> exactly one
+         LOG job exit id=<id> signal=<name-or-number> from=outside
+
+The two lifecycle lines are mutually exclusive. `from=outside` says only that
+dotlink did not enter a semantic stop sequence; a reasoned stop record suppresses
+it even for NoTarget/Unknown evidence because direct-child fallback may have
+delivered the physical signal.
+
+## Shared Job contracts
+
+Finite model/product refs:
+
+    JobRef = j:<handle>[/n:<positive-coordinate>]
+
+JobRef fields are private behind validated constructors/accessors.
+Hierarchical ExecutionRef remains internal ownership/Agent-routing identity.
+
+Budgets:
 
     RawPageBytes
     SerializedResultBytes
 
-Raw retained page limits come only from `JobProfile::resolve_read_page`.
-Serialized MCP/result envelope limits are separate.
-
+Raw page size comes from JobProfile::resolve_read_page; zero is invalid.
 A one-byte raw page is valid inside a larger serialized response.
 
-### Finite Job refs
+Diagnostics:
 
-    JobRef = j:<handle>[/n:<coordinate>]
+    aw_tools::diagnostic::bounded_diagnostic
 
-Finite model/product output uses flat `JobRef`.
-Hierarchical `ExecutionRef` remains internal ownership/Agent-routing identity.
-
-### Shared finite receipt grammar
+Receipts:
 
     Receipt::JobStatus
     Receipt::NodeStatus
     Receipt::Handoff
     Receipt::Cancel
-    Receipt::Ack {
-        AckMode::Finish | AckMode::Through(...)
-    }
+    Receipt::Ack { Finish | Through(...) }
 
-`render_handoff` may fall back to a smaller receipt under a tight envelope but
-must keep the exact same Job and explicit `no-rerun`.
+Typed Job/Node receipts now preserve process stop=timeout|cancelled|runtime_error.
 
-### Diagnostics
+Job lifecycle remains distinct and receipts preserve:
 
-Use shared UTF-8-safe:
+    running
+    cancelling
+    revoking
+    settled
+    cancelled
+    revoked
 
-    aw_tools::diagnostic::bounded_diagnostic
+Do not conflate Job Cancelled/Revoked with process StopReason.
 
-Do not recreate unbounded product ref/error formatting.
+## Lightweight MCP protocol boundary
 
-### MCP result metadata / fitting
+Generic MCP model projection now lives in aw-mcp-protocol.
 
-Shared `aw-mcp` surface includes:
+It depends only on:
 
-    McpToolResult { content, structured_content, is_error, meta }
+- aw-tools with default features disabled and **no aw-tools feature enabled**;
+- rmcp model types with default features disabled;
+- serde_json;
+- Tokio timing/macros/runtime.
+
+It deliberately does not pull:
+
+- aw-agent-core;
+- aw-agent-kernel;
+- reqwest;
+- jsonschema;
+- clap;
+- MCP client/server transport features.
+
+The full aw-mcp client adapter depends on and re-exports this surface; there is
+one projection implementation.
+
+Shared protocol helpers:
 
     stored_receipt_timestamp(...)
     has_visible_receipt_timestamp(...)
     set_stored_receipt_timestamp(...)
-    decorate_and_fit_complete_result(...)
+    validate_complete_result(...)
     fit_complete_result(...)
-
-Shared receipt metadata key:
-
-    io.abird/receipt
-
-Stored `ts` wins on replay. Fresh selected results receive a host-supplied
-timestamp.
-
-The fitter measures actual serialized `CallToolResult` bytes.
-Only text may shrink. Typed media/resources, structured JSON, result metadata,
-result type, error class, content-block order and block metadata are immutable.
-If immutable facts cannot fit, return an explicit limit error rather than
-rewriting them as prose.
-
-### MCP progress
-
-Shared `aw-mcp` surface:
+    decorate_and_fit_complete_result(...)
 
     ProgressHeartbeatConfig
     ProgressHeartbeat
@@ -210,107 +231,137 @@ Shared `aw-mcp` surface:
     semantic_progress_notification(...)
     notify_semantic_progress_bounded(...)
 
-Dotlink owns extracting the rmcp request progress token and peer. Build
-`ProgressHeartbeat::from_token(...)` and provide
-`peer.notify_progress(...)` through the send closure.
+Result rules:
 
-Heartbeat defaults are 10 s interval / 100 ms per-send budget. Heartbeats are
-monotonic, unknown-total, no-message ticks. No detached task/queue exists.
-While progress delivery is blocked, the operation must continue being polled.
-The optional observer carries attempted/delivered counts into dotlink logging.
+- whole result _meta: max 16 KiB serialized;
+- per-block metadata overhead independently bounded;
+- stored receipt timestamp wins on replay;
+- timestamp mutation merges into the existing io.abird/receipt object;
+- malformed reserved receipt metadata fails transactionally;
+- only text may shrink;
+- truncation always carries the generic marker;
+- typed media/resources, structured JSON, block order/metadata, result type,
+  error class and result metadata are immutable;
+- if immutable facts + minimal marker cannot fit, return explicit Limit;
+- fit against the full envelope first: if the exact visible ts= survives,
+  no sidecar reserve is charged;
+- at the 32-block limit, an existing text block can carry the visible marker;
+  an all-typed full block set fails explicitly.
 
-Real semantic progress must use AW's existing
-`filesystem::progress::End::{Known,Unknown}`; never invent percentages.
+Progress rules:
 
-### Signal naming
+- no token => sender never polled;
+- heartbeat ticks are monotonic 1,2,3...;
+- heartbeat total/message are absent;
+- default interval/send budget = 10 s / 100 ms;
+- operation continues polling while send is backpressured;
+- no detached task/queue;
+- expired delivery deadline does not poll sender;
+- observer gets only {attempted, delivered};
+- semantic progress uses AW's real known/unknown total, never guessed percent.
 
-Use the shared platform `signal_name(number)` helper for presentation hints.
-Canonical process state stores the numeric signal only.
+## Validation after fresh review
 
-## P8 validation baseline
+AW:
 
-Current working tree is green on L5:
+- aw-tools: 357/357
+- aw-tools-adapter: 255/255
+- aw-mcp-protocol: 12/12
+- aw-mcp: 20/20
+- aw-platform-unix: 13/13
+- live PTY: 4/4
+- cross-UID fixture: 1 intentional ignore
+- aw-terminal: 20/20
+- no-default/minimal checks: green
+- host-side aw-platform-win check: green
+- aw-host / aw-cli / workspace all-feature check: green
+- strict Clippy for touched crates: green
+- rustfmt / diff check: green
 
-- `aw-tools --all-features --lib`: **354/354**
-- `aw-tools-adapter --all-features --lib`: **256/256**
-- `aw-mcp --all-features --lib`: **33/33**
-- `aw-platform-unix`: **13/13**
-- Unix live PTY integrations: **4/4**
-- cross-UID Unix fixture: intentionally ignored
-- `aw-terminal --lib`: **20/20**
-- strict all-target/all-feature Clippy for touched crates
-- no-default `aw-tools`
-- batch-only `aw-tools`
-- no-default adapter
-- no-default Unix platform
-- host-side Windows platform check
-- downstream `aw-host`, `aw-cli`
-- full workspace all-feature compile
-- rustfmt and `git diff --check`
+Native Windows Job Object/exit-signal execution remains external because L5 has
+no Windows Rust std target.
 
-P8 API review also made `ProgressHeartbeatConfig` and `JobRef` fields private
-behind validated constructors/accessors.
+Dotlink after fresh-review parity fixes:
 
-## P9 objective — dotlink thin consumer
+- main binary: 698 passed / 0 failed / 1 intentional ignored
+- integrations: 40/40
+- all-target/all-feature check: green
+- strict Clippy: green
+- rustfmt / diff check: green
+- Markdown lint: green
+- NixOS module check: green
 
-Only now begin the dotlink source cutover.
+## Dotlink pre-repin parity fixes
 
-The companion D-items map to P9:
+Current uncommitted dotlink fixes intentionally keep the old pinned binary
+behavior aligned until the shared cutover:
 
-1. Replace dotlink-local stop/cause/process-terminal reconstruction with shared
-   AW stop/terminal facts.
-2. Project shared `TaskTerminalDetail { exit, stop }` into MCP error data
-   without erasing reaped exit/signal behind later internal failures.
-3. Replace local raw finite Job-ref parsing with `JobRef`; keep product
-   transport error bounding.
-4. Replace local handoff/status/cancel/ACK grammar with shared receipts.
-5. Consume `RawPageBytes` / `SerializedResultBytes`; preserve raw
-   offsets/EOF/delivery/ACK proof.
-6. Replace local MCP receipt metadata helpers and generic result fitter with
-   shared aw-mcp helpers.
-7. Replace local heartbeat helper with shared heartbeat/progress adapter and
-   implement dotlink logging as `ProgressHeartbeatObserver`.
-8. Keep only genuinely product-owned mappings:
-   - exact `stopped_by="cancel"|"shutdown"|"timeout"|"failed"` wording;
-   - operator log destination/text;
-   - transport response windows;
-   - config/CLI/env/Nix behavior;
-   - outer OpenAI request replay ledger.
-9. Run the v0.17.4 equivalence matrix and delete duplicate local generic
-   semantics only after parity is proved.
+- jobs_read(limit=0) is rejected;
+- one-byte pages still work with independent response envelopes and ACK proof;
+- local receipt stamping preserves fields inside reserved receipt metadata;
+- malformed reserved receipt metadata fails transactionally;
+- visible stored timestamps are rechecked after fitting;
+- a surviving visible ts= is not charged a fake sidecar reserve;
+- text fitting never silently truncates without a marker;
+- typed/structured facts remain immutable.
 
-Important release references:
+These are temporary generic product helpers. Delete them after the same
+regressions pass against the shared protocol crate.
 
-    c185558  stop/provenance
-    74820ff  bounded Job diagnostics
-    06d5548  raw page vs serialized envelope
-    30099aa  Nix environment ownership
-    5b27784  runtime-health/backport docs
-    8874013  platform signal-label test cleanup
+## Publish/repin boundary
 
-Do not mechanically copy release-local architecture. Use those commits as
-behavioral reference only.
+Do not publish or repin without explicit user authorization.
 
-## Authority-gated items — do not perform automatically
+The final fresh-review implementation pin is
+`7c7de6c9aeedf714adbe67b17ac863f27697e90e`; do not pin `eb325b31`.
 
-P8 still has three intentionally open items:
+The eventual direct dotlink AW dependency set is exactly:
 
-- signed AW implementation checkpoint;
-- publish/push that exact AW checkpoint;
-- atomically repin all dotlink AW dependencies to that exact published commit.
+    aw-tools
+    aw-tools-fs-unix
+    aw-tools-fs-win
+    aw-platform
+    aw-mcp-protocol
 
-They require explicit user authorization. P9 may be implemented on the current
-dirty shared working tree if the user directs continuation, but do not create a
-fake pin to an unpublished/dirty state.
+All five plus every transitive AW Git package in Cargo.lock must resolve to the
+same exact published AW_IMPL_SHA.
 
-## Checkpoint discipline
+Do not add full aw-mcp.
+Do not use sibling/path overrides.
 
-At the end of each P9 turn:
+## Post-repin cutover order
 
-- run focused tests plus the relevant full affected suite;
-- run strict Clippy for touched crates;
-- run rustfmt and `git diff --check`;
-- verify frozen sandbox paths remain untouched;
-- verify unrelated work is preserved;
-- update AW master plan and dotlink companion plan;
-- pause at the next coherent boundary.
+D1-D3:
+
+1. replace dotlink private process Guard/pre-spawn logic with aw-platform;
+2. use shared exit_signal, StopRecord/StopTracker and retained ProcessTerminal;
+3. delete stop_proven / synthetic old ProcessExit reconstruction;
+4. preserve terminal facts through later spool/journal failure;
+5. use ProcessReceipt::stop_record() for exactly one product stop line and
+   combine it with physical ProcessExit for the mutually exclusive v0.17.5
+   outside-exit line;
+6. use lifecycle events only for attempt diagnostics;
+7. project TaskTerminalDetail with one product compatibility mapper.
+
+D4-D5:
+
+1. use typed JobRef;
+2. use shared receipt grammar and bounded diagnostics;
+3. use JobProfile::resolve_read_page / RawPageBytes;
+4. use SerializedResultBytes independently;
+5. retain hostile-ref, zero/one-byte page, ACK and replay regressions.
+
+D6-D7:
+
+1. add aw-mcp-protocol;
+2. replace local receipt/fitter helpers;
+3. replace local heartbeat scheduler;
+4. implement product logging as ProgressHeartbeatObserver;
+5. retain typed-media/structured, tight timestamp, marker and backpressure tests.
+
+Then rerun D9/v0.17.4 equivalence.
+
+## Frozen work
+
+Do not implement sandbox/mount/config-v13 convergence from this plan.
+It remains a separate explicitly deferred scope.

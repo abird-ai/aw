@@ -159,8 +159,8 @@ provenance and product wording are higher-layer observer context, not canonical
 process state.
 
 Only `Some(reason) + Stopped` contributes to the optional terminal stop reason.
-The Guard must retain an existing semantic reason across an Unknown retry; a
-later Drop retry does not relabel Cancelled as "Dropped".
+Shared zero-cost `StopTracker` retains the existing semantic reason across an
+Unknown retry; a later Drop retry does not relabel Cancelled as "Dropped".
 
 `NoTarget` is positive knowledge that no live target remains; `Unknown` is
 unresolved and the target may still be alive. They remain distinct because the
@@ -186,7 +186,10 @@ rather than growing canonical state speculatively.
 
 The existing `job_event` module remains for Result/Settled/Attention and
 Agent wake semantics. Process stop attempts are lower-level execution evidence
-and use a separate optional lifecycle-event sink.
+and use a separate optional lifecycle-event sink. The adapter also retains one
+final factual `ProcessReceipt::stop_record()` for the logical stop sequence;
+products use that for one final projection rather than treating each attempt
+event as a terminal result.
 
 ### Task failures retain factual terminal detail
 
@@ -197,7 +200,8 @@ detail; MCP transports project it.
 ### Page and response budgets are different types
 
 A one-byte raw page must not imply a one-byte serialized MCP envelope. AW owns
-the semantic page budget; AW MCP owns the serialized result envelope.
+the semantic page budget; `aw-mcp-protocol` owns generic serialized result
+projection.
 
 ### Receipts and finite Job refs are typed shared facts
 
@@ -213,10 +217,11 @@ never changes execution identity or result semantics.
 
 ### MCP receipt metadata and fitting preserve result identity
 
-P6 makes result-level MCP `_meta` a bounded public `McpToolResult` fact and
-stores shared receipt time under `io.abird/receipt.ts`. Hosts supply the fresh
-timestamp; an already stored timestamp wins on replay, and the exact visible
-`ts=` line is added only when absent.
+P6 keeps raw client `McpToolResult` ownership in `aw-mcp`, while generic
+result/receipt projection lives in lightweight `aw-mcp-protocol`. Shared receipt
+time is stored under `io.abird/receipt.ts`; hosts supply the fresh timestamp,
+an already stored timestamp wins on replay, and the exact visible `ts=` line is
+added only when absent. `aw-mcp` re-exports the protocol helpers for AW clients.
 
 The complete-result fitter measures actual serialized `CallToolResult` bytes.
 Only text may shrink. Structured JSON, typed media/resources, result metadata,
@@ -230,12 +235,16 @@ P7 adds token-gated `ProgressHeartbeat` /
 A heartbeat emits only monotonic unknown-total ticks; it never invents a total,
 message or final completion state.
 
-The product supplies its rmcp request peer as a send closure, keeping
-`aw-mcp` client-feature-only. Each notification send is independently bounded,
-and the operation future remains polled while delivery is pending, so progress
-backpressure cannot delay completion. No detached task/queue exists. An
-optional RAII observer receives only attempted/delivered counts, including when
-the wrapper itself is cancelled.
+The product supplies its rmcp request peer as a send closure. The shared
+`aw-mcp-protocol` crate has no client/server transport feature, enables no
+`aw-tools` feature, and therefore adds no Agent, HTTP client or MCP transport
+stack to server consumers. Receipt selection is a feature-neutral copyable
+`ReceiptProfile`, not a Toolset/catalog dependency. Each
+notification send is independently bounded, and the operation future remains
+polled while delivery is pending, so progress backpressure cannot delay
+completion. No detached task/queue exists. An optional RAII observer receives
+only attempted/delivered counts, including when the wrapper itself is
+cancelled.
 
 Real semantic progress remains owned by the transport-independent AW progress
 type and is projected through its existing known/unknown total semantics.
@@ -254,8 +263,8 @@ AW in this effort.
 - Optional event sinks must be no-op when absent.
 - Do not add heap allocation merely to classify a process stop.
 - Reuse existing `JobManager`, `ProcessTerminal`, `TaskDisposition`,
-  `ExecutionRef`, `Receipt`, `Toolset` and `aw-mcp`; do not create
-  parallel registries.
+  `ExecutionRef`, `Receipt`, `Toolset`, `aw-mcp-protocol` and the `aw-mcp`
+  client adapter; do not create parallel registries or projection engines.
 - Preserve no_std/alloc boundaries where existing modules support them.
 - Platform proof belongs in `aw-platform*`/std adapters, not the pure kernel.
 - Product prose and logging strings remain outside shared semantic types.

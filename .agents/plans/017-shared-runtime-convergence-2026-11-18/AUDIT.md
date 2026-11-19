@@ -16,17 +16,17 @@ strengthens platform-owned signal-label testing.
 | 4 | Evidence-preserving managed process-tree guard | AW platform/adapter | P2 | implemented; Unix native gate green, authored Windows native gate pending Windows target |
 | 5 | Stop evidence in `ProcessTerminal` / JobManager | AW core | P3 | implemented and green in working tree |
 | 6 | Typed Task terminal/failure detail | AW core | P3 | compact `{exit, stop}` projection implemented and green |
-| 7 | Execution lifecycle event sink | AW core/adapter | P3 | optional `ProcessStop` sink implemented and green |
+| 7 | Execution lifecycle stop sequencing/events | AW core/adapter | P3 | shared zero-cost `StopTracker`, attempt-level `ProcessStop` sink and final factual `ProcessReceipt::stop_record()`; product logging remains host-owned |
 | 8 | Generic sandbox mount semantics | AW sandbox | S | **deferred** |
 | 9 | Linux pinned generic mount/Bubblewrap binding | AW sandbox_linux | S | **deferred** |
-| 10 | Page vs serialized response budget types | AW core + adapter + aw-mcp | P4 | implemented and green; complete MCP fitter remains P6 |
-| 11 | Complete Job handoff/control receipts | AW receipt | P5 | typed JobStatus/NodeStatus/Handoff/Cancel/Ack grammar implemented and green |
+| 10 | Page vs serialized response budget types | AW core + adapter + aw-mcp-protocol | P4 | implemented and green; complete MCP fitter remains P6 |
+| 11 | Complete Job handoff/control receipts | AW receipt | P5 | typed JobStatus/NodeStatus/Handoff/Cancel/Ack grammar; revocation distinct from cancellation and `ProcessTerminal.stop` retained |
 | 12 | Typed bounded flat Job refs + diagnostics | AW execution_ref/Job API | P5 | `JobRef` + shared bounded diagnostics implemented and green |
-| 13 | MCP receipt metadata decorator | aw-mcp | P6 | implemented: bounded `_meta`, replay-stable host timestamp, atomic visible receipt |
-| 14 | MCP serialized result fitter | aw-mcp | P6 | implemented: text-only fitting, immutable typed/structured facts fail explicitly |
-| 15 | MCP heartbeat/progress adapter | aw-mcp | P7 | implemented: token-gated no-total heartbeat, concurrent bounded delivery, RAII summary observer, semantic progress adapter |
+| 13 | MCP receipt metadata decorator | aw-mcp-protocol + feature-neutral receipt policy | P6 | copyable `ReceiptProfile`, zero aw-tools features, no full-result clone for sidecar reservation; bounded `_meta`, replay-stable timestamp and full-budget visible-marker preservation |
+| 14 | MCP serialized result fitter | aw-mcp-protocol | P6 | text-only fitting with mandatory marker; immutable typed/structured facts fail explicitly; `aw-mcp` re-exports |
+| 15 | MCP heartbeat/progress adapter | aw-mcp-protocol | P7 | no client/server transport dependency; token-gated no-total heartbeat, concurrent bounded delivery, RAII summary observer, semantic progress adapter |
 | 16 | Signal/exit platform facts | aw-platform | P2 | `signal_name` plus allocation-free `exit_signal(&ExitStatus)` implemented; AW adapter consumes the same exit-signal helper; Unix green, Windows projections are correctly None with native assertion authored |
-| 17 | Cross-repo shared checkpoint | AW + dotlink plan boundary | P8 | all host-available technical gates green; native Windows test and commit/publish/repin remain external/authority-gated |
+| 17 | Cross-repo shared checkpoint | AW + dotlink plan boundary | P8 | fresh-review implementation signed at `7c7de6c9...`; publish/repin explicitly authorized this turn; native Windows test remains external |
 
 ## v0.17.x release disposition
 

@@ -10,53 +10,58 @@ document unless the user explicitly authorizes that action.
 
 ## 1. Current source boundary
 
-AW:
+AW implementation pin selected for this publish:
 
-    HEAD        021b8cec7b9122a6f6acaf5ef9137fb31f0a6659
-    origin/main 792f0b38d104659264b70c31736655df1a46b60f
+    AW_IMPL_SHA 7c7de6c9aeedf714adbe67b17ac863f27697e90e
+    origin/main 792f0b38d104659264b70c31736655df1a46b60f  # before current push
 
-Existing local commits above origin/main:
+Signed local commits above origin/main include:
 
     796225e9b50e824606586859d7bcc88722b4919e  Separate process signal identity from lifecycle
     63f4056027135227f49170ce6602c8f43a9f5ad0  Plan shared-first 0.17 runtime convergence
     021b8cec7b9122a6f6acaf5ef9137fb31f0a6659  Add shared process stop evidence types
+    eb325b31d393e4d30c8aa2ff3d9e00bf5c506d2f  Complete shared 0.17 runtime convergence
+    61ed065dbaf88ef6365d2ecb890e0df940e250f4  Record shared 0.17 convergence handoff
+    7c7de6c9aeedf714adbe67b17ac863f27697e90e  Fix shared 0.17 projection boundaries
 
-All three contain SSH commit signatures. AW is configured with
-commit.gpgsign=true, gpg.format=ssh and the owner's Ed25519 signing key.
+Fresh-review projection fixes are now signed in `AW_IMPL_SHA`. They supersede
+`eb325b31` for dependency use.
 
-The remaining P2-P8 source is intentionally unstaged in the AW working tree.
-It includes the shared platform Guard/evidence adapter, ProcessTerminal/Task
-propagation, raw-vs-serialized budgets, flat JobRef, bounded diagnostics, typed
-receipts, aw-mcp receipt/result fitting, and heartbeat/progress.
-
-The untracked source files that must be part of the implementation checkpoint:
-
-    crates/aw-tools/src/budget.rs
-    crates/aw-tools/src/diagnostic.rs
+The new lightweight shared surface is `crates/aw-mcp-protocol/**`; `aw-mcp`
+depends on and re-exports it for AW client users.
 
 Frozen sandbox/config-v13 paths remain out of scope and must have no working
 diff.
 
 ## 2. Commit partition when explicitly authorized
 
-Prefer two new AW commits after the three existing signed commits.
+The initial source/docs pair exists at `eb325b31` / `61ed065d` and the
+fresh-review source checkpoint is now signed at `7c7de6c9...`. Only the docs
+sync and remote publication remain before the atomic dotlink repin.
 
-### A. Source implementation checkpoint
+### A. Fresh-review source checkpoint
 
-Proposed subject:
+Completed signed source checkpoint:
 
-    Complete shared 0.17 runtime convergence
+    7c7de6c9aeedf714adbe67b17ac863f27697e90e  Fix shared 0.17 projection boundaries
 
-Stage only the P2-P8 source/test implementation in:
+The committed source/test set is:
 
-    crates/aw-tools/**
-    crates/aw-tools-adapter/**
-    crates/aw-mcp/**
-    crates/aw-platform-unix/**
-    crates/aw-platform-win/**
-    crates/aw-terminal/**
+    Cargo.toml
+    Cargo.lock
+    crates/aw-mcp/Cargo.toml
+    crates/aw-mcp/src/lib.rs
+    crates/aw-mcp-protocol/Cargo.toml
+    crates/aw-mcp-protocol/src/lib.rs
+    crates/aw-tools-adapter/src/process.rs
+    crates/aw-tools/src/execution_stop.rs
+    crates/aw-tools/src/filesystem/runner.rs
+    crates/aw-tools/src/lib.rs
+    crates/aw-tools/src/receipt.rs
+    crates/aw-tools/src/receipt_policy.rs
+    crates/aw-tools/src/toolset.rs
 
-Include budget.rs and diagnostic.rs.
+This exact signed commit, not `eb325b31`, is the dependency pin SHA.
 
 Do not stage .agents/plans/ux/** or any frozen sandbox/config-v13 path.
 
@@ -72,8 +77,17 @@ Proposed subject:
 
     Record shared 0.17 convergence handoff
 
-Stage the owned convergence docs/handoffs and historical plan-status
-synchronization only after the source checkpoint is fixed.
+Stage only the owned convergence docs/handoffs after the source checkpoint is
+fixed:
+
+    .agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-18.md
+    .agents/docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-18.md
+    .agents/docs/CURRENT_HANDOFF.md
+    .agents/plans/017-shared-runtime-convergence-2026-11-18/AUDIT.md
+    .agents/plans/017-shared-runtime-convergence-2026-11-18/DESIGN.md
+    .agents/plans/017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md
+    .agents/plans/017-shared-runtime-convergence-2026-11-18/README.md
+    .agents/plans/017-shared-runtime-convergence-2026-11-18/TODO.md
 
 This docs commit may be pushed after the implementation checkpoint, but dotlink
 must pin the implementation checkpoint SHA, not this later docs-only SHA.
@@ -84,6 +98,7 @@ Immediately before the implementation commit, revalidate:
 
 - aw-tools all-features lib;
 - aw-tools-adapter all-features lib;
+- aw-mcp-protocol unit + strict Clippy + dependency-tree lightweight-boundary check;
 - aw-mcp all-features lib;
 - aw-platform-unix unit + PTY integration;
 - aw-terminal lib;
@@ -117,13 +132,13 @@ logic. `aw-platform` remains independent of `aw-tools::ProcessExit`; the host or
 adapter combines `status.code()` / `exit_signal()` into the shared exit enum.
 
 Fresh qualification: Unix platform **13/13 + 4/4 PTY** (cross-UID fixture still
-intentionally ignored), adapter **256/256**, terminal **20/20**, strict affected
+intentionally ignored), adapter **255/255**, terminal **20/20**, strict affected
 Clippy, minimal configs, downstream host/CLI and full workspace all-feature
 check green. Windows-native execution remains external because L5 lacks the
 Windows Rust std target.
 
-The exact dotlink D1-D3 source inventory is recorded in its companion
-`D1-D3-SOURCE-CUTOVER-MAP.md`.
+The exact dotlink consumer inventories are recorded in the companion
+`D1-D3-SOURCE-CUTOVER-MAP.md` and `D4-D7-SOURCE-CUTOVER-MAP.md` files.
 
 Before staging, verify status/staging while excluding the reserved UX subtree,
 and separately verify zero working diff in the frozen sandbox plan/source set.
@@ -146,22 +161,52 @@ commit reachability must be checked.
 
 ## 5. Dotlink pre-repin baseline
 
-Current dotlink:
+Current committed dotlink baseline:
 
-    HEAD        6598de605a006a75473a2043de3f60db384b0d02
+    HEAD        8e14ee2b8575c35bc3d5a7204ac15c121410c751
     origin/main 5381729cd469eda54691e540deb3fee13e9f3e3e
 
-The dirty dotlink tree already contains product-owned/pre-repin D2/D4-D8/D9
-hardening and compatibility regressions. Preserve it exactly.
+Signed pre-repin Nix/logging/runtime/docs checkpoints already exist. Fresh review
+adds one small product-source parity set plus its updated consumer documentation.
 
-If commit authorization includes dotlink, prefer logical signed baseline commits
-before the semantic cutover:
+If explicit commit authorization includes dotlink, use two logical signed
+checkpoints before the semantic cutover.
 
-1. Nix environment ownership hardening;
-2. pre-repin runtime/MCP compatibility prerequisites;
-3. equivalence/runtime-health/consumer-plan documentation.
+### Dotlink A. Fresh-review product parity
 
-These baseline commits are rollback/readability aids; they are not permission to
+Suggested subject:
+
+    Harden pre-repin MCP and shell boundaries
+
+Stage exactly:
+
+    src/mcp.rs
+    src/mcp/tools/jobs.rs
+    src/mcp/tools/shell.rs
+    tests/stdio_tools.rs
+
+This contains only independently valid behavior on the old AW pin: zero-byte
+raw-page rejection, receipt-object/tight-timestamp fixes, mandatory truncation
+markers, and the v0.17.5 hard-deadline wording.
+
+### Dotlink B. Fresh-review consumer docs
+
+Suggested subject:
+
+    Record fresh 0.17.x consumer cutover
+
+Stage exactly:
+
+    AGENTS.md
+    .agents/docs/CURRENT_HANDOFF.md
+    .agents/docs/runtime-health-check.md
+    .agents/plans/017-main-shared-consumer-backport-2026-11-18/README.md
+    .agents/plans/017-main-shared-consumer-backport-2026-11-18/TODO.md
+    .agents/plans/017-main-shared-consumer-backport-2026-11-18/V0174-EQUIVALENCE.md
+    .agents/plans/017-main-shared-consumer-backport-2026-11-18/D1-D3-SOURCE-CUTOVER-MAP.md
+    .agents/plans/017-main-shared-consumer-backport-2026-11-18/D4-D7-SOURCE-CUTOVER-MAP.md
+
+These commits are rollback/readability aids; they are not permission to push,
 publish or repin.
 
 ## 6. Atomic dependency set
@@ -176,7 +221,7 @@ The three existing direct AW Git dependencies currently all pin
 D1 and D6/D7 introduce two additional direct shared surfaces:
 
     aw-platform
-    aw-mcp
+    aw-mcp-protocol
 
 The repin must therefore converge the complete direct AW set on one exact
 published AW_IMPL_SHA:
@@ -185,7 +230,7 @@ published AW_IMPL_SHA:
     aw-tools-fs-unix  -> AW_IMPL_SHA
     aw-tools-fs-win   -> AW_IMPL_SHA
     aw-platform       -> AW_IMPL_SHA
-    aw-mcp            -> AW_IMPL_SHA
+    aw-mcp-protocol   -> AW_IMPL_SHA
 
 Cargo.lock must resolve every Git package sourced from
 https://github.com/abird-ai/aw to that same commit. Do not leave a mixed AW
@@ -195,7 +240,10 @@ Why the two new direct dependencies are required:
 
 - D1 replaces dotlink's private process-tree Guard with the target-selected
   aw-platform::ManagedProcessGuard and platform facts.
-- D6/D7 replace dotlink-local receipt/fitter/heartbeat helpers with aw-mcp.
+- D6/D7 replace dotlink-local receipt/fitter/heartbeat helpers with the
+  lightweight `aw-mcp-protocol`; dotlink must not depend on the full `aw-mcp`
+  client adapter. It enables no aw-tools feature, so it cannot widen dotlink's
+  existing `aw-tools/conformance,durable` feature set through Cargo unification.
 
 Do not add aw-tools-adapter merely to reach these generic surfaces; dotlink
 retains its own product shell/job adapter and should consume the smallest shared
@@ -223,8 +271,10 @@ qualification.
 - consume aw-platform::ManagedProcessGuard;
 - consume aw_tools::execution_stop::{StopRecord, StopEvidence, StopReason};
 - preserve ProcessExit::Signal(n) as observed physical exit;
-- connect ExecutionLifecycleEvent::ProcessStop to the product observer;
-- render exact product stopped_by and operator log only from canonical facts;
+- consume shared `StopTracker` for Unknown->retry reason preservation;
+- treat `ExecutionLifecycleEvent::ProcessStop` as attempt-level diagnostics;
+- render exact product stopped_by and exactly one operator stop line from
+  `ProcessReceipt::stop_record()`, never once per attempt event;
 - project shared TaskTerminalDetail { exit, stop };
 - remove private stop_proven/synthetic process-verdict reconstruction only after
   parity tests are green.
@@ -236,12 +286,12 @@ qualification.
 - use bounded_diagnostic;
 - use RawPageBytes for source-page requests;
 - use SerializedResultBytes independently for the response envelope;
-- retain the already-green one-byte-page, absolute-offset, ACK and hostile-ref
-  regressions.
+- retain the already-green zero-byte rejection, one-byte page, absolute-offset,
+  ACK and hostile-ref regressions.
 
 ### D6-D7: MCP result decoration / progress
 
-- add/consume aw-mcp;
+- add/consume `aw-mcp-protocol` only;
 - replace local stored/visible receipt timestamp helpers;
 - replace local text-only complete-result fitter;
 - preserve the already-green immutable metadata/media behavior;
@@ -264,8 +314,9 @@ After D1-D7:
 - rustfmt;
 - git diff --check;
 - Nix module/check derivations;
-- current v0.17.4 equivalence matrix;
+- current v0.17.x equivalence matrix through the read-only local 0.17.5 release head;
 - real connector stop-line tests;
+- v0.17.5 outside-signal line / stop-vs-exit mutual-exclusion tests at every verbosity;
 - external-kill/no-stopped_by tests;
 - typed media/structured result tests;
 - one-byte jobs_read + ACK tests;
