@@ -9,7 +9,7 @@ use std::{
         process::CommandExt,
     },
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -21,6 +21,40 @@ pub mod pty_poll;
 pub use aw_tools_fs_unix::scoped_fs;
 
 pub const FAMILY: &str = "unix";
+
+/// Signal that physically ended a waited process, when the platform reports one.
+///
+/// This is exit evidence only: it says nothing about who sent the signal or why.
+pub fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
+}
+
+/// Stable platform name for a known signal number.
+///
+/// Process state retains only the number; names are presentation helpers.
+pub const fn signal_name(number: i32) -> Option<&'static str> {
+    match number {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGQUIT => Some("SIGQUIT"),
+        libc::SIGILL => Some("SIGILL"),
+        libc::SIGTRAP => Some("SIGTRAP"),
+        libc::SIGABRT => Some("SIGABRT"),
+        libc::SIGBUS => Some("SIGBUS"),
+        libc::SIGFPE => Some("SIGFPE"),
+        libc::SIGKILL => Some("SIGKILL"),
+        libc::SIGSEGV => Some("SIGSEGV"),
+        libc::SIGPIPE => Some("SIGPIPE"),
+        libc::SIGALRM => Some("SIGALRM"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGUSR1 => Some("SIGUSR1"),
+        libc::SIGUSR2 => Some("SIGUSR2"),
+        libc::SIGXCPU => Some("SIGXCPU"),
+        libc::SIGSYS => Some("SIGSYS"),
+        _ => None,
+    }
+}
 
 /// An observed directory identity, retained without locking its pathname.
 /// Callers must still account for external writers racing a later path operation.
@@ -123,11 +157,8 @@ pub fn spawn_detached_session(command: &mut Command) -> io::Result<Child> {
     command.spawn()
 }
 
-/// Graceful stop of the explicitly spawned per-child process group.
-/// A missing/already-exited group is harmless; a failed signal is never
-/// interpreted as proof of process termination.
-pub fn terminate_process_group(pid: u32) -> io::Result<()> {
-    let pid = i32::try_from(pid)
+fn checked_process_group(pid: u32) -> io::Result<libc::pid_t> {
+    let pid = libc::pid_t::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group"))?;
     if pid <= 1 {
         return Err(io::Error::new(
@@ -135,32 +166,94 @@ pub fn terminate_process_group(pid: u32) -> io::Result<()> {
             "unsafe process group",
         ));
     }
+    Ok(pid)
+}
+
+/// Signal one explicitly spawned per-child process group.
+///
+/// `Ok(true)` proves the signal was delivered to a live group; `Ok(false)`
+/// proves the group was absent; an error leaves the result unknown.
+fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) -> io::Result<bool> {
     // SAFETY: negative pid targets only the group established on child spawn.
-    let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
-    if result == 0 {
-        return Ok(());
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(true);
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
+        Ok(false)
     } else {
         Err(error)
     }
 }
 
-pub fn kill_process_group(pid: u32) {
-    if let Ok(pid) = i32::try_from(pid) {
-        if pid > 1 {
-            // SAFETY: negative pid addresses the process group created by aw.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
+/// Graceful stop request for the explicitly spawned per-child process group.
+///
+/// The bool preserves live-target vs already-absent evidence for the caller.
+pub fn terminate_process_group(pid: u32) -> io::Result<bool> {
+    signal_process_group(checked_process_group(pid)?, libc::SIGTERM)
+}
+
+/// Forced stop of the explicitly spawned per-child process group.
+///
+/// The bool preserves live-target vs already-absent evidence for the caller.
+pub fn kill_process_group(pid: u32) -> io::Result<bool> {
+    signal_process_group(checked_process_group(pid)?, libc::SIGKILL)
+}
+
+/// Owns the process group created for one child and provides a final RAII stop.
+///
+/// An unknown explicit stop stays armed so Drop can make one final attempt.
+/// This contains the process group only; an unsandboxed descendant may escape
+/// with `setsid`, which no process-group API can recover as contained.
+pub struct ManagedProcessGuard {
+    group: libc::pid_t,
+    active: bool,
+}
+
+impl ManagedProcessGuard {
+    pub fn attach(pid: u32) -> io::Result<Self> {
+        Ok(Self {
+            group: checked_process_group(pid)?,
+            active: true,
+        })
+    }
+
+    /// Force-stop the owned process group.
+    ///
+    /// `Ok(true)` = delivered to a live group; `Ok(false)` = no group;
+    /// `Err` = unknown and the guard remains armed.
+    pub fn terminate(&mut self) -> io::Result<bool> {
+        if !self.active {
+            return Ok(false);
+        }
+        match signal_process_group(self.group, libc::SIGKILL) {
+            Ok(delivered) => {
+                self.active = false;
+                Ok(delivered)
             }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ManagedProcessGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.terminate();
         }
     }
 }
 
 pub fn terminate_child_tree(child: &mut Child) -> io::Result<()> {
-    kill_process_group(child.id());
+    let _ = kill_process_group(child.id());
     child.kill()
 }
 
@@ -544,5 +637,52 @@ impl Drop for LocalBoundSocket {
         if local_ipc_socket_identity(&self.path, self.uid).ok() == Some(self.identity) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod managed_process_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    fn grouped_shell(command: &str) -> Child {
+        let mut child = Command::new("/bin/sh");
+        configure_child_group(&mut child);
+        child.arg("-c").arg(command).spawn().expect("grouped child")
+    }
+
+    #[test]
+    fn managed_guard_distinguishes_stopped_and_no_target() {
+        let mut child = grouped_shell("sleep 30");
+        let mut guard = ManagedProcessGuard::attach(child.id()).expect("managed group");
+        assert!(guard.terminate().expect("force stop"));
+        assert!(!guard.is_active());
+        let status = child.wait().expect("reap");
+        assert_eq!(exit_signal(&status), Some(libc::SIGKILL));
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+        let mut exited = grouped_shell("exit 0");
+        let pid = exited.id();
+        let status = exited.wait().expect("reap exited");
+        assert!(status.success());
+        assert_eq!(exit_signal(&status), None);
+        let mut absent = ManagedProcessGuard::attach(pid).expect("absent group handle");
+        assert!(!absent.terminate().expect("absent group"));
+        assert!(!absent.is_active());
+    }
+
+    #[test]
+    fn signal_names_are_platform_facts_not_process_state() {
+        assert_eq!(signal_name(libc::SIGKILL), Some("SIGKILL"));
+        assert_eq!(signal_name(libc::SIGSEGV), Some("SIGSEGV"));
+        assert_eq!(signal_name(i32::MAX), None);
+    }
+
+    #[test]
+    fn managed_guard_drop_is_final_fail_safe() {
+        let mut child = grouped_shell("sleep 30");
+        let guard = ManagedProcessGuard::attach(child.id()).expect("managed group");
+        drop(guard);
+        assert_eq!(child.wait().expect("reap").signal(), Some(libc::SIGKILL));
     }
 }

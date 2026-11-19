@@ -5,6 +5,7 @@
 //! which owns status classification. Output truncation is observability only;
 //! an unproven stop or incomplete reader/drain state is `unknown`.
 use super::{batch::Status, status::Primary};
+use crate::execution_stop::StopReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessExit {
@@ -30,18 +31,22 @@ pub struct ProcessOutputMeta {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessTerminal {
     pub exit: ProcessExit,
+    /// Semantic reason AW proved it stopped the process, if any.
+    pub stop: Option<StopReason>,
     pub output: ProcessOutputMeta,
 }
 
 impl ProcessTerminal {
     pub fn status(self) -> Status {
-        let primary = if !self.output.complete || self.exit == ProcessExit::Unknown {
+        let primary = if !self.output.complete {
             Primary::Unknown
+        } else if self.stop.is_some() {
+            Primary::Fail
         } else {
             match self.exit {
                 ProcessExit::Code(0) => Primary::Ok,
                 ProcessExit::Code(_) | ProcessExit::Signal(_) => Primary::Fail,
-                ProcessExit::Unknown => unreachable!("handled above"),
+                ProcessExit::Unknown => Primary::Unknown,
             }
         };
         Status {
@@ -64,6 +69,9 @@ impl ProcessTerminal {
         if self.output.stderr_truncated {
             fields.push("stderr_truncated=true".into());
         }
+        if let Some(stop) = self.stop {
+            fields.push(format!("stop={}", stop_label(stop)));
+        }
         if !self.output.complete {
             fields.push("output_complete=false".into());
         }
@@ -78,16 +86,29 @@ impl ProcessTerminal {
             ProcessExit::Signal(signal) => format!("exit=signal:{signal}"),
             ProcessExit::Unknown => "exit=unknown".into(),
         };
+        let stop = self
+            .stop
+            .map(|reason| format!(" stop={}", stop_label(reason)))
+            .unwrap_or_default();
         format!(
-            "{} {} stdout={} stderr={} stdout_truncated={} stderr_truncated={} output_complete={}",
+            "{} {}{} stdout={} stderr={} stdout_truncated={} stderr_truncated={} output_complete={}",
             self.status().primary.as_str(),
             exit,
+            stop,
             self.output.stdout_bytes,
             self.output.stderr_bytes,
             self.output.stdout_truncated,
             self.output.stderr_truncated,
             self.output.complete
         )
+    }
+}
+
+const fn stop_label(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Timeout => "timeout",
+        StopReason::Cancelled => "cancelled",
+        StopReason::RuntimeError => "runtime_error",
     }
 }
 
@@ -115,6 +136,7 @@ impl StopProof {
             Self::Confirmed(terminal) => terminal,
             Self::Unknown(output) => ProcessTerminal {
                 exit: ProcessExit::Unknown,
+                stop: None,
                 output,
             },
         }
@@ -139,6 +161,7 @@ mod tests {
     fn truncation_is_observability_not_graph_incomplete() {
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(0),
+            stop: None,
             output: output(true, true),
         };
         assert_eq!(
@@ -160,6 +183,7 @@ mod tests {
             assert_eq!(
                 ProcessTerminal {
                     exit,
+                    stop: None,
                     output: output(true, false),
                 }
                 .status()
@@ -169,6 +193,7 @@ mod tests {
         }
         let signal = ProcessTerminal {
             exit: ProcessExit::Signal(11),
+            stop: None,
             output: output(true, false),
         };
         assert!(signal.status_detail().contains("exit=signal:11"));
@@ -187,11 +212,30 @@ mod tests {
         assert_eq!(
             ProcessTerminal {
                 exit: ProcessExit::Code(0),
+                stop: None,
                 output: output(false, false),
             }
             .status()
             .primary,
             Primary::Unknown
         );
+    }
+
+    #[test]
+    fn proven_stop_is_failure_even_when_physical_exit_is_unknown() {
+        let terminal = ProcessTerminal {
+            exit: ProcessExit::Unknown,
+            stop: Some(StopReason::Timeout),
+            output: output(true, false),
+        };
+        assert_eq!(terminal.status().primary, Primary::Fail);
+        assert!(terminal.status_detail().contains("stop=timeout"));
+        assert!(terminal.compact_result().contains("stop=timeout"));
+
+        let uncertain_output = ProcessTerminal {
+            output: output(false, false),
+            ..terminal
+        };
+        assert_eq!(uncertain_output.status().primary, Primary::Unknown);
     }
 }

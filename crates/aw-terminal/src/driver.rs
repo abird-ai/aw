@@ -549,7 +549,7 @@ impl Custodian {
         match self {
             Self::Original(child) => {
                 if let Some(pid) = child.process_id() {
-                    aw_platform::kill_process_group(pid);
+                    let _ = aw_platform::kill_process_group(pid);
                 }
                 let _ = child.kill();
             }
@@ -631,7 +631,7 @@ impl Drop for ChildGuard {
         };
         if matches!(inner.try_wait(), Ok(None)) {
             if let Some(pid) = inner.process_id() {
-                aw_platform::kill_process_group(pid);
+                let _ = aw_platform::kill_process_group(pid);
             }
             let _ = inner.kill();
             let _ = inner.wait();

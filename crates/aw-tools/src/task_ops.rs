@@ -3,6 +3,8 @@
 //! journal CAS, and any actual cancellation effect.
 
 use crate::{
+    execution_stop::StopReason,
+    filesystem::runner::{ProcessExit, ProcessTerminal},
     task::{TaskDisposition, MAX_RETAINED_TASKS},
     task_fence::TaskIdentity,
 };
@@ -34,7 +36,24 @@ pub struct TaskInfo {
     pub generation: u64,
     pub journal_sequence: u64,
     pub state: TaskDisposition,
+    /// Compact factual process termination detail for failure/error projection.
+    pub terminal: Option<TaskTerminalDetail>,
     pub source_live: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskTerminalDetail {
+    pub exit: ProcessExit,
+    pub stop: Option<StopReason>,
+}
+
+impl From<ProcessTerminal> for TaskTerminalDetail {
+    fn from(terminal: ProcessTerminal) -> Self {
+        Self {
+            exit: terminal.exit,
+            stop: terminal.stop,
+        }
+    }
 }
 #[derive(Debug)]
 pub enum TaskReply {
@@ -213,6 +232,7 @@ mod tests {
                 generation: 3,
                 journal_sequence: 20,
                 state: TaskDisposition::Running,
+                terminal: None,
                 source_live: true,
             })
         }

@@ -15,7 +15,8 @@ use aw_agent_core::{
 };
 use aw_tools::{
     execution_ref::{
-        AgentRef, ExecutionRef, ExecutionSegment, Handle, NodeCoordinate, ResolvedExecutionRef,
+        AgentRef, ExecutionRef, ExecutionSegment, Handle, JobRef, NodeCoordinate,
+        ResolvedExecutionRef,
     },
     filesystem::{
         batch::{Graph, NodeTool, Status},
@@ -835,6 +836,20 @@ impl JobHost {
         Ok(binding_hash(actor, &binding))
     }
 
+    pub fn job_ref(&self, id: &str, node: Option<usize>) -> Result<JobRef> {
+        let job = Handle::new(id.to_owned()).map_err(|_| Error::Protocol("invalid Job handle"))?;
+        let node = match node {
+            Some(node) => Some(
+                u32::try_from(node)
+                    .ok()
+                    .and_then(|value| NodeCoordinate::new(value).ok())
+                    .ok_or(Error::Denied("Job node coordinate is invalid"))?,
+            ),
+            None => None,
+        };
+        Ok(JobRef::new(job, node))
+    }
+
     pub fn execution_ref(&self, id: &str, node: Option<usize>) -> Result<ResolvedExecutionRef> {
         let task = self
             .manager
@@ -860,7 +875,22 @@ impl JobHost {
             .map_err(|_| Error::Protocol("cannot construct canonical Job ref"))
     }
 
+    fn resolve_flat_job_ref(&self, requested: &JobRef) -> Result<(String, Option<usize>)> {
+        let id = requested.job().as_str().to_owned();
+        self.manager
+            .get(&id)
+            .map_err(|_| Error::Denied("Job is not exposed or missing"))?;
+        let node = requested.node().map(|node| node.get() as usize);
+        Ok((id, node))
+    }
+
     pub fn resolve_job_ref(&self, requested: &str) -> Result<(String, Option<usize>)> {
+        if let Ok(flat) = JobRef::parse(requested) {
+            return self.resolve_flat_job_ref(&flat);
+        }
+
+        // Compatibility for pre-flat AW contextual references and Agent-owned
+        // callers. New finite Jobs responses always render the typed flat form.
         let parsed =
             ExecutionRef::parse(requested).map_err(|_| Error::Denied("invalid execution ref"))?;
         let owner = self.bound_agent_ref()?;
@@ -878,7 +908,7 @@ impl JobHost {
             }
             _ => {
                 return Err(Error::Denied(
-                    "finite Job ref must be t:<turn>/j:<job>[/n:<coordinate>]",
+                    "finite Job ref must be j:<job>[/n:<coordinate>]",
                 ))
             }
         };
@@ -2061,6 +2091,7 @@ impl JobHost {
         id: &str,
         coordinate: usize,
         exit: aw_tools::filesystem::runner::ProcessExit,
+        stop: Option<aw_tools::execution_stop::StopReason>,
         process_output_complete: bool,
     ) -> Result<aw_tools::filesystem::runner::ProcessTerminal> {
         use aw_tools::filesystem::{
@@ -2077,6 +2108,7 @@ impl JobHost {
             .map_err(|_| Error::Protocol("ShellNode stderr summary unavailable"))?;
         Ok(ProcessTerminal {
             exit,
+            stop,
             output: ProcessOutputMeta {
                 stdout_bytes: stdout.total_bytes,
                 stderr_bytes: stderr.total_bytes,
@@ -2204,16 +2236,24 @@ impl JobHost {
                             id,
                             coordinate,
                             observed.exit,
+                            observed.stop,
                             observed.output.complete,
                         )?;
                         (terminal, primary)
                     }
                     Err(_) => (
-                        self.retained_process_terminal(id, coordinate, ProcessExit::Unknown, false)
-                            .unwrap_or(ProcessTerminal {
-                                exit: ProcessExit::Unknown,
-                                output: Default::default(),
-                            }),
+                        self.retained_process_terminal(
+                            id,
+                            coordinate,
+                            ProcessExit::Unknown,
+                            None,
+                            false,
+                        )
+                        .unwrap_or(ProcessTerminal {
+                            exit: ProcessExit::Unknown,
+                            stop: None,
+                            output: Default::default(),
+                        }),
                         Primary::Unknown,
                     ),
                 };
@@ -2281,6 +2321,7 @@ impl JobHost {
             id,
             coordinate,
             observed.exit,
+            observed.stop,
             observed.output.complete,
         )?;
         self.settle_shell_result(

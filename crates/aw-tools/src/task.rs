@@ -342,17 +342,12 @@ impl TaskUsage {
     }
 }
 
-pub fn bounded_task_error(mut error: String) -> String {
-    if error.len() <= MAX_TASK_ERROR_BYTES {
-        return error;
-    }
-    let mut end = MAX_TASK_ERROR_BYTES.saturating_sub('…'.len_utf8());
-    while !error.is_char_boundary(end) {
-        end -= 1;
-    }
-    error.truncate(end);
-    error.push('…');
-    error
+pub fn bounded_task_error(error: String) -> String {
+    debug_assert_eq!(
+        MAX_TASK_ERROR_BYTES,
+        crate::diagnostic::MAX_DIAGNOSTIC_BYTES
+    );
+    crate::diagnostic::bounded_diagnostic(error)
 }
 
 /// AW's durable journal or dotlink's job manager implements this. The

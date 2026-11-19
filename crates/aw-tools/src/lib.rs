@@ -13,9 +13,11 @@ pub const MAX_BINARY_EDIT_RANGES: usize = 32;
 
 #[cfg(feature = "binary")]
 pub mod binary;
+pub mod budget;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod coordination;
+pub mod diagnostic;
 pub mod execution_ref;
 pub mod execution_stop;
 pub mod filesystem;

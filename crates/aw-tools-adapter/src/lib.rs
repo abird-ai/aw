@@ -703,11 +703,6 @@ impl LocalToolLimits {
                     "AW Job profile must narrow its built-in ceilings".into(),
                 ));
             }
-            if self.job_profile.read_page_max_bytes < aw_agent_core::tool::MIN_TOOL_RESULT_BYTES {
-                return Err(Error::Config(
-                    "AW jobs_read ceiling must fit the minimum factual tool-result envelope".into(),
-                ));
-            }
             self.jobs
                 .validate()
                 .map_err(|_| Error::Config("invalid shared JobManager limits".into()))?;

@@ -1,6 +1,6 @@
 //! Compact model receipts from typed trusted facts. No execution, output
 //! disclosure, owner delivery or clock occurs in this module.
-use crate::toolset::ToolsetError;
+use crate::{execution_ref::JobRef, toolset::ToolsetError};
 use std::fmt::Write as _;
 
 #[cfg(all(feature = "batch", feature = "durable"))]
@@ -31,36 +31,37 @@ pub enum NextAction {
 pub enum Receipt<'a> {
     #[cfg(all(feature = "batch", feature = "durable"))]
     JobStatus {
-        reference: &'a str,
+        reference: &'a JobRef,
         snapshot: &'a Snapshot,
         terminal: Option<ProcessTerminal>,
         next: Option<NextAction>,
     },
     #[cfg(all(feature = "batch", feature = "durable"))]
     NodeStatus {
-        reference: &'a str,
+        reference: &'a JobRef,
         tool: &'a str,
         revision: u64,
         state: NodeState,
         journal_unknown: bool,
         terminal: Option<ProcessTerminal>,
     },
+    /// Minimal durable continuation when a richer status cannot fit.
+    Handoff {
+        reference: &'a JobRef,
+        revision: u64,
+    },
+    /// Idempotent cancellation-control result.
+    Cancel {
+        reference: &'a JobRef,
+        revision: u64,
+        changed: bool,
+    },
     Ack {
-        reference: &'a str,
+        reference: &'a JobRef,
         mode: AckMode,
         changed: bool,
         released: bool,
     },
-}
-
-fn validate_reference(reference: &str) -> Result<(), ToolsetError> {
-    if reference.is_empty()
-        || reference.len() > 2048
-        || !reference.bytes().all(|c| c.is_ascii_graphic())
-    {
-        return Err(ToolsetError::Invalid("invalid compact receipt reference"));
-    }
-    Ok(())
 }
 
 #[cfg(all(feature = "batch", feature = "durable"))]
@@ -101,7 +102,9 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
             terminal,
             next,
         } => {
-            validate_reference(reference)?;
+            if reference.node().is_some() {
+                return Err(ToolsetError::Invalid("Job status requires a root Job ref"));
+            }
             if snapshot.label.is_empty()
                 || snapshot.label.len() > 128
                 || !snapshot.label.bytes().all(|c| c.is_ascii_graphic())
@@ -168,7 +171,9 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
             journal_unknown,
             terminal,
         } => {
-            validate_reference(reference)?;
+            if reference.node().is_none() {
+                return Err(ToolsetError::Invalid("node status requires a node Job ref"));
+            }
             if tool.is_empty() || tool.len() > 128 || !tool.bytes().all(|c| c.is_ascii_graphic()) {
                 return Err(ToolsetError::Invalid("invalid Job node tool"));
             }
@@ -208,13 +213,42 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
                 append_terminal(&mut content, terminal);
             }
         }
+        Receipt::Handoff {
+            reference,
+            revision,
+        } => {
+            if reference.node().is_some() {
+                return Err(ToolsetError::Invalid("Job handoff requires a root Job ref"));
+            }
+            write!(
+                content,
+                "{reference} rev={revision} next=jobs_get|jobs_read no-rerun"
+            )
+            .expect("writing into a String never fails");
+        }
+        Receipt::Cancel {
+            reference,
+            revision,
+            changed,
+        } => {
+            if reference.node().is_some() {
+                return Err(ToolsetError::Invalid(
+                    "Job cancellation requires a root Job ref",
+                ));
+            }
+            write!(
+                content,
+                "{reference} rev={revision} cancel={}",
+                if changed { "accepted" } else { "unchanged" }
+            )
+            .expect("writing into a String never fails");
+        }
         Receipt::Ack {
             reference,
             mode,
             changed,
             released,
         } => {
-            validate_reference(reference)?;
             write!(
                 content,
                 "{reference} {} ack=",
@@ -236,14 +270,46 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
     Ok(content)
 }
 
+#[cfg(all(feature = "batch", feature = "durable"))]
+pub fn render_handoff(
+    reference: &JobRef,
+    snapshot: &Snapshot,
+    terminal: Option<ProcessTerminal>,
+    budget: usize,
+) -> Result<String, ToolsetError> {
+    match render_plain(
+        Receipt::JobStatus {
+            reference,
+            snapshot,
+            terminal,
+            next: Some(NextAction::ObserveJob),
+        },
+        budget,
+    ) {
+        Ok(content) => Ok(content),
+        Err(ToolsetError::ResultLimit) => render_plain(
+            Receipt::Handoff {
+                reference,
+                revision: snapshot.sequence,
+            },
+            budget,
+        ),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn job_ref(value: &str) -> &'static JobRef {
+        Box::leak(Box::new(JobRef::parse(value).unwrap()))
+    }
+
     #[test]
     fn ack_is_a_bounded_factual_receipt_not_an_effect() {
         let finish = Receipt::Ack {
-            reference: "j:7",
+            reference: job_ref("j:7"),
             mode: AckMode::Finish,
             changed: true,
             released: false,
@@ -256,7 +322,7 @@ mod tests {
         assert_eq!(
             render_plain(
                 Receipt::Ack {
-                    reference: "j:7",
+                    reference: job_ref("j:7"),
                     mode: AckMode::Through(512),
                     changed: false,
                     released: true
@@ -266,16 +332,73 @@ mod tests {
             .unwrap(),
             "j:7 unchanged ack=512 released=true"
         );
-        assert!(render_plain(
-            Receipt::Ack {
-                reference: "j:7\nfalse",
-                mode: AckMode::Finish,
-                changed: true,
-                released: false,
-            },
-            1024
+        assert!(JobRef::parse(
+            "j:7
+false"
         )
         .is_err());
+    }
+
+    #[test]
+    fn cancellation_receipt_is_typed_idempotent_and_bounded() {
+        let reference = job_ref("j:cancel-7");
+        let changed = Receipt::Cancel {
+            reference,
+            revision: 9,
+            changed: true,
+        };
+        assert_eq!(
+            render_plain(changed, 128).unwrap(),
+            "j:cancel-7 rev=9 cancel=accepted"
+        );
+        let replay = Receipt::Cancel {
+            reference,
+            revision: 9,
+            changed: false,
+        };
+        assert_eq!(
+            render_plain(replay, 128).unwrap(),
+            "j:cancel-7 rev=9 cancel=unchanged"
+        );
+        assert_eq!(render_plain(changed, 8), Err(ToolsetError::ResultLimit));
+    }
+
+    #[cfg(all(feature = "durable", feature = "batch"))]
+    #[test]
+    fn handoff_falls_back_to_same_job_and_never_implies_rerun() {
+        use crate::filesystem::{job::Lifecycle, job_manager::Snapshot, status::Primary};
+
+        let reference = job_ref("j:handoff-7");
+        let snapshot = Snapshot {
+            id: "handoff-7".into(),
+            label: "x".repeat(96),
+            lifecycle: Lifecycle::Terminal,
+            stop_reason: None,
+            journal_unknown: false,
+            sequence: 11,
+            finished: 1,
+            total: 1,
+            summary: Some((Primary::Ok, false, false)),
+            detail: None,
+        };
+        let minimal = render_plain(
+            Receipt::Handoff {
+                reference,
+                revision: snapshot.sequence,
+            },
+            256,
+        )
+        .unwrap();
+        let handoff = render_handoff(reference, &snapshot, None, minimal.len()).unwrap();
+        assert_eq!(handoff, minimal);
+        assert_eq!(
+            handoff,
+            "j:handoff-7 rev=11 next=jobs_get|jobs_read no-rerun"
+        );
+        assert_eq!(
+            render_handoff(reference, &snapshot, None, minimal.len() - 1),
+            Err(ToolsetError::ResultLimit)
+        );
     }
 
     #[cfg(all(feature = "durable", feature = "batch"))]
@@ -289,6 +412,7 @@ mod tests {
         };
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(1),
+            stop: None,
             output: ProcessOutputMeta {
                 stdout_bytes: 20_001,
                 stderr_bytes: 732,
@@ -310,7 +434,7 @@ mod tests {
             detail: Some("not parsed exit=99999".into()),
         };
         let receipt = Receipt::JobStatus {
-            reference: "j:7",
+            reference: job_ref("j:7"),
             snapshot: &snapshot,
             terminal: Some(terminal),
             next: Some(NextAction::ObserveJob),
@@ -323,7 +447,7 @@ mod tests {
             Err(ToolsetError::ResultLimit)
         );
         let ordinary = Receipt::JobStatus {
-            reference: "j:7",
+            reference: job_ref("j:7"),
             snapshot: &snapshot,
             terminal: Some(terminal),
             next: None,
@@ -331,6 +455,7 @@ mod tests {
         assert!(!render_plain(ordinary, 200).unwrap().contains("next="));
         let unknown_terminal = ProcessTerminal {
             exit: ProcessExit::Unknown,
+            stop: None,
             output: ProcessOutputMeta {
                 stdout_bytes: 0,
                 stderr_bytes: 3,
@@ -340,7 +465,7 @@ mod tests {
             },
         };
         let node = Receipt::NodeStatus {
-            reference: "j:7/n:2",
+            reference: job_ref("j:7/n:2"),
             tool: "bash",
             revision: 4,
             state: NodeState::Terminal {
@@ -357,7 +482,7 @@ mod tests {
         assert_eq!(render_plain(node, 512).unwrap(),
             "j:7/n:2 bash settled rev=4 outcome=mixed more incomplete exit=unknown out=0 err=3 err_truncated output_incomplete");
         let invalid = Receipt::NodeStatus {
-            reference: "j:7/n:2",
+            reference: job_ref("j:7/n:2"),
             tool: "bash",
             revision: 4,
             state: NodeState::Running { sequence: 10 },
@@ -369,7 +494,7 @@ mod tests {
         running.lifecycle = Lifecycle::Running;
         assert!(render_plain(
             Receipt::JobStatus {
-                reference: "j:7",
+                reference: job_ref("j:7"),
                 snapshot: &running,
                 terminal: Some(terminal),
                 next: None,
@@ -398,7 +523,7 @@ mod tests {
         assert_eq!(
             render_plain(
                 Receipt::JobStatus {
-                    reference: "j:unknown-1",
+                    reference: job_ref("j:unknown-1"),
                     snapshot: &snapshot,
                     terminal: None,
                     next: None,
@@ -411,7 +536,7 @@ mod tests {
         assert_eq!(
             render_plain(
                 Receipt::NodeStatus {
-                    reference: "j:unknown-1/n:1",
+                    reference: job_ref("j:unknown-1/n:1"),
                     tool: "bash",
                     revision: 3,
                     state: NodeState::Running { sequence: 2 },
@@ -426,7 +551,7 @@ mod tests {
         assert_eq!(
             render_plain(
                 Receipt::NodeStatus {
-                    reference: "j:unknown-1/n:1",
+                    reference: job_ref("j:unknown-1/n:1"),
                     tool: "bash",
                     revision: 3,
                     state: NodeState::Pending,
@@ -447,7 +572,7 @@ mod tests {
         let show = |state| {
             render_plain(
                 Receipt::NodeStatus {
-                    reference: "j:7/n:2",
+                    reference: job_ref("j:7/n:2"),
                     tool: "bash",
                     revision: 9,
                     state,
@@ -477,7 +602,7 @@ mod tests {
         );
         assert!(render_plain(
             Receipt::NodeStatus {
-                reference: "j:7/n:2",
+                reference: job_ref("j:7/n:2"),
                 tool: "bash\nspoof",
                 revision: 9,
                 state: terminal,
@@ -508,7 +633,7 @@ mod tests {
         let render = |snapshot: &Snapshot| {
             render_plain(
                 Receipt::JobStatus {
-                    reference: "j:7",
+                    reference: job_ref("j:7"),
                     snapshot,
                     terminal: None,
                     next: None,
@@ -531,7 +656,7 @@ mod tests {
         snapshot.label = "bash\nspoof".into();
         assert!(render_plain(
             Receipt::JobStatus {
-                reference: "j:7",
+                reference: job_ref("j:7"),
                 snapshot: &snapshot,
                 terminal: None,
                 next: None,
@@ -540,15 +665,6 @@ mod tests {
         )
         .is_err());
         snapshot.label = "bash".into();
-        assert!(render_plain(
-            Receipt::JobStatus {
-                reference: "j:7\nspoof",
-                snapshot: &snapshot,
-                terminal: None,
-                next: None,
-            },
-            512
-        )
-        .is_err());
+        assert!(JobRef::parse("j:7\nspoof").is_err());
     }
 }

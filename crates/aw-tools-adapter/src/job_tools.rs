@@ -64,24 +64,22 @@ fn handoff_receipt(
     host: &crate::job_host::JobHost,
     id: &str,
     snapshot: &aw_tools::filesystem::job_manager::Snapshot,
+    budget: usize,
 ) -> Result<ToolOutput> {
-    let reference = host.execution_ref(id, None)?.canonical();
-    let content = aw_tools::receipt::render_plain(
-        aw_tools::receipt::Receipt::JobStatus {
-            reference: &reference,
-            snapshot,
-            terminal: if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal
-                && snapshot.total == 1
-            {
-                host.manager()
-                    .process_terminal(id, 1)
-                    .map_err(|_| Error::Protocol("Job Process terminal facts unavailable"))?
-            } else {
-                None
-            },
-            next: Some(aw_tools::receipt::NextAction::ObserveJob),
+    let reference = host.job_ref(id, None)?;
+    let content = aw_tools::receipt::render_handoff(
+        &reference,
+        snapshot,
+        if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal
+            && snapshot.total == 1
+        {
+            host.manager()
+                .process_terminal(id, 1)
+                .map_err(|_| Error::Protocol("Job Process terminal facts unavailable"))?
+        } else {
+            None
         },
-        aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+        budget.min(aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES),
     )
     .map_err(|_| Error::Protocol("cannot render typed compact handoff receipt"))?;
     Ok(ToolOutput {
@@ -286,7 +284,7 @@ impl Tool for JobShell {
                         .manager()
                         .runtime_snapshot(&id)
                         .map_err(|_| Error::Protocol("replayed shell Job is unavailable"))?;
-                    return handoff_receipt(&host, &id, &snapshot);
+                    return handoff_receipt(&host, &id, &snapshot, direct_budget);
                 }
                 StartDecision::Unknown => {
                     return Ok(ToolOutput::error(
@@ -303,7 +301,7 @@ impl Tool for JobShell {
                     .runtime_snapshot(&started.id)
                     .map_err(|_| Error::Protocol("new Process Job status unavailable"))?;
                 drop(started.task);
-                return handoff_receipt(&started.host, &started.id, &snapshot);
+                return handoff_receipt(&started.host, &started.id, &snapshot, direct_budget);
             }
             let completed = tokio::select! {
                 result = &mut started.task => result,
@@ -329,7 +327,7 @@ impl Tool for JobShell {
             };
             if snapshot.journal_unknown {
                 handoff.expose()?;
-                return handoff_receipt(&started.host, &started.id, &snapshot);
+                return handoff_receipt(&started.host, &started.id, &snapshot, direct_budget);
             }
             let (result, _) =
                 Self::retained_text(&started.host, &started.id, OutputStream::Result)?;
@@ -357,7 +355,8 @@ impl Tool for JobShell {
                 }
                 _ if direct.content.len() > direct_budget => {
                     handoff.expose()?;
-                    let output = handoff_receipt(&started.host, &started.id, &snapshot)?;
+                    let output =
+                        handoff_receipt(&started.host, &started.id, &snapshot, direct_budget)?;
                     output.validate()?;
                     Ok(output)
                 }
@@ -452,7 +451,7 @@ impl Tool for Batch {
                         .manager()
                         .runtime_snapshot(&id)
                         .map_err(|_| Error::Protocol("replayed batch Job is unavailable"))?;
-                    return handoff_receipt(&host, &id, &snapshot);
+                    return handoff_receipt(&host, &id, &snapshot, direct_budget);
                 }
                 StartDecision::Unknown => {
                     return Ok(ToolOutput::error(
@@ -469,7 +468,7 @@ impl Tool for Batch {
                     .runtime_snapshot(&started.id)
                     .map_err(|_| Error::Protocol("new Graph Job status unavailable"))?;
                 drop(started.task);
-                return handoff_receipt(&started.host, &started.id, &snapshot);
+                return handoff_receipt(&started.host, &started.id, &snapshot, direct_budget);
             }
             let completed = tokio::select! {
                 result = &mut started.task => result,
@@ -495,7 +494,7 @@ impl Tool for Batch {
             };
             if snapshot.journal_unknown {
                 handoff.expose()?;
-                return handoff_receipt(&started.host, &started.id, &snapshot);
+                return handoff_receipt(&started.host, &started.id, &snapshot, direct_budget);
             }
             let rendered = started
                 .host
@@ -516,7 +515,7 @@ impl Tool for Batch {
                 return Ok(output);
             }
             handoff.expose()?;
-            let output = handoff_receipt(&started.host, &started.id, &snapshot)?;
+            let output = handoff_receipt(&started.host, &started.id, &snapshot, direct_budget)?;
             output.validate()?;
             Ok(output)
         })
@@ -1156,41 +1155,44 @@ impl Tool for JobControl {
                         .manager()
                         .acknowledge_output(id, node, stream, owner, through)
                         .map_err(|_| Error::Denied("Job acknowledgement refused"))?;
-                    Ok(ToolOutput::text(if ack.changed {
-                        "ok"
-                    } else {
-                        "unchanged"
-                    }))
+                    let reference = host.job_ref(id, Some(node))?;
+                    let content = aw_tools::receipt::render_plain(
+                        aw_tools::receipt::Receipt::Ack {
+                            reference: &reference,
+                            mode: aw_tools::receipt::AckMode::Through(through),
+                            changed: ack.changed,
+                            released: ack.released,
+                        },
+                        direct_budget,
+                    )
+                    .map_err(|error| match error {
+                        aw_tools::toolset::ToolsetError::ResultLimit => {
+                            Error::Limit("Job ACK receipt exceeds current result budget")
+                        }
+                        _ => Error::Protocol("cannot render typed Job ACK receipt"),
+                    })?;
+                    Ok(ToolOutput::text(content))
                 }
                 JobToolKind::Cancel => {
                     let id = Self::id(arguments)?;
                     let (changed, snapshot) = self.runtime.cancel(&ctx, id)?;
                     let host = self.runtime.host_for(&ctx)?;
-                    let state = match snapshot.lifecycle {
-                        Lifecycle::Terminal => match snapshot.stop_reason {
-                            Some(aw_tools::filesystem::job::StopReason::Cancelled) => "cancelled",
-                            Some(aw_tools::filesystem::job::StopReason::Revoked) => "revoked",
-                            None => snapshot
-                                .summary
-                                .map_or("unknown", |summary| summary.0.as_str()),
+                    let reference = host.job_ref(id, None)?;
+                    let content = aw_tools::receipt::render_plain(
+                        aw_tools::receipt::Receipt::Cancel {
+                            reference: &reference,
+                            revision: snapshot.sequence,
+                            changed,
                         },
-                        Lifecycle::Running => "running",
-                        Lifecycle::Cancelling => "cancelling",
-                        Lifecycle::Revoking => "revoking",
-                    };
-                    if changed {
-                        let status = host
-                            .manager()
-                            .render_job_status(id)
-                            .map_err(|_| Error::Protocol("cancelled Job status unavailable"))?;
-                        if status.len() <= direct_budget {
-                            Ok(ToolOutput::text(status))
-                        } else {
-                            Ok(ToolOutput::text(format!("{state} {id}")))
+                        direct_budget,
+                    )
+                    .map_err(|error| match error {
+                        aw_tools::toolset::ToolsetError::ResultLimit => {
+                            Error::Limit("Job cancellation receipt exceeds current result budget")
                         }
-                    } else {
-                        Ok(ToolOutput::text(format!("unchanged {state}")))
-                    }
+                        _ => Error::Protocol("cannot render typed Job cancellation receipt"),
+                    })?;
+                    Ok(ToolOutput::text(content))
                 }
                 JobToolKind::Restart => {
                     let source = Self::id(arguments)?;
@@ -1302,6 +1304,9 @@ mod tests {
             .split_whitespace()
             .next()
             .expect("handoff receipt needs canonical ref");
+        if let Some(flat) = reference.strip_prefix("j:") {
+            return flat.split('/').next().expect("flat Job ref has a handle");
+        }
         reference
             .rsplit_once("/j:")
             .map(|(_, id)| id)
@@ -1583,10 +1588,9 @@ mod tests {
             .expect("cancelled direct shell must expose its Job")
             .to_owned();
         let get = JobControl::new(runtime.clone(), JobToolKind::Get);
-        assert_eq!(
-            wait_terminal(&get, ctx.clone(), &id).await,
-            "cancelled bash exit=unknown"
-        );
+        let rendered = wait_terminal(&get, ctx.clone(), &id).await;
+        assert!(rendered.starts_with("cancelled bash "));
+        assert!(rendered.contains("stop=cancelled"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1676,7 +1680,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(acknowledged.content, "ok");
+        assert!(acknowledged.content.starts_with("j:"));
+        assert!(acknowledged.content.contains(" ok ack="));
         assert!(output
             .execute(ctx.clone(), &json!({"id":id,"stream":"result"}))
             .await
@@ -1751,7 +1756,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            output.content.starts_with("/d:") && output.content.contains(" bash settled "),
+            output.content.starts_with("j:") && output.content.contains(" bash settled "),
             "{}",
             output.content
         );
@@ -1884,7 +1889,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            receipt.content.starts_with("/d:") && receipt.content.contains(" settled "),
+            receipt.content.starts_with("j:") && receipt.content.contains(" settled "),
             "{}",
             receipt.content
         );
@@ -1923,7 +1928,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            receipt.content.starts_with("/d:") && receipt.content.contains(" graph settled "),
+            receipt.content.starts_with("j:") && receipt.content.contains(" graph settled "),
             "{}",
             receipt.content
         );
@@ -1961,7 +1966,7 @@ mod tests {
             .unwrap();
         assert!(receipt.content.len() <= ctx.result_budget_bytes);
         assert!(
-            receipt.content.starts_with("/d:") && receipt.content.contains(" settled "),
+            receipt.content.starts_with("j:") && receipt.content.contains(" settled "),
             "{}",
             receipt.content
         );
@@ -2498,7 +2503,10 @@ mod tests {
             .execute(ctx.clone(), &json!({"ref":node}))
             .await
             .unwrap();
-        assert_eq!(finished.content, "unchanged ack=all released=true");
+        assert!(finished.content.starts_with("j:"));
+        assert!(finished
+            .content
+            .ends_with(" unchanged ack=all released=true"));
         let again = ack
             .execute(ctx.clone(), &json!({"ref":node}))
             .await
@@ -3268,6 +3276,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_byte_jobs_read_page_uses_normal_serialized_envelope() {
+        use aw_tools::toolset::JobProfile;
+        let (root, agent, _default_runtime, mut ctx) = fixture();
+        fs::write(
+            root.join("one-byte-page.txt"),
+            "abcdef
+",
+        )
+        .unwrap();
+        let limits = crate::LocalToolLimits {
+            job_profile: JobProfile {
+                read_page_default_bytes: 1,
+                read_page_max_bytes: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime = JobRuntime::new_with_native_tools(
+            Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),
+            agent.tool_binding_authority(),
+            limits,
+            crate::LocalToolConcurrency::default(),
+            aw_tools::filesystem::schema::Tool::GRAPH_NATIVE.to_vec(),
+        )
+        .unwrap();
+        let (session, branch) = runtime.test_scope_identity();
+        ctx.execution_owner = Some(
+            aw_agent_core::AgentExecutionBinding::from_trusted_host(
+                "/d:0/i:0/p:0/a:0",
+                session,
+                branch,
+            )
+            .unwrap(),
+        );
+        ctx.call_id = "one-byte-page-batch".into();
+        // Force durable handoff with an ordinary factual response envelope.
+        ctx.result_budget_bytes = aw_agent_core::tool::MIN_TOOL_RESULT_BYTES;
+        let started = Batch::new(runtime.clone())
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "background":true,
+                    "ops":[["read",{"path":"one-byte-page.txt","numbered":false,"lines":8}]]
+                }),
+            )
+            .await
+            .unwrap();
+        let id = handoff_job_id(&started.content).to_owned();
+        let host = runtime.host_for(&ctx).unwrap();
+        let reference = host.execution_ref(&id, Some(1)).unwrap().canonical();
+        let read = crate::jobs_tools::JobsTool::new(runtime, crate::jobs_tools::JobsKind::Read);
+        let page = read
+            .execute(
+                ctx,
+                &json!({"ref":reference,"view":"result","offset":0,"limit":1,"wait_ms":1000,"encoding":"text"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            page.content.len() > 1,
+            "serialized envelope metadata is not raw page data"
+        );
+        assert!(page.content.len() <= aw_agent_core::tool::MIN_TOOL_RESULT_BYTES);
+        assert_eq!(
+            page.content.lines().last(),
+            Some("more offset=1"),
+            "one raw byte must advance by exactly one byte inside the larger response envelope"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn job_controls_cover_start_list_get_output_ack_cancel_and_restart() {
         let (root, _agent, runtime, mut ctx) = fixture();
         ctx.call_id = "start-call".into();
@@ -3322,7 +3402,8 @@ mod tests {
             .execute(ctx.clone(), &json!({"id":id,"offset":2}))
             .await
             .unwrap();
-        assert_eq!(acked.content, "ok");
+        assert!(acked.content.starts_with("j:"));
+        assert!(acked.content.contains(" ok ack="));
         assert_eq!(
             runtime
                 .host_for(&ctx)
@@ -3338,7 +3419,8 @@ mod tests {
             .execute(ctx.clone(), &json!({"id":id}))
             .await
             .unwrap();
-        assert_eq!(unchanged.content, "unchanged ok");
+        assert!(unchanged.content.starts_with("j:"));
+        assert!(unchanged.content.contains(" cancel=unchanged"));
 
         let mut restart_ctx = ctx.clone();
         restart_ctx.call_id = "restart-call".into();

@@ -16,6 +16,7 @@ use aw_agent_core::{
 };
 use aw_agent_kernel::capability::SourceKind;
 use aw_tools::{
+    budget::SerializedResultBytes,
     remote_start::{arguments_sha256, RemoteRuntimeLease, RemoteStartAuthorization},
     OperationId,
 };
@@ -23,7 +24,8 @@ use futures_util::StreamExt as _;
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ClientConfig, ContentBlock,
-        PaginatedRequestParams, ProtocolVersion, RequestMetaObject,
+        MetaObject, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+        ProtocolVersion, RequestMetaObject,
     },
     service::RunningService,
     transport::{
@@ -35,6 +37,7 @@ use rmcp::{
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::PathBuf,
     process::Stdio,
     sync::{atomic::Ordering, Arc},
@@ -43,6 +46,7 @@ use std::{
 use tokio::{
     process::{Child, Command},
     sync::Mutex,
+    time::{sleep_until, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -51,6 +55,281 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_START_META_KEY: &str = "io.abird.aw/remoteStart";
 const MAX_MCP_RESULT_BLOCKS: usize = 32;
 const MAX_MCP_BLOCK_METADATA_BYTES: usize = 16 * 1024;
+pub const MAX_MCP_RESULT_META_BYTES: usize = 16 * 1024;
+pub const RECEIPT_META_KEY: &str = "io.abird/receipt";
+const FIT_TRUNCATION_SUFFIX: &str = "\n… truncated to fit the serialized MCP result budget";
+
+pub const DEFAULT_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_PROGRESS_SEND_BUDGET: Duration = Duration::from_millis(100);
+const MAX_SEMANTIC_PROGRESS_MESSAGE_BYTES: usize = 64;
+const MAX_EXACT_F64_INTEGER: u64 = 1u64 << 53;
+
+/// Host-tunable heartbeat timings. Both values must be positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressHeartbeatConfig {
+    interval: Duration,
+    send_budget: Duration,
+}
+
+impl ProgressHeartbeatConfig {
+    pub fn new(interval: Duration, send_budget: Duration) -> Result<Self> {
+        if interval.is_zero() || send_budget.is_zero() {
+            return Err(Error::Config(
+                "MCP progress heartbeat interval and send budget must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            interval,
+            send_budget,
+        })
+    }
+
+    pub const fn interval(self) -> Duration {
+        self.interval
+    }
+
+    pub const fn send_budget(self) -> Duration {
+        self.send_budget
+    }
+}
+
+impl Default for ProgressHeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_PROGRESS_HEARTBEAT_INTERVAL,
+            send_budget: DEFAULT_PROGRESS_SEND_BUDGET,
+        }
+    }
+}
+
+/// Advisory heartbeat delivery counts for one wait.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProgressHeartbeatSummary {
+    pub attempted: u64,
+    pub delivered: u64,
+}
+
+/// Optional product/host observer. The shared adapter emits only counts.
+pub trait ProgressHeartbeatObserver: Send + Sync {
+    fn completed(&self, summary: ProgressHeartbeatSummary);
+}
+
+/// MCP heartbeat context for one request that actually carried a progress token.
+pub struct ProgressHeartbeat {
+    token: ProgressToken,
+    config: ProgressHeartbeatConfig,
+    observer: Option<Arc<dyn ProgressHeartbeatObserver>>,
+}
+
+impl ProgressHeartbeat {
+    pub fn new(
+        token: ProgressToken,
+        config: ProgressHeartbeatConfig,
+        observer: Option<Arc<dyn ProgressHeartbeatObserver>>,
+    ) -> Self {
+        Self {
+            token,
+            config,
+            observer,
+        }
+    }
+
+    pub fn from_token(
+        token: Option<ProgressToken>,
+        config: ProgressHeartbeatConfig,
+        observer: Option<Arc<dyn ProgressHeartbeatObserver>>,
+    ) -> Option<Self> {
+        token.map(|token| Self::new(token, config, observer))
+    }
+}
+
+struct ProgressObserverGuard {
+    observer: Option<Arc<dyn ProgressHeartbeatObserver>>,
+    summary: ProgressHeartbeatSummary,
+}
+
+impl ProgressObserverGuard {
+    fn new(observer: Option<Arc<dyn ProgressHeartbeatObserver>>) -> Self {
+        Self {
+            observer,
+            summary: ProgressHeartbeatSummary::default(),
+        }
+    }
+}
+
+impl Drop for ProgressObserverGuard {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.observer {
+            observer.completed(self.summary);
+        }
+    }
+}
+
+/// Adapt transport-independent semantic progress into one MCP notification.
+///
+/// Heartbeat callers should not invent totals here. Bare heartbeat ticks use
+/// an unknown total; real semantic progress may use End::Known.
+pub fn semantic_progress_notification(
+    token: ProgressToken,
+    completed: u64,
+    end: aw_tools::filesystem::progress::End,
+    message: Option<&str>,
+) -> Result<ProgressNotificationParam> {
+    if completed > MAX_EXACT_F64_INTEGER {
+        return Err(Error::Limit(
+            "MCP progress counter exceeds exact numeric representation",
+        ));
+    }
+    let total = match end {
+        aw_tools::filesystem::progress::End::Known(total) => {
+            if total == 0 || total > MAX_EXACT_F64_INTEGER || completed > total {
+                return Err(Error::Protocol("invalid semantic MCP progress total"));
+            }
+            Some(total as f64)
+        }
+        aw_tools::filesystem::progress::End::Unknown => None,
+    };
+    let message = match message {
+        Some(message)
+            if message.len() <= MAX_SEMANTIC_PROGRESS_MESSAGE_BYTES
+                && !message.chars().any(char::is_control) =>
+        {
+            Some(message.to_owned())
+        }
+        Some(_) => return Err(Error::Protocol("invalid semantic MCP progress message")),
+        None => None,
+    };
+    let mut param = ProgressNotificationParam::new(token, completed as f64);
+    param.total = total;
+    param.message = message;
+    Ok(param)
+}
+
+fn heartbeat_notification(token: ProgressToken, tick: u64) -> ProgressNotificationParam {
+    ProgressNotificationParam::new(token, tick as f64)
+}
+
+async fn await_with_heartbeat_sender<F, S, SF>(
+    token: Option<ProgressToken>,
+    config: ProgressHeartbeatConfig,
+    deadline: Option<Instant>,
+    observer: Option<Arc<dyn ProgressHeartbeatObserver>>,
+    wait: F,
+    mut send: S,
+) -> F::Output
+where
+    F: Future,
+    S: FnMut(ProgressNotificationParam) -> SF,
+    SF: Future<Output = bool>,
+{
+    let Some(token) = token else {
+        return wait.await;
+    };
+    tokio::pin!(wait);
+    let mut report = ProgressObserverGuard::new(observer);
+
+    loop {
+        let tick_at = Instant::now() + config.interval;
+        tokio::select! {
+            biased;
+            output = &mut wait => return output,
+            () = sleep_until(tick_at) => {}
+        }
+
+        if report.summary.attempted >= MAX_EXACT_F64_INTEGER {
+            continue;
+        }
+        report.summary.attempted = report.summary.attempted.saturating_add(1);
+        let param = heartbeat_notification(token.clone(), report.summary.attempted);
+
+        let now = Instant::now();
+        let send_bound = now + config.send_budget;
+        let send_deadline = deadline.map_or(send_bound, |deadline| deadline.min(send_bound));
+        if send_deadline <= now {
+            continue;
+        }
+
+        let delivery = send(param);
+        tokio::pin!(delivery);
+        tokio::select! {
+            biased;
+            output = &mut wait => return output,
+            delivered = &mut delivery => {
+                if delivered {
+                    report.summary.delivered = report.summary.delivered.saturating_add(1);
+                }
+            }
+            () = sleep_until(send_deadline) => {}
+        }
+    }
+}
+
+/// Await one operation while emitting bare unknown-total MCP heartbeat ticks.
+///
+/// Without a progress token this is exactly wait.await. With a token, each send
+/// attempt is independently bounded. The underlying wait is polled while
+/// delivery is in flight, so a stalled progress transport cannot delay or own
+/// completion. No detached task or queue is created.
+pub async fn await_with_progress_heartbeat<F, S, SF>(
+    heartbeat: Option<ProgressHeartbeat>,
+    deadline: Option<Instant>,
+    wait: F,
+    send: S,
+) -> F::Output
+where
+    F: Future,
+    S: FnMut(ProgressNotificationParam) -> SF,
+    SF: Future<Output = bool>,
+{
+    let Some(heartbeat) = heartbeat else {
+        return wait.await;
+    };
+    await_with_heartbeat_sender(
+        Some(heartbeat.token),
+        heartbeat.config,
+        deadline,
+        heartbeat.observer,
+        wait,
+        send,
+    )
+    .await
+}
+
+/// Send one real semantic progress update with the same bounded delivery rule.
+///
+/// This adapter never changes semantic progress; it only projects an existing
+/// cumulative value/total/message into MCP.
+pub async fn notify_semantic_progress_bounded<S, SF>(
+    token: ProgressToken,
+    completed: u64,
+    end: aw_tools::filesystem::progress::End,
+    message: Option<&str>,
+    send_budget: Duration,
+    deadline: Option<Instant>,
+    mut send: S,
+) -> Result<bool>
+where
+    S: FnMut(ProgressNotificationParam) -> SF,
+    SF: Future<Output = bool>,
+{
+    if send_budget.is_zero() {
+        return Err(Error::Config(
+            "MCP semantic progress send budget must be positive".into(),
+        ));
+    }
+    let param = semantic_progress_notification(token, completed, end, message)?;
+    let now = Instant::now();
+    let bound = now + send_budget;
+    let send_deadline = deadline.map_or(bound, |deadline| deadline.min(bound));
+    if send_deadline <= now {
+        return Ok(false);
+    }
+    tokio::select! {
+        biased;
+        () = sleep_until(send_deadline) => Ok(false),
+        delivered = send(param) => Ok(delivered),
+    }
+}
 
 fn label(s: &str, max: usize) -> bool {
     !s.is_empty()
@@ -399,6 +678,241 @@ impl Drop for Connection {
     }
 }
 
+fn serialized_result_len(result: &CallToolResult) -> Result<usize> {
+    serde_json::to_vec(result)
+        .map(|bytes| bytes.len())
+        .map_err(|_| Error::Protocol("invalid MCP tool result"))
+}
+
+fn validate_result_meta(meta: Option<&MetaObject>) -> Result<()> {
+    let Some(meta) = meta else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec(meta)
+        .map_err(|_| Error::Protocol("invalid MCP result metadata"))?
+        .len();
+    if bytes > MAX_MCP_RESULT_META_BYTES {
+        return Err(Error::Limit("MCP result metadata exceeds 16 KiB"));
+    }
+    Ok(())
+}
+
+fn validate_complete_shape(result: &CallToolResult) -> Result<()> {
+    if result.content.len() > MAX_MCP_RESULT_BLOCKS {
+        return Err(Error::Limit("too many MCP tool result content blocks"));
+    }
+    validate_result_meta(result.meta.as_ref())?;
+    for block in &result.content {
+        let _ = McpToolResult::payload_len(block)?;
+    }
+    if let Some(value) = &result.structured_content {
+        serde_json::to_vec(value).map_err(|_| Error::Protocol("invalid structured MCP result"))?;
+    }
+    Ok(())
+}
+
+pub fn stored_receipt_timestamp(result: &CallToolResult) -> Option<u64> {
+    result
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.0.get(RECEIPT_META_KEY))
+        .and_then(Value::as_object)
+        .and_then(|receipt| receipt.get("ts"))
+        .and_then(Value::as_u64)
+}
+
+pub fn has_visible_receipt_timestamp(result: &CallToolResult, ts: u64) -> bool {
+    let marker = format!("ts={ts}");
+    result.content.iter().any(|block| {
+        block
+            .as_text()
+            .is_some_and(|text| text.text.lines().any(|line| line.trim() == marker))
+    })
+}
+
+pub fn set_stored_receipt_timestamp(result: &mut CallToolResult, ts: u64) -> Result<()> {
+    let mut meta = result.meta.clone().unwrap_or_default();
+    let receipt = meta
+        .0
+        .entry(RECEIPT_META_KEY.to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    let object = receipt.as_object_mut().ok_or(Error::Protocol(
+        "reserved receipt metadata must be an object",
+    ))?;
+    object.insert("ts".to_owned(), Value::from(ts));
+    validate_result_meta(Some(&meta))?;
+    result.meta = Some(meta);
+    Ok(())
+}
+
+fn total_text_bytes(result: &CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .filter_map(ContentBlock::as_text)
+        .map(|text| text.text.len())
+        .sum()
+}
+
+fn fitted_text_candidate(
+    original: &CallToolResult,
+    keep_bytes: usize,
+    suffix: &str,
+) -> CallToolResult {
+    let total = total_text_bytes(original);
+    if keep_bytes >= total {
+        return original.clone();
+    }
+
+    let mut fitted = original.clone();
+    let mut remaining = keep_bytes;
+    let mut truncated = false;
+    for block in &mut fitted.content {
+        let ContentBlock::Text(text) = block else {
+            continue;
+        };
+        if truncated {
+            text.text.clear();
+            continue;
+        }
+        if remaining >= text.text.len() {
+            remaining -= text.text.len();
+            continue;
+        }
+        let mut end = remaining.min(text.text.len());
+        while end > 0 && !text.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.text.truncate(end);
+        text.text.push_str(suffix);
+        remaining = 0;
+        truncated = true;
+    }
+    fitted
+}
+
+/// Fit one complete MCP tool result without changing typed media, structured
+/// JSON, result metadata, result type, error class, content-block order or
+/// per-block metadata. Only text payload bytes may be shortened.
+///
+/// If the immutable facts plus a truncation marker cannot fit, this returns an
+/// explicit limit error instead of silently changing the result meaning.
+pub fn fit_complete_result(
+    result: CallToolResult,
+    ceiling: SerializedResultBytes,
+) -> Result<CallToolResult> {
+    validate_complete_shape(&result)?;
+    let budget = ceiling.get();
+    if serialized_result_len(&result)? <= budget {
+        return Ok(result);
+    }
+
+    let total_text = total_text_bytes(&result);
+    if total_text == 0 {
+        return Err(Error::Limit(
+            "immutable MCP result cannot fit serialized result ceiling",
+        ));
+    }
+
+    let minimal = fitted_text_candidate(&result, 0, FIT_TRUNCATION_SUFFIX);
+    if serialized_result_len(&minimal)? > budget {
+        return Err(Error::Limit(
+            "minimal factual MCP result cannot fit serialized result ceiling",
+        ));
+    }
+
+    let mut low = 0usize;
+    let mut high = total_text.saturating_sub(1);
+    let mut best = minimal;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate = fitted_text_candidate(&result, mid, FIT_TRUNCATION_SUFFIX);
+        if serialized_result_len(&candidate)? <= budget {
+            best = candidate;
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(best)
+}
+
+/// Stamp shared Toolset receipt metadata and fit one complete result.
+///
+/// An already stored io.abird/receipt.ts is immutable replay state and wins
+/// over host_timestamp. A fresh selected result requires the host-supplied
+/// timestamp. If the typed receipt body already carries the exact ts= line,
+/// no duplicate sidecar is added.
+pub fn decorate_and_fit_complete_result(
+    toolset: &aw_tools::toolset::Toolset,
+    operation: OperationId,
+    mut result: CallToolResult,
+    host_timestamp: Option<u64>,
+    ceiling: SerializedResultBytes,
+) -> Result<CallToolResult> {
+    validate_complete_shape(&result)?;
+    let profile = toolset.receipt_profile();
+    if !profile.unix_ts || !profile.scope.contains(operation) {
+        return fit_complete_result(result, ceiling);
+    }
+
+    let ts = stored_receipt_timestamp(&result)
+        .or(host_timestamp)
+        .ok_or_else(|| Error::Config("timestamped receipt requires host timestamp".into()))?;
+    let metadata = toolset
+        .receipt_metadata(operation, Some(ts))
+        .map_err(|_| Error::Config("invalid Toolset receipt configuration".into()))?
+        .ok_or(Error::Protocol("selected receipt operation lost metadata"))?;
+    set_stored_receipt_timestamp(&mut result, metadata.ts)?;
+
+    let budget = ceiling.get();
+    if serialized_result_len(&result)? <= budget
+        && has_visible_receipt_timestamp(&result, metadata.ts)
+    {
+        return Ok(result);
+    }
+
+    let marker = format!("ts={}", metadata.ts);
+    if serialized_result_len(&result)? <= budget
+        && !has_visible_receipt_timestamp(&result, metadata.ts)
+    {
+        let mut candidate = result.clone();
+        candidate.content.push(ContentBlock::text(marker.clone()));
+        if serialized_result_len(&candidate)? <= budget {
+            return Ok(candidate);
+        }
+    }
+
+    // Reserve the exact serialized sidecar cost before fitting the underlying
+    // result. This makes receipt metadata atomic with the final response.
+    let base_size = serialized_result_len(&result)?;
+    let mut with_sidecar = result.clone();
+    with_sidecar
+        .content
+        .push(ContentBlock::text(marker.clone()));
+    let sidecar_size = serialized_result_len(&with_sidecar)?;
+    let reserve = sidecar_size.saturating_sub(base_size);
+    let body_budget = budget
+        .checked_sub(reserve)
+        .and_then(SerializedResultBytes::new)
+        .ok_or(Error::Limit(
+            "receipt timestamp cannot fit serialized result ceiling",
+        ))?;
+
+    let mut fitted = fit_complete_result(result, body_budget)?;
+    if !has_visible_receipt_timestamp(&fitted, metadata.ts) {
+        fitted.content.push(ContentBlock::text(marker));
+    }
+    if serialized_result_len(&fitted)? > budget {
+        return Err(Error::Limit(
+            "receipt timestamp cannot fit serialized result ceiling",
+        ));
+    }
+    Ok(fitted)
+}
+
 /// Bounded raw MCP result, preserving provider-native content blocks without
 /// granting them to AW's text-only Agent/tool-result path.
 #[derive(Clone, Debug)]
@@ -406,6 +920,8 @@ pub struct McpToolResult {
     pub content: Vec<ContentBlock>,
     pub structured_content: Option<Value>,
     pub is_error: bool,
+    /// Bounded result-level MCP metadata, preserved for host/product consumers.
+    pub meta: Option<MetaObject>,
 }
 
 impl McpToolResult {
@@ -432,32 +948,26 @@ impl McpToolResult {
     }
 
     fn from_complete(response: CallToolResult) -> Result<Self> {
-        if response.content.len() > MAX_MCP_RESULT_BLOCKS {
-            return Err(Error::Limit("too many MCP tool result content blocks"));
-        }
-        let mut total = 0usize;
-        for block in &response.content {
-            total = total
-                .checked_add(Self::payload_len(block)?)
-                .ok_or(Error::Limit("MCP tool result size overflow"))?;
-            if total > MAX_TOOL_RESULT_BYTES {
-                return Err(Error::Limit("MCP response exceeds 128 KiB"));
-            }
-        }
-        if let Some(value) = &response.structured_content {
-            let structured = serde_json::to_vec(value)
-                .map_err(|_| Error::Protocol("invalid structured MCP result"))?;
-            total = total
-                .checked_add(structured.len())
-                .ok_or(Error::Limit("MCP tool result size overflow"))?;
-            if total > MAX_TOOL_RESULT_BYTES {
-                return Err(Error::Limit("MCP structured output too large"));
-            }
+        let ceiling = SerializedResultBytes::new(MAX_TOOL_RESULT_BYTES)
+            .expect("MCP serialized result ceiling is non-zero");
+        Self::from_complete_with_ceiling(response, ceiling)
+    }
+
+    fn from_complete_with_ceiling(
+        response: CallToolResult,
+        ceiling: SerializedResultBytes,
+    ) -> Result<Self> {
+        validate_complete_shape(&response)?;
+        if serialized_result_len(&response)? > ceiling.get() {
+            return Err(Error::Limit(
+                "MCP response exceeds serialized result ceiling",
+            ));
         }
         Ok(Self {
             content: response.content,
             structured_content: response.structured_content,
             is_error: response.is_error.unwrap_or(false),
+            meta: response.meta,
         })
     }
 
@@ -1409,6 +1919,570 @@ mod tests {
                 "image/png",
             )]));
         assert!(McpToolResult::try_from(oversized).is_err());
+    }
+
+    #[test]
+    fn mcp_owns_serialized_result_ceiling_independently_of_raw_pages() {
+        let response = CallToolResult::success(vec![ContentBlock::text("abc")]);
+        let exact_bytes = serialized_result_len(&response).unwrap();
+        let too_small = SerializedResultBytes::new(exact_bytes - 1).unwrap();
+        assert!(McpToolResult::from_complete_with_ceiling(response.clone(), too_small).is_err());
+
+        let exact = SerializedResultBytes::new(exact_bytes).unwrap();
+        let result = McpToolResult::from_complete_with_ceiling(response, exact).unwrap();
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn raw_mcp_result_boundary_preserves_bounded_result_meta() {
+        let mut meta = MetaObject::new();
+        meta.0.insert("provider".into(), json!("fixture"));
+        let mut response = CallToolResult::success(vec![ContentBlock::text("ok")]);
+        response.meta = Some(meta.clone());
+        let exact = SerializedResultBytes::new(serialized_result_len(&response).unwrap()).unwrap();
+        let typed = McpToolResult::from_complete_with_ceiling(response, exact).unwrap();
+        assert_eq!(typed.meta, Some(meta));
+
+        let mut oversized = CallToolResult::success(vec![ContentBlock::text("ok")]);
+        let mut huge = MetaObject::new();
+        huge.0.insert(
+            "caller".into(),
+            Value::String("x".repeat(MAX_MCP_RESULT_META_BYTES)),
+        );
+        oversized.meta = Some(huge);
+        assert!(McpToolResult::try_from(CallToolResponse::Complete(oversized)).is_err());
+    }
+
+    #[test]
+    fn complete_result_fitter_only_shrinks_text_and_preserves_typed_facts() {
+        let image = ContentBlock::image("aW1hZ2U=", "image/png");
+        let structured = json!({"kind":"page","offset":7});
+        let mut meta = MetaObject::new();
+        meta.0.insert("keep".into(), json!("yes"));
+
+        let mut original =
+            CallToolResult::success(vec![ContentBlock::text("雪".repeat(2048)), image.clone()]);
+        original.structured_content = Some(structured.clone());
+        original.meta = Some(meta.clone());
+
+        let minimal = fitted_text_candidate(&original, 0, FIT_TRUNCATION_SUFFIX);
+        let budget = serialized_result_len(&minimal).unwrap() + 96;
+        let fitted = fit_complete_result(
+            original.clone(),
+            SerializedResultBytes::new(budget).unwrap(),
+        )
+        .unwrap();
+
+        assert!(serialized_result_len(&fitted).unwrap() <= budget);
+        assert_eq!(fitted.content[1], image);
+        assert_eq!(fitted.structured_content, Some(structured));
+        assert_eq!(fitted.meta, Some(meta));
+        assert_eq!(fitted.is_error, original.is_error);
+        assert_eq!(fitted.result_type, original.result_type);
+        let text = fitted.content[0].as_text().unwrap().text.as_str();
+        assert!(text.ends_with(FIT_TRUNCATION_SUFFIX));
+        assert!(core::str::from_utf8(text.as_bytes()).is_ok());
+
+        let error = CallToolResult::error(vec![ContentBlock::text("e".repeat(4096))]);
+        let minimal = fitted_text_candidate(&error, 0, FIT_TRUNCATION_SUFFIX);
+        let budget = serialized_result_len(&minimal).unwrap() + 64;
+        let fitted =
+            fit_complete_result(error, SerializedResultBytes::new(budget).unwrap()).unwrap();
+        assert_eq!(fitted.is_error, Some(true));
+    }
+
+    #[test]
+    fn immutable_typed_or_structured_result_fails_instead_of_changing_identity() {
+        let media =
+            CallToolResult::success(vec![ContentBlock::image("x".repeat(2048), "image/png")]);
+        let media_size = serialized_result_len(&media).unwrap();
+        assert!(
+            fit_complete_result(media, SerializedResultBytes::new(media_size - 1).unwrap(),)
+                .is_err()
+        );
+
+        let mut structured = CallToolResult::success(Vec::new());
+        structured.structured_content = Some(json!({"payload":"x".repeat(2048)}));
+        let structured_size = serialized_result_len(&structured).unwrap();
+        assert!(fit_complete_result(
+            structured,
+            SerializedResultBytes::new(structured_size - 1).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn receipt_decorator_is_visible_replay_stable_and_payload_preserving() {
+        let toolset = aw_tools::toolset::Toolset::builder()
+            .receipts(aw_tools::toolset::ReceiptProfile {
+                unix_ts: true,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+        let ceiling = SerializedResultBytes::new(4096).unwrap();
+
+        let structured = json!({"kind":"page","offset":0});
+        let mut meta = MetaObject::new();
+        meta.0.insert("other".into(), json!("preserve"));
+        meta.0
+            .insert(RECEIPT_META_KEY.into(), json!({"kind":"job"}));
+        let mut fresh = CallToolResult::success(vec![ContentBlock::text("chunk")]);
+        fresh.structured_content = Some(structured.clone());
+        fresh.meta = Some(meta);
+
+        let decorated = decorate_and_fit_complete_result(
+            &toolset,
+            OperationId::JobsRead,
+            fresh,
+            Some(1234),
+            ceiling,
+        )
+        .unwrap();
+        assert_eq!(stored_receipt_timestamp(&decorated), Some(1234));
+        assert!(has_visible_receipt_timestamp(&decorated, 1234));
+        assert_eq!(decorated.structured_content, Some(structured));
+        assert_eq!(decorated.content[0].as_text().unwrap().text, "chunk");
+        assert_eq!(
+            decorated
+                .meta
+                .as_ref()
+                .unwrap()
+                .0
+                .get("other")
+                .and_then(Value::as_str),
+            Some("preserve")
+        );
+        assert_eq!(
+            decorated
+                .meta
+                .as_ref()
+                .unwrap()
+                .0
+                .get(RECEIPT_META_KEY)
+                .and_then(Value::as_object)
+                .and_then(|receipt| receipt.get("kind"))
+                .and_then(Value::as_str),
+            Some("job")
+        );
+
+        let mut replay = decorated.clone();
+        replay.content.retain(|block| {
+            block
+                .as_text()
+                .is_none_or(|text| text.text.trim() != "ts=1234")
+        });
+        let replay = decorate_and_fit_complete_result(
+            &toolset,
+            OperationId::JobsRead,
+            replay,
+            Some(9999),
+            ceiling,
+        )
+        .unwrap();
+        assert_eq!(stored_receipt_timestamp(&replay), Some(1234));
+        assert!(has_visible_receipt_timestamp(&replay, 1234));
+        assert!(!has_visible_receipt_timestamp(&replay, 9999));
+
+        let image = ContentBlock::image("aW1hZ2U=", "image/png");
+        let media = decorate_and_fit_complete_result(
+            &toolset,
+            OperationId::JobsRead,
+            CallToolResult::success(vec![image.clone()]),
+            Some(55),
+            ceiling,
+        )
+        .unwrap();
+        assert_eq!(media.content[0], image);
+        assert_eq!(media.content.len(), 2);
+        assert!(has_visible_receipt_timestamp(&media, 55));
+
+        let typed = CallToolResult::success(vec![ContentBlock::text(
+            "j:abc rev=7 next=jobs_get|jobs_read no-rerun
+ts=77",
+        )]);
+        let typed = decorate_and_fit_complete_result(
+            &toolset,
+            OperationId::JobsGet,
+            typed,
+            Some(77),
+            ceiling,
+        )
+        .unwrap();
+        assert_eq!(
+            typed.content.len(),
+            1,
+            "typed receipt timestamp must not duplicate"
+        );
+        assert_eq!(stored_receipt_timestamp(&typed), Some(77));
+    }
+
+    #[test]
+    fn receipt_reservation_is_atomic_under_tight_result_budgets() {
+        let toolset = aw_tools::toolset::Toolset::builder()
+            .receipts(aw_tools::toolset::ReceiptProfile {
+                unix_ts: true,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+
+        let long = CallToolResult::success(vec![ContentBlock::text("x".repeat(4096))]);
+        let tight = decorate_and_fit_complete_result(
+            &toolset,
+            OperationId::JobsGet,
+            long,
+            Some(1_794_737_000),
+            SerializedResultBytes::new(512).unwrap(),
+        )
+        .unwrap();
+        assert!(serialized_result_len(&tight).unwrap() <= 512);
+        assert_eq!(stored_receipt_timestamp(&tight), Some(1_794_737_000));
+        assert!(has_visible_receipt_timestamp(&tight, 1_794_737_000));
+
+        let minimal = CallToolResult::success(vec![ContentBlock::text("x")]);
+        assert!(decorate_and_fit_complete_result(
+            &toolset,
+            OperationId::JobsGet,
+            minimal,
+            Some(1_794_737_000),
+            SerializedResultBytes::new(32).unwrap(),
+        )
+        .is_err());
+
+        let missing = CallToolResult::success(vec![ContentBlock::text("x")]);
+        assert!(decorate_and_fit_complete_result(
+            &toolset,
+            OperationId::JobsGet,
+            missing,
+            None,
+            SerializedResultBytes::new(512).unwrap(),
+        )
+        .is_err());
+    }
+
+    fn test_progress_token(value: &str) -> ProgressToken {
+        ProgressToken(rmcp::model::NumberOrString::String(value.into()))
+    }
+
+    #[derive(Default)]
+    struct RecordingProgressObserver(std::sync::Mutex<Vec<ProgressHeartbeatSummary>>);
+
+    impl ProgressHeartbeatObserver for RecordingProgressObserver {
+        fn completed(&self, summary: ProgressHeartbeatSummary) {
+            self.0.lock().unwrap().push(summary);
+        }
+    }
+
+    #[test]
+    fn progress_heartbeat_config_and_semantic_projection_are_strict() {
+        assert!(ProgressHeartbeatConfig::new(Duration::ZERO, Duration::from_millis(1)).is_err());
+        assert!(ProgressHeartbeatConfig::new(Duration::from_millis(1), Duration::ZERO).is_err());
+
+        let token = test_progress_token("semantic");
+        let known = semantic_progress_notification(
+            token.clone(),
+            4,
+            aw_tools::filesystem::progress::End::Known(10),
+            Some("scan"),
+        )
+        .unwrap();
+        assert_eq!(known.progress_token, token);
+        assert_eq!(known.progress, 4.0);
+        assert_eq!(known.total, Some(10.0));
+        assert_eq!(known.message.as_deref(), Some("scan"));
+
+        let unknown = semantic_progress_notification(
+            test_progress_token("unknown"),
+            918,
+            aw_tools::filesystem::progress::End::Unknown,
+            None,
+        )
+        .unwrap();
+        assert_eq!(unknown.progress, 918.0);
+        assert_eq!(unknown.total, None);
+        assert_eq!(unknown.message, None);
+
+        assert!(semantic_progress_notification(
+            test_progress_token("bad-total"),
+            11,
+            aw_tools::filesystem::progress::End::Known(10),
+            None,
+        )
+        .is_err());
+        assert!(semantic_progress_notification(
+            test_progress_token("bad-message"),
+            1,
+            aw_tools::filesystem::progress::End::Unknown,
+            Some("bad\nphase"),
+        )
+        .is_err());
+        assert!(semantic_progress_notification(
+            test_progress_token("too-large"),
+            MAX_EXACT_F64_INTEGER + 1,
+            aw_tools::filesystem::progress::End::Unknown,
+            None,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_without_token_is_exact_wait_and_never_polls_sender() {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let send_polled = polled.clone();
+        let output = await_with_progress_heartbeat(None, None, async { 42_u32 }, move |_| {
+            send_polled.store(true, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(true)
+        })
+        .await;
+        assert_eq!(output, 42);
+        assert!(!polled.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ticks_are_monotonic_unknown_total_and_stop_with_wait() {
+        let config =
+            ProgressHeartbeatConfig::new(Duration::from_millis(3), Duration::from_millis(20))
+                .unwrap();
+        let observer = Arc::new(RecordingProgressObserver::default());
+        let heartbeat =
+            ProgressHeartbeat::new(test_progress_token("beat"), config, Some(observer.clone()));
+        let sent = Arc::new(std::sync::Mutex::new(
+            Vec::<ProgressNotificationParam>::new(),
+        ));
+        let sent_for_send = sent.clone();
+
+        let output = await_with_progress_heartbeat(
+            Some(heartbeat),
+            None,
+            async {
+                tokio::time::sleep(Duration::from_millis(22)).await;
+                "done"
+            },
+            move |param| {
+                sent_for_send.lock().unwrap().push(param);
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert_eq!(output, "done");
+
+        let params = sent.lock().unwrap().clone();
+        assert!(params.len() >= 2, "{params:?}");
+        for (index, param) in params.iter().enumerate() {
+            assert_eq!(param.progress, (index + 1) as f64);
+            assert_eq!(param.total, None);
+            assert_eq!(param.message, None);
+        }
+        let summaries = observer.0.lock().unwrap().clone();
+        assert_eq!(
+            summaries,
+            vec![ProgressHeartbeatSummary {
+                attempted: params.len() as u64,
+                delivered: params.len() as u64,
+            }]
+        );
+
+        let count = params.len();
+        tokio::time::sleep(Duration::from_millis(12)).await;
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            count,
+            "heartbeat must not leave a detached sender/task after completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_heartbeat_delivery_never_delays_underlying_wait() {
+        let config =
+            ProgressHeartbeatConfig::new(Duration::from_millis(1), Duration::from_secs(1)).unwrap();
+        let observer = Arc::new(RecordingProgressObserver::default());
+        let heartbeat = ProgressHeartbeat::new(
+            test_progress_token("stalled"),
+            config,
+            Some(observer.clone()),
+        );
+
+        let output = tokio::time::timeout(
+            Duration::from_millis(100),
+            await_with_progress_heartbeat(
+                Some(heartbeat),
+                None,
+                async {
+                    tokio::time::sleep(Duration::from_millis(12)).await;
+                    7_u8
+                },
+                |_| std::future::pending::<bool>(),
+            ),
+        )
+        .await
+        .expect("stalled progress send delayed the underlying wait");
+        assert_eq!(output, 7);
+        assert_eq!(
+            observer.0.lock().unwrap().as_slice(),
+            &[ProgressHeartbeatSummary {
+                attempted: 1,
+                delivered: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_stalled_heartbeat_send_is_independently_bounded() {
+        let config =
+            ProgressHeartbeatConfig::new(Duration::from_millis(1), Duration::from_millis(3))
+                .unwrap();
+        let observer = Arc::new(RecordingProgressObserver::default());
+        let heartbeat = ProgressHeartbeat::new(
+            test_progress_token("bounded"),
+            config,
+            Some(observer.clone()),
+        );
+
+        let output = tokio::time::timeout(
+            Duration::from_millis(100),
+            await_with_progress_heartbeat(
+                Some(heartbeat),
+                None,
+                async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    9_u8
+                },
+                |_| std::future::pending::<bool>(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, 9);
+        let summary = observer.0.lock().unwrap()[0];
+        assert!(summary.attempted >= 2, "{summary:?}");
+        assert_eq!(summary.delivered, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_heartbeat_deadline_never_polls_sender() {
+        let config =
+            ProgressHeartbeatConfig::new(Duration::from_millis(1), Duration::from_secs(1)).unwrap();
+        let observer = Arc::new(RecordingProgressObserver::default());
+        let heartbeat = ProgressHeartbeat::new(
+            test_progress_token("expired-heartbeat"),
+            config,
+            Some(observer.clone()),
+        );
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let send_polled = polled.clone();
+
+        let output = await_with_progress_heartbeat(
+            Some(heartbeat),
+            Some(Instant::now() - Duration::from_millis(1)),
+            async {
+                tokio::time::sleep(Duration::from_millis(6)).await;
+                5_u8
+            },
+            move |_| {
+                send_polled.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert_eq!(output, 5);
+        assert!(!polled.load(std::sync::atomic::Ordering::Relaxed));
+        let summary = observer.0.lock().unwrap()[0];
+        assert!(summary.attempted >= 1);
+        assert_eq!(summary.delivered, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_heartbeat_wrapper_still_reports_attempt_summary() {
+        let config =
+            ProgressHeartbeatConfig::new(Duration::from_millis(1), Duration::from_secs(1)).unwrap();
+        let observer = Arc::new(RecordingProgressObserver::default());
+        let heartbeat = ProgressHeartbeat::new(
+            test_progress_token("cancelled-wrapper"),
+            config,
+            Some(observer.clone()),
+        );
+
+        let timed = tokio::time::timeout(
+            Duration::from_millis(12),
+            await_with_progress_heartbeat(
+                Some(heartbeat),
+                None,
+                std::future::pending::<()>(),
+                |_| std::future::pending::<bool>(),
+            ),
+        )
+        .await;
+        assert!(timed.is_err());
+
+        let summaries = observer.0.lock().unwrap().clone();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].attempted, 1);
+        assert_eq!(summaries[0].delivered, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_prevents_progress_delivery_from_being_polled() {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let send_polled = polled.clone();
+        let delivered = notify_semantic_progress_bounded(
+            test_progress_token("deadline"),
+            1,
+            aw_tools::filesystem::progress::End::Unknown,
+            None,
+            Duration::from_secs(1),
+            Some(Instant::now() - Duration::from_millis(1)),
+            move |_| {
+                send_polled.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::future::ready(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!delivered);
+        assert!(!polled.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn semantic_progress_uses_same_bounded_delivery_path() {
+        let captured = Arc::new(std::sync::Mutex::new(None::<ProgressNotificationParam>));
+        let captured_for_send = captured.clone();
+        let delivered = notify_semantic_progress_bounded(
+            test_progress_token("real"),
+            3,
+            aw_tools::filesystem::progress::End::Known(8),
+            Some("commit"),
+            Duration::from_millis(20),
+            None,
+            move |param| {
+                *captured_for_send.lock().unwrap() = Some(param);
+                std::future::ready(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(delivered);
+        let param = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(param.progress, 3.0);
+        assert_eq!(param.total, Some(8.0));
+        assert_eq!(param.message.as_deref(), Some("commit"));
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(100),
+            notify_semantic_progress_bounded(
+                test_progress_token("slow-real"),
+                4,
+                aw_tools::filesystem::progress::End::Unknown,
+                None,
+                Duration::from_millis(3),
+                None,
+                |_| std::future::pending::<bool>(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!timed_out);
     }
 
     #[cfg(unix)]

@@ -10,6 +10,7 @@ use std::{
 pub const MAX_HANDLE_BYTES: usize = 64;
 pub const MAX_REF_BYTES: usize = 2048;
 pub const MAX_REF_SEGMENTS: usize = 32;
+pub const MAX_JOB_REF_BYTES: usize = 80;
 const MAX_SUFFIX_SEGMENTS: usize = MAX_REF_SEGMENTS - 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,6 +84,86 @@ impl NodeCoordinate {
 impl fmt::Display for NodeCoordinate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.get().fmt(f)
+    }
+}
+
+/// Flat finite-Job reference for model/transport surfaces.
+///
+/// Hierarchical ownership continues to use `ExecutionRef`; this value is only
+/// the bounded local Job/Node handle: `j:<handle>[/n:<coordinate>]`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct JobRef {
+    job: Handle,
+    node: Option<NodeCoordinate>,
+}
+
+impl JobRef {
+    pub fn new(job: Handle, node: Option<NodeCoordinate>) -> Self {
+        Self { job, node }
+    }
+
+    pub fn parse(input: &str) -> Result<Self, RefError> {
+        if input.is_empty() {
+            return Err(RefError::InvalidSyntax);
+        }
+        if input.len() > MAX_JOB_REF_BYTES {
+            return Err(RefError::RefTooLong);
+        }
+        let body = input.strip_prefix("j:").ok_or(RefError::InvalidSyntax)?;
+        let (job, node) = match body.split_once("/n:") {
+            Some((job, node)) => {
+                if node.is_empty()
+                    || node.starts_with('0')
+                    || node.bytes().any(|byte| !byte.is_ascii_digit())
+                    || node.contains('/')
+                {
+                    return Err(RefError::InvalidNodeCoordinate);
+                }
+                let node = node
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(NonZeroU32::new)
+                    .map(NodeCoordinate)
+                    .ok_or(RefError::InvalidNodeCoordinate)?;
+                (job, Some(node))
+            }
+            None => {
+                if body.contains('/') {
+                    return Err(RefError::InvalidSyntax);
+                }
+                (body, None)
+            }
+        };
+        Ok(Self {
+            job: Handle::new(job)?,
+            node,
+        })
+    }
+
+    pub fn job(&self) -> &Handle {
+        &self.job
+    }
+
+    pub const fn node(&self) -> Option<NodeCoordinate> {
+        self.node
+    }
+}
+
+impl fmt::Display for JobRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "j:{}", self.job)?;
+        if let Some(node) = self.node {
+            write!(f, "/n:{node}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for JobRef {
+    type Err = RefError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
     }
 }
 
@@ -519,6 +600,37 @@ mod tests {
         }
         assert!(Handle::new("a".repeat(MAX_HANDLE_BYTES)).is_ok());
         assert!(Handle::new("a".repeat(MAX_HANDLE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn flat_job_refs_are_strict_bounded_and_round_trip() {
+        let root = JobRef::parse("j:abc-7").unwrap();
+        assert_eq!(root.job().as_str(), "abc-7");
+        assert_eq!(root.node(), None);
+        assert_eq!(root.to_string(), "j:abc-7");
+
+        let node = JobRef::parse("j:abc-7/n:42").unwrap();
+        assert_eq!(node.job().as_str(), "abc-7");
+        assert_eq!(node.node().unwrap().get(), 42);
+        assert_eq!(node.to_string(), "j:abc-7/n:42");
+
+        for invalid in [
+            "",
+            "abc",
+            "j:",
+            "j:a/",
+            "j:a/n:",
+            "j:a/n:0",
+            "j:a/n:01",
+            "j:a/n:-1",
+            "j:a/n:1/x:2",
+            "/j:a",
+            "t:1/j:a",
+        ] {
+            assert!(JobRef::parse(invalid).is_err(), "{invalid}");
+        }
+        let huge = format!("j:{}", "a".repeat(MAX_JOB_REF_BYTES));
+        assert_eq!(JobRef::parse(&huge), Err(RefError::RefTooLong));
     }
 
     #[test]

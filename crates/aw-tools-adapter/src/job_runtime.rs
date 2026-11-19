@@ -2346,13 +2346,14 @@ mod tests {
             snapshot.lifecycle,
             aw_tools::filesystem::job::Lifecycle::Terminal
         );
-        assert!(runtime
+        let rendered = runtime
             .host_for(&ctx)
             .unwrap()
             .manager()
             .render_job_status(&id)
-            .unwrap()
-            .starts_with("revoked bash exit=unknown"));
+            .unwrap();
+        assert!(rendered.starts_with("revoked bash "));
+        assert!(rendered.contains("stop=cancelled"));
         let _ = fs::remove_dir_all(root);
     }
 

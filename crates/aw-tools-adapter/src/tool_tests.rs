@@ -1262,11 +1262,11 @@ fn local_tool_limits_reject_caller_owned_schema_capability_flags() {
     assert!(limits.validate().is_err());
 
     let mut limits = crate::LocalToolLimits::default();
-    limits.job_profile.read_page_default_bytes = 511;
-    limits.job_profile.read_page_max_bytes = 511;
+    limits.job_profile.read_page_default_bytes = 1;
+    limits.job_profile.read_page_max_bytes = 1;
     assert!(
-        limits.validate().is_err(),
-        "AW Agent jobs_read needs at least one factual 512-byte result envelope"
+        limits.validate().is_ok(),
+        "a one-byte raw jobs_read page is independent of the serialized result envelope"
     );
 }
 

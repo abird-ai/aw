@@ -29,6 +29,8 @@ impl Default for GrepProfile {
     }
 }
 
+use crate::budget::RawPageBytes;
+
 /// Limits for compact Job interfaces; a host may choose stricter defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobProfile {
@@ -40,6 +42,18 @@ pub struct JobProfile {
     pub read_wait_max_ms: u64,
     pub list_page_max: usize,
 }
+impl JobProfile {
+    /// Resolve a raw retained-page request independently from any serialized
+    /// result/envelope ceiling.
+    pub fn resolve_read_page(self, requested: Option<usize>) -> Result<RawPageBytes, ToolsetError> {
+        let bytes = requested.unwrap_or(self.read_page_default_bytes);
+        if bytes == 0 || bytes > self.read_page_max_bytes {
+            return Err(ToolsetError::Invalid("invalid Job raw page size"));
+        }
+        RawPageBytes::new(bytes).ok_or(ToolsetError::Invalid("invalid Job raw page size"))
+    }
+}
+
 impl Default for JobProfile {
     fn default() -> Self {
         Self {
@@ -950,6 +964,19 @@ mod tests {
     use crate::filesystem::schema::Tool;
 
     #[test]
+    fn raw_job_page_resolution_is_independent_of_serialized_envelopes() {
+        let profile = JobProfile {
+            read_page_default_bytes: 1,
+            read_page_max_bytes: 4,
+            ..Default::default()
+        };
+        assert_eq!(profile.resolve_read_page(None).unwrap().get(), 1);
+        assert_eq!(profile.resolve_read_page(Some(4)).unwrap().get(), 4);
+        assert!(profile.resolve_read_page(Some(0)).is_err());
+        assert!(profile.resolve_read_page(Some(5)).is_err());
+    }
+
+    #[test]
     fn configured_profiles_drive_catalog_defaults_and_limits() {
         let compact = Toolset::builder()
             .grep(GrepProfile {
@@ -1504,8 +1531,9 @@ mod tests {
             summary: Some((Primary::Fail, false, true)),
             detail: Some("unrendered internal detail".into()),
         };
+        let reference = crate::execution_ref::JobRef::parse("j:1").unwrap();
         let receipt = Receipt::JobStatus {
-            reference: "j:1",
+            reference: &reference,
             snapshot: &snapshot,
             terminal: None,
             next: None,
@@ -1562,8 +1590,9 @@ mod tests {
             .build()
             .unwrap();
         assert!(tools.model_instructions().unwrap().contains("35 minutes"));
+        let reference = crate::execution_ref::JobRef::parse("j:4").unwrap();
         let receipt = crate::receipt::Receipt::Ack {
-            reference: "j:4",
+            reference: &reference,
             mode: crate::receipt::AckMode::Finish,
             changed: true,
             released: false,

@@ -9,7 +9,7 @@ use std::{
         io::AsRawHandle,
     },
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     sync::atomic::{AtomicU64, Ordering},
 };
 use windows_sys::Win32::{
@@ -32,6 +32,16 @@ use windows_sys::Win32::{
 pub use aw_tools_fs_win::scoped_fs;
 
 pub const FAMILY: &str = "windows";
+
+/// Windows process exits have no Unix signal termination field.
+pub fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Windows process exits have no Unix signal-name namespace.
+pub const fn signal_name(_number: i32) -> Option<&'static str> {
+    None
+}
 
 /// An observed directory identity, retained without denying external renames.
 /// Identity validation does not lock a later pathname-based operation.
@@ -283,22 +293,68 @@ impl ManagedProcessGuard {
         resume_managed_process(pid)?;
         Ok(guard)
     }
-    pub fn terminate(&mut self) {
+    /// Force-stop the owned Job Object while preserving live-target evidence.
+    ///
+    /// `Ok(true)` proves a live member was terminated, `Ok(false)` proves the
+    /// job was already empty, and `Err` leaves the result unknown and the guard
+    /// armed for its final Drop attempt.
+    pub fn terminate(&mut self) -> io::Result<bool> {
         if !self.active {
-            return;
+            return Ok(false);
         }
-        self.active = false;
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-        // SAFETY: the job object belongs exclusively to this process invocation.
-        unsafe {
-            TerminateJobObject(self.job.as_raw_handle(), 1);
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the job is owned by this guard and the output struct matches
+        // the requested information class.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        let query_error = (queried == 0).then(io::Error::last_os_error);
+        if queried != 0 && accounting.ActiveProcesses == 0 {
+            self.active = false;
+            return Ok(false);
         }
+
+        // Always attempt termination even when membership could not be queried:
+        // fail-safe cleanup must not leave descendants running. A successful
+        // termination after a failed query is still unprovable, so return the
+        // query error and remain armed for Drop.
+        // SAFETY: the Job Object belongs exclusively to this invocation.
+        if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Some(error) = query_error {
+            return Err(error);
+        }
+
+        self.active = false;
+        Ok(true)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn disarm(&mut self) {
+        self.active = false;
     }
 }
 impl Drop for ManagedProcessGuard {
     fn drop(&mut self) {
-        self.terminate();
+        if self.active {
+            let _ = self.terminate();
+        }
     }
 }
 
@@ -318,14 +374,43 @@ mod managed_process_tests {
         let mut child = command.spawn().expect("suspended child");
         let job = ManagedProcessGuard::attach(child.id(), child.as_raw_handle())
             .expect("attach and resume only after Job Object membership");
-        assert!(child.wait().expect("child wait").success());
+        let status = child.wait().expect("child wait");
+        assert!(status.success());
+        assert_eq!(exit_signal(&status), None);
         drop(job);
+    }
+
+    #[test]
+    fn managed_job_distinguishes_live_and_empty_membership() {
+        let system_root =
+            std::env::var_os("SystemRoot").expect("Windows runner must have a SystemRoot");
+        let program = Path::new(&system_root).join("System32").join("cmd.exe");
+
+        let mut live = Command::new(&program);
+        configure_managed_process(&mut live);
+        live.arg("/C").arg("ping -n 30 127.0.0.1 >NUL");
+        let mut child = live.spawn().expect("suspended live child");
+        let mut guard = ManagedProcessGuard::attach(child.id(), child.as_raw_handle())
+            .expect("attach live child");
+        assert!(guard.terminate().expect("terminate live job"));
+        assert!(!guard.is_active());
+        let _ = child.wait().expect("reap terminated child");
+
+        let mut short = Command::new(program);
+        configure_managed_process(&mut short);
+        short.arg("/C").arg("exit /B 0");
+        let mut child = short.spawn().expect("suspended short child");
+        let mut guard = ManagedProcessGuard::attach(child.id(), child.as_raw_handle())
+            .expect("attach short child");
+        assert!(child.wait().expect("reap short child").success());
+        assert!(!guard.terminate().expect("empty job"));
+        assert!(!guard.is_active());
     }
 }
 
 /// Windows job-object graceful signaling is not currently supported; fail
 /// explicitly so a hosted supervisor can attempt a forced termination.
-pub fn terminate_process_group(_pid: u32) -> io::Result<()> {
+pub fn terminate_process_group(_pid: u32) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Windows process-group grace unsupported",

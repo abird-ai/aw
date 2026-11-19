@@ -1,97 +1,97 @@
 //! Host-neutral process stop evidence.
 //!
-//! These values describe why a runtime attempted to stop a process and what
-//! evidence that attempt produced. They carry no authority, clock, logging or
-//! OS handles. Physical process exit remains separate in `ProcessExit`.
+//! These values retain only facts that affect shared process semantics:
+//! why a process was meant to stop, when known, and what the platform proved.
+//! Authority, caller provenance, cleanup paths and logging remain host context.
+//! Physical process exit remains separate in `ProcessExit`.
 
-/// Who originated a cooperative/forced cancellation request.
+/// Semantic reason the runtime intended a process to stop.
 ///
-/// Keep this factual and portable. Product-specific spellings such as
-/// dotlink's `shutdown` are projections of these values, not shared semantics.
+/// Every variant is a valid terminal attribution when paired with
+/// `StopEvidence::Stopped`. Housekeeping has no semantic reason and is
+/// represented by `StopRecord::reason == None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum CancellationOrigin {
-    /// Explicit control request from the current caller/owner.
-    Caller,
-    /// A parent execution cancelled a child/subagent execution.
-    Parent,
-    /// Runtime shutdown, restart, owner teardown or replacement.
-    Runtime,
-    /// Source/grant/policy authority was revoked or replaced.
-    Authority,
-}
-
-/// Why the runtime can claim it stopped the waited command.
-///
-/// This is terminal attribution, not Job lifecycle and not physical exit shape.
-/// It exists only when a claimable stop attempt was actually delivered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ProcessStopCause {
+pub enum StopReason {
     Timeout,
-    Cancelled(CancellationOrigin),
-    Failed,
+    Cancelled,
+    RuntimeError,
 }
 
-/// Why the runtime attempted to signal/terminate a process tree.
-///
-/// `Cleanup` and `Dropped` are forensic attempt reasons only. They never justify
-/// a terminal `ProcessStopCause` by themselves.
+/// What the platform stop operation actually proved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum StopAttemptReason {
-    Timeout,
-    Cancelled(CancellationOrigin),
-    Failed,
-    Cleanup,
-    Dropped,
+#[repr(u8)]
+pub enum StopEvidence {
+    /// The platform proved the stop operation reached a live containment target.
+    Stopped,
+    /// Positive knowledge that no live containment target remains.
+    NoTarget,
+    /// The result cannot be established; the target may still be alive.
+    Unknown,
 }
 
-impl StopAttemptReason {
-    /// Terminal claim this reason could support if termination was delivered.
-    pub const fn terminal_cause(self) -> Option<ProcessStopCause> {
-        match self {
-            Self::Timeout => Some(ProcessStopCause::Timeout),
-            Self::Cancelled(origin) => Some(ProcessStopCause::Cancelled(origin)),
-            Self::Failed => Some(ProcessStopCause::Failed),
-            Self::Cleanup | Self::Dropped => None,
+/// One factual process-tree stop record.
+///
+/// `reason == None` means housekeeping rather than a semantic terminal cause.
+/// How the attempt happened (explicit cleanup, Drop fallback, authority
+/// withdrawal, parent cancellation, etc.) belongs in higher-layer context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StopRecord {
+    pub reason: Option<StopReason>,
+    pub evidence: StopEvidence,
+}
+
+/// Host-neutral execution evidence, separate from Job wake events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExecutionLifecycleEvent {
+    ProcessStop { record: StopRecord },
+}
+
+/// Optional observation hook for execution evidence.
+///
+/// Implementations may capture richer host/product context externally; the
+/// shared event remains bounded and allocation-free.
+pub trait ExecutionEventSink: Send + Sync {
+    fn record(&self, event: ExecutionLifecycleEvent);
+}
+
+impl StopRecord {
+    /// Record a stop attempt with a semantic reason.
+    pub const fn new(reason: StopReason, evidence: StopEvidence) -> Self {
+        Self {
+            reason: Some(reason),
+            evidence,
         }
     }
-}
 
-/// What the platform termination operation actually proved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum StopOutcome {
-    /// The platform proved the termination operation was delivered to a live
-    /// containment object/target.
-    Delivered,
-    /// The target/containment object was already absent. Desired state, but not
-    /// evidence that this attempt stopped the waited command.
-    AlreadyGone,
-    /// Delivery could not be proved; the target may still be running.
-    Failed,
-}
-
-/// One factual process-tree stop attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StopAttempt {
-    pub reason: StopAttemptReason,
-    pub outcome: StopOutcome,
-}
-
-impl StopAttempt {
-    pub const fn new(reason: StopAttemptReason, outcome: StopOutcome) -> Self {
-        Self { reason, outcome }
+    pub const fn stopped(reason: StopReason) -> Self {
+        Self::new(reason, StopEvidence::Stopped)
     }
 
-    /// Convert platform evidence into a terminal attribution.
+    pub const fn no_target(reason: StopReason) -> Self {
+        Self::new(reason, StopEvidence::NoTarget)
+    }
+
+    pub const fn unknown(reason: StopReason) -> Self {
+        Self::new(reason, StopEvidence::Unknown)
+    }
+
+    /// Record housekeeping that has no semantic terminal reason.
+    pub const fn housekeeping(evidence: StopEvidence) -> Self {
+        Self {
+            reason: None,
+            evidence,
+        }
+    }
+
+    /// Terminal attribution supported by this record.
     ///
-    /// Only a delivered, claimable reason may become a `ProcessStopCause`.
-    /// Cleanup/Drop attempts and gone/failed delivery remain forensic evidence
-    /// only.
-    pub const fn terminal_cause(self) -> Option<ProcessStopCause> {
-        match self.outcome {
-            StopOutcome::Delivered => self.reason.terminal_cause(),
-            StopOutcome::AlreadyGone | StopOutcome::Failed => None,
+    /// Every semantic reason is claimable; only `Stopped` evidence proves that
+    /// this runtime actually stopped the live target.
+    pub const fn terminal_reason(self) -> Option<StopReason> {
+        match self.evidence {
+            StopEvidence::Stopped => self.reason,
+            StopEvidence::NoTarget | StopEvidence::Unknown => None,
         }
     }
 }
@@ -100,59 +100,49 @@ impl StopAttempt {
 mod tests {
     use super::*;
 
+    const REASONS: [StopReason; 3] = [
+        StopReason::Timeout,
+        StopReason::Cancelled,
+        StopReason::RuntimeError,
+    ];
+
     #[test]
-    fn every_cancellation_origin_survives_a_delivered_claim() {
-        for origin in [
-            CancellationOrigin::Caller,
-            CancellationOrigin::Parent,
-            CancellationOrigin::Runtime,
-            CancellationOrigin::Authority,
+    fn every_semantic_reason_is_terminal_when_stopped() {
+        for reason in REASONS {
+            assert_eq!(StopRecord::stopped(reason).terminal_reason(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn no_target_and_unknown_never_claim_a_terminal_stop() {
+        for reason in REASONS {
+            assert_eq!(StopRecord::no_target(reason).terminal_reason(), None);
+            assert_eq!(StopRecord::unknown(reason).terminal_reason(), None);
+        }
+    }
+
+    #[test]
+    fn housekeeping_never_claims_a_terminal_reason() {
+        for evidence in [
+            StopEvidence::Stopped,
+            StopEvidence::NoTarget,
+            StopEvidence::Unknown,
         ] {
-            assert_eq!(
-                StopAttempt::new(StopAttemptReason::Cancelled(origin), StopOutcome::Delivered,)
-                    .terminal_cause(),
-                Some(ProcessStopCause::Cancelled(origin))
-            );
+            let record = StopRecord::housekeeping(evidence);
+            assert_eq!(record.reason, None);
+            assert_eq!(record.terminal_reason(), None);
         }
     }
 
     #[test]
-    fn only_delivered_claimable_attempts_become_terminal_causes() {
-        for outcome in [StopOutcome::AlreadyGone, StopOutcome::Failed] {
-            for reason in [
-                StopAttemptReason::Timeout,
-                StopAttemptReason::Cancelled(CancellationOrigin::Caller),
-                StopAttemptReason::Cancelled(CancellationOrigin::Parent),
-                StopAttemptReason::Cancelled(CancellationOrigin::Runtime),
-                StopAttemptReason::Cancelled(CancellationOrigin::Authority),
-                StopAttemptReason::Failed,
-                StopAttemptReason::Cleanup,
-                StopAttemptReason::Dropped,
-            ] {
-                assert_eq!(
-                    StopAttempt::new(reason, outcome).terminal_cause(),
-                    None,
-                    "{reason:?} with {outcome:?} must not claim a terminal stop"
-                );
-            }
-        }
-
+    fn no_target_and_unknown_remain_distinct_evidence() {
+        let reason = StopReason::RuntimeError;
         assert_eq!(
-            StopAttempt::new(StopAttemptReason::Timeout, StopOutcome::Delivered).terminal_cause(),
-            Some(ProcessStopCause::Timeout)
+            StopRecord::no_target(reason).evidence,
+            StopEvidence::NoTarget
         );
-        assert_eq!(
-            StopAttempt::new(StopAttemptReason::Failed, StopOutcome::Delivered).terminal_cause(),
-            Some(ProcessStopCause::Failed)
-        );
-    }
-
-    #[test]
-    fn cleanup_and_drop_are_forensic_even_when_delivery_succeeds() {
-        for reason in [StopAttemptReason::Cleanup, StopAttemptReason::Dropped] {
-            let attempt = StopAttempt::new(reason, StopOutcome::Delivered);
-            assert_eq!(attempt.terminal_cause(), None);
-        }
+        assert_eq!(StopRecord::unknown(reason).evidence, StopEvidence::Unknown);
+        assert_ne!(StopEvidence::NoTarget, StopEvidence::Unknown);
     }
 
     #[test]
@@ -161,15 +151,12 @@ mod tests {
             value
         }
 
-        let origin = copy(CancellationOrigin::Authority);
-        let cause = copy(ProcessStopCause::Cancelled(origin));
-        let attempt = copy(StopAttempt::new(
-            StopAttemptReason::Cancelled(origin),
-            StopOutcome::Delivered,
-        ));
-        assert_eq!(attempt.terminal_cause(), Some(cause));
-        assert!(std::mem::size_of::<CancellationOrigin>() <= 1);
-        assert!(std::mem::size_of::<StopOutcome>() <= 1);
-        assert!(std::mem::size_of::<StopAttempt>() <= 4);
+        let reason = copy(StopReason::Cancelled);
+        let evidence = copy(StopEvidence::Stopped);
+        let record = copy(StopRecord::new(reason, evidence));
+        assert_eq!(record.terminal_reason(), Some(reason));
+        assert!(core::mem::size_of::<StopReason>() <= 1);
+        assert!(core::mem::size_of::<StopEvidence>() <= 1);
+        assert!(core::mem::size_of::<StopRecord>() <= 4);
     }
 }

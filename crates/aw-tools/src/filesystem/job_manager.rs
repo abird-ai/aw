@@ -18,7 +18,7 @@ use crate::{
         MAX_SESSION_SPOOL,
     },
     task_fence::TaskIdentity,
-    task_ops::TaskInfo,
+    task_ops::{TaskInfo, TaskTerminalDetail},
     task_spool::{BoundedFileSpool, BoundedMemorySpool, SessionQuota, MAX_SPOOL_PAGE_BYTES},
 };
 use sha2::{Digest as _, Sha256};
@@ -1631,12 +1631,18 @@ impl JobManager {
         hash.update(managed.job.binding());
         hash.update(1u64.to_le_bytes());
         let result_owner = OutputOwner::new(hash.finalize().into())?;
+        let terminal = managed
+            .process_terminals
+            .get(&1)
+            .copied()
+            .map(TaskTerminalDetail::from);
         Ok(TaskProjection {
             info: TaskInfo {
                 binding,
                 generation: managed.job.sequence(),
                 journal_sequence: managed.job.admission_sequence(),
                 state: disposition,
+                terminal,
                 source_live,
             },
             result_owner,
@@ -4197,6 +4203,7 @@ mod tests {
                         },
                         terminal: ProcessTerminal {
                             exit: ProcessExit::Code(i32::MIN + coordinate as i32),
+                            stop: None,
                             output: ProcessOutputMeta {
                                 stdout_bytes: u64::MAX,
                                 stderr_bytes: u64::MAX,
@@ -4471,6 +4478,7 @@ mod tests {
             .unwrap();
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(7),
+            stop: None,
             output: ProcessOutputMeta {
                 stdout_bytes: 11,
                 stderr_bytes: 3,
@@ -8608,8 +8616,17 @@ mod tests {
     }
 
     #[test]
-    fn single_node_task_projection_uses_same_job_state_and_result_owner() {
-        let graph = Graph::compile(&json!({"ops":[["read",{"path":"a"}]]}), |_, _| true).unwrap();
+    fn single_node_task_projection_keeps_process_terminal_behind_later_failure() {
+        use crate::{
+            execution_stop::StopReason as ProcessStopReason,
+            filesystem::runner::{ProcessExit, ProcessOutputMeta, ProcessTerminal},
+        };
+        let graph = Graph::compile_with(
+            &json!({"ops":[["bash",{"command":"true"}]]}),
+            |name| (name == "bash").then_some(NodeTool::Bash),
+            |node, arguments| node == NodeTool::Bash && arguments.is_object(),
+        )
+        .unwrap();
         let node_plans = plan_graph(&graph, |_, _| {
             Ok::<_, ()>(NodePolicy {
                 budget: SemanticBudget {
@@ -8634,7 +8651,7 @@ mod tests {
             branch: "main".into(),
             turn_id: 1,
             call_id: "call".into(),
-            effect: ToolEffect::Read,
+            effect: ToolEffect::Process,
         };
         let manager = manager(8);
         manager
@@ -8654,6 +8671,7 @@ mod tests {
         assert_eq!(queued.info.state, TaskDisposition::Queued);
         assert_eq!(queued.info.journal_sequence, 10);
         assert_eq!(queued.info.binding, task);
+        assert_eq!(queued.info.terminal, None);
         assert_eq!(
             queued.result_owner,
             manager.task_result_owner("task", 1).unwrap()
@@ -8676,23 +8694,46 @@ mod tests {
             manager.task_projection("task", true).unwrap().info.state,
             TaskDisposition::Running
         );
+
+        let terminal = ProcessTerminal {
+            exit: ProcessExit::Signal(9),
+            stop: Some(ProcessStopReason::Timeout),
+            output: ProcessOutputMeta {
+                stdout_bytes: 10,
+                stderr_bytes: 2,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                complete: true,
+            },
+        };
         manager
-            .settle(
+            .settle_process_with_status(
                 "task",
-                1,
-                NodeState::Running { sequence: 12 },
-                Status {
-                    primary: Primary::Ok,
-                    more: false,
-                    incomplete: false,
+                ProcessSettlement {
+                    coordinate: 1,
+                    expected: NodeState::Running { sequence: 12 },
+                    terminal,
+                    // Later result/spool/projection failure may make the Task
+                    // uncertain without erasing observed process facts.
+                    status: Status {
+                        primary: Primary::Unknown,
+                        more: false,
+                        incomplete: false,
+                    },
+                    sequence: 13,
                 },
-                13,
                 |_, _| Ok(()),
             )
             .unwrap();
+
         let done = manager.task_projection("task", true).unwrap();
-        assert_eq!(done.info.state, TaskDisposition::Completed);
+        assert_eq!(done.info.state, TaskDisposition::Uncertain);
         assert_eq!(done.info.generation, 13);
+        assert_eq!(done.info.terminal, Some(TaskTerminalDetail::from(terminal)));
+        assert_eq!(
+            done.info.terminal.and_then(|terminal| terminal.stop),
+            Some(ProcessStopReason::Timeout)
+        );
     }
 
     #[test]

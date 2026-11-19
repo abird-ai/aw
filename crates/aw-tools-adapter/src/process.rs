@@ -2,6 +2,10 @@
 //! A trusted caller must authenticate grants and journal Process intent
 //! before spawn. Pipes and optional PTYs share lifecycle ownership.
 use aw_tools::{
+    execution_stop::{
+        ExecutionEventSink, ExecutionLifecycleEvent, StopEvidence, StopReason as ProcessStopReason,
+        StopRecord,
+    },
     filesystem::{
         job_manager::OutputWriter,
         runner::{ProcessExit as RunnerExit, ProcessOutputMeta, ProcessTerminal, StopProof},
@@ -412,6 +416,7 @@ impl HostTaskOperations for BoundProcessTaskHost<'_> {
             generation: fence.generation(),
             journal_sequence: fence.journal_intent_sequence(),
             state: fence.state(),
+            terminal: None,
             source_live: live,
         })
     }
@@ -451,6 +456,7 @@ impl HostTaskOperations for BoundProcessTaskHost<'_> {
             generation: fence.generation(),
             journal_sequence: fence.journal_intent_sequence(),
             state: fence.state(),
+            terminal: None,
             source_live: true,
         }])
     }
@@ -847,6 +853,8 @@ pub enum Outcome {
 }
 pub struct ProcessReceipt {
     pub outcome: Outcome,
+    exit: RunnerExit,
+    stop: Option<ProcessStopReason>,
     pub output: ProcessSnapshot,
     pub output_complete: bool,
     /// Present only when the trusted host supplied durable output handles.
@@ -862,14 +870,9 @@ impl ProcessReceipt {
     }
 
     pub fn runner_terminal(&self) -> ProcessTerminal {
-        let exit = match self.outcome {
-            Outcome::Exited(code) => RunnerExit::Code(code),
-            Outcome::ExitedBySignal(signal) => RunnerExit::Signal(signal),
-            Outcome::Cancelled | Outcome::DeadlineExceeded => RunnerExit::Unknown,
-            Outcome::Unknown => RunnerExit::Unknown,
-        };
         ProcessTerminal {
-            exit,
+            exit: self.exit,
+            stop: self.stop,
             output: ProcessOutputMeta {
                 stdout_bytes: self.output.stdout.total_bytes,
                 stderr_bytes: self.output.stderr.total_bytes,
@@ -881,29 +884,14 @@ impl ProcessReceipt {
     }
 
     pub fn runner_status(&self) -> aw_tools::filesystem::batch::Status {
-        use aw_tools::filesystem::status::Primary;
-        let primary = if !self.output_complete {
-            Primary::Unknown
-        } else {
-            match self.outcome {
-                Outcome::Exited(0) => Primary::Ok,
-                Outcome::Exited(_)
-                | Outcome::ExitedBySignal(_)
-                | Outcome::Cancelled
-                | Outcome::DeadlineExceeded => Primary::Fail,
-                Outcome::Unknown => Primary::Unknown,
-            }
-        };
-        aw_tools::filesystem::batch::Status {
-            primary,
-            more: false,
-            incomplete: false,
-        }
+        self.runner_terminal().status()
     }
 
     pub fn stop_proof(&self) -> StopProof {
         let terminal = self.runner_terminal();
-        if terminal.exit == RunnerExit::Unknown || !terminal.output.complete {
+        if !terminal.output.complete
+            || (terminal.exit == RunnerExit::Unknown && terminal.stop.is_none())
+        {
             StopProof::Unknown(terminal.output)
         } else {
             StopProof::Confirmed(terminal)
@@ -920,6 +908,35 @@ enum SpawnOutputTarget {
     },
 }
 
+#[derive(Default)]
+struct ProcessStopState {
+    pending_reason: Option<ProcessStopReason>,
+}
+
+impl ProcessStopState {
+    fn record(
+        &mut self,
+        requested_reason: Option<ProcessStopReason>,
+        evidence: StopEvidence,
+    ) -> StopRecord {
+        let reason = self.pending_reason.or(requested_reason);
+        self.pending_reason = if evidence == StopEvidence::Unknown {
+            reason
+        } else {
+            None
+        };
+        StopRecord { reason, evidence }
+    }
+}
+
+fn platform_stop_evidence(result: std::io::Result<bool>) -> StopEvidence {
+    match result {
+        Ok(true) => StopEvidence::Stopped,
+        Ok(false) => StopEvidence::NoTarget,
+        Err(_) => StopEvidence::Unknown,
+    }
+}
+
 pub struct PipeProcess {
     child: Child,
     pid: u32,
@@ -934,12 +951,20 @@ pub struct PipeProcess {
     /// live host-owned PipeProcess is always refused, even after an unknown
     /// Process exit or a cancelled caller; never silently resend a signal.
     termination_attempted: bool,
-    #[cfg(windows)]
-    job: aw_platform::ManagedProcessGuard,
+    stop_state: ProcessStopState,
+    event_sink: Option<Arc<dyn ExecutionEventSink>>,
+    guard: aw_platform::ManagedProcessGuard,
 }
 impl PipeProcess {
     pub async fn spawn(spec: PipeSpec) -> crate::Result<Self> {
-        Self::spawn_inner(spec, SpawnOutputTarget::None).await
+        Self::spawn_inner(spec, SpawnOutputTarget::None, None).await
+    }
+
+    pub async fn spawn_with_event_sink(
+        spec: PipeSpec,
+        event_sink: Arc<dyn ExecutionEventSink>,
+    ) -> crate::Result<Self> {
+        Self::spawn_inner(spec, SpawnOutputTarget::None, Some(event_sink)).await
     }
     /// Opt-in host-authorized durable spooling. Host constructs handles and
     /// journals Process intent; no new background task or model grant.
@@ -947,7 +972,7 @@ impl PipeProcess {
         spec: PipeSpec,
         files: HostSpoolFiles,
     ) -> crate::Result<Self> {
-        Self::spawn_inner(spec, SpawnOutputTarget::Legacy(files)).await
+        Self::spawn_inner(spec, SpawnOutputTarget::Legacy(files), None).await
     }
 
     /// V2 Job/ShellNode path: stdout/stderr writers are already admitted by
@@ -958,10 +983,28 @@ impl PipeProcess {
         stdout: OutputWriter,
         stderr: OutputWriter,
     ) -> crate::Result<Self> {
-        Self::spawn_inner(spec, SpawnOutputTarget::Job { stdout, stderr }).await
+        Self::spawn_inner(spec, SpawnOutputTarget::Job { stdout, stderr }, None).await
     }
 
-    async fn spawn_inner(spec: PipeSpec, target: SpawnOutputTarget) -> crate::Result<Self> {
+    pub async fn spawn_with_job_outputs_and_event_sink(
+        spec: PipeSpec,
+        stdout: OutputWriter,
+        stderr: OutputWriter,
+        event_sink: Arc<dyn ExecutionEventSink>,
+    ) -> crate::Result<Self> {
+        Self::spawn_inner(
+            spec,
+            SpawnOutputTarget::Job { stdout, stderr },
+            Some(event_sink),
+        )
+        .await
+    }
+
+    async fn spawn_inner(
+        spec: PipeSpec,
+        target: SpawnOutputTarget,
+        event_sink: Option<Arc<dyn ExecutionEventSink>>,
+    ) -> crate::Result<Self> {
         spec.validate()?;
         let spool_writers = Arc::new(SpoolWriters::default());
         // Validate/reserve output capabilities before external spawn.
@@ -1046,8 +1089,18 @@ impl PipeProcess {
                 "process launched but PID/setup outcome is uncertain",
             ));
         };
+        #[cfg(unix)]
+        let mut guard = match aw_platform::ManagedProcessGuard::attach(pid) {
+            Ok(guard) => guard,
+            Err(_) => {
+                let _ = child.start_kill();
+                return Err(crate::Error::Transport(
+                    "process launched but process-group guard setup is uncertain",
+                ));
+            }
+        };
         #[cfg(windows)]
-        let mut job = {
+        let mut guard = {
             let Some(handle) = child.raw_handle() else {
                 let _ = child.start_kill();
                 return Err(crate::Error::Transport(
@@ -1055,7 +1108,7 @@ impl PipeProcess {
                 ));
             };
             match aw_platform::ManagedProcessGuard::attach(pid, handle) {
-                Ok(job) => job,
+                Ok(guard) => guard,
                 Err(_) => {
                     let _ = child.start_kill();
                     return Err(crate::Error::Transport(
@@ -1065,20 +1118,14 @@ impl PipeProcess {
             }
         };
         let Some(stdout) = child.stdout.take() else {
-            #[cfg(unix)]
-            aw_platform::kill_process_group(pid);
-            #[cfg(windows)]
-            job.terminate();
+            let _ = guard.terminate();
             let _ = child.start_kill();
             return Err(crate::Error::Transport(
                 "process launched but stdout setup outcome is uncertain",
             ));
         };
         let Some(stderr) = child.stderr.take() else {
-            #[cfg(unix)]
-            aw_platform::kill_process_group(pid);
-            #[cfg(windows)]
-            job.terminate();
+            let _ = guard.terminate();
             let _ = child.start_kill();
             return Err(crate::Error::Transport(
                 "process launched but stderr setup outcome is uncertain",
@@ -1086,10 +1133,7 @@ impl PipeProcess {
         };
         let stdin = child.stdin.take();
         let Some([out_lease, err_lease]) = spool_writers.begin::<2>() else {
-            #[cfg(unix)]
-            aw_platform::kill_process_group(pid);
-            #[cfg(windows)]
-            job.terminate();
+            let _ = guard.terminate();
             let _ = child.start_kill();
             return Err(crate::Error::Transport(
                 "process launched but output-reader setup outcome is uncertain",
@@ -1107,8 +1151,9 @@ impl PipeProcess {
             spool_writers,
             spools,
             termination_attempted: false,
-            #[cfg(windows)]
-            job,
+            stop_state: ProcessStopState::default(),
+            event_sink,
+            guard,
         })
     }
     pub fn mode(&self) -> ProcessMode {
@@ -1176,28 +1221,59 @@ impl PipeProcess {
             && !s.stdout.read_failed
             && !s.stderr.read_failed
     }
-    fn kill_group(&mut self) {
-        #[cfg(unix)]
-        aw_platform::kill_process_group(self.pid);
-        #[cfg(windows)]
-        self.job.terminate();
+    fn record_stop(
+        &mut self,
+        reason: Option<ProcessStopReason>,
+        evidence: StopEvidence,
+    ) -> StopRecord {
+        let record = self.stop_state.record(reason, evidence);
+        if let Some(sink) = &self.event_sink {
+            sink.record(ExecutionLifecycleEvent::ProcessStop { record });
+        }
+        record
     }
-    async fn stop(&mut self) -> Outcome {
+
+    fn stop_tree(&mut self, reason: Option<ProcessStopReason>) -> StopRecord {
+        let evidence = platform_stop_evidence(self.guard.terminate());
+        self.record_stop(reason, evidence)
+    }
+
+    fn stop_outcome(record: StopRecord, known: Outcome) -> Outcome {
+        if record.evidence == StopEvidence::Unknown {
+            Outcome::Unknown
+        } else {
+            known
+        }
+    }
+
+    async fn stop(&mut self, reason: ProcessStopReason) -> (StopRecord, RunnerExit) {
         self.termination_attempted = true;
         self.stdin.take();
-        // Graceful signal only if actually supported. On unsupported Windows
-        // backend, force stop without claiming graceful OS group termination.
-        if aw_platform::terminate_process_group(self.pid).is_ok() {
-            if let Ok(Ok(_)) = timeout(GRACEFUL_TERM, self.child.wait()).await {
-                return Outcome::Cancelled;
+
+        // Preserve graceful shutdown where supported, but only call it a
+        // stopped command if the signal reached a live group and the direct
+        // child then reaped. NoTarget stays positive absence, not our stop.
+        let graceful = platform_stop_evidence(aw_platform::terminate_process_group(self.pid));
+        let graceful_record = self.record_stop(Some(reason), graceful);
+        if graceful != StopEvidence::Unknown {
+            if let Ok(Ok(status)) = timeout(GRACEFUL_TERM, self.child.wait()).await {
+                return (graceful_record, Self::status_facts(status).1);
             }
         }
-        self.kill_group();
+
+        // Forced containment stop uses the managed guard. Unknown evidence
+        // leaves it armed and retains the semantic reason for the Drop retry.
+        let record = self.stop_tree(Some(reason));
         let _ = self.child.start_kill();
-        match timeout(REAP_DEADLINE, self.child.wait()).await {
-            Ok(Ok(_)) => Outcome::Cancelled,
-            _ => Outcome::Unknown,
-        }
+        let exit = match timeout(REAP_DEADLINE, self.child.wait()).await {
+            Ok(Ok(status)) => Self::status_facts(status).1,
+            _ => RunnerExit::Unknown,
+        };
+        let record = graceful_record
+            .terminal_reason()
+            .map(StopRecord::stopped)
+            .unwrap_or(record);
+        (record, exit)
     }
     /// AW-P6-9D2B2B1: Only the already-authorized owning HOST may expose
     /// this to an individually grant-fenced and journaled model Tool. The
@@ -1218,20 +1294,25 @@ impl PipeProcess {
             ));
         }
         // stop() fences the attempt before the first possible OS signal.
-        let outcome = self.stop().await;
+        let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
+        let outcome = Self::stop_outcome(record, Outcome::Cancelled);
+        let mut stop = record.terminal_reason();
         let output_complete = self.drain_output().await;
         if !output_complete {
             // Same original descendant cleanup as wait(); never assert that
             // a single exited direct child proves its group has stopped.
-            self.kill_group();
+            stop = stop.or_else(|| self.stop_tree(None).terminal_reason());
         }
         Ok(ProcessReceipt {
             outcome,
+            exit,
+            stop,
             output: self.snapshot(),
             output_complete,
             spools: self.spools.clone(),
         })
     }
+
     /// Caller retains the resource across model steps if needed. Output drains
     /// while no one polls the process. Unknown effects never auto-replay.
     pub async fn wait<C: core::future::Future<Output = ()>>(
@@ -1239,25 +1320,46 @@ impl PipeProcess {
         cancellation: C,
         deadline: Duration,
     ) -> ProcessReceipt {
-        let outcome = tokio::select! {
+        let (outcome, exit, mut stop) = tokio::select! {
             biased;
-            _=cancellation=>self.stop().await,
-            result=timeout(deadline,self.child.wait())=>match result {
-                Ok(Ok(status))=>{Self::status_outcome(status)}
-                Ok(Err(_))=>{let _=self.stop().await;Outcome::Unknown}
-                Err(_)=>{if self.stop().await==Outcome::Unknown {Outcome::Unknown}
-                        else {Outcome::DeadlineExceeded}}
+            _ = cancellation => {
+                let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
+                (
+                    Self::stop_outcome(record, Outcome::Cancelled),
+                    exit,
+                    record.terminal_reason(),
+                )
+            },
+            result = timeout(deadline, self.child.wait()) => match result {
+                Ok(Ok(status)) => {
+                    let (outcome, exit) = Self::status_facts(status);
+                    (outcome, exit, None)
+                }
+                Ok(Err(_)) => {
+                    let (record, exit) = self.stop(ProcessStopReason::RuntimeError).await;
+                    (Outcome::Unknown, exit, record.terminal_reason())
+                }
+                Err(_) => {
+                    let (record, exit) = self.stop(ProcessStopReason::Timeout).await;
+                    (
+                        Self::stop_outcome(record, Outcome::DeadlineExceeded),
+                        exit,
+                        record.terminal_reason(),
+                    )
+                }
             },
         };
         let output_complete = self.drain_output().await;
         if !output_complete {
             // A descendant may still hold an inherited pipe after its parent
             // has exited. Do not detach that group's possible external effects.
-            self.kill_group();
+            stop = stop.or_else(|| self.stop_tree(None).terminal_reason());
         }
         let output = self.snapshot();
         ProcessReceipt {
             outcome,
+            exit,
+            stop,
             output,
             output_complete,
             spools: self.spools.clone(),
@@ -1276,16 +1378,24 @@ impl PipeProcess {
         tokio::pin!(cancellation);
         let deadline = sleep(deadline);
         tokio::pin!(deadline);
-        let outcome = loop {
+        let (outcome, exit, mut stop) = loop {
             tokio::select! {
                 biased;
-                _ = &mut cancellation => break self.stop().await,
+                _ = &mut cancellation => {
+                    let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
+                    break (
+                        Self::stop_outcome(record, Outcome::Cancelled),
+                        exit,
+                        record.terminal_reason(),
+                    );
+                }
                 _ = &mut deadline => {
-                    break if self.stop().await == Outcome::Unknown {
-                        Outcome::Unknown
-                    } else {
-                        Outcome::DeadlineExceeded
-                    };
+                    let (record, exit) = self.stop(ProcessStopReason::Timeout).await;
+                    break (
+                        Self::stop_outcome(record, Outcome::DeadlineExceeded),
+                        exit,
+                        record.terminal_reason(),
+                    );
                 }
                 command = input.recv() => {
                     let Some(command) = command else {
@@ -1308,10 +1418,14 @@ impl PipeProcess {
                 }
                 result = self.child.wait() => {
                     break match result {
-                        Ok(status) => Self::status_outcome(status),
+                        Ok(status) => {
+                            let (outcome, exit) = Self::status_facts(status);
+                            (outcome, exit, None)
+                        }
                         Err(_) => {
-                            let _ = self.stop().await;
-                            Outcome::Unknown
+                            let (record, exit) =
+                                self.stop(ProcessStopReason::RuntimeError).await;
+                            (Outcome::Unknown, exit, record.terminal_reason())
                         }
                     };
                 }
@@ -1328,28 +1442,27 @@ impl PipeProcess {
         self.close_stdin();
         let output_complete = self.drain_output().await;
         if !output_complete {
-            self.kill_group();
+            stop = stop.or_else(|| self.stop_tree(None).terminal_reason());
         }
         let output = self.snapshot();
         ProcessReceipt {
             outcome,
+            exit,
+            stop,
             output,
             output_complete,
             spools: self.spools.clone(),
         }
     }
-    fn status_outcome(status: ExitStatus) -> Outcome {
+
+    fn status_facts(status: ExitStatus) -> (Outcome, RunnerExit) {
         if let Some(code) = status.code() {
-            return Outcome::Exited(code);
+            return (Outcome::Exited(code), RunnerExit::Code(code));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt as _;
-            if let Some(signal) = status.signal() {
-                return Outcome::ExitedBySignal(signal);
-            }
+        if let Some(signal) = aw_platform::exit_signal(&status) {
+            return (Outcome::ExitedBySignal(signal), RunnerExit::Signal(signal));
         }
-        Outcome::Unknown
+        (Outcome::Unknown, RunnerExit::Unknown)
     }
 }
 impl Drop for PipeProcess {
@@ -1362,7 +1475,13 @@ impl Drop for PipeProcess {
         // remain in its process group with stdout/stderr redirected. Preserve
         // the old Bash guard's unconditional group teardown. Escaped children
         // and same-UID code remain outside this best-effort boundary.
-        self.kill_group();
+        if self.guard.is_active() {
+            let _ = self.stop_tree(None);
+            // This is the final adapter-level fail-safe attempt. If its result
+            // is still Unknown, do not let the inner platform guard make an
+            // unobserved second Drop retry.
+            self.guard.disarm();
+        }
     }
 }
 #[cfg(feature = "pty")]
@@ -1407,6 +1526,84 @@ impl PtyProcess {
 mod tests {
     use super::*;
     use std::future::pending;
+
+    #[derive(Default)]
+    struct RecordingEventSink(Mutex<Vec<ExecutionLifecycleEvent>>);
+
+    impl ExecutionEventSink for RecordingEventSink {
+        fn record(&self, event: ExecutionLifecycleEvent) {
+            self.0.lock().expect("event sink").push(event);
+        }
+    }
+
+    #[test]
+    fn unknown_stop_retry_preserves_original_semantic_reason() {
+        let mut state = ProcessStopState::default();
+
+        let first = state.record(Some(ProcessStopReason::Cancelled), StopEvidence::Unknown);
+        assert_eq!(
+            first,
+            StopRecord::unknown(ProcessStopReason::Cancelled),
+            "the first unproven attempt retains its semantic reason"
+        );
+
+        let retry = state.record(None, StopEvidence::Stopped);
+        assert_eq!(
+            retry,
+            StopRecord::stopped(ProcessStopReason::Cancelled),
+            "a housekeeping/Drop retry must not relabel the original cancellation"
+        );
+
+        let cleanup = state.record(None, StopEvidence::NoTarget);
+        assert_eq!(cleanup, StopRecord::housekeeping(StopEvidence::NoTarget));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sink_observes_connector_stop_but_not_external_exit() {
+        let sink = Arc::new(RecordingEventSink::default());
+        let process = PipeProcess::spawn_with_event_sink(spec("while :; do :; done"), sink.clone())
+            .await
+            .unwrap();
+        let receipt = process
+            .wait(
+                async { tokio::time::sleep(Duration::from_millis(30)).await },
+                Duration::from_secs(3),
+            )
+            .await;
+        assert_eq!(
+            receipt.runner_terminal().stop,
+            Some(ProcessStopReason::Cancelled)
+        );
+        assert!(sink.0.lock().expect("events").iter().any(|event| matches!(
+            event,
+            ExecutionLifecycleEvent::ProcessStop {
+                record: StopRecord {
+                    reason: Some(ProcessStopReason::Cancelled),
+                    evidence: StopEvidence::Stopped,
+                },
+            }
+        )));
+
+        let external = Arc::new(RecordingEventSink::default());
+        let process = PipeProcess::spawn_with_event_sink(spec("kill -KILL $$"), external.clone())
+            .await
+            .unwrap();
+        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
+        assert_eq!(receipt.runner_terminal().stop, None);
+        assert_eq!(receipt.runner_terminal().exit, RunnerExit::Signal(9));
+        assert!(external
+            .0
+            .lock()
+            .expect("events")
+            .iter()
+            .all(|event| matches!(
+                event,
+                ExecutionLifecycleEvent::ProcessStop {
+                    record: StopRecord { reason: None, .. },
+                }
+            )));
+    }
+
     fn bash() -> PathBuf {
         std::env::var_os("AW_BASH")
             .map(PathBuf::from)
@@ -1459,7 +1656,15 @@ mod tests {
             process.terminate().await.is_err(),
             "post-settlement original Process must never receive a second signal"
         );
-        assert_eq!(receipt.runner_terminal().exit, RunnerExit::Unknown);
+        let terminal = receipt.runner_terminal();
+        assert_eq!(terminal.stop, Some(ProcessStopReason::Cancelled));
+        #[cfg(unix)]
+        match terminal.exit {
+            RunnerExit::Signal(signal) => {
+                assert_eq!(aw_platform::signal_name(signal), Some("SIGTERM"));
+            }
+            other => panic!("expected factual SIGTERM exit, got {other:?}"),
+        }
         assert_eq!(
             receipt.runner_status().primary,
             aw_tools::filesystem::status::Primary::Fail

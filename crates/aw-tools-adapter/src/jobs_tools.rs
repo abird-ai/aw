@@ -11,6 +11,8 @@ use crate::{
 };
 use aw_agent_core::{Tool, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSpec};
 use aw_tools::{
+    budget::SerializedResultBytes,
+    execution_ref::JobRef,
     filesystem::job_manager::{
         FiniteJobKind, OutputPage, OutputPosition, OutputStream, Snapshot, MAX_JOB_LIST_PAGE,
     },
@@ -264,7 +266,7 @@ impl JobsTool {
         }
     }
 
-    fn render_snapshot(reference: &str, snapshot: &Snapshot) -> Result<String> {
+    fn render_snapshot(reference: &JobRef, snapshot: &Snapshot) -> Result<String> {
         aw_tools::receipt::render_plain(
             aw_tools::receipt::Receipt::JobStatus {
                 reference,
@@ -380,8 +382,9 @@ impl JobsTool {
         page: &OutputPage,
         offset: u64,
         encoding: &str,
-        budget: usize,
+        budget: SerializedResultBytes,
     ) -> Result<(String, usize)> {
+        let budget = budget.get();
         let render = |bytes: &[u8]| -> Result<String> {
             let next = offset
                 .checked_add(bytes.len() as u64)
@@ -484,7 +487,7 @@ impl JobsTool {
         offset: u64,
         limit: usize,
         encoding: &str,
-        budget: usize,
+        budget: SerializedResultBytes,
     ) -> Result<String> {
         let (_, spool_limit) = manager
             .spool_usage()
@@ -1007,7 +1010,10 @@ impl Tool for JobsTool {
                             .as_u64()
                             .and_then(|value| usize::try_from(value).ok())
                             .is_none_or(|value| {
-                                value == 0 || value > self.runtime.job_profile().read_page_max_bytes
+                                self.runtime
+                                    .job_profile()
+                                    .resolve_read_page(Some(value))
+                                    .is_err()
                             })
                     })
                 {
@@ -1100,11 +1106,19 @@ impl Tool for JobsTool {
     fn execute<'a>(&'a self, ctx: ToolContext, arguments: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
             self.validate(arguments)?;
-            let budget = if self.kind == JobsKind::Read {
-                ctx.extended_result_budget(self.runtime.job_profile().read_page_max_bytes)?
+            let read_budget = if self.kind == JobsKind::Read {
+                let bytes =
+                    ctx.extended_result_budget(aw_agent_core::tool::MAX_AGENT_TOOL_RESULT_BYTES)?;
+                Some(
+                    SerializedResultBytes::new(bytes)
+                        .expect("validated ToolContext result budget is non-zero"),
+                )
             } else {
-                ctx.result_budget(self.runtime.result_limit())?
+                None
             };
+            let budget = read_budget
+                .map(SerializedResultBytes::get)
+                .unwrap_or(ctx.result_budget(self.runtime.result_limit())?);
             let host = self.runtime.host_for(&ctx)?;
             // Mark delivery only after the *entire* tool response validates.
             // A tail/status peek never mints ACKable byte proof.
@@ -1139,35 +1153,36 @@ impl Tool for JobsTool {
                             let mut advanced_cursor: Option<String> = None;
                             let mut stopped_early = false;
                             for (index, item) in page.items.iter().enumerate() {
-                                let row =
-                                    if let Some(output) = router
-                                        .get(
-                                            &ctx,
-                                            AgentJobGet {
-                                                reference: item.reference.clone(),
-                                                revision: None,
-                                                wait_ms: 0,
-                                            },
-                                        )
-                                        .await?
-                                    {
-                                        Some(output.content)
-                                    } else {
-                                        match host.resolve_job_ref(&item.reference) {
-                                            Ok((id, None)) => match host.manager().get(&id) {
-                                                Ok(snapshot) => Some(Self::render_snapshot(
-                                                    &item.reference,
-                                                    &snapshot,
-                                                )?),
-                                                Err(_) => None,
-                                            },
-                                            Ok((_, Some(_))) => return Err(Error::Protocol(
+                                let row = if let Some(output) = router
+                                    .get(
+                                        &ctx,
+                                        AgentJobGet {
+                                            reference: item.reference.clone(),
+                                            revision: None,
+                                            wait_ms: 0,
+                                        },
+                                    )
+                                    .await?
+                                {
+                                    Some(output.content)
+                                } else {
+                                    match host.resolve_job_ref(&item.reference) {
+                                        Ok((id, None)) => match host.manager().get(&id) {
+                                            Ok(snapshot) => {
+                                                let reference = host.job_ref(&id, None)?;
+                                                Some(Self::render_snapshot(&reference, &snapshot)?)
+                                            }
+                                            Err(_) => None,
+                                        },
+                                        Ok((_, Some(_))) => {
+                                            return Err(Error::Protocol(
                                                 "jobs_list durable index contains descendant ref",
-                                            )),
-                                            Err(Error::Denied(_)) => None,
-                                            Err(error) => return Err(error),
+                                            ))
                                         }
-                                    };
+                                        Err(Error::Denied(_)) => None,
+                                        Err(error) => return Err(error),
+                                    }
+                                };
                                 let more_after =
                                     index + 1 < page.items.len() || page.next_cursor.is_some();
                                 if let Some(row) = row {
@@ -1208,7 +1223,7 @@ impl Tool for JobsTool {
                     let (jobs, next) = host.list_jobs(&ctx.actor, cursor, limit)?;
                     let mut rows = Vec::new();
                     for snapshot in jobs {
-                        let reference = host.execution_ref(&snapshot.id, None)?.canonical();
+                        let reference = host.job_ref(&snapshot.id, None)?;
                         let row = Self::render_snapshot(&reference, &snapshot)?;
                         let mut candidate = rows.clone();
                         candidate.push(row.clone());
@@ -1271,7 +1286,7 @@ impl Tool for JobsTool {
                         &ctx.cancellation,
                     )
                     .await?;
-                    let reference = host.execution_ref(&id, node)?.canonical();
+                    let reference = host.job_ref(&id, node)?;
                     let content = if let Some(node) = node {
                         let plans = host
                             .manager()
@@ -1349,11 +1364,18 @@ impl Tool for JobsTool {
                         .get("cursor")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    let limit = arguments
+                    let requested_limit = arguments
                         .get("limit")
                         .and_then(Value::as_u64)
-                        .and_then(|value| usize::try_from(value).ok())
-                        .unwrap_or(self.runtime.job_profile().read_page_default_bytes);
+                        .and_then(|value| usize::try_from(value).ok());
+                    let limit = self
+                        .runtime
+                        .job_profile()
+                        .resolve_read_page(requested_limit)
+                        .map_err(|_| Error::Denied("invalid jobs_read raw page size"))?
+                        .get();
+                    let read_budget =
+                        read_budget.expect("jobs_read always resolves serialized result budget");
                     let wait_ms = arguments
                         .get("wait_ms")
                         .and_then(Value::as_u64)
@@ -1437,7 +1459,7 @@ impl Tool for JobsTool {
                             offset,
                             limit,
                             encoding,
-                            budget,
+                            read_budget,
                         )?
                     } else {
                         let (coordinate, stream) =
@@ -1472,7 +1494,7 @@ impl Tool for JobsTool {
                             )
                             .map_err(|_| Error::Denied("Job output view is unavailable"))?;
                         let (rendered, credited) =
-                            Self::render_output_page(&page, page.offset, encoding, budget)?;
+                            Self::render_output_page(&page, page.offset, encoding, read_budget)?;
                         delivered = Some((id, coordinate, stream, owner, page.offset, credited));
                         rendered
                     };
@@ -1480,6 +1502,7 @@ impl Tool for JobsTool {
                 }
                 JobsKind::Ack => {
                     let (id, node) = host.resolve_job_ref(Self::reference(arguments, false)?)?;
+                    let reference = host.job_ref(&id, node)?;
                     if !self.runtime.control_authorized(&ctx, "jobs_ack")
                         || !host.payload_authorized(&ctx.actor, &id)
                     {
@@ -1540,17 +1563,40 @@ impl Tool for JobsTool {
                                     ),
                                 })
                         })?;
-                        return Ok(ToolOutput::text(format!(
-                            "{} ack=all released={}",
-                            if ack.changed { "ok" } else { "unchanged" },
-                            ack.released
-                        )));
+                        let content = aw_tools::receipt::render_plain(
+                            aw_tools::receipt::Receipt::Ack {
+                                reference: &reference,
+                                mode: aw_tools::receipt::AckMode::Finish,
+                                changed: ack.changed,
+                                released: ack.released,
+                            },
+                            budget,
+                        )
+                        .map_err(|error| match error {
+                            aw_tools::toolset::ToolsetError::ResultLimit => {
+                                Error::Limit("Job ACK receipt exceeds current result budget")
+                            }
+                            _ => Error::Protocol("cannot render typed Job ACK receipt"),
+                        })?;
+                        return Ok(ToolOutput::text(content));
                     };
-                    ToolOutput::text(format!(
-                        "{} released={}",
-                        if ack.changed { "ok" } else { "unchanged" },
-                        ack.released
-                    ))
+                    let through = offset.expect("through ACK branch has an offset");
+                    let content = aw_tools::receipt::render_plain(
+                        aw_tools::receipt::Receipt::Ack {
+                            reference: &reference,
+                            mode: aw_tools::receipt::AckMode::Through(through),
+                            changed: ack.changed,
+                            released: ack.released,
+                        },
+                        budget,
+                    )
+                    .map_err(|error| match error {
+                        aw_tools::toolset::ToolsetError::ResultLimit => {
+                            Error::Limit("Job ACK receipt exceeds current result budget")
+                        }
+                        _ => Error::Protocol("cannot render typed Job ACK receipt"),
+                    })?;
+                    ToolOutput::text(content)
                 }
                 JobsKind::Send => {
                     let requested_ref = Self::reference(arguments, true)?.to_owned();
@@ -1644,7 +1690,8 @@ impl Tool for JobsTool {
                                         )
                                     }
                                 };
-                                let canonical = host.execution_ref(&id, node)?.canonical();
+                                let canonical_ref = host.job_ref(&id, node)?;
+                                let canonical = canonical_ref.to_string();
                                 self.runtime.bind_control_replay_target(key, &canonical)?;
                                 let kind = match host.manager().finite_kind(&id) {
                                     Ok(kind) => kind,
@@ -1805,7 +1852,8 @@ impl Tool for JobsTool {
                                         )
                                     }
                                 };
-                                let canonical = host.execution_ref(&id, node)?.canonical();
+                                let canonical_ref = host.job_ref(&id, node)?;
+                                let canonical = canonical_ref.to_string();
                                 self.runtime.bind_control_replay_target(key, &canonical)?;
                                 if node.is_some() {
                                     return Self::finish_control_error(
@@ -1819,11 +1867,25 @@ impl Tool for JobsTool {
                                 }
                                 match self.runtime.cancel_checked(&ctx, &id, revision).await {
                                     Ok((changed, snapshot)) => {
-                                        let output = ToolOutput::text(format!(
-                                            "{canonical} rev={} {}",
-                                            snapshot.sequence,
-                                            if changed { "cancelling" } else { "unchanged" }
-                                        ));
+                                        let content = aw_tools::receipt::render_plain(
+                                            aw_tools::receipt::Receipt::Cancel {
+                                                reference: &canonical_ref,
+                                                revision: snapshot.sequence,
+                                                changed,
+                                            },
+                                            budget,
+                                        )
+                                        .map_err(|error| match error {
+                                            aw_tools::toolset::ToolsetError::ResultLimit => {
+                                                Error::Limit(
+                                                    "Job cancellation receipt exceeds current result budget",
+                                                )
+                                            }
+                                            _ => Error::Protocol(
+                                                "cannot render typed Job cancellation receipt",
+                                            ),
+                                        })?;
+                                        let output = ToolOutput::text(content);
                                         Self::finish_control_output(
                                             &self.runtime,
                                             key,
@@ -2012,7 +2074,8 @@ impl Tool for JobsTool {
                                         ));
                                     }
                                 };
-                                let canonical = host.execution_ref(&id, node)?.canonical();
+                                let canonical_ref = host.job_ref(&id, node)?;
+                                let canonical = canonical_ref.to_string();
                                 self.runtime.bind_control_replay_target(key, &canonical)?;
                                 match host.subscribe_finite(
                                     crate::job_host::FiniteSubscriptionRequest {
@@ -2060,7 +2123,11 @@ impl Tool for JobsTool {
                     }
                 }
             };
-            output.validate()?;
+            if let Some(read_budget) = read_budget {
+                output.validate_with_limit(read_budget.get())?;
+            } else {
+                output.validate()?;
+            }
             // Synthetic Graph-root projections also need a final live check:
             // no delivery ledger entry exists for their synthesized result.
             if let Some(id) = finite_read_id.as_deref() {
@@ -2095,8 +2162,12 @@ impl Tool for JobsTool {
 mod delivery_tests {
     use super::*;
 
+    fn serialized(bytes: usize) -> SerializedResultBytes {
+        SerializedResultBytes::new(bytes).expect("test serialized budget")
+    }
+
     #[test]
-    fn bounded_projection_returns_exact_raw_prefix_for_delivery_credit() {
+    fn serialized_envelope_narrows_projection_without_changing_raw_page() {
         let page = OutputPage {
             offset: 0,
             bytes: vec![0xff; 700],
@@ -2106,16 +2177,19 @@ mod delivery_tests {
             total_bytes: 700,
             retained_bytes: 700,
         };
-        let (lossy, used) = JobsTool::render_output_page(&page, 0, "text", 512).unwrap();
+        let (lossy, used) =
+            JobsTool::render_output_page(&page, 0, "text", serialized(512)).unwrap();
         assert!(used > 0 && used < page.bytes.len());
         assert!(lossy.len() <= 512);
         assert!(lossy.contains(&format!("more offset={used}")));
         assert!(!lossy.contains("more offset=700"));
-        let (b64, raw) = JobsTool::render_output_page(&page, 0, "base64", 512).unwrap();
+        let (b64, raw) = JobsTool::render_output_page(&page, 0, "base64", serialized(512)).unwrap();
         assert!(raw > used && raw < page.bytes.len());
         assert!(b64.len() <= 512);
         assert!(b64.contains(&format!("more offset={raw}")));
-        assert!(JobsTool::render_output_page(&page, 0, "base64", 0).is_err());
+        assert_eq!(page.bytes.len(), 700);
+        assert_eq!(page.retained_bytes, 700);
+        assert!(JobsTool::render_output_page(&page, 0, "base64", serialized(1)).is_err());
     }
 
     #[test]
@@ -2129,9 +2203,10 @@ mod delivery_tests {
             total_bytes: 100,
             retained_bytes: 0,
         };
-        let (rendered, used) = JobsTool::render_output_page(&page, 0, "text", 512).unwrap();
+        let (rendered, used) =
+            JobsTool::render_output_page(&page, 0, "text", serialized(512)).unwrap();
         assert_eq!(used, 0);
         assert_eq!(rendered, "truncated retained=0 total=100");
-        assert!(JobsTool::render_output_page(&page, 0, "text", 0).is_err());
+        assert!(JobsTool::render_output_page(&page, 0, "text", serialized(1)).is_err());
     }
 }
