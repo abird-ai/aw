@@ -25,6 +25,7 @@ pub mod job_event;
 pub mod operation;
 #[cfg(feature = "read")]
 pub mod receipt;
+pub mod receipt_policy;
 pub mod remote_start;
 #[cfg(feature = "read")]
 pub mod toolset;

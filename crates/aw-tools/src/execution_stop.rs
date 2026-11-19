@@ -18,6 +18,16 @@ pub enum StopReason {
     RuntimeError,
 }
 
+impl StopReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::RuntimeError => "runtime_error",
+        }
+    }
+}
+
 /// What the platform stop operation actually proved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -53,6 +63,37 @@ pub enum ExecutionLifecycleEvent {
 /// shared event remains bounded and allocation-free.
 pub trait ExecutionEventSink: Send + Sync {
     fn record(&self, event: ExecutionLifecycleEvent);
+}
+
+/// Small escalation state for one logical stop sequence.
+///
+/// An Unknown attempt retains its original semantic reason for the next
+/// fail-safe retry. Any conclusive Stopped/NoTarget observation ends that
+/// sequence. Housekeeping retries therefore never relabel a prior timeout or
+/// cancellation, while an unrelated later cleanup starts reason-less.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StopTracker {
+    pending_reason: Option<StopReason>,
+}
+
+impl StopTracker {
+    pub fn record(
+        &mut self,
+        requested_reason: Option<StopReason>,
+        evidence: StopEvidence,
+    ) -> StopRecord {
+        let reason = self.pending_reason.or(requested_reason);
+        self.pending_reason = if evidence == StopEvidence::Unknown {
+            reason
+        } else {
+            None
+        };
+        StopRecord { reason, evidence }
+    }
+
+    pub const fn pending_reason(self) -> Option<StopReason> {
+        self.pending_reason
+    }
 }
 
 impl StopRecord {
@@ -143,6 +184,21 @@ mod tests {
         );
         assert_eq!(StopRecord::unknown(reason).evidence, StopEvidence::Unknown);
         assert_ne!(StopEvidence::NoTarget, StopEvidence::Unknown);
+    }
+
+    #[test]
+    fn tracker_preserves_reason_across_unknown_then_resets_after_conclusion() {
+        let mut tracker = StopTracker::default();
+        let first = tracker.record(Some(StopReason::Cancelled), StopEvidence::Unknown);
+        assert_eq!(first, StopRecord::unknown(StopReason::Cancelled));
+        assert_eq!(tracker.pending_reason(), Some(StopReason::Cancelled));
+
+        let retry = tracker.record(None, StopEvidence::Stopped);
+        assert_eq!(retry, StopRecord::stopped(StopReason::Cancelled));
+        assert_eq!(tracker.pending_reason(), None);
+
+        let cleanup = tracker.record(None, StopEvidence::NoTarget);
+        assert_eq!(cleanup, StopRecord::housekeeping(StopEvidence::NoTarget));
     }
 
     #[test]

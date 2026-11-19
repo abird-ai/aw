@@ -70,7 +70,7 @@ impl ProcessTerminal {
             fields.push("stderr_truncated=true".into());
         }
         if let Some(stop) = self.stop {
-            fields.push(format!("stop={}", stop_label(stop)));
+            fields.push(format!("stop={}", stop.as_str()));
         }
         if !self.output.complete {
             fields.push("output_complete=false".into());
@@ -88,7 +88,7 @@ impl ProcessTerminal {
         };
         let stop = self
             .stop
-            .map(|reason| format!(" stop={}", stop_label(reason)))
+            .map(|reason| format!(" stop={}", reason.as_str()))
             .unwrap_or_default();
         format!(
             "{} {}{} stdout={} stderr={} stdout_truncated={} stderr_truncated={} output_complete={}",
@@ -101,14 +101,6 @@ impl ProcessTerminal {
             self.output.stderr_truncated,
             self.output.complete
         )
-    }
-}
-
-const fn stop_label(reason: StopReason) -> &'static str {
-    match reason {
-        StopReason::Timeout => "timeout",
-        StopReason::Cancelled => "cancelled",
-        StopReason::RuntimeError => "runtime_error",
     }
 }
 

@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 #[cfg(all(feature = "batch", feature = "durable"))]
 use crate::filesystem::{
-    job::{Lifecycle, NodeState},
+    job::{Lifecycle, NodeState, StopReason as JobStopReason},
     job_manager::Snapshot,
     runner::{ProcessExit, ProcessTerminal},
 };
@@ -73,6 +73,9 @@ fn append_terminal(content: &mut String, terminal: ProcessTerminal) {
         ProcessExit::Unknown => content.write_str("unknown"),
     }
     .expect("writing into a String never fails");
+    if let Some(stop) = terminal.stop {
+        write!(content, " stop={}", stop.as_str()).expect("writing into a String never fails");
+    }
     write!(
         content,
         " out={} err={}",
@@ -116,11 +119,13 @@ pub fn render_plain(receipt: Receipt<'_>, budget: usize) -> Result<String, Tools
             let state = if snapshot.journal_unknown {
                 "unknown"
             } else {
-                match snapshot.lifecycle {
-                    Lifecycle::Running => "running",
-                    Lifecycle::Cancelling | Lifecycle::Revoking => "cancelling",
-                    Lifecycle::Terminal if snapshot.stop_reason.is_some() => "cancelled",
-                    Lifecycle::Terminal => "settled",
+                match (snapshot.lifecycle, snapshot.stop_reason) {
+                    (Lifecycle::Running, _) => "running",
+                    (Lifecycle::Cancelling, _) => "cancelling",
+                    (Lifecycle::Revoking, _) => "revoking",
+                    (Lifecycle::Terminal, Some(JobStopReason::Cancelled)) => "cancelled",
+                    (Lifecycle::Terminal, Some(JobStopReason::Revoked)) => "revoked",
+                    (Lifecycle::Terminal, None) => "settled",
                 }
             };
             write!(
@@ -453,6 +458,19 @@ false"
             next: None,
         };
         assert!(!render_plain(ordinary, 200).unwrap().contains("next="));
+        let stopped = ProcessTerminal {
+            stop: Some(crate::execution_stop::StopReason::Timeout),
+            ..terminal
+        };
+        let stopped_receipt = Receipt::JobStatus {
+            reference: job_ref("j:7"),
+            snapshot: &snapshot,
+            terminal: Some(stopped),
+            next: None,
+        };
+        assert!(render_plain(stopped_receipt, 200)
+            .unwrap()
+            .contains(" stop=timeout "));
         let unknown_terminal = ProcessTerminal {
             exit: ProcessExit::Unknown,
             stop: None,
@@ -617,7 +635,10 @@ false"
     #[cfg(all(feature = "durable", feature = "batch"))]
     #[test]
     fn job_status_uses_original_snapshot_without_reclassifying_outcome() {
-        use crate::filesystem::{job::Lifecycle, status::Primary};
+        use crate::filesystem::{
+            job::{Lifecycle, StopReason as JobStopReason},
+            status::Primary,
+        };
         let mut snapshot = Snapshot {
             id: "job-7".into(),
             label: "bash".into(),
@@ -643,7 +664,11 @@ false"
             .unwrap()
         };
         assert_eq!(render(&snapshot), "j:7 bash running rev=3");
+        snapshot.lifecycle = Lifecycle::Revoking;
+        snapshot.stop_reason = Some(JobStopReason::Revoked);
+        assert_eq!(render(&snapshot), "j:7 bash revoking rev=3");
         snapshot.lifecycle = Lifecycle::Terminal;
+        snapshot.stop_reason = None;
         snapshot.sequence = 4;
         snapshot.finished = 1;
         snapshot.summary = Some((Primary::Mixed, true, true));
@@ -652,6 +677,14 @@ false"
             "j:7 bash settled rev=4 outcome=mixed more incomplete"
         );
         snapshot.summary = Some((Primary::Unknown, false, false));
+        snapshot.stop_reason = Some(JobStopReason::Revoked);
+        assert_eq!(render(&snapshot), "j:7 bash revoked rev=4 outcome=unknown");
+        snapshot.stop_reason = Some(JobStopReason::Cancelled);
+        assert_eq!(
+            render(&snapshot),
+            "j:7 bash cancelled rev=4 outcome=unknown"
+        );
+        snapshot.stop_reason = None;
         assert_eq!(render(&snapshot), "j:7 bash settled rev=4 outcome=unknown");
         snapshot.label = "bash\nspoof".into();
         assert!(render_plain(

@@ -854,7 +854,12 @@ pub enum Outcome {
 pub struct ProcessReceipt {
     pub outcome: Outcome,
     exit: RunnerExit,
-    stop: Option<ProcessStopReason>,
+    /// Final factual stop observation for this logical stop sequence.
+    ///
+    /// Attempt-level events may contain graceful/forced/cleanup records; this
+    /// value selects the final product-facing record without changing terminal
+    /// semantics. A reason-less value is housekeeping only.
+    stop_record: Option<StopRecord>,
     pub output: ProcessSnapshot,
     pub output_complete: bool,
     /// Present only when the trusted host supplied durable output handles.
@@ -869,10 +874,14 @@ impl ProcessReceipt {
         ) && self.output_complete
     }
 
+    pub const fn stop_record(&self) -> Option<StopRecord> {
+        self.stop_record
+    }
+
     pub fn runner_terminal(&self) -> ProcessTerminal {
         ProcessTerminal {
             exit: self.exit,
-            stop: self.stop,
+            stop: self.stop_record.and_then(StopRecord::terminal_reason),
             output: ProcessOutputMeta {
                 stdout_bytes: self.output.stdout.total_bytes,
                 stderr_bytes: self.output.stderr.total_bytes,
@@ -908,27 +917,6 @@ enum SpawnOutputTarget {
     },
 }
 
-#[derive(Default)]
-struct ProcessStopState {
-    pending_reason: Option<ProcessStopReason>,
-}
-
-impl ProcessStopState {
-    fn record(
-        &mut self,
-        requested_reason: Option<ProcessStopReason>,
-        evidence: StopEvidence,
-    ) -> StopRecord {
-        let reason = self.pending_reason.or(requested_reason);
-        self.pending_reason = if evidence == StopEvidence::Unknown {
-            reason
-        } else {
-            None
-        };
-        StopRecord { reason, evidence }
-    }
-}
-
 fn platform_stop_evidence(result: std::io::Result<bool>) -> StopEvidence {
     match result {
         Ok(true) => StopEvidence::Stopped,
@@ -951,7 +939,7 @@ pub struct PipeProcess {
     /// live host-owned PipeProcess is always refused, even after an unknown
     /// Process exit or a cancelled caller; never silently resend a signal.
     termination_attempted: bool,
-    stop_state: ProcessStopState,
+    stop_state: aw_tools::execution_stop::StopTracker,
     event_sink: Option<Arc<dyn ExecutionEventSink>>,
     guard: aw_platform::ManagedProcessGuard,
 }
@@ -1151,7 +1139,7 @@ impl PipeProcess {
             spool_writers,
             spools,
             termination_attempted: false,
-            stop_state: ProcessStopState::default(),
+            stop_state: aw_tools::execution_stop::StopTracker::default(),
             event_sink,
             guard,
         })
@@ -1246,6 +1234,16 @@ impl PipeProcess {
         }
     }
 
+    /// Keep the semantic stop record across a later reason-less cleanup.
+    ///
+    /// If an earlier attempt was Unknown, StopTracker carries its reason into
+    /// the retry; that reasoned retry is therefore the new final record.
+    fn merge_final_stop(current: &mut Option<StopRecord>, record: StopRecord) {
+        if current.is_none() || record.reason.is_some() {
+            *current = Some(record);
+        }
+    }
+
     async fn stop(&mut self, reason: ProcessStopReason) -> (StopRecord, RunnerExit) {
         self.termination_attempted = true;
         self.stdin.take();
@@ -1296,17 +1294,18 @@ impl PipeProcess {
         // stop() fences the attempt before the first possible OS signal.
         let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
         let outcome = Self::stop_outcome(record, Outcome::Cancelled);
-        let mut stop = record.terminal_reason();
+        let mut stop_record = Some(record);
         let output_complete = self.drain_output().await;
         if !output_complete {
             // Same original descendant cleanup as wait(); never assert that
             // a single exited direct child proves its group has stopped.
-            stop = stop.or_else(|| self.stop_tree(None).terminal_reason());
+            let cleanup = self.stop_tree(None);
+            Self::merge_final_stop(&mut stop_record, cleanup);
         }
         Ok(ProcessReceipt {
             outcome,
             exit,
-            stop,
+            stop_record,
             output: self.snapshot(),
             output_complete,
             spools: self.spools.clone(),
@@ -1320,14 +1319,14 @@ impl PipeProcess {
         cancellation: C,
         deadline: Duration,
     ) -> ProcessReceipt {
-        let (outcome, exit, mut stop) = tokio::select! {
+        let (outcome, exit, mut stop_record) = tokio::select! {
             biased;
             _ = cancellation => {
                 let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
                 (
                     Self::stop_outcome(record, Outcome::Cancelled),
                     exit,
-                    record.terminal_reason(),
+                    Some(record),
                 )
             },
             result = timeout(deadline, self.child.wait()) => match result {
@@ -1337,14 +1336,14 @@ impl PipeProcess {
                 }
                 Ok(Err(_)) => {
                     let (record, exit) = self.stop(ProcessStopReason::RuntimeError).await;
-                    (Outcome::Unknown, exit, record.terminal_reason())
+                    (Outcome::Unknown, exit, Some(record))
                 }
                 Err(_) => {
                     let (record, exit) = self.stop(ProcessStopReason::Timeout).await;
                     (
                         Self::stop_outcome(record, Outcome::DeadlineExceeded),
                         exit,
-                        record.terminal_reason(),
+                        Some(record),
                     )
                 }
             },
@@ -1353,13 +1352,14 @@ impl PipeProcess {
         if !output_complete {
             // A descendant may still hold an inherited pipe after its parent
             // has exited. Do not detach that group's possible external effects.
-            stop = stop.or_else(|| self.stop_tree(None).terminal_reason());
+            let cleanup = self.stop_tree(None);
+            Self::merge_final_stop(&mut stop_record, cleanup);
         }
         let output = self.snapshot();
         ProcessReceipt {
             outcome,
             exit,
-            stop,
+            stop_record,
             output,
             output_complete,
             spools: self.spools.clone(),
@@ -1378,7 +1378,7 @@ impl PipeProcess {
         tokio::pin!(cancellation);
         let deadline = sleep(deadline);
         tokio::pin!(deadline);
-        let (outcome, exit, mut stop) = loop {
+        let (outcome, exit, mut stop_record) = loop {
             tokio::select! {
                 biased;
                 _ = &mut cancellation => {
@@ -1386,7 +1386,7 @@ impl PipeProcess {
                     break (
                         Self::stop_outcome(record, Outcome::Cancelled),
                         exit,
-                        record.terminal_reason(),
+                        Some(record),
                     );
                 }
                 _ = &mut deadline => {
@@ -1394,7 +1394,7 @@ impl PipeProcess {
                     break (
                         Self::stop_outcome(record, Outcome::DeadlineExceeded),
                         exit,
-                        record.terminal_reason(),
+                        Some(record),
                     );
                 }
                 command = input.recv() => {
@@ -1425,7 +1425,7 @@ impl PipeProcess {
                         Err(_) => {
                             let (record, exit) =
                                 self.stop(ProcessStopReason::RuntimeError).await;
-                            (Outcome::Unknown, exit, record.terminal_reason())
+                            (Outcome::Unknown, exit, Some(record))
                         }
                     };
                 }
@@ -1442,13 +1442,14 @@ impl PipeProcess {
         self.close_stdin();
         let output_complete = self.drain_output().await;
         if !output_complete {
-            stop = stop.or_else(|| self.stop_tree(None).terminal_reason());
+            let cleanup = self.stop_tree(None);
+            Self::merge_final_stop(&mut stop_record, cleanup);
         }
         let output = self.snapshot();
         ProcessReceipt {
             outcome,
             exit,
-            stop,
+            stop_record,
             output,
             output_complete,
             spools: self.spools.clone(),
@@ -1536,28 +1537,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unknown_stop_retry_preserves_original_semantic_reason() {
-        let mut state = ProcessStopState::default();
-
-        let first = state.record(Some(ProcessStopReason::Cancelled), StopEvidence::Unknown);
-        assert_eq!(
-            first,
-            StopRecord::unknown(ProcessStopReason::Cancelled),
-            "the first unproven attempt retains its semantic reason"
-        );
-
-        let retry = state.record(None, StopEvidence::Stopped);
-        assert_eq!(
-            retry,
-            StopRecord::stopped(ProcessStopReason::Cancelled),
-            "a housekeeping/Drop retry must not relabel the original cancellation"
-        );
-
-        let cleanup = state.record(None, StopEvidence::NoTarget);
-        assert_eq!(cleanup, StopRecord::housekeeping(StopEvidence::NoTarget));
-    }
-
     #[tokio::test]
     async fn lifecycle_sink_observes_connector_stop_but_not_external_exit() {
         let sink = Arc::new(RecordingEventSink::default());
@@ -1573,6 +1552,11 @@ mod tests {
         assert_eq!(
             receipt.runner_terminal().stop,
             Some(ProcessStopReason::Cancelled)
+        );
+        assert_eq!(
+            receipt.stop_record(),
+            Some(StopRecord::stopped(ProcessStopReason::Cancelled)),
+            "one final factual stop record must be available independently of attempt events"
         );
         assert!(sink.0.lock().expect("events").iter().any(|event| matches!(
             event,
@@ -1591,6 +1575,12 @@ mod tests {
         let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
         assert_eq!(receipt.runner_terminal().stop, None);
         assert_eq!(receipt.runner_terminal().exit, RunnerExit::Signal(9));
+        assert!(
+            receipt
+                .stop_record()
+                .is_none_or(|record| record.reason.is_none()),
+            "external process death must not acquire a semantic connector stop record"
+        );
         assert!(external
             .0
             .lock()

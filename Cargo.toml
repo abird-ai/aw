@@ -5,7 +5,7 @@ members = [
     "crates/aw-embedded-ffi", "examples/sdk-embedded-ffi-staticlib",
     "crates/aw-tools", "crates/aw-tools-fs-unix", "crates/aw-tools-fs-win",
     "crates/aw-policy", "crates/aw-session", "crates/aw-host",
-    "crates/aw-mcp", "crates/aw-extensions", "examples/process-extension-rust",
+    "crates/aw-mcp", "crates/aw-mcp-protocol", "crates/aw-extensions", "examples/process-extension-rust",
     "crates/aw-editor", "crates/aw-ui-extension", "crates/aw-collab", "crates/aw-pipeline", "crates/aw-routing",
     "crates/aw-platform", "crates/aw-platform-unix", "crates/aw-platform-win",
     "crates/aw-store-api", "crates/aw-store-jsonl", "crates/aw-session-format",

@@ -474,6 +474,7 @@ version = "0.15.0"
 dependencies = [
  "aw-agent-core",
  "aw-agent-kernel",
+ "aw-mcp-protocol",
  "aw-tools",
  "clap",
  "futures-util",
@@ -487,6 +488,16 @@ dependencies = [
  "tokio-util",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "aw-mcp-protocol"
+version = "0.15.0"
+dependencies = [
+ "aw-tools",
+ "rmcp",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
