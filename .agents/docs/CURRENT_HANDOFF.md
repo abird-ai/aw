@@ -2,7 +2,7 @@
 
 Author: coordinating implementation agent
 Owner: @pvl
-Updated: 2026-11-17
+Updated: 2026-11-18
 Source authority host: **L5 only**
 Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 
@@ -12,25 +12,135 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
 
-## Latest AW-tools published checkpoint — 2026-11-17
+## Latest 0.17 shared-runtime convergence checkpoint — P8, 2026-11-18
+
+This section supersedes older state summaries below where they conflict.
+
+- AW local HEAD remains
+  `021b8cec7b9122a6f6acaf5ef9137fb31f0a6659`;
+  `origin/main` remains
+  `792f0b38d104659264b70c31736655df1a46b60f`.
+- The accumulated P1-P8 implementation is intentionally uncommitted and
+  unstaged; the user has not authorized staging/commit/push.
+- dotlink local HEAD remains
+  `6598de605a006a75473a2043de3f60db384b0d02`;
+  `origin/main` remains
+  `5381729cd469eda54691e540deb3fee13e9f3e3e`.
+- dotlink has not consumed the unpublished P1-P8 shared APIs and has no
+  sibling/path override. Its working tree now contains only independently
+  valid pre-repin product hardening/compatibility prerequisites plus the 017
+  consumer docs; those changes must be preserved through the cutover.
+- The authority-gated publish/repin sequence is frozen in
+  `.agents/plans/017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`:
+  dotlink must pin the signed **source implementation** commit, not the later
+  docs-only checkpoint, and atomically converge `aw-tools`, both direct
+  `aw-tools-fs-*` pins, new `aw-platform`, and new `aw-mcp` on that same SHA.
+- release authority remains
+  `887401398da297c458ffa2a152a07e1b85870c35`.
+
+Implemented shared contracts:
+
+- minimal process stop core:
+  `StopReason::{Timeout,Cancelled,RuntimeError}`,
+  `StopEvidence::{Stopped,NoTarget,Unknown}`,
+  `StopRecord { reason: Option<StopReason>, evidence }`;
+- orthogonal physical `ProcessExit::{Code,Signal,Unknown}`;
+- evidence-preserving cross-platform `ManagedProcessGuard`;
+- `ProcessTerminal { exit, stop, output }`;
+- compact `TaskTerminalDetail { exit, stop }`;
+- optional `ExecutionLifecycleEvent::ProcessStop` sink;
+- `RawPageBytes` vs `SerializedResultBytes`;
+- flat bounded finite `JobRef = j:<handle>[/n:<coordinate>]`;
+- shared finite receipt grammar
+  `JobStatus/NodeStatus/Handoff/Cancel/Ack`;
+- shared 16 KiB UTF-8-safe diagnostic bounding;
+- bounded MCP result-level `_meta`, replay-stable
+  `io.abird/receipt.ts`, complete-result fitting that only shrinks text;
+- shared token-gated MCP heartbeat/progress adapter with independently bounded
+  sends and no detached queue/task;
+- platform signal-name projection plus shared factual
+  `exit_signal(&ExitStatus) -> Option<i32>`; the process adapter consumes the
+  same helper, removing the last D1 pre-publish Unix signal-extraction gap.
+
+P8 host-available validation is green:
+
+- `aw-tools --all-features --lib`: **354/354**
+- `aw-tools-adapter --all-features --lib`: **256/256**
+- `aw-mcp --all-features --lib`: **33/33**
+- `aw-platform-unix`: **13/13**, live PTY integrations **4/4**
+- cross-UID Unix fixture intentionally ignored
+- `aw-terminal --lib`: **20/20**
+- strict all-target/all-feature Clippy for all touched crates
+- no-default/minimal feature checks
+- downstream `aw-host` / `aw-cli`
+- full workspace all-feature compile
+- rustfmt / `git diff --check`
+
+P8 API review additionally made `ProgressHeartbeatConfig` and `JobRef`
+fields private behind validated constructors/accessors.
+
+Still open by authority/environment, not implementation drift:
+
+- native Windows Job Object test is authored but L5 has no Windows Rust std target;
+- signed AW implementation checkpoint requires explicit user authorization;
+- publish/push requires separate explicit authorization;
+- dotlink dependency repin is blocked until an exact AW commit is authorized and
+  published.
+
+**Next implementation phase is P9: dotlink thin-consumer conversion.** Do not
+redo P1-P8. Do not resurrect the rejected `StopOrigin/Cleanup/Dropped`
+taxonomy.
+
+Frozen sandbox/mount work remains untouched and deferred.
+
+## Latest AW-tools published checkpoint — 2026-11-18
 
 - Shared-runtime implementation commit:
   `be6d48db552fd44b9dd85364cd8734454109ce68`
-  — `Harden shared Job output and journal uncertainty`; docs/status follow-up
-  `403eb8473498454a97871702ff37aaedb1de9ee1` is the current AW `main` tip.
-- `HEAD == origin/main == 403eb8473498454a97871702ff37aaedb1de9ee1` at the
-  start of the current D1 follow-up. Dotlink D0 consumes `be6d48d` in signed
-  commit `d0a392234e918bd4ec9f0fbd7ab6fe771e1eb696`.
+  — `Harden shared Job output and journal uncertainty`; strict-ACK follow-up
+  `26a8c788d6dc7e0a7fe16995f8057fb332440978` remains the D1 ACK-compaction
+  checkpoint. Writer-quiescence landed in
+  `beef1bc2d2f37b5660ebe928d368bca37368e608`; the current shared metadata pin
+  is signed/published `7e6fe20a95640e32610819ce94b61a121e165dea`
+  — `Align shared Job list metadata`.
+- Local `main` contains signed typed-media implementation
+  `d6009deaea31abe0cdfbd87b4de48b0eaf9a0ba0` plus its owning-plan follow-up;
+  `origin/main` remains published `7e6fe20a95640e32610819ce94b61a121e165dea`
+  until a separately authorized push.
+  Dotlink `main` is published at
+  `5381729cd469eda54691e540deb3fee13e9f3e3e`
+  (`Complete shared Toolset metadata adoption`) and consumes `7e6fe20` in all
+  three shared dependencies/lock records.
 - Git reports **Good ED25519 signatures** for the published AW commits using key
   fingerprint `SHA256:4aB+NvRb1shCx4xjtZDr2Y7FzfHGph80eFtpF+pHuCI`; L5 has
   no `allowed_signers` principal file, so local trust status is `U` rather than
   a principal-mapped `G`.
-- Published implementation qualification: `aw-tools` **339/339**,
+- Current implementation qualification: `aw-tools` **341/341**,
   `aw-tools-adapter` **251/251**, read-only shared **110/110**, strict
   all-target/all-feature Clippy, formatting/diff checks, minimal shared build,
   MCP, minimal CLI and full CLI all green.
 
-## Current D1 shared prerequisite — 2026-11-17
+## Typed MCP wire/media checkpoint — 2026-11-18
+
+- Signed local AW checkpoint `d6009de` adds bounded `aw_mcp::McpToolResult` as
+  the raw typed MCP result boundary. It preserves current RMCP Text/Image/Audio/
+  Resource/ResourceLink blocks plus structured content, with 32-block and
+  existing 128 KiB semantic-result bounds plus bounded metadata overhead.
+- Existing `ToolOutput` and the Agent/provider conversation path stay text-only.
+  The ordinary MCP `RemoteTool` path still rejects non-text content; this work
+  does not implicitly grant provider media delivery, device/media consent or a
+  new durable media transcript format.
+- Real cross-repo qualification uses exact published dotlink `5381729` over
+  stdio with a private temporary profile: `bread(format=mcp)` preserves a PNG
+  image block (`image/png`), WAV audio block (`audio/wav`) and PDF embedded
+  resource (`application/pdf`) through AW's MCP client. Synthetic regressions
+  also prove non-text text-path denial and block/payload bounds.
+- Current gates: `aw-mcp` **18/18**, strict all-target Clippy `-D warnings`,
+  downstream `cargo check -p aw-cli --lib`, rustfmt and diff checks green.
+- Remaining media work is explicitly **provider/model delivery**, durable media
+  receipt/history semantics and consent—not MCP wire interoperability.
+
+## Current dotlink D1–D4 security checkpoint — 2026-11-17
 
 - Signed implementation commit `26a8c788d6dc7e0a7fe16995f8057fb332440978`
   — `Preserve strict output ACK replay across compaction` — contains the shared
@@ -47,11 +157,63 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
   replaying Job owner and independent Task owner. Full shared **339/339** and
   minimal Job-runtime **200/200** tests pass; strict all-target/all-feature
   `aw-tools` Clippy, format and diff checks pass.
-- `26a8c78` is published and the current uncommitted dotlink D1 worktree pins all
-  three AW dependencies/lock records to it. The previously red Task/model ACK
-  replay gate is green, and dotlink shared delivery proof + Through-ACK +
-  omitted-offset Finish are qualified. The next D1 slice is aggregate
-  `jobs_get.tail`; do not path-patch or add a host-side bypass.
+- `beef1bc` is published and the current uncommitted dotlink D1–D4 worktree
+  pins all three AW dependencies/lock records to it. D1 remains complete there: shared
+  delivery proof + Through-ACK + omitted-offset Finish + aggregate
+  `jobs_get.tail` all delegate to AW. Tail uses the shared 512-default / 1024-max
+  combined stdout+stderr split/redistribution and remains a pure peek with no
+  delivery/ACK credit.
+- D2 is also complete without a production grep fork. Dotlink direct MCP and
+  Graph-native grep already use AW's exact schema, `request::parse`,
+  `direct::execute`, and `search::grep`. A real stdio regression qualifies exact
+  files/directories, runtime context 0/8/128, rejection of 129 and unknown
+  fields, asymmetric side overrides, pagination/resume, compact incomplete
+  projection, and native `batch` parity.
+- Dotlink's first D3 owner-policy review found one concrete host/shared mismatch:
+  standalone shell Jobs could become native MCP Tasks while the immutable shared
+  plan said `task_result_eligible=false`; dotlink then attached a private
+  hash-derived Task owner outside AW's plan policy. The current dotlink tree now
+  declares standalone Process Task-result eligibility in the sealed plan and
+  derives the exact lease with shared `task_result_owner(id, 1)`. Native and
+  shell Graph plans remain Task-ineligible; non-Task dispositions release the
+  prospective lease only after terminal metadata fixes the retained prefix.
+- Hosted physical-delivery semantics still require positive POST delivery plus
+  replay commit; 404/expiry/ambiguous delivery does not ACK the inner request
+  key. A second D3 review found a real old-owner leak on namespace/execution-
+  authority rotation: outer replay state could become retired/uncertain while a
+  hidden durable shell request key still pinned the inner Job/spool. Dotlink now
+  records bounded shell-owner dependencies before dispatch and routes revoked
+  generations through its existing `RetireShell → retire_job_request_delivery`
+  queue. A real replacement-client regression proves the same execution is
+  exposed/released without rerun, while ordinary mutations remain `Uncertain`.
+- Optional `consumer_output_owner` leases remain intentionally unadopted because
+  dotlink currently has no distinct authenticated output-consumer audience beyond
+  canonical Job/model and native Task owners.
+- Final D3 audit adds direct proof that Busy old-owner retirement stays queued
+  until the active response attempt releases, then retires/exposes the same Job;
+  positive `Delivered` tombstones remain final under later authority revocation
+  even with a registered shell-owner dependency. Runtime replacement sequencing
+  was re-read end-to-end: old transports are cancelled/drained before a new
+  runtime/client is constructed, and cleanup failure blocks restart.
+- D4 independent review found one additional dotlink-host bug outside AW shared
+  semantics: a cached shell response whose live sandbox guard was revoked could
+  become generic uncertainty while hidden discard was Busy, allowing later
+  expiry to lose cleanup while the revoked request key remained. Dotlink now
+  carries guard revocation through the same bounded shell cleanup queue in an
+  explicit **discard** mode; Busy cleanup stays queued, revoked hidden work is
+  cancelled/discarded rather than exposed, and ordinary old-owner retirement
+  still exposes the same execution. A red regression fails before and passes
+  after the fix; no AW source change was required.
+- D4 all-feature host qualification is **684 passed / 1 ignored** in the binary
+  plus **36/36 integrations**; strict all-feature Clippy/fmt/diff/Alejandra pass.
+  Repo-wide dotlink Markdown is **0 issues across 76 files**. All Nix check
+  derivations are green using command-local verified SSH + an immutable Nix-store
+  CA bundle. The hermetic Nix test fixture now supplies pinned Bash explicitly and
+  passes **684/0/1 + 36/36 integrations** with a verified store output. Native full
+  Bubblewrap qualification is also **684/0/1 + 36/36**, and all seven targeted
+  GPU/KVM/device-security cases pass on a capable host. D1–D4 are complete.
+  Fresh post-repin Rust qualification on `beef1bc` is **684/0/1 + 36/36**,
+  strict all-feature Clippy/fmt/diff green.
 
 ## Repository state before this review
 
@@ -180,3 +342,64 @@ AW-tools review.
 ## 2026-11-17 AW–dotlink tools handoff update
 
 The newer, comprehensive **shared-toolset/Job-output** handoff is [AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md](AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md). It supersedes this dated file for the post-merge Job wait, owner/ACK, journal and dotlink migration state. Keep this file for its original AW merge review and broader Workspace context; live code/tests and the active owning plan take precedence.
+
+## 2026-11-18 current AW-tools revalidation
+
+- Revalidated current `HEAD == origin/main == beef1bc` and reviewed the
+  post-`0d2b4e3` shared changes through `be6d48d` and `26a8c78`, plus the
+  current dotlink D1–D4 consumer paths. The older 2026-11-16 “Still open” wait
+  bullets above are historical: settle-only `jobs_get` and byte/EOF-aware
+  finite `jobs_read` are implemented and qualified in the active Job-output
+  plan.
+- Two adjacent shared removal defects were found red/green: a locally terminal
+  Job with a still-live retained `OutputWriter` could be erased by
+  `discard_unexposed_terminal`, and automatic exposed-capacity pruning could
+  erase the same state when that live stream retained zero bytes. The published
+  `beef1bc` fix applies the same writer-quiescence invariant already used by
+  `expire_terminal` to both paths; after `OutputWriter::finish`, ordinary
+  hidden retirement/capacity reclamation proceeds.
+- `has_nonterminal_jobs()` now treats unfinished retained writers as live
+  runtime work because AW uses it to fence parallel-policy changes and Session
+  scope replacement. Execution terminality remains a separate factual state;
+  this does not alter `Snapshot::is_known_terminal()`.
+- Source change is signed/published in
+  `beef1bc2d2f37b5660ebe928d368bca37368e608`
+  (`Harden Job writer quiescence`). Preserve the existing dirty documentation
+  changes in this file and the Job-output TODO; nothing else is staged.
+- Final post-fix gate: `aw-tools` **341/341**, adapter **251/251**, Agent core
+  **90 passed / 1 ignored**, read-only shared **110/110**, minimal shared build,
+  strict affected-crate Clippy, `aw-mcp`, `aw-host`, `aw-cli --lib`, and
+  rustfmt all green.
+- Dotlink repin qualification on the exact Git dependency is also green:
+  all-feature binary **684 passed / 1 ignored**, integrations **36/36**,
+  locked all-target/all-feature check, strict Clippy, fmt and diff checks.
+
+## 2026-11-18 B6 Toolset cross-product checkpoint
+
+- Published dotlink `main` is now
+  `4f343c3183d427e036a6cb1a9cc42c8a4f2c2cb4`
+  (`Complete AW shared-tools convergence`). The current uncommitted B6 slice
+  is repinned to published AW
+  `7e6fe20a95640e32610819ce94b61a121e165dea`.
+- The current dotlink B6 slice consumes one shared immutable `Toolset` for
+  canonical filesystem, shell, batch and finite Job MCP descriptors.
+  Runtime Job defaults now come from one `DOTLINK_JOB_PROFILE` matching the
+  shared contract: tail 512/1024, waits 30 s, list max 256. Toolset does not
+  replace dotlink policy/sandbox/replay/transport authority.
+- Dotlink deliberately leaves `ReceiptProfile` disabled: no `ts` or
+  checkpoint metadata is added until a typed shared receipt can carry factual
+  status. Existing free-form MCP strings are not reparsed for presentation.
+- B6 review found one shared descriptor gap: `JobsList.limit` had the
+  configured maximum but not the runtime-universal `minimum=1`. Published
+  AW `7e6fe20` now projects that lower bound while preserving stricter host
+  minima; focused Toolset **12/12** and full
+  `aw-tools` **341/341** plus strict Clippy/fmt/diff are green.
+- Dotlink is repinned to `7e6fe20`; the local lower-bound shim is removed.
+  Shell/PowerShell/Batch and finite Job provider metadata use one shared
+  descriptor projection after host dynamic limits. Inspection, `list_tools`
+  and `get_tool` report the same shared canonical titles while product
+  descriptions/schema shapes remain unchanged.
+- Current dotlink validation is **685 passed / 1 ignored + 36/36 integrations**,
+  all-target/all-feature check, strict Clippy, fmt and diff green.
+- B6 is complete for the current product surfaces. Release/version/tag/deploy
+  remains separate.

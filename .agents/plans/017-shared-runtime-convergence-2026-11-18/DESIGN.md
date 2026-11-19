@@ -19,92 +19,113 @@ pub enum ProcessExit {
 Only a reaped/host-observed OS status may produce `Signal(n)`. A requested
 termination never invents a signal number.
 
-### 1.2 Cancellation origin
+### 1.2 Final host-facing stop vocabulary
 
-The parent/subagent audit found an explicit, observably distinct parent-cancel
-path, so freeze four portable origins:
+The committed P1 checkpoint `021b8ce` proved the important invariants with a
+transitional taxonomy. The final P1 refinement keeps only facts that change
+shared process semantics:
 
 ```rust
-pub enum CancellationOrigin {
-    Caller,
-    Parent,
-    Runtime,
-    Authority,
+pub enum StopReason {
+    Timeout,
+    Cancelled,
+    RuntimeError,
+}
+
+pub enum StopEvidence {
+    Stopped,
+    NoTarget,
+    Unknown,
+}
+
+pub struct StopRecord {
+    pub reason: Option<StopReason>,
+    pub evidence: StopEvidence,
 }
 ```
 
 Meaning:
 
-- `Caller`: explicit owner/user/model-facing control request;
-- `Parent`: a parent execution cancels a child/subagent execution;
-- `Runtime`: host shutdown, restart, runtime replacement or owner teardown;
-- `Authority`: grant/source/policy revocation or replacement.
+- `Some(reason)` answers **why the process was meant to stop**;
+- `None` means housekeeping with no semantic terminal cause;
+- `evidence` answers **what the platform actually proved happened**;
+- `NoTarget` is positive knowledge that there is no live containment target;
+- `Unknown` means the result cannot be established and the target may still be
+  alive.
 
-This type is factual metadata, not authority.
+`NoTarget` and `Unknown` remain distinct because they change Guard behavior:
+`NoTarget` disarms, while `Unknown` may keep the Guard armed for a fail-safe
+retry.
 
-### 1.3 Claimable process stop cause
+### 1.3 Rich provenance belongs in hooks, not canonical state
 
-Add:
+Caller/parent/runtime/authority provenance is useful context, but it does not
+change the process stop primitive. Likewise explicit cleanup and Drop fallback
+describe **how the attempt happened**, not **why the process should stop**.
 
-```rust
-pub enum ProcessStopCause {
-    Timeout,
-    Cancelled(CancellationOrigin),
-    Failed,
-}
+Do not encode those dimensions in `StopReason`. Higher layers may capture them
+through lifecycle hooks, logging context or product state when needed. This
+keeps the shared library small without preventing dotlink or AW orchestration
+from retaining richer diagnostics.
+
+If a future provenance fact changes shared correctness or Guard behavior,
+promote that fact deliberately then; do not predeclare speculative enum
+variants.
+
+A Guard retry must preserve the original semantic reason. For example, a
+Cancelled attempt that returns `Unknown` and later succeeds from Drop still
+records `Cancelled + Stopped`, not a synthetic `Dropped` reason.
+
+### 1.4 Terminal attribution rule
+
+`StopRecord::terminal_reason()` is intentionally tautological:
+
+```text
+Some(Timeout)      + Stopped  -> Timeout
+Some(Cancelled)    + Stopped  -> Cancelled
+Some(RuntimeError) + Stopped  -> RuntimeError
+
+None         + any evidence -> no terminal stop
+Some(reason) + NoTarget     -> no terminal stop
+Some(reason) + Unknown      -> no terminal stop
 ```
 
-This is a claim about why the runtime proved it stopped the waited command. It
-must never be populated from lifecycle status alone.
+Every `StopReason` is therefore a legitimate terminal attribution. There is no
+second claimability allowlist.
 
-### 1.4 Stop-attempt evidence
-
-Add separate types:
+Convenience constructors keep host code simple:
 
 ```rust
-pub enum StopAttemptReason {
-    Timeout,
-    Cancelled(CancellationOrigin),
-    Failed,
-    Cleanup,
-    Dropped,
-}
-
-pub enum StopOutcome {
-    Delivered,
-    AlreadyGone,
-    Failed,
-}
-
-pub struct StopAttempt {
-    pub reason: StopAttemptReason,
-    pub outcome: StopOutcome,
-}
+StopRecord::new(reason, evidence)
+StopRecord::stopped(reason)
+StopRecord::no_target(reason)
+StopRecord::unknown(reason)
+StopRecord::housekeeping(evidence)
 ```
 
-Rules:
+The obsolete `CancellationOrigin / StopOrigin / ProcessStopCause /
+StopAttemptReason / StopOutcome / StopAttempt` public names are removed.
+Cleanup and Drop are no longer stop reasons.
 
-- only `Delivered` can support a terminal `ProcessStopCause`;
-- `Cleanup` and `Dropped` never become a terminal cause;
-- `AlreadyGone` means desired end state but not a stop performed by us;
-- `Failed` means the stop is unproven and the guard remains armed where a
-  fail-safe retry is meaningful;
-- a later failure cannot relabel an earlier timeout/cancel stop.
+Executed final P1 gate: focused **5/5**; full `aw-tools --all-features --lib`
+**347/347**; strict all-target/all-feature Clippy; no-default-features check;
+downstream `aw-tools-adapter --all-features` check; rustfmt and
+`git diff --check` green.
 
 ### 1.5 ProcessTerminal
 
-Evolve the canonical terminal:
+Evolve the canonical terminal toward:
 
 ```rust
 pub struct ProcessTerminal {
     pub exit: ProcessExit,
-    pub stop: Option<ProcessStopCause>,
+    pub stop: Option<StopReason>,
     pub output: ProcessOutputMeta,
 }
 ```
 
-The terminal is the one canonical settled process-fact record retained by
-`JobManager`.
+`stop` is populated only from `StopRecord::terminal_reason()`. The terminal is
+the one canonical settled process-fact record retained by `JobManager`.
 
 Do not add product fields such as `stopped_by`, `signal_name` or prose.
 
@@ -116,42 +137,49 @@ AW currently has duplicate process-tree cleanup behavior across
 `aw-tools-adapter`, `aw-platform*` and dotlink. Consolidate the factual
 platform operation.
 
-The platform primitive should return a typed outcome rather than unit success:
+Keep the platform crates below `aw-tools`: they must not depend upward on
+`aw_tools::StopEvidence`. The low-level stop primitive therefore returns the
+zero-allocation factual shape `io::Result<bool>`:
 
 ```text
-Delivered
-AlreadyGone
-Failed
+Ok(true)  -> signal/termination reached a proven live target
+Ok(false) -> target was positively absent
+Err(_)    -> result is unknown
 ```
+
+`aw-tools-adapter` maps that losslessly and once to
+`StopEvidence::{Stopped,NoTarget,Unknown}`.
 
 Unix process-group semantics:
 
-- successful group signal => Delivered;
-- ESRCH => AlreadyGone;
-- other signal error => Failed.
+- successful group signal => `Ok(true)` => Stopped;
+- ESRCH => `Ok(false)` => NoTarget;
+- other signal error => `Err` => Unknown.
 
-Windows Job Object semantics must preserve v0.17.4's distinction:
+Windows Job Object semantics preserve v0.17.4's distinction:
 
 - query active processes when possible;
-- empty job => AlreadyGone;
-- successful termination with proven live membership => Delivered;
-- unprovable query/termination => Failed.
+- empty job => `Ok(false)` => NoTarget;
+- successful termination with proven live membership => `Ok(true)` => Stopped;
+- failed membership query or termination => `Err` => Unknown.
 
 Do not claim that an unsandboxed Unix process group contains descendants that
 escaped with `setsid`.
 
 ### 2.2 Adapter guard
 
-The std/async process adapter owns a small RAII guard around the platform
-primitive:
+The target platform owns the containment RAII guard; the std/async process
+adapter owns only semantic stop state around it:
 
-- active/disarmed state;
-- stop attempt reason supplied by caller;
-- typed `StopAttempt` result;
-- optional lifecycle-event emission;
-- Drop performs `Dropped` fail-safe when still armed;
-- failed stop remains armed for Drop retry;
-- cleanup of an already-ended command records `Cleanup`, never terminal cause.
+- platform guard owns active/disarmed state and the final fail-safe termination;
+- adapter maps platform evidence into `StopEvidence`;
+- adapter retains a semantic `StopReason` only across an Unknown retry;
+- housekeeping uses no reason;
+- typed `StopRecord` is produced at each adapter stop boundary;
+- Drop retry preserves the original semantic reason rather than inventing a
+  Drop reason;
+- NoTarget and Stopped disarm; Unknown remains armed for retry;
+- cleanup of an already-ended command uses `StopRecord::housekeeping(...)`.
 
 Dotlink should consume this primitive rather than permanently keep a separate
 semantic guard. Dotlink may still have a thin wrapper for its launcher/Bubblewrap
@@ -165,15 +193,17 @@ Add a separate host-neutral execution event:
 
 ```rust
 pub enum ExecutionLifecycleEvent {
-    ProcessStopAttempt {
-        attempt: StopAttempt,
+    ProcessStop {
+        record: StopRecord,
     },
 }
 ```
 
-The event sink should be optional and zero-cost/no-op when absent.
+The event sink is optional and no-op when absent. `PipeProcess` stores only an
+`Option<Arc<dyn ExecutionEventSink>>`; existing constructors install no sink,
+while explicit event-aware constructors opt in.
 
-Possible std-side trait shape:
+Implemented std-side trait:
 
 ```rust
 pub trait ExecutionEventSink: Send + Sync {
@@ -181,13 +211,21 @@ pub trait ExecutionEventSink: Send + Sync {
 }
 ```
 
-The pure core owns event values, not logging.
+The pure core owns event values, not logging. The canonical event stays small;
+a host/adapter observer may capture caller/parent/runtime/authority provenance,
+explicit-vs-Drop path, Job identity or product policy in its surrounding
+context. Do not add a generic metadata bag or speculative provenance enum to
+`StopRecord` merely for diagnostics.
+
+A normal/external process exit may still produce a reason-less housekeeping
+`ProcessStop` when the RAII guard checks/cleans descendants. Consumers must not
+turn `record.reason=None` into a semantic stop claim.
 
 Dotlink sink mapping:
 
 ```text
-ProcessStopAttempt
-  -> LOG job stop id=<ref> reason=<...> outcome=<...>
+ProcessStop { record }
+  -> LOG job stop id=<ref> reason=<product context> outcome=<evidence>
 ```
 
 The exact `LOG` string, stderr/journald destination and quiet-mode policy stay
@@ -208,20 +246,25 @@ Existing Job lifecycle:
 - Terminal;
 - StopReason::Cancelled / Revoked.
 
-Do not mechanically replace `StopReason` with process stop cause. A Job can be
-cancelled/revoked even when no OS process stop is provable.
+Do not mechanically replace the existing Job lifecycle `job::StopReason` with
+`execution_stop::StopReason`. A Job can be cancelled/revoked even when no OS
+process stop is provable.
 
-Audit cancellation call sites and carry `CancellationOrigin` where it affects
-process termination. Avoid widening immutable journal semantics unless origin is
-actually needed for replay/correctness.
+Audit cancellation call sites and map process termination to the minimal
+`execution_stop::StopReason`. Retain caller/parent/runtime/authority provenance
+only in the higher layer that actually needs it; avoid widening immutable
+journal semantics or canonical process state for diagnostics alone.
 
-`JobManager::ProcessSettlement` continues to carry `ProcessTerminal`, so
-adding `terminal.stop` automatically makes the canonical manager the owner of
-settled stop facts.
+`JobManager::ProcessSettlement` continues to carry `ProcessTerminal`; the
+canonical terminal now contains orthogonal `exit` and `stop` facts. A proven
+runtime stop can therefore retain both the actual reaped signal/code and the
+semantic stop reason. `ProcessTerminal::status()` treats complete proven stops
+as Fail even if physical exit is otherwise unknown; incomplete output remains
+Unknown.
 
-Compact shared status/receipt rendering may include a terse stop token only if
-it remains bounded and factual. Product-specific `stopped_by=shutdown` stays
-outside core rendering.
+Compact shared status/receipt rendering includes only the bounded factual
+`stop=timeout|cancelled|runtime_error` token. Product-specific
+`stopped_by=shutdown` stays outside core rendering.
 
 ## 5. Task terminal/failure detail
 
@@ -233,44 +276,40 @@ process state.
 
 ### Shared design
 
-Add optional typed terminal detail to the host Task projection.
-
-Candidate shape:
+Keep Task failure detail smaller than the full process terminal:
 
 ```rust
 pub struct TaskTerminalDetail {
-    pub process: Option<ProcessTerminal>,
-    pub prior_disposition: Option<TaskDisposition>,
+    pub exit: ProcessExit,
+    pub stop: Option<StopReason>,
+}
+
+pub struct TaskInfo {
+    // existing identity/generation/state fields
+    pub terminal: Option<TaskTerminalDetail>,
 }
 ```
 
-The exact final shape should reuse existing Task/Job state without duplicating
-strings.
+The full `ProcessTerminal`, including output metadata, remains canonically
+retained by JobManager. Task projection carries only the physical exit and
+semantic stop facts that error projection needs. This avoided inflating the hot
+`TaskReply` enum or adding heap allocation merely to expose failure detail.
 
-Requirements:
+A later spool/result/projection failure may make Task disposition Uncertain
+while `TaskTerminalDetail` still preserves an earlier factual signal and
+`stop=Timeout`. That removes the need for a separate `prior_disposition` field:
+the actual deadline fact already lives in the process stop reason.
 
-- a spool/internal/projection failure after process settlement retains the
-  already observed process terminal;
-- a failure after an actual deadline can retain the prior timed-out
-  disposition;
-- successful Tasks pay no extra allocation;
-- consumers that do not expose process Tasks can leave detail absent;
-- bounded error text remains separate from typed factual detail.
+Consumers that do not expose process Tasks leave detail absent. Bounded error
+text remains separate from typed facts; there is no generic metadata/JSON bag.
 
-Extend `TaskInfo` / relevant host Task projection only where needed. Do not
-turn Task detail into a generic unbounded JSON bag.
-
-`aw-mcp` maps this typed detail to MCP error `data`.
+`aw-mcp` can project this typed detail into MCP error `data` in its owning phase.
 
 ## 6. Flat Job/Node references and bounded diagnostics
 
 ### 6.1 Typed flat reference
 
-Dotlink's flat Jobs surface uses `j:<handle>[/n:<coordinate>]`. Add a shared
-bounded type backed by existing `execution_ref::Handle` and
-`NodeCoordinate`.
-
-Candidate:
+P5 adds the shared finite-Job surface type:
 
 ```rust
 pub struct JobRef {
@@ -279,81 +318,136 @@ pub struct JobRef {
 }
 ```
 
-It owns parse/render for the flat surface.
+Its only accepted/rendered grammar is:
 
-Transport strings are parsed once. Internal Job operations should consume typed
-bounded identity where practical.
+```text
+j:<handle>
+j:<handle>/n:<positive-canonical-coordinate>
+```
+
+It reuses the existing bounded `Handle` and `NodeCoordinate` primitives and
+has an independent maximum large enough for exactly the maximal legal flat
+form. Empty handles, extra segments, leading-zero nodes, zero nodes,
+hierarchical prefixes and oversized refs fail before Job lookup.
+
+The architectural boundary is deliberate:
+
+- hierarchical `ExecutionRef` remains the ownership, Agent-routing and event
+  identity;
+- finite model/product Job surfaces render `JobRef`;
+- the adapter accepts prior hierarchical finite refs as compatibility input,
+  resolves them once, then emits only the flat typed form;
+- Agent-owned refs keep their richer hierarchical identity.
+
+This avoids flattening AW's internal ownership model merely to match the compact
+Jobs transport surface.
 
 ### 6.2 Bounded diagnostics
 
-Retain a shared bounded diagnostic helper as defense in depth even after typed
-parsing. User-controlled raw strings must never reach an unbounded `Display`.
+P5 adds one shared 16 KiB UTF-8-safe `bounded_diagnostic` helper. It is
+defense in depth, not a substitute for typed parsing. Existing Task diagnostic
+bounding now reuses the same helper instead of carrying a second truncation
+algorithm.
 
-Dotlink's `74820ff` then becomes mostly a consumer cleanup rather than a
-separate semantic fix.
+Huge or malformed finite Job refs are rejected by `JobRef::parse` before they
+can enter receipts. Product/transport layers may still apply the shared
+diagnostic helper to unrelated caller-controlled error prose.
+
+Dotlink's `74820ff` therefore becomes consumer cleanup plus a transport-boundary
+backstop rather than a separate semantic implementation.
 
 ## 7. Shared Job receipt grammar
 
-Current shared receipt support:
+P5 completes the shared finite-Job receipt grammar:
 
-- JobStatus;
-- NodeStatus;
-- Ack(Finish/Through).
+- `JobStatus`;
+- `NodeStatus`;
+- `Handoff`;
+- `Cancel`;
+- `Ack(Finish/Through)`.
 
-Extend it so dotlink does not own a second control/handoff grammar.
+Every Job receipt now receives a typed `&JobRef`, never an arbitrary string.
+Malformed refs therefore cannot be injected at render time.
 
-Add typed variants or equivalent constructors for:
+`render_handoff(...)` first attempts the richer factual `JobStatus` with
+`next=jobs_get|jobs_read no-rerun`. If and only if that fails because of the
+current result budget, it falls back to:
 
-- durable Job handoff/continuation;
-- cancellation accepted/applied;
-- ACK/Finish outcome;
-- effect-applied-but-full-status-did-not-fit fallback.
+```text
+j:<handle> rev=<revision> next=jobs_get|jobs_read no-rerun
+```
 
-Requirements:
+The fallback names the exact same durable Job and never changes or repeats the
+underlying effect. If even that factual minimum cannot fit, rendering returns
+`ResultLimit`.
 
-- every receipt is built from trusted typed facts;
-- no execution occurs during rendering;
-- no raw tool arguments;
-- whole factual receipt fits or returns `ResultLimit`;
-- continuation always names the same durable Job and says no-rerun;
-- replay projection may become more compact under a narrower envelope but never
-  changes the underlying effect/result.
+Cancellation has an idempotent typed receipt:
 
-Exact model wording can remain configurable where product wording genuinely
-differs, but the durable semantics and bounded structure stay shared.
+```text
+j:<handle> rev=<revision> cancel=accepted
+j:<handle> rev=<revision> cancel=unchanged
+```
+
+ACK continues to distinguish `Finish` from `Through(offset)`, but finite
+adapter surfaces now render it through the shared receipt rather than local
+strings.
+
+Rendering remains pure: no execution, raw arguments, owner delivery, clocks or
+product-specific prose occur in `receipt.rs`. Replay may choose the smaller
+handoff projection under a narrower envelope, but Job identity/effect/result
+remain unchanged.
 
 ## 8. Page budget vs serialized response budget
 
-Introduce zero-cost distinct budget types so code cannot accidentally reuse one
-as the other.
-
-Candidate:
+P4 implements two zero-cost, non-zero, `repr(transparent)` budget types so
+code cannot accidentally reuse one boundary as the other:
 
 ```rust
-pub struct RawPageBytes(usize);
-pub struct SerializedResultBytes(usize);
+pub struct RawPageBytes(NonZeroUsize);
+pub struct SerializedResultBytes(NonZeroUsize);
 ```
 
-Responsibilities:
+Responsibilities are now explicit.
 
 `aw-tools`:
 
-- resolve omitted/requested raw page against `JobProfile`;
-- preserve raw offsets and page semantics.
+- `JobProfile::resolve_read_page(...)` resolves omitted/requested retained
+  payload size to `RawPageBytes`;
+- a one-byte raw page is valid even though a model/tool response requires a
+  larger factual envelope;
+- raw retained offsets, EOF and ownership/delivery semantics never depend on
+  serialized response size.
+
+`aw-tools-adapter`:
+
+- `jobs_read` resolves raw page size only through `JobProfile`;
+- separately captures the authenticated invocation result ceiling as
+  `SerializedResultBytes`;
+- a narrower serialized ceiling may fit/project fewer bytes from an already
+  read raw page, but does not mutate that raw page, its retained length or its
+  continuation semantics;
+- only the raw prefix actually included in the fully validated response becomes
+  delivery credit.
 
 `aw-mcp`:
 
-- own serialized `CallToolResult` envelope ceiling;
-- reserve protocol/receipt overhead;
-- fit only within authenticated/host result ceiling.
+- owns the serialized `CallToolResult` ceiling and validates complete MCP
+  payloads against `SerializedResultBytes`;
+- P6 still owns the richer generic complete-result fitter, metadata reservation
+  and receipt decoration. P4 does not pull that work forward.
 
-Invariant:
+Executed invariant:
 
 ```text
+JobProfile raw max = 1
 jobs_read(limit=1)
-=> raw page <= 1 byte
-=> serialized response may use the full transport/host envelope
+=> exactly one retained byte consumed/credited
+=> continuation offset advances by exactly 1
+=> the serialized response uses the ordinary authenticated envelope
 ```
+
+A separate regression proves a tighter serialized envelope may return a smaller
+projection while the source `OutputPage` remains byte-for-byte unchanged.
 
 This is the shared form of dotlink v0.17.4 `06d5548`.
 
@@ -361,52 +455,140 @@ This is the shared form of dotlink v0.17.4 `06d5548`.
 
 ### 9.1 Preserve result metadata
 
-AW MCP result boundaries must retain bounded MCP result `_meta`, not only
-content/structured/error.
+P6 extends the public raw `McpToolResult` boundary with bounded result-level
+`MetaObject`. Whole result `_meta` is capped at 16 KiB; per-content-block
+metadata remains independently bounded by the existing 16 KiB metadata-overhead
+rule. The text-only Agent projection still refuses typed media rather than
+flattening it, while explicit raw MCP consumers retain result metadata.
+
+`SerializedResultBytes` now means the actual serialized `CallToolResult`
+size, including framing, content metadata, structured content and result
+`_meta`; it is no longer approximated from payload bytes.
 
 ### 9.2 Shared receipt decorator
 
-Move the generic logic currently in dotlink into `aw-mcp`:
+P6 adds these public `aw-mcp` receipt helpers:
 
-- inspect Toolset ReceiptProfile;
-- accept host-supplied/stored timestamp;
-- store namespaced receipt metadata;
-- add visible timestamp content only when needed;
-- do not duplicate an existing compact typed receipt timestamp;
-- preserve raw text, structured JSON and typed media payload identity.
+```text
+stored_receipt_timestamp(...)
+has_visible_receipt_timestamp(...)
+set_stored_receipt_timestamp(...)
+decorate_and_fit_complete_result(...)
+```
 
-The core still owns no wall clock. Host decides fresh observation vs immutable
-replay timestamp.
+The namespaced metadata key is `io.abird/receipt`.
+
+The decorator:
+
+- inspects the shared `Toolset::ReceiptProfile`;
+- accepts a host-supplied timestamp but first checks stored result metadata;
+- treats an existing stored `io.abird/receipt.ts` as immutable replay state,
+  so it wins over a fresh host observation timestamp;
+- merges the timestamp into existing bounded result metadata without deleting
+  unrelated keys;
+- adds a visible `ts=<unix>` sidecar only if the typed receipt/result does not
+  already carry that exact line;
+- reserves the exact serialized sidecar cost before fitting, making receipt
+  metadata atomic with the response;
+- requires the host timestamp only for a fresh selected operation.
+
+Neither `aw-tools` nor `aw-mcp` reads the wall clock. The host chooses the
+fresh observation timestamp; replayed results retain their stored timestamp.
 
 ### 9.3 Serialized result fitter
 
-Move generic complete-`CallToolResult` fitting into `aw-mcp`:
+P6 implements public `fit_complete_result(...)` in `aw-mcp`.
 
-- preserve `_meta`;
-- preserve `is_error`;
-- do not corrupt typed media/structured content;
-- reserve receipt overhead atomically;
-- return an explicit fit error when even the minimal factual envelope cannot
-  fit.
+The fitter preserves, byte/shape-for-byte where applicable:
 
-Dotlink should stop maintaining its own generic MCP result fitter.
+- result `_meta`;
+- `result_type`;
+- `is_error`;
+- content-block order;
+- per-block metadata/annotations;
+- typed image/audio/resource/resource-link blocks;
+- structured JSON.
+
+Only text payload bytes are shrinkable, on a UTF-8 character boundary, with a
+bounded generic truncation marker. If immutable typed/structured facts plus the
+minimal marker cannot fit, the fitter returns an explicit `Limit` error.
+
+This is intentionally stricter than dotlink's current generic fallback, which
+can replace an oversized typed result with text. Dotlink should consume the
+shared fitter and delete that semantics-changing local fallback after parity.
 
 ## 10. MCP progress/heartbeat
 
-The semantic filesystem progress type remains transport-independent.
+The semantic filesystem progress type remains transport-independent. P7 adds a
+transport adapter in `aw-mcp` without enabling rmcp's server feature in the
+shared crate. Dotlink/other server hosts supply their request peer as a send
+closure.
 
-Add an MCP adapter utility in `aw-mcp` for long waits that have no meaningful
-total:
+Implemented heartbeat surface:
 
-- active only when a progress token exists;
-- monotonic tick counter;
-- bounded per-tick send deadline;
-- progress delivery never delays the underlying operation;
-- attempted/delivered counts available to an optional host observer;
-- no detached queue/task;
-- final result, not progress, owns completion.
+```rust
+ProgressHeartbeatConfig { interval, send_budget }
+ProgressHeartbeat::new(...)
+ProgressHeartbeat::from_token(...)
+ProgressHeartbeatSummary { attempted, delivered }
+ProgressHeartbeatObserver::completed(...)
+await_with_progress_heartbeat(...)
+```
 
-Dotlink supplies peer/request context and optional logging observer.
+Defaults preserve the reviewed product behavior:
+
+```text
+heartbeat interval = 10 s
+per-send budget    = 100 ms
+```
+
+Both are host-tunable positive durations.
+
+Heartbeat semantics:
+
+- no progress token => no `ProgressHeartbeat`; awaiting is exactly the
+  underlying future and the sender is never polled;
+- tick values are monotonic `1, 2, 3, ...`;
+- heartbeat notifications always have `total=None` and `message=None`; AW
+  never invents a completion percentage;
+- numeric ticks stop before they can lose integer monotonicity in MCP's f64
+  representation;
+- every delivery gets an independent deadline
+  `min(now + send_budget, operation_send_deadline)`;
+- if the operation's send deadline is already expired, the transport sender is
+  not polled;
+- while a notification send is pending, the underlying operation remains in
+  the same biased `select!` and can complete immediately. Progress
+  backpressure therefore cannot add even the per-send budget to operation
+  completion latency;
+- no queue or detached Tokio task is created;
+- after the wrapper returns, no later heartbeat is possible;
+- the final operation result alone owns completion; heartbeats never publish a
+  synthetic final/100% notification.
+
+The optional observer receives only `{attempted, delivered}`. A small RAII
+guard reports the summary on normal completion *and* if the heartbeat wrapper
+is itself cancelled/dropped. Product tool names/log destinations stay outside
+the shared API.
+
+P7 also integrates real semantic progress through:
+
+```rust
+semantic_progress_notification(...)
+notify_semantic_progress_bounded(...)
+```
+
+These map the existing `aw_tools::filesystem::progress::End::{Known,Unknown}`
+onto MCP without coupling the semantic type to rmcp. Known totals are validated,
+unknown totals stay absent, the existing 64-byte/control-free phase/message
+contract is retained, and counters must remain exactly representable by MCP's
+numeric field. Real semantic notifications use the same independently bounded
+delivery rule as heartbeats.
+
+Dotlink should obtain the request progress token from its rmcp
+`RequestContext`, build `ProgressHeartbeat::from_token(...)`, and pass a
+closure around `peer.notify_progress(...)`. Its logging layer implements the
+optional observer.
 
 ## 11. Signal naming
 
@@ -426,15 +608,16 @@ AW semantic state stores only the number. Product prose remains product-owned.
 Final dotlink v0.17.4 wire mapping:
 
 ```text
-ProcessExit::Signal(n)          -> signal: n
-ProcessStopCause::Timeout      -> stopped_by: "timeout"
-Cancelled(Caller|Parent)       -> stopped_by: "cancel"
-Cancelled(Runtime|Authority)   -> stopped_by: "shutdown"
-ProcessStopCause::Failed       -> stopped_by: "failed"
+ProcessExit::Signal(n)                 -> signal: n
+StopReason::Timeout + Stopped         -> stopped_by: "timeout"
+StopReason::Cancelled + Stopped       -> stopped_by: "cancel" or "shutdown"
+StopReason::RuntimeError + Stopped    -> stopped_by: "failed"
 ```
 
-No `stopped_by` when stop outcome was AlreadyGone/Failed or only
-Cleanup/Dropped evidence exists.
+The shared `Cancelled` value deliberately does not choose dotlink's `cancel` vs
+`shutdown` wording. Dotlink retains that product context at the stop boundary
+through its higher-layer state/observer. No `stopped_by` is produced for
+`NoTarget`, `Unknown`, or housekeeping with `reason=None`.
 
 Dotlink's outside-signal prose and signal-name wording remain its responsibility.
 

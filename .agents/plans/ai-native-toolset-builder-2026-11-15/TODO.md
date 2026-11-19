@@ -11,20 +11,26 @@ Review base before the signed follow-up: `7d09d5f`.
   `main`. The historical checkpoint sections below intentionally retain their
   pre-merge wording as provenance; they are not evidence that those slices are
   still uncommitted.
-- [x] `be6d48db552fd44b9dd85364cd8734454109ce68`: signed local follow-up keeps the
+- [x] `be6d48db552fd44b9dd85364cd8734454109ce68`: published signed follow-up keeps the
   shared Toolset/receipt contract aligned with the hardened Job runtime
   (`journal_unknown` typed facts and async watch support). It adds no second
-  builder/authority surface. This SHA is not yet pushed or consumable by
-  dotlink.
+  builder/authority surface. Dotlink subsequently consumed the strict shared
+  follow-up `26a8c788d6dc7e0a7fe16995f8057fb332440978`.
 
 ## Open
 
-- [ ] B6. Targeted qualification and exact implementation handoff; then revisit AW/dotlink-specific public options and compact receipt grammar before dotlink cutover.
-- [ ] Product-specific receipt/timestamp/turn-horizon defaults and MCP metadata
-  adoption remain host decisions; the shared renderer must stay clock-free and
-  authority-free.
-- [ ] Job observation waits remain owned by the Job output/grep plan:
-  `jobs_get` settlement-only event wait and finite `jobs_read` byte/EOF wait.
+- [x] B6. Cross-product public defaults/metadata adoption is complete on the
+  current dotlink worktree against published AW `7e6fe20`: canonical
+  filesystem, shell, batch and finite Job MCP metadata share one Toolset
+  projection; runtime authority remains product-owned.
+- [x] Product-specific receipt/timestamp/turn-horizon behavior is now an
+  explicit host decision: dotlink keeps shared receipt timestamps/checkpoint
+  guidance **disabled** until it has a typed shared receipt projection. Do not
+  parse/decorate its existing free-form MCP result text. The shared renderer
+  remains clock-free and authority-free.
+- [x] Job observation semantics remain owned by the Job output/grep plan and are
+  now implemented there: settle-only event-driven `jobs_get` plus byte/EOF-aware
+  finite `jobs_read`, with journal-unknown observation fences.
 
 ## Working checkpoint — 2026-11-15 (uncommitted)
 
@@ -107,7 +113,49 @@ Review base before the signed follow-up: `7d09d5f`.
   read-only Toolset **9/9**, minimal `aw-tools`, strict affected-crate
   all-target/all-feature Clippy, rustfmt, plus downstream `aw-mcp`,
   `aw-host` and `aw-cli --lib` checks.
-- [ ] B6 still owns cross-product product defaults and dotlink adoption. In
-  particular, define/document product-neutral shared grep hard maxima before a
-  consumer intentionally configures work budgets above AW's default ceilings;
-  do not invent those caps in an AW-only review.
+- [x] B6 cross-product adoption checkpoint below is complete for the current
+  product surfaces.
+  Product-neutral grep work hard maxima still need design only if a consumer
+  intentionally configures budgets above the current shared defaults; dotlink
+  does not, so this checkpoint does not invent wider ceilings.
+
+## B6 cross-product Toolset adoption — 2026-11-18
+
+- [x] **Dotlink-selected shared profile:** one immutable shared `Toolset` now
+  projects its canonical filesystem MCP title/description/argument metadata and
+  the six finite Job-control descriptors. Dotlink keeps its own policy,
+  transport, sandbox, replay and execution authority; Toolset remains
+  presentation/limit configuration only.
+- [x] **One Job default source:** dotlink's runtime and Toolset consume one
+  `DOTLINK_JOB_PROFILE`: combined Process tail **512 default / 1024 max**,
+  `jobs_get` / `jobs_read` wait ceiling **30 s**, and list page maximum
+  **256**. Grep remains shared default context **0**, hard context **128** and
+  existing shared `GrepLimits::default()`; no wider work budget is requested.
+- [x] **Receipt decision:** dotlink explicitly builds `ReceiptProfile::default()`
+  (`unix_ts=false`, no checkpoint horizon). Its current status/control strings
+  are not parsed back into shared typed receipts merely to add `ts`; future
+  timestamp/checkpoint adoption requires a typed factual projection.
+- [x] **Metadata/conformance boundary:** the dotlink differential gate still
+  compares the complete structural schema to linked `aw-tools`, stripping only
+  `description` fields because B6 intentionally adds shared documentation.
+  A separate projection regression requires exact shared titles, descriptions
+  and annotation titles.
+- [x] **Shared defect found red/green:** `Toolset::describe_operation(JobsList)`
+  applied the configured page maximum but omitted the universal runtime
+  `minimum=1`. Published AW `7e6fe20a95640e32610819ce94b61a121e165dea`
+  adds a shared lower-bound projection that preserves any stricter host
+  minimum. Focused Toolset **12/12**, full
+  `aw-tools` **341/341**, strict all-target/all-feature Clippy, fmt and diff
+  checks are green.
+- [x] **Dotlink repin + metadata completion:** all three shared dependencies and
+  lock records now use published AW `7e6fe20`; the temporary local
+  `jobs_list minimum=1` shim is removed. One generic shared metadata
+  projection now covers shell, batch and finite Jobs after host dynamic limits,
+  so `list_tools`, `get_tool` and inspection agree on canonical titles while
+  preserving dotlink descriptions/schema shape. Current dotlink binary
+  **685 passed / 1 ignored**, integrations **36/36**, locked all-target/all-
+  feature check, strict Clippy, fmt and diff checks are green.
+- [x] **B6 scoped decision complete:** shell/batch consume shared canonical
+  metadata; dotlink keeps `ReceiptProfile::default()`; no wider grep work
+  ceiling is requested. No version/tag/release action belongs to this B6
+  checkpoint.

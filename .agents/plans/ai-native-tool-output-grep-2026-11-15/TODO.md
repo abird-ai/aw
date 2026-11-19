@@ -22,6 +22,10 @@ Review base before the signed follow-up: `7d09d5f`.
 - [x] `26a8c788d6dc7e0a7fe16995f8057fb332440978` — signed D1 shared follow-up
   fixing strict delivered-ACK replay after independent owner compaction while
   preserving the prohibition on new ACK advances into compacted-away bytes.
+- [x] `beef1bc2d2f37b5660ebe928d368bca37368e608` — signed/published
+  writer-quiescence follow-up. Hidden terminal retirement, automatic capacity
+  reclamation and runtime live-work reporting now refuse to cross an unfinished
+  retained output writer.
 
 ## Current status
 
@@ -39,11 +43,27 @@ Review base before the signed follow-up: `7d09d5f`.
     the merged checkpoints below.
 - [x] E. Shared grep symmetric/asymmetric context up to 128 in schema/request/search, exact file/dir, output budgets and direct/Graph conformance.
 - [x] F. Catalog/description limits and unified tests for shared direct/Graph surface; no new generic registry or hidden model-facing `jobs_*` leaves.
-- [~] G. The reviewed shared checkpoints `be6d48d` and strict-ACK follow-up
-  `26a8c78` are published; the current uncommitted dotlink D1 worktree consumes
-  `26a8c78`. Shared read delivery proof, Through-ACK and omitted-offset Finish
-  are qualified there with no duplicate shared watermark. Remaining D1 is
-  aggregate `jobs_get.tail`; D2–D4 remain separate.
+- [x] G. The reviewed shared checkpoints `be6d48d`, `26a8c78`, and
+  writer-quiescence follow-up `beef1bc` are published; the current uncommitted
+  dotlink tree consumes `beef1bc`. D1 shared output and D2 grep convergence are complete there. The
+  first D3 owner-policy checkpoint also removed dotlink's private native-Task
+  output-owner hash: standalone shell planning now declares
+  `task_result_eligible=true` and uses shared `task_result_owner(id,1)`, while
+  Graph plans remain Task-ineligible. Dotlink D3 also now retires old durable
+  shell request owners when the hosted namespace/execution authority changes,
+  using its existing bounded retirement queue; ordinary mutations stay
+  fail-closed without shell retirement. Final D3 audit proves Busy retirement
+  retry, positive-delivery monotonicity under late revocation, and serialized
+  runtime replacement/cleanup failure blocking. Optional shared consumer leases
+  remain unadopted because no distinct authenticated output audience exists.
+  Dotlink D1–D3 are complete. D4 independent security review is also complete:
+  one host-only stale-guard Busy-discard leak was fixed by carrying guard
+  revocation through dotlink's bounded cleanup queue in discard mode; no AW
+  source change was needed. Host all-feature tests/lint are green. Dotlink
+  repo-wide Markdown and all Nix check derivations are green; the hermetic Nix
+  test fixture supplies pinned Bash explicitly. Native full Bubblewrap plus all
+  seven targeted GPU/KVM/device-security cases are green. Dotlink D1–D4 are
+  complete; only separately authorized publication/signing/release actions remain.
 
 ## Working checkpoint — 2026-11-15 (uncommitted)
 
@@ -247,3 +267,50 @@ Review base before the signed follow-up: `7d09d5f`.
 - [x] Review identified the old 10 ms `jobs_get` revision polling and
   rejection of positive `jobs_read.wait_ms`. Resolved by the uncommitted
   event-driven checkpoint below; this is no longer an open semantic gap.
+
+## Post-adoption AW merge review — 2026-11-17
+
+- [x] Revalidated current published AW `a05d5c8` plus the shared pins
+  `be6d48d` / `26a8c78` against the live JobManager, AW adapter and the
+  current dotlink consumer. Event-driven finite waits, journal-unknown
+  publication/retention fences, strict delivered-ACK replay after compaction,
+  Task-owner eligibility and direct/Graph shared boundaries remain coherent.
+- [x] Fresh current-HEAD baseline before this review: `aw-tools` **339/339**,
+  `aw-tools-adapter` **251/251**, Agent core **90 passed / 1 ignored**,
+  read-only shared **110/110**, minimal shared build, strict affected-crate
+  all-target/all-feature Clippy, `aw-mcp`, `aw-host`, `aw-cli --lib` and
+  rustfmt all green.
+- [x] **New shared lifecycle defects reproduced red/green:** a Job could be
+  locally terminal while an attached retained `OutputWriter` was still live.
+  Both `discard_unexposed_terminal` and automatic exposed-capacity pruning
+  could then remove its manager namespace (the latter when the live stream still
+  retained zero bytes). That differed from `expire_terminal` and could leave a
+  live writer capability detached from its Job record. Hidden retirement and
+  automatic reclamation now both require every attached writer to be finished.
+  Each focused regression fails on the prior code and passes after the
+  shared-manager fix.
+- [x] The fixes stay in canonical `aw-tools`; no AW/dotlink adapter special
+  case, new owner ledger, scheduler, replay rule or public schema is added.
+  Normal AW and dotlink settlement order already quiesces writers first, so the
+  change is a fail-closed invariant for out-of-order/future hosts. Explicit
+  retention expiry, automatic capacity pruning and optimistic hidden retirement
+  now agree on writer quiescence.
+- [x] The same writer-lifetime fact now participates in
+  `has_nonterminal_jobs()`, because that predicate gates AW parallel-policy
+  changes and Session scope replacement. A known terminal execution may still
+  drain output, but the runtime remains live until its retained writers finish;
+  this does not redefine `Snapshot::is_known_terminal()`.
+- [x] Ready replay records intentionally remain fail-closed if a successful
+  inline hidden Job is retired: a duplicate with no retained runtime Job becomes
+  `Unknown`, never a redispatch. Task binding likewise is not itself a second
+  retained-output lease; only explicitly attached/enrolled owners pin output.
+- [x] **Final post-fix qualification:** `aw-tools --all-features --lib`
+  **341/341**, `aw-tools-adapter --all-features --lib` **251/251**, Agent core
+  **90 passed / 1 ignored**, read-only shared **110/110**, minimal
+  `aw-tools --no-default-features`, strict affected-crate
+  all-target/all-feature Clippy with `-D warnings`, `aw-mcp`, `aw-host`,
+  `aw-cli --lib`, and rustfmt all green.
+- [x] `beef1bc` is published on AW `main`; dotlink repinned all three shared
+  dependencies/lock entries to that exact SHA and requalified its current D1–D4
+  tree: all-feature binary **684 passed / 1 ignored**, integrations **36/36**,
+  locked all-target/all-feature check, strict Clippy, fmt and diff checks green.
