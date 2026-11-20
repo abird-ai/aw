@@ -175,17 +175,17 @@ Historical v0.17.4 baseline remains `fd1cdb6429a341a4e3d27805cae0bec288fc26df`.
       the Windows Rust std target is unavailable.
 - [x] Initial signed P1-P8 implementation checkpoint exists at `eb325b31` and
       docs checkpoint at `61ed065d` per explicit user authorization.
-- [x] Fresh-review implementation checkpoint `7c7de6c9...` plus downstream
-      dependency-range follow-up `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`;
-      the latter is the final dependency pin and supersedes `eb325b31`/`7c7de6c9`.
-- [x] Publish final AW implementation pin
-      `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; docs/main are published
-      through `4234447612421069a746c925c76a25e3ba27774a` and remote reachability
-      was verified.
-- [x] Dotlink companion repin completed atomically: direct `aw-tools`,
-      `aw-tools-fs-unix`, `aw-tools-fs-win`, `aw-platform`,
-      `aw-mcp-protocol` plus every transitive AW Git lock entry resolve to
-      `1a5d0f65...`, with no registry package/version churn and no path override.
+- [x] Historical fresh-review checkpoint `7c7de6c9...` and dependency-range
+      follow-up `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59` are superseded by the
+      final v36/shared-process source pin below.
+- [x] Publish final AW v36/shared-process implementation pin
+      `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`; remote `main` reachability was
+      verified before dotlink repin.
+- [x] Dotlink companion repin completed atomically in signed source
+      `648519add3d174b9e13de81aeca62431591dac6d`: direct `aw-tools`,
+      `aw-tools-fs-unix`, `aw-tools-fs-win`, `aw-platform`, `aw-mcp-protocol`
+      plus every transitive AW Git lock entry resolve to `b8a46a94...`, with no
+      registry package/version churn and no path override.
       Historical publish/repin mechanics remain recorded in
       [PUBLISH-REPIN-PREFLIGHT.md](PUBLISH-REPIN-PREFLIGHT.md).
 
@@ -193,13 +193,13 @@ Historical v0.17.4 baseline remains `fd1cdb6429a341a4e3d27805cae0bec288fc26df`.
 
 Owned by dotlink companion plan.
 
-Current sequencing: the original P9 thin-consumer convergence is complete.
-Dotlink still consumes published AW
-`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; current local dotlink HEAD is
-`20b6f045f79fa7725f286e05b40e9262b1c9e4d3`, four commits ahead of
-`origin/main = 4c3b96fd5ba9e6772bc159f10a3ad893c9729887`. D4-D7 and the
-v0.17.5 semantic-equivalence proof are closed and must not be reopened without
-a reproduced regression. No temporary sibling/path dependency is allowed.
+Current sequencing: P9 thin-consumer convergence, process/control hardening,
+AW repin and trusted Remote Start issuer cutover are complete. Dotlink consumes
+published AW `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`; signed dotlink source is
+`648519add3d174b9e13de81aeca62431591dac6d` and published dotlink main is
+`bbd29c13904b7255eb28e2ed6c776c3590ac122a`. D4-D7 and the v0.17.5
+semantic-equivalence proof remain closed and must not be reopened without a
+reproduced regression. No temporary sibling/path dependency is allowed.
 
 - [x] Consume shared stop/cancellation/process terminal semantics (D1-D2).
 - [x] Consume shared Task failure detail (D3).
@@ -242,7 +242,7 @@ The original P1-P9/D4-D7 work is historical baseline here. Do not interpret old
 unchecked D4-D7/equivalence prose as an instruction to reimplement completed
 dotlink convergence.
 
-### Implemented locally, uncommitted
+### Implemented and published in AW source `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`
 
 - [x] Schema v36 indexed runtime-admission projections:
       policy_admission_current and remote_start_current.
@@ -288,12 +288,12 @@ dotlink convergence.
       aw-store lib, and aw-cli all targets (`--no-deps`). Repeated aw-store
       all-target Clippy/check attempts were externally SIGKILLed by L5 without a
       compiler diagnostic and are not classified as source failures.
-- [x] Dotlink post-equivalence process/control hardening is complete locally:
-      ordinary-exit descendant cleanup, 250 ms post-exit output grace,
-      escaped-`setsid` factual exit + incomplete output, shared-owner-only
-      revision-fenced cancel, stdin authority linearization, and single MCP
-      instruction ownership.
-- [x] Dotlink final L5 gate is green at **703/0/1 + 42/42**, strict
+- [x] Dotlink post-equivalence process/control hardening is published in signed
+      source `648519add3d174b9e13de81aeca62431591dac6d`: ordinary-exit descendant
+      cleanup, 250 ms post-exit output grace, escaped-`setsid` factual exit +
+      incomplete output, shared-owner-only revision-fenced cancel, stdin
+      authority linearization, and single MCP instruction ownership.
+- [x] Dotlink final repinned L5 gate is green at **706/0/1 + 42/42**, strict
       all-target/all-feature Clippy, fmt/diff, Alejandra and Markdown
       **0 issues / 86 files**.
 - [x] Shared process projection now also keeps known exit/stop truth orthogonal
@@ -302,14 +302,21 @@ dotlink convergence.
       Exact full-feature regression, aw-tools **359/359** and strict
       all-target/all-feature Clippy are green.
 
-### Remaining
+### Cross-repo cutover complete
 
-- [ ] Dotlink must adopt the published issuer-bearing AW wire after a future
-      authorized AW publish/repin and enforce that only explicitly trusted OAuth
-      bridge clients can mint a new issuer lease; do not add a temporary path
-      dependency or duplicate the AW type locally.
-- [ ] On that same authorized repin, remove dotlink's temporary
-      `shared_process_status` published-pin compatibility shim and consume the
-      corrected shared `ProcessTerminal::status()` directly.
-- [ ] Native Windows process/Job Object qualification remains an external gate.
+- [x] Dotlink is repinned atomically to AW
+      `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`; all seven AW Git packages use
+      that exact source pin with no path override or registry drift.
+- [x] Trusted Remote Start issuer enforcement is live target-side: ordinary
+      OAuth and AW-bridge trust are separate, trust epochs are monotonic, lease
+      issuance is 401/403/trusted, new claims require current trust, and exact
+      committed replay survives later issuer revocation.
+- [x] Dotlink's temporary `shared_process_status` compatibility shim is removed;
+      it consumes shared `ProcessTerminal::status()` directly.
+
+### Remaining external / deferred
+
+- [ ] Native Windows process/Job Object and macOS runtime/deployment qualification
+      remain external gates.
+- [ ] Trusted-selector Bubblewrap runtime smoke remains host-gated.
 - [ ] Sandbox/config-v13 remains frozen pending explicit user promotion.

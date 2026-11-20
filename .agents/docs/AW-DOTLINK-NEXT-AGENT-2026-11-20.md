@@ -31,114 +31,90 @@ Read first, in this order:
 9. dotlink DL-060 TODO
 10. live source/tests for every owner you touch.
 
-Current exact Git state:
+Current published source state:
 
-AW:
+AW reusable source pin:
 
 ~~~text
-HEAD == origin/main ==
-4234447612421069a746c925c76a25e3ba27774a
+b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
+Complete v36 runtime admission and process semantics
 ~~~
-
-AW has a substantial **uncommitted** v36 admission/Agent-source batch. Do not
-reset or overwrite it.
 
 dotlink:
 
 ~~~text
-HEAD = 20b6f045f79fa7725f286e05b40e9262b1c9e4d3
-origin/main = 4c3b96fd5ba9e6772bc159f10a3ad893c9729887
-local branch = 4 commits ahead
+source checkpoint = 648519add3d174b9e13de81aeca62431591dac6d
+published main     = bbd29c13904b7255eb28e2ed6c776c3590ac122a
 ~~~
 
-dotlink also has **uncommitted** post-017 source hardening. Preserve it.
+Preserve unrelated AW working-tree material exactly, especially
+`.agents/plans/ux/**` and the untracked
+`.agents/plans/dl150-jobs-host-input-extension-2026-11-20/` tree.
 
-The read-only release worktree is clean at local `release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`, 28 commits ahead of published `origin/release/0.17 = v0.17.5 = 3995448d7bf33794ef84c7bb51150d77cc260ada`. Do not modify or reset that worktree.
+The read-only release worktree is clean at local
+`release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`, 28 commits ahead
+of published
+`origin/release/0.17 = v0.17.5 = 3995448d7bf33794ef84c7bb51150d77cc260ada`.
+Do not modify or reset that worktree.
 
-All seven AW Git packages in dotlink Cargo.lock still resolve to:
+All seven AW Git packages in dotlink Cargo.lock now resolve exactly to:
 
 ~~~text
-1a5d0f65208e4a05b737c804a55a3aaad3e2fa59
+b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
 ~~~
 
-The 0.17 D4-D7 shared-consumer implementation and semantic equivalence are
-complete. Do not reopen them without a reproduced regression.
+Published source checkpoints:
 
-Current AW v36 batch is at a coherent **uncommitted** source checkpoint:
+- AW reusable source pin:
+  `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`;
+- dotlink repinned source:
+  `648519add3d174b9e13de81aeca62431591dac6d`;
+- dotlink published main/docs tip:
+  `bbd29c13904b7255eb28e2ed6c776c3590ac122a`.
 
-- all previously listed v36 admission/Agent-source/restart/notification work;
-- explicit v35 -> v36 migration/open coverage with projection backfill and exact
-  issuer-less v35 Remote Start replay;
-- `RemoteStartIssuer { client_id, trust_epoch }` and
-  `RemoteStartLease { target, issuer }`;
-- issuer-bound v2 authorization digest for new Starts while issuer-less v1 facts
-  remain exact replay-only history;
-- issuer-independent committed Start recovery by immutable attempt+semantic
-  identity before any new issuer/lease is obtained;
-- indexed canonical Agent binding lookup with current Session authorization
-  recheck;
-- query-only `job_exposure_current` projection derived from immutable
-  commit-log positions;
-- index-backed/keyset mixed Agent/finite Job pagination under the existing
-  position cursor contract;
-- historical P9/D4-D7/v0.17.5 equivalence status reconciled as complete.
+The 0.17 D4-D7 shared-consumer implementation, semantic equivalence, AW v36
+batch, dotlink process/control hardening and trusted Remote Start issuer cutover
+are complete. Do not reopen them without a reproduced regression.
 
-Validation already green on L5:
+Completed AW source includes:
 
-- focused migration/replay/participant/source/restart/wake/list regressions;
-- aw-tools Remote Start 6/6, aw-store Remote Start 4/4, aw-mcp exact wire test;
-- aw-store lib check and AW lib/bins check;
-- strict `-D warnings` Clippy for aw-tools/aw-mcp all targets, aw-store lib,
-  and AW all targets (`--no-deps`).
+- v35 -> v36 migration/open coverage and projection backfill;
+- issuer-bearing `RemoteStartLease` / `RemoteStartIssuer` v2 Start semantics;
+- issuer-independent exact committed replay;
+- indexed canonical Agent lookup and index-backed mixed Agent/finite listing;
+- durable Agent/Turn source/wake/restart behavior;
+- shared `ProcessTerminal::status()` where output completeness is orthogonal to
+  known exit/stop truth.
 
-Repeated aw-store all-target check/Clippy attempts were externally SIGKILLed by
-L5 with no compiler diagnostics; do not classify those as code failures. A
-root Clippy run did find two real issues (an over-wide positional API and a
-Rust-2024-only let-chain); both were fixed and subsequent root all-target strict
-Clippy (`--no-deps`) is green.
+Completed dotlink source includes:
 
-Dotlink process/control hardening is now also at a coherent **uncommitted**
-source checkpoint:
+- immediate reasonless managed-descendant cleanup on ordinary child exit;
+- independent 250 ms post-exit output grace;
+- escaped-`setsid` FD handling that preserves factual exit;
+- direct shared process-status consumption with no compatibility shim;
+- shared-owner-only revision-fenced cancel;
+- stdin authority/revision linearization before bytes;
+- one MCP instruction owner;
+- separate ordinary OAuth and AW-bridge issuer authority;
+- monotonic per-client trust epochs controlled by
+  `oauth trust-aw-bridge` / `oauth untrust-aw-bridge`;
+- 401/403/trusted issuer-bearing lease semantics;
+- exact committed replay before current issuer trust, so revocation blocks new
+  effects without erasing historical fact.
 
-- ordinary waited-child exit closes managed descendants immediately as
-  reasonless housekeeping;
-- inherited output has a separate 250 ms post-exit grace;
-- escaped-`setsid` retained FDs preserve known exit and mark output incomplete
-  through shared `ProcessSettlement + Status.incomplete`;
-- revision-fenced public cancel requires canonical shared ownership;
-- stdin authority verification/revision acceptance is linearized before bytes;
-- duplicate static MCP instruction ownership is removed;
-- wait/read/cancel control tests use deterministic canonical shared Running
-  Process fixtures rather than child sleeps;
-- final L5 gate is **703/0/1 + 42/42**, strict all-target/all-feature Clippy,
-  fmt/diff, Alejandra and Markdown **0 issues / 86 files**.
+Final repinned dotlink gate on L5:
 
-AW-side issuer identity/wire semantics are implemented, but current dotlink
-still consumes published AW `1a5d0f65...`. Do not add a temporary path
-dependency or duplicate the issuer type.
+- main **706/0/1**;
+- integrations **42/42**;
+- strict all-target/all-feature Clippy, fmt/diff, Alejandra and Markdown green.
 
-Next implementation order:
+There is no remaining source implementation in this workstream that should be
+started implicitly. Remaining boundaries are external/deferred only:
 
-## 1. Preserve the two qualified dirty checkpoints
-
-There is no remaining source item in the current AW v36 or dotlink
-process/control batches that can be completed without crossing an explicitly
-guarded boundary.
-
-## 2. After explicit AW publish/repin authorization only
-
-- publish/repin the issuer-bearing AW shared wire and corrected shared
-  `ProcessTerminal::status()` projection;
-- remove dotlink's temporary `shared_process_status` compatibility shim;
-- make dotlink issue `RemoteStartLease` only for explicitly trusted OAuth AW
-  bridge clients;
-- bind the actual authenticated `client_id` and trust epoch;
-- prove an ordinary authenticated OAuth client cannot self-mint a new Start;
-- preserve exact committed replay after issuer revocation;
-- rerun the cross-repo trust/replay/full gates.
-
-Native Windows/macOS validation remains external. Sandbox/config-v13 remains
-frozen unless explicitly promoted.
+- native Windows Job Object runtime qualification;
+- native macOS runtime/deployment qualification;
+- trusted-selector Bubblewrap smoke on a suitable host;
+- sandbox/config-v13, still frozen unless explicitly promoted.
 
 Do not:
 

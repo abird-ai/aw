@@ -62,73 +62,47 @@ host/transport/deployment consumer and must not grow parallel shared runtimes.
 
 ### AW
 
-~~~text
-HEAD        4234447612421069a746c925c76a25e3ba27774a
-origin/main 4234447612421069a746c925c76a25e3ba27774a
-~~~
-
-Published shared implementation pin still consumed by dotlink:
+The reusable shared **source pin** consumed by dotlink is signed and published:
 
 ~~~text
-1a5d0f65208e4a05b737c804a55a3aaad3e2fa59
+b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
+Complete v36 runtime admission and process semantics
 ~~~
 
-The AW working tree is intentionally **not clean**. Excluding the untouched
-`.agents/plans/ux/**` subtree, the final checkpoint has **22 modified tracked
-entries, 7 untracked entries, and nothing staged**. The dirty tree includes the
-v36 admission/source/query-index batch plus the shared
-`ProcessTerminal::status()` output-completeness correction in
-`crates/aw-tools/src/filesystem/runner.rs`.
+That source commit contains the complete v36 admission/source/query-index batch,
+issuer-bearing Remote Start wire, and corrected shared process-status projection.
+This document reconciliation is docs-only on top of that reusable source pin;
+dotlink intentionally stays pinned to `b8a46a94...`, not to later AW docs-only
+commits.
 
-Preserve all unrelated planning/handoff dirt and untracked work exactly,
-including the pre-existing `.agents/plans/dl150-jobs-host-input-extension-2026-11-20/`
-tree. Do not inspect or absorb it into this workstream.
+Preserve unrelated AW working-tree material exactly. In particular, do not
+inspect/absorb `.agents/plans/ux/**` or the pre-existing untracked
+`.agents/plans/dl150-jobs-host-input-extension-2026-11-20/` tree.
 
 ### dotlink
 
+Published dotlink main:
+
 ~~~text
-HEAD        20b6f045f79fa7725f286e05b40e9262b1c9e4d3
-origin/main 4c3b96fd5ba9e6772bc159f10a3ad893c9729887
-ahead       4 local commits
-behind      0
+source checkpoint 648519add3d174b9e13de81aeca62431591dac6d
+                  Repin AW and complete process-control hardening
+
+docs/main tip     bbd29c13904b7255eb28e2ed6c776c3590ac122a
+                  Record AW repin and Remote Start trust cutover
 ~~~
 
-Important signed local commits above origin:
+Every direct/transitive AW Git package in dotlink `Cargo.lock` resolves exactly
+to:
 
 ~~~text
-fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7
-  Complete D4-D7 shared consumer convergence
-
-8b77bae48633d8c609b44ccec7291e5e20ab5624
-  Record final 0.17 equivalence checkpoint
-
-d32a3196ec18ada7f85176a9feed42667e5f2d6b
-  Harden Jobs replay and response budget boundaries
-
-20b6f045f79fa7725f286e05b40e9262b1c9e4d3
-  Record fresh 0.17 review remediation
-~~~
-
-Dotlink also has uncommitted post-commit hardening. The final checkpoint has
-**12 modified tracked entries, no untracked entries, and nothing staged**.
-Current source files touched by the post-equivalence process/control slice are:
-
-~~~text
-src/jobs.rs
-src/mcp.rs
-src/mcp/tools/graph.rs
-src/mcp/tools/jobs.rs
-src/mcp/tools/shell.rs
-~~~
-
-All seven direct/transitive AW Git packages in `Cargo.lock` still resolve
-exactly to:
-
-~~~text
-1a5d0f65208e4a05b737c804a55a3aaad3e2fa59
+b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
 ~~~
 
 No path override or registry package/version drift was introduced.
+
+The published source includes the post-equivalence process/control hardening,
+direct consumption of shared `ProcessTerminal::status()`, and target-side trusted
+AW Remote Start issuer enforcement with monotonic per-client OAuth trust epochs.
 
 ### Release reference
 
@@ -289,8 +263,9 @@ Progress backpressure cannot own operation completion.
 
 ## 5. Dotlink D4-D7 and review hardening
 
-D4-D7 implementation and 0.17.5 semantic equivalence are complete in the local
-four-commit stack and later uncommitted hardening.
+D4-D7 implementation, 0.17.5 semantic equivalence and later review hardening
+are complete and published; latest signed dotlink source is `648519ad...`,
+pinned to published AW `b8a46a94...`.
 
 ### Canonical replay before projection
 
@@ -326,7 +301,7 @@ The credited page text is byte-identical after decoration.
 
 ### jobs_get Process-tail fitting
 
-Current uncommitted production API:
+Published production API:
 
 ~~~rust
 JobManager::standalone_process_tail_fitted(..., fits)
@@ -365,7 +340,7 @@ boundary.
 
 ## 6. Validated external-review findings
 
-### Resolved in the current uncommitted AW batch
+### Resolved and published in AW `b8a46a94...`
 
 #### Policy replay-before-authority
 
@@ -436,31 +411,20 @@ participant epochs and exact tool/capability authority still match.
 
 Revoke/regrant does not revive stale refs.
 
-### Still pending
+### Cross-repo completion
 
-#### Remote Start trusted issuer — P1
+Remote Start trusted issuer and Agent scaling work are complete:
 
-OAuth authenticates a client but does not yet prove that client is an authorized
-AW Remote Start issuer.
+- `RemoteStartIssuer { client_id, trust_epoch }` is the shared issuer identity;
+- dotlink ordinary OAuth and AW-bridge trust are separate capabilities;
+- only an explicitly trusted bridge client with the current trust epoch may
+  create a new Start claim;
+- exact existing replay remains recoverable after issuer revocation;
+- canonical Agent lookup is indexed and rechecks current Session authority;
+- mixed Agent/finite listing is index-backed/keyset-paged under the existing
+  cursor contract.
 
-Preferred design:
-
-~~~text
-RemoteStartIssuer { client_id, trust_epoch }
-~~~
-
-Only configured trusted AW bridge clients may create a new Start claim.
-
-Exact existing replay remains recoverable after issuer revocation.
-
-#### Agent canonical lookup/list scaling — P2
-
-Still pending:
-
-- indexed canonical Agent lookup;
-- index-backed mixed Agent/finite listing pagination.
-
-Do not add another Job registry.
+No second Job/Agent registry was added.
 
 ---
 
@@ -598,7 +562,7 @@ Incomplete tails were rerun independently and completed green.
 
 ---
 
-## 10. Dotlink process/control batch — complete locally, uncommitted
+## 10. Dotlink process/control batch — complete and published
 
 The formerly pending process/control batch is implemented and fully qualified on
 L5. The design below is retained as the as-built contract.
@@ -696,7 +660,7 @@ one-occurrence regression is green.
 The final L5 host-available gate uses
 `AW_BASH="$(command -v bash)"` and is green:
 
-- main binary **703 passed / 0 failed / 1 intentional ignored**;
+- main binary **706 passed / 0 failed / 1 intentional ignored**;
 - integrations **42/42**;
 - strict all-target/all-feature Clippy `-D warnings`;
 - rustfmt and `git diff --check`;
@@ -710,25 +674,25 @@ dotlink stores the existing typed `ProcessTerminal` through
 `Code(0)` into `Unknown` merely by retaining an inherited FD past the 250 ms
 post-exit grace.
 
-The current uncommitted AW shared owner now has the same rule directly in
+The published AW shared owner has the same rule directly in
 `ProcessTerminal::status()`: `Primary` derives only from stop/exit evidence and
 `incomplete = !output.complete`. The exact full-feature runner regression is
 green, the full `aw-tools --all-features --lib` suite is **359/359**, and strict
 all-target/all-feature Clippy is green after one diagnostic-free L5 kill/retry.
-Dotlink's private `shared_process_status` is therefore only a compatibility shim
-for published AW `1a5d0f65...` and should be removed on the same future
-authorized AW publish/repin required for issuer adoption.
+Published AW `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b` carries that
+shared projection. Dotlink source `648519add3d174b9e13de81aeca62431591dac6d`
+is repinned to it and has removed the temporary `shared_process_status`
+compatibility shim.
 
 ---
 
-## 11. Remote Start trusted issuer — remaining target-side cross-repo P1
+## 11. Remote Start trusted issuer — complete cross-repo
 
-AW-side issuer identity/wire/replay semantics are implemented locally. Dotlink
-still consumes published AW `1a5d0f65...`, so target-side trusted issuer
-issuance must wait for an explicitly authorized AW publish/repin. Do not add a
-temporary path dependency or duplicate the issuer wire locally.
+AW-side issuer identity/wire/replay semantics are published in `b8a46a94...`.
+Dotlink source `648519ad...` consumes that exact pin and implements target-side
+issuer trust in existing private OAuth state.
 
-Preferred direct bridge design after that repin:
+Final direct bridge design:
 
 ~~~text
 Remote Start semantic identity
@@ -744,18 +708,22 @@ Issuer revocation blocks new Starts but does not erase existing replay.
 Add signature/MAC only if future evidence must cross an untrusted intermediary
 or be independently verifiable offline.
 
-Required negative test:
+Qualified trust/replay behavior:
 
 ~~~text
-valid ordinary OAuth client self-constructs consistent Start -> denied
-trusted AW bridge client presents same semantic Start        -> accepted
+unauthenticated lease request                         -> 401
+authenticated ordinary OAuth client                   -> 403 lease
+trusted AW bridge current epoch                       -> issuer-bearing lease
+revoked issuer + genuinely new Start                  -> denied
+revoked issuer + exact already-committed Start replay -> original factual replay
+re-trusted client                                     -> new epoch; old lease stale
 ~~~
 
 ---
 
-## 12. Agent scaling — complete locally
+## 12. Agent scaling — complete and published
 
-Completed in the uncommitted AW v36 batch:
+Completed in published AW source `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`:
 
 - durable Agent/Turn source subscriptions;
 - durable wake receipt and restart recovery;
@@ -778,12 +746,15 @@ Do not reimplement D4-D7 because of stale AW plan checkboxes.
 Factual state:
 
 ~~~text
-D4-D7 implementation            complete
+D4-D7 implementation            complete/published
 0.17.5 semantic equivalence     complete
-post-review dotlink hardening   complete locally, uncommitted
-process/control hardening       complete/qualified locally, uncommitted
-AW v36 admission/Agent batch    implemented/green locally, uncommitted
-Windows native gate             external/open
+post-review dotlink hardening   complete/published
+process/control hardening       complete/published
+trusted Remote Start issuer     complete/published
+AW v36 admission/Agent batch    complete/published at b8a46a94
+dotlink source checkpoint       648519ad
+dotlink published main          bbd29c13
+Windows/macOS native gates      external/open
 trusted-selector Bubblewrap     host-gated
 sandbox/config-v13              explicitly deferred
 ~~~
@@ -877,7 +848,7 @@ started while active runtime work is dirty.
 
 ## 16. Current definition of done
 
-### AW local source criteria — complete at the current uncommitted checkpoint
+### AW source criteria — complete and published at `b8a46a94...`
 
 - v35 -> v36 migration/open coverage and legacy replay are green;
 - replay/participant/source/restart regressions remain green;
@@ -886,7 +857,7 @@ started while active runtime work is dirty.
 - mixed listing is index-backed/keyset-paged;
 - relevant host-available checks/clippy/fmt/diff are green.
 
-### dotlink local source criteria — complete at the current uncommitted checkpoint
+### dotlink source criteria — complete and published at `648519ad...`
 
 - ordinary child exit closes the managed group/Job Object immediately as
   reasonless housekeeping;
@@ -895,13 +866,14 @@ started while active runtime work is dirty.
 - public revision-fenced cancel has no non-shared CAS authority;
 - stdin authority is checked at the per-Job acceptance boundary;
 - duplicate server instruction ownership is removed;
-- full L5 gate is green at **703/0/1 + 42/42** with strict Clippy,
-  fmt/diff, Alejandra and Markdown lint.
+- full repinned L5 gate is green at **706/0/1 + 42/42** with strict Clippy,
+  fmt/diff, Alejandra and Markdown lint;
+- trusted OAuth AW-bridge issuer enforcement and replay-after-revoke semantics
+  are qualified and published.
 
 ### Cross-repo / external criteria still open
 
-- dotlink target-side trusted issuer issuance waits for an explicitly authorized
-  AW publish/repin of the issuer-bearing shared wire;
+- trusted issuer cutover is complete and published;
 - native Windows/macOS runtime validation remains external;
 - sandbox/config-v13 remains untouched unless explicitly promoted;
 - no duplicate runtime/store/event service/scheduler;
@@ -911,21 +883,14 @@ started while active runtime work is dirty.
 
 ## 17. Exact next implementation order
 
-There is no remaining source implementation in the current AW v36 or dotlink
-process/control batches that can be completed without crossing an explicitly
-guarded boundary.
+There is no remaining source implementation in the AW v36 / dotlink
+process-control-trust cutover that should be started implicitly.
 
-1. Preserve both dirty working trees and current refs.
-2. Do not publish/repin AW unless the user explicitly authorizes it.
-3. After such an authorized AW publish/repin, adopt the shared
-   `RemoteStartLease`/issuer wire in dotlink and enforce trusted OAuth AW bridge
-   issuance with the ordinary-OAuth negative test.
-4. On the same repin, remove dotlink's temporary `shared_process_status`
-   compatibility projection and consume AW's corrected shared
-   `ProcessTerminal::status()` directly.
-5. Run the corresponding cross-repo replay/trust/process/full gates.
-5. Native Windows/macOS validation remains external.
-6. Do not implement sandbox/config-v13 unless explicitly promoted.
+1. Preserve published source pins and unrelated working-tree material.
+2. Native Windows/macOS validation remains external.
+3. Trusted-selector Bubblewrap smoke remains host-gated.
+4. Do not implement sandbox/config-v13 unless explicitly promoted.
+5. Do not tag/release/deploy without separate explicit authorization.
 
 Current plan/current-handoff documentation is reconciled through this
 checkpoint.
@@ -3323,24 +3288,18 @@ Implemented locally/uncommitted:
 Both active local source batches are now at coherent **uncommitted** checkpoints:
 
 - AW v36 admission/Agent/source/query-index work is implemented and qualified;
-- dotlink post-equivalence process/control hardening is implemented and
-  qualified at **703/0/1 + 42/42** with strict Clippy, fmt/diff, Alejandra and
-  Markdown lint.
+- dotlink post-equivalence process/control + trusted issuer hardening is
+  published and qualified at **706/0/1 + 42/42** with strict Clippy,
+  fmt/diff, Alejandra and Markdown lint;
+- dotlink consumes `RemoteStartLease`, requires explicit trusted OAuth bridge
+  authority for new claims, binds authenticated `client_id` + trust epoch,
+  rejects ordinary OAuth issuer self-construction, removes the temporary process
+  status shim, and preserves exact committed replay after later trust revocation.
 
 No further source change should cross one of the guarded boundaries implicitly.
 
-Cross-repo follow-up after an explicitly authorized AW publish/repin:
-
-- dotlink adopts `RemoteStartLease` and requires an explicitly trusted OAuth
-  AW bridge client to mint it;
-- dotlink removes its temporary published-pin `shared_process_status` shim and
-  consumes the corrected shared `ProcessTerminal::status()` directly;
-- actual authenticated `client_id` and trust epoch are bound into the issuer;
-- ordinary OAuth client self-construction of an otherwise consistent Start is
-  denied; trusted AW bridge issuance is accepted;
-- existing committed replay is not erased by later issuer revocation.
-
-P9/D4-D7/v0.17.5 equivalence and the process/control batch are complete.
+P9/D4-D7/v0.17.5 equivalence, process/control hardening and trusted issuer
+cutover are complete.
 Native Windows/macOS runtime/deployment validation and trusted-selector
 Bubblewrap remain external gates.
 

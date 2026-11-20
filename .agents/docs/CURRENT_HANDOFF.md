@@ -22,121 +22,100 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
 
-## LIVE uncommitted AW v36 completion checkpoint — 2026-11-20
+## LIVE published AW + dotlink repin/trust checkpoint — 2026-11-20
 
-This section supersedes the older pending-order text below where it conflicts.
-No commit/push/repin was performed for this checkpoint.
+This section supersedes older current-state/pending-order text below where it
+conflicts.
 
-Current boundary:
+Current published boundary:
 
-- AW `HEAD == origin/main == 4234447612421069a746c925c76a25e3ba27774a`;
-- the existing substantial uncommitted v36 admission/Agent-source work is
-  preserved and extended in place; nothing was reset or staged;
-- dotlink was not modified in this AW slice. It remains at local
-  `20b6f045f79fa7725f286e05b40e9262b1c9e4d3`, four commits ahead of
-  `origin/main = 4c3b96fd5ba9e6772bc159f10a3ad893c9729887`, with its existing
-  post-017 dirty source hardening preserved;
-- all seven AW Git packages in dotlink remain pinned to
-  `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`;
-- the read-only dotlink release worktree is clean at local `release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`, 28 commits ahead of published `origin/release/0.17 = v0.17.5 = 3995448d7bf33794ef84c7bb51150d77cc260ada`; it was not modified here;
-- D4-D7 and v0.17.5 semantic equivalence remain closed; do not reopen them
-  without a reproduced regression;
+- AW shared source implementation is signed/published at
+  `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`
+  (`Complete v36 runtime admission and process semantics`);
+- dotlink consumes that exact AW source commit in all seven direct/transitive AW
+  Git packages;
+- dotlink signed source checkpoint is
+  `648519add3d174b9e13de81aeca62431591dac6d`
+  (`Repin AW and complete process-control hardening`);
+- dotlink `main` is published through
+  `bbd29c13904b7255eb28e2ed6c776c3590ac122a`
+  (`Record AW repin and Remote Start trust cutover`);
+- the read-only release worktree remains clean at local
+  `release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`,
+  28 commits ahead / 0 behind published
+  `origin/release/0.17 = v0.17.5 = 3995448d7bf33794ef84c7bb51150d77cc260ada`;
+- D4-D7 and v0.17.5 semantic equivalence remain closed;
 - sandbox/mount/config-v13 remains frozen.
 
-The remaining AW v36 source batch is now implemented locally:
+AW v36 completion published in `b8a46a94...` includes:
 
-- explicit v35 -> v36 open/migration coverage reconstructs the current
-  projections and proves exact replay of a real issuer-less v35 Remote Start
-  authorization without inventing v36 evidence;
+- explicit v35 -> v36 migration/open coverage and projection backfill;
+- exact replay of historical issuer-less v35 Remote Start facts without
+  manufacturing v36 issuer evidence;
 - `RemoteStartIssuer { client_id, trust_epoch }` and
-  `RemoteStartLease { target, issuer }` make the AW-side trusted-issuer
-  identity explicit. New Starts use an issuer-bound v2 authorization digest;
-  historical issuer-less facts retain the exact v1 digest and are replay-only;
-- committed Start recovery is issuer/lease independent. AW first recovers by the
-  immutable invocation/effect-attempt identity and verifies the original
-  semantic operation/ref/argument/request/action facts; only a new Start obtains
-  a current issuer+runtime lease. Changed semantics fail closed;
-- canonical Agent binding lookup is indexed by the existing authoritative
-  Workspace/Session/branch rows and always rechecks current Session
-  authorization. No Agent lifecycle registry/table was introduced;
-- v36 adds the query-only `job_exposure_current` projection. It derives Agent
-  and finite-Job list positions atomically from immutable `commit_log`
-  evidence, is rebuilt during migration, and supports bounded keyset pagination
-  of the mixed Agent/finite list. SessionStore remains the Agent owner,
-  JobManager remains the finite Job owner, and `commit_log` remains ordering
-  evidence;
-- Agent resolve/source/wake/list hot paths no longer enumerate all Agent
-  bindings; mixed listing no longer reconstructs the entire finite exposure
-  history and sorts the union in memory;
-- the Remote Start admission call is grouped as one
-  `RemoteStartAdmissionRequest` rather than an expanding positional argument
-  list.
+  `RemoteStartLease { target, issuer }`;
+- issuer-bound v2 authorization digest for new Starts, with issuer-less v1 facts
+  retained only for exact historical replay;
+- issuer/lease-independent recovery of an exact committed Start before new
+  mutable authority is consulted;
+- indexed canonical Agent lookup with current Session authorization recheck;
+- query-only `job_exposure_current` plus bounded keyset pagination for mixed
+  Agent/finite Job listing;
+- durable Agent/Turn source events, wake admissions and restart recovery;
+- shared `ProcessTerminal::status()` projection where physical/semantic process
+  outcome and output completeness are orthogonal:
+  `Primary` derives from exit/stop evidence and
+  `Status.incomplete = !output.complete`.
 
-Current validation on L5:
+The dotlink consumer cutover is also complete:
 
-- v35 -> v36 migration/open regression: green;
-- mixed Store exposure ordering/indexed pagination regression: green;
-- mixed Agent/finite router pagination + cursor-authority regression: green;
-- `jobs_get` revision-wake regression: green;
-- revoked-participant wake/history-cursor regression: green;
-- durable Agent/Turn exact-source delivery regression: green;
-- shared-session participation/revocation epoch regression: green;
-- Remote Start replay-after-revoke/fresh-attempt-deny regression: green,
-  including issuer-independent recovery;
-- aw-tools Remote Start suite: **6/6** green;
-- aw-store Remote Start module: **4/4** green;
-- aw-mcp exact Remote Start wire-metadata regression: green;
-- `cargo check --locked -p aw-store --lib -j1`: green;
-- `cargo check --locked -p aw-cli --lib --bins -j1`: green;
-- strict `-D warnings` Clippy: aw-tools all targets green, aw-mcp all targets
-  green, aw-store lib green, and aw-cli all targets (`--no-deps`) green;
-- `cargo fmt --all -- --check` and UX-excluding `git diff --check`: green at
-  the final handoff.
+- ordinary child exit immediately performs reasonless managed-descendant
+  housekeeping;
+- inherited stdout/stderr use a separate 250 ms post-exit drain grace;
+- an escaped `setsid` writer cannot erase a known command exit merely by
+  retaining an inherited FD;
+- the temporary dotlink `shared_process_status` compatibility shim is gone;
+  dotlink consumes AW `ProcessTerminal::status()` directly;
+- revision-fenced public cancel requires canonical shared Job ownership;
+- stdin authority and revision acceptance are linearized before bytes are
+  enqueued;
+- duplicate static MCP instruction ownership is removed.
 
-L5 repeatedly externally SIGKILLed aw-store all-target/all-feature check/Clippy
-while compiling aw-store, with no Rust diagnostic. Those attempts are recorded
-as infrastructure interruption, not source failures. One root Clippy attempt did
-produce real diagnostics before an external kill (too many arguments, then a
-Rust-2024-only let-chain); both were fixed structurally and the subsequent
-aw-cli all-target strict Clippy (`--no-deps`) is green.
+Trusted AW Remote Start issuer enforcement is complete target-side:
 
-Cross-repo issuer boundary:
+- ordinary OAuth authentication remains distinct from AW-bridge issuer trust;
+- private dotlink OAuth state persists one monotonic trust epoch per approved
+  DCR client;
+- owner controls are `oauth trust-aw-bridge` and `oauth untrust-aw-bridge`;
+- lease issuance is 401 when unauthenticated, 403 for authenticated but
+  untrusted clients, and returns issuer-bearing `RemoteStartLease` only for a
+  currently trusted bridge client;
+- the authorization issuer client ID must match the authenticated OAuth client;
+- exact committed replay resolves before current issuer trust;
+- revocation blocks a genuinely new Start but does not erase the original
+  committed replay;
+- re-trust advances the epoch, so an older lease cannot become current again.
 
-- AW now defines/consumes the issuer-bearing wire and refuses to mint a new
-  Store authorization without a structurally valid issuer;
-- current dotlink still consumes the published pre-issuer AW pin. Do **not**
-  introduce a temporary path dependency or duplicate the new AW wire locally;
-- after an explicitly authorized AW publish/repin, dotlink must make its lease
-  endpoint issue `RemoteStartLease` only for explicitly trusted OAuth AW
-  bridge clients, bind actual authenticated `client_id`/trust epoch, and add
-  the ordinary-OAuth-client negative test. That target-side trust enforcement
-  is not falsely claimed complete by this AW-only checkpoint.
+Final repinned dotlink qualification on L5:
 
-The dotlink process/control batch is now complete locally/uncommitted:
+- main binary: **706 passed / 0 failed / 1 intentional ignored**;
+- integrations: **42/42**;
+- strict all-target/all-feature Clippy `-D warnings`: green;
+- fmt/diff, Alejandra and Markdown (**0 issues / 86 files**): green.
 
-- ordinary waited-child exit closes the remaining managed process group / Job
-  Object immediately as reasonless housekeeping;
-- inherited output gets a separate 250 ms post-exit grace;
-- escaped-`setsid` retained FDs preserve known command exit while marking output
-  incomplete through shared `ProcessSettlement + Status.incomplete`;
-- revision-fenced public cancel requires the canonical shared Job owner;
-- stdin authority verification and shared revision acceptance are linearized at
-  the per-Job transition boundary before bytes are enqueued;
-- the duplicate static MCP instruction owner is removed;
-- deterministic shared-Process control fixtures replace child-sleep timing in
-  the relevant wait/read/cancel regressions;
-- AW's shared `ProcessTerminal::status()` now also treats process outcome and
-  output completeness orthogonally: `Primary` derives from stop/exit evidence
-  while `Status.incomplete = !output.complete`. Exact full-feature runner
-  regression, `aw-tools --all-features --lib` **359/359**, and strict
-  all-target/all-feature Clippy are green (after one diagnostic-free L5 kill).
+Two combined all-feature test invocations were externally SIGKILLed by L5
+before producing test output or Rust diagnostics. The complete main binary and
+all six integration targets were then run serially and are green. Those kills
+are infrastructure noise, not source failures.
 
-Final L5 gate: main **703/0/1**, integrations **42/42**, strict all-target/
-all-feature Clippy, fmt/diff, Alejandra and Markdown **0 issues / 86 files**.
-The only remaining cross-repo source item is dotlink trusted-issuer issuance
-after an explicitly authorized AW publish/repin exposes the issuer-bearing
-shared wire. Native Windows/macOS validation remains external.
-Do not touch sandbox/config-v13.
+Remaining boundaries are external/deferred only:
+
+- native Windows Job Object runtime validation;
+- native macOS runtime/deployment validation;
+- trusted-selector Bubblewrap runtime smoke on a suitable host;
+- frozen sandbox/config-v13 unless explicitly promoted.
+
+No release/tag/deploy action was performed by this source publication.
 
 ## LIVE 0.17 fresh-review convergence checkpoint — 2026-11-19
 
