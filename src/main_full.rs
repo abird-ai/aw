@@ -4220,6 +4220,9 @@ impl Host {
             routed
         };
 
+        let event_owner = agent
+            .execution_binding()
+            .map(|binding| binding.canonical_ref().to_owned());
         let result = if let Some(owner) = self.agent_jobs_owner.clone() {
             let selected = match selected {
                 Some(selected) => selected,
@@ -4269,6 +4272,9 @@ impl Host {
         } else {
             runtime.block_on(agent.prompt(text, cancelled(cancel.clone()), &mut event))
         };
+        if let Some(canonical) = event_owner.as_deref() {
+            let _ = runtime.block_on(self.tools.agent_jobs.deliver_source_events(canonical));
+        }
         if let Some(p) = &self.persistent {
             let _ = p.handle.clear_retry_operation();
             #[cfg(feature = "routing")]
@@ -5166,13 +5172,18 @@ impl aw::headless::Driver for Host {
         }
         if self.runtime.is_none(){self.runtime=Some(runtime()?);}
         let tokio=self.runtime.as_ref().ok_or(Error::Storage("Agent runtime unavailable"))?;
-        tokio.block_on(async {
+        let canonical=agent.execution_binding().map(|binding|binding.canonical_ref().to_owned());
+        let result=tokio.block_on(async {
             tokio::select! {
                 biased;
                 _=cancel.cancelled()=>Err(Error::Cancelled),
                 result=owner.run_once(agent, |event| emit(event))=>result,
             }
-        })
+        });
+        if let Some(canonical)=canonical.as_deref() {
+            let _=tokio.block_on(self.tools.agent_jobs.deliver_source_events(canonical));
+        }
+        result
     }
     fn prompt(
         &mut self,text:String,cancel:aw::CancellationToken,

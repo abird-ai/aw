@@ -5,21 +5,20 @@
 //! facts from the existing Session audit and current writer/ACL authority.
 
 use crate::{
-    audit, branch_in, context, db, now, principal_is_session_owner, workspace_writer, Error,
-    PrincipalId, Result, SessionStore,
+    audit, branch_in, context, db, now, principal_is_session_owner, session_participation,
+    workspace_writer, Error, PrincipalId, Result, SessionStore,
 };
 use aw_agent_core::{
     AuxiliaryInput, AuxiliaryJournal, AuxiliaryResult, InvocationContext, InvocationIdentity,
     InvocationPurpose, JournalFuture, Outcome,
 };
 use aw_policy::{Decision, PolicyDecision, Strategy};
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 const ACTION: &str = "policy.admission";
-const MAX_EVENTS: usize = 4_096;
 const MAX_ADMISSIONS_PER_TURN: usize = 64;
 const MAX_APPROVERS: usize = 16;
 
@@ -52,6 +51,32 @@ impl PolicyAdmissionState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PolicyAdmissionSubject {
+    pub actor: PrincipalId,
+    pub membership_epoch: u64,
+    pub audience_epoch: u64,
+    pub owner: bool,
+}
+
+impl PolicyAdmissionSubject {
+    pub fn from_participation(
+        evidence: &session_participation::SessionParticipationEvidence,
+    ) -> Self {
+        Self {
+            actor: evidence.actor.clone(),
+            membership_epoch: evidence.membership_epoch,
+            audience_epoch: evidence.audience_epoch,
+            owner: evidence.owner,
+        }
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.actor == other.actor
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyAdmissionRequest {
     pub session_id: String,
     pub branch_id: String,
@@ -60,6 +85,7 @@ pub struct PolicyAdmissionRequest {
     pub call_id: String,
     pub canonical_target: String,
     pub request_sha256: String,
+    pub subject: PolicyAdmissionSubject,
     pub policy_revision_sha256: String,
     pub authority_sha256: String,
     pub candidate_local: bool,
@@ -111,6 +137,8 @@ fn validate_request(request: &PolicyAdmissionRequest) -> Result<()> {
         || !bounded_ascii(&request.call_id, 256)
         || !bounded_ascii(&request.canonical_target, 2_048)
         || !digest(&request.request_sha256)
+        || request.subject.membership_epoch == 0
+        || request.subject.audience_epoch == 0
         || !digest(&request.policy_revision_sha256)
         || !digest(&request.authority_sha256)
         || !(request.candidate_local || request.candidate_delegate_agent)
@@ -119,11 +147,16 @@ fn validate_request(request: &PolicyAdmissionRequest) -> Result<()> {
         return Err(Error::Denied("invalid policy admission request"));
     }
 
+    if request.subject.actor.as_str().is_empty() {
+        return Err(Error::Denied("policy admission subject is invalid"));
+    }
+
     if request.guardian_required {
         let identity = request.guardian_identity.as_ref().ok_or(Error::Denied(
             "guardian policy admission needs a pinned invocation identity",
         ))?;
         if identity.grant_revision == 0
+            || identity.actor != request.subject.actor
             || request
                 .guardian_site
                 .as_deref()
@@ -183,27 +216,127 @@ pub(crate) fn admission_id(owner: &PrincipalId, request: &PolicyAdmissionRequest
     format!("pa_{:x}", hash.finalize())
 }
 
-fn events(c: &rusqlite::Connection, session: &str) -> Result<Vec<PolicyAdmissionFact>> {
-    let mut query = db(c.prepare(
-        "SELECT data_json FROM audit
-         WHERE session_id=?1 AND action=?2
-         ORDER BY seq LIMIT 4097",
-    ))?;
-    let rows = db(query.query_map(params![session, ACTION], |row| row.get::<_, String>(0)))?;
-    let encoded = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
-    if encoded.len() > MAX_EVENTS {
-        return Err(Error::Limit(
-            "policy admission audit requires explicit inspection/rotation",
-        ));
-    }
-    encoded
-        .into_iter()
-        .map(|value| crate::decode::<PolicyAdmissionFact>(&value))
-        .collect()
+fn replay_matches(a: &PolicyAdmissionRequest, b: &PolicyAdmissionRequest) -> bool {
+    a.session_id == b.session_id
+        && a.branch_id == b.branch_id
+        && a.turn_id == b.turn_id
+        && a.call_id == b.call_id
+        && a.canonical_target == b.canonical_target
+        && a.request_sha256 == b.request_sha256
+        && a.subject.same_identity(&b.subject)
 }
 
-fn latest<'a>(facts: &'a [PolicyAdmissionFact], id: &str) -> Option<&'a PolicyAdmissionFact> {
-    facts.iter().rev().find(|fact| fact.id == id)
+fn current_fact(c: &rusqlite::Connection, id: &str) -> Result<Option<PolicyAdmissionFact>> {
+    let encoded: Option<String> = db(c
+        .query_row(
+            "SELECT fact_json FROM policy_admission_current WHERE admission_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional())?;
+    encoded.map(|value| crate::decode(&value)).transpose()
+}
+
+fn store_current(c: &rusqlite::Connection, fact: &PolicyAdmissionFact) -> Result<()> {
+    let encoded = serde_json::to_string(fact)
+        .map_err(|_| Error::Storage("cannot serialize policy admission fact"))?;
+    let current: Option<(u64, String)> = db(c
+        .query_row(
+            "SELECT revision,fact_json FROM policy_admission_current WHERE admission_id=?1",
+            [&fact.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional())?;
+    match current {
+        None if fact.revision == 1 => {}
+        Some((revision, existing)) if revision == fact.revision && existing == encoded => {
+            return Ok(())
+        }
+        Some((revision, _)) if revision.checked_add(1) == Some(fact.revision) => {}
+        None => {
+            return Err(Error::Storage(
+                "policy admission projection must begin at revision one",
+            ))
+        }
+        Some(_) => {
+            return Err(Error::Storage(
+                "policy admission projection revision is not monotonic",
+            ))
+        }
+    }
+    db(c.execute(
+        "INSERT INTO policy_admission_current(
+            admission_id,session_id,branch_id,turn_id,call_id,canonical_target,
+            subject_actor,request_sha256,revision,fact_json,updated_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(admission_id) DO UPDATE SET
+            session_id=excluded.session_id,
+            branch_id=excluded.branch_id,
+            turn_id=excluded.turn_id,
+            call_id=excluded.call_id,
+            canonical_target=excluded.canonical_target,
+            subject_actor=excluded.subject_actor,
+            request_sha256=excluded.request_sha256,
+            revision=excluded.revision,
+            fact_json=excluded.fact_json,
+            updated_at=excluded.updated_at",
+        params![
+            fact.id,
+            fact.request.session_id,
+            fact.request.branch_id,
+            fact.request.turn_id,
+            fact.request.call_id,
+            fact.request.canonical_target,
+            fact.request.subject.actor.as_str(),
+            fact.request.request_sha256,
+            fact.revision,
+            encoded,
+            now(),
+        ],
+    ))?;
+    Ok(())
+}
+
+pub(crate) fn backfill_current(c: &rusqlite::Connection) -> Result<()> {
+    let mut query = db(c.prepare(
+        "SELECT data_json FROM audit
+         WHERE action=?1
+         ORDER BY seq",
+    ))?;
+    let rows = db(query.query_map([ACTION], |row| row.get::<_, String>(0)))?;
+    for row in rows {
+        let encoded = db(row)?;
+        let mut value: serde_json::Value = serde_json::from_str(&encoded)
+            .map_err(|_| Error::Storage("cannot decode legacy policy admission fact"))?;
+        let request = value
+            .get_mut("request")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(Error::Storage(
+                "legacy policy admission request is malformed",
+            ))?;
+        if !request.contains_key("subject") {
+            let session_id = request
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(Error::Storage(
+                    "legacy policy admission Session identity is malformed",
+                ))?;
+            let actor = crate::session_in(c, session_id)?.owner;
+            request.insert(
+                "subject".into(),
+                serde_json::json!({
+                    "actor": actor,
+                    "membership_epoch": 1,
+                    "audience_epoch": 1,
+                    "owner": true,
+                }),
+            );
+        }
+        let fact: PolicyAdmissionFact = serde_json::from_value(value)
+            .map_err(|_| Error::Storage("cannot migrate legacy policy admission fact"))?;
+        store_current(c, &fact)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn fact_in(
@@ -211,9 +344,14 @@ pub(crate) fn fact_in(
     session: &str,
     id: &str,
 ) -> Result<PolicyAdmissionFact> {
-    latest(&events(connection, session)?, id)
-        .cloned()
-        .ok_or(Error::Denied("policy admission fact is unavailable"))
+    let fact = current_fact(connection, id)?
+        .ok_or(Error::Denied("policy admission fact is unavailable"))?;
+    if fact.request.session_id != session {
+        return Err(Error::Denied(
+            "policy admission fact belongs to another Session",
+        ));
+    }
+    Ok(fact)
 }
 
 fn audit_fact(
@@ -221,6 +359,7 @@ fn audit_fact(
     actor: &PrincipalId,
     fact: &PolicyAdmissionFact,
 ) -> Result<()> {
+    store_current(c, fact)?;
     audit(
         c,
         &fact.request.session_id,
@@ -231,6 +370,24 @@ fn audit_fact(
     )
 }
 
+fn require_subject(c: &rusqlite::Connection, request: &PolicyAdmissionRequest) -> Result<()> {
+    let current = session_participation::authorize_in(
+        c,
+        &request.subject.actor,
+        &request.session_id,
+        session_participation::SessionParticipationAction::Submit,
+    )?;
+    if current.membership_epoch != request.subject.membership_epoch
+        || current.audience_epoch != request.subject.audience_epoch
+        || current.owner != request.subject.owner
+    {
+        return Err(Error::Denied(
+            "policy admission subject participation changed after admission",
+        ));
+    }
+    Ok(())
+}
+
 fn require_owner_writer(
     c: &rusqlite::Connection,
     owner: &PrincipalId,
@@ -238,7 +395,7 @@ fn require_owner_writer(
 ) -> Result<()> {
     if !principal_is_session_owner(c, &request.session_id, owner)? {
         return Err(Error::Denied(
-            "policy admission belongs to the durable Session owner",
+            "policy admission resource owner differs from the durable Session owner",
         ));
     }
     context::authorize_tree(c, &request.session_id, owner)?;
@@ -267,6 +424,7 @@ fn require_active_turn(
     request: &PolicyAdmissionRequest,
 ) -> Result<()> {
     require_owner_writer(c, owner, request)?;
+    require_subject(c, request)?;
     let branch = branch_in(c, &request.session_id, &request.branch_id)?;
     let run = branch.active_run.as_deref().ok_or(Error::Conflict(
         "policy admission requires an active original Turn",
@@ -445,7 +603,6 @@ impl AuxiliaryJournal for PolicyGuardianJournal {
             let before = self.authorize_current(input, identity)?;
             let digest = input.digest()?;
             let started = self.store.policy_admission_start_guardian(
-                &self.actor,
                 &self.session,
                 &self.admission_id,
                 &digest,
@@ -492,42 +649,40 @@ impl SessionStore {
     /// before any auxiliary model call. Exact redelivery returns the same fact.
     pub fn policy_admission_claim(
         &self,
-        owner: &PrincipalId,
         request: PolicyAdmissionRequest,
     ) -> Result<PolicyAdmissionFact> {
         validate_request(&request)?;
         if request
             .guardian_identity
             .as_ref()
-            .is_some_and(|identity| identity.actor != *owner)
+            .is_some_and(|identity| identity.actor != request.subject.actor)
         {
             return Err(Error::Denied(
-                "policy guardian identity actor differs from Session owner",
+                "policy guardian identity actor differs from the admitted subject",
             ));
         }
-        let id = admission_id(owner, &request);
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        require_active_turn(&tx, owner, &request)?;
-        let all = events(&tx, &request.session_id)?;
-        if let Some(existing) = latest(&all, &id) {
-            if existing.request != request {
+        let owner = crate::session_in(&tx, &request.session_id)?.owner;
+        let id = admission_id(&owner, &request);
+        if let Some(existing) = current_fact(&tx, &id)? {
+            if !replay_matches(&existing.request, &request) {
                 return Err(Error::Conflict(
-                    "policy replay identity was reused with changed request/policy/authority",
+                    "policy replay identity was reused with changed invocation/subject",
                 ));
             }
             db(tx.commit())?;
-            return Ok(existing.clone());
+            return Ok(existing);
         }
-        let mut unique = BTreeMap::<&str, ()>::new();
-        for fact in &all {
-            if fact.request.branch_id == request.branch_id
-                && fact.request.turn_id == request.turn_id
-            {
-                unique.insert(fact.id.as_str(), ());
-            }
-        }
-        if unique.len() >= MAX_ADMISSIONS_PER_TURN {
+
+        require_active_turn(&tx, &owner, &request)?;
+        let unique: usize = db(tx.query_row(
+            "SELECT count(*) FROM policy_admission_current
+             WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3",
+            params![request.session_id, request.branch_id, request.turn_id],
+            |row| row.get(0),
+        ))?;
+        if unique >= MAX_ADMISSIONS_PER_TURN {
             return Err(Error::Limit(
                 "policy admission count exceeds the bounded active-Turn budget",
             ));
@@ -549,7 +704,7 @@ impl SessionStore {
             approval_decided_by: None,
             note: None,
         };
-        audit_fact(&tx, owner, &fact)?;
+        audit_fact(&tx, &fact.request.subject.actor, &fact)?;
         db(tx.commit())?;
         Ok(fact)
     }
@@ -562,16 +717,13 @@ impl SessionStore {
     ) -> Result<PolicyAdmissionFact> {
         let connection = self.connection()?;
         context::authorize_tree(&connection, session, reader)?;
-        latest(&events(&connection, session)?, id)
-            .cloned()
-            .ok_or(Error::Denied("policy admission fact is unavailable"))
+        fact_in(&connection, session, id)
     }
 
     /// Commit the single reserved paid guardian attempt before dispatch. A
     /// repeated call after this point fails rather than paying again.
     pub fn policy_admission_start_guardian(
         &self,
-        owner: &PrincipalId,
         session: &str,
         id: &str,
         input_sha256: &str,
@@ -584,11 +736,9 @@ impl SessionStore {
         ))?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let facts = events(&tx, session)?;
-        let current = latest(&facts, id)
-            .cloned()
-            .ok_or(Error::Denied("policy admission fact is unavailable"))?;
-        require_active_turn(&tx, owner, &current.request)?;
+        let current = fact_in(&tx, session, id)?;
+        let owner = crate::session_in(&tx, session)?.owner;
+        require_active_turn(&tx, &owner, &current.request)?;
         if !current.request.guardian_required || current.request.guardian_identity.is_none() {
             return Err(Error::Denied(
                 "policy admission has no reserved guardian attempt",
@@ -603,7 +753,7 @@ impl SessionStore {
         next.guardian_process_id = Some(process.process_id);
         next.guardian_store_generation = Some(process.store_generation);
         next.guardian_input_sha256 = Some(input_sha256.to_owned());
-        audit_fact(&tx, owner, &next)?;
+        audit_fact(&tx, &current.request.subject.actor, &next)?;
         db(tx.commit())?;
         Ok(next)
     }
@@ -613,7 +763,7 @@ impl SessionStore {
     /// provider work; it never authorizes another attempt.
     pub fn policy_admission_finish_guardian(
         &self,
-        owner: &PrincipalId,
+        actor: &PrincipalId,
         session: &str,
         id: &str,
         result: &AuxiliaryResult,
@@ -625,10 +775,7 @@ impl SessionStore {
         }
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let facts = events(&tx, session)?;
-        let current = latest(&facts, id)
-            .cloned()
-            .ok_or(Error::Denied("policy admission fact is unavailable"))?;
+        let current = fact_in(&tx, session, id)?;
         if current.state != PolicyAdmissionState::GuardianStarted {
             return Err(Error::Conflict(
                 "policy guardian result has no exact started attempt",
@@ -638,7 +785,7 @@ impl SessionStore {
             .request
             .guardian_identity
             .as_ref()
-            .is_none_or(|identity| identity.actor != *owner)
+            .is_none_or(|identity| identity.actor != *actor)
         {
             return Err(Error::Denied(
                 "policy guardian result belongs to another actor",
@@ -683,7 +830,7 @@ impl SessionStore {
                     .collect(),
             );
         }
-        audit_fact(&tx, owner, &next)?;
+        audit_fact(&tx, actor, &next)?;
         db(tx.commit())?;
         Ok(next)
     }
@@ -692,7 +839,6 @@ impl SessionStore {
     /// inside the original replay claim; it never grants missing authority.
     pub fn policy_admission_record_decision(
         &self,
-        owner: &PrincipalId,
         session: &str,
         id: &str,
         decision: PolicyDecision<'_>,
@@ -703,11 +849,7 @@ impl SessionStore {
         }
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let facts = events(&tx, session)?;
-        let current = latest(&facts, id)
-            .cloned()
-            .ok_or(Error::Denied("policy admission fact is unavailable"))?;
-        require_active_turn(&tx, owner, &current.request)?;
+        let current = fact_in(&tx, session, id)?;
         validate_decision(&current.request, &decision)?;
 
         if current.request.guardian_required {
@@ -748,7 +890,7 @@ impl SessionStore {
         next.decision_sha256 = Some(decision_sha256.to_owned());
         next.decision_route = route_label(decision.route).map(str::to_owned);
         next.narrow_ref = decision.narrow_ref.map(str::to_owned);
-        audit_fact(&tx, owner, &next)?;
+        audit_fact(&tx, &current.request.subject.actor, &next)?;
         db(tx.commit())?;
         Ok(next)
     }
@@ -757,7 +899,6 @@ impl SessionStore {
     /// never a retry authorization.
     pub fn policy_admission_mark_guardian_unknown(
         &self,
-        owner: &PrincipalId,
         session: &str,
         id: &str,
         note: &str,
@@ -767,11 +908,7 @@ impl SessionStore {
         }
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let facts = events(&tx, session)?;
-        let current = latest(&facts, id)
-            .cloned()
-            .ok_or(Error::Denied("policy admission fact is unavailable"))?;
-        require_owner_writer(&tx, owner, &current.request)?;
+        let current = fact_in(&tx, session, id)?;
         if current.state != PolicyAdmissionState::GuardianStarted {
             return Err(Error::Conflict(
                 "only an unresolved started guardian attempt can become unknown",
@@ -779,7 +916,7 @@ impl SessionStore {
         }
         let mut next = next_fact(&current, PolicyAdmissionState::GuardianUnknown)?;
         next.note = Some(note.to_owned());
-        audit_fact(&tx, owner, &next)?;
+        audit_fact(&tx, &current.request.subject.actor, &next)?;
         db(tx.commit())?;
         Ok(next)
     }
@@ -796,10 +933,7 @@ impl SessionStore {
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         context::authorize_tree(&tx, session, approver)?;
-        let facts = events(&tx, session)?;
-        let current = latest(&facts, id)
-            .cloned()
-            .ok_or(Error::Denied("policy admission fact is unavailable"))?;
+        let current = fact_in(&tx, session, id)?;
 
         if matches!(
             current.state,
@@ -857,7 +991,6 @@ impl SessionStore {
     /// owning executor may consume an Allow/Narrow/Approved decision.
     pub fn policy_admission_consume(
         &self,
-        owner: &PrincipalId,
         session: &str,
         id: &str,
         current_policy_revision_sha256: &str,
@@ -870,11 +1003,9 @@ impl SessionStore {
         }
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let facts = events(&tx, session)?;
-        let current = latest(&facts, id)
-            .cloned()
-            .ok_or(Error::Denied("policy admission fact is unavailable"))?;
-        require_active_turn(&tx, owner, &current.request)?;
+        let current = fact_in(&tx, session, id)?;
+        let owner = crate::session_in(&tx, session)?.owner;
+        require_active_turn(&tx, &owner, &current.request)?;
         if current.request.policy_revision_sha256 != current_policy_revision_sha256
             || current.request.authority_sha256 != current_authority_sha256
         {
@@ -912,7 +1043,7 @@ impl SessionStore {
         {
             let mut expired = next_fact(&current, PolicyAdmissionState::AskExpired)?;
             expired.note = Some("approved policy admission expired before consumption".into());
-            audit_fact(&tx, owner, &expired)?;
+            audit_fact(&tx, &current.request.subject.actor, &expired)?;
             db(tx.commit())?;
             return Ok(expired);
         }
@@ -922,7 +1053,7 @@ impl SessionStore {
             ));
         }
         let next = next_fact(&current, PolicyAdmissionState::Consumed)?;
-        audit_fact(&tx, owner, &next)?;
+        audit_fact(&tx, &current.request.subject.actor, &next)?;
         db(tx.commit())?;
         Ok(next)
     }

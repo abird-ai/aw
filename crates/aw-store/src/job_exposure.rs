@@ -12,6 +12,7 @@ use crate::{
 };
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 const ENTITY: &str = "job_exposure";
@@ -40,6 +41,12 @@ pub struct FiniteExposure {
     pub session_id: String,
     pub branch_id: String,
     pub writer_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobExposureListItem {
+    pub canonical_ref: String,
+    pub position: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,6 +149,157 @@ fn decode_event(kind: &str, seq: u64, encoded: &str) -> Result<FiniteExposure> {
     })
 }
 
+fn project_agent(
+    c: &rusqlite::Connection,
+    session_id: &str,
+    branch_id: &str,
+    position: u64,
+) -> Result<()> {
+    let binding = crate::agent_binding_unchecked(c, session_id, branch_id)?;
+    let canonical_ref = root_ref(&binding);
+    let changed = db(c.execute(
+        "INSERT INTO job_exposure_current(
+             kind,generation,canonical_ref,domain_handle,identity_handle,project_handle,
+             session_id,branch_id,position,state,writer_epoch
+         ) VALUES('agent','',?1,?2,?3,?4,?5,?6,?7,'published',NULL)
+         ON CONFLICT(kind,generation,canonical_ref) DO UPDATE SET
+             canonical_ref=excluded.canonical_ref
+         WHERE job_exposure_current.session_id=excluded.session_id
+           AND job_exposure_current.branch_id=excluded.branch_id
+           AND job_exposure_current.position=excluded.position
+           AND job_exposure_current.domain_handle=excluded.domain_handle
+           AND job_exposure_current.identity_handle=excluded.identity_handle
+           AND job_exposure_current.project_handle=excluded.project_handle",
+        params![
+            canonical_ref,
+            binding.domain_handle,
+            binding.identity_handle,
+            binding.project_handle,
+            binding.session_id,
+            binding.branch_id,
+            position,
+        ],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Storage(
+            "Agent exposure projection conflicts with immutable creation evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn project_finite(c: &rusqlite::Connection, kind: &str, seq: u64, payload: &Payload) -> Result<()> {
+    let state = kind_state(kind)?;
+    let position = match state {
+        FiniteExposureState::Reserved => seq,
+        FiniteExposureState::Published | FiniteExposureState::Released => {
+            payload.reservation_position.ok_or(Error::Storage(
+                "finite Job exposure closure lacks reservation position",
+            ))?
+        }
+    };
+    let state = match state {
+        FiniteExposureState::Reserved => "reserved",
+        FiniteExposureState::Published => "published",
+        FiniteExposureState::Released => "released",
+    };
+    let changed = db(c.execute(
+        "INSERT INTO job_exposure_current(
+             kind,generation,canonical_ref,domain_handle,identity_handle,project_handle,
+             session_id,branch_id,position,state,writer_epoch
+         ) VALUES('finite',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(kind,generation,canonical_ref) DO UPDATE SET state=excluded.state
+         WHERE job_exposure_current.domain_handle=excluded.domain_handle
+           AND job_exposure_current.identity_handle=excluded.identity_handle
+           AND job_exposure_current.project_handle=excluded.project_handle
+           AND job_exposure_current.session_id=excluded.session_id
+           AND job_exposure_current.branch_id=excluded.branch_id
+           AND job_exposure_current.position=excluded.position
+           AND job_exposure_current.writer_epoch=excluded.writer_epoch",
+        params![
+            payload.generation,
+            payload.canonical_ref,
+            payload.domain_handle,
+            payload.identity_handle,
+            payload.project_handle,
+            payload.session_id,
+            payload.branch_id,
+            position,
+            state,
+            payload.writer_epoch,
+        ],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Storage(
+            "finite Job exposure projection conflicts with immutable reservation evidence",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn project_commit_event(
+    c: &rusqlite::Connection,
+    kind: &str,
+    entity_type: &str,
+    entity_id: &str,
+    payload: &Value,
+    position: u64,
+) -> Result<()> {
+    match (kind, entity_type) {
+        ("session.created", "session") => {
+            let branch = payload
+                .get("branch_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::Storage(
+                    "Session creation event lacks Agent branch identity",
+                ))?;
+            project_agent(c, entity_id, branch, position)
+        }
+        ("branch.created", "branch") => {
+            let session =
+                payload
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or(Error::Storage(
+                        "branch creation event lacks Agent Session identity",
+                    ))?;
+            project_agent(c, session, entity_id, position)
+        }
+        (RESERVED | PUBLISHED | RELEASED, ENTITY) => {
+            let payload: Payload = serde_json::from_value(payload.clone())
+                .map_err(|_| Error::Storage("invalid finite Job exposure event payload"))?;
+            project_finite(c, kind, position, &payload)
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn backfill_current(c: &rusqlite::Connection) -> Result<()> {
+    let mut query = db(c.prepare(
+        "SELECT seq,kind,entity_type,entity_id,payload_json
+         FROM commit_log
+         WHERE kind IN ('session.created','branch.created',?1,?2,?3)
+         ORDER BY seq",
+    ))?;
+    let rows = db(
+        query.query_map(params![RESERVED, PUBLISHED, RELEASED], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        }),
+    )?;
+    for row in rows {
+        let (position, kind, entity_type, entity_id, encoded) = db(row)?;
+        let payload: Value = crate::decode(&encoded)?;
+        project_commit_event(c, &kind, &entity_type, &entity_id, &payload, position)?;
+    }
+    Ok(())
+}
+
 fn latest(
     c: &rusqlite::Connection,
     generation: &str,
@@ -195,7 +353,193 @@ fn payload(
     }
 }
 
+fn visible_projection_page(
+    c: &rusqlite::Connection,
+    actor: &PrincipalId,
+    binding: &AgentBindingInfo,
+    kind: &str,
+    generation: &str,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<Vec<JobExposureListItem>> {
+    let actor_user = crate::user_for_principal(c, actor)?;
+    let mut scan_before = before;
+    let batch = limit.clamp(32, 257);
+    let mut out = Vec::with_capacity(limit);
+    while out.len() < limit {
+        let mut query = db(c.prepare(
+            "SELECT e.canonical_ref,e.position,e.session_id
+             FROM job_exposure_current e
+             JOIN sessions s ON s.id=e.session_id
+             WHERE e.domain_handle=?1
+               AND e.identity_handle=?2
+               AND e.project_handle=?3
+               AND e.kind=?4 AND e.generation=?5 AND e.state='published'
+               AND (?6 IS NULL OR e.position<?6)
+               AND (
+                    (s.owner_user_id IS NULL AND s.owner=?7)
+                    OR (?8 IS NOT NULL AND s.owner_user_id=?8)
+                    OR EXISTS(
+                        SELECT 1 FROM members m
+                        WHERE m.session_id=s.id
+                          AND ((?8 IS NOT NULL AND m.principal_user_id=?8)
+                               OR (m.principal_user_id IS NULL AND m.principal=?7))
+                    )
+                    OR (?8 IS NOT NULL AND EXISTS(
+                        SELECT 1 FROM session_participation_grants p
+                        WHERE p.session_id=s.id AND p.user_id=?8
+                          AND p.status='active' AND p.can_view=1
+                    ))
+               )
+             ORDER BY e.position DESC,e.canonical_ref
+             LIMIT ?9",
+        ))?;
+        let scan_before_i64 = scan_before
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| Error::Denied("invalid mixed Job exposure page cursor"))?;
+        let rows = db(query.query_map(
+            params![
+                binding.domain_handle,
+                binding.identity_handle,
+                binding.project_handle,
+                kind,
+                generation,
+                scan_before_i64,
+                actor.as_str(),
+                actor_user,
+                batch as i64,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        ))?;
+        let mut fetched = 0usize;
+        let mut last_position = None;
+        for row in rows {
+            let (canonical_ref, position, session_id) = db(row)?;
+            fetched += 1;
+            last_position = Some(position);
+            match context::authorize_tree(c, &session_id, actor) {
+                Ok(()) => out.push(JobExposureListItem {
+                    canonical_ref,
+                    position,
+                }),
+                Err(Error::Denied(_)) => {}
+                Err(error) => return Err(error),
+            }
+            if out.len() == limit {
+                break;
+            }
+        }
+        if out.len() == limit || fetched < batch {
+            break;
+        }
+        let Some(position) = last_position else {
+            break;
+        };
+        scan_before = Some(position);
+    }
+    Ok(out)
+}
+
 impl SessionStore {
+    pub fn agent_binding_by_handles(
+        &self,
+        actor: &PrincipalId,
+        domain_handle: &str,
+        identity_handle: &str,
+        project_handle: &str,
+        agent_handle: &str,
+    ) -> Result<AgentBindingInfo> {
+        for value in [domain_handle, identity_handle, project_handle, agent_handle] {
+            crate::validate_agent_handle_component(value)?;
+        }
+        let connection = self.connection()?;
+        let candidate: Option<(String, String)> = if agent_handle == "0" {
+            db(connection
+                .query_row(
+                    "SELECT s.id,b.id
+                     FROM sessions s
+                     JOIN workspaces w ON w.workspace_id=s.workspace_id
+                     JOIN nodes root ON root.session_id=s.id AND root.id=s.root_node
+                     JOIN branches b ON b.session_id=s.id
+                     WHERE s.workspace_id=?1 AND s.owner_user_id=?2 AND w.domain_id=?3
+                     ORDER BY root.seq,b.created_at,b.id
+                     LIMIT 1",
+                    params![project_handle, identity_handle, domain_handle],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional())?
+        } else {
+            db(connection
+                .query_row(
+                    "SELECT s.id,b.id
+                     FROM branches b
+                     JOIN sessions s ON s.id=b.session_id
+                     JOIN workspaces w ON w.workspace_id=s.workspace_id
+                     WHERE b.id=?1 AND s.workspace_id=?2
+                       AND s.owner_user_id=?3 AND w.domain_id=?4
+                     LIMIT 1",
+                    params![agent_handle, project_handle, identity_handle, domain_handle],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional())?
+        };
+        let (session_id, branch_id) =
+            candidate.ok_or(Error::Denied("Agent ref is unavailable or not authorized"))?;
+        let binding = crate::agent_binding_in(&connection, actor, &session_id, &branch_id)?;
+        if binding.domain_handle != domain_handle
+            || binding.identity_handle != identity_handle
+            || binding.project_handle != project_handle
+            || binding.agent_handle != agent_handle
+        {
+            return Err(Error::Denied("Agent ref is unavailable or not authorized"));
+        }
+        Ok(binding)
+    }
+
+    pub fn job_exposure_page(
+        &self,
+        actor: &PrincipalId,
+        binding: &AgentBindingInfo,
+        generation: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<JobExposureListItem>> {
+        validate_generation(generation)?;
+        if limit == 0 || limit > 257 {
+            return Err(Error::Limit("invalid mixed Job exposure page limit"));
+        }
+        if before == Some(0) {
+            return Err(Error::Denied("invalid mixed Job exposure page cursor"));
+        }
+        let connection = self.connection()?;
+        let actual = authoritative_binding(&connection, actor, binding)?;
+        let mut rows =
+            visible_projection_page(&connection, actor, &actual, "agent", "", before, limit)?;
+        rows.extend(visible_projection_page(
+            &connection,
+            actor,
+            &actual,
+            "finite",
+            generation,
+            before,
+            limit,
+        )?);
+        rows.sort_by(|a, b| {
+            b.position
+                .cmp(&a.position)
+                .then_with(|| a.canonical_ref.cmp(&b.canonical_ref))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     pub fn finite_job_exposure_reserve(
         &self,
         actor: &PrincipalId,

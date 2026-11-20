@@ -3,7 +3,8 @@
 //! Hosts retain process-launch policy, OS handles and reattachment custody.
 //! After launch they report only these bounded facts to the common Job runtime,
 //! which owns status classification. Output truncation is observability only;
-//! an unproven stop or incomplete reader/drain state is `unknown`.
+//! incomplete reader/drain state is an independent `Status::incomplete` fact
+//! and never erases an otherwise known physical/semantic process outcome.
 use super::{batch::Status, status::Primary};
 use crate::execution_stop::StopReason;
 
@@ -38,9 +39,7 @@ pub struct ProcessTerminal {
 
 impl ProcessTerminal {
     pub fn status(self) -> Status {
-        let primary = if !self.output.complete {
-            Primary::Unknown
-        } else if self.stop.is_some() {
+        let primary = if self.stop.is_some() {
             Primary::Fail
         } else {
             match self.exit {
@@ -53,7 +52,7 @@ impl ProcessTerminal {
             primary,
             // Retained stdout/stderr truncation is observability only.
             more: false,
-            incomplete: false,
+            incomplete: !self.output.complete,
         }
     }
 
@@ -193,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_stop_or_unquiesced_output_is_unknown() {
+    fn unknown_exit_is_unknown_and_unquiesced_output_is_independently_incomplete() {
         assert_eq!(
             StopProof::Unknown(output(true, false))
                 .terminal()
@@ -201,16 +200,22 @@ mod tests {
                 .primary,
             Primary::Unknown
         );
-        assert_eq!(
-            ProcessTerminal {
-                exit: ProcessExit::Code(0),
+        for (exit, expected) in [
+            (ProcessExit::Code(0), Primary::Ok),
+            (ProcessExit::Code(9), Primary::Fail),
+            (ProcessExit::Signal(9), Primary::Fail),
+            (ProcessExit::Unknown, Primary::Unknown),
+        ] {
+            let status = ProcessTerminal {
+                exit,
                 stop: None,
                 output: output(false, false),
             }
-            .status()
-            .primary,
-            Primary::Unknown
-        );
+            .status();
+            assert_eq!(status.primary, expected);
+            assert!(status.incomplete);
+            assert!(!status.more);
+        }
     }
 
     #[test]
@@ -228,6 +233,8 @@ mod tests {
             output: output(false, false),
             ..terminal
         };
-        assert_eq!(uncertain_output.status().primary, Primary::Unknown);
+        let status = uncertain_output.status();
+        assert_eq!(status.primary, Primary::Fail);
+        assert!(status.incomplete);
     }
 }

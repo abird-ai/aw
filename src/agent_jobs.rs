@@ -13,7 +13,7 @@ use aw_store::{QueueState, SessionStore};
 use aw_store_api::{AgentBindingInfo, SessionBackend, SessionView};
 use aw_tools::{
     execution_ref::{AgentRef, ExecutionRef, ExecutionSegment},
-    job_event::JobEventDelivery,
+    job_event::{JobEventDelivery, JobEventKind, JobWakeMode},
 };
 use aw_tools_adapter::agent_jobs::{
     AgentEventFuture, AgentJobCancel, AgentJobFuture, AgentJobGet, AgentJobListFuture,
@@ -27,7 +27,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const MAX_HISTORY_TURNS: usize = 200;
@@ -100,6 +100,33 @@ impl WakeAuthority {
             Self::Hidden(_) => 0,
         }
     }
+
+    fn visible(&self) -> bool {
+        matches!(self, Self::Visible(_))
+    }
+
+    fn effect_label(&self) -> &'static str {
+        match self.effect() {
+            ToolEffect::Read => "read",
+            ToolEffect::Write => "write",
+            ToolEffect::Process => "process",
+            ToolEffect::Control => "control",
+            ToolEffect::Unknown => "unknown",
+        }
+    }
+
+    fn matches_receipt(&self, receipt: &aw_store::AgentJobWakeAdmission) -> bool {
+        let source = self.source();
+        receipt.tool_name == self.name()
+            && receipt.source_kind == source.kind_label()
+            && receipt.source_id == source.id
+            && receipt.source_epoch == source.epoch
+            && receipt.execution_site == self.execution_site()
+            && receipt.visible == self.visible()
+            && receipt.registry_revision == self.visible().then(|| self.registry_revision())
+            && receipt.authority_revision == self.authority_revision()
+            && receipt.effect == self.effect_label()
+    }
 }
 
 #[derive(Clone)]
@@ -122,6 +149,7 @@ pub struct Router {
     finite_capacity: usize,
     owners: Arc<Mutex<HashMap<String, LiveOwner>>>,
     wake_admissions: Arc<Mutex<HashMap<String, WakeAdmission>>>,
+    revision_watchers: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<u64>>>>,
 }
 
 #[derive(Clone)]
@@ -160,6 +188,7 @@ impl Router {
             finite_capacity,
             owners: Arc::new(Mutex::new(HashMap::new())),
             wake_admissions: Arc::new(Mutex::new(HashMap::new())),
+            revision_watchers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -208,6 +237,10 @@ impl Router {
             .lock()
             .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?
             .remove(canonical_agent_ref);
+        self.revision_watchers
+            .lock()
+            .map_err(|_| Error::Storage("Agent revision watcher registry poisoned"))?
+            .remove(canonical_agent_ref);
         Ok(())
     }
 
@@ -215,6 +248,16 @@ impl Router {
         format!(
             "/d:{}/i:{}/p:{}/a:{}",
             info.domain_handle, info.identity_handle, info.project_handle, info.agent_handle
+        )
+    }
+
+    fn binding_for_agent_ref(&self, agent: &AgentRef) -> Result<AgentBindingInfo> {
+        self.store.agent_binding_by_handles(
+            &self.actor,
+            agent.domain.as_str(),
+            agent.identity.as_str(),
+            agent.project.as_str(),
+            agent.agent.as_str(),
         )
     }
 
@@ -287,12 +330,7 @@ impl Router {
         }
 
         let canonical_agent = resolved.agent_ref().canonical();
-        let binding = self
-            .store
-            .agent_bindings(&self.actor)?
-            .into_iter()
-            .find(|binding| Self::canonical(binding) == canonical_agent)
-            .ok_or(Error::Denied("Agent ref is unavailable or not authorized"))?;
+        let binding = self.binding_for_agent_ref(resolved.agent_ref())?;
         self.store.authorize_session_participation(
             &ctx.actor,
             &binding.session_id,
@@ -940,17 +978,23 @@ impl Router {
                 "finite Job exposure principal differs from router owner",
             ));
         }
-        self.store
-            .agent_bindings(&self.actor)?
-            .into_iter()
-            .find(|binding| {
-                Self::canonical(binding) == owner.canonical_agent_ref
-                    && binding.session_id == owner.session_id
-                    && binding.branch_id == owner.branch_id
-            })
-            .ok_or(Error::Denied(
+        let parsed = ExecutionRef::parse(&owner.canonical_agent_ref)
+            .map_err(|_| Error::Denied("invalid finite Job exposure owner"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid finite Job exposure owner"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "finite Job exposure owner is not an Agent root",
+            ));
+        }
+        let binding = self.binding_for_agent_ref(resolved.agent_ref())?;
+        if binding.session_id != owner.session_id || binding.branch_id != owner.branch_id {
+            return Err(Error::Denied(
                 "finite Job exposure owner is unavailable or unauthorized",
-            ))
+            ));
+        }
+        Ok(binding)
     }
 
     fn list_scope_fingerprint(&self, binding: &AgentBindingInfo) -> [u8; 32] {
@@ -1188,6 +1232,29 @@ impl Router {
             owner: participation.owner,
             authority,
         };
+        let source = admission.authority.source();
+        self.store
+            .store_agent_job_wake_admission(aw_store::AgentJobWakeAdmission {
+                recipient_ref: canonical.clone(),
+                actor: ctx.actor.as_str().to_owned(),
+                authority_ref: authority_ref.clone(),
+                session_id: execution.session_id().to_owned(),
+                membership_epoch: participation.membership_epoch,
+                audience_epoch: participation.audience_epoch,
+                owner: participation.owner,
+                tool_name: admission.authority.name().to_owned(),
+                source_kind: source.kind_label().to_owned(),
+                source_id: source.id.clone(),
+                source_epoch: source.epoch,
+                execution_site: admission.authority.execution_site().to_owned(),
+                visible: admission.authority.visible(),
+                registry_revision: admission
+                    .authority
+                    .visible()
+                    .then(|| admission.authority.registry_revision()),
+                authority_revision: admission.authority.authority_revision(),
+                effect: admission.authority.effect_label().to_owned(),
+            })?;
         let mut admissions = self
             .wake_admissions
             .lock()
@@ -1209,15 +1276,113 @@ impl Router {
         recipient: &AgentWakeRecipient,
         expected_actor: Option<&PrincipalId>,
     ) -> Result<WakeAdmission> {
-        let admission = self
+        let cached = self
             .wake_admissions
             .lock()
             .map_err(|_| Error::Storage("Agent wake admission registry poisoned"))?
             .get(&recipient.authority_ref)
-            .cloned()
-            .ok_or(Error::Denied(
-                "wake recipient admission is stale or unknown",
-            ))?;
+            .cloned();
+
+        let admission = if let Some(admission) = cached {
+            admission
+        } else {
+            let receipt = self
+                .store
+                .agent_job_wake_admission(&recipient.authority_ref)?
+                .ok_or(Error::Denied(
+                    "wake recipient admission is stale or unknown",
+                ))?;
+            if receipt.recipient_ref != recipient.canonical_ref {
+                return Err(Error::Denied("wake recipient admission identity changed"));
+            }
+            let actor = PrincipalId::new(receipt.actor.clone())?;
+            if expected_actor.is_some_and(|expected| expected != &actor) {
+                return Err(Error::Denied("wake recipient admission actor changed"));
+            }
+            let participation = self.store.authorize_session_participation(
+                &actor,
+                &receipt.session_id,
+                aw_store::SessionParticipationAction::Control,
+            )?;
+            if participation.membership_epoch != receipt.membership_epoch
+                || participation.audience_epoch != receipt.audience_epoch
+                || participation.owner != receipt.owner
+            {
+                return Err(Error::Denied(
+                    "wake participant membership/audience changed after registration",
+                ));
+            }
+            let live = self
+                .owners
+                .lock()
+                .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?
+                .get(&receipt.recipient_ref)
+                .cloned()
+                .ok_or(Error::Denied("wake recipient is no longer live"))?;
+            if live.wake.is_none() {
+                return Err(Error::Denied(
+                    "wake recipient no longer owns bounded automatic work",
+                ));
+            }
+            let authority = if receipt.visible {
+                WakeAuthority::Visible(
+                    live.wake_authority
+                        .permitted_binding(&actor, &receipt.tool_name)?,
+                )
+            } else {
+                if receipt.source_kind != "host"
+                    || receipt.source_id != ToolSource::trusted_host().id
+                    || receipt.source_epoch != ToolSource::trusted_host().epoch
+                    || receipt.effect != "control"
+                {
+                    return Err(Error::Denied("hidden wake admission source/effect changed"));
+                }
+                WakeAuthority::Hidden(live.wake_authority.permitted_capability_binding(
+                    &actor,
+                    &receipt.tool_name,
+                    &ToolSource::trusted_host(),
+                    &ToolEffect::Control,
+                )?)
+            };
+            if !authority.matches_receipt(&receipt) {
+                return Err(Error::Denied(
+                    "jobs_subscribe grant changed after wake registration",
+                ));
+            }
+            let expected_ref = Self::wake_authority_ref(
+                &receipt.recipient_ref,
+                &actor,
+                &receipt.session_id,
+                receipt.membership_epoch,
+                receipt.audience_epoch,
+                receipt.owner,
+                &authority,
+            );
+            if expected_ref != recipient.authority_ref {
+                return Err(Error::Denied(
+                    "wake recipient admission digest no longer matches",
+                ));
+            }
+            let admission = WakeAdmission {
+                recipient_ref: receipt.recipient_ref,
+                actor,
+                session_id: receipt.session_id,
+                membership_epoch: receipt.membership_epoch,
+                audience_epoch: receipt.audience_epoch,
+                owner: receipt.owner,
+                authority,
+            };
+            let mut admissions = self
+                .wake_admissions
+                .lock()
+                .map_err(|_| Error::Storage("Agent wake admission registry poisoned"))?;
+            if admissions.len() >= self.finite_capacity.clamp(64, 8_192) {
+                return Err(Error::Limit("Agent wake admission registry is full"));
+            }
+            admissions.insert(recipient.authority_ref.clone(), admission.clone());
+            admission
+        };
+
         if admission.recipient_ref != recipient.canonical_ref
             || expected_actor.is_some_and(|actor| actor != &admission.actor)
         {
@@ -1264,6 +1429,46 @@ impl Router {
                 .revalidate_capability(&admission.actor, binding)?,
         }
         Ok(admission)
+    }
+
+    fn revision_receiver(
+        &self,
+        binding: &AgentBindingInfo,
+    ) -> Result<tokio::sync::watch::Receiver<u64>> {
+        let canonical = Self::canonical(binding);
+        let current = self.revision(binding)?;
+        let mut watchers = self
+            .revision_watchers
+            .lock()
+            .map_err(|_| Error::Storage("Agent revision watcher registry poisoned"))?;
+        if let Some(sender) = watchers.get(&canonical) {
+            if *sender.borrow() != current {
+                sender.send_replace(current);
+            }
+            return Ok(sender.subscribe());
+        }
+        if watchers.len() >= self.finite_capacity.clamp(64, 8_192) {
+            return Err(Error::Limit("Agent revision watcher capacity exhausted"));
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(current);
+        watchers.insert(canonical, sender);
+        Ok(receiver)
+    }
+
+    fn publish_revision(&self, binding: &AgentBindingInfo) -> Result<()> {
+        let canonical = Self::canonical(binding);
+        let current = self.revision(binding)?;
+        if let Some(sender) = self
+            .revision_watchers
+            .lock()
+            .map_err(|_| Error::Storage("Agent revision watcher registry poisoned"))?
+            .get(&canonical)
+        {
+            if *sender.borrow() != current {
+                sender.send_replace(current);
+            }
+        }
+        Ok(())
     }
 
     fn live_owner(&self, canonical: &str) -> Result<LiveOwner> {
@@ -1360,39 +1565,7 @@ impl AgentJobRouter for Router {
                 ));
             }
             let current = Self::current_agent(ctx)?;
-            let current_ref = current.canonical();
-            let bindings = self.store.agent_bindings(&self.actor)?;
-            let current_binding = bindings
-                .iter()
-                .find(|binding| Self::canonical(binding) == current_ref)
-                .cloned()
-                .ok_or(Error::Denied(
-                    "current Agent is unavailable from durable Job-list scope",
-                ))?;
-
-            let mut roots = Vec::<(u64, String)>::new();
-            for binding in bindings.into_iter().filter(|binding| {
-                binding.domain_handle == current_binding.domain_handle
-                    && binding.identity_handle == current_binding.identity_handle
-                    && binding.project_handle == current_binding.project_handle
-            }) {
-                let position = self
-                    .store
-                    .agent_job_exposure_position(&self.actor, &binding)?;
-                roots.push((position, Self::canonical(&binding)));
-            }
-            for finite in self.store.finite_job_exposures(
-                &self.actor,
-                &current_binding,
-                &self.exposure_generation,
-                self.finite_capacity,
-            )? {
-                roots.push((finite.position, finite.canonical_ref));
-            }
-            roots.sort_by(|(position_a, ref_a), (position_b, ref_b)| {
-                position_b.cmp(position_a).then_with(|| ref_a.cmp(ref_b))
-            });
-            roots.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+            let current_binding = self.binding_for_agent_ref(&current)?;
 
             let cursor = request
                 .cursor
@@ -1401,26 +1574,26 @@ impl AgentJobRouter for Router {
                     self.decode_list_cursor(cursor, &current_binding, request.authority_fingerprint)
                 })
                 .transpose()?;
-            let mut eligible = roots.into_iter().filter(|(position, _)| {
-                cursor.is_none_or(|cursor_position| *position < cursor_position)
-            });
-            let mut page = eligible
-                .by_ref()
-                .take(request.limit.saturating_add(1))
-                .collect::<Vec<_>>();
+            let mut page = self.store.job_exposure_page(
+                &self.actor,
+                &current_binding,
+                &self.exposure_generation,
+                cursor,
+                request.limit.saturating_add(1),
+            )?;
             let has_more = page.len() > request.limit;
             if has_more {
                 page.truncate(request.limit);
             }
             let items = page
                 .iter()
-                .map(|(position, reference)| {
+                .map(|item| {
                     Ok(AgentJobListItem {
-                        reference: reference.clone(),
+                        reference: item.canonical_ref.clone(),
                         after_cursor: self.encode_list_cursor(
                             &current_binding,
                             request.authority_fingerprint,
-                            *position,
+                            item.position,
                         )?,
                     })
                 })
@@ -1439,15 +1612,29 @@ impl AgentJobRouter for Router {
             let Some(target) = self.resolve(ctx, &request.reference)? else {
                 return Ok(None);
             };
-            let started = Instant::now();
-            let wait = Duration::from_millis(request.wait_ms);
+            let binding = match &target {
+                Target::Agent { binding, .. } | Target::Turn { binding, .. } => binding,
+            };
+            let mut revision = self.revision_receiver(binding)?;
             let mut snapshot = self.snapshot(&target)?;
             let baseline = request.revision.unwrap_or(snapshot.0);
-            while snapshot.0 == baseline && request.wait_ms != 0 && started.elapsed() < wait {
-                tokio::time::sleep(
-                    Duration::from_millis(10).min(wait.saturating_sub(started.elapsed())),
-                )
-                .await;
+            if snapshot.0 == baseline && request.wait_ms != 0 {
+                let wait = Duration::from_millis(request.wait_ms);
+                if *revision.borrow() == baseline {
+                    tokio::select! {
+                        biased;
+                        _ = ctx.cancellation.cancelled() => return Err(Error::Cancelled),
+                        changed = revision.changed() => {
+                            let _ = changed;
+                        }
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+                self.store.authorize_session_participation(
+                    &ctx.actor,
+                    &binding.session_id,
+                    aw_store::SessionParticipationAction::View,
+                )?;
                 snapshot = self.snapshot(&target)?;
             }
             Ok(Some(self.bounded_text(ctx, &snapshot.1)?))
@@ -1499,6 +1686,7 @@ impl AgentJobRouter for Router {
                     if let Some(wake) = &live.wake {
                         wake.wake()?;
                     }
+                    self.publish_revision(&binding)?;
                     let revision = self.revision(&binding)?;
                     Ok(Some(ToolOutput::text(format!(
                         "{canonical} agent waiting rev={revision} queued={} queue_ref={}",
@@ -1518,6 +1706,7 @@ impl AgentJobRouter for Router {
                                 request.revision,
                                 &text,
                             )?;
+                            self.publish_revision(&binding)?;
                             let revision = self.revision(&binding)?;
                             Ok(Some(ToolOutput::text(format!(
                                 "{canonical} turn running rev={revision} steer={} segment={}",
@@ -1535,6 +1724,7 @@ impl AgentJobRouter for Router {
                             if let Some(wake) = &live.wake {
                                 wake.wake()?;
                             }
+                            self.publish_revision(&binding)?;
                             let revision = self.revision(&binding)?;
                             Ok(Some(ToolOutput::text(format!(
                                 "{agent_ref} agent waiting rev={revision} queued={} queue_ref={}",
@@ -1548,6 +1738,7 @@ impl AgentJobRouter for Router {
                                 request.revision,
                                 &text,
                             )?;
+                            self.publish_revision(&binding)?;
                             let revision = self.revision(&binding)?;
                             Ok(Some(ToolOutput::text(format!(
                                 "{canonical} turn running rev={revision} interrupt={} segment={}",
@@ -1589,19 +1780,116 @@ impl AgentJobRouter for Router {
             if newly_admitted {
                 wake.wake()?;
             }
+            let recipient_ref = ExecutionRef::parse(&admission.recipient_ref)
+                .map_err(|_| Error::Denied("invalid canonical Agent wake recipient"))?
+                .resolve(None, None)
+                .map_err(|_| Error::Denied("invalid canonical Agent wake recipient"))?;
+            if recipient_ref.suffix().is_empty() {
+                let binding = self.binding_for_agent_ref(recipient_ref.agent_ref())?;
+                self.publish_revision(&binding)?;
+            }
             Ok(())
         })
     }
 
     fn subscribe<'a>(
         &'a self,
-        _ctx: &'a ToolContext,
-        _request: AgentJobSubscribe,
+        ctx: &'a ToolContext,
+        request: AgentJobSubscribe,
     ) -> AgentJobFuture<'a> {
-        Box::pin(async {
-            Err(Error::Denied(
-                "Agent-source subscriptions require durable source event ownership",
-            ))
+        Box::pin(async move {
+            let Some(target) = self.resolve(ctx, &request.reference)? else {
+                return Ok(None);
+            };
+            self.revalidate_wake_admission(&request.recipient, Some(&ctx.actor))?;
+
+            for rule in request.rules.as_slice() {
+                match rule.event {
+                    JobEventKind::Attention => return Err(Error::Denied(
+                        "Agent attention subscriptions require an attention-capable source owner",
+                    )),
+                    JobEventKind::Result | JobEventKind::Settled => {
+                        if !matches!(rule.mode, JobWakeMode::Auto | JobWakeMode::Queue) {
+                            return Err(Error::Denied(
+                                "Agent result/settled wake supports only auto or queue",
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let (canonical, binding, turn) = match target {
+                Target::Agent { canonical, binding } => (canonical, binding, None),
+                Target::Turn {
+                    canonical,
+                    binding,
+                    turn,
+                } => (canonical, binding, Some(turn)),
+            };
+            if Self::canonical(&binding) == request.recipient.canonical_ref {
+                return Err(Error::Denied(
+                    "Agent event source cannot subscribe its own Agent",
+                ));
+            }
+            let (source, update) = self.store.replace_agent_job_subscription(
+                &ctx.actor,
+                &binding.session_id,
+                &binding.branch_id,
+                turn,
+                request.revision,
+                &request.recipient.canonical_ref,
+                &request.recipient.authority_ref,
+                request.rules,
+                self.finite_capacity.clamp(64, 8_192),
+            )?;
+            if source != canonical {
+                return Err(Error::Storage(
+                    "Agent Job subscription source canonicalization changed",
+                ));
+            }
+            self.publish_revision(&binding)?;
+            Ok(Some(ToolOutput::text(format!(
+                "{canonical} subscription={} generation={}{}",
+                if update.active { "active" } else { "cleared" },
+                update.generation,
+                if update.changed { "" } else { " unchanged" },
+            ))))
+        })
+    }
+
+    fn deliver_source_events<'a>(&'a self, canonical_agent_ref: &'a str) -> AgentEventFuture<'a> {
+        Box::pin(async move {
+            let parsed = ExecutionRef::parse(canonical_agent_ref)
+                .map_err(|_| Error::Denied("invalid canonical Agent event owner ref"))?;
+            let resolved = parsed
+                .resolve(None, None)
+                .map_err(|_| Error::Denied("invalid canonical Agent event owner ref"))?;
+            if !resolved.suffix().is_empty() {
+                return Err(Error::Denied(
+                    "Agent event delivery owner must be an Agent root",
+                ));
+            }
+            let binding = self.binding_for_agent_ref(resolved.agent_ref())?;
+            let pending = self.store.pending_agent_job_events(
+                &self.actor,
+                &binding.session_id,
+                &binding.branch_id,
+            )?;
+            for delivery in pending {
+                match self.admit_event(delivery.clone()).await {
+                    Ok(()) | Err(Error::Denied(_) | Error::Conflict(_) | Error::Limit(_)) => {
+                        self.store.ack_agent_job_event(
+                            &self.actor,
+                            &binding.session_id,
+                            &binding.branch_id,
+                            &delivery,
+                        )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            self.publish_revision(&binding)?;
+            Ok(())
         })
     }
 
@@ -1660,6 +1948,7 @@ impl AgentJobRouter for Router {
                         "delegated Agent has no live close controller",
                     ))?;
                     wake.close()?;
+                    self.publish_revision(&binding)?;
                     let revision = self.revision(&binding)?;
                     Ok(Some(ToolOutput::text(format!(
                         "{canonical} agent closing rev={revision} control={request_id}"
@@ -1675,6 +1964,7 @@ impl AgentJobRouter for Router {
                     let fact =
                         live.owner
                             .jobs_cancel_turn(ctx, &canonical, turn, request.revision)?;
+                    self.publish_revision(&binding)?;
                     let revision = self.revision(&binding)?;
                     let state = match fact.state {
                         aw_store::ActorControlState::Applied => "cancelling",
@@ -1837,6 +2127,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jobs_get_wait_wakes_on_authoritative_agent_revision_without_polling() {
+        let actor = PrincipalId::new("internal:fixture:wait-owner").unwrap();
+        let store = SessionStore::in_memory().unwrap();
+        let (session, branch) = store.create(&actor, "wait Agent", binding()).unwrap();
+        let binding_info = store
+            .agent_binding(&actor, &session.id, &branch.id)
+            .unwrap();
+        let router = Router::new(store.clone(), actor.clone(), 8).unwrap();
+
+        let baseline = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        let wait_router = router.clone();
+        let wait_ctx = context(&actor, &binding_info, ToolEffect::Read);
+        let waiter = tokio::spawn(async move {
+            wait_router
+                .get(
+                    &wait_ctx,
+                    AgentJobGet {
+                        reference: ".".into(),
+                        revision: Some(baseline),
+                        wait_ms: 5_000,
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap()
+        });
+
+        store
+            .set_title(&actor, &session.id, "wait Agent changed")
+            .unwrap();
+        router.publish_revision(&binding_info).unwrap();
+
+        let current = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        assert!(current > baseline);
+        let observed = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("revision signal must wake jobs_get without polling")
+            .unwrap();
+        assert!(observed.content.contains(&format!("rev={current}")));
+    }
+
+    #[tokio::test]
     async fn revoked_shared_participant_cannot_receive_committed_wake_or_reuse_history_cursor() {
         use aw_tools::job_event::{
             EventRule, EventRuleSet, JobEventKind, JobWakeMode, SourceEventBook,
@@ -1913,13 +2249,14 @@ mod tests {
         )
         .unwrap();
         let wake = Arc::new(CountingWake::default());
+        let wake_authority = agent.tool_binding_authority();
         let router = Router::new(store.clone(), alice.clone(), 8).unwrap();
         router
             .register_live_owner_with_wake(
                 &Router::canonical(&binding_info),
-                owner,
+                owner.clone(),
                 Some(wake.clone()),
-                agent.tool_binding_authority(),
+                wake_authority.clone(),
             )
             .unwrap();
 
@@ -1953,6 +2290,19 @@ mod tests {
             .unwrap()
             .expect("shared participant has explicit bounded wake authority");
         assert_eq!(recipient.canonical_ref, Router::canonical(&binding_info));
+
+        let restarted = Router::new(store.clone(), alice.clone(), 8).unwrap();
+        restarted
+            .register_live_owner_with_wake(
+                &Router::canonical(&binding_info),
+                owner,
+                Some(wake.clone()),
+                wake_authority,
+            )
+            .unwrap();
+        restarted
+            .revalidate_wake_recipient(&subscribe_ctx, &recipient)
+            .expect("fresh Router must recover and revalidate durable wake admission");
 
         let mut source = SourceEventBook::default();
         let rules =

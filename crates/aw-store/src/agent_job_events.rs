@@ -1,0 +1,769 @@
+//! Durable source-owned Job event state for Agent/Turn resources.
+//!
+//! The shared aw-tools SourceEventBook owns rule replacement, subscription
+//! generations and event revisions. This module only binds that pure state to
+//! the authoritative SQLite Agent/Turn lifecycle and stores exact committed
+//! deliveries until the existing Agent Job router attempts receiver admission.
+
+use crate::{
+    agent_binding_in, audit, db, now, session_in, session_participation, Error, PrincipalId,
+    Result, SessionStore,
+};
+use aw_store_api::AgentBindingInfo;
+use aw_tools::job_event::{
+    EventRuleSet, JobEventDelivery, JobEventKind, SourceEventBook, SubscriptionUpdate,
+};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentJobWakeAdmission {
+    pub recipient_ref: String,
+    pub actor: String,
+    pub authority_ref: String,
+    pub session_id: String,
+    pub membership_epoch: u64,
+    pub audience_epoch: u64,
+    pub owner: bool,
+    pub tool_name: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub source_epoch: u64,
+    pub execution_site: String,
+    pub visible: bool,
+    pub registry_revision: Option<u64>,
+    pub authority_revision: u64,
+    pub effect: String,
+}
+
+impl AgentJobWakeAdmission {
+    fn validate(&self) -> Result<()> {
+        let bounded = |value: &str, max: usize| {
+            !value.is_empty()
+                && value.len() <= max
+                && value.is_ascii()
+                && !value.chars().any(char::is_control)
+        };
+        if !bounded(&self.recipient_ref, 2048)
+            || !bounded(&self.actor, 256)
+            || !bounded(&self.authority_ref, 256)
+            || !bounded(&self.session_id, 256)
+            || !bounded(&self.tool_name, 256)
+            || !matches!(self.source_kind.as_str(), "host" | "mcp" | "extension")
+            || !bounded(&self.source_id, 256)
+            || !bounded(&self.execution_site, 256)
+            || self.membership_epoch == 0
+            || self.audience_epoch == 0
+            || self.source_epoch == 0
+            || self.authority_revision == 0
+            || self.visible != self.registry_revision.is_some()
+            || !matches!(
+                self.effect.as_str(),
+                "read" | "write" | "process" | "control" | "unknown"
+            )
+        {
+            return Err(Error::Denied("invalid Agent Job wake admission receipt"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SourceState {
+    book: SourceEventBook,
+    last_result_turn: u64,
+    settled: bool,
+    pending: Vec<JobEventDelivery>,
+}
+
+fn canonical(binding: &AgentBindingInfo) -> String {
+    format!(
+        "/d:{}/i:{}/p:{}/a:{}",
+        binding.domain_handle,
+        binding.identity_handle,
+        binding.project_handle,
+        binding.agent_handle
+    )
+}
+
+fn source_ref(binding: &AgentBindingInfo, turn: Option<u64>) -> String {
+    let root = canonical(binding);
+    turn.map_or(root.clone(), |turn| format!("{root}/t:{turn}"))
+}
+
+fn current_revision(c: &rusqlite::Connection, session: &str) -> Result<u64> {
+    let seq: u64 = db(c.query_row(
+        "SELECT COALESCE(MAX(seq),0) FROM audit WHERE session_id=?1",
+        [session],
+        |row| row.get(0),
+    ))?;
+    seq.checked_add(1)
+        .ok_or(Error::Limit("Agent public revision exhausted"))
+}
+
+fn latest_attached_turn(c: &rusqlite::Connection, session: &str, branch: &str) -> Result<u64> {
+    db(c.query_row(
+        "SELECT COALESCE(MAX(turn_id),0) FROM runs
+         WHERE session_id=?1 AND branch_id=?2
+           AND status<>'running' AND attach_status='attached'",
+        params![session, branch],
+        |row| row.get(0),
+    ))
+}
+
+fn turn_is_attached(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    turn: u64,
+) -> Result<bool> {
+    db(c.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM runs
+            WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3
+              AND status<>'running' AND attach_status='attached'
+         )",
+        params![session, branch, turn],
+        |row| row.get(0),
+    ))
+}
+
+fn row(c: &rusqlite::Connection, source: &str) -> Result<Option<SourceState>> {
+    let encoded: Option<(String, u64, i64, String)> = db(c
+        .query_row(
+            "SELECT event_book_json,last_result_turn,settled,pending_deliveries_json
+             FROM agent_job_event_sources WHERE source_ref=?1",
+            [source],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional())?;
+    encoded
+        .map(|(book, last_result_turn, settled, pending)| {
+            let book: SourceEventBook = serde_json::from_str(&book)
+                .map_err(|_| Error::Storage("cannot decode Agent Job event source state"))?;
+            book.validate().map_err(Error::Storage)?;
+            let pending: Vec<JobEventDelivery> = serde_json::from_str(&pending)
+                .map_err(|_| Error::Storage("cannot decode pending Agent Job events"))?;
+            for delivery in &pending {
+                delivery.validate().map_err(Error::Storage)?;
+                if delivery.source_ref != source {
+                    return Err(Error::Storage(
+                        "pending Agent Job event belongs to another source",
+                    ));
+                }
+            }
+            Ok(SourceState {
+                book,
+                last_result_turn,
+                settled: settled != 0,
+                pending,
+            })
+        })
+        .transpose()
+}
+
+fn save(
+    c: &rusqlite::Connection,
+    binding: &AgentBindingInfo,
+    turn: Option<u64>,
+    state: &SourceState,
+) -> Result<()> {
+    let source = source_ref(binding, turn);
+    let book = serde_json::to_string(&state.book)
+        .map_err(|_| Error::Storage("cannot encode Agent Job event source state"))?;
+    let pending = serde_json::to_string(&state.pending)
+        .map_err(|_| Error::Storage("cannot encode pending Agent Job events"))?;
+    db(c.execute(
+        "INSERT INTO agent_job_event_sources(
+            source_ref,session_id,branch_id,turn_id,event_book_json,
+            last_result_turn,settled,pending_deliveries_json,updated_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(source_ref) DO UPDATE SET
+            event_book_json=excluded.event_book_json,
+            last_result_turn=excluded.last_result_turn,
+            settled=excluded.settled,
+            pending_deliveries_json=excluded.pending_deliveries_json,
+            updated_at=excluded.updated_at",
+        params![
+            source,
+            binding.session_id,
+            binding.branch_id,
+            turn,
+            book,
+            state.last_result_turn,
+            i64::from(state.settled),
+            pending,
+            now(),
+        ],
+    ))?;
+    Ok(())
+}
+
+fn agent_is_settled(c: &rusqlite::Connection, session: &str) -> Result<bool> {
+    let state: Option<String> = db(c
+        .query_row(
+            "SELECT state FROM subagent_sessions
+             WHERE child_session_id=?1
+             ORDER BY created_at DESC LIMIT 1",
+            [session],
+            |row| row.get(0),
+        )
+        .optional())?;
+    Ok(state.is_some_and(|state| state != "running"))
+}
+
+fn initial_state(
+    c: &rusqlite::Connection,
+    binding: &AgentBindingInfo,
+    turn: Option<u64>,
+) -> Result<SourceState> {
+    let turn_settled = turn
+        .map(|turn| turn_is_attached(c, &binding.session_id, &binding.branch_id, turn))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(SourceState {
+        book: SourceEventBook::default(),
+        last_result_turn: match turn {
+            Some(turn) if turn_settled => turn,
+            Some(_) => 0,
+            None => latest_attached_turn(c, &binding.session_id, &binding.branch_id)?,
+        },
+        settled: match turn {
+            Some(_) => turn_settled,
+            None => agent_is_settled(c, &binding.session_id)?,
+        },
+        pending: Vec::new(),
+    })
+}
+
+fn commit_source(
+    c: &rusqlite::Connection,
+    binding: &AgentBindingInfo,
+    turn: Option<u64>,
+    events: &[JobEventKind],
+    result_turn: Option<u64>,
+    settle: bool,
+    actor: &PrincipalId,
+) -> Result<()> {
+    let source = source_ref(binding, turn);
+    let Some(mut state) = row(c, &source)? else {
+        return Ok(());
+    };
+    if let Some(result_turn) = result_turn {
+        if result_turn <= state.last_result_turn {
+            return Ok(());
+        }
+        state.last_result_turn = result_turn;
+    }
+    if settle {
+        if state.settled {
+            return Ok(());
+        }
+        state.settled = true;
+    }
+    let deliveries = state.book.commit(&source, events).map_err(Error::Storage)?;
+    state.pending.extend(deliveries);
+    save(c, binding, turn, &state)?;
+    audit(
+        c,
+        &binding.session_id,
+        actor,
+        "agent.job.event",
+        serde_json::json!({
+            "source_ref": source,
+            "turn_id": turn,
+            "result_turn": result_turn,
+            "events": events.iter().map(|event| event.as_str()).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+pub(crate) fn commit_turn_settled_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    turn: u64,
+) -> Result<()> {
+    let owner = session_in(c, session)?.owner;
+    let binding = agent_binding_in(c, &owner, session, branch)?;
+    commit_source(
+        c,
+        &binding,
+        None,
+        &[JobEventKind::Result],
+        Some(turn),
+        false,
+        &owner,
+    )?;
+    commit_source(
+        c,
+        &binding,
+        Some(turn),
+        &[JobEventKind::Result, JobEventKind::Settled],
+        Some(turn),
+        true,
+        &owner,
+    )
+}
+
+pub(crate) fn commit_agent_settled_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    actor: &PrincipalId,
+) -> Result<()> {
+    let binding = agent_binding_in(c, actor, session, branch)?;
+    commit_source(
+        c,
+        &binding,
+        None,
+        &[JobEventKind::Settled],
+        None,
+        true,
+        actor,
+    )
+}
+
+impl SessionStore {
+    pub fn store_agent_job_wake_admission(&self, receipt: AgentJobWakeAdmission) -> Result<()> {
+        receipt.validate()?;
+        let actor = PrincipalId::new(receipt.actor.clone())?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let participation = session_participation::authorize_in(
+            &tx,
+            &actor,
+            &receipt.session_id,
+            session_participation::SessionParticipationAction::Control,
+        )?;
+        if participation.membership_epoch != receipt.membership_epoch
+            || participation.audience_epoch != receipt.audience_epoch
+            || participation.owner != receipt.owner
+        {
+            return Err(Error::Denied(
+                "Agent Job wake admission participation changed before persistence",
+            ));
+        }
+        db(tx.execute(
+            "INSERT INTO agent_job_wake_admissions(
+                recipient_ref,actor,authority_ref,session_id,membership_epoch,audience_epoch,
+                is_owner,tool_name,source_kind,source_id,source_epoch,execution_site,
+                is_visible,registry_revision,authority_revision,effect,updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+             ON CONFLICT(recipient_ref,actor) DO UPDATE SET
+                authority_ref=excluded.authority_ref,
+                session_id=excluded.session_id,
+                membership_epoch=excluded.membership_epoch,
+                audience_epoch=excluded.audience_epoch,
+                is_owner=excluded.is_owner,
+                tool_name=excluded.tool_name,
+                source_kind=excluded.source_kind,
+                source_id=excluded.source_id,
+                source_epoch=excluded.source_epoch,
+                execution_site=excluded.execution_site,
+                is_visible=excluded.is_visible,
+                registry_revision=excluded.registry_revision,
+                authority_revision=excluded.authority_revision,
+                effect=excluded.effect,
+                updated_at=excluded.updated_at",
+            params![
+                receipt.recipient_ref,
+                receipt.actor,
+                receipt.authority_ref,
+                receipt.session_id,
+                receipt.membership_epoch,
+                receipt.audience_epoch,
+                i64::from(receipt.owner),
+                receipt.tool_name,
+                receipt.source_kind,
+                receipt.source_id,
+                receipt.source_epoch,
+                receipt.execution_site,
+                i64::from(receipt.visible),
+                receipt.registry_revision,
+                receipt.authority_revision,
+                receipt.effect,
+                now(),
+            ],
+        ))?;
+        db(tx.commit())?;
+        Ok(())
+    }
+
+    pub fn agent_job_wake_admission(
+        &self,
+        authority_ref: &str,
+    ) -> Result<Option<AgentJobWakeAdmission>> {
+        if authority_ref.is_empty()
+            || authority_ref.len() > 256
+            || !authority_ref.is_ascii()
+            || authority_ref.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid Agent Job wake admission identity"));
+        }
+        let connection = self.connection()?;
+        let receipt = db(connection
+            .query_row(
+                "SELECT recipient_ref,actor,authority_ref,session_id,membership_epoch,
+                        audience_epoch,is_owner,tool_name,source_kind,source_id,source_epoch,
+                        execution_site,is_visible,registry_revision,authority_revision,effect
+                 FROM agent_job_wake_admissions WHERE authority_ref=?1",
+                [authority_ref],
+                |row| {
+                    Ok(AgentJobWakeAdmission {
+                        recipient_ref: row.get(0)?,
+                        actor: row.get(1)?,
+                        authority_ref: row.get(2)?,
+                        session_id: row.get(3)?,
+                        membership_epoch: row.get(4)?,
+                        audience_epoch: row.get(5)?,
+                        owner: row.get::<_, i64>(6)? != 0,
+                        tool_name: row.get(7)?,
+                        source_kind: row.get(8)?,
+                        source_id: row.get(9)?,
+                        source_epoch: row.get(10)?,
+                        execution_site: row.get(11)?,
+                        visible: row.get::<_, i64>(12)? != 0,
+                        registry_revision: row.get(13)?,
+                        authority_revision: row.get(14)?,
+                        effect: row.get(15)?,
+                    })
+                },
+            )
+            .optional())?;
+        if let Some(receipt) = &receipt {
+            receipt.validate()?;
+        }
+        Ok(receipt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_agent_job_subscription(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        turn: Option<u64>,
+        expected_revision: Option<u64>,
+        recipient_ref: &str,
+        recipient_authority_ref: &str,
+        rules: EventRuleSet,
+        capacity: usize,
+    ) -> Result<(String, SubscriptionUpdate)> {
+        if capacity == 0 || capacity > 8_192 {
+            return Err(Error::Limit("invalid Agent Job subscription capacity"));
+        }
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        session_participation::authorize_in(
+            &tx,
+            actor,
+            session,
+            session_participation::SessionParticipationAction::Control,
+        )?;
+        let binding = agent_binding_in(&tx, actor, session, branch)?;
+        if let Some(expected) = expected_revision {
+            if current_revision(&tx, session)? != expected {
+                return Err(Error::Conflict("stale Agent revision"));
+            }
+        }
+        if let Some(turn) = turn {
+            let exists: bool = db(tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runs
+                    WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3
+                 )",
+                params![session, branch, turn],
+                |row| row.get(0),
+            ))?;
+            if !exists {
+                return Err(Error::Denied("Turn subscription source is unavailable"));
+            }
+        }
+        let source = source_ref(&binding, turn);
+        let existing = row(&tx, &source)?;
+        if existing.is_none() && rules.is_empty() {
+            db(tx.commit())?;
+            return Ok((
+                source,
+                SubscriptionUpdate {
+                    generation: 0,
+                    changed: false,
+                    active: false,
+                },
+            ));
+        }
+        let mut state = match existing {
+            Some(state) => state,
+            None => initial_state(&tx, &binding, turn)?,
+        };
+        if state.settled && !rules.is_empty() {
+            return Err(Error::Conflict(
+                "Agent Job subscription source is already settled",
+            ));
+        }
+        if state.book.generation_for(recipient_ref).is_none()
+            && !rules.is_empty()
+            && state.book.subscription_count() >= capacity
+        {
+            return Err(Error::Limit("Agent Job subscription capacity exhausted"));
+        }
+        let update = state
+            .book
+            .replace(recipient_ref, recipient_authority_ref, rules)
+            .map_err(Error::Denied)?;
+        if update.changed {
+            save(&tx, &binding, turn, &state)?;
+            audit(
+                &tx,
+                session,
+                actor,
+                "agent.job.subscription",
+                serde_json::json!({
+                    "source_ref": source,
+                    "recipient_ref": recipient_ref,
+                    "generation": update.generation,
+                    "active": update.active,
+                }),
+            )?;
+        }
+        db(tx.commit())?;
+        Ok((source, update))
+    }
+
+    pub fn pending_agent_job_events(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<Vec<JobEventDelivery>> {
+        let connection = self.connection()?;
+        let binding = agent_binding_in(&connection, actor, session, branch)?;
+        let root = canonical(&binding);
+        let mut query = db(connection.prepare(
+            "SELECT source_ref,pending_deliveries_json
+             FROM agent_job_event_sources
+             WHERE session_id=?1 AND branch_id=?2 AND pending_deliveries_json<>'[]'
+             ORDER BY CASE WHEN source_ref=?3 THEN 0 ELSE 1 END, source_ref",
+        ))?;
+        let rows = db(query.query_map(params![session, branch, root], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, encoded) = db(row)?;
+            let deliveries: Vec<JobEventDelivery> = serde_json::from_str(&encoded)
+                .map_err(|_| Error::Storage("cannot decode pending Agent Job events"))?;
+            for delivery in deliveries {
+                delivery.validate().map_err(Error::Storage)?;
+                if delivery.source_ref != source {
+                    return Err(Error::Storage(
+                        "pending Agent Job event belongs to another source",
+                    ));
+                }
+                out.push(delivery);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn ack_agent_job_event(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        delivery: &JobEventDelivery,
+    ) -> Result<()> {
+        delivery.validate().map_err(Error::Denied)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let binding = agent_binding_in(&tx, actor, session, branch)?;
+        let root = canonical(&binding);
+        if delivery.source_ref != root
+            && !delivery
+                .source_ref
+                .strip_prefix(&format!("{root}/t:"))
+                .is_some_and(|turn| {
+                    turn.parse::<u64>()
+                        .ok()
+                        .is_some_and(|value| value != 0 && value.to_string() == turn)
+                })
+        {
+            return Err(Error::Denied(
+                "Agent Job event ACK belongs to another source",
+            ));
+        }
+        let Some(mut state) = row(&tx, &delivery.source_ref)? else {
+            db(tx.commit())?;
+            return Ok(());
+        };
+        let before = state.pending.len();
+        state.pending.retain(|candidate| candidate != delivery);
+        if state.pending.len() != before {
+            let turn = delivery
+                .source_ref
+                .strip_prefix(&format!("{root}/t:"))
+                .and_then(|value| value.parse::<u64>().ok());
+            save(&tx, &binding, turn, &state)?;
+        }
+        db(tx.commit())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aw_agent_core::{
+        Agent, AgentOptions, CompletionFuture, DeltaSink, Message, Outcome, Provider, Turn,
+        TurnJournal, TurnStart,
+    };
+    use aw_store_api::SessionBinding;
+    use aw_tools::job_event::{EventRule, JobWakeMode};
+    use std::{path::PathBuf, sync::Arc};
+
+    struct UnusedProvider;
+
+    impl Provider for UnusedProvider {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async { Err(aw_agent_core::Error::Protocol("unused provider")) })
+        }
+    }
+
+    fn binding() -> SessionBinding {
+        SessionBinding {
+            working_directory: PathBuf::from("/tmp"),
+            tool_root: PathBuf::from("/tmp"),
+            system_prompt: String::new(),
+            profile_hint: "fixture".into(),
+            model_hint: "model".into(),
+            destination_fingerprint: "0".repeat(64),
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_turn_commits_root_and_exact_turn_events_until_exact_ack() {
+        let store = SessionStore::in_memory().unwrap();
+        let agent = Agent::builder(
+            Arc::new(UnusedProvider),
+            AgentOptions::new("fixture", "model"),
+        )
+        .build()
+        .unwrap();
+        let actor = agent.actor().clone();
+        let identity = agent.default_identity().unwrap();
+        let (session, branch) = store.create(&actor, "events", binding()).unwrap();
+        let (_, journal) = store.activate(&actor, &session.id, &branch.id).unwrap();
+        journal
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "event source".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+
+        let recipient = "/d:0/i:0/p:0/a:99";
+        let authority = "jwa_durable_fixture";
+        let root_rules =
+            EventRuleSet::new([EventRule::new(JobEventKind::Result, JobWakeMode::Queue)]).unwrap();
+        let (root, root_update) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &session.id,
+                &branch.id,
+                None,
+                None,
+                recipient,
+                authority,
+                root_rules,
+                8,
+            )
+            .unwrap();
+        assert_eq!(root_update.generation, 1);
+
+        let turn_rules = EventRuleSet::new([
+            EventRule::new(JobEventKind::Result, JobWakeMode::Queue),
+            EventRule::new(JobEventKind::Settled, JobWakeMode::Queue),
+        ])
+        .unwrap();
+        let (turn_ref, turn_update) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &session.id,
+                &branch.id,
+                Some(1),
+                None,
+                recipient,
+                authority,
+                turn_rules,
+                8,
+            )
+            .unwrap();
+        assert_eq!(turn_ref, format!("{root}/t:1"));
+        assert_eq!(turn_update.generation, 1);
+        assert!(store
+            .pending_agent_job_events(&actor, &session.id, &branch.id)
+            .unwrap()
+            .is_empty());
+
+        journal
+            .finish(Turn {
+                id: 1,
+                prompt: "event source".into(),
+                answer: "done".into(),
+                model: identity.model.clone(),
+                profile: identity.account_id.clone(),
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(actor.clone()),
+                tool_records: Vec::new(),
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+
+        let pending = store
+            .pending_agent_job_events(&actor, &session.id, &branch.id)
+            .unwrap();
+        assert_eq!(pending.len(), 3);
+        let root_result = pending
+            .iter()
+            .find(|delivery| delivery.source_ref == root)
+            .unwrap();
+        assert_eq!(root_result.event, JobEventKind::Result);
+        assert_eq!(root_result.event_rev, 1);
+
+        let turn_events = pending
+            .iter()
+            .filter(|delivery| delivery.source_ref == turn_ref)
+            .collect::<Vec<_>>();
+        assert_eq!(turn_events.len(), 2);
+        assert_eq!(turn_events[0].event_rev, turn_events[1].event_rev);
+        assert_eq!(turn_events[0].event_rev, 1);
+        assert!(turn_events
+            .iter()
+            .any(|delivery| delivery.event == JobEventKind::Result));
+        assert!(turn_events
+            .iter()
+            .any(|delivery| delivery.event == JobEventKind::Settled));
+
+        store
+            .ack_agent_job_event(&actor, &session.id, &branch.id, root_result)
+            .unwrap();
+        assert_eq!(
+            store
+                .pending_agent_job_events(&actor, &session.id, &branch.id)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}

@@ -4,8 +4,10 @@ Base: `796225e9b50e824606586859d7bcc88722b4919e`
 
 Design: [README.md](README.md), [DESIGN.md](DESIGN.md)
 Audit: [AUDIT.md](AUDIT.md)
-Dotlink reference: `release/0.17 @ 887401398da297c458ffa2a152a07e1b85870c35`
-(`v0.17.4 fd1cdb6` plus post-tag platform signal-label test cleanup `8874013`)
+Current dotlink release reference:
+`release/0.17 = origin/release/0.17 = v0.17.5 =`
+`3995448d7bf33794ef84c7bb51150d77cc260ada`.
+Historical v0.17.4 baseline remains `fd1cdb6429a341a4e3d27805cae0bec288fc26df`.
 
 ## Committed
 
@@ -18,7 +20,7 @@ Dotlink reference: `release/0.17 @ 887401398da297c458ffa2a152a07e1b85870c35`
 - [x] Real SIGKILL/SIGSEGV distinction test.
 - [x] AW-requested termination does not fabricate a signal.
 
-## Uncommitted
+## Implementation phases and current P9 queue
 
 ### Phase P1 — simplify and freeze shared stop vocabulary
 
@@ -176,41 +178,37 @@ Dotlink reference: `release/0.17 @ 887401398da297c458ffa2a152a07e1b85870c35`
 - [x] Fresh-review implementation checkpoint `7c7de6c9...` plus downstream
       dependency-range follow-up `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`;
       the latter is the final dependency pin and supersedes `eb325b31`/`7c7de6c9`.
-- [ ] Publish — explicitly authorized in the current user turn; push and remote
-      verification are the next actions.
-- [ ] Dotlink companion repin — blocked until an exact AW implementation commit
-      is authorized, signed and published; do not pin a dirty working tree.
-      Mechanical commit/publish/repin order, the five-direct-dependency pin set,
-      validation gates and rollback conditions are frozen in
+- [x] Publish final AW implementation pin
+      `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; docs/main are published
+      through `4234447612421069a746c925c76a25e3ba27774a` and remote reachability
+      was verified.
+- [x] Dotlink companion repin completed atomically: direct `aw-tools`,
+      `aw-tools-fs-unix`, `aw-tools-fs-win`, `aw-platform`,
+      `aw-mcp-protocol` plus every transitive AW Git lock entry resolve to
+      `1a5d0f65...`, with no registry package/version churn and no path override.
+      Historical publish/repin mechanics remain recorded in
       [PUBLISH-REPIN-PREFLIGHT.md](PUBLISH-REPIN-PREFLIGHT.md).
 
 ### Phase P9 — dotlink thin consumer
 
 Owned by dotlink companion plan.
 
-Current sequencing: dotlink D1-D7 shared-semantic hookup is blocked until this
-exact P1-P8 AW implementation is explicitly authorized for signed commit/publish
-and dotlink is atomically repinned. No temporary sibling/path dependency is
-allowed. Product-owned work that does not duplicate AW semantics may proceed:
-dotlink D8 Nix environment hardening is complete, D9 pre-repin
-docs/equivalence/baseline is complete, the D2 structured logger prerequisite is
-non-panicking/Drop-safe with a production-used always-visible lifecycle channel,
-D6 compatibility is locked with real stdio/hosted Image+Audio+Resource identity,
-structured/receipt regressions, reserved receipt-object preservation, mandatory
-truncation markers and post-fit visible-timestamp stability; dotlink D4/D5 locks
-hostile-ref compactness plus zero-rejection/one-byte raw-page behavior; D7 polls
-the operation through progress backpressure and drops a pending send when the
-result wins. Shared `ProcessReceipt::stop_record()` now gives D2 one final
-logical stop record while lifecycle events remain attempt diagnostics. The
-actual shared stop/result/ref/budget/protocol hookups remain publish/repin blocked.
+Current sequencing: the original P9 thin-consumer convergence is complete.
+Dotlink still consumes published AW
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; current local dotlink HEAD is
+`20b6f045f79fa7725f286e05b40e9262b1c9e4d3`, four commits ahead of
+`origin/main = 4c3b96fd5ba9e6772bc159f10a3ad893c9729887`. D4-D7 and the
+v0.17.5 semantic-equivalence proof are closed and must not be reopened without
+a reproduced regression. No temporary sibling/path dependency is allowed.
 
-- [ ] Consume shared stop/cancellation/process terminal semantics.
-- [ ] Consume shared Task failure detail.
-- [ ] Consume shared Job refs/receipts/budgets.
-- [ ] Consume `aw-mcp-protocol` decorator/fitter/heartbeat; do not pull the
-      `aw-mcp` client adapter into dotlink.
-- [ ] Keep only product wire/log/config/transport policy.
-- [ ] v0.17.x equivalence matrix through the current local 0.17.5 reference passes.
+- [x] Consume shared stop/cancellation/process terminal semantics (D1-D2).
+- [x] Consume shared Task failure detail (D3).
+- [x] Consume shared Job refs/receipts/budgets (D4-D5).
+- [x] Consume `aw-mcp-protocol` decorator/fitter/heartbeat (D6-D7); dotlink
+      remains a thin consumer and does not pull in the `aw-mcp` client adapter.
+- [x] Keep only product wire/log/config/transport policy after duplicate generic
+      helpers were removed.
+- [x] v0.17.x semantic-equivalence matrix through published v0.17.5 is complete.
 
 ### Deferred Phase S — sandbox/mount convergence
 
@@ -232,5 +230,86 @@ actual shared stop/result/ref/budget/protocol hookups remain publish/repin block
 - [x] P6 MCP metadata/fitter — `aw-mcp --all-features --lib` **24/24**; full `aw-tools` **354/354**; full adapter **256/256**; strict MCP+core+adapter Clippy; no-default core; downstream `aw-host`/`aw-cli`; rustfmt and `git diff --check` green.
 - [x] P7 heartbeat/progress historical checkpoint — pre-extraction `aw-mcp` **33/33**; retained as historical evidence only.
 - [x] Fresh-review projection checkpoint — `aw-tools` **357/357**, adapter **255/255**, `aw-mcp-protocol` **12/12**, `aw-mcp` **20/20**, Unix platform **13/13 + 4/4 PTY** (1 cross-UID fixture intentionally ignored), terminal **20/20**; minimal/no-default checks, host-side Windows check, downstream host/CLI and workspace all-feature check, strict Clippy for all touched crates, rustfmt and diff check are green. Protocol dependency-tree check proves it enables **no aw-tools feature** and leaks no Agent/runtime, reqwest, jsonschema, clap or MCP transport dependency.
-- [ ] full AW shared-first convergence gate — all host-available technical gates are green after fresh review, including `exit_signal`, shared `StopTracker`, final receipt stop evidence, typed receipt stop/revocation projection and lightweight MCP protocol extraction. Native Windows Job Object/exit-signal tests remain authored but unexecuted because L5 has no Windows Rust std target; fresh-review commit/publish gates remain open.
-- [ ] dotlink v0.17.x consumer/equivalence gate through the current local 0.17.5 reference.
+- [ ] full AW shared-first convergence gate — all published 0.17 host-available AW technical gates are green and the final implementation pin is published; native Windows Job Object/exit-signal tests remain authored but unexecuted because L5 has no Windows Rust std target. This stays open only for that external native-Windows gate.
+- [x] dotlink v0.17.x consumer/equivalence gate through the published v0.17.5 reference.
+
+## Post-P9 runtime admission / Agent ownership hardening — 2026-11-20
+
+Canonical current handoff:
+[../../docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](../../docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md).
+
+The original P1-P9/D4-D7 work is historical baseline here. Do not interpret old
+unchecked D4-D7/equivalence prose as an instruction to reimplement completed
+dotlink convergence.
+
+### Implemented locally, uncommitted
+
+- [x] Schema v36 indexed runtime-admission projections:
+      policy_admission_current and remote_start_current.
+- [x] Policy replay lookup precedes mutable writer/policy/participation checks.
+- [x] Session resource owner and initiating policy subject are distinct facts.
+- [x] Shared-session participant routing requires the participant's current
+      Submit + exact tool authority; owner privileges are never unioned.
+- [x] Policy projection revisions are monotonic and audit remains immutable
+      historical evidence.
+- [x] Remote Start replay/counting no longer scans lifetime Session audit.
+- [x] SourceEventBook is serializable/validated for durable Agent/Turn sources.
+- [x] Durable agent_job_event_sources owns Agent/Turn rules, generations,
+      event revisions and exact pending deliveries.
+- [x] Agent root result events commit on newly attached Turns; exact Turn commits
+      result+settled at one event revision; Agent root settled commits on close.
+- [x] Durable agent_job_wake_admissions supports fresh-Router recovery while
+      revalidating current participant/tool/capability generations.
+- [x] Agent jobs_get(wait_ms) uses revision notification rather than the old
+      10 ms store polling loop.
+- [x] Focused replay/participant/source/restart/notification regressions green.
+- [x] Relevant aw-store and AW lib/bin checks + focused strict Clippy + fmt/diff
+      are green for the pre-existing v36 slice.
+- [x] Explicit v35 -> v36 open regression reconstructs the v36 projections from
+      real legacy evidence and preserves exact issuer-less v35 Remote Start replay.
+- [x] AW Remote Start issuer identity is explicit:
+      `RemoteStartIssuer { client_id, trust_epoch }` is target-authenticated,
+      `RemoteStartLease` carries target+issuer, new v36 Start authorization uses
+      an issuer-bound v2 digest, and issuer-less facts remain v1 replay-only.
+- [x] Exact committed Remote Start recovery is issuer-independent: immutable
+      attempt semantics recover the original authorization before any new
+      issuer/lease is obtained. A changed semantic request fails closed.
+- [x] Canonical Agent resolution uses indexed domain/identity/project/Agent lookup
+      and then rechecks current Session authorization; hot resolve paths no longer
+      enumerate every Agent binding.
+- [x] Mixed Agent/finite Job listing uses the v36 `job_exposure_current`
+      query-only projection plus keyset pagination under the existing position
+      cursor contract. SessionStore/JobManager/commit_log remain the owners.
+- [x] Historical P9/D4-D7/equivalence status above is reconciled with the live
+      completed dotlink source-cutover/equivalence docs.
+- [x] Current focused migration/replay/participant/source/restart/list regressions
+      are green; `aw-store --lib` and `aw-cli --lib --bins` checks are green.
+      Strict `-D warnings` Clippy is green for aw-tools/aw-mcp all targets,
+      aw-store lib, and aw-cli all targets (`--no-deps`). Repeated aw-store
+      all-target Clippy/check attempts were externally SIGKILLed by L5 without a
+      compiler diagnostic and are not classified as source failures.
+- [x] Dotlink post-equivalence process/control hardening is complete locally:
+      ordinary-exit descendant cleanup, 250 ms post-exit output grace,
+      escaped-`setsid` factual exit + incomplete output, shared-owner-only
+      revision-fenced cancel, stdin authority linearization, and single MCP
+      instruction ownership.
+- [x] Dotlink final L5 gate is green at **703/0/1 + 42/42**, strict
+      all-target/all-feature Clippy, fmt/diff, Alejandra and Markdown
+      **0 issues / 86 files**.
+- [x] Shared process projection now also keeps known exit/stop truth orthogonal
+      from output completeness: `ProcessTerminal::status()` uses
+      `Status.incomplete` instead of rewriting known exit to `Unknown`.
+      Exact full-feature regression, aw-tools **359/359** and strict
+      all-target/all-feature Clippy are green.
+
+### Remaining
+
+- [ ] Dotlink must adopt the published issuer-bearing AW wire after a future
+      authorized AW publish/repin and enforce that only explicitly trusted OAuth
+      bridge clients can mint a new issuer lease; do not add a temporary path
+      dependency or duplicate the AW type locally.
+- [ ] On that same authorized repin, remove dotlink's temporary
+      `shared_process_status` published-pin compatibility shim and consume the
+      corrected shared `ProcessTerminal::status()` directly.
+- [ ] Native Windows process/Job Object qualification remains an external gate.
+- [ ] Sandbox/config-v13 remains frozen pending explicit user promotion.

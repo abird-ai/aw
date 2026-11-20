@@ -2993,6 +2993,31 @@ impl SessionStore {
         state: &str,
         error: Option<&str>,
     ) -> Result<SubagentInfo> {
+        self.settle_subagent_inner(actor, id, state, error, None)
+    }
+
+    /// Stable Agent settlement variant. The exact child branch is supplied by
+    /// the already-bound live Agent owner so root settlement event commitment
+    /// is atomic with the authoritative lifecycle transition.
+    pub fn settle_agent_job(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        child_branch: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<SubagentInfo> {
+        self.settle_subagent_inner(actor, id, state, error, Some(child_branch))
+    }
+
+    fn settle_subagent_inner(
+        &self,
+        actor: &PrincipalId,
+        id: &str,
+        state: &str,
+        error: Option<&str>,
+        child_branch: Option<&str>,
+    ) -> Result<SubagentInfo> {
         if !matches!(state, "completed" | "failed" | "cancelled" | "interrupted") {
             return Err(Error::Config("invalid terminal subagent state".into()));
         }
@@ -3049,6 +3074,14 @@ impl SessionStore {
             "agent.closed",
             serde_json::json!({"subagent_id":id,"state":state}),
         )?;
+        if let Some(child_branch) = child_branch {
+            crate::agent_job_events::commit_agent_settled_in(
+                &tx,
+                &info.child_session_id,
+                child_branch,
+                actor,
+            )?;
+        }
         let txid = durability::tx_id()?;
         durability::commit_event(
             &tx,

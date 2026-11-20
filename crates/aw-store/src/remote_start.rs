@@ -9,14 +9,12 @@ use crate::{
     PrincipalId, Result, SessionStore,
 };
 use aw_tools::remote_start::{
-    RemoteSessionAction, RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance,
-    RemoteStartSource,
+    RemoteSessionAction, RemoteStartAuthorization, RemoteStartIntent, RemoteStartIssuer,
+    RemoteStartProvenance, RemoteStartSource,
 };
-use rusqlite::{params, TransactionBehavior};
-use std::collections::BTreeSet;
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 const ACTION: &str = "remote.start.authorized";
-const MAX_EVENTS: usize = 8_192;
 const MAX_STARTS_PER_TURN: usize = 256;
 
 fn parse_digest(value: &str) -> Result<[u8; 32]> {
@@ -36,47 +34,76 @@ fn parse_digest(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn events(
-    connection: &rusqlite::Connection,
-    session: &str,
-) -> Result<Vec<RemoteStartAuthorization>> {
-    let mut query = db(connection.prepare(
-        "SELECT data_json FROM audit
-         WHERE session_id=?1 AND action=?2
-         ORDER BY seq LIMIT 8193",
-    ))?;
-    let rows = db(query.query_map(params![session, ACTION], |row| row.get::<_, String>(0)))?;
-    let encoded = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
-    if encoded.len() > MAX_EVENTS {
-        return Err(Error::Limit(
-            "remote Start audit requires explicit inspection/rotation",
-        ));
-    }
-    encoded
-        .into_iter()
-        .map(|value| crate::decode::<RemoteStartAuthorization>(&value))
-        .collect()
+fn attempt_key(actor: &PrincipalId, session: &str, intent: &RemoteStartIntent) -> Result<[u8; 32]> {
+    intent
+        .attempt_key(actor.as_str(), session)
+        .map_err(|_| Error::Denied("invalid remote Start attempt identity"))
 }
 
-fn existing_attempt<'a>(
-    facts: &'a [RemoteStartAuthorization],
-    actor: &PrincipalId,
-    session: &str,
-    intent: &RemoteStartIntent,
-) -> Result<Option<&'a RemoteStartAuthorization>> {
-    let key = intent
-        .attempt_key(actor.as_str(), session)
-        .map_err(|_| Error::Denied("invalid remote Start attempt identity"))?;
-    for fact in facts.iter().rev() {
-        let fact_key = fact
-            .intent
-            .attempt_key(&fact.provenance.actor, &fact.provenance.session_id)
-            .map_err(|_| Error::Storage("invalid persisted remote Start fact"))?;
-        if fact_key == key {
-            return Ok(Some(fact));
-        }
+fn current_by_key(
+    connection: &rusqlite::Connection,
+    key: &[u8; 32],
+) -> Result<Option<RemoteStartAuthorization>> {
+    let encoded: Option<String> = db(connection
+        .query_row(
+            "SELECT authorization_json FROM remote_start_current WHERE attempt_key=?1",
+            [key.as_slice()],
+            |row| row.get(0),
+        )
+        .optional())?;
+    encoded.map(|value| crate::decode(&value)).transpose()
+}
+
+fn store_current(
+    connection: &rusqlite::Connection,
+    authorization: &RemoteStartAuthorization,
+) -> Result<()> {
+    let actor = PrincipalId::new(authorization.provenance.actor.clone())?;
+    let key = attempt_key(
+        &actor,
+        &authorization.provenance.session_id,
+        &authorization.intent,
+    )?;
+    if let Some(existing) = current_by_key(connection, &key)? {
+        return if existing == *authorization {
+            Ok(())
+        } else {
+            Err(Error::Storage(
+                "duplicate persisted remote Start attempt identity",
+            ))
+        };
     }
-    Ok(None)
+    let encoded = serde_json::to_string(authorization)
+        .map_err(|_| Error::Storage("cannot serialize remote Start authorization"))?;
+    db(connection.execute(
+        "INSERT INTO remote_start_current(
+            attempt_key,session_id,actor,original_invocation_id,effect_attempt_id,
+            turn_id,authorization_json,created_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            key.as_slice(),
+            authorization.provenance.session_id,
+            authorization.provenance.actor,
+            authorization.intent.original_invocation_id,
+            authorization.intent.effect_attempt_id,
+            authorization.intent.turn_id,
+            encoded,
+            crate::now(),
+        ],
+    ))?;
+    Ok(())
+}
+
+pub(crate) fn backfill_current(connection: &rusqlite::Connection) -> Result<()> {
+    let mut query =
+        db(connection.prepare("SELECT data_json FROM audit WHERE action=?1 ORDER BY seq"))?;
+    let rows = db(query.query_map([ACTION], |row| row.get::<_, String>(0)))?;
+    for row in rows {
+        let encoded = db(row)?;
+        let authorization: RemoteStartAuthorization = crate::decode(&encoded)?;
+        store_current(connection, &authorization)?;
+    }
+    Ok(())
 }
 
 fn require_running_turn(
@@ -141,23 +168,21 @@ impl SessionStore {
             return Err(Error::Denied("invalid remote Start replay identity"));
         }
         let connection = self.connection()?;
-        let facts = events(&connection, session)?;
-        let mut found = None;
-        for fact in facts.iter().rev() {
-            if fact.provenance.actor == actor.as_str()
-                && fact.provenance.session_id == session
-                && fact.intent.original_invocation_id == original_invocation_id
-                && fact.intent.effect_attempt_id == effect_attempt_id
-            {
-                if found.is_some() {
-                    return Err(Error::Storage(
-                        "duplicate persisted remote Start attempt identity",
-                    ));
-                }
-                found = Some(fact.clone());
-            }
-        }
-        Ok(found)
+        let encoded: Option<String> = db(connection
+            .query_row(
+                "SELECT authorization_json FROM remote_start_current
+                 WHERE session_id=?1 AND actor=?2
+                   AND original_invocation_id=?3 AND effect_attempt_id=?4",
+                params![
+                    session,
+                    actor.as_str(),
+                    original_invocation_id,
+                    effect_attempt_id
+                ],
+                |row| row.get(0),
+            )
+            .optional())?;
+        encoded.map(|value| crate::decode(&value)).transpose()
     }
 
     /// Recover an already-committed Start without current effect reauthorization.
@@ -173,9 +198,9 @@ impl SessionStore {
             .validate()
             .map_err(|_| Error::Denied("invalid remote Start intent"))?;
         let connection = self.connection()?;
-        let facts = events(&connection, session)?;
-        match existing_attempt(&facts, actor, session, intent)? {
-            Some(existing) if existing.intent == *intent => Ok(Some(existing.clone())),
+        let key = attempt_key(actor, session, intent)?;
+        match current_by_key(&connection, &key)? {
+            Some(existing) if existing.intent == *intent => Ok(Some(existing)),
             Some(_) => Err(Error::Conflict(
                 "remote Start attempt identity was reused with changed intent",
             )),
@@ -194,6 +219,7 @@ impl SessionStore {
         policy_admission_id: &str,
         intent: RemoteStartIntent,
         source: RemoteStartSource,
+        issuer: RemoteStartIssuer,
     ) -> Result<RemoteStartAuthorization> {
         intent
             .validate()
@@ -201,24 +227,30 @@ impl SessionStore {
         source
             .validate()
             .map_err(|_| Error::Denied("invalid remote Start source provenance"))?;
+        issuer
+            .validate()
+            .map_err(|_| Error::Denied("invalid or untrusted remote Start issuer identity"))?;
 
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let facts = events(&tx, session)?;
-        if let Some(existing) = existing_attempt(&facts, actor, session, &intent)? {
+        let key = attempt_key(actor, session, &intent)?;
+        if let Some(existing) = current_by_key(&tx, &key)? {
             if existing.intent != intent {
                 return Err(Error::Conflict(
                     "remote Start attempt identity was reused with changed intent",
                 ));
             }
             db(tx.commit())?;
-            return Ok(existing.clone());
+            return Ok(existing);
         }
 
         let policy = policy_admission::fact_in(&tx, session, policy_admission_id)?;
-        if policy.id != policy_admission::admission_id(actor, &policy.request) {
+        let resource_owner = crate::session_in(&tx, session)?.owner;
+        if policy.id != policy_admission::admission_id(&resource_owner, &policy.request)
+            || policy.request.subject.actor != *actor
+        {
             return Err(Error::Denied(
-                "remote Start policy admission belongs to another actor",
+                "remote Start policy admission belongs to another subject or Session owner",
             ));
         }
         if policy.state != policy_admission::PolicyAdmissionState::Consumed {
@@ -269,16 +301,13 @@ impl SessionStore {
             session_action(intent.session_action),
         )?;
 
-        let mut unique = BTreeSet::new();
-        for fact in &facts {
-            if fact.provenance.actor == actor.as_str()
-                && fact.provenance.session_id == session
-                && fact.intent.turn_id == intent.turn_id
-            {
-                unique.insert(fact.intent.effect_attempt_id.as_str());
-            }
-        }
-        if unique.len() >= MAX_STARTS_PER_TURN {
+        let unique: usize = db(tx.query_row(
+            "SELECT count(*) FROM remote_start_current
+             WHERE session_id=?1 AND actor=?2 AND turn_id=?3",
+            params![session, actor.as_str(), intent.turn_id],
+            |row| row.get(0),
+        ))?;
+        if unique >= MAX_STARTS_PER_TURN {
             return Err(Error::Limit(
                 "remote Start attempts exceed the bounded active-Turn budget",
             ));
@@ -287,6 +316,7 @@ impl SessionStore {
         let provenance = RemoteStartProvenance {
             actor: actor.as_str().to_owned(),
             source,
+            issuer: Some(issuer),
             policy_revision_sha256: parse_digest(&policy.request.policy_revision_sha256)?,
             policy_admission_id: policy.id,
             session_id: session.to_owned(),
@@ -297,6 +327,7 @@ impl SessionStore {
         };
         let authorization = RemoteStartAuthorization::new(intent, provenance)
             .map_err(|_| Error::Denied("invalid committed remote Start authorization"))?;
+        store_current(&tx, &authorization)?;
         audit(
             &tx,
             session,
@@ -402,6 +433,13 @@ mod tests {
         }
     }
 
+    fn issuer() -> RemoteStartIssuer {
+        RemoteStartIssuer {
+            client_id: "aw-client".into(),
+            trust_epoch: 1,
+        }
+    }
+
     #[cfg(unix)]
     fn intent(request_digest: [u8; 32]) -> RemoteStartIntent {
         RemoteStartIntent {
@@ -457,6 +495,15 @@ mod tests {
         assert!(NonZeroU64::new(writer_epoch).is_some());
 
         let request_digest = [2; 32];
+        let subject = policy_admission::PolicyAdmissionSubject::from_participation(
+            &store
+                .authorize_session_participation(
+                    &actor,
+                    &session.id,
+                    session_participation::SessionParticipationAction::Submit,
+                )
+                .unwrap(),
+        );
         let request = policy_admission::PolicyAdmissionRequest {
             session_id: session.id.clone(),
             branch_id: branch.id.clone(),
@@ -465,6 +512,7 @@ mod tests {
             call_id: "remote-start".into(),
             canonical_target: "/d:local/i:owner/p:repo/a:0".into(),
             request_sha256: digest(2),
+            subject,
             policy_revision_sha256: digest(4),
             authority_sha256: digest(3),
             candidate_local: true,
@@ -476,10 +524,9 @@ mod tests {
             authorized_approvers: Vec::new(),
             approval_expires_at: None,
         };
-        let claimed = store.policy_admission_claim(&actor, request).unwrap();
+        let claimed = store.policy_admission_claim(request).unwrap();
         let decided = store
             .policy_admission_record_decision(
-                &actor,
                 &session.id,
                 &claimed.id,
                 PolicyDecision {
@@ -494,7 +541,6 @@ mod tests {
             .unwrap();
         let consumed = store
             .policy_admission_consume(
-                &actor,
                 &session.id,
                 &decided.id,
                 &digest(4),
@@ -516,7 +562,14 @@ mod tests {
         let (_temp, store, actor, session, policy_id, request_digest) = admitted_fixture().await;
         let intent = intent(request_digest);
         let first = store
-            .remote_start_authorize(&actor, &session, &policy_id, intent.clone(), source())
+            .remote_start_authorize(
+                &actor,
+                &session,
+                &policy_id,
+                intent.clone(),
+                source(),
+                issuer(),
+            )
             .unwrap();
 
         let by_attempt = store
@@ -552,7 +605,14 @@ mod tests {
         }
         assert_eq!(
             store
-                .remote_start_authorize(&actor, &session, &policy_id, intent.clone(), source(),)
+                .remote_start_authorize(
+                    &actor,
+                    &session,
+                    &policy_id,
+                    intent.clone(),
+                    source(),
+                    issuer()
+                )
                 .unwrap(),
             first
         );
@@ -593,12 +653,19 @@ mod tests {
         let mut wrong = intent(request_digest);
         wrong.original_request_sha256 = [5; 32];
         assert!(store
-            .remote_start_authorize(&actor, &session, &policy_id, wrong, source())
+            .remote_start_authorize(&actor, &session, &policy_id, wrong, source(), issuer())
             .is_err());
 
         let valid = intent(request_digest);
         let authorization = store
-            .remote_start_authorize(&actor, &session, &policy_id, valid.clone(), source())
+            .remote_start_authorize(
+                &actor,
+                &session,
+                &policy_id,
+                valid.clone(),
+                source(),
+                issuer(),
+            )
             .unwrap();
         assert_eq!(authorization.provenance.actor, actor.as_str());
         assert!(authorization.provenance.writer_epoch > 0);
@@ -610,8 +677,103 @@ mod tests {
         let mut wrong_source = source();
         wrong_source.grant_sha256 = [6; 32];
         assert!(store
-            .remote_start_authorize(&actor, &session, &policy_id, changed_attempt, wrong_source)
+            .remote_start_authorize(
+                &actor,
+                &session,
+                &policy_id,
+                changed_attempt,
+                wrong_source,
+                issuer()
+            )
             .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v35_open_migrates_legacy_remote_start_and_agent_exposure_indexes() {
+        let (temp, store, actor, session, policy_id, request_digest) = admitted_fixture().await;
+        let intent = intent(request_digest);
+        let current = store
+            .remote_start_authorize(
+                &actor,
+                &session,
+                &policy_id,
+                intent.clone(),
+                source(),
+                issuer(),
+            )
+            .unwrap();
+
+        let mut legacy_intent = intent;
+        legacy_intent.effect_attempt_id = "attempt-legacy-v35".into();
+        let mut legacy_provenance = current.provenance.clone();
+        legacy_provenance.issuer = None;
+        let legacy =
+            RemoteStartAuthorization::new(legacy_intent.clone(), legacy_provenance).unwrap();
+        assert!(legacy.provenance.issuer.is_none());
+        {
+            let connection = store.connection().unwrap();
+            audit(
+                &connection,
+                &session,
+                &actor,
+                ACTION,
+                serde_json::to_value(&legacy).unwrap(),
+            )
+            .unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE policy_admission_current;
+                     DROP TABLE remote_start_current;
+                     DROP TABLE agent_job_event_sources;
+                     DROP TABLE agent_job_wake_admissions;
+                     DROP TABLE job_exposure_current;
+                     DROP INDEX sessions_agent_namespace;
+                     DROP INDEX branches_agent_namespace;
+                     UPDATE store_meta SET value='35' WHERE key='schema_epoch';
+                     UPDATE schema_meta
+                        SET schema_epoch=35,activation_epoch=35,migration_phase='ready',updated_at=0
+                      WHERE singleton=1;
+                     UPDATE migration_lease
+                        SET holder_client_id=NULL,generation=generation+1,current_epoch=35,
+                            target_epoch=NULL,lease_expires_at=NULL,updated_at=0
+                      WHERE singleton=1;
+                     PRAGMA user_version=35;",
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let migrated = SessionStore::open(&temp.0).unwrap();
+        let connection = migrated.connection().unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let projected_agents: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM job_exposure_current WHERE kind='agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 36);
+        assert!(projected_agents >= 1);
+        drop(connection);
+
+        let replay = migrated
+            .remote_start_lookup_attempt(
+                &actor,
+                &session,
+                &legacy_intent.original_invocation_id,
+                &legacy_intent.effect_attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay, legacy);
+        assert!(
+            replay.provenance.issuer.is_none(),
+            "v35 historical Start must remain exact rather than minting v36 issuer evidence"
+        );
     }
 
     #[cfg(unix)]
@@ -631,7 +793,14 @@ mod tests {
         let mut stale_writer = intent(request_digest);
         stale_writer.effect_attempt_id = "attempt-writer-revoked".into();
         assert!(store
-            .remote_start_authorize(&actor, &session, &policy_id, stale_writer, source())
+            .remote_start_authorize(
+                &actor,
+                &session,
+                &policy_id,
+                stale_writer,
+                source(),
+                issuer()
+            )
             .is_err());
 
         let (_temp, store, actor, session, policy_id, request_digest) = admitted_fixture().await;
@@ -650,7 +819,14 @@ mod tests {
         let mut revoked_member = intent(request_digest);
         revoked_member.effect_attempt_id = "attempt-member-revoked".into();
         assert!(store
-            .remote_start_authorize(&actor, &session, &policy_id, revoked_member, source())
+            .remote_start_authorize(
+                &actor,
+                &session,
+                &policy_id,
+                revoked_member,
+                source(),
+                issuer()
+            )
             .is_err());
     }
 }

@@ -98,6 +98,7 @@ pub struct AgentJobSubscribe {
     pub reference: String,
     pub revision: Option<u64>,
     pub rules: EventRuleSet,
+    pub recipient: AgentWakeRecipient,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +177,12 @@ pub trait AgentJobRouter: Send + Sync {
     fn admit_event<'a>(&'a self, _delivery: JobEventDelivery) -> AgentEventFuture<'a> {
         Box::pin(async { Err(Error::Denied("Agent wake recipient is unavailable")) })
     }
+
+    /// Host-only drain of already-committed source events. This performs no
+    /// source transition and grants no recipient authority.
+    fn deliver_source_events<'a>(&'a self, _canonical_agent_ref: &'a str) -> AgentEventFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Stable host composition slot shared across Agent rebuilds. Replacing the
@@ -239,5 +246,17 @@ impl AgentJobRouterSlot {
             .read()
             .map_err(|_| Error::Protocol("Agent Job router slot poisoned"))?
             .clone())
+    }
+
+    pub fn deliver_source_events<'a>(
+        &'a self,
+        canonical_agent_ref: &'a str,
+    ) -> AgentEventFuture<'a> {
+        Box::pin(async move {
+            if let Some(router) = self.current()? {
+                router.deliver_source_events(canonical_agent_ref).await?;
+            }
+            Ok(())
+        })
     }
 }

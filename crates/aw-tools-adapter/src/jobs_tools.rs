@@ -2023,6 +2023,7 @@ impl Tool for JobsTool {
                                                 reference: canonical.clone(),
                                                 revision,
                                                 rules: rules.clone(),
+                                                recipient: recipient.clone(),
                                             },
                                         )
                                         .await

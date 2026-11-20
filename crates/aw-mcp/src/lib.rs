@@ -17,7 +17,7 @@ use aw_agent_core::{
 use aw_agent_kernel::capability::SourceKind;
 use aw_tools::{
     budget::SerializedResultBytes,
-    remote_start::{arguments_sha256, RemoteRuntimeLease, RemoteStartAuthorization},
+    remote_start::{arguments_sha256, RemoteStartAuthorization, RemoteStartLease},
     OperationId,
 };
 use futures_util::StreamExt as _;
@@ -510,7 +510,7 @@ pub struct RemoteBridge {
 }
 
 impl RemoteBridge {
-    pub async fn lease(&self) -> Result<RemoteRuntimeLease> {
+    pub async fn lease(&self) -> Result<RemoteStartLease> {
         const MAX_LEASE_BYTES: usize = 16 * 1024;
         let bridge = self.conn.http_bridge.as_ref().ok_or(Error::Denied(
             "remote Start requires authenticated Streamable HTTP MCP",
@@ -538,7 +538,7 @@ impl RemoteBridge {
             }
             body.extend_from_slice(&chunk);
         }
-        let lease = serde_json::from_slice::<RemoteRuntimeLease>(&body)
+        let lease = serde_json::from_slice::<RemoteStartLease>(&body)
             .map_err(|_| Error::Protocol("invalid remote Start lease"))?;
         lease
             .validate()
@@ -1355,8 +1355,8 @@ mod tests {
     use aw_tools::{
         filesystem::schema::Tool as FsTool,
         remote_start::{
-            RemoteSessionAction, RemoteStartIntent, RemoteStartProvenance, RemoteStartSource,
-            REMOTE_START_VERSION,
+            RemoteSessionAction, RemoteStartIntent, RemoteStartLease, RemoteStartProvenance,
+            RemoteStartSource, REMOTE_START_VERSION,
         },
     };
     use serde_json::json;
@@ -1608,7 +1608,7 @@ mod tests {
     }
 
     fn live_start(
-        lease: &RemoteRuntimeLease,
+        lease: &RemoteStartLease,
         operation: OperationId,
         arguments: &Value,
         canonical_ref: &str,
@@ -1627,7 +1627,7 @@ mod tests {
                 arguments_sha256: arguments_sha256(arguments),
                 original_request_sha256: [3; 32],
                 session_action: action,
-                target: lease.clone(),
+                target: lease.target.clone(),
             },
             RemoteStartProvenance {
                 actor: "local:bridge-test".into(),
@@ -1639,6 +1639,7 @@ mod tests {
                     resource_scope: canonical_ref.into(),
                     grant_sha256: [4; 32],
                 },
+                issuer: Some(lease.issuer.clone()),
                 policy_revision_sha256: [5; 32],
                 policy_admission_id: format!("policy-{attempt}"),
                 session_id: "session".into(),
@@ -1678,7 +1679,7 @@ mod tests {
         panic!("remote Job did not settle")
     }
 
-    async fn live_bridge_fixture() -> Option<(RemoteBridge, RemoteRuntimeLease, ToolContext)> {
+    async fn live_bridge_fixture() -> Option<(RemoteBridge, RemoteStartLease, ToolContext)> {
         let Ok(url) = std::env::var("AW_DOTLINK_BRIDGE_TEST_URL") else {
             return None;
         };
@@ -1977,8 +1978,8 @@ mod tests {
     #[test]
     fn remote_effect_wire_metadata_binds_exact_authorization_and_arguments() {
         use aw_tools::remote_start::{
-            RemoteRuntimeLease, RemoteSessionAction, RemoteStartIntent, RemoteStartProvenance,
-            RemoteStartSource, REMOTE_START_VERSION,
+            RemoteRuntimeLease, RemoteSessionAction, RemoteStartIntent, RemoteStartIssuer,
+            RemoteStartProvenance, RemoteStartSource, REMOTE_START_VERSION,
         };
 
         let operation = OperationId::Fs(aw_tools::filesystem::schema::Tool::Move);
@@ -2013,6 +2014,10 @@ mod tests {
                     resource_scope: "root".into(),
                     grant_sha256: [4; 32],
                 },
+                issuer: Some(RemoteStartIssuer {
+                    client_id: "aw-client".into(),
+                    trust_epoch: 1,
+                }),
                 policy_revision_sha256: [5; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),

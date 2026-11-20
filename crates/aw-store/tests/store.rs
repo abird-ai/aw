@@ -190,6 +190,38 @@ fn mixed_job_exposure_positions_interleave_agents_and_finite_jobs_without_duplic
     assert_eq!(combined[1].0, reserved.position);
     assert_eq!(combined[2].0, first_position);
 
+    let indexed = store
+        .job_exposure_page(&actor, &first, "generation-a", None, 4)
+        .unwrap();
+    assert_eq!(
+        indexed
+            .iter()
+            .map(|item| (item.position, item.canonical_ref.as_str()))
+            .collect::<Vec<_>>(),
+        combined
+            .iter()
+            .map(|(position, reference)| (*position, reference.as_str()))
+            .collect::<Vec<_>>(),
+        "mixed listing must preserve the immutable commit-log exposure order"
+    );
+    let next = store
+        .job_exposure_page(&actor, &first, "generation-a", Some(indexed[1].position), 4)
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].position, first_position);
+
+    let resolved = store
+        .agent_binding_by_handles(
+            &actor,
+            &second.domain_handle,
+            &second.identity_handle,
+            &second.project_handle,
+            &second.agent_handle,
+        )
+        .unwrap();
+    assert_eq!(resolved.session_id, second.session_id);
+    assert_eq!(resolved.branch_id, second.branch_id);
+
     assert!(
         store
             .finite_job_exposures(&actor, &first, "generation-b", 8)
@@ -2169,6 +2201,15 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
         .workspace_writer(&actor, None, &session.workspace_id)
         .unwrap()
         .writer_epoch;
+    let subject = PolicyAdmissionSubject::from_participation(
+        &store
+            .authorize_session_participation(
+                &actor,
+                &session.id,
+                SessionParticipationAction::Submit,
+            )
+            .unwrap(),
+    );
     let expiry = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -2183,6 +2224,7 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
         call_id: call_id.into(),
         canonical_target: "/d:0/i:0/p:0/a:0/t:1/j:policy-target".into(),
         request_sha256: request_sha.to_string().repeat(64),
+        subject: subject.clone(),
         policy_revision_sha256: policy_sha.to_string().repeat(64),
         authority_sha256: "c".repeat(64),
         candidate_local: true,
@@ -2196,38 +2238,46 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     };
 
     let first = store
-        .policy_admission_claim(&actor, request("guardian-unknown", 'a', 'b'))
+        .policy_admission_claim(request("guardian-unknown", 'a', 'b'))
         .unwrap();
     assert_eq!(first.state, PolicyAdmissionState::Claimed);
     assert_eq!(
         store
-            .policy_admission_claim(&actor, request("guardian-unknown", 'a', 'b'))
+            .policy_admission_claim(request("guardian-unknown", 'a', 'b'))
             .unwrap(),
         first,
         "exact redelivery must recover the original replay claim"
     );
 
     assert!(matches!(
-        store.policy_admission_claim(&actor, request("guardian-unknown", 'd', 'b')),
+        store.policy_admission_claim(request("guardian-unknown", 'd', 'b')),
         Err(Error::Conflict(_))
     ));
-    assert!(matches!(
-        store.policy_admission_claim(&actor, request("guardian-unknown", 'a', 'e')),
-        Err(Error::Conflict(_))
-    ));
+    let mut refreshed_evidence = request("guardian-unknown", 'a', 'e');
+    refreshed_evidence.writer_epoch = refreshed_evidence.writer_epoch.saturating_add(1);
+    refreshed_evidence.subject.membership_epoch = refreshed_evidence
+        .subject
+        .membership_epoch
+        .saturating_add(1);
+    refreshed_evidence.subject.audience_epoch =
+        refreshed_evidence.subject.audience_epoch.saturating_add(1);
+    assert_eq!(
+        store.policy_admission_claim(refreshed_evidence).unwrap(),
+        first,
+        "mutable writer/policy/participation evidence must not change replay identity"
+    );
 
     let started = store
-        .policy_admission_start_guardian(&actor, &session.id, &first.id, &"3".repeat(64))
+        .policy_admission_start_guardian(&session.id, &first.id, &"3".repeat(64))
         .unwrap();
     assert_eq!(started.state, PolicyAdmissionState::GuardianStarted);
     assert!(matches!(
-        store.policy_admission_start_guardian(&actor, &session.id, &first.id, &"3".repeat(64)),
+        store.policy_admission_start_guardian(&session.id, &first.id, &"3".repeat(64)),
         Err(Error::Conflict(_))
     ));
 
     let unknown = store
         .policy_admission_mark_guardian_unknown(
-            &actor,
             &session.id,
             &first.id,
             "provider acceptance may have occurred; never retry automatically",
@@ -2236,21 +2286,21 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     assert_eq!(unknown.state, PolicyAdmissionState::GuardianUnknown);
     assert_eq!(
         store
-            .policy_admission_claim(&actor, request("guardian-unknown", 'a', 'b'))
+            .policy_admission_claim(request("guardian-unknown", 'a', 'b'))
             .unwrap()
             .state,
         PolicyAdmissionState::GuardianUnknown
     );
     assert!(matches!(
-        store.policy_admission_start_guardian(&actor, &session.id, &first.id, &"3".repeat(64)),
+        store.policy_admission_start_guardian(&session.id, &first.id, &"3".repeat(64)),
         Err(Error::Conflict(_))
     ));
 
     let ask = store
-        .policy_admission_claim(&actor, request("guardian-ask", 'f', '1'))
+        .policy_admission_claim(request("guardian-ask", 'f', '1'))
         .unwrap();
     store
-        .policy_admission_start_guardian(&actor, &session.id, &ask.id, &"4".repeat(64))
+        .policy_admission_start_guardian(&session.id, &ask.id, &"4".repeat(64))
         .unwrap();
     let guardian_text = r#"{"decision":"ask","scope":"/d:0/i:0/p:0"}"#;
     let guardian_digest = format!("{:x}", Sha256::digest(guardian_text.as_bytes()));
@@ -2282,7 +2332,6 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     );
     let waiting = store
         .policy_admission_record_decision(
-            &actor,
             &session.id,
             &ask.id,
             PolicyDecision {
@@ -2310,7 +2359,6 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     );
     assert!(matches!(
         store.policy_admission_consume(
-            &actor,
             &session.id,
             &ask.id,
             &"9".repeat(64),
@@ -2322,7 +2370,6 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     ));
     let consumed = store
         .policy_admission_consume(
-            &actor,
             &session.id,
             &ask.id,
             &"1".repeat(64),
@@ -2335,7 +2382,6 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     assert_eq!(
         store
             .policy_admission_consume(
-                &actor,
                 &session.id,
                 &ask.id,
                 &"1".repeat(64),
@@ -2368,7 +2414,7 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
         timeout: Duration::from_secs(5),
     };
     let executor_claim = store
-        .policy_admission_claim(&actor, request("guardian-executor", '6', '7'))
+        .policy_admission_claim(request("guardian-executor", '6', '7'))
         .unwrap();
     let journal = PolicyGuardianJournal::new(
         store.clone(),

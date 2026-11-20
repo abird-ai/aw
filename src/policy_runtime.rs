@@ -14,7 +14,12 @@ use aw_store::{
     PolicyAdmissionFact, PolicyAdmissionRequest, PolicyAdmissionState, PolicyGuardianJournal,
     SessionStore,
 };
-use aw_tools::remote_start::{RemoteStartAuthorization, RemoteStartIntent, RemoteStartSource};
+#[cfg(test)]
+use aw_store::{PolicyAdmissionSubject, SessionParticipationAction};
+use aw_tools::remote_start::{
+    RemoteSessionAction, RemoteStartAuthorization, RemoteStartIntent, RemoteStartIssuer,
+    RemoteStartSource,
+};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::future::Future;
@@ -96,18 +101,94 @@ fn decode_sha256(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Inputs for one source-fenced Remote Start admission. Grouping the authority
+/// tuple makes it explicit which facts are consumed at the same linearization
+/// boundary and keeps future evidence additions from widening a positional API.
+pub struct RemoteStartAdmissionRequest<'a> {
+    pub store: &'a SessionStore,
+    pub authority: &'a ToolBindingAuthority,
+    pub actor: &'a PrincipalId,
+    pub evidence: &'a AuthenticatedToolGrantEvidence,
+    pub session: &'a str,
+    pub policy_admission_id: &'a str,
+    pub intent: RemoteStartIntent,
+    pub issuer: RemoteStartIssuer,
+}
+
+/// Immutable semantic identity needed to recover a Start that was already
+/// committed. Deliberately excludes the target lease and issuer: replay reuses
+/// those original facts instead of consulting current issuer trust.
+pub struct RemoteStartReplayRequest<'a> {
+    pub store: &'a SessionStore,
+    pub actor: &'a PrincipalId,
+    pub session: &'a str,
+    pub policy_admission_id: &'a str,
+    pub original_invocation_id: &'a str,
+    pub effect_attempt_id: &'a str,
+    pub turn_id: u64,
+    pub call_id: &'a str,
+    pub operation: &'a str,
+    pub canonical_ref: &'a str,
+    pub arguments_sha256: [u8; 32],
+    pub original_request_sha256: [u8; 32],
+    pub session_action: RemoteSessionAction,
+}
+
+/// Recover an exact committed Start without obtaining a current issuer or
+/// target lease. A reused attempt identity with different semantic input fails
+/// closed; only the original persisted target/issuer evidence is returned.
+pub fn recover_remote_start(
+    request: RemoteStartReplayRequest<'_>,
+) -> Result<Option<RemoteStartAuthorization>> {
+    let Some(existing) = request.store.remote_start_lookup_attempt(
+        request.actor,
+        request.session,
+        request.original_invocation_id,
+        request.effect_attempt_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    existing
+        .validate()
+        .map_err(|_| Error::Denied("invalid persisted remote Start authorization"))?;
+    let intent = &existing.intent;
+    if intent.original_invocation_id != request.original_invocation_id
+        || intent.effect_attempt_id != request.effect_attempt_id
+        || intent.turn_id != request.turn_id
+        || intent.call_id != request.call_id
+        || intent.operation != request.operation
+        || intent.canonical_ref != request.canonical_ref
+        || intent.arguments_sha256 != request.arguments_sha256
+        || intent.original_request_sha256 != request.original_request_sha256
+        || intent.session_action != request.session_action
+        || existing.provenance.actor != request.actor.as_str()
+        || existing.provenance.session_id != request.session
+        || existing.provenance.policy_admission_id != request.policy_admission_id
+    {
+        return Err(Error::Conflict(
+            "remote Start replay identity was reused with changed semantic input",
+        ));
+    }
+    Ok(Some(existing))
+}
+
 /// Commit one source-fenced remote Start under the exact current ToolBinding.
 /// Exact replay lookup happens first so a committed attempt remains the same
 /// attempt after later revocation; changed intent can never mint a replacement.
 pub fn authorize_remote_start(
-    store: &SessionStore,
-    authority: &ToolBindingAuthority,
-    actor: &PrincipalId,
-    evidence: &AuthenticatedToolGrantEvidence,
-    session: &str,
-    policy_admission_id: &str,
-    intent: RemoteStartIntent,
+    request: RemoteStartAdmissionRequest<'_>,
 ) -> Result<RemoteStartAuthorization> {
+    let RemoteStartAdmissionRequest {
+        store,
+        authority,
+        actor,
+        evidence,
+        session,
+        policy_admission_id,
+        intent,
+        issuer,
+    } = request;
     if let Some(existing) = store.remote_start_lookup(actor, session, &intent)? {
         return Ok(existing);
     }
@@ -137,7 +218,7 @@ pub fn authorize_remote_start(
     };
 
     authority.with_revalidated_binding(actor, evidence.binding(), || {
-        store.remote_start_authorize(actor, session, policy_admission_id, intent, source)
+        store.remote_start_authorize(actor, session, policy_admission_id, intent, source, issuer)
     })
 }
 
@@ -187,24 +268,10 @@ where
         ));
     }
 
-    let effective = authorized.effective();
-    if request.candidate_local != effective.routes().contains(Strategy::Local)
-        || request.candidate_delegate_agent != effective.routes().contains(Strategy::DelegateAgent)
-    {
-        return Err(Error::Denied(
-            "policy admission candidate routes differ from resolved authority",
-        ));
-    }
-    selected.revalidate()?;
-    if request.guardian_identity.as_ref() != Some(selected.identity())
-        || request.guardian_site.as_deref() != Some(selected.identity().inference_executor.as_str())
-    {
-        return Err(Error::Denied(
-            "guardian provider/payer/site differs from the captured admission",
-        ));
-    }
-
-    let claimed = store.policy_admission_claim(actor, request)?;
+    // Replay lookup precedes mutable policy/provider authority. Recovering an
+    // already committed decision is factual observation, not a new paid/effect
+    // attempt. Current authority is required only below when work may start.
+    let claimed = store.policy_admission_claim(request)?;
     if terminal_or_waiting(claimed.state) {
         return Ok(claimed);
     }
@@ -218,6 +285,25 @@ where
             ))
         }
         _ => unreachable!("terminal states handled above"),
+    }
+
+    let effective = authorized.effective();
+    if claimed.request.candidate_local != effective.routes().contains(Strategy::Local)
+        || claimed.request.candidate_delegate_agent
+            != effective.routes().contains(Strategy::DelegateAgent)
+    {
+        return Err(Error::Denied(
+            "policy admission candidate routes differ from resolved authority",
+        ));
+    }
+    selected.revalidate()?;
+    if claimed.request.guardian_identity.as_ref() != Some(selected.identity())
+        || claimed.request.guardian_site.as_deref()
+            != Some(selected.identity().inference_executor.as_str())
+    {
+        return Err(Error::Denied(
+            "guardian provider/payer/site differs from the captured admission",
+        ));
     }
 
     let journal = PolicyGuardianJournal::new(
@@ -251,7 +337,6 @@ where
 
     let digest = format!("{:x}", Sha256::digest(result.text.as_bytes()));
     store.policy_admission_record_decision(
-        actor,
         &claimed.request.session_id,
         &claimed.id,
         policy_decision,
@@ -290,6 +375,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    fn policy_subject(
+        store: &SessionStore,
+        actor: &PrincipalId,
+        session: &str,
+    ) -> PolicyAdmissionSubject {
+        PolicyAdmissionSubject::from_participation(
+            &store
+                .authorize_session_participation(actor, session, SessionParticipationAction::Submit)
+                .unwrap(),
+        )
     }
 
     #[cfg(unix)]
@@ -360,7 +458,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn completed_guardian_replay_never_pays_twice_or_accepts_changed_policy() {
+    async fn completed_guardian_replay_survives_policy_change_without_reauthorizing_effect() {
         use aw_agent_core::{Agent, AgentOptions, TurnJournal, TurnStart};
         use aw_policy::{
             AuthenticatedGrantPath, Effect, GrantRestrictions, GrantSubject, OperationContext,
@@ -460,6 +558,7 @@ mod tests {
             call_id: "policy-guardian".into(),
             canonical_target: "/d:local/i:local/p:repo/a:0/t:1/j:read".into(),
             request_sha256: "a".repeat(64),
+            subject: policy_subject(&store, &actor, &session.id),
             policy_revision_sha256: "b".repeat(64),
             authority_sha256: "c".repeat(64),
             candidate_local: authorized.effective().routes().contains(Strategy::Local),
@@ -524,23 +623,39 @@ mod tests {
 
         let mut changed = request;
         changed.policy_revision_sha256 = "d".repeat(64);
+        changed.writer_epoch = changed.writer_epoch.saturating_add(1);
+        changed.subject.membership_epoch = changed.subject.membership_epoch.saturating_add(1);
+        let replay = run_admission_guardian(
+            AdmissionGuardianRequest {
+                store: &store,
+                actor: &actor,
+                request: changed,
+                authorized,
+                selected: &selected,
+                input: &input,
+                decision_revision: 4,
+            },
+            pending::<()>(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "changed mutable evidence must recover the paid decision without another guardian"
+        );
         assert!(matches!(
-            run_admission_guardian(
-                AdmissionGuardianRequest {
-                    store: &store,
-                    actor: &actor,
-                    request: changed,
-                    authorized,
-                    selected: &selected,
-                    input: &input,
-                    decision_revision: 4,
-                },
-                pending::<()>(),
-            )
-            .await,
+            store.policy_admission_consume(
+                &session.id,
+                &first.id,
+                &"d".repeat(64),
+                &"c".repeat(64),
+                Some(Strategy::Local),
+                None,
+            ),
             Err(Error::Conflict(_))
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
@@ -644,6 +759,7 @@ mod tests {
             call_id: "policy-guardian-crash".into(),
             canonical_target: "/d:local/i:local/p:repo/a:0/t:1/j:read-crash".into(),
             request_sha256: "1".repeat(64),
+            subject: policy_subject(&store, &actor, &session.id),
             policy_revision_sha256: "2".repeat(64),
             authority_sha256: "3".repeat(64),
             candidate_local: authorized.effective().routes().contains(Strategy::Local),
@@ -668,12 +784,10 @@ mod tests {
             timeout: Duration::from_secs(5),
         };
 
-        let claimed = store
-            .policy_admission_claim(&actor, request.clone())
-            .unwrap();
+        let claimed = store.policy_admission_claim(request.clone()).unwrap();
         let digest = input.digest().unwrap();
         let started = store
-            .policy_admission_start_guardian(&actor, &session.id, &claimed.id, &digest)
+            .policy_admission_start_guardian(&session.id, &claimed.id, &digest)
             .unwrap();
         assert_eq!(started.state, PolicyAdmissionState::GuardianStarted);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -730,7 +844,8 @@ mod tests {
     async fn remote_start_exact_replay_survives_tool_revoke_but_fresh_attempt_denies() {
         use aw_agent_core::{Agent, AgentOptions, ToolSource, TurnJournal, TurnStart};
         use aw_tools::remote_start::{
-            RemoteRuntimeLease, RemoteSessionAction, RemoteStartIntent, REMOTE_START_VERSION,
+            RemoteRuntimeLease, RemoteSessionAction, RemoteStartIntent, RemoteStartIssuer,
+            REMOTE_START_VERSION,
         };
         use std::sync::{atomic::AtomicUsize, Arc};
 
@@ -786,6 +901,7 @@ mod tests {
             call_id: "remote-start".into(),
             canonical_target: canonical.into(),
             request_sha256: "02".repeat(32),
+            subject: policy_subject(&store, &actor, &session.id),
             policy_revision_sha256: "04".repeat(32),
             authority_sha256: evidence.authority_sha256(),
             candidate_local: true,
@@ -797,10 +913,9 @@ mod tests {
             authorized_approvers: Vec::new(),
             approval_expires_at: None,
         };
-        let claimed = store.policy_admission_claim(&actor, request).unwrap();
+        let claimed = store.policy_admission_claim(request).unwrap();
         let decided = store
             .policy_admission_record_decision(
-                &actor,
                 &session.id,
                 &claimed.id,
                 PolicyDecision {
@@ -815,7 +930,6 @@ mod tests {
             .unwrap();
         let consumed = store
             .policy_admission_consume(
-                &actor,
                 &session.id,
                 &decided.id,
                 &"04".repeat(32),
@@ -845,43 +959,69 @@ mod tests {
                 expires_at_unix_ms: 61_000,
             },
         };
-        let first = authorize_remote_start(
-            &store,
-            &authority,
-            &actor,
-            &evidence,
-            &session.id,
-            &consumed.id,
-            intent.clone(),
-        )
+        let issuer = RemoteStartIssuer {
+            client_id: "aw-client".into(),
+            trust_epoch: 1,
+        };
+        let first = authorize_remote_start(RemoteStartAdmissionRequest {
+            store: &store,
+            authority: &authority,
+            actor: &actor,
+            evidence: &evidence,
+            session: &session.id,
+            policy_admission_id: &consumed.id,
+            intent: intent.clone(),
+            issuer: issuer.clone(),
+        })
         .unwrap();
 
         agent
             .revoke_registered_source_tool(&actor, "bash", &ToolSource::trusted_host())
             .unwrap();
-        let replay = authorize_remote_start(
-            &store,
-            &authority,
-            &actor,
-            &evidence,
-            &session.id,
-            &consumed.id,
-            intent.clone(),
-        )
+        let recovered = recover_remote_start(RemoteStartReplayRequest {
+            store: &store,
+            actor: &actor,
+            session: &session.id,
+            policy_admission_id: &consumed.id,
+            original_invocation_id: &intent.original_invocation_id,
+            effect_attempt_id: &intent.effect_attempt_id,
+            turn_id: intent.turn_id,
+            call_id: &intent.call_id,
+            operation: &intent.operation,
+            canonical_ref: &intent.canonical_ref,
+            arguments_sha256: intent.arguments_sha256,
+            original_request_sha256: intent.original_request_sha256,
+            session_action: intent.session_action,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered, first);
+
+        let replay = authorize_remote_start(RemoteStartAdmissionRequest {
+            store: &store,
+            authority: &authority,
+            actor: &actor,
+            evidence: &evidence,
+            session: &session.id,
+            policy_admission_id: &consumed.id,
+            intent: intent.clone(),
+            issuer: issuer.clone(),
+        })
         .unwrap();
         assert_eq!(replay, first);
 
         let mut fresh = intent;
         fresh.effect_attempt_id = "effect-2".into();
-        assert!(authorize_remote_start(
-            &store,
-            &authority,
-            &actor,
-            &evidence,
-            &session.id,
-            &consumed.id,
-            fresh,
-        )
+        assert!(authorize_remote_start(RemoteStartAdmissionRequest {
+            store: &store,
+            authority: &authority,
+            actor: &actor,
+            evidence: &evidence,
+            session: &session.id,
+            policy_admission_id: &consumed.id,
+            intent: fresh,
+            issuer,
+        })
         .is_err());
     }
 

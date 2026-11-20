@@ -13,14 +13,16 @@ parity. The goal is that AW owns portable process, Job, Task, receipt, budget
 and MCP semantics, while dotlink becomes a thin host/transport/deployment
 consumer.
 
-Authoritative dotlink reference:
+Authoritative current dotlink release reference:
 
-- `release/0.17 = 887401398da297c458ffa2a152a07e1b85870c35`
-- `v0.17.4 = fd1cdb6429a341a4e3d27805cae0bec288fc26df`
-- post-tag `8874013` removes hardcoded signal-name expectations and asks the
-  platform helper for the signal label, reinforcing the shared signal-name plan
-- canonical v0.17.4 stop/provenance implementation: `c185558`
-- v0.17.4 hardening: `74820ff`, `06d5548`, `30099aa`, `5b27784`
+- `release/0.17 = origin/release/0.17 = v0.17.5 =`
+  `3995448d7bf33794ef84c7bb51150d77cc260ada`;
+- `v0.17.4 = fd1cdb6429a341a4e3d27805cae0bec288fc26df`;
+- canonical v0.17.4 stop/provenance implementation: `c185558`;
+- v0.17.4 hardening: `74820ff`, `06d5548`, `30099aa`, `5b27784`;
+- `8874013` delegates signal labels to the platform helper;
+- v0.17.5 adds outside-signal lifecycle projection `f9537bb` and hard execution
+  deadline wording `a1f8505`.
 
 AW base for this master plan is the signed local checkpoint:
 
@@ -33,8 +35,9 @@ That checkpoint is the completed first slice: physical process exit is now
 Detailed API/ownership design: [DESIGN.md](DESIGN.md)
 Release/shared mapping: [AUDIT.md](AUDIT.md)
 Implementation phases: [TODO.md](TODO.md)
-Comprehensive handoff: [../../docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-18.md](../../docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-18.md)
-Next-agent entrypoint: [../../docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-18.md](../../docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-18.md)
+Current comprehensive handoff: [../../docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](../../docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md)
+Current next-agent entrypoint: [../../docs/AW-DOTLINK-NEXT-AGENT-2026-11-20.md](../../docs/AW-DOTLINK-NEXT-AGENT-2026-11-20.md)
+The 2026-11-19 and 2026-11-18 handoffs remain available for historical chronology.
 
 ## Goal
 

@@ -12,8 +12,8 @@ use aw_agent_core::{InvocationContext, RoutingExecutor, RoutingInput, RoutingJou
 #[cfg(feature = "routing")]
 use aw_routing::{target as routing_target, RoutingMode};
 use aw_store::{
-    DelegationLimits, PolicyAdmissionRequest, PolicyAdmissionState, QueueState, SessionStore,
-    SubagentInfo, SubagentMode,
+    DelegationLimits, PolicyAdmissionRequest, PolicyAdmissionState, PolicyAdmissionSubject,
+    QueueState, SessionParticipationAction, SessionStore, SubagentInfo, SubagentMode,
 };
 use aw_host::{
     execute_with_strategy, AuthenticatedToolGrantEvidence, DelegateAdmissionAuthority,
@@ -1032,8 +1032,13 @@ impl PolicyOperationRouter {
         let effective = authorized.effective();
 
         let session = self.store.session(&ctx.actor, &scope.session_id)?;
-        let writer = self.store.workspace_writer(
+        let subject = self.store.authorize_session_participation(
             &ctx.actor,
+            &scope.session_id,
+            SessionParticipationAction::Submit,
+        )?;
+        let writer = self.store.workspace_writer(
+            &session.owner,
             None,
             &session.workspace_id,
         )?;
@@ -1055,6 +1060,7 @@ impl PolicyOperationRouter {
             call_id: ctx.call_id.clone(),
             canonical_target: target.clone(),
             request_sha256: Self::request_sha256(operation, &arguments),
+            subject: PolicyAdmissionSubject::from_participation(&subject),
             policy_revision_sha256: policy_sha.clone(),
             authority_sha256: authority_sha.clone(),
             candidate_local: effective.routes().contains(aw_policy::Strategy::Local),
@@ -1072,7 +1078,7 @@ impl PolicyOperationRouter {
             authorized_approvers: Vec::new(),
             approval_expires_at: None,
         };
-        let claimed = self.store.policy_admission_claim(&ctx.actor, request)?;
+        let claimed = self.store.policy_admission_claim(request)?;
 
         let decided = if self.config.guardian {
             let selected = selected_for_guardian
@@ -1125,7 +1131,6 @@ impl PolicyOperationRouter {
                     let route = effective.strategy();
                     let digest = Self::decision_digest(self.config.revision, route, "allow");
                     self.store.policy_admission_record_decision(
-                        &ctx.actor,
                         &scope.session_id,
                         &claimed.id,
                         aw_policy::PolicyDecision {
@@ -1143,6 +1148,33 @@ impl PolicyOperationRouter {
         };
 
         if decided.state == PolicyAdmissionState::Consumed {
+            let strategy = Self::selected_route(&decided, effective.strategy())?;
+            if strategy == aw_policy::Strategy::Local && Self::remote_effect(operation) {
+                if let Some(bridge) = self.remote_sites.get(&ctx.execution_site).cloned() {
+                    let wire_arguments = Self::remote_arguments(operation, &target, &arguments)?;
+                    if let Some(authorization) = aw::policy_runtime::recover_remote_start(
+                        aw::policy_runtime::RemoteStartReplayRequest {
+                            store: &self.store,
+                            actor: &ctx.actor,
+                            session: &scope.session_id,
+                            policy_admission_id: &decided.id,
+                            original_invocation_id: &invocation,
+                            effect_attempt_id: &ctx.call_id,
+                            turn_id: ctx.turn_id,
+                            call_id: &ctx.call_id,
+                            operation: operation.semantic_name(),
+                            canonical_ref: &target,
+                            arguments_sha256: remote_arguments_sha256(&wire_arguments),
+                            original_request_sha256: Self::request_digest(operation, &arguments),
+                            session_action: Self::remote_session_action(operation)?,
+                        },
+                    )? {
+                        return bridge
+                            .call_effect(&ctx, operation, &wire_arguments, &authorization)
+                            .await;
+                    }
+                }
+            }
             return Err(Error::Conflict(
                 "policy admission already consumed; recover the original factual receipt",
             ));
@@ -1197,7 +1229,7 @@ impl PolicyOperationRouter {
                 let wire_arguments = remote_arguments
                     .as_ref()
                     .ok_or(Error::Protocol("remote arguments disappeared"))?;
-                Some(RemoteStartIntent {
+                Some((RemoteStartIntent {
                     version: REMOTE_START_VERSION,
                     original_invocation_id: invocation.clone(),
                     turn_id: ctx.turn_id,
@@ -1208,15 +1240,14 @@ impl PolicyOperationRouter {
                     arguments_sha256: remote_arguments_sha256(wire_arguments),
                     original_request_sha256: Self::request_digest(operation, &arguments),
                     session_action: Self::remote_session_action(operation)?,
-                    target: lease,
-                })
+                    target: lease.target,
+                }, lease.issuer))
             }
             _ => None,
         };
 
         evidence.revalidate(&self.authority)?;
         let consumed = self.store.policy_admission_consume(
-            &ctx.actor,
             &scope.session_id,
             &decided.id,
             &policy_sha,
@@ -1237,15 +1268,19 @@ impl PolicyOperationRouter {
             if Self::remote_read(operation) {
                 return bridge.call_read(&ctx, operation, wire_arguments).await;
             }
-            let intent = remote_intent.ok_or(Error::Protocol("remote Start intent disappeared"))?;
+            let (intent, issuer) =
+                remote_intent.ok_or(Error::Protocol("remote Start intent disappeared"))?;
             let authorization = aw::policy_runtime::authorize_remote_start(
-                &self.store,
-                &self.authority,
-                &ctx.actor,
-                &evidence,
-                &scope.session_id,
-                &consumed.id,
-                intent,
+                aw::policy_runtime::RemoteStartAdmissionRequest {
+                    store: &self.store,
+                    authority: &self.authority,
+                    actor: &ctx.actor,
+                    evidence: &evidence,
+                    session: &scope.session_id,
+                    policy_admission_id: &consumed.id,
+                    intent,
+                    issuer,
+                },
             )?;
             return bridge
                 .call_effect(&ctx, operation, wire_arguments, &authorization)
@@ -2755,6 +2790,17 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         })
     }
 
+    async fn deliver_stable_agent_events(
+        router: &aw::agent_jobs::Router,
+        canonical_ref: &str,
+    ) {
+        let _ = aw_tools_adapter::agent_jobs::AgentJobRouter::deliver_source_events(
+            router,
+            canonical_ref,
+        )
+        .await;
+    }
+
     async fn run_stable_claimed_turn(
         prepared: &mut Prepared,
         owner: &aw::actor_owner::Service,
@@ -2814,7 +2860,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         reason: &str,
     ) -> Result<()> {
         runtime.closing.store(true, Ordering::Release);
-        let (_principal, session, _branch, _site, _epoch) =
+        let (_principal, session, branch, _site, _epoch) =
             runtime.owner.bound_peer_scope();
         for fact in runtime.owner.queue_list()? {
             if fact.state != QueueState::Pending {
@@ -2837,9 +2883,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 );
             }
         }
-        inner.store.settle_subagent(
+        inner.store.settle_agent_job(
             &prepared.info.identity.actor,
             &prepared.info.id,
+            branch,
             "cancelled",
             Some(reason),
         )?;
@@ -2854,9 +2901,11 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         detail: &str,
     ) {
         let bounded = detail.chars().take(2048).collect::<String>();
-        let _ = inner.store.settle_subagent(
+        let (_principal, _session, branch, _site, _epoch) = runtime.owner.bound_peer_scope();
+        let _ = inner.store.settle_agent_job(
             &prepared.info.identity.actor,
             &prepared.info.id,
+            branch,
             "failed",
             Some(&bounded),
         );
@@ -2911,6 +2960,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                             &mut prepared,
                             &runtime_state.owner,
                         ));
+                        runtime.block_on(Self::deliver_stable_agent_events(
+                            runtime_state.router.as_ref(),
+                            &runtime_state.canonical_ref,
+                        ));
                     }
                     Ok(LiveAgentCommand::Close) => {
                         let _ = Self::close_stable_agent(
@@ -2919,6 +2972,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                             &runtime_state,
                             "Agent closed by jobs_cancel",
                         );
+                        runtime.block_on(Self::deliver_stable_agent_events(
+                            runtime_state.router.as_ref(),
+                            &runtime_state.canonical_ref,
+                        ));
                         break;
                     }
                     Err(_) => {
@@ -2958,6 +3015,9 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         let cleanup_id = prepared.info.id.clone();
         let cleanup_router = runtime_state.router.clone();
         let cleanup_ref = runtime_state.canonical_ref.clone();
+        let (_principal, _session, cleanup_branch, _site, _epoch) =
+            runtime_state.owner.bound_peer_scope();
+        let cleanup_branch = cleanup_branch.to_owned();
         let spawn = thread::Builder::new().name(name).spawn(move || {
             let _active = active;
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -3014,6 +3074,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 first_cancel,
             ));
             Self::finish_scoped_initial_turn(&mut prepared, &first);
+            runtime.block_on(Self::deliver_stable_agent_events(
+                            runtime_state.router.as_ref(),
+                            &runtime_state.canonical_ref,
+                        ));
 
             loop {
                 match runtime_state.receiver.recv() {
@@ -3025,6 +3089,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                             &mut prepared,
                             &runtime_state.owner,
                         ));
+                        runtime.block_on(Self::deliver_stable_agent_events(
+                            runtime_state.router.as_ref(),
+                            &runtime_state.canonical_ref,
+                        ));
                     }
                     Ok(LiveAgentCommand::Close) => {
                         let _ = Self::close_stable_agent(
@@ -3033,6 +3101,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                             &runtime_state,
                             "Agent closed by jobs_cancel",
                         );
+                        runtime.block_on(Self::deliver_stable_agent_events(
+                            runtime_state.router.as_ref(),
+                            &runtime_state.canonical_ref,
+                        ));
                         break;
                     }
                     Err(_) => {
@@ -3050,9 +3122,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         if let Err(error) = spawn {
             let detail = format!("cannot spawn stable Agent worker: {error}");
             let bounded = detail.chars().take(2048).collect::<String>();
-            let _ = cleanup_inner.store.settle_subagent(
+            let _ = cleanup_inner.store.settle_agent_job(
                 &cleanup_actor,
                 &cleanup_id,
+                &cleanup_branch,
                 "failed",
                 Some(&bounded),
             );
@@ -3244,6 +3317,11 @@ impl Tool for AgentConstructor {
             )
             .await;
             Service::finish_scoped_initial_turn(&mut prepared, &first);
+            Service::deliver_stable_agent_events(
+                runtime_state.router.as_ref(),
+                &runtime_state.canonical_ref,
+            )
+            .await;
             let revision = self.service.inner.store.agent_public_revision(
                 &ctx.actor,
                 binding.session_id(),
@@ -5125,6 +5203,24 @@ mod tests {
             calls: native_calls.clone(),
         });
         parent_agent.register_host_tool(native.clone()).unwrap();
+        let participant = PrincipalId::new("local:policy-participant").unwrap();
+        store
+            .set_session_participation(
+                &actor,
+                &parent.id,
+                &participant,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    contribute: false,
+                    submit: true,
+                    control: false,
+                    manage: false,
+                },
+            )
+            .unwrap();
+        parent_agent
+            .permit_registered_host_tool(participant.clone(), "read")
+            .unwrap();
         let authority = parent_agent.tool_binding_authority();
 
         handle
@@ -5207,6 +5303,65 @@ mod tests {
             "deterministic Local policy must perform zero auxiliary/delegate model calls"
         );
 
+        let mut participant_context = base_context.clone();
+        participant_context.actor = participant.clone();
+        participant_context.identity.actor = participant.clone();
+        participant_context.call_id = "policy-participant".into();
+        let participant_result = local_router
+            .execute(
+                OperationId::Fs(FsTool::Read),
+                participant_context.clone(),
+                &json!({"path":"participant.txt"}),
+                native.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(participant_result.content, "native:participant.txt");
+        assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+
+        parent_agent
+            .revoke_registered_source_tool(
+                &participant,
+                "read",
+                &aw_agent_core::ToolSource::trusted_host(),
+            )
+            .unwrap();
+        participant_context.call_id = "policy-participant-no-tool".into();
+        assert!(
+            local_router
+                .execute(
+                    OperationId::Fs(FsTool::Read),
+                    participant_context.clone(),
+                    &json!({"path":"must-not-run.txt"}),
+                    native.clone(),
+                )
+                .await
+                .is_err(),
+            "Session owner tool authority must never be unioned into participant authority"
+        );
+        assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+
+        parent_agent
+            .permit_registered_host_tool(participant.clone(), "read")
+            .unwrap();
+        store
+            .revoke_session_participation(&actor, &parent.id, &participant)
+            .unwrap();
+        participant_context.call_id = "policy-participant-revoked".into();
+        assert!(
+            local_router
+                .execute(
+                    OperationId::Fs(FsTool::Read),
+                    participant_context,
+                    &json!({"path":"must-not-run-after-revoke.txt"}),
+                    native.clone(),
+                )
+                .await
+                .is_err(),
+            "current participant Submit authority is independently required"
+        );
+        assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+
         let delegate_policy = aw_policy::Policy {
             deny: false,
             routes: aw_policy::Routes::BOTH,
@@ -5235,7 +5390,7 @@ mod tests {
         assert_eq!(delegated.content, "native:sealed-parent-argument.txt");
         assert_eq!(
             native_calls.load(Ordering::SeqCst),
-            2,
+            3,
             "delegate must execute the original factual operation exactly once"
         );
         assert_eq!(
@@ -5255,7 +5410,7 @@ mod tests {
                 .is_err(),
             "consumed admission replay must not repeat the native effect"
         );
-        assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 3);
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
     }
 

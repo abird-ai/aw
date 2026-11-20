@@ -24,6 +24,7 @@ const MAX_SCOPE_BYTES: usize = 2_048;
 const MAX_SESSION_BYTES: usize = 256;
 const MAX_BRANCH_BYTES: usize = 256;
 const MAX_ADMISSION_BYTES: usize = 128;
+const MAX_CLIENT_ID_BYTES: usize = 512;
 
 fn bounded_ascii(value: &str, max: usize) -> bool {
     !value.is_empty()
@@ -121,6 +122,41 @@ impl RemoteRuntimeLease {
     }
 }
 
+/// Target-authenticated identity of the AW bridge client that may mint a new
+/// remote Start. This is capability evidence, not a bearer secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteStartIssuer {
+    pub client_id: String,
+    pub trust_epoch: u64,
+}
+
+impl RemoteStartIssuer {
+    pub fn validate(&self) -> Result<(), RemoteStartError> {
+        if !bounded_ascii(&self.client_id, MAX_CLIENT_ID_BYTES) || self.trust_epoch == 0 {
+            return Err(RemoteStartError::InvalidIssuer);
+        }
+        Ok(())
+    }
+}
+
+/// Lease response issued by the authenticated target bridge. Keeping issuer
+/// identity separate from the runtime target makes trust revocation independent
+/// from runtime generation/expiry while binding both into a new Start fact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteStartLease {
+    pub target: RemoteRuntimeLease,
+    pub issuer: RemoteStartIssuer,
+}
+
+impl RemoteStartLease {
+    pub fn validate(&self) -> Result<(), RemoteStartError> {
+        self.target.validate()?;
+        self.issuer.validate()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteStartIntent {
@@ -204,6 +240,10 @@ impl RemoteStartSource {
 pub struct RemoteStartProvenance {
     pub actor: String,
     pub source: RemoteStartSource,
+    /// Absent only on pre-v36 persisted facts. New Starts must carry a
+    /// target-authenticated issuer and the Store enforces that at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<RemoteStartIssuer>,
     pub policy_revision_sha256: [u8; 32],
     pub policy_admission_id: String,
     pub session_id: String,
@@ -216,6 +256,9 @@ pub struct RemoteStartProvenance {
 impl RemoteStartProvenance {
     pub fn validate(&self) -> Result<(), RemoteStartError> {
         self.source.validate()?;
+        if let Some(issuer) = &self.issuer {
+            issuer.validate()?;
+        }
         if !bounded_ascii(&self.actor, 256)
             || !bounded_ascii(&self.policy_admission_id, MAX_ADMISSION_BYTES)
             || !bounded_ascii(&self.session_id, MAX_SESSION_BYTES)
@@ -290,7 +333,13 @@ impl RemoteStartAuthorization {
 
     fn digest_parts(intent: &RemoteStartIntent, provenance: &RemoteStartProvenance) -> [u8; 32] {
         let mut hash = Sha256::new();
-        hash.update(b"aw-remote-start-authorization-v1\0");
+        if provenance.issuer.is_some() {
+            hash.update(b"aw-remote-start-authorization-v2\0");
+        } else {
+            // Exact compatibility for pre-v36 audit facts. These may be
+            // replayed, but the Store refuses to mint a new issuer-less fact.
+            hash.update(b"aw-remote-start-authorization-v1\0");
+        }
         hash.update(intent.version.to_be_bytes());
         put_str(&mut hash, &intent.original_invocation_id);
         hash.update(intent.turn_id.to_be_bytes());
@@ -317,6 +366,10 @@ impl RemoteStartAuthorization {
         put_str(&mut hash, &provenance.source.site);
         put_str(&mut hash, &provenance.source.resource_scope);
         hash.update(provenance.source.grant_sha256);
+        if let Some(issuer) = &provenance.issuer {
+            put_str(&mut hash, &issuer.client_id);
+            hash.update(issuer.trust_epoch.to_be_bytes());
+        }
         hash.update(provenance.policy_revision_sha256);
         put_str(&mut hash, &provenance.policy_admission_id);
         put_str(&mut hash, &provenance.session_id);
@@ -331,6 +384,7 @@ impl RemoteStartAuthorization {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteStartError {
     InvalidLease,
+    InvalidIssuer,
     InvalidIntent,
     InvalidOperation,
     InvalidRef,
@@ -377,6 +431,10 @@ mod tests {
                 resource_scope: "/d:abird/i:pvl/p:repo".into(),
                 grant_sha256: [4; 32],
             },
+            issuer: Some(RemoteStartIssuer {
+                client_id: "aw-client".into(),
+                trust_epoch: 9,
+            }),
             policy_revision_sha256: [5; 32],
             policy_admission_id: "pa_fixture".into(),
             session_id: "session".into(),
@@ -446,6 +504,26 @@ mod tests {
                 .unwrap()
                 .authorization_id
         );
+
+        let mut changed_provenance = provenance();
+        changed_provenance.issuer.as_mut().unwrap().trust_epoch += 1;
+        assert_ne!(
+            base.authorization_id,
+            RemoteStartAuthorization::new(intent(), changed_provenance)
+                .unwrap()
+                .authorization_id
+        );
+    }
+
+    #[test]
+    fn legacy_issuerless_authorization_keeps_v1_digest_but_new_issuer_is_v2_bound() {
+        let mut legacy = provenance();
+        legacy.issuer = None;
+        let legacy = RemoteStartAuthorization::new(intent(), legacy).unwrap();
+        legacy.validate().unwrap();
+        let current = RemoteStartAuthorization::new(intent(), provenance()).unwrap();
+        assert_ne!(legacy.authorization_id, current.authorization_id);
+        assert!(current.provenance.issuer.is_some());
     }
 
     #[test]

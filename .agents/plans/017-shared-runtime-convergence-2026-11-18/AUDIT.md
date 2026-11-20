@@ -2,9 +2,11 @@
 
 Parent: [README.md](README.md)
 
-Authoritative release branch: dotlink `release/0.17 @ 8874013`.
-Tagged release baseline: `v0.17.4 @ fd1cdb6`; post-tag `8874013` only
-strengthens platform-owned signal-label testing.
+Current authoritative release reference:
+`release/0.17 = origin/release/0.17 = v0.17.5 =`
+`3995448d7bf33794ef84c7bb51150d77cc260ada`.
+Historical v0.17.4 baseline: `fd1cdb6429a341a4e3d27805cae0bec288fc26df`;
+`8874013` is the v0.17.4 post-tag signal-label test cleanup.
 
 ## Shared-first capability map
 

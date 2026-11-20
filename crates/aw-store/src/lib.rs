@@ -14,6 +14,7 @@ mod actor_custody;
 mod actor_notice;
 mod actor_peer;
 mod actor_queue;
+mod agent_job_events;
 mod archive;
 mod auth_session;
 mod authority;
@@ -82,6 +83,7 @@ pub use actor_queue::{
     ActorQueueRequest, ActorQueueView, ClaimedQueueInput, ModelQueueDispositionKind,
     ModelQueueDispositionRequest, QueueClaim, QueueState, QueueTarget,
 };
+pub use agent_job_events::AgentJobWakeAdmission;
 pub use auth_session::*;
 pub use authority::{
     domain_authority_vote_transcript, DomainAuthorityElectionInfo, DomainAuthorityGrantBundle,
@@ -133,7 +135,8 @@ pub use pipelines::*;
 #[cfg(all(feature = "pipelines", feature = "routing"))]
 pub use planner::*;
 pub use policy_admission::{
-    PolicyAdmissionFact, PolicyAdmissionRequest, PolicyAdmissionState, PolicyGuardianJournal,
+    PolicyAdmissionFact, PolicyAdmissionRequest, PolicyAdmissionState, PolicyAdmissionSubject,
+    PolicyGuardianJournal,
 };
 pub use provider_credentials::*;
 pub use remote_view::*;
@@ -224,8 +227,10 @@ pub const PIPELINE_SCHEDULE_SCHEMA: &str = include_str!("../migrations/033_pipel
 pub const SHARED_SESSION_PARTICIPATION_SCHEMA: &str =
     include_str!("../migrations/034_shared_session_participation.sql");
 pub const REMOTE_VIEW_TRUST_SCHEMA: &str = include_str!("../migrations/035_remote_view_trust.sql");
+pub const RUNTIME_ADMISSION_INDEX_SCHEMA: &str =
+    include_str!("../migrations/036_runtime_admission_indexes.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 35;
+const LATEST_SCHEMA_VERSION: i64 = 36;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2520,6 +2525,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 34 {
         migrate_remote_view_trust(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 35 {
+        migrate_runtime_admission_indexes(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -2556,6 +2565,38 @@ fn add_coordination_column_if_missing(
     }
     let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
     db(c.execute_batch(&statement))?;
+    Ok(())
+}
+
+fn migrate_runtime_admission_indexes(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='runtime-admission-indexes',generation=generation+1,
+             target_epoch=36,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(RUNTIME_ADMISSION_INDEX_SCHEMA))?;
+    policy_admission::backfill_current(&tx)?;
+    remote_start::backfill_current(&tx)?;
+    job_exposure::backfill_current(&tx)?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |r| r.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "runtime-admission index migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.commit())?;
     Ok(())
 }
 
@@ -3481,6 +3522,14 @@ pub(crate) fn agent_binding_in(
     branch: &str,
 ) -> Result<AgentBindingInfo> {
     context::authorize_tree(c, session, actor)?;
+    agent_binding_unchecked(c, session, branch)
+}
+
+pub(crate) fn agent_binding_unchecked(
+    c: &Connection,
+    session: &str,
+    branch: &str,
+) -> Result<AgentBindingInfo> {
     let row: Option<(String, String, i64, String, i64, String, String)> = db(c
         .query_row(
             "SELECT COALESCE(s.workspace_id,''),COALESCE(s.owner_user_id,''),s.created_at,

@@ -1,8 +1,18 @@
 # CURRENT HANDOFF — AW live state
 
+Canonical cross-repo comprehensive handoff:
+[AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md).
+
+Current copy-ready next-agent entrypoint:
+[AW-DOTLINK-NEXT-AGENT-2026-11-20.md](AW-DOTLINK-NEXT-AGENT-2026-11-20.md).
+
+The dated 2026-11-19 017 handoff is preserved as historical chronology and is
+embedded in the canonical 2026-11-20 document above. Current refs/status/pending
+work in that older file are superseded.
+
 Author: coordinating implementation agent
 Owner: @pvl
-Updated: 2026-11-18
+Updated: 2026-11-20
 Source authority host: **L5 only**
 Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 
@@ -11,6 +21,122 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 >
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
+
+## LIVE uncommitted AW v36 completion checkpoint — 2026-11-20
+
+This section supersedes the older pending-order text below where it conflicts.
+No commit/push/repin was performed for this checkpoint.
+
+Current boundary:
+
+- AW `HEAD == origin/main == 4234447612421069a746c925c76a25e3ba27774a`;
+- the existing substantial uncommitted v36 admission/Agent-source work is
+  preserved and extended in place; nothing was reset or staged;
+- dotlink was not modified in this AW slice. It remains at local
+  `20b6f045f79fa7725f286e05b40e9262b1c9e4d3`, four commits ahead of
+  `origin/main = 4c3b96fd5ba9e6772bc159f10a3ad893c9729887`, with its existing
+  post-017 dirty source hardening preserved;
+- all seven AW Git packages in dotlink remain pinned to
+  `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`;
+- the read-only dotlink release worktree is clean at local `release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`, 28 commits ahead of published `origin/release/0.17 = v0.17.5 = 3995448d7bf33794ef84c7bb51150d77cc260ada`; it was not modified here;
+- D4-D7 and v0.17.5 semantic equivalence remain closed; do not reopen them
+  without a reproduced regression;
+- sandbox/mount/config-v13 remains frozen.
+
+The remaining AW v36 source batch is now implemented locally:
+
+- explicit v35 -> v36 open/migration coverage reconstructs the current
+  projections and proves exact replay of a real issuer-less v35 Remote Start
+  authorization without inventing v36 evidence;
+- `RemoteStartIssuer { client_id, trust_epoch }` and
+  `RemoteStartLease { target, issuer }` make the AW-side trusted-issuer
+  identity explicit. New Starts use an issuer-bound v2 authorization digest;
+  historical issuer-less facts retain the exact v1 digest and are replay-only;
+- committed Start recovery is issuer/lease independent. AW first recovers by the
+  immutable invocation/effect-attempt identity and verifies the original
+  semantic operation/ref/argument/request/action facts; only a new Start obtains
+  a current issuer+runtime lease. Changed semantics fail closed;
+- canonical Agent binding lookup is indexed by the existing authoritative
+  Workspace/Session/branch rows and always rechecks current Session
+  authorization. No Agent lifecycle registry/table was introduced;
+- v36 adds the query-only `job_exposure_current` projection. It derives Agent
+  and finite-Job list positions atomically from immutable `commit_log`
+  evidence, is rebuilt during migration, and supports bounded keyset pagination
+  of the mixed Agent/finite list. SessionStore remains the Agent owner,
+  JobManager remains the finite Job owner, and `commit_log` remains ordering
+  evidence;
+- Agent resolve/source/wake/list hot paths no longer enumerate all Agent
+  bindings; mixed listing no longer reconstructs the entire finite exposure
+  history and sorts the union in memory;
+- the Remote Start admission call is grouped as one
+  `RemoteStartAdmissionRequest` rather than an expanding positional argument
+  list.
+
+Current validation on L5:
+
+- v35 -> v36 migration/open regression: green;
+- mixed Store exposure ordering/indexed pagination regression: green;
+- mixed Agent/finite router pagination + cursor-authority regression: green;
+- `jobs_get` revision-wake regression: green;
+- revoked-participant wake/history-cursor regression: green;
+- durable Agent/Turn exact-source delivery regression: green;
+- shared-session participation/revocation epoch regression: green;
+- Remote Start replay-after-revoke/fresh-attempt-deny regression: green,
+  including issuer-independent recovery;
+- aw-tools Remote Start suite: **6/6** green;
+- aw-store Remote Start module: **4/4** green;
+- aw-mcp exact Remote Start wire-metadata regression: green;
+- `cargo check --locked -p aw-store --lib -j1`: green;
+- `cargo check --locked -p aw-cli --lib --bins -j1`: green;
+- strict `-D warnings` Clippy: aw-tools all targets green, aw-mcp all targets
+  green, aw-store lib green, and aw-cli all targets (`--no-deps`) green;
+- `cargo fmt --all -- --check` and UX-excluding `git diff --check`: green at
+  the final handoff.
+
+L5 repeatedly externally SIGKILLed aw-store all-target/all-feature check/Clippy
+while compiling aw-store, with no Rust diagnostic. Those attempts are recorded
+as infrastructure interruption, not source failures. One root Clippy attempt did
+produce real diagnostics before an external kill (too many arguments, then a
+Rust-2024-only let-chain); both were fixed structurally and the subsequent
+aw-cli all-target strict Clippy (`--no-deps`) is green.
+
+Cross-repo issuer boundary:
+
+- AW now defines/consumes the issuer-bearing wire and refuses to mint a new
+  Store authorization without a structurally valid issuer;
+- current dotlink still consumes the published pre-issuer AW pin. Do **not**
+  introduce a temporary path dependency or duplicate the new AW wire locally;
+- after an explicitly authorized AW publish/repin, dotlink must make its lease
+  endpoint issue `RemoteStartLease` only for explicitly trusted OAuth AW
+  bridge clients, bind actual authenticated `client_id`/trust epoch, and add
+  the ordinary-OAuth-client negative test. That target-side trust enforcement
+  is not falsely claimed complete by this AW-only checkpoint.
+
+The dotlink process/control batch is now complete locally/uncommitted:
+
+- ordinary waited-child exit closes the remaining managed process group / Job
+  Object immediately as reasonless housekeeping;
+- inherited output gets a separate 250 ms post-exit grace;
+- escaped-`setsid` retained FDs preserve known command exit while marking output
+  incomplete through shared `ProcessSettlement + Status.incomplete`;
+- revision-fenced public cancel requires the canonical shared Job owner;
+- stdin authority verification and shared revision acceptance are linearized at
+  the per-Job transition boundary before bytes are enqueued;
+- the duplicate static MCP instruction owner is removed;
+- deterministic shared-Process control fixtures replace child-sleep timing in
+  the relevant wait/read/cancel regressions;
+- AW's shared `ProcessTerminal::status()` now also treats process outcome and
+  output completeness orthogonally: `Primary` derives from stop/exit evidence
+  while `Status.incomplete = !output.complete`. Exact full-feature runner
+  regression, `aw-tools --all-features --lib` **359/359**, and strict
+  all-target/all-feature Clippy are green (after one diagnostic-free L5 kill).
+
+Final L5 gate: main **703/0/1**, integrations **42/42**, strict all-target/
+all-feature Clippy, fmt/diff, Alejandra and Markdown **0 issues / 86 files**.
+The only remaining cross-repo source item is dotlink trusted-issuer issuance
+after an explicitly authorized AW publish/repin exposes the issuer-bearing
+shared wire. Native Windows/macOS validation remains external.
+Do not touch sandbox/config-v13.
 
 ## LIVE 0.17 fresh-review convergence checkpoint — 2026-11-19
 
@@ -25,14 +151,13 @@ Current Git boundary:
   protocol crate from downgrading compatible downstream Tokio/serde_json;
 - previous source checkpoint `eb325b31...` is historical and must not be used
   for the dotlink repin;
-- `origin/main` is still `792f0b38...` at this docs-edit instant; the user has
-  explicitly authorized publishing this checkpoint in the current turn;
-- dotlink committed HEAD is
-  `8e14ee2b8575c35bc3d5a7204ac15c121410c751`;
-  `origin/main` remains
-  `5381729cd469eda54691e540deb3fee13e9f3e3e`;
-- dotlink also has small uncommitted pre-repin parity fixes from this review;
-- nothing is staged or pushed;
+- AW `HEAD == origin/main == 4234447612421069a746c925c76a25e3ba27774a`
+  (`Record final shared 0.17 implementation pin`); final reusable implementation
+  remains `AW_IMPL_SHA = 1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`;
+- dotlink `HEAD == origin/main == 4c3b96fd5ba9e6772bc159f10a3ad893c9729887`
+  (`Record repinned D1-D3 convergence checkpoint`);
+- dotlink D0-D3 are published/complete; D4-D7 are the active consumer queue;
+- AW and dotlink working trees are clean at this handoff refresh;
 - the read-only release reference is now fully published at
   `release/0.17 = origin/release/0.17 = v0.17.5 =`
   `3995448d7bf33794ef84c7bb51150d77cc260ada`. This worktree was not modified
@@ -102,9 +227,9 @@ Fresh AW validation:
 The native Windows Job Object / exit-signal assertions remain authored but
 unexecuted on L5 because its Windows Rust std target is unavailable.
 
-The publish/repin gate is explicitly authorized in the current turn.
-`AW_IMPL_SHA` is fixed at `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`.
-The direct dotlink AW set to repin atomically is:
+Publish and atomic repin are complete. `AW_IMPL_SHA` is fixed at
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`. The direct dotlink AW set now
+pinned atomically is:
 
 - `aw-tools`;
 - `aw-tools-fs-unix`;
@@ -112,7 +237,9 @@ The direct dotlink AW set to repin atomically is:
 - `aw-platform`;
 - **`aw-mcp-protocol`** (not the full `aw-mcp` client adapter).
 
-Frozen sandbox/config-v13 work remains untouched and deferred.
+All direct/transitive AW Git packages in dotlink resolve to that exact SHA,
+with no registry package/version churn and no path override. Frozen
+sandbox/config-v13 work remains untouched and deferred.
 
 ## Latest AW-tools published checkpoint — 2026-11-18
 

@@ -1943,11 +1943,12 @@ fn attach_settled_run(c: &Connection, run: &str) -> Result<bool> {
         u64,
         String,
         String,
+        u64,
     )> = db(c
         .query_row(
             "SELECT session_id,branch_id,prompt_node,identity_json,operation_id,attempt_no,
                 produced_from_head,produced_from_revision,produced_from_writer_epoch,
-                final_node,attach_status
+                final_node,attach_status,turn_id
          FROM runs WHERE id=?1 AND status<>'running'",
             [run],
             |r| {
@@ -1963,6 +1964,7 @@ fn attach_settled_run(c: &Connection, run: &str) -> Result<bool> {
                     r.get(8)?,
                     r.get(9)?,
                     r.get(10)?,
+                    r.get(11)?,
                 ))
             },
         )
@@ -1979,6 +1981,7 @@ fn attach_settled_run(c: &Connection, run: &str) -> Result<bool> {
         source_writer_epoch,
         node,
         attach_status,
+        turn_id,
     )) = row
     else {
         return Err(Error::Conflict("settled run is unavailable for attachment"));
@@ -2039,6 +2042,9 @@ fn attach_settled_run(c: &Connection, run: &str) -> Result<bool> {
         ))?;
         let hint = id("hint")?;
         db(c.execute("INSERT INTO recovery_hints(id,operation_id,session_id,branch_id,kind,severity,message,action_json,state,created_at) VALUES(?1,?2,?3,?4,'attachment_conflict','warning','A completed model result could not attach because the branch moved. The paid result is preserved; do not regenerate automatically.',?5,'open',?6)",params![hint,operation,session,branch,json(&serde_json::json!({"operation_id":operation,"run_id":run,"result_node":node,"produced_from_head":source_head,"produced_from_revision":source_revision,"produced_from_writer_epoch":source_writer_epoch,"writer_epoch_still_current":writer_matches,"actions":["fork_from_original","compare","summarize","leave_unattached"]}))?,now()]))?;
+    }
+    if attached {
+        crate::agent_job_events::commit_turn_settled_in(c, &session, &branch, turn_id)?;
     }
     crate::durability::commit_event(
         c,

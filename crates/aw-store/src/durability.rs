@@ -370,7 +370,10 @@ pub(crate) fn commit_event_position(
     ))?;
     let event = id("ev")?;
     db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![event,store,tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
-    u64::try_from(c.last_insert_rowid()).map_err(|_| Error::Storage("commit log sequence overflow"))
+    let position = u64::try_from(c.last_insert_rowid())
+        .map_err(|_| Error::Storage("commit log sequence overflow"))?;
+    crate::job_exposure::project_commit_event(c, kind, entity_type, entity_id, &payload, position)?;
+    Ok(position)
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ref_event(

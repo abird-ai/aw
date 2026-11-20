@@ -139,7 +139,8 @@ pub struct SubscriptionUpdate {
     pub active: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Subscription {
     generation: u64,
     recipient_authority_ref: String,
@@ -148,7 +149,8 @@ struct Subscription {
 
 /// Pure source-side rule/event revision state. Callers serialize this with the
 /// authoritative source transition; this type performs no I/O or authorization.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceEventBook {
     next_generation: u64,
     next_event_rev: u64,
@@ -156,6 +158,36 @@ pub struct SourceEventBook {
 }
 
 impl SourceEventBook {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.subscriptions.values().any(|subscription| {
+            let canonical = EventRuleSet::new(subscription.rules.as_slice().iter().copied());
+            subscription.generation == 0
+                || subscription.generation > self.next_generation
+                || match canonical {
+                    Ok(canonical) => canonical != subscription.rules,
+                    Err(_) => true,
+                }
+        }) {
+            return Err("invalid persisted Job event source state");
+        }
+        for (recipient_ref, subscription) in &self.subscriptions {
+            let bounded = |value: &str| {
+                !value.is_empty()
+                    && value.len() <= 2048
+                    && value.is_ascii()
+                    && !value.chars().any(char::is_control)
+            };
+            if !bounded(recipient_ref) || !bounded(&subscription.recipient_authority_ref) {
+                return Err("invalid persisted Job event recipient");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+
     pub fn replace(
         &mut self,
         recipient_ref: &str,
@@ -299,6 +331,27 @@ mod tests {
             EventRule::new(JobEventKind::Result, JobWakeMode::Steer),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn source_event_book_round_trips_without_losing_generations_or_rules() {
+        let mut book = SourceEventBook::default();
+        let rules = EventRuleSet::new([
+            EventRule::new(JobEventKind::Result, JobWakeMode::Queue),
+            EventRule::new(JobEventKind::Settled, JobWakeMode::Queue),
+        ])
+        .unwrap();
+        let update = book
+            .replace("/d:0/i:0/p:0/a:1", "jwa_fixture", rules)
+            .unwrap();
+        let encoded = serde_json::to_string(&book).unwrap();
+        let restored: SourceEventBook = serde_json::from_str(&encoded).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, book);
+        assert_eq!(
+            restored.generation_for("/d:0/i:0/p:0/a:1"),
+            Some(update.generation)
+        );
     }
 
     #[test]
