@@ -4,6 +4,7 @@
 
 - [~] P1 release-readiness — @pvl — [details](release-readiness/TODO.md)
 - [~] P1 017-shared-runtime-convergence-2026-11-18 — @pvl — Shared-first process/Job/Task/MCP convergence for dotlink v0.17.4; sandbox explicitly deferred — [details](017-shared-runtime-convergence-2026-11-18/README.md)
+- [~] P1 dl200-unified-jobs-agent-events-2026-11-20 — @pvl — SEALED / IMPLEMENTATION PLAN READY / NOT PROMOTED: full audit + simplified 0.17.6 Process settlement sealed; phased implementation plan prepared, awaiting separate implementation promotion — [details](dl200-unified-jobs-agent-events-2026-11-20/README.md)
 - [~] P2 workspace-views — @pvl — [details](workspace-views/TODO.md)
 
 - [~] P2 dotlink-tool-port — @pvl — Dotlink-native filesystem tools under AW authorization and model-directed execution — [details](dotlink-tool-port/README.md)

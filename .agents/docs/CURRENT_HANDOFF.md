@@ -1,16 +1,25 @@
-# CURRENT HANDOFF — AW live state
+# CURRENT HANDOFF — AW live state + DL-200 design
 
-Canonical cross-repo comprehensive handoff:
-[AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md).
+Canonical comprehensive handoff:
+[AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md).
 
 Current copy-ready next-agent entrypoint:
-[AW-DOTLINK-NEXT-AGENT-2026-11-20.md](AW-DOTLINK-NEXT-AGENT-2026-11-20.md).
+[AW-DL200-NEXT-AGENT-2026-11-20.md](AW-DL200-NEXT-AGENT-2026-11-20.md).
 
-The dated 2026-11-19 017 handoff is preserved as historical chronology and is
-embedded in the canonical 2026-11-20 document above. Current refs/status/pending
-work in that older file are superseded.
+Sealed design specification:
+[`../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md`](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md).
 
-Author: coordinating implementation agent
+Phased implementation plan:
+[`../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md`](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md).
+
+The previous
+[AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md)
+is preserved and embedded verbatim in the new canonical handoff as historical
+implementation chronology. The dated 2026-11-19 017 handoff is likewise historical.
+
+**DL-200 is SEALED / IMPLEMENTATION PLAN READY / NOT PROMOTED. The fresh full pre-seal audit, simplified 0.17.6 Process-settlement adoption and phased `IMPLEMENTATION.md` are complete. No implementation source work begins until a separate explicit promotion.**
+
+Author: coordinating design/implementation agent
 Owner: @pvl
 Updated: 2026-11-20
 Source authority host: **L5 only**
@@ -21,6 +30,78 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 >
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
+
+## LATEST DL-200 design refinement — 2026-11-20
+
+This section supersedes older DL-200 design summaries below where they conflict.
+
+- one public host constructor: `agent.create(from=Agent|settled Turn)`; no `agent.fork`;
+  trusted in-process library code may use typed HistoryBaseRef as a lower primitive;
+- model ancestry selector is `agent(..., from=...)`;
+- `checkpoint.restore` remains first-class because it restores exact history **plus**
+  exact SourceSet into a new Agent + new Sandbox;
+- checkpoints capture a plural named typed `SourceSet`; Git is the mandatory first
+  SourceDriver and versioned/content-addressed object/bucket manifests fit the same
+  fail-closed driver contract;
+- Sandbox is canonical at `/d:/i:/p:/s:<sandbox>` as a Project-level sibling of the
+  Agent execution branch; it never enters Jobs/control `ExecutionRef` grammar;
+- Sandbox is logical mutable execution state. An Agent chooses one Sandbox at creation and
+  does not live-rebind in v1; Agents can share one, branch one, or start fresh by creating
+  a new Agent; physical Process containment remains fresh per dispatch;
+- named source attachment is only `sandbox.sources.list/set`; SourceRef never carries
+  credentials, which remain Vault authority;
+- same Sandbox does not imply same authority;
+- Agent-scoped VaultGrants project selected provider-backed secrets/services as
+  broker/socket/ephemeral-file/env capabilities; Vault authority is never inherited from
+  history/Sandbox/checkpoint/ACL state;
+- system Event names are bare; custom Events are structurally `#name`; Event routing
+  reversibly encodes literal `.` in canonical handles as `%2E`, so resource refs need no
+  grammar weakening;
+- Events expose stable opaque `Event.id`, durable causal root/hop budgets and internal
+  immutable DisclosureManifest refs; read, Agent delivery and durable Handlers all enforce
+  exact source + disclosure closure; host also has bounded `events.subscriptions.list`;
+- one plain `Extension` registers through one typed `ExtensionRegistry` composition root;
+- typed subregistries include Tool/Hook/Action/Resource/View/EventType/EventHandler/
+  Provider/ProviderHook/ProcessHook/UI/Setting/State/Compactor plus native SourceDriver/
+  SandboxDriver/VaultProvider registries;
+- native Rust registration preserves concrete types and may return typed handles; stable
+  Extension/local IDs + schema versions own durable/wire identity, never Rust TypeId;
+- all contributions from one Extension registration publish atomically across registries,
+  but registered/installed definitions are inert until explicitly activated/bound by host
+  authority; typed handles stale on their own registration/schema, not unrelated reloads;
+- runtime callbacks still use scoped `ctx.tools`, `ctx.state`, `ctx.ui`, `ctx.models`, etc.;
+- Context customization is Hook(Context), dynamic Tool visibility/calls use `ctx.tools`,
+  Views are pull/read facets, EventHandlers are durable push/background reactions;
+- Histate can register fully typed domain Actions/Views/Handlers/UI/Tools/Hooks without
+  converting its Rust domain model to arbitrary JSON;
+- dynamic Extensions reuse/generalize the existing `aw-extensions` child-process path: one bounded full-duplex stdio protocol projects the same registries and scoped `ctx.*` capabilities;
+- Node/Bun/Deno/Python/Rust/etc. participate as ordinary executables; AW owns no npm/pip/cargo marketplace/resolver in v1;
+- do not embed a JS runtime or Wasmtime for v1. A WASI Extension may already run through an external `wasmtime run ...` process speaking the same protocol; embedded WASM remains optional later;
+- Histate may own a product Session referencing many AW Agents + zero/many Sandboxes and a
+  product checkpoint referencing one/more AW Checkpoints; cross-store writes use a
+  product-owned idempotent saga/outbox, not AW distributed transactions;
+- shared Process settlement is sealed as one small AW delta: `Tree::{Empty,Live,Unknown}`,
+  per-stream output completeness and one `ProcessTerminal { exit, stop, tree, output }`
+  truth; platform observation stays `io::Result<bool>` and settlement happens before final
+  reap/drain;
+- dotlink alone owns result/log projection, non-login Bash and the runtime horizon:
+  ~30-minute coherent-checkpoint guidance + 35-minute hard conversational command bound;
+- one authenticated mutation replay identity/fingerprint protects constructors/additive
+  mutations without per-method request-id clutter; multi-resource construction uses private
+  prepare -> atomic AW publication -> reconciled cleanup, so half-created resources are
+  never public;
+- clean and dirty Git checkpoint anchors are both privately retained; submodule contents
+  require their own SourceBinding when they must be retained/reproducible;
+- Vault `file/env/socket` projections are provider/host-defined safe profiles, never
+  arbitrary caller mount/env injection; grant removal never pretends to erase already-
+  materialized capability from a running Process;
+- the frozen 017 sandbox/mount/config-v13 implementation plan remains frozen.
+
+The canonical detailed authority is the DL-200 SPEC/TODO, not older summaries in this
+handoff. The fresh full pre-seal audit and earlier naming/typed-registry/dynamic-host
+reviews are clean: no duplicate owner/catalog/database/replay ledger, partial registry
+publication, authority/disclosure leak, Event-log duplication, stringly native Histate
+path, second transport/runtime stack or Histate/AW ownership conflict remains.
 
 ## LIVE published AW + dotlink repin/trust checkpoint — 2026-11-20
 
@@ -40,11 +121,12 @@ Current published boundary:
 - dotlink `main` is published through
   `bbd29c13904b7255eb28e2ed6c776c3590ac122a`
   (`Record AW repin and Remote Start trust cutover`);
-- the read-only release worktree remains clean at local
-  `release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`,
-  28 commits ahead / 0 behind published
+- the read-only release worktree is currently local
+  `release/0.17 = v0.17.6 = 6cd056672d9390b17ac591786253af5f04bfeef1`,
+  3 commits ahead of the still-published
   `origin/release/0.17 = v0.17.5 = 3995448d7bf33794ef84c7bb51150d77cc260ada`;
-- D4-D7 and v0.17.5 semantic equivalence remain closed;
+- D4-D7/v0.17.5 semantic equivalence remains closed; the later v0.17.6 forensic delta is
+  now captured by sealed DL-200 section 25.11 / implementation Phase 0;
 - sandbox/mount/config-v13 remains frozen.
 
 AW v36 completion published in `b8a46a94...` includes:
