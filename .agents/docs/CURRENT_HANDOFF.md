@@ -57,19 +57,31 @@ pending-attachment `(session, branch)`, deduplicates those keys in a cold-path `
 each Agent exactly once before the same recovery commit. Hot mutation paths stay allocation-free and
 there is no generic transaction/mutation framework.
 
-Do **not** activate `agent_state_current` yet. Remaining cutover blockers are the final
-committed-input custody/admission boundary above ActorQueue and legacy Session-level title/ACL
-compatibility paths whose semantics cannot be silently projected onto one branch Agent. Those must
-either gain an exact Agent owner boundary or be retired/blocked by the exclusive cutover before the
-one Agent-state+ACL seed/activation transaction.
-Only add cursor/projection-head mechanics when a real consumer requires them; do not prebuild
-Phase-2/4 engines.
+The committed-Input boundary is now exact too: `actor_input_prepare` remains proposal-only and
+revision-neutral; only `Prepared -> Accepted`, after the live controller has actually queued the
+message, marks the exact `(session, branch)` Agent changed in the same transaction. Dispatching,
+Settled, Rejected, Unknown and lower ActorQueue staging/edit/claim/ACK/finalization do not add an
+Agent mutation; Turn admission/settlement already own their respective Agent changes.
+
+Legacy Session title/participation writers are now explicitly classified as backing compatibility
+state, not Agent-owner mutations. Several Agents may share one Session, so broadcasting those writes
+or arbitrarily choosing a branch would violate the final owner model. Session participation is only
+a conservative seed source for the first direct Agent ACL; direct Agent ACL/title state evolves
+independently after activation.
+
+The next Phase-1 slice can therefore be the one exclusive Agent-state+ACL owner migration/cutover:
+seed every exact Agent binding under write/schema exclusion, preserve the legacy initial revision,
+freeze title/owner/lineage/access into the new owner, and switch Agent-facing title/ACL/revision reads
+and writes atomically. Legacy Session metadata may remain for backing compatibility but must stop
+defining public Agent state. Only add cursor/projection-head mechanics when a real consumer requires
+them; do not prebuild Phase-2/4 engines.
 
 Current focused evidence: StoreScope **2/2**, mixed Job exposure/root lookup green, coordination
 **24/24** including killed-process result-before-attach recovery, restart unknown-model recovery
-green, Agent Job-event/idempotent-subscription test green, delegated child relation/budget tests
-green, stable-Agent survive/continue/close regression green, `aw-cli` all-feature check green, and
-strict all-target/all-feature `aw-store` Clippy/fmt/diff green.
+green, Actor Input **2/2** plus restart-durable admission regression green, Agent
+Job-event/idempotent-subscription test green, delegated child relation/budget tests green,
+stable-Agent survive/continue/close regression green, `aw-cli` all-feature check green, and strict
+all-target/all-feature `aw-store` Clippy/fmt/diff green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

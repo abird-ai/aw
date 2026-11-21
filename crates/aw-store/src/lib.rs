@@ -1519,6 +1519,10 @@ impl SessionStore {
         let branch = branch_in(&c, session, branch)?;
         agent_owner::revision(&c, agent_owner::AgentKey::new(session, &branch.id))
     }
+    /// Legacy Session-scoped title compatibility state. Several public Agents
+    /// may share one backing Session, so this must not be treated as an exact
+    /// Agent mutation. DL-200 `agent.edit(title=...)` moves to the branch-bound
+    /// Agent owner at the exclusive cutover; this API remains backing metadata.
     pub fn set_title(
         &self,
         actor: &PrincipalId,

@@ -3,7 +3,8 @@
 //! claims an acknowledged input was a provider/tool/OS effect receipt.
 //! This is a host-only fact API; authentication is the existing SessionStore.
 use crate::{
-    audit, branch_in, db, principal_is_session_owner, session_in, workspace_writer, SessionStore,
+    agent_owner, audit, branch_in, db, principal_is_session_owner, session_in, workspace_writer,
+    SessionStore,
 };
 use aw_agent_core::{AuthoritySegmentEvidence, Error, InvocationIdentity, PrincipalId, Result};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -486,6 +487,15 @@ impl SessionStore {
         }
         let fact = ActorInputFact::new(admission.clone(), next, None);
         append(&tx, actor, &fact)?;
+        if next == InputAdmissionState::Accepted {
+            // Prepared is only private proposal custody. Accepted is the first
+            // committed inbox admission owned by this exact Agent; later queue/
+            // dispatch bookkeeping and Turn settlement have their own owners.
+            agent_owner::changed(
+                &tx,
+                agent_owner::AgentKey::new(&admission.session_id, &admission.branch_id),
+            )?;
+        }
         db(tx.commit())?;
         Ok(fact)
     }

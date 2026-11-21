@@ -64,13 +64,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       admission, durable result + attachment settlement, changed-only subscription, delegated
       parent/child publication with immutable parent lineage, stable close request, exact stable
       settlement. Recovery deduplicates exact changed Agent keys in its already-cold transaction and
-      marks each once before commit; hot paths remain allocation-free. Legacy revision remains
-      `MAX(audit.seq)+1` until exclusive activation; no audit rows were added. Do not activate
-      `agent_state_current` while committed-input admission and Session-level title/ACL compatibility
-      still lack an exact final owner boundary. Next: close those owner seams or explicitly retire/
-      block the compatibility writers,
-      then perform one exclusive Agent-state+ACL seed/activation transaction. Add shared cursor/
-      projection-head mechanics only when an actual Phase-1 consumer needs them.
+      marks each once before commit; hot paths remain allocation-free. Committed Input now marks the
+      Agent only on exact `Prepared -> Accepted`; proposal, dispatch/settlement and ActorQueue staging
+      remain revision-neutral at this layer. Legacy Session title/participation are explicitly backing
+      compatibility state, not branch-selected or broadcast Agent mutations; participation only seeds
+      the first direct Agent ACL conservatively. Legacy revision remains `MAX(audit.seq)+1` until
+      exclusive activation; no audit rows were added. Next: perform the one exclusive Agent-state+ACL
+      seed/activation and atomically switch Agent-facing revision/title/access reads+writes away from
+      Session compatibility state. Add shared cursor/projection-head mechanics only when an actual
+      Phase-1 consumer needs them.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

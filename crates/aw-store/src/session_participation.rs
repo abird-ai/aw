@@ -412,8 +412,11 @@ impl SessionStore {
         authorize_in(&connection, actor, session, action)
     }
 
-    /// Set one participant's collaboration predicates. The requestor must hold
-    /// current Manage authority. Resource ownership is unchanged.
+    /// Set one participant's backing Session collaboration predicates. The
+    /// requestor must hold current Manage authority. These grants seed the first
+    /// per-Agent ACL conservatively at the exclusive DL-200 cutover, but after
+    /// activation they are compatibility/backing authority rather than a direct
+    /// Agent ACL writer. Resource ownership is unchanged.
     pub fn set_session_participation(
         &self,
         requestor: &PrincipalId,
