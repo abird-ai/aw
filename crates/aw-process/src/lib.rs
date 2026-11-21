@@ -795,14 +795,34 @@ impl Process {
     }
 
     async fn drain_output(&mut self) -> (bool, bool) {
-        for task in &mut self.readers {
-            match timeout(READER_DRAIN_DEADLINE, &mut *task).await {
-                Ok(Ok(())) => {}
-                _ => {
-                    task.abort();
-                    let _ = timeout(READER_DRAIN_DEADLINE, &mut *task).await;
+        // One Process drain deadline covers both streams together. Sequential
+        // per-stream deadlines would let two inherited FDs double the bounded
+        // settlement window even though they belong to one Process lifetime.
+        let drained = timeout(READER_DRAIN_DEADLINE, async {
+            for task in &mut self.readers {
+                if !task.is_finished() {
+                    let _ = task.await;
                 }
             }
+        })
+        .await
+        .is_ok();
+        if !drained {
+            for task in &self.readers {
+                if !task.is_finished() {
+                    task.abort();
+                }
+            }
+            // Abortion is itself asynchronous; give all still-live readers one
+            // shared bounded quiescence window before publishing completeness.
+            let _ = timeout(READER_DRAIN_DEADLINE, async {
+                for task in &mut self.readers {
+                    if !task.is_finished() {
+                        let _ = task.await;
+                    }
+                }
+            })
+            .await;
         }
         let snapshot = self.snapshot();
         (
