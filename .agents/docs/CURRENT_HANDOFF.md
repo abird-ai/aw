@@ -181,22 +181,49 @@ revocable source-equivalent share contract is still not implemented. Destination
 a fresh lineage (`supersedes=NULL`); source grants are evidence only, never the destination's mutable
 security owner.
 
-Phase 1 is still **underway**, not complete. Next owner work is settled-Turn exact-boundary selection
-plus the host/model `agent.create(from=...)` selector adapters over this lower constructor (including
-trusted destination binding/access policy), then provenance propagation for newly committed
+Exact-history selector resolution and the model constructor adapter are now live over the same lower
+owner. The canonical Store-side host adapter is `create_agent_from_history_ref`: it accepts only an
+absolute canonical Agent ref or settled Turn ref, reuses the shared destination publication helper,
+and therefore keeps one disclosure/HistoryGrant/ACL/publication path. A settled Turn selector resolves
+an exact attached local result when present, otherwise walks the structurally shared HistoryBase chain
+to the inherited immutable Turn fact. Canonical decimal Turn handles are enforced; active/unsettled
+Turns fail closed rather than falling back to the mutable Agent head.
+
+Model `agent(task,...,from?)` now accepts contextual Agent/Turn refs through the existing
+`ExecutionRef` grammar. The caller surface resolves `.`/relative/parent context to one absolute ref,
+requires the model-selected source to remain in the current Project, and passes only that canonical
+ref into the durable child-allocation transaction. Source `derive`, exact boundary selection and
+HistoryGrant disclosure are rechecked by the Store before child publication. The fresh child Session
+is created first inside that transaction and history is attached before the existing subagent/replay
+facts commit, so a disclosure failure leaves no half-published child.
+
+Constructor replay identity is semantic: canonical `from` is part of the fingerprint, so `from="."`
+and the equivalent absolute ref replay the same committed child. Requests with no `from` deliberately
+retain the pre-feature fingerprint JSON shape byte-for-byte, preserving previously committed Agent
+constructor replay across upgrade. Policy/operation delegates continue to pass no history source.
+
+This checkpoint does **not** claim the complete external host `agent.create` request shell from §28.3.
+The Store now provides its canonical Agent/settled-Turn history adapter, and the model `agent(from=...)`
+surface is wired. Still open are trusted host request/defaulting for alternate Project selection,
+custom access arrays, Sandbox `auto|ref`, optional initial task admission, and the remaining public
+Agent list/get/edit/close/admission shell. Those must compose this constructor rather than introduce a
+second publication path.
+
+Phase 1 is still **underway**, not complete. Next coherent work is the external host Agent lifecycle/
+creation shell over the existing owners, then provenance propagation for newly committed
 Event/Tool/Process facts, reachability/flatten acceleration, minimal authoritative snapshots, and
 rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/projection-head
 helpers only when one of those real consumers needs them; do not prebuild Phase-2/4 engines.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
-backfill are green; group access/wake/history fencing remains green; v40 history-owner tests are now
-**4/4**. The new exact-fork regression proves settled Turn 1 structural inheritance into a physically
-fresh Session, `next_turn=2`, runtime activation over inherited history, independent inherited ACL,
-source-ACL narrowing without destination mutation, and an active source Turn 2 fork that still
-inherits only committed Turn 1. The legacy same-Session `fork_shares_prefix_without_changing_original_head`
-regression remains green. Existing seven-permission/HistoryGrant, manifest and group regressions remain
-green. Strict all-target/all-feature `aw-store` + `aw-cli` Clippy, all-feature `aw-cli` check, fmt and
-diff checks are green.
+backfill are green; group access/wake/history fencing remains green. The exact-history Store regression
+now additionally proves active `t:2` rejection, canonical local `t:1` selection after later Turn
+settlement, and `t:1` selection through an already-forked Agent's inherited HistoryBase chain. The
+model constructor regression proves `agent(from=".")` sees committed parent Turn 1 but not active
+parent Turn 2, starts its child work at Turn 2, and replays unchanged when the same call uses the
+equivalent absolute Agent ref. The pre-existing no-`from` stable-Agent replay regression remains green,
+proving fingerprint backward compatibility. Strict all-target/all-feature `aw-store` + `aw-cli`
+Clippy, all-feature checks, fmt and diff checks are green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

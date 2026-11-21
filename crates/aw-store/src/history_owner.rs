@@ -9,6 +9,7 @@ use crate::{
     session_in, stable_user_principal, user_for_principal, Error, PrincipalId, Result,
     SessionBinding, SessionStore,
 };
+use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -33,6 +34,15 @@ pub(crate) struct HistoryBaseRef {
 pub enum AgentHistoryForkAccess {
     Private,
     Inherit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedHistorySource {
+    session_id: String,
+    branch_id: String,
+    agent_ref: String,
+    current_grant_id: Option<String>,
+    base: HistoryBaseRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -683,6 +693,178 @@ pub(crate) fn seal_latest_committed_in(
     seal_boundary_in(connection, session_id, branch_id, &head, next_turn)
 }
 
+fn canonical_turn_id(handle: &str) -> Result<u64> {
+    handle
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value != 0 && value.to_string() == handle)
+        .ok_or(Error::Denied("Turn handle is not canonical decimal"))
+}
+
+fn inherited_turn_boundary(
+    connection: &Connection,
+    base_id: &str,
+    turn_id: u64,
+) -> Result<Option<HistoryBaseRef>> {
+    let mut cursor = Some(base_id.to_owned());
+    let mut depth = 0usize;
+    while let Some(base) = cursor {
+        depth += 1;
+        if depth > crate::MAX_SESSION_NODES {
+            return Err(Error::Limit(
+                "HistoryBase ancestry exceeds turn lookup bound",
+            ));
+        }
+        let (parent, span): (Option<String>, String) = db(connection.query_row(
+            "SELECT parent_base_id,local_span_id FROM history_bases WHERE base_id=?1",
+            [&base],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))?;
+        let (backing_session, backing_branch): (String, String) = db(connection.query_row(
+            "SELECT backing_session_id,backing_branch_id FROM history_spans WHERE span_id=?1",
+            [&span],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))?;
+        let mut query = db(connection.prepare(
+            "SELECT h.node_id
+             FROM history_span_nodes h
+             JOIN nodes n ON n.id=h.node_id AND n.session_id=?2
+             WHERE h.span_id=?1 AND n.kind='turn'
+               AND json_extract(n.payload,'$.id')=?3
+             ORDER BY h.ordinal LIMIT 2",
+        ))?;
+        let rows = db(
+            query.query_map(params![span, backing_session, turn_id], |row| {
+                row.get::<_, String>(0)
+            }),
+        )?;
+        let matches = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        match matches.as_slice() {
+            [node] => {
+                let base = seal_boundary_in(
+                    connection,
+                    &backing_session,
+                    &backing_branch,
+                    node,
+                    turn_id
+                        .checked_add(1)
+                        .ok_or(Error::Limit("Turn ordinal exhausted"))?,
+                )?;
+                return Ok(Some(base));
+            }
+            [] => {}
+            _ => {
+                return Err(Error::Storage(
+                    "HistoryBase contains duplicate Turn ordinal",
+                ))
+            }
+        }
+        cursor = parent;
+    }
+    Ok(None)
+}
+
+fn seal_settled_turn_in(
+    connection: &Connection,
+    session_id: &str,
+    branch_id: &str,
+    turn_id: u64,
+) -> Result<HistoryBaseRef> {
+    let mut query = db(connection.prepare(
+        "SELECT final_node FROM runs
+         WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3
+           AND status<>'running' AND attach_status='attached' AND final_node IS NOT NULL
+         ORDER BY ended_at DESC,id DESC LIMIT 2",
+    ))?;
+    let rows = db(
+        query.query_map(params![session_id, branch_id, turn_id], |row| {
+            row.get::<_, String>(0)
+        }),
+    )?;
+    let local = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    match local.as_slice() {
+        [node] => {
+            return seal_boundary_in(
+                connection,
+                session_id,
+                branch_id,
+                node,
+                turn_id
+                    .checked_add(1)
+                    .ok_or(Error::Limit("Turn ordinal exhausted"))?,
+            )
+        }
+        [] => {}
+        _ => {
+            return Err(Error::Storage(
+                "multiple attached results exist for one Turn",
+            ))
+        }
+    }
+
+    let current_base: Option<String> = db(connection.query_row(
+        "SELECT history_base_id FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![session_id, branch_id],
+        |row| row.get(0),
+    ))?;
+    if let Some(base) = current_base {
+        if let Some(boundary) = inherited_turn_boundary(connection, &base, turn_id)? {
+            return Ok(boundary);
+        }
+    }
+    Err(Error::Denied("Turn is not a settled history boundary"))
+}
+
+fn resolve_canonical_history_source_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    reference: &str,
+) -> Result<ResolvedHistorySource> {
+    let parsed = ExecutionRef::parse(reference)
+        .map_err(|_| Error::Denied("invalid exact-history source ref"))?;
+    if !parsed.is_canonical() {
+        return Err(Error::Denied("history source ref must be canonical"));
+    }
+    let resolved = parsed
+        .resolve(None, None)
+        .map_err(|_| Error::Denied("invalid canonical history source ref"))?;
+    let agent_ref = resolved.agent_ref().canonical();
+    let (session_id, branch_id) = agent_owner::key_for_ref(connection, &agent_ref)?;
+    let source_agent = agent_owner::AgentKey::new(&session_id, &branch_id);
+    agent_owner::authorize_permission(
+        connection,
+        actor,
+        source_agent,
+        agent_owner::AgentPermission::Derive,
+    )?;
+    let base = match resolved.suffix() {
+        [] => seal_latest_committed_in(connection, &session_id, &branch_id)?,
+        [ExecutionSegment::Turn(handle)] => {
+            let turn = canonical_turn_id(handle.as_str())?;
+            seal_settled_turn_in(connection, &session_id, &branch_id, turn)?
+        }
+        _ => {
+            return Err(Error::Denied(
+                "history source must be an Agent ref or settled Turn ref",
+            ))
+        }
+    };
+    let current_grant_id: Option<String> = db(connection.query_row(
+        "SELECT history_grant_id FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![session_id, branch_id],
+        |row| row.get(0),
+    ))?;
+    Ok(ResolvedHistorySource {
+        session_id,
+        branch_id,
+        agent_ref,
+        current_grant_id,
+        base,
+    })
+}
+
 fn manifest_authority_roots(
     connection: &Connection,
     manifest: &str,
@@ -1103,16 +1285,191 @@ pub(crate) fn prepare_disclosure_expansion(
     Ok(Some(grant_id))
 }
 
+fn attach_resolved_history_to_destination_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source: &ResolvedHistorySource,
+    destination_session: &str,
+    destination_branch: &str,
+    access: AgentHistoryForkAccess,
+) -> Result<()> {
+    let source_agent = agent_owner::AgentKey::new(&source.session_id, &source.branch_id);
+    let (owner_kind, owner_handle, source_workspace): (String, String, Option<String>) =
+        db(connection.query_row(
+            "SELECT a.owner_kind,a.owner_handle,s.workspace_id
+             FROM agent_state_current a JOIN sessions s ON s.id=a.session_id
+             WHERE a.session_id=?1 AND a.branch_id=?2",
+            params![source.session_id, source.branch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ))?;
+    if owner_kind != "user" {
+        return Err(Error::Denied(
+            "exact-history constructor currently requires a user-owned source Project",
+        ));
+    }
+    let source_workspace = source_workspace.ok_or(Error::Storage(
+        "source Agent is missing its authoritative Project binding",
+    ))?;
+    let (destination_owner, destination_workspace): (Option<String>, Option<String>) =
+        db(connection.query_row(
+            "SELECT owner_user_id,workspace_id FROM sessions WHERE id=?1",
+            [destination_session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))?;
+    if destination_owner.as_deref() != Some(owner_handle.as_str())
+        || destination_workspace.as_deref() != Some(source_workspace.as_str())
+    {
+        return Err(Error::Denied(
+            "exact-history destination must keep the source Project owner and Project",
+        ));
+    }
+
+    let inherited_acl = match access {
+        AgentHistoryForkAccess::Private => Vec::new(),
+        AgentHistoryForkAccess::Inherit => direct_acl_rows(connection, source_agent)?,
+    };
+    let mut audience = BTreeSet::from([("user".to_owned(), owner_handle)]);
+    for (kind, handle, permissions) in &inherited_acl {
+        if permissions.view {
+            audience.insert((kind.clone(), handle.clone()));
+        }
+    }
+    for (kind, handle) in &audience {
+        validate_fork_manifest_for_principal(
+            connection,
+            actor,
+            &source.base.manifest_digest,
+            source.current_grant_id.as_deref(),
+            kind,
+            handle,
+        )?;
+    }
+
+    let destination_ref: String = db(connection.query_row(
+        "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
+                '/p:' || project_handle || '/a:' || agent_handle
+         FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+        params![destination_session, destination_branch],
+        |row| row.get(0),
+    ))?;
+    let created_by = user_for_principal(connection, actor)?
+        .ok_or(Error::Denied("Agent fork creator identity is inactive"))?;
+    for (kind, handle, permissions) in &inherited_acl {
+        db(connection.execute(
+            "INSERT INTO agent_acl_current(
+                 session_id,branch_id,principal_kind,principal_handle,
+                 can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
+                 grant_rev,granted_by_handle,updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12,?13)",
+            params![
+                destination_session,
+                destination_branch,
+                kind,
+                handle,
+                i64::from(permissions.view),
+                i64::from(permissions.contribute),
+                i64::from(permissions.submit),
+                i64::from(permissions.control),
+                i64::from(permissions.derive),
+                i64::from(permissions.share),
+                i64::from(permissions.manage),
+                created_by,
+                now(),
+            ],
+        ))?;
+    }
+    let grant_id = mint_destination_grant(
+        connection,
+        actor,
+        &source.base,
+        &source.agent_ref,
+        &destination_ref,
+        &audience,
+    )?;
+    let changed = db(connection.execute(
+        "UPDATE agent_state_current
+         SET history_base_id=?1,history_grant_id=?2,updated_at=?3
+         WHERE session_id=?4 AND branch_id=?5",
+        params![
+            source.base.id,
+            grant_id,
+            now(),
+            destination_session,
+            destination_branch
+        ],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Storage(
+            "destination Agent history pointer initialization failed",
+        ));
+    }
+    let session_changed = db(connection.execute(
+        "UPDATE sessions SET next_turn=?1,updated_at=?2 WHERE id=?3",
+        params![source.base.next_turn, now(), destination_session],
+    ))?;
+    if session_changed != 1 {
+        return Err(Error::Storage(
+            "destination Session inherited Turn cursor initialization failed",
+        ));
+    }
+    crate::audit(
+        connection,
+        destination_session,
+        actor,
+        "agent.history_inherited",
+        serde_json::json!({
+            "source_agent":source.agent_ref,
+            "destination_agent":destination_ref,
+            "history_content_digest":source.base.content_digest,
+            "access":access,
+        }),
+    )?;
+    let txid = crate::durability::tx_id()?;
+    crate::durability::commit_event(
+        connection,
+        &txid,
+        "agent.history_inherited",
+        "agent",
+        &destination_ref,
+        Some(actor),
+        serde_json::json!({
+            "session_id":destination_session,
+            "branch_id":destination_branch,
+            "source_agent":source.agent_ref,
+            "history_content_digest":source.base.content_digest,
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn attach_canonical_history_to_existing_agent_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    canonical_source: &str,
+    destination_session: &str,
+    destination_branch: &str,
+    access: AgentHistoryForkAccess,
+) -> Result<()> {
+    let source = resolve_canonical_history_source_in(connection, actor, canonical_source)?;
+    attach_resolved_history_to_destination_in(
+        connection,
+        actor,
+        &source,
+        destination_session,
+        destination_branch,
+        access,
+    )
+}
+
 impl SessionStore {
     /// Trusted lower constructor for a structurally shared exact-history Agent.
     /// History ancestry is independent from execution/Sandbox ancestry: callers
     /// supply the destination binding explicitly. The destination remains in the
     /// source Project and uses that Project's current user owner in this cut.
-    pub fn create_agent_from_agent_history(
+    pub fn create_agent_from_history_ref(
         &self,
         actor: &PrincipalId,
-        source_session: &str,
-        source_branch: &str,
+        canonical_source: &str,
         title: &str,
         binding: SessionBinding,
         access: AgentHistoryForkAccess,
@@ -1122,45 +1479,15 @@ impl SessionStore {
         let mut connection = self.connection()?;
         let tx =
             db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
-        let source_branch_info = branch_in(&tx, source_session, source_branch)?;
-        if source_branch_info.id != source_branch {
-            return Err(Error::Denied(
-                "exact-history Agent creation requires an exact source branch ID",
-            ));
-        }
-        let source_agent = agent_owner::AgentKey::new(source_session, source_branch);
-        agent_owner::authorize_permission(
-            &tx,
-            actor,
-            source_agent,
-            agent_owner::AgentPermission::Derive,
-        )?;
-        let base = seal_latest_committed_in(&tx, source_session, source_branch)?;
-        let (owner_kind, owner_handle, workspace, source_ref, source_grant): (
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        ) = db(tx.query_row(
-            "SELECT a.owner_kind,a.owner_handle,s.workspace_id,
-                    '/d:' || a.domain_handle || '/i:' || a.identity_handle ||
-                    '/p:' || a.project_handle || '/a:' || a.agent_handle,
-                    a.history_grant_id
-             FROM agent_state_current a
-             JOIN sessions s ON s.id=a.session_id
-             WHERE a.session_id=?1 AND a.branch_id=?2",
-            params![source_session, source_branch],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        ))?;
+        let source = resolve_canonical_history_source_in(&tx, actor, canonical_source)?;
+        let (owner_kind, owner_handle, workspace): (String, String, Option<String>) = db(tx
+            .query_row(
+                "SELECT a.owner_kind,a.owner_handle,s.workspace_id
+                 FROM agent_state_current a JOIN sessions s ON s.id=a.session_id
+                 WHERE a.session_id=?1 AND a.branch_id=?2",
+                params![source.session_id, source.branch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ))?;
         if owner_kind != "user" {
             return Err(Error::Denied(
                 "exact-history constructor currently requires a user-owned source Project",
@@ -1170,27 +1497,6 @@ impl SessionStore {
             "source Agent is missing its authoritative Project binding",
         ))?;
         let destination_owner = stable_user_principal(&owner_handle)?;
-        let inherited_acl = match access {
-            AgentHistoryForkAccess::Private => Vec::new(),
-            AgentHistoryForkAccess::Inherit => direct_acl_rows(&tx, source_agent)?,
-        };
-        let mut audience = BTreeSet::from([("user".to_owned(), owner_handle.clone())]);
-        for (kind, handle, permissions) in &inherited_acl {
-            if permissions.view {
-                audience.insert((kind.clone(), handle.clone()));
-            }
-        }
-        for (kind, handle) in &audience {
-            validate_fork_manifest_for_principal(
-                &tx,
-                actor,
-                &base.manifest_digest,
-                source_grant.as_deref(),
-                kind,
-                handle,
-            )?;
-        }
-
         let (destination_session, destination_branch) = resources::create_in_workspace_tx(
             &tx,
             &destination_owner,
@@ -1199,93 +1505,13 @@ impl SessionStore {
             &workspace,
             None,
         )?;
-        let destination_ref: String = db(tx.query_row(
-            "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
-                    '/p:' || project_handle || '/a:' || agent_handle
-             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
-            params![destination_session.id, destination_branch.id],
-            |row| row.get(0),
-        ))?;
-        let created_by = user_for_principal(&tx, actor)?
-            .ok_or(Error::Denied("Agent fork creator identity is inactive"))?;
-        for (kind, handle, permissions) in &inherited_acl {
-            db(tx.execute(
-                "INSERT INTO agent_acl_current(
-                     session_id,branch_id,principal_kind,principal_handle,
-                     can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
-                     grant_rev,granted_by_handle,updated_at
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12,?13)",
-                params![
-                    destination_session.id,
-                    destination_branch.id,
-                    kind,
-                    handle,
-                    i64::from(permissions.view),
-                    i64::from(permissions.contribute),
-                    i64::from(permissions.submit),
-                    i64::from(permissions.control),
-                    i64::from(permissions.derive),
-                    i64::from(permissions.share),
-                    i64::from(permissions.manage),
-                    created_by,
-                    now(),
-                ],
-            ))?;
-        }
-        let grant_id =
-            mint_destination_grant(&tx, actor, &base, &source_ref, &destination_ref, &audience)?;
-        let changed = db(tx.execute(
-            "UPDATE agent_state_current
-             SET history_base_id=?1,history_grant_id=?2,updated_at=?3
-             WHERE session_id=?4 AND branch_id=?5",
-            params![
-                base.id,
-                grant_id,
-                now(),
-                destination_session.id,
-                destination_branch.id
-            ],
-        ))?;
-        if changed != 1 {
-            return Err(Error::Storage(
-                "destination Agent history pointer initialization failed",
-            ));
-        }
-        let session_changed = db(tx.execute(
-            "UPDATE sessions SET next_turn=?1,updated_at=?2 WHERE id=?3",
-            params![base.next_turn, now(), destination_session.id],
-        ))?;
-        if session_changed != 1 {
-            return Err(Error::Storage(
-                "destination Session inherited Turn cursor initialization failed",
-            ));
-        }
-        crate::audit(
+        attach_resolved_history_to_destination_in(
             &tx,
-            &destination_session.id,
             actor,
-            "agent.history_inherited",
-            serde_json::json!({
-                "source_agent":source_ref,
-                "destination_agent":destination_ref,
-                "history_content_digest":base.content_digest,
-                "access":access,
-            }),
-        )?;
-        let txid = crate::durability::tx_id()?;
-        crate::durability::commit_event(
-            &tx,
-            &txid,
-            "agent.history_inherited",
-            "agent",
-            &destination_ref,
-            Some(actor),
-            serde_json::json!({
-                "session_id":destination_session.id,
-                "branch_id":destination_branch.id,
-                "source_agent":source_ref,
-                "history_content_digest":base.content_digest,
-            }),
+            &source,
+            &destination_session.id,
+            &destination_branch.id,
+            access,
         )?;
         let result = (
             session_in(&tx, &destination_session.id)?,
@@ -1293,6 +1519,28 @@ impl SessionStore {
         );
         db(tx.commit())?;
         Ok(result)
+    }
+
+    pub fn create_agent_from_agent_history(
+        &self,
+        actor: &PrincipalId,
+        source_session: &str,
+        source_branch: &str,
+        title: &str,
+        binding: SessionBinding,
+        access: AgentHistoryForkAccess,
+    ) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+        let canonical_source = {
+            let connection = self.connection()?;
+            db(connection.query_row(
+                "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
+                        '/p:' || project_handle || '/a:' || agent_handle
+                 FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+                params![source_session, source_branch],
+                |row| row.get::<_, String>(0),
+            ))?
+        };
+        self.create_agent_from_history_ref(actor, &canonical_source, title, binding, access)
     }
 }
 
@@ -1514,10 +1762,19 @@ mod tests {
         let bob = PrincipalId::new("internal:fixture:fork-bob").unwrap();
         let (source, source_branch) = store.create(&owner, "source", binding()).unwrap();
         let domain = store.default_domain(&owner).unwrap();
-        let bob_ref = {
+        let (bob_ref, source_ref) = {
             let connection = store.connection().unwrap();
             let bob_user = crate::ensure_user_for_principal(&connection, &bob).unwrap();
-            format!("/d:{}/i:{bob_user}", domain.id)
+            let source_ref: String = connection
+                .query_row(
+                    "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
+                            '/p:' || project_handle || '/a:' || agent_handle
+                     FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+                    params![source.id, source_branch.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (format!("/d:{}/i:{bob_user}", domain.id), source_ref)
         };
         let source_rev = store
             .agent_public_revision(&owner, &source.id, &source_branch.id)
@@ -1607,6 +1864,33 @@ mod tests {
             .agent_public_revision(&owner, &inherited.id, &inherited_branch.id)
             .unwrap();
         assert_eq!(inherited_rev, 1, "fork starts with fresh Agent revision");
+        let inherited_ref: String = {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
+                            '/p:' || project_handle || '/a:' || agent_handle
+                     FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+                    params![inherited.id, inherited_branch.id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let (reforked_turn, reforked_turn_branch) = store
+            .create_agent_from_history_ref(
+                &owner,
+                &format!("{inherited_ref}/t:1"),
+                "inherited turn prefix",
+                binding(),
+                AgentHistoryForkAccess::Private,
+            )
+            .unwrap();
+        assert_eq!(reforked_turn.next_turn, 2);
+        let reforked_turn_view = store
+            .read_agent_branch_view(&owner, &reforked_turn.id, &reforked_turn_branch.id)
+            .unwrap();
+        assert_eq!(reforked_turn_view.history.turns.len(), 1);
+        assert_eq!(reforked_turn_view.history.turns[0].id, 1);
         {
             let connection = store.connection().unwrap();
             let local_nodes: u64 = connection
@@ -1656,10 +1940,19 @@ mod tests {
             .begin(TurnStart {
                 turn_id: 2,
                 prompt: "still running".into(),
-                identity,
+                identity: identity.clone(),
             })
             .await
             .unwrap();
+        assert!(store
+            .create_agent_from_history_ref(
+                &owner,
+                &format!("{source_ref}/t:2"),
+                "unsettled turn fork",
+                binding(),
+                AgentHistoryForkAccess::Private,
+            )
+            .is_err());
         let (private, private_branch) = store
             .create_agent_from_agent_history(
                 &owner,
@@ -1696,6 +1989,42 @@ mod tests {
                 .unwrap();
             assert_eq!(local_nodes, 1);
         }
+
+        source_handle
+            .finish(Turn {
+                id: 2,
+                prompt: "still running".into(),
+                answer: "second answer".into(),
+                model: identity.model.clone(),
+                profile: identity.account_id.clone(),
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(owner.clone()),
+                tool_records: Vec::new(),
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+        let (turn_one, turn_one_branch) = store
+            .create_agent_from_history_ref(
+                &owner,
+                &format!("{source_ref}/t:1"),
+                "turn one prefix",
+                binding(),
+                AgentHistoryForkAccess::Private,
+            )
+            .unwrap();
+        assert_eq!(turn_one.next_turn, 2);
+        let turn_one_view = store
+            .read_agent_branch_view(&owner, &turn_one.id, &turn_one_branch.id)
+            .unwrap();
+        assert_eq!(turn_one_view.history.turns.len(), 1);
+        assert_eq!(turn_one_view.history.turns[0].id, 1);
+        assert_eq!(turn_one_view.history.turns[0].answer, "seed answer");
+        assert_eq!(turn_one_view.history.next_turn_id, 2);
     }
 
     #[test]

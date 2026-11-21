@@ -409,6 +409,8 @@ struct AgentSpawnArgs {
     title: Option<String>,
     #[serde(default)]
     background: bool,
+    #[serde(default)]
+    from: Option<String>,
 }
 
 #[derive(Clone)]
@@ -428,6 +430,7 @@ struct PrepareRequest {
     mode: SubagentMode,
     attach_legacy_child_actor: bool,
     constructor_fingerprint: Option<String>,
+    history_from: Option<String>,
     tool_mode_override: Option<ToolMode>,
     allow_recursive_tools: bool,
     policy_gate: Option<PolicyGateSpec>,
@@ -1605,6 +1608,7 @@ impl DelegateAgentPort for PolicyDelegatePort {
                         mode: SubagentMode::Foreground,
                         attach_legacy_child_actor: true,
                         constructor_fingerprint: None,
+                        history_from: None,
                         tool_mode_override: Some(ToolMode::Off),
                         allow_recursive_tools: false,
                         policy_gate: Some(gate_spec),
@@ -2148,6 +2152,67 @@ impl Service {
         Ok((selection, operation))
     }
 
+    fn resolve_agent_history_from(&self, ctx: &ToolContext, reference: &str) -> Result<String> {
+        let owner = ctx.execution_owner.as_ref().ok_or(Error::Denied(
+            "agent history fork requires a bound current Agent",
+        ))?;
+        let current = ExecutionRef::parse(owner.canonical_ref())
+            .map_err(|_| Error::Denied("invalid bound current Agent ref"))?
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid bound current Agent ref"))?;
+        if !current.suffix().is_empty() {
+            return Err(Error::Denied("current execution owner is not an Agent root"));
+        }
+        let parent = self
+            .inner
+            .store
+            .subagent_for_child_session(&ctx.actor, owner.session_id())?
+            .and_then(|relation| {
+                self.inner
+                    .store
+                    .agent_binding(
+                        &ctx.actor,
+                        &relation.parent_session_id,
+                        &relation.parent_branch_id,
+                    )
+                    .ok()
+            })
+            .and_then(|binding| {
+                let canonical = format!(
+                    "/d:{}/i:{}/p:{}/a:{}",
+                    binding.domain_handle,
+                    binding.identity_handle,
+                    binding.project_handle,
+                    binding.agent_handle
+                );
+                ExecutionRef::parse(&canonical)
+                    .ok()?
+                    .resolve(None, None)
+                    .ok()
+                    .map(|resolved| resolved.agent_ref().clone())
+            });
+        let resolved = ExecutionRef::parse(reference)
+            .map_err(|_| Error::Denied("invalid agent history source ref"))?
+            .resolve(Some(current.agent_ref()), parent.as_ref())
+            .map_err(|_| Error::Denied("agent history source needs unavailable context"))?;
+        if !matches!(resolved.suffix(), [] | [ExecutionSegment::Turn(_)]) {
+            return Err(Error::Denied(
+                "agent from accepts only an Agent ref or settled Turn ref",
+            ));
+        }
+        let source = resolved.agent_ref();
+        let here = current.agent_ref();
+        if source.domain != here.domain
+            || source.identity != here.identity
+            || source.project != here.project
+        {
+            return Err(Error::Denied(
+                "model agent from source must stay in the current Project",
+            ));
+        }
+        Ok(resolved.canonical())
+    }
+
     fn default_title(task: &str) -> String {
         let mut title = String::from("Subagent: ");
         for ch in task.trim().chars().take(72) {
@@ -2162,7 +2227,9 @@ impl Service {
 
     fn validate_agent_args(arguments: &Value) -> Result<AgentSpawnArgs> {
         let args: AgentSpawnArgs = serde_json::from_value(arguments.clone()).map_err(|_| {
-            Error::Denied("agent arguments must contain task, optional title, optional background")
+            Error::Denied(
+                "agent arguments must contain task and may contain title, background, from",
+            )
         })?;
         if args.task.trim().is_empty()
             || args.task.len() > aw::config::MAX_PROMPT_BYTES
@@ -2179,30 +2246,59 @@ impl Service {
                 ));
             }
         }
+        if let Some(reference) = &args.from {
+            if reference.is_empty() || reference.contains('\0') {
+                return Err(Error::Config("agent from ref is invalid".into()));
+            }
+        }
         Ok(args)
     }
 
-    fn agent_constructor_fingerprint(ctx: &ToolContext, args: &AgentSpawnArgs) -> Result<String> {
+    fn agent_constructor_fingerprint(
+        ctx: &ToolContext,
+        args: &AgentSpawnArgs,
+        canonical_from: Option<&str>,
+    ) -> Result<String> {
         let owner = ctx.execution_owner.as_ref().ok_or(Error::Denied(
             "agent constructor requires a bound parent Agent",
         ))?;
         let scope = ctx.scope.as_ref().ok_or(Error::Denied(
             "agent constructor requires a durable parent scope",
         ))?;
-        let request = json!({
-            "task": args.task,
-            "title": args.title,
-            "background": args.background,
-            "parent_agent": owner.canonical_ref(),
-            "session": scope.session_id,
-            "branch": scope.branch_id,
-            "turn": ctx.turn_id,
-            "source_kind": ctx.source.kind_label(),
-            "source_id": ctx.source.id,
-            "source_epoch": ctx.source.epoch,
-            "execution_site": ctx.execution_site,
-            "identity": ctx.identity,
-        });
+        let request = if let Some(canonical_from) = canonical_from {
+            json!({
+                "task": args.task,
+                "title": args.title,
+                "background": args.background,
+                "parent_agent": owner.canonical_ref(),
+                "session": scope.session_id,
+                "branch": scope.branch_id,
+                "turn": ctx.turn_id,
+                "source_kind": ctx.source.kind_label(),
+                "source_id": ctx.source.id,
+                "source_epoch": ctx.source.epoch,
+                "execution_site": ctx.execution_site,
+                "identity": ctx.identity,
+                "from": canonical_from,
+            })
+        } else {
+            // Keep the pre-from request shape byte-for-byte for replay
+            // compatibility with already-committed constructor calls.
+            json!({
+                "task": args.task,
+                "title": args.title,
+                "background": args.background,
+                "parent_agent": owner.canonical_ref(),
+                "session": scope.session_id,
+                "branch": scope.branch_id,
+                "turn": ctx.turn_id,
+                "source_kind": ctx.source.kind_label(),
+                "source_id": ctx.source.id,
+                "source_epoch": ctx.source.epoch,
+                "execution_site": ctx.execution_site,
+                "identity": ctx.identity,
+            })
+        };
         let encoded = serde_json::to_vec(&request)
             .map_err(|_| Error::Protocol("cannot encode Agent constructor fingerprint"))?;
         let mut hash = Sha256::new();
@@ -2215,6 +2311,7 @@ impl Service {
         &self,
         ctx: &ToolContext,
         args: AgentSpawnArgs,
+        canonical_from: Option<String>,
         constructor_fingerprint: &str,
     ) -> Result<(Prepared, bool)> {
         let background = args.background;
@@ -2235,6 +2332,7 @@ impl Service {
                     mode,
                     attach_legacy_child_actor: false,
                     constructor_fingerprint: Some(constructor_fingerprint.to_owned()),
+                    history_from: canonical_from,
                     tool_mode_override: None,
                     allow_recursive_tools: true,
                     policy_gate: None,
@@ -2399,6 +2497,7 @@ impl Service {
             mode,
             attach_legacy_child_actor,
             constructor_fingerprint,
+            history_from,
             tool_mode_override,
             allow_recursive_tools,
             policy_gate,
@@ -2527,6 +2626,7 @@ impl Service {
                 mode,
                 &ctx.call_id,
                 fingerprint,
+                history_from.as_deref(),
             )
         } else if participant_policy_delegate {
             inner.store.create_participant_policy_delegate_session(
@@ -3365,13 +3465,14 @@ impl Tool for AgentConstructor {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "agent".into(),
-            description: "Create one long-lived bounded Agent with an initial Turn. The Agent remains addressable after that Turn and continues only through jobs_send. background changes only response disposition; it never creates a second Agent.".into(),
+            description: "Create one long-lived bounded Agent with an initial Turn. Optional from forks the exact committed history of a visible Agent or settled Turn; mutable runtime/Sandbox state is never inherited. The Agent remains addressable after that Turn and continues only through jobs_send. background changes only response disposition; it never creates a second Agent.".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
                     "task":{"type":"string","minLength":1,"maxLength":aw::config::MAX_PROMPT_BYTES},
                     "title":{"type":["string","null"],"minLength":1,"maxLength":160},
-                    "background":{"type":["boolean","null"]}
+                    "background":{"type":["boolean","null"]},
+                    "from":{"type":["string","null"],"minLength":1,"maxLength":512}
                 },
                 "required":["task"],
                 "additionalProperties":false
@@ -3388,7 +3489,16 @@ impl Tool for AgentConstructor {
         Box::pin(async move {
             let args = Service::validate_agent_args(arguments)?;
             self.service.exact_selection(&ctx)?;
-            let fingerprint = Service::agent_constructor_fingerprint(&ctx, &args)?;
+            let canonical_from = args
+                .from
+                .as_deref()
+                .map(|reference| self.service.resolve_agent_history_from(&ctx, reference))
+                .transpose()?;
+            let fingerprint = Service::agent_constructor_fingerprint(
+                &ctx,
+                &args,
+                canonical_from.as_deref(),
+            )?;
             if let Some(replay) =
                 self.service
                     .replay_agent_constructor(&ctx, &args, &fingerprint)?
@@ -3398,8 +3508,10 @@ impl Tool for AgentConstructor {
             // Reserve the live-worker slot before creating any child Session.
             // A constructor that cannot retain the Agent must fail pre-effect.
             let active = Service::reserve_background(&self.service.inner)?;
-            let (mut prepared, background) =
-                self.service.prepare_agent(&ctx, args, &fingerprint).await?;
+            let (mut prepared, background) = self
+                .service
+                .prepare_agent(&ctx, args, canonical_from, &fingerprint)
+                .await?;
             let runtime_state = match self.service.attach_stable_agent_runtime(&prepared) {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -3518,8 +3630,8 @@ mod tests {
     use aw::config;
     use aw_agent_core::{
         AccountDescriptor, CompletionFuture, CompletionMeta, DeltaSink, InvocationScope,
-        JournalEntry, PrincipalId, Provider, ToolCall, ToolContext, ToolEffect, ToolRecord,
-        ToolStatus, TurnJournal, TurnStart, Usage,
+        JournalEntry, Outcome, PrincipalId, Provider, ToolCall, ToolContext, ToolEffect, ToolRecord,
+        ToolStatus, Turn, TurnJournal, TurnStart, Usage,
     };
     use aw_agent_core::{Message, ModelFuture, ModelReply, Role};
     #[cfg(feature = "workspace")]
@@ -4545,6 +4657,43 @@ mod tests {
                     finish_reason: "stop".into(),
                     usage: Usage {
                         input_tokens: Some(3),
+                        output_tokens: Some(2),
+                    },
+                })
+            })
+        }
+    }
+
+    struct ForkHistoryProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    impl Provider for ForkHistoryProvider {
+        fn stream<'a>(
+            &'a self,
+            messages: &'a [aw_agent_core::Message],
+            model: &'a str,
+            sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(model, "fixture-model");
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content == "parent seed"));
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content == "parent answer"));
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content == "fork child task"));
+                assert!(!messages
+                    .iter()
+                    .any(|message| message.content == "active parent turn"));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                sink("fork child answer")?;
+                Ok(CompletionMeta {
+                    finish_reason: "stop".into(),
+                    usage: Usage {
+                        input_tokens: Some(5),
                         output_tokens: Some(2),
                     },
                 })
@@ -6094,6 +6243,169 @@ mod tests {
         // or hidden child runtime is introduced by Graph execution.
         drop(router);
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn model_agent_from_current_inherits_only_committed_history_and_replays_canonically() {
+        let actor = PrincipalId::new("local:fork-model-agent").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let accounts = ProviderAccounts::new("local").unwrap();
+        accounts
+            .register(
+                AccountDescriptor::personal(
+                    "fixture-account",
+                    actor.clone(),
+                    "local",
+                    ["fixture-model".into()],
+                ),
+                Arc::new(ForkHistoryProvider {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+        let identity = accounts
+            .select(&actor, "fixture-account", "fixture-model")
+            .unwrap()
+            .identity()
+            .clone();
+        let store = SessionStore::in_memory().unwrap();
+        let (parent, branch) = store.create(&actor, "Parent", binding()).unwrap();
+        let (_, parent_handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
+        parent_handle
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "parent seed".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        parent_handle
+            .finish(Turn {
+                id: 1,
+                prompt: "parent seed".into(),
+                answer: "parent answer".into(),
+                model: identity.model.clone(),
+                profile: identity.account_id.clone(),
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(actor.clone()),
+                tool_records: Vec::new(),
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+        parent_handle
+            .begin(TurnStart {
+                turn_id: 2,
+                prompt: "active parent turn".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+
+        let parent_binding = store.agent_binding(&actor, &parent.id, &branch.id).unwrap();
+        let parent_canonical = format!(
+            "/d:{}/i:{}/p:{}/a:{}",
+            parent_binding.domain_handle,
+            parent_binding.identity_handle,
+            parent_binding.project_handle,
+            parent_binding.agent_handle,
+        );
+        let parent_owner = AgentExecutionBinding::from_trusted_host(
+            parent_canonical.clone(),
+            parent_binding.session_id.clone(),
+            parent_binding.branch_id.clone(),
+        )
+        .unwrap();
+        let service = Service::new(
+            store.clone(),
+            accounts,
+            settings(),
+            ServiceConfig::new(
+                ToolMode::Off,
+                BudgetConfig::default(),
+                PathBuf::from("/tmp"),
+                None,
+            ),
+        )
+        .unwrap();
+        service
+            .bind_agent_jobs_router(Arc::new(
+                aw::agent_jobs::Router::new(
+                    store.clone(),
+                    actor.clone(),
+                    LocalToolLimits::default().jobs.max_retained_jobs,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let constructor = service.agent_tool();
+        let ctx = ToolContext {
+            actor: actor.clone(),
+            turn_id: 2,
+            call_id: "fork-model-agent-call".into(),
+            source: aw_agent_core::ToolSource::trusted_host(),
+            effect: ToolEffect::Process,
+            execution_site: "local".into(),
+            cancellation: CancellationToken::new(),
+            result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+            identity: identity.clone(),
+            scope: Some(InvocationScope {
+                session_id: parent.id.clone(),
+                branch_id: branch.id.clone(),
+            }),
+            execution_owner: Some(parent_owner),
+            execution_scope: None,
+            live_step_gate: None,
+        };
+        let args = json!({
+            "task":"fork child task",
+            "title":"Forked child",
+            "background":false,
+            "from":"."
+        });
+        let output = constructor.execute(ctx.clone(), &args).await.unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let child = store
+            .subagents_for_parent(&actor, &parent.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("forked Agent relation");
+        let child_binding = store
+            .agent_bindings(&actor)
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.session_id == child.child_session_id)
+            .expect("forked Agent binding");
+        let child_view = store
+            .read_agent_branch_view(
+                &actor,
+                &child_binding.session_id,
+                &child_binding.branch_id,
+            )
+            .unwrap();
+        assert_eq!(child_view.history.turns.len(), 2);
+        assert_eq!(child_view.history.turns[0].id, 1);
+        assert_eq!(child_view.history.turns[0].prompt, "parent seed");
+        assert_eq!(child_view.history.turns[1].id, 2);
+        assert_eq!(child_view.history.turns[1].prompt, "fork child task");
+        assert_eq!(child_view.history.next_turn_id, 3);
+
+        let replay_args = json!({
+            "task":"fork child task",
+            "title":"Forked child",
+            "background":false,
+            "from":parent_canonical
+        });
+        let replay = constructor.execute(ctx, &replay_args).await.unwrap();
+        assert!(!replay.is_error, "{}", replay.content);
+        assert!(replay.content.contains(" unchanged"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

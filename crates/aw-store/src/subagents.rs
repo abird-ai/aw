@@ -1964,6 +1964,7 @@ impl SessionStore {
             mode,
             ChildIdentityAuthority::Owner,
             None,
+            None,
         )
     }
 
@@ -2000,6 +2001,7 @@ impl SessionStore {
             mode,
             ChildIdentityAuthority::ParticipantSubmit,
             None,
+            None,
         )
     }
 
@@ -2021,6 +2023,7 @@ impl SessionStore {
         mode: SubagentMode,
         constructor_call_id: &str,
         constructor_fingerprint: &str,
+        history_source: Option<&str>,
     ) -> Result<(SubagentInfo, SessionInfo, crate::BranchInfo)> {
         if constructor_call_id.is_empty()
             || constructor_call_id.len() > 256
@@ -2045,6 +2048,7 @@ impl SessionStore {
             mode,
             ChildIdentityAuthority::Owner,
             Some((constructor_call_id, constructor_fingerprint)),
+            history_source,
         )
     }
 
@@ -2066,10 +2070,18 @@ impl SessionStore {
         mode: SubagentMode,
         identity_authority: ChildIdentityAuthority,
         constructor_replay: Option<(&str, &str)>,
+        history_source: Option<&str>,
     ) -> Result<(SubagentInfo, SessionInfo, crate::BranchInfo)> {
         label(title, 160)?;
         validate_sha256(task_sha256)?;
         validate_tool_mode(tool_mode)?;
+        if history_source.is_some()
+            && (identity_authority != ChildIdentityAuthority::Owner || constructor_replay.is_none())
+        {
+            return Err(Error::Denied(
+                "exact-history source is allowed only for the durable Agent constructor",
+            ));
+        }
         if matches!(tool_mode, "trusted" | "full") {
             return Err(Error::Denied(
                 "Phase 42 does not grant trusted shell tools to child Agents",
@@ -2363,6 +2375,16 @@ impl SessionStore {
             &parent.workspace_id,
             Some(target),
         )?;
+        if let Some(history_source) = history_source {
+            crate::history_owner::attach_canonical_history_to_existing_agent_in(
+                &tx,
+                actor,
+                history_source,
+                &child.id,
+                &child_branch.id,
+                crate::AgentHistoryForkAccess::Inherit,
+            )?;
+        }
         if let Some(binding_id) = execution_binding_id {
             let changed = db(tx.execute(
                 "UPDATE subagent_execution_bindings
