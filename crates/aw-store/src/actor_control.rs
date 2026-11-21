@@ -354,6 +354,12 @@ impl SessionStore {
             owner_store_generation: previous.owner_store_generation,
         };
         append(&tx, actor, &fact)?;
+        if to == ActorControlState::Applied {
+            crate::agent_owner::changed(
+                &tx,
+                crate::agent_owner::AgentKey::new(&admission.session_id, &admission.branch_id),
+            )?;
+        }
         db(tx.commit())?;
         Ok(fact)
     }

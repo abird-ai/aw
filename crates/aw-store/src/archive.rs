@@ -567,6 +567,11 @@ impl SessionStore {
                     head,
                     &b.name,
                 )?;
+                crate::agent_owner::created(
+                    &tx,
+                    crate::agent_owner::AgentKey::new(&created.id, &branch_id),
+                    None,
+                )?;
             }
         }
         db(tx.execute(

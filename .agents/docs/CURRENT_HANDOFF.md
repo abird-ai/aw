@@ -41,47 +41,53 @@ Agent-ref lookup uses the existing `job_exposure_current` primary-key projection
 non-root Agents, followed by the existing current authorization/binding recheck; it no longer scans
 Sessions/branches to discover a canonical Agent.
 
-A private zero-allocation `agent_owner` cutover seam now centralizes exact branch-bound Agent
-revision reads and owner mutations **without changing legacy persistence yet**. Today `revision()`
-still returns the historical `MAX(audit.seq)+1`; `created()`/`changed()` are in-transaction zero-work
-markers that the exclusive cutover can replace with the authoritative row insert/rev bump. No audit
-row or second state owner is created. Exact paths already crossing the seam are Agent create/fork,
-Turn admission, durable result settlement + branch attachment settlement, changed-only Agent
-subscriptions, delegated child publication (parent change + child creation with immutable parent
-Agent lineage), stable-Agent close request, and exact stable-Agent settlement. Idempotent
-subscription replacement remains revision-neutral. Session-only subagent runtime bookkeeping
-(`running`, legacy failure/settlement) is deliberately not mislabeled as DL-200 Agent lifecycle.
+Schema **v38** now performs the exclusive Agent-owner cutover. In one existing BEGIN-IMMEDIATE /
+migration-lease transaction it creates `agent_state_current` + `agent_acl_current`, seeds every
+published exact Agent binding from the already-complete v37 exposure index plus authoritative legacy
+Session/User state, verifies complete branch/exposure/owner cardinality + foreign keys, and only then
+publishes schema/activation epoch 38. Rollback leaves v37 ownership intact; there is no online
+dual-write/catch-up period.
 
-Recovery is now exact too: the existing single recovery transaction records every recovered or
-pending-attachment `(session, branch)`, deduplicates those keys in a cold-path `BTreeSet`, and marks
-each Agent exactly once before the same recovery commit. Hot mutation paths stay allocation-free and
-there is no generic transaction/mutation framework.
+`agent_state_current` is now authoritative for frozen canonical handles/backing Session+branch,
+owner, title, Agent-local `rev`/`acl_rev`, `open|closing|closed` lifecycle, `open|held` admission and
+immutable delegation parent lineage. Migration seeds each Agent rev from the exact old
+`MAX(audit.seq)+1` bridge, then revisions become branch-local. Existing Session participation seeds
+only the five direct permissions it already proves; migrated nonowners receive **no invented
+`derive/share`**. Owner authority is implicit in the Agent row. New Agent/branch constructors write
+the owner row in their existing transaction; the v37 exposure projector deliberately retains the
+legacy namespace derivation only as creation/rebuild machinery.
 
-The committed-Input boundary is now exact too: `actor_input_prepare` remains proposal-only and
-revision-neutral; only `Prepared -> Accepted`, after the live controller has actually queued the
-message, marks the exact `(session, branch)` Agent changed in the same transaction. Dispatching,
-Settled, Rejected, Unknown and lower ActorQueue staging/edit/claim/ACK/finalization do not add an
-Agent mutation; Turn admission/settlement already own their respective Agent changes.
+The previous mutation seam is now real owner persistence: Turn admission/result/attachment,
+`Prepared -> Accepted` Input custody, Applied Actor Control, changed subscriptions, direct child
+attachment, stable close/terminal settlement and recovery advance the exact Agent owner. Recovery
+still deduplicates arbitrary changed `(session, branch)` keys only in its cold path; if subagent
+restart recovery closes an Agent in that transaction, the generic Turn-recovery bump is suppressed
+so one logical recovery transaction does not double-advance it. Close moves `open -> closing/held ->
+closed/held`; Session-only subagent runtime bookkeeping remains distinct.
 
-Legacy Session title/participation writers are now explicitly classified as backing compatibility
-state, not Agent-owner mutations. Several Agents may share one Session, so broadcasting those writes
-or arbitrarily choosing a branch would violate the final owner model. Session participation is only
-a conservative seed source for the first direct Agent ACL; direct Agent ACL/title state evolves
-independently after activation.
+Agent-facing Jobs access now uses direct Agent ACL rather than Session participation. Durable wake
+receipts reuse their existing two generation fields as direct-grant revision + Agent `acl_rev`;
+Agent history cursors bind to the same access evidence. Mixed Agent/finite-Job exposure SQL filters
+by the Agent owner/ACL and rechecks exact current ACL before disclosure. A narrow exact-branch
+`set_agent_collaboration_access` bridge supports the five already-shipped collaboration permissions,
+CAS-advancing `acl_rev + rev` together and reusing the existing disclosure-dependency grant check;
+it deliberately cannot rewrite/grant future `derive/share`. Exact Agent title CAS likewise advances
+only that Agent. Legacy `set_title(session)` and Session participation remain backing compatibility
+state and no longer define Agent revision or AgentJobs access.
 
-The next Phase-1 slice can therefore be the one exclusive Agent-state+ACL owner migration/cutover:
-seed every exact Agent binding under write/schema exclusion, preserve the legacy initial revision,
-freeze title/owner/lineage/access into the new owner, and switch Agent-facing title/ACL/revision reads
-and writes atomically. Legacy Session metadata may remain for backing compatibility but must stop
-defining public Agent state. Only add cursor/projection-head mechanics when a real consumer requires
-them; do not prebuild Phase-2/4 engines.
+Phase 1 is still **underway**, not complete. Remaining owner work includes Domain principal/group
+registry + group/security generations and derived `access_generation`; the full seven-permission
+`agent.access.*` surface including reviewed `derive/share`; HistorySpan/Base/Grant + scalable
+DisclosureManifest/provenance and lazy sealing; minimal authoritative snapshots; and rebuilding the
+Agent lookup/exposure projection from `agent_state_current`. Add StoreScope cursor/projection-head
+helpers only when one of those real consumers needs them; do not prebuild Phase-2/4 engines.
 
-Current focused evidence: StoreScope **2/2**, mixed Job exposure/root lookup green, coordination
-**24/24** including killed-process result-before-attach recovery, restart unknown-model recovery
-green, Actor Input **2/2** plus restart-durable admission regression green, Agent
-Job-event/idempotent-subscription test green, delegated child relation/budget tests green,
-stable-Agent survive/continue/close regression green, `aw-cli` all-feature check green, and strict
-all-target/all-feature `aw-store` Clippy/fmt/diff green.
+Current focused evidence: populated **v37 -> v38** Agent-owner seed regression green; root/fork
+owner separation proves legacy Session title does not perturb Agent rev and exact title CAS changes
+only its target; direct Agent ACL revoke/regrant fences durable wake admission + history cursors;
+mixed Job exposure green; coordination **24/24** including killed-process recovery; stable-Agent
+survive/continue/close, revision-fenced Turn cancel, and jobs_get revision wake are green. Strict
+`aw-store` + `aw-cli` all-target/all-feature Clippy, fmt and diff checks are green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

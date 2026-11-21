@@ -2279,7 +2279,10 @@ impl SessionStore {
             ))?;
         }
         for (session, branch) in &changed_agents {
-            crate::agent_owner::changed(&tx, crate::agent_owner::AgentKey::new(session, branch))?;
+            let agent = crate::agent_owner::AgentKey::new(session, branch);
+            if crate::agent_owner::lifecycle(&tx, agent)?.0 != "closed" {
+                crate::agent_owner::changed(&tx, agent)?;
+            }
         }
         db(tx.commit())?;
         Ok(())

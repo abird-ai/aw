@@ -133,7 +133,6 @@ impl WakeAuthority {
 struct WakeAdmission {
     recipient_ref: String,
     actor: PrincipalId,
-    session_id: String,
     membership_epoch: u64,
     audience_epoch: u64,
     owner: bool,
@@ -331,9 +330,10 @@ impl Router {
 
         let canonical_agent = resolved.agent_ref().canonical();
         let binding = self.binding_for_agent_ref(resolved.agent_ref())?;
-        self.store.authorize_session_participation(
+        self.store.authorize_agent_access(
             &ctx.actor,
             &binding.session_id,
+            &binding.branch_id,
             aw_store::SessionParticipationAction::View,
         )?;
 
@@ -361,7 +361,7 @@ impl Router {
 
     fn view(&self, viewer: &PrincipalId, binding: &AgentBindingInfo) -> Result<SessionView> {
         self.store
-            .read_branch_view(viewer, &binding.session_id, &binding.branch_id)
+            .read_agent_branch_view(viewer, &binding.session_id, &binding.branch_id)
     }
 
     fn revision(&self, binding: &AgentBindingInfo) -> Result<u64> {
@@ -380,19 +380,14 @@ impl Router {
         active_run: bool,
         needs_reconciliation: bool,
     ) -> Result<(&'static str, usize)> {
-        if let Some(relation) = self
-            .store
-            .subagent_for_child_session(&self.actor, &binding.session_id)?
-        {
-            if relation.state != "running" {
-                return Ok(("closed", 0));
-            }
-            if self
-                .store
-                .subagent_close_requested(&self.actor, &binding.session_id)?
-            {
-                return Ok(("closing", 0));
-            }
+        let (lifecycle, _) =
+            self.store
+                .agent_lifecycle(&self.actor, &binding.session_id, &binding.branch_id)?;
+        if lifecycle == "closed" {
+            return Ok(("closed", 0));
+        }
+        if lifecycle == "closing" {
+            return Ok(("closing", 0));
         }
         let queue = self.queue_facts(binding)?;
         let queued = queue
@@ -572,9 +567,10 @@ impl Router {
         viewer: &PrincipalId,
         binding: &AgentBindingInfo,
     ) -> Result<[u8; 32]> {
-        let participation = self.store.authorize_session_participation(
+        let access = self.store.authorize_agent_access(
             viewer,
             &binding.session_id,
+            &binding.branch_id,
             aw_store::SessionParticipationAction::View,
         )?;
         let mut hash = Sha256::new();
@@ -587,9 +583,9 @@ impl Router {
             hash.update((part.len() as u64).to_be_bytes());
             hash.update(part);
         }
-        hash.update(participation.membership_epoch.to_be_bytes());
-        hash.update(participation.audience_epoch.to_be_bytes());
-        hash.update([u8::from(participation.owner)]);
+        hash.update(access.grant_revision.to_be_bytes());
+        hash.update(access.acl_revision.to_be_bytes());
+        hash.update([u8::from(access.owner)]);
         Ok(hash.finalize().into())
     }
 
@@ -1192,9 +1188,10 @@ impl Router {
         if live.wake.is_none() {
             return Ok(None);
         }
-        let participation = self.store.authorize_session_participation(
+        let access = self.store.authorize_agent_access(
             &ctx.actor,
             execution.session_id(),
+            execution.branch_id(),
             aw_store::SessionParticipationAction::Control,
         )?;
         let authority = match live
@@ -1218,18 +1215,17 @@ impl Router {
             &canonical,
             &ctx.actor,
             execution.session_id(),
-            participation.membership_epoch,
-            participation.audience_epoch,
-            participation.owner,
+            access.grant_revision,
+            access.acl_revision,
+            access.owner,
             &authority,
         );
         let admission = WakeAdmission {
             recipient_ref: canonical.clone(),
             actor: ctx.actor.clone(),
-            session_id: execution.session_id().to_owned(),
-            membership_epoch: participation.membership_epoch,
-            audience_epoch: participation.audience_epoch,
-            owner: participation.owner,
+            membership_epoch: access.grant_revision,
+            audience_epoch: access.acl_revision,
+            owner: access.owner,
             authority,
         };
         let source = admission.authority.source();
@@ -1239,9 +1235,9 @@ impl Router {
                 actor: ctx.actor.as_str().to_owned(),
                 authority_ref: authority_ref.clone(),
                 session_id: execution.session_id().to_owned(),
-                membership_epoch: participation.membership_epoch,
-                audience_epoch: participation.audience_epoch,
-                owner: participation.owner,
+                membership_epoch: access.grant_revision,
+                audience_epoch: access.acl_revision,
+                owner: access.owner,
                 tool_name: admission.authority.name().to_owned(),
                 source_kind: source.kind_label().to_owned(),
                 source_id: source.id.clone(),
@@ -1299,14 +1295,14 @@ impl Router {
             if expected_actor.is_some_and(|expected| expected != &actor) {
                 return Err(Error::Denied("wake recipient admission actor changed"));
             }
-            let participation = self.store.authorize_session_participation(
+            let access = self.store.authorize_agent_access_ref(
                 &actor,
-                &receipt.session_id,
+                &receipt.recipient_ref,
                 aw_store::SessionParticipationAction::Control,
             )?;
-            if participation.membership_epoch != receipt.membership_epoch
-                || participation.audience_epoch != receipt.audience_epoch
-                || participation.owner != receipt.owner
+            if access.grant_revision != receipt.membership_epoch
+                || access.acl_revision != receipt.audience_epoch
+                || access.owner != receipt.owner
             {
                 return Err(Error::Denied(
                     "wake participant membership/audience changed after registration",
@@ -1366,7 +1362,6 @@ impl Router {
             let admission = WakeAdmission {
                 recipient_ref: receipt.recipient_ref,
                 actor,
-                session_id: receipt.session_id,
                 membership_epoch: receipt.membership_epoch,
                 audience_epoch: receipt.audience_epoch,
                 owner: receipt.owner,
@@ -1388,14 +1383,14 @@ impl Router {
         {
             return Err(Error::Denied("wake recipient admission identity changed"));
         }
-        let participation = self.store.authorize_session_participation(
+        let access = self.store.authorize_agent_access_ref(
             &admission.actor,
-            &admission.session_id,
+            &admission.recipient_ref,
             aw_store::SessionParticipationAction::Control,
         )?;
-        if participation.membership_epoch != admission.membership_epoch
-            || participation.audience_epoch != admission.audience_epoch
-            || participation.owner != admission.owner
+        if access.grant_revision != admission.membership_epoch
+            || access.acl_revision != admission.audience_epoch
+            || access.owner != admission.owner
         {
             return Err(Error::Denied(
                 "wake participant membership/audience changed after registration",
@@ -1630,9 +1625,10 @@ impl AgentJobRouter for Router {
                         _ = tokio::time::sleep(wait) => {}
                     }
                 }
-                self.store.authorize_session_participation(
+                self.store.authorize_agent_access(
                     &ctx.actor,
                     &binding.session_id,
+                    &binding.branch_id,
                     aw_store::SessionParticipationAction::View,
                 )?;
                 snapshot = self.snapshot(&target)?;
@@ -2158,7 +2154,13 @@ mod tests {
         });
 
         store
-            .set_title(&actor, &session.id, "wait Agent changed")
+            .set_agent_title(
+                &actor,
+                &session.id,
+                &branch.id,
+                baseline,
+                "wait Agent changed",
+            )
             .unwrap();
         router.publish_revision(&binding_info).unwrap();
 
@@ -2229,16 +2231,20 @@ mod tests {
         agent
             .permit_registered_host_tool(bob.clone(), "jobs_subscribe")
             .unwrap();
-        store
-            .set_session_participation(
+        let access_revision = store
+            .set_agent_collaboration_access(
                 &alice,
                 &session.id,
+                &branch.id,
                 &bob,
                 aw_store::SessionParticipationPermissions {
                     view: true,
                     control: true,
                     ..Default::default()
                 },
+                store
+                    .agent_public_revision(&alice, &session.id, &branch.id)
+                    .unwrap(),
             )
             .unwrap();
 
@@ -2323,8 +2329,15 @@ mod tests {
         assert_eq!(delivery.event_rev, 1);
         assert_eq!(delivery.subscription_generation, update.generation);
 
-        store
-            .revoke_session_participation(&alice, &session.id, &bob)
+        let revoked_revision = store
+            .set_agent_collaboration_access(
+                &alice,
+                &session.id,
+                &branch.id,
+                &bob,
+                aw_store::SessionParticipationPermissions::default(),
+                access_revision,
+            )
             .unwrap();
 
         assert!(
@@ -2357,19 +2370,21 @@ mod tests {
             "revoked participant cannot disclose transcript history"
         );
 
-        let regrant = store
-            .set_session_participation(
+        let regrant_revision = store
+            .set_agent_collaboration_access(
                 &alice,
                 &session.id,
+                &branch.id,
                 &bob,
                 aw_store::SessionParticipationPermissions {
                     view: true,
                     control: true,
                     ..Default::default()
                 },
+                revoked_revision,
             )
             .unwrap();
-        assert!(regrant.membership_epoch > 1);
+        assert!(regrant_revision > revoked_revision);
         assert!(
             router.admit_event(delivery.clone()).await.is_err(),
             "re-grant must not revive an old wake admission generation"

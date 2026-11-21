@@ -3025,5 +3025,10 @@ pub(crate) fn create_in_workspace_tx(
         Some(owner),
         serde_json::json!({"session_id":session,"branch_id":branch,"head":root,"workspace_id":workspace,"target":target}),
     )?;
+    crate::agent_owner::created(
+        c,
+        crate::agent_owner::AgentKey::new(&session, &branch),
+        None,
+    )?;
     Ok((session_in(c, &session)?, branch_in(c, &session, &branch)?))
 }

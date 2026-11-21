@@ -8,8 +8,8 @@
 
 use crate::store_scope::StorePos;
 use crate::{
-    agent_binding_in, context, db, durability, workspace_writer, AgentBindingInfo, Error,
-    PrincipalId, Result, SessionStore,
+    agent_binding_in, db, durability, workspace_writer, AgentBindingInfo, Error, PrincipalId,
+    Result, SessionStore,
 };
 use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -159,7 +159,7 @@ fn project_agent(
     branch_id: &str,
     position: StorePos,
 ) -> Result<()> {
-    let binding = crate::agent_binding_unchecked(c, session_id, branch_id)?;
+    let binding = crate::legacy_agent_binding_unchecked(c, session_id, branch_id)?;
     let canonical_ref = root_ref(&binding);
     let changed = db(c.execute(
         "INSERT INTO job_exposure_current(
@@ -486,31 +486,27 @@ fn visible_projection_page(
     let mut out = Vec::with_capacity(limit);
     while out.len() < limit {
         let mut query = db(c.prepare(
-            "SELECT e.canonical_ref,e.position,e.session_id
+            "SELECT e.canonical_ref,e.position,e.session_id,e.branch_id
              FROM job_exposure_current e
-             JOIN sessions s ON s.id=e.session_id
+             JOIN agent_state_current a
+               ON a.session_id=e.session_id AND a.branch_id=e.branch_id
              WHERE e.domain_handle=?1
                AND e.identity_handle=?2
                AND e.project_handle=?3
                AND e.kind=?4 AND e.generation=?5 AND e.state='published'
                AND (?6 IS NULL OR e.position<?6)
+               AND ?7 IS NOT NULL
                AND (
-                    (s.owner_user_id IS NULL AND s.owner=?7)
-                    OR (?8 IS NOT NULL AND s.owner_user_id=?8)
+                    (a.owner_kind='user' AND a.owner_handle=?7)
                     OR EXISTS(
-                        SELECT 1 FROM members m
-                        WHERE m.session_id=s.id
-                          AND ((?8 IS NOT NULL AND m.principal_user_id=?8)
-                               OR (m.principal_user_id IS NULL AND m.principal=?7))
+                        SELECT 1 FROM agent_acl_current p
+                        WHERE p.session_id=e.session_id AND p.branch_id=e.branch_id
+                          AND p.principal_kind='user' AND p.principal_handle=?7
+                          AND p.can_view=1
                     )
-                    OR (?8 IS NOT NULL AND EXISTS(
-                        SELECT 1 FROM session_participation_grants p
-                        WHERE p.session_id=s.id AND p.user_id=?8
-                          AND p.status='active' AND p.can_view=1
-                    ))
                )
              ORDER BY e.position DESC,e.canonical_ref
-             LIMIT ?9",
+             LIMIT ?8",
         ))?;
         let scan_before_i64 = scan_before
             .map(i64::try_from)
@@ -524,7 +520,6 @@ fn visible_projection_page(
                 kind,
                 generation,
                 scan_before_i64,
-                actor.as_str(),
                 actor_user,
                 batch as i64,
             ],
@@ -533,17 +528,23 @@ fn visible_projection_page(
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         ))?;
         let mut fetched = 0usize;
         let mut last_position = None;
         for row in rows {
-            let (canonical_ref, position, session_id) = db(row)?;
+            let (canonical_ref, position, session_id, branch_id) = db(row)?;
             fetched += 1;
             last_position = Some(position);
-            match context::authorize_tree(c, &session_id, actor) {
-                Ok(()) => out.push(JobExposureListItem {
+            match crate::agent_owner::authorize_access(
+                c,
+                actor,
+                crate::agent_owner::AgentKey::new(&session_id, &branch_id),
+                crate::SessionParticipationAction::View,
+            ) {
+                Ok(_) => out.push(JobExposureListItem {
                     canonical_ref,
                     position,
                 }),
@@ -844,7 +845,6 @@ impl SessionStore {
         }
         let connection = self.connection()?;
         let actual = authoritative_binding(&connection, actor, binding)?;
-        context::authorize_tree(&connection, &actual.session_id, actor)?;
         let mut query = db(connection.prepare(
             "SELECT canonical_ref,position,state,generation,domain_handle,identity_handle,
                     project_handle,session_id,branch_id,writer_epoch

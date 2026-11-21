@@ -6,8 +6,8 @@
 //! deliveries until the existing Agent Job router attempts receiver admission.
 
 use crate::{
-    agent_binding_in, agent_owner, audit, db, now, session_in, session_participation, Error,
-    PrincipalId, Result, SessionStore,
+    agent_binding_in, agent_owner, audit, db, now, session_in, Error, PrincipalId, Result,
+    SessionParticipationAction, SessionStore,
 };
 use aw_store_api::AgentBindingInfo;
 use aw_tools::job_event::{
@@ -319,18 +319,22 @@ impl SessionStore {
         let actor = PrincipalId::new(receipt.actor.clone())?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let participation = session_participation::authorize_in(
-            &tx,
-            &actor,
-            &receipt.session_id,
-            session_participation::SessionParticipationAction::Control,
+        let access = agent_owner::key_for_ref(&tx, &receipt.recipient_ref).and_then(
+            |(session, branch)| {
+                agent_owner::authorize_access(
+                    &tx,
+                    &actor,
+                    agent_owner::AgentKey::new(&session, &branch),
+                    SessionParticipationAction::Control,
+                )
+            },
         )?;
-        if participation.membership_epoch != receipt.membership_epoch
-            || participation.audience_epoch != receipt.audience_epoch
-            || participation.owner != receipt.owner
+        if access.grant_revision != receipt.membership_epoch
+            || access.acl_revision != receipt.audience_epoch
+            || access.owner != receipt.owner
         {
             return Err(Error::Denied(
-                "Agent Job wake admission participation changed before persistence",
+                "Agent Job wake admission access changed before persistence",
             ));
         }
         db(tx.execute(
@@ -444,13 +448,13 @@ impl SessionStore {
         }
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        session_participation::authorize_in(
+        let binding = agent_binding_in(&tx, actor, session, branch)?;
+        agent_owner::authorize_access(
             &tx,
             actor,
-            session,
-            session_participation::SessionParticipationAction::Control,
+            agent_owner::AgentKey::new(session, &binding.branch_id),
+            SessionParticipationAction::Control,
         )?;
-        let binding = agent_binding_in(&tx, actor, session, branch)?;
         if let Some(expected) = expected_revision {
             if agent_owner::revision(&tx, agent_owner::AgentKey::new(session, &binding.branch_id))?
                 != expected

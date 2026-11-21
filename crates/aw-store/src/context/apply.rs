@@ -140,6 +140,11 @@ impl SessionStore {
                     &request.target.head,
                     name,
                 )?;
+                crate::agent_owner::created(
+                    &tx,
+                    crate::agent_owner::AgentKey::new(&session.id, &bid),
+                    None,
+                )?;
                 branch = branch_in(&tx, &session.id, &bid)?;
             }
             ApplyMode::NewSession { title } => {

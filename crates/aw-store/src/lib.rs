@@ -86,6 +86,7 @@ pub use actor_queue::{
     ModelQueueDispositionRequest, QueueClaim, QueueState, QueueTarget,
 };
 pub use agent_job_events::AgentJobWakeAdmission;
+pub use agent_owner::AgentAccessEvidence;
 pub use auth_session::*;
 pub use authority::{
     domain_authority_vote_transcript, DomainAuthorityElectionInfo, DomainAuthorityGrantBundle,
@@ -234,8 +235,9 @@ pub const RUNTIME_ADMISSION_INDEX_SCHEMA: &str =
     include_str!("../migrations/036_runtime_admission_indexes.sql");
 pub const JOB_EXPOSURE_REPAIR_SCHEMA: &str =
     include_str!("../migrations/037_job_exposure_repair.sql");
+pub const AGENT_OWNER_SCHEMA: &str = include_str!("../migrations/038_agent_owner.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 37;
+const LATEST_SCHEMA_VERSION: i64 = 38;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -1467,11 +1469,6 @@ impl SessionStore {
         let (_, workspace) = resources::ensure_default_domain_workspace(&tx, &user, &realm)?;
         let result =
             resources::create_in_workspace_tx(&tx, owner, title, &binding, &workspace, None)?;
-        agent_owner::created(
-            &tx,
-            agent_owner::AgentKey::new(&result.0.id, &result.1.id),
-            None,
-        )?;
         db(tx.commit())?;
         Ok(result)
     }
@@ -1508,6 +1505,39 @@ impl SessionStore {
         Ok(turn)
     }
 
+    pub fn authorize_agent_access(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        action: SessionParticipationAction,
+    ) -> Result<AgentAccessEvidence> {
+        let c = self.connection()?;
+        let branch = branch_in(&c, session, branch)?;
+        agent_owner::authorize_access(
+            &c,
+            actor,
+            agent_owner::AgentKey::new(session, &branch.id),
+            action,
+        )
+    }
+
+    pub fn authorize_agent_access_ref(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        action: SessionParticipationAction,
+    ) -> Result<AgentAccessEvidence> {
+        let c = self.connection()?;
+        let (session, branch) = agent_owner::key_for_ref(&c, canonical_ref)?;
+        agent_owner::authorize_access(
+            &c,
+            actor,
+            agent_owner::AgentKey::new(&session, &branch),
+            action,
+        )
+    }
+
     pub fn agent_public_revision(
         &self,
         actor: &PrincipalId,
@@ -1515,9 +1545,184 @@ impl SessionStore {
         branch: &str,
     ) -> Result<u64> {
         let c = self.connection()?;
-        context::authorize_tree(&c, session, actor)?;
         let branch = branch_in(&c, session, branch)?;
-        agent_owner::revision(&c, agent_owner::AgentKey::new(session, &branch.id))
+        let agent = agent_owner::AgentKey::new(session, &branch.id);
+        agent_owner::authorize_access(&c, actor, agent, SessionParticipationAction::View)?;
+        agent_owner::revision(&c, agent)
+    }
+
+    pub fn agent_lifecycle(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<(String, String)> {
+        let c = self.connection()?;
+        let branch = branch_in(&c, session, branch)?;
+        let agent = agent_owner::AgentKey::new(session, &branch.id);
+        agent_owner::authorize_access(&c, actor, agent, SessionParticipationAction::View)?;
+        agent_owner::lifecycle(&c, agent)
+    }
+
+    /// Exact-branch compatibility bridge for the five collaboration permissions
+    /// already implemented by Session participation. It never grants derive/share.
+    pub fn set_agent_collaboration_access(
+        &self,
+        requestor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        participant: &PrincipalId,
+        permissions: SessionParticipationPermissions,
+        expected_rev: u64,
+    ) -> Result<u64> {
+        let permissions = permissions.validate()?;
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let branch = branch_in(&tx, session, branch)?;
+        let agent = agent_owner::AgentKey::new(session, &branch.id);
+        agent_owner::authorize_access(&tx, requestor, agent, SessionParticipationAction::Manage)?;
+        if agent_owner::revision(&tx, agent)? != expected_rev {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+        let participant_user = ensure_user_for_principal(&tx, participant)?;
+        let owner: String = db(tx.query_row(
+            "SELECT owner_handle FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+            params![session, branch.id],
+            |row| row.get(0),
+        ))?;
+        if participant_user == owner {
+            return Err(Error::Denied("Agent owner access is implicit"));
+        }
+        let current: Option<(i64, i64, i64, i64, i64, i64, i64, u64)> = db(tx
+            .query_row(
+                "SELECT can_view,can_contribute,can_submit,can_control,can_derive,can_share,
+                        can_manage,grant_rev
+                 FROM agent_acl_current
+                 WHERE session_id=?1 AND branch_id=?2
+                   AND principal_kind='user' AND principal_handle=?3",
+                params![session, branch.id, participant_user],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional())?;
+        if current.as_ref().is_some_and(|row| row.4 != 0 || row.5 != 0) {
+            return Err(Error::Conflict(
+                "compatibility access cannot rewrite derive/share grants",
+            ));
+        }
+        let before = current
+            .as_ref()
+            .map_or(SessionParticipationPermissions::default(), |row| {
+                SessionParticipationPermissions {
+                    view: row.0 != 0,
+                    contribute: row.1 != 0,
+                    submit: row.2 != 0,
+                    control: row.3 != 0,
+                    manage: row.6 != 0,
+                }
+            });
+        if before == permissions {
+            db(tx.commit())?;
+            return Ok(expected_rev);
+        }
+        if !before.view && permissions.view {
+            context::authorize_dependencies_for_grant(&tx, session, participant)?;
+        }
+        let next_grant = current
+            .as_ref()
+            .map_or(1, |row| row.7.checked_add(1).unwrap_or(0));
+        if next_grant == 0 {
+            return Err(Error::Limit("Agent access grant revision exhausted"));
+        }
+        if permissions.is_empty() {
+            db(tx.execute(
+                "DELETE FROM agent_acl_current
+                 WHERE session_id=?1 AND branch_id=?2
+                   AND principal_kind='user' AND principal_handle=?3",
+                params![session, branch.id, participant_user],
+            ))?;
+        } else {
+            let manager = user_for_principal(&tx, requestor)?
+                .ok_or(Error::Denied("Agent manager identity is inactive"))?;
+            db(tx.execute(
+                "INSERT INTO agent_acl_current(
+                     session_id,branch_id,principal_kind,principal_handle,
+                     can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
+                     grant_rev,granted_by_handle,updated_at
+                 ) VALUES(?1,?2,'user',?3,?4,?5,?6,?7,0,0,?8,?9,?10,?11)
+                 ON CONFLICT(session_id,branch_id,principal_kind,principal_handle) DO UPDATE SET
+                     can_view=excluded.can_view,can_contribute=excluded.can_contribute,
+                     can_submit=excluded.can_submit,can_control=excluded.can_control,
+                     can_derive=0,can_share=0,can_manage=excluded.can_manage,
+                     grant_rev=excluded.grant_rev,granted_by_handle=excluded.granted_by_handle,
+                     updated_at=excluded.updated_at",
+                params![
+                    session,
+                    branch.id,
+                    participant_user,
+                    i64::from(permissions.view),
+                    i64::from(permissions.contribute),
+                    i64::from(permissions.submit),
+                    i64::from(permissions.control),
+                    i64::from(permissions.manage),
+                    next_grant,
+                    manager,
+                    now(),
+                ],
+            ))?;
+        }
+        let next = agent_owner::changed_acl(&tx, agent, expected_rev)?;
+        audit(
+            &tx,
+            session,
+            requestor,
+            "agent.access.changed",
+            serde_json::json!({
+                "branch_id":branch.id,
+                "participant":participant.as_str(),
+                "permissions":permissions,
+                "grant_rev":next_grant,
+                "rev":next,
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(next)
+    }
+
+    pub fn set_agent_title(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        expected_rev: u64,
+        title: &str,
+    ) -> Result<u64> {
+        label(title, 160)?;
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let branch = branch_in(&tx, session, branch)?;
+        let agent = agent_owner::AgentKey::new(session, &branch.id);
+        agent_owner::authorize_access(&tx, actor, agent, SessionParticipationAction::Manage)?;
+        let next = agent_owner::set_title(&tx, agent, expected_rev, title)?;
+        audit(
+            &tx,
+            session,
+            actor,
+            "agent.title.changed",
+            serde_json::json!({"branch_id":branch.id,"title":title,"rev":next}),
+        )?;
+        db(tx.commit())?;
+        Ok(next)
     }
     /// Legacy Session-scoped title compatibility state. Several public Agents
     /// may share one backing Session, so this must not be treated as an exact
@@ -1799,6 +2004,40 @@ impl SessionStore {
         read_branch_view_in(&c, actor, session_id, branch_id, true)
     }
 
+    /// Exact Agent snapshot read after the v38 access cutover. Agent ACL owns
+    /// disclosure; Session membership remains only a backing Session API rule.
+    pub fn read_agent_branch_view(
+        &self,
+        actor: &PrincipalId,
+        session_id: &str,
+        branch_id: &str,
+    ) -> Result<SessionView> {
+        let c = self.connection()?;
+        let branch = branch_in(&c, session_id, branch_id)?;
+        if branch.id != branch_id {
+            return Err(Error::Denied("Agent view requires an exact branch ID"));
+        }
+        agent_owner::authorize_access(
+            &c,
+            actor,
+            agent_owner::AgentKey::new(session_id, branch_id),
+            SessionParticipationAction::View,
+        )?;
+        if branch.active_run.is_some() {
+            return Err(Error::Conflict(
+                "branch has an active or unreconciled owner run",
+            ));
+        }
+        let session = session_in(&c, session_id)?;
+        let history = history_in(&c, &session, &branch)?;
+        Conversation::from_history(session.binding.system_prompt.clone(), &history)?;
+        Ok(SessionView {
+            session,
+            branch,
+            history,
+        })
+    }
+
     pub fn activate(
         &self,
         actor: &PrincipalId,
@@ -1895,8 +2134,8 @@ impl SessionStore {
             at,
             name,
         )?;
+        agent_owner::created(&tx, agent_owner::AgentKey::new(session, &branch), None)?;
         let out = branch_in(&tx, session, &branch)?;
-        agent_owner::created(&tx, agent_owner::AgentKey::new(session, &out.id), None)?;
         db(tx.commit())?;
         Ok(out)
     }
@@ -2542,6 +2781,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 36 {
         migrate_job_exposure_repair(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 37 {
+        migrate_agent_owner(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -2607,6 +2850,70 @@ fn migrate_job_exposure_repair(c: &mut Connection) -> Result<()> {
             "Job exposure repair migration foreign-key check failed; old transaction retained",
         ));
     }
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_agent_owner(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='agent-owner',generation=generation+1,
+             target_epoch=38,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(AGENT_OWNER_SCHEMA))?;
+    let seeded = agent_owner::seed_from_legacy(&tx)?;
+    let branches: usize = db(tx.query_row("SELECT count(*) FROM branches", [], |row| row.get(0)))?;
+    let exposures: usize = db(tx.query_row(
+        "SELECT count(*) FROM job_exposure_current
+         WHERE kind='agent' AND generation='' AND state='published'",
+        [],
+        |row| row.get(0),
+    ))?;
+    let owners: usize = db(
+        tx.query_row("SELECT count(*) FROM agent_state_current", [], |row| {
+            row.get(0)
+        }),
+    )?;
+    if branches != exposures || seeded != exposures || owners != exposures {
+        return Err(Error::Storage(
+            "Agent owner migration did not seed every exact public branch",
+        ));
+    }
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Agent owner migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='38' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=38,activation_epoch=38,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=38,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 38))?;
     db(tx.commit())?;
     Ok(())
 }
@@ -3564,11 +3871,70 @@ pub(crate) fn agent_binding_in(
     session: &str,
     branch: &str,
 ) -> Result<AgentBindingInfo> {
-    context::authorize_tree(c, session, actor)?;
-    agent_binding_unchecked(c, session, branch)
+    let binding = agent_binding_unchecked(c, session, branch)?;
+    agent_owner::authorize_access(
+        c,
+        actor,
+        agent_owner::AgentKey::new(&binding.session_id, &binding.branch_id),
+        SessionParticipationAction::View,
+    )?;
+    Ok(binding)
 }
 
 pub(crate) fn agent_binding_unchecked(
+    c: &Connection,
+    session: &str,
+    branch: &str,
+) -> Result<AgentBindingInfo> {
+    let branch = branch_in(c, session, branch)?;
+    let row: Option<(String, String, String, String, i64, i64)> = db(c
+        .query_row(
+            "SELECT a.domain_handle,a.identity_handle,a.project_handle,a.agent_handle,
+                    s.created_at,b.created_at
+             FROM agent_state_current a
+             JOIN sessions s ON s.id=a.session_id
+             JOIN branches b ON b.id=a.branch_id AND b.session_id=a.session_id
+             WHERE a.session_id=?1 AND a.branch_id=?2",
+            params![session, branch.id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional())?;
+    let Some((
+        domain_handle,
+        identity_handle,
+        project_handle,
+        agent_handle,
+        session_created_at,
+        branch_created_at,
+    )) = row
+    else {
+        return Err(Error::Denied("Agent owner is unavailable or unauthorized"));
+    };
+    Ok(AgentBindingInfo {
+        session_id: session.to_owned(),
+        branch_id: branch.id,
+        domain_handle,
+        identity_handle,
+        project_handle,
+        agent_handle,
+        session_created_at,
+        branch_created_at,
+    })
+}
+
+/// Pre-v38 Session/branch namespace derivation used only while creating the
+/// rebuildable Agent exposure projection. The projection is then frozen into
+/// `agent_state_current`; authoritative reads never call this after activation.
+pub(crate) fn legacy_agent_binding_unchecked(
     c: &Connection,
     session: &str,
     branch: &str,
@@ -6016,6 +6382,43 @@ mod phase5_agent_binding_regressions {
             "another branch in the root Session must not alias a:0"
         );
 
+        let root_rev = store
+            .agent_public_revision(&owner, &first.id, &first_branch.id)
+            .unwrap();
+        let fork_rev = store
+            .agent_public_revision(&owner, &first.id, &fork.id)
+            .unwrap();
+        store
+            .set_title(&owner, &first.id, "legacy Session title")
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_public_revision(&owner, &first.id, &first_branch.id)
+                .unwrap(),
+            root_rev,
+            "Session metadata cannot define root Agent revision after v38"
+        );
+        assert_eq!(
+            store
+                .agent_public_revision(&owner, &first.id, &fork.id)
+                .unwrap(),
+            fork_rev,
+            "Session metadata cannot fan out an Agent revision"
+        );
+        assert_eq!(
+            store
+                .set_agent_title(&owner, &first.id, &fork.id, fork_rev, "fork Agent title")
+                .unwrap(),
+            fork_rev + 1
+        );
+        assert_eq!(
+            store
+                .agent_public_revision(&owner, &first.id, &first_branch.id)
+                .unwrap(),
+            root_rev,
+            "exact Agent title edit cannot change a sibling Agent"
+        );
+
         store.set_session_archived(&owner, &first.id, true).unwrap();
         let second_after_archive = store
             .agent_binding(&owner, &second.id, &second_branch.id)
@@ -6030,6 +6433,98 @@ mod phase5_agent_binding_regressions {
             .agent_binding(&owner, &first.id, &first_branch.id)
             .unwrap();
         assert_eq!(root_after_archive.agent_handle, "0");
+    }
+
+    #[test]
+    fn v37_agent_owner_migration_seeds_exact_revision_title_and_direct_access() {
+        let store = SessionStore::in_memory().unwrap();
+        let owner = PrincipalId::new("internal:fixture:v38-owner").unwrap();
+        let member = PrincipalId::new("internal:fixture:v38-member").unwrap();
+        let (session, branch) = store.create(&owner, "before cutover", binding()).unwrap();
+        let fork = store
+            .fork(&owner, &session.id, "fork", &branch.head)
+            .unwrap();
+        store
+            .set_session_participation(
+                &owner,
+                &session.id,
+                &member,
+                SessionParticipationPermissions {
+                    view: true,
+                    control: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .set_title(&owner, &session.id, "legacy title")
+            .unwrap();
+
+        let mut c = store.connection().unwrap();
+        let legacy_revision: u64 = c
+            .query_row(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM audit WHERE session_id=?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        c.execute_batch(
+            "DROP TABLE agent_acl_current;
+             DROP TABLE agent_state_current;
+             UPDATE store_meta SET value='37' WHERE key='schema_epoch';
+             UPDATE schema_meta
+                SET schema_epoch=37,activation_epoch=37,migration_phase='ready'
+                WHERE singleton=1;
+             UPDATE migration_lease
+                SET holder_client_id=NULL,current_epoch=37,target_epoch=NULL,lease_expires_at=NULL
+                WHERE singleton=1;
+             PRAGMA user_version=37;",
+        )
+        .unwrap();
+
+        migrate_agent_owner(&mut c).unwrap();
+        assert_eq!(
+            c.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            38
+        );
+        let rows: i64 = c
+            .query_row("SELECT count(*) FROM agent_state_current", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 2);
+        for branch_id in [&branch.id, &fork.id] {
+            let (title, revision): (String, u64) = c
+                .query_row(
+                    "SELECT title,rev FROM agent_state_current
+                     WHERE session_id=?1 AND branch_id=?2",
+                    params![session.id, branch_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(title, "legacy title");
+            assert_eq!(revision, legacy_revision);
+        }
+        let member_user = user_for_principal(&c, &member).unwrap().unwrap();
+        let seeded: Vec<(i64, i64, i64, i64)> = {
+            let mut query = c
+                .prepare(
+                    "SELECT can_view,can_control,can_derive,can_share
+                     FROM agent_acl_current
+                     WHERE principal_kind='user' AND principal_handle=?1
+                     ORDER BY branch_id",
+                )
+                .unwrap();
+            query
+                .query_map([member_user], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(seeded, vec![(1, 1, 0, 0), (1, 1, 0, 0)]);
     }
 }
 

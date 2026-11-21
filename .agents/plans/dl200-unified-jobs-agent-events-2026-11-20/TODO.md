@@ -58,21 +58,22 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       explicitly scoped to active Turns/subscriptions/exposures rather than retained history.
 - [~] **Phase 1 UNDERWAY** — private `StoreScope` reuses existing `store_id` + nonzero
       `restore_generation`; transparent `StorePos(u64)` carries internal `commit_log.seq`; exact
-      Agent lookup reuses indexed `job_exposure_current` with current-authority recheck. A private
-      branch-bound `agent_owner` seam now owns legacy revision reads + zero-work in-transaction
-      `created`/`changed` markers with no new persistence. Wired exact paths: create/fork, Turn
-      admission, durable result + attachment settlement, changed-only subscription, delegated
-      parent/child publication with immutable parent lineage, stable close request, exact stable
-      settlement. Recovery deduplicates exact changed Agent keys in its already-cold transaction and
-      marks each once before commit; hot paths remain allocation-free. Committed Input now marks the
-      Agent only on exact `Prepared -> Accepted`; proposal, dispatch/settlement and ActorQueue staging
-      remain revision-neutral at this layer. Legacy Session title/participation are explicitly backing
-      compatibility state, not branch-selected or broadcast Agent mutations; participation only seeds
-      the first direct Agent ACL conservatively. Legacy revision remains `MAX(audit.seq)+1` until
-      exclusive activation; no audit rows were added. Next: perform the one exclusive Agent-state+ACL
-      seed/activation and atomically switch Agent-facing revision/title/access reads+writes away from
-      Session compatibility state. Add shared cursor/projection-head mechanics only when an actual
-      Phase-1 consumer needs them.
+      Agent lookup reuses indexed `job_exposure_current` with current-authority recheck. **v38
+      owner cutover landed:** one exclusive migration transaction creates/seeds
+      `agent_state_current` + `agent_acl_current`, freezes exact canonical/backing identity,
+      legacy initial rev/title/owner/lifecycle/parent lineage and conservative five-permission direct
+      ACL, validates completeness/FKs, then activates epoch 38. New creation/fork/Turn/Input-Accepted/
+      Applied-Control/subscription/child/close/recovery paths mutate the exact owner; hot ordinary
+      paths remain allocation-free and recovery alone deduplicates arbitrary changed Agents. Agent
+      Jobs/history/wake/list authority now uses direct Agent ACL revisions rather than Session
+      participation; exact title/access compatibility mutations CAS Agent rev and ACL changes advance
+      `acl_rev + rev` together. Legacy Session title/participation remain backing compatibility only.
+      Populated v37->v38 seed, branch-local rev/title isolation, direct ACL revoke/regrant fencing,
+      mixed exposure, coordination 24/24 and stable lifecycle/control regressions are green. Remaining
+      Phase-1 work: principal/groups + security/access generations; full seven-permission access with
+      derive/share; HistorySpan/Base/Grant + DisclosureManifest/provenance/lazy sealing; minimal
+      snapshots; rebuild Agent exposure from the new owner. Add cursor/projection-head helpers only
+      when one of those real consumers requires them.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

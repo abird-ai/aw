@@ -65,7 +65,7 @@ impl SessionParticipationPermissions {
         !self.view && !self.contribute && !self.submit && !self.control && !self.manage
     }
 
-    fn validate(self) -> Result<Self> {
+    pub(crate) fn validate(self) -> Result<Self> {
         if !self.view && (self.contribute || self.submit || self.control || self.manage) {
             return Err(Error::Denied(
                 "Session participation actions require explicit View authority",

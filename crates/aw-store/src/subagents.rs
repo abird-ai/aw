@@ -2922,7 +2922,7 @@ impl SessionStore {
                 "parent_branch_id": relation.parent_branch_id,
             }),
         )?;
-        crate::agent_owner::changed(
+        crate::agent_owner::request_close(
             &tx,
             crate::agent_owner::AgentKey::new(child_session, &child_branch.id),
         )?;
@@ -3077,6 +3077,15 @@ impl SessionStore {
                 return Err(Error::Conflict("delegation allocation is not bound"));
             }
         }
+        let child_branch = crate::agent_owner::delegated_child_branch(
+            &tx,
+            &info.child_session_id,
+            crate::agent_owner::AgentKey::new(&info.parent_session_id, &info.parent_branch_id),
+        )?;
+        crate::agent_owner::close(
+            &tx,
+            crate::agent_owner::AgentKey::new(&info.child_session_id, &child_branch),
+        )?;
         db(tx.commit())?;
         row(&c, id)
     }
@@ -3185,12 +3194,23 @@ impl SessionStore {
             Some(actor),
             serde_json::json!({"state":state}),
         )?;
-        if let Some(child_branch) = child_branch {
-            crate::agent_owner::changed(
-                &tx,
-                crate::agent_owner::AgentKey::new(&info.child_session_id, child_branch),
-            )?;
-        }
+        let owned_branch = child_branch.map(str::to_owned).map_or_else(
+            || {
+                crate::agent_owner::delegated_child_branch(
+                    &tx,
+                    &info.child_session_id,
+                    crate::agent_owner::AgentKey::new(
+                        &info.parent_session_id,
+                        &info.parent_branch_id,
+                    ),
+                )
+            },
+            Ok,
+        )?;
+        crate::agent_owner::close(
+            &tx,
+            crate::agent_owner::AgentKey::new(&info.child_session_id, &owned_branch),
+        )?;
         db(tx.commit())?;
         row(&c, id)
     }
@@ -3222,6 +3242,20 @@ impl SessionStore {
             return Ok(());
         }
         let at = now();
+        let interrupted_agents = {
+            let mut query = db(c.prepare(
+                "SELECT child_session_id,parent_session_id,parent_branch_id
+                 FROM subagent_sessions WHERE state IN ('admitted','running')",
+            ))?;
+            let rows = db(query.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            }))?;
+            db(rows.collect::<rusqlite::Result<Vec<_>>>())?
+        };
         db(c.execute(
             "UPDATE delegation_roots
              SET active_children=MAX(
@@ -3273,6 +3307,17 @@ impl SessionStore {
              WHERE state IN ('admitted','running')",
             [at],
         ))?;
+        for (child_session, parent_session, parent_branch) in interrupted_agents {
+            let child_branch = crate::agent_owner::delegated_child_branch(
+                c,
+                &child_session,
+                crate::agent_owner::AgentKey::new(&parent_session, &parent_branch),
+            )?;
+            crate::agent_owner::close(
+                c,
+                crate::agent_owner::AgentKey::new(&child_session, &child_branch),
+            )?;
+        }
         Ok(())
     }
 }

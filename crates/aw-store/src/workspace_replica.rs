@@ -1261,6 +1261,11 @@ fn preserve_divergence(
             preserved_head,
             &name,
         )?;
+        crate::agent_owner::created(
+            c,
+            crate::agent_owner::AgentKey::new(session_id, &preserved_id),
+            None,
+        )?;
     }
     db(c.execute("INSERT INTO workspace_replica_divergences(divergence_id,workspace_id,session_id,canonical_branch_id,preserved_branch_id,local_writer_epoch,incoming_writer_epoch,local_head,incoming_head,detected_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![divergence_id,workspace_id,session_id,canonical.id,preserved_id,local_epoch,incoming_epoch,canonical.head,incoming.head,now()]))?;
     Ok(true)
@@ -1789,6 +1794,11 @@ impl SessionStore {
                         &incoming.head,
                         &incoming.name,
                     )?;
+                    crate::agent_owner::created(
+                        &tx,
+                        crate::agent_owner::AgentKey::new(&incoming.session_id, &incoming.id),
+                        None,
+                    )?;
                 }
             }
         }
@@ -2148,6 +2158,11 @@ impl SessionStore {
             &branch,
             at,
             name,
+        )?;
+        crate::agent_owner::created(
+            &tx,
+            crate::agent_owner::AgentKey::new(session_id, &branch),
+            None,
         )?;
         audit(
             &tx,
