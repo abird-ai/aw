@@ -30,13 +30,13 @@ Read first:
 11. live source/tests for every owner touched
 
 Published implementation checkpoints after reseal:
-  AW main        3191e62
-  AW source      c7cc948
+  AW main        59d67babaa846fa9b60e39a27170ac9d148e3b6f
+  AW runtime pin 7c1670821b15082821a0b9621cd1caccbe62f144
   AW R6 seal     7c3800c
-  dotlink main   f5deaa6
-  dotlink source 89ff3fb
+  dotlink main   fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
+  dotlink source 16475e4
   dotlink AW pin:
-               b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
+               7c1670821b15082821a0b9621cd1caccbe62f144
   read-only 017:
                94ae8bf2757a279dc5b16b50b010ee1d278c3b44
 
@@ -62,21 +62,25 @@ global replay ledger, distributed Event router, universal revision clock or unus
 registry implementations.
 
 Current source:
-  AW has an uncommitted green R6 Phase-0 Process cut on top of published `3191e62`:
+  AW shared Process runtime is published and consumed by dotlink:
     - Tree -> Occupancy / ProcessTerminal.occupancy
     - weak direct-Unix negative -> Occupancy::Unknown
-    - new minimal crates/aw-process owns async Scope/Child/stdin/pipes/wait/stop/reap/drain
-    - aw-tools-adapter is a thin consumer and retains policy/storage/ProcessReceipt only
-    - aw-terminal PTY custody remains separate
-  Grouped evidence: aw-process 2/2, runner 4/4, adapter Process 27/27, root check and strict
-  affected all-target Clippy green, rustfmt/diff-check green.
-  Preserve the earlier Phase-0B owner-hardening semantics already published in `c7cc948`.
-  dotlink `89ff3fb` checkpoints Remote Start/replay hardening and has NOT begun the R6
-  shared-Process cutover; it still pins AW `b8a46a94...`.
+    - minimal aw-process solely owns async Scope/Child/stdin/pipes/wait/stop/reap/drain
+    - global bounded drain flushes captured partial sink batches before incomplete publication
+    - interactive stdin writes are cancellation/deadline-preemptible
+    - aw-tools-adapter retains policy/storage/ProcessReceipt only; aw-terminal PTY stays separate
+  AW grouped evidence: aw-process 3/3, runner 4/4, adapter Process 27/27, strict Clippy green.
+  dotlink `16475e4` consumes aw-process, deletes its parallel shell Process owner, stores one
+  canonical optional ProcessTerminal, preserves tree compatibility, uses non-login Bash, and
+  owns the 30-minute checkpoint / 35-minute hard conversational shell horizon.
+  dotlink source graph + strict all-target Clippy are green. One real shell executable run
+  reached 133/134 before the final shared drain fix; that sole failure is now the focused AW
+  regression test. L5 externally SIGKILLs final dotlink codegen/link before test execution.
 
 First revalidate current refs/status. Then follow the user's instruction.
-R6 is already sealed. Continue Phase 0 only; do not start Phase 1 before the coherent
-Phase-0 checkpoint is reviewed/accepted.
+R6 is already sealed. Continue Phase 0 only: rerun the grouped dotlink shell/Process/
+Remote-Start executable gate on a host where linking is not externally killed and finish
+outstanding Phase-0B owner/evidence work. Do not start Phase 1 before Phase 0 is accepted.
 
 Keep implementation turns around 30 minutes and stop at the next coherent checkpoint.
 ~~~

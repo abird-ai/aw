@@ -7,11 +7,11 @@ Status: **R6 SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS**
 ## Committed
 
 - [x] `132bfd7` — published R1 DL-200 seal/implementation-plan baseline.
-- [x] `7c3800c` / `3191e62` — R6 sealed and current handoff published.
-- [~] Current AW R6 Phase-0 Process cut is **green but uncommitted**: Occupancy rename,
-      weak-Unix Unknown semantics, `aw-process`, and AW consumer extraction are complete.
-      Dotlink shared-runtime consumer/repin remains the Process convergence gate. No
-      commit/push without separate authorization.
+- [x] `7c3800c` — R6 architecture sealed.
+- [x] AW shared Process runtime published through `7c16708`; AW main `59d67ba` adds the
+      focused bounded-drain regression test only.
+- [x] dotlink source `16475e4` + handoff/main `fb1b7b9` — repinned to AW `7c16708`, real
+      `aw-process` consumer cutover complete, old shell Process owner deleted.
 
 ## R6 design approval and real implementation queue
 
@@ -35,10 +35,11 @@ Status: **R6 SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS**
 
 **Next implementation slices (R6 sealed; no extra phase):**
 
-- [ ] **Phase 0** — rename Rust `Tree`/`.tree` to `Occupancy`/`.occupancy`; **create
-      `crates/aw-process`** as the only async Process + stdin/stdout/stderr pipe lifetime,
-      wait/stop/drain owner; migrate AW and dotlink consumers, remove parallel guards,
-      keep product output stores/wires, and qualify bounded sink failure + AW/dotlink parity.
+- [~] **Phase 0** — source architecture/cross-repo Process cut is complete: `Occupancy`,
+      `crates/aw-process`, AW+dotlink consumption, no parallel Process guard/runtime,
+      compatibility `tree` projection, non-login Bash and dotlink-owned 30/35 horizon.
+      Remaining acceptance gate is the grouped dotlink shell/Process/Remote-Start executable
+      qualification on a host where L5 does not externally SIGKILL dotlink codegen/link.
 - [ ] **Phase 0B** — reuse private replay/effect/ExternalEvidence helpers inside existing
       policy, guardian and remote Start owners; complete original-invocation, actor,
       disclosure and lifetime audit gates without a global replay database.
@@ -76,11 +77,11 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
 ## Tests and verification
 
 - [x] Design work performed on L5 only.
-- [x] AW R6 Process cut is implemented and grouped-check green in the uncommitted working
-      tree: `Occupancy`, `aw-process`, weak-Unix Unknown, and AW adapter consumption.
+- [x] AW R6 Process runtime is published and grouped-check green: `Occupancy`, `aw-process`,
+      weak-Unix Unknown, AW adapter consumption, global bounded drain and flush-on-bound.
 - [x] Phase-0B source checkpoint from the prior owner-hardening slice is preserved.
-- [x] DL-200 dotlink Phase-0 shared-Process consumer/projection work has not begun; published
-      dotlink replay hardening is not evidence of the Process cutover.
+- [x] dotlink shared-Process consumer/projection source cut is published at `16475e4`; all AW
+      Git deps pin exactly `7c16708`; old `shell_process`/ManagedProcessGuard owner is gone.
 - [x] No AW `.agents/plans/ux/**` content inspected or modified.
 - [x] Sandbox/mount/config-v13 implementation remains frozen.
 - [x] DL-200 R5 amendment/reseal recorded; R1–R4 retained as historical provenance.
@@ -90,8 +91,9 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       2026-11-21 and proceeds under sealed R6.
 - [x] R6 comprehensive handoff + copy-ready next-agent prompt created under `.agents/docs/`
       and wired as the canonical entrypoint from AW/dotlink CURRENT_HANDOFF.
-- [ ] Accept Phase 0 only after its consolidated AW+dotlink behavior gate; Phase-0A focused
-      checks and Phase-0B work-in-progress are not Phase-0 completion.
+- [ ] Accept Phase 0 only after the final grouped executable AW+dotlink behavior gate. Source
+      architecture is converged; L5 final test/binary codegen is externally SIGKILLed before
+      execution. Do not replace this gate with fragmented fixture evidence.
 - [ ] Phase-0B review gaps: stable original replay vs writer/policy/parent changes,
       actual participant ToolPolicy/payer authority, compact replay tombstones, exact
       opaque/minimal withheld-replay response, current disclosure on cached receipts and

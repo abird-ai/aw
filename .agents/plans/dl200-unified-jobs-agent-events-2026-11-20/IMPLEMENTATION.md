@@ -73,31 +73,34 @@ requalify unchanged primitives at every step.
 
 Status: **IN PROGRESS**.
 
-### R6 AW Process extraction checkpoint — green, uncommitted (2026-11-21)
+### R6 shared-Process cross-repo checkpoint — published source (2026-11-21)
 
-The current AW working tree now implements the R6 shared-runtime side of Phase 0:
+The R6 shared-runtime source cut is complete across AW and dotlink:
 
-- `Tree` is renamed to `Occupancy`, including `ProcessTerminal.occupancy`;
-- `crates/aw-process` is the sole async Pipe Process owner for containment/spawn/stdin/
-  stdout/stderr/wait/stop/reap/drain and canonical `ProcessTerminal` settlement;
-- hosts transfer authorized prepared commands by value; AW keeps policy, durable output
-  storage/paging/ACK and its `ProcessReceipt` envelope at the edge;
-- weak direct-Unix negative membership evidence maps to `Occupancy::Unknown`; Windows Job
-  negative remains `Empty`;
-- the AW adapter has no parallel Scope/Child/Reader/wait/stop/drain implementation;
-- PTY Terminal custody remains in `aw-terminal` and is not folded into Process Scope;
-- bounded retained-output sink failure always releases/finalizes writer custody and cannot
-  turn incomplete output into success.
+- AW runtime `7c16708` owns `Occupancy`, containment/spawn/stdin/stdout/stderr/wait/stop/reap/
+  drain and canonical `ProcessTerminal`; AW main `59d67ba` adds the focused drain-flush test;
+- hosts transfer authorized prepared commands by value; AW and dotlink retain policy,
+  product storage/paging/ACK/result projection at their edges;
+- weak direct-Unix negative membership => `Occupancy::Unknown`; Windows Job negative => Empty;
+- `aw-process` has one global output-drain bound, cancellation/deadline-preemptible interactive
+  writes, and bounded reader quiescence that flushes already-captured partial sink batches;
+- AW adapter and dotlink contain no parallel Scope/Child/Reader/wait/stop/drain owner;
+- dotlink `16475e4` deletes `src/shell_process.rs`, stores canonical optional ProcessTerminal in
+  JobCompletion, retains exact `tree=leftovers|unknown` compatibility projection, uses non-login
+  Bash, and owns the 30-minute guidance / 35-minute hard conversational horizon;
+- PTY Terminal custody remains in `aw-terminal` and is not folded into Process Scope.
 
-Grouped evidence: `aw-process` 2/2; `aw-tools` runner 4/4; adapter Process 27/27; affected
-and root compile through `aw-cli`; strict affected all-target Clippy `-D warnings`; rustfmt
-and diff-check all green. The L5 sysroot does not include a Windows std target, so the new
-Windows-only branch cannot be cross-target checked here; `aw-platform-win` remains in the
-successful root package check.
+Grouped evidence remains intentionally compact: AW `aw-process` 3/3, runner 4/4 and adapter
+Process 27/27 are green; dotlink final all-target/all-feature source graph and strict Clippy
+`-D warnings` are green; rustfmt/diff checks are green. A real dotlink shell executable run
+reached 133 pass / 1 fail before the last shared drain-flush fix; that sole failure is now the
+focused AW regression test. L5 externally SIGKILLs the final dotlink test/binary during codegen/
+link before execution after pin changes. Do not fragment the suite to manufacture acceptance.
 
-Remaining Process gate: explicitly authorized AW publication, then dotlink repin + real
-`aw-process` consumer cutover/parity. Phase 0 is not accepted until that cross-repo gate is
-green. The stronger PID-1 launcher/backend remains separately promoted future work.
+Remaining Process gate: rerun the grouped shell/Process/Remote-Start executable qualification
+on a host where dotlink linking is not externally killed. Phase 0 is not accepted until that
+behavior gate is green. The stronger PID-1 launcher/backend remains separately promoted future
+work.
 
 ### Phase 0A checkpoint — shared facts + direct observation complete (2026-11-21)
 
@@ -195,9 +198,10 @@ The Process design was deliberately reopened before dotlink cutover and simplifi
 Focused existing Process regressions remain green after the ownership refactor; platform
 crates and adapter compile on Unix + Windows.
 
-**Resume boundary:** complete the concurrent Phase 0B replay/admission/exposure remediation
-without disturbing this Process owner, then cut dotlink over to the shared Process terminal
-facts, non-login Bash and the 30/35-minute runtime policy. Do not start DL-200 Phase 1 yet.
+**Resume boundary:** shared Process source convergence is complete. Rerun the final grouped
+executable shell/Process/Remote-Start gate on a host where linking succeeds and continue the
+outstanding Phase 0B replay/admission/exposure remediation without disturbing this owner.
+Do not start DL-200 Phase 1 yet.
 
 This phase is intentionally first. It fixes current reusable Process semantics before
 DL-200 builds more Jobs/Agent behavior on them.

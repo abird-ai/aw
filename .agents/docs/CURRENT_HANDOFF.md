@@ -17,7 +17,7 @@ The previous
 is preserved and embedded verbatim in the new canonical handoff as historical
 implementation chronology. The dated 2026-11-19 017 handoff is likewise historical.
 
-**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R1–R5 remain historical design provenance. R6 was explicitly approved on 2026-11-21 and is authoritative. Published AW remains `3191e62`; the current **uncommitted** AW Phase-0 working tree now completes the R6 `Tree -> Occupancy` rename, weak-direct-Unix negative-to-Unknown correction, required `crates/aw-process` extraction, and the AW adapter cutover to that sole async Process/pipe lifetime owner. Dotlink Remote Start/replay hardening remains published at `89ff3fb`, but dotlink still consumes published AW `b8a46a94...`; its real `aw-process` consumer/repin is the remaining cross-repo Phase-0 Process gate. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a reason to thaw frozen sandbox work. This is not final Phase-0 acceptance.
+**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 CROSS-REPO PROCESS CUTOVER COMPLETE IN SOURCE.** R1–R5 remain historical design provenance. AW shared runtime is published through `7c1670821b15082821a0b9621cd1caccbe62f144`; AW main is `59d67babaa846fa9b60e39a27170ac9d148e3b6f`, whose only later delta is the focused bounded-drain regression test. Dotlink source `16475e4` consumes `aw-process` directly and dotlink main/handoff is `fb1b7b9`; all eight direct/transitive AW Git packages resolve to the exact `7c16708...` runtime pin. The parallel dotlink shell Process owner is deleted. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a reason to thaw frozen sandbox work. Final Phase-0 acceptance still requires the grouped executable gate on a host where dotlink test linking is not externally SIGKILLed.
 
 **R6 simplification seal (2026-11-21):** The canonical DL-200
 [README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md),
@@ -34,51 +34,45 @@ one Agent-neutral async Scope/pipe/wait/stop/drain owner for AW and dotlink, wit
 host-provided bounded output sinks and planned `Occupancy` naming. The normative SPEC
 is single-definition/indexed rather than repeating the R1–R5 invariant ledger; that history
 is preserved in [historical archive](DL200-R1-R5-RESOLVED-DESIGN-CHECKLIST-2026-11-21.md).
-R6 is the **sealed** implementation authority. Its final live-owner review also fixes the
-shared Process boundary: `ProcessTerminal` is the cross-host Fact; AW/dotlink keep their
-product receipt/output owners; prepared commands transfer by value into `aw-process`;
-weak direct-Unix negative containment maps to semantic Unknown; and `aw-terminal` PTY
-source-release/adoption remains a distinct Terminal resource. R6 Phase 0 is not yet fully implemented because the dotlink consumer/repin remains pending;
-the current uncommitted AW source/test checkpoint below is the factual boundary.
-Commit/push/release remain separately gated.
+R6 is the **sealed** implementation authority. `ProcessTerminal` is the cross-host Fact;
+AW/dotlink keep product receipt/output authority at their edges; prepared commands transfer by
+value into `aw-process`; weak direct-Unix negative containment maps to semantic Unknown; and
+`aw-terminal` PTY source-release/adoption remains a distinct Terminal resource.
 
-## LIVE DL-200 R6 Process extraction checkpoint — AW green, uncommitted, 2026-11-21
+## LIVE DL-200 R6 shared-Process cross-repo checkpoint — published source, 2026-11-21
 
-The current AW working tree has crossed the R6 Process ownership boundary cleanly:
+The Phase-0 Process ownership cut is now published across both repos:
 
-- `Tree` / `ProcessTerminal.tree` is now `Occupancy` / `.occupancy` throughout the shared
-  Process facts and AW consumers; there is no semantic Process-`Tree` residue;
-- new `crates/aw-process` is the sole Agent-neutral async owner of prepared-command
-  containment finalization, stdio, spawn, exact Child/Scope custody, stdin, pipe capture,
-  wait/stop/reap, bounded drain and `ProcessTerminal` settlement;
-- `aw-process` depends only on minimal `aw-tools` Process facts (`batch`), `aw-platform`,
-  Tokio and `thiserror`; it has no AgentCore, Store, MCP, ToolPolicy or product receipt owner;
-- AW passes an already-authorized prepared `tokio::process::Command` by value. The adapter
-  keeps `PipeSpec` validation, Tool/policy authority, legacy spool and Job `OutputWriter`
-  storage, paging/ACK, and the AW-specific `ProcessReceipt` envelope;
-- the output seam is one small `OutputSink` contract. No-sink foreground capture allocates
-  no 64-KiB sink batches; retained output uses one bounded queue and one blocking writer per
-  stream. Sink failure still drains the OS pipe, always finalizes writer custody, and marks
-  output incomplete rather than inventing success;
-- direct Unix positive group evidence maps to `Occupancy::Live`; negative group/procfs
-  evidence maps to `Occupancy::Unknown` because `setsid(2)` escape cannot be excluded.
-  Windows Job Object negative evidence remains a real `Occupancy::Empty` proof;
-- the adapter no longer contains a duplicate `Scope`, `Reader`, Child/ChildStdin owner,
-  wait/stop/reap/drain state machine or DirectScope choreography;
-- `aw-terminal` PTY custody is untouched and remains deliberately separate.
+- AW runtime pin `7c16708...`: `Occupancy`, minimal `aw-process`, weak-Unix Unknown semantics,
+  sole async Scope/Child/stdin/pipe/wait/stop/reap/drain ownership, semantic `stop_with`, one
+  global drain bound, cancellation/deadline-preemptible interactive writes, and bounded reader
+  quiescence that flushes captured partial sink batches before reporting incomplete output;
+- AW main `59d67ba...` adds only the focused shared failure-boundary test; `aw-process` is **3/3**
+  including `reader_stop_flushes_partial_sink_batch_before_incomplete`, strict Clippy green;
+- dotlink source `16475e4` consumes `aw-process`, deletes `src/shell_process.rs` and all
+  production `ManagedProcessGuard`/local Child/ChildStdin/stop-tree/drain ownership;
+- dotlink `JobCompletion` stores the canonical optional `ProcessTerminal`; definite pre-spawn
+  failure has no synthetic terminal. Occupancy projects compatibly as Empty=>no `tree`,
+  Live=>`tree="leftovers"`, Unknown=>`tree="unknown"`;
+- Live leftovers clear dotlink product `success` without rewriting factual exit/status into a
+  generic tool error; weak-Unix escaped descendants remain Occupancy Unknown;
+- direct + Bubblewrap Bash converge on non-login/non-profile `-c`; dotlink's one runtime profile
+  owns 30-minute checkpoint guidance and a 35-minute hard conversational shell horizon, with
+  effective deadline `min(configured policy, 35m)`. AW remains horizon-free;
+- dotlink product stdin authority/revision fencing remains local, but actual ChildStdin custody
+  never leaves `aw-process`; initial stdin is chunked through the shared 64-KiB primitive.
 
-Focused grouped evidence (no fixture expansion): `aw-process` **2/2**; shared runner **4/4**;
-AW adapter Process suite **27/27**; affected/root `cargo check` green through `aw-cli` and
-`aw-platform-win`; strict affected all-target Clippy `-D warnings` green; rustfmt and
-`git diff --check` green. L5 externally SIGKILLed two cold/warmed compilation attempts during
-this work; both corresponding commands passed on immediate warmed reruns with no Rust error.
-The installed Rust sysroot has no Windows std target, so the new Windows-only `aw-process`
-branch was not cross-target compiled on L5; the unchanged `aw-platform-win` package and root
-consumer graph compile on this host.
+Qualification stayed grouped: final dotlink all-target/all-feature source graph type-checks;
+strict all-target/all-feature Clippy `-D warnings`, rustfmt and diff-check are green. A real
+shell executable run during the cut reached **133 passed / 1 failed**; that single inherited-FD
+partial-batch failure is the exact shared regression now proven by AW's 3/3 test. L5 repeatedly
+SIGKILLs the final dotlink test/binary during dotlink codegen/link after pin changes, before any
+test executes, so final executable parity remains an explicit environment qualification gap.
+Do not split the suite into fixture fragments to manufacture evidence.
 
-**Next coherent Phase-0 step:** publish this AW cut only when explicitly authorized, repin
-and migrate dotlink to `aw-process`, then qualify AW/dotlink parity plus dotlink non-login Bash
-and its product-owned 30/35-minute horizon. Do not start Phase 1 yet.
+**Next coherent Phase-0 step:** on a host where dotlink test linking is not externally killed,
+rerun the grouped shell/Process/Remote-Start executable gate. Continue outstanding Phase-0B
+owner/evidence work as already planned, but **do not start Phase 1 until Phase 0 is accepted**.
 
 Author: coordinating design/implementation agent
 Owner: @pvl

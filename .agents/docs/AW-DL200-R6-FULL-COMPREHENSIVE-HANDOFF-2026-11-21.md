@@ -84,48 +84,38 @@ sealed R6 design or live source.
 
 ### 3.1 AW
 
-Current implementation source checkpoint before this handoff sync:
+Current published AW boundary:
 
-    c7cc948 — Checkpoint DL-200 Phase 0 owner hardening
-    branch: main
+    main:        59d67babaa846fa9b60e39a27170ac9d148e3b6f
+    runtime pin: 7c1670821b15082821a0b9621cd1caccbe62f144
+    R6 seal:     7c3800c — Seal DL-200 R6 architecture
 
-The immediately preceding R6 seal/docs checkpoint is:
+`7c16708...` is the exact reusable runtime revision consumed by dotlink. `59d67ba...` differs
+only by the focused bounded-drain regression test; no runtime behavior changed after the pin.
+The older R1 baseline `132bfd7...`, Phase-0 owner-hardening checkpoint `c7cc948...`, and
+implementation/design base `f035a00...` remain historical provenance.
 
-    7c3800c — Seal DL-200 R6 architecture
-
-The older published R1 baseline remains `132bfd7416a0a83e915ab18ffc10de9f6d3e2a2b`.
-
-The DL-200 TODO still records the older implementation/design base:
-
-    f035a00031b8f5879f4d77f3fd14bfe02b89305c
-
-The reusable AW implementation currently consumed by dotlink remains:
-
-    b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
-
-The R6 plan/docs are checkpointed in `7c3800c`; published AW main is `3191e62`. The
-pre-R6 Phase-0A Process work and independent Phase-0B store/policy/exposure work are
-checkpointed together in `c7cc948`. The current **uncommitted** working tree advances only
-the R6 Process side: `Occupancy`, minimal `crates/aw-process`, weak-Unix negative Unknown,
-and AW adapter consumption are implemented and grouped-check green. Preserve the Phase-0B
-owner-hardening semantics while continuing this cut; dotlink publication/repin is still
-separate.
+The R6 Process side is now published: `Occupancy`, minimal `crates/aw-process`, weak-Unix
+negative Unknown, AW adapter consumption, global bounded drain, semantic `stop_with`,
+cancellation/deadline-preemptible interactive stdin and flush-before-incomplete drain
+quiescence. Preserve the independent Phase-0B owner-hardening semantics while continuing.
 
 ### 3.2 dotlink
 
-Current implementation source checkpoint before its handoff sync:
+Current published dotlink boundary:
 
-    89ff3fb — Harden Remote Start replay admission
+    source: 16475e4 — Converge shell Process runtime on aw-process
+    main:   fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
     branch: main
 
 Current AW Git dependency pin in dotlink Cargo.toml/Cargo.lock:
 
-    b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
+    7c1670821b15082821a0b9621cd1caccbe62f144
 
-The Remote Start/replay hardening previously dirty in `src/jobs.rs`,
-`src/mcp/tools/shell.rs` and `src/remote_start.rs` is checkpointed in `89ff3fb`. It is
-Phase-0B/replay hardening, **not** evidence that the R6 shared-Process consumer cutover has
-begun. The real dotlink `aw-process` migration remains pending.
+All six direct AW manifest revisions and all eight direct/transitive AW lock sources resolve
+to that exact revision. `89ff3fb` remains the earlier Remote Start/replay checkpoint; the real
+R6 shared-Process migration is now complete in source. Dotlink deletes its parallel shell
+Process owner and consumes `aw-process` directly.
 
 Published dotlink lineage immediately below current head includes:
 
@@ -960,46 +950,33 @@ Do not accidentally reintroduce these.
 
 ## 10. Current implementation reality
 
-### 10.1 implemented Phase-0A work
+### 10.1 current R6 shared-Process implementation
 
-AW source checkpoint `c7cc948` contains the pre-R6 Process work:
+The Process source architecture is converged and published:
 
-- ProcessTerminal has physical exit, StopRecord, Tree and per-stream output completeness;
-- ProcessReceipt stores ProcessTerminal as terminal truth;
-- private async Scope owns Child + platform DirectScope;
-- Linux DirectScope uses pidfd when available plus direct process-group/procfs observation;
-- Windows uses exact duplicated leader HANDLE + Job Object;
-- settlement ordering closes remaining scope before output drain;
-- direct Unix/Darwin/Windows process observations and stop semantics were focused-tested.
+- `ProcessTerminal = exit + Option<StopRecord> + Occupancy + per-stream output facts`;
+- `crates/aw-process` solely owns async Scope/Child/stdin/pipes/wait/stop/reap/drain;
+- weak direct-Unix negative membership is `Occupancy::Unknown`; Windows Job negative is Empty;
+- one global drain bound applies to both streams; bounded reader quiescence flushes captured
+  partial sink batches before publishing incomplete output; sink failure cannot hang cleanup;
+- interactive shared stdin writes are cancellation/deadline-preemptible;
+- AW adapter retains policy/storage/ProcessReceipt only; `aw-terminal` PTY remains separate;
+- dotlink consumes `aw-process` directly, deletes its parallel shell Process runtime, stores
+  canonical optional ProcessTerminal in JobCompletion, and preserves `tree` compatibility;
+- dotlink direct/Bubblewrap Bash is non-login and dotlink alone owns the 30/35 runtime policy.
 
-Important: this is pre-R6 source and still spells Tree.
+Focused/grouped evidence: AW `aw-process` 3/3, shared runner 4/4, adapter Process 27/27;
+dotlink all-target/all-feature source graph and strict Clippy are green. A real shell grouped
+run reached 133 pass / 1 fail before the final shared drain-flush correction; that exact sole
+failure is now the focused AW regression. L5 externally SIGKILLs final dotlink codegen/link
+before execution after pin changes.
 
-Historical focused evidence recorded in CURRENT_HANDOFF includes:
+### 10.2 remaining Phase-0 acceptance gap
 
-- affected shared crates compile, including aw-platform-win;
-- DirectScope tests 4/4;
-- aw-tools Process runner tests 4/4 with full;
-- adapter lifecycle regressions for descendants, inherited pipes, external signals,
-  cancellation/deadline and terminate-once;
-- strict affected Clippy green;
-- git diff --check clean at that checkpoint.
-
-This evidence does not qualify the R6 Occupancy/shared-owner/dotlink cutover.
-
-### 10.2 known Phase-0 gaps
-
-Before Phase 0 can be accepted under R6:
-
-- approve/reseal R6 first;
-- rename shared Rust Tree/.tree -> Occupancy/.occupancy;
-- correct weak direct-Unix semantic negative observation so it cannot claim Occupancy::Empty
-  when setsid escape cannot be excluded;
-- extract one Agent-neutral Process lifetime owner at a dependency-clean boundary;
-- make the real dotlink consumer compile/use that owner without importing the full
-  Agent-specific adapter solely for Process lifetime;
-- remove dotlink parallel guard/wait/reap/tree-classification semantics;
-- preserve dotlink wire tree projection;
-- qualify real AW+dotlink behavior together.
+Source convergence is complete. Before Phase 0 can be accepted under R6, rerun the grouped
+shell/Process/Remote-Start executable qualification on a host where dotlink linking is not
+externally killed. Do not fragment the suite into fixture-level substitutes. The strong Linux
+PID-1 launcher remains separately promoted future work and is not part of this gate.
 
 ### 10.3 Phase-0B concurrent work
 
@@ -1018,13 +995,11 @@ Do not conflate this concurrent work with Phase-0 Process acceptance.
 
 ### 10.4 dotlink current state
 
-dotlink is still pinned to AW b8a46a... and does not yet consume the R6 shared Process owner.
-
-Current dirty dotlink source is not R6 implementation evidence.
-
-The current dotlink shell already contains several 0.17.6-era product behaviors such as
-non-login Bash arguments and tree/result projection, but R6 requires the lifetime semantics
-to move to the one shared Process owner rather than preserving a second implementation.
+dotlink main `fb1b7b9...` contains source checkpoint `16475e4` and pins AW runtime
+`7c16708...`. It directly consumes the R6 shared Process owner. The old `shell_process.rs`,
+ManagedProcessGuard choreography and local Child/stdout/stderr lifetime engine are deleted.
+Product output storage, stdin authority/revision fencing, result/log projection and the 30/35
+runtime horizon remain dotlink-owned as intended.
 
 ## 11. R6 implementation plan — no eighth phase
 
@@ -1258,12 +1233,14 @@ Read first:
 10. dotlink/.agents/docs/CURRENT_HANDOFF.md
 11. live source/tests for every owner touched
 
-Current implementation source checkpoints after reseal:
-  AW source      c7cc948
+Current published implementation checkpoints after reseal:
+  AW main        59d67babaa846fa9b60e39a27170ac9d148e3b6f
+  AW runtime pin 7c1670821b15082821a0b9621cd1caccbe62f144
   AW R6 seal     7c3800c
-  dotlink source 89ff3fb
+  dotlink main   fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
+  dotlink source 16475e4
   dotlink AW implementation pin:
-               b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
+               7c1670821b15082821a0b9621cd1caccbe62f144
   read-only 017 reference:
                94ae8bf2757a279dc5b16b50b010ee1d278c3b44
 
@@ -1311,21 +1288,21 @@ Do not collapse:
   different Unknown semantics
 
 Current implementation reality:
-  Published AW main is `3191e62`; the current uncommitted AW working tree has completed the
-  R6 Process-side extraction: `Occupancy`, weak direct-Unix negative Unknown, minimal
-  `crates/aw-process`, and AW adapter consumption are green. The adapter no longer owns a
-  parallel Scope/Child/Reader/wait/stop/drain engine; AW product policy/storage/receipt
-  ownership remains at the edge. PTY Terminal custody remains separate in `aw-terminal`.
-  Dotlink `89ff3fb` preserves Remote Start/replay hardening; the real R6 shared-Process
-  consumer cutover has not begun and dotlink still pins published AW `b8a46a94...`.
+  AW runtime `7c16708...` and main `59d67ba...` publish the R6 Process owner and focused
+  drain-flush regression. `Occupancy`, weak direct-Unix Unknown, minimal `aw-process`, sole
+  async lifetime ownership, global bounded drain and preemptible interactive stdin are live.
+  Dotlink source `16475e4` / main `fb1b7b9...` pins that exact runtime, consumes aw-process,
+  deletes its parallel shell Process owner, preserves tree compatibility, converges non-login
+  Bash and owns the 30/35 conversational runtime horizon.
+  Final dotlink source graph/strict Clippy is green. A real shell group reached 133/134 before
+  the sole drain-flush regression was fixed at AW; L5 now externally kills final dotlink
+  codegen/link before execution. The exact failure is covered by AW aw-process 3/3.
 
 Before continuing, revalidate current refs/status because source outranks this handoff.
 R6 is already sealed. Continue Phase 0 only:
-    explicitly authorized AW publication
-    dotlink repin + aw-process consumer cutover
-    preserve dotlink tree=leftovers|unknown compatibility projection
-    non-login Bash + product-owned 30/35-minute horizon
-    one grouped AW+dotlink behavior gate
+    rerun grouped shell/Process/Remote-Start executable qualification on a suitable host
+    complete remaining Phase-0B owner/evidence gates
+    do not start Phase 1 until Phase 0 acceptance
 
 Keep implementation turns around 30 minutes and stop at the next coherent checkpoint.
 Prefer zero-cost/static Rust abstractions and simple owner-local logic; do not create a
