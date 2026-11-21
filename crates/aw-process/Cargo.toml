@@ -10,8 +10,8 @@ description = "Agent-neutral async Process lifetime, containment, pipe and settl
 [dependencies]
 aw-tools = { path = "../aw-tools", version = "=0.15.0", default-features = false, features = ["batch"] }
 aw-platform = { path = "../aw-platform", version = "=0.15.0" }
-thiserror = { workspace = true }
-tokio = { version = "=1.48.0", features = ["rt", "macros", "process", "io-util", "time", "sync", "signal"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "time", "sync", "signal"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
