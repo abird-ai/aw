@@ -1594,116 +1594,47 @@ impl SessionStore {
             &branch.id,
             &participant_user,
         )?;
-        let owner: String = db(tx.query_row(
-            "SELECT owner_handle FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+        let (owner_kind, owner_handle): (String, String) = db(tx.query_row(
+            "SELECT owner_kind,owner_handle FROM agent_state_current
+             WHERE session_id=?1 AND branch_id=?2",
             params![session, branch.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         ))?;
-        if participant_user == owner {
+        if owner_kind == "user" && participant_user == owner_handle {
             return Err(Error::Denied("Agent owner access is implicit"));
         }
-        let current: Option<(i64, i64, i64, i64, i64, i64, i64, u64)> = db(tx
-            .query_row(
-                "SELECT can_view,can_contribute,can_submit,can_control,can_derive,can_share,
-                        can_manage,grant_rev
-                 FROM agent_acl_current
-                 WHERE session_id=?1 AND branch_id=?2
-                   AND principal_kind='user' AND principal_handle=?3",
-                params![session, branch.id, participant_user],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .optional())?;
-        if current.as_ref().is_some_and(|row| row.4 != 0 || row.5 != 0) {
-            return Err(Error::Conflict(
-                "compatibility access cannot rewrite derive/share grants",
-            ));
-        }
-        let before = current
-            .as_ref()
-            .map_or(SessionParticipationPermissions::default(), |row| {
-                SessionParticipationPermissions {
-                    view: row.0 != 0,
-                    contribute: row.1 != 0,
-                    submit: row.2 != 0,
-                    control: row.3 != 0,
-                    manage: row.6 != 0,
-                }
-            });
-        if before == permissions {
-            db(tx.commit())?;
-            return Ok(expected_rev);
-        }
+        let (before, _) =
+            agent_owner::collaboration_acl_permissions(&tx, agent, "user", &participant_user)?;
         if !before.view && permissions.view {
             context::authorize_dependencies_for_grant(&tx, session, participant)?;
         }
-        let next_grant = current
-            .as_ref()
-            .map_or(1, |row| row.7.checked_add(1).unwrap_or(0));
-        if next_grant == 0 {
-            return Err(Error::Limit("Agent access grant revision exhausted"));
-        }
-        if permissions.is_empty() {
-            db(tx.execute(
-                "DELETE FROM agent_acl_current
-                 WHERE session_id=?1 AND branch_id=?2
-                   AND principal_kind='user' AND principal_handle=?3",
-                params![session, branch.id, participant_user],
-            ))?;
-        } else {
-            let manager = user_for_principal(&tx, requestor)?
-                .ok_or(Error::Denied("Agent manager identity is inactive"))?;
-            db(tx.execute(
-                "INSERT INTO agent_acl_current(
-                     session_id,branch_id,principal_kind,principal_handle,
-                     can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
-                     grant_rev,granted_by_handle,updated_at
-                 ) VALUES(?1,?2,'user',?3,?4,?5,?6,?7,0,0,?8,?9,?10,?11)
-                 ON CONFLICT(session_id,branch_id,principal_kind,principal_handle) DO UPDATE SET
-                     can_view=excluded.can_view,can_contribute=excluded.can_contribute,
-                     can_submit=excluded.can_submit,can_control=excluded.can_control,
-                     can_derive=0,can_share=0,can_manage=excluded.can_manage,
-                     grant_rev=excluded.grant_rev,granted_by_handle=excluded.granted_by_handle,
-                     updated_at=excluded.updated_at",
-                params![
-                    session,
-                    branch.id,
-                    participant_user,
-                    i64::from(permissions.view),
-                    i64::from(permissions.contribute),
-                    i64::from(permissions.submit),
-                    i64::from(permissions.control),
-                    i64::from(permissions.manage),
-                    next_grant,
-                    manager,
-                    now(),
-                ],
-            ))?;
-        }
-        let next = agent_owner::changed_acl(&tx, agent, expected_rev)?;
-        audit(
+        let manager = user_for_principal(&tx, requestor)?
+            .ok_or(Error::Denied("Agent manager identity is inactive"))?;
+        let (next, grant_rev, changed) = agent_owner::set_collaboration_acl(
             &tx,
-            session,
-            requestor,
-            "agent.access.changed",
-            serde_json::json!({
-                "branch_id":branch.id,
-                "participant":participant.as_str(),
-                "permissions":permissions,
-                "grant_rev":next_grant,
-                "rev":next,
-            }),
+            agent,
+            "user",
+            &participant_user,
+            permissions,
+            &manager,
+            expected_rev,
         )?;
+        if changed {
+            audit(
+                &tx,
+                session,
+                requestor,
+                "agent.access.changed",
+                serde_json::json!({
+                    "branch_id":branch.id,
+                    "principal_kind":"user",
+                    "principal_handle":participant_user,
+                    "permissions":permissions,
+                    "grant_rev":grant_rev,
+                    "rev":next,
+                }),
+            )?;
+        }
         db(tx.commit())?;
         Ok(next)
     }

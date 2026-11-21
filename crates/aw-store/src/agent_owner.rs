@@ -5,10 +5,20 @@
 //! and compatibility evidence but never defines Agent revision/lifecycle/lineage.
 
 use crate::{
-    db, now, session_participation::SessionParticipationAction, user_for_principal, Error,
-    PrincipalId, Result,
+    db, now,
+    session_participation::{SessionParticipationAction, SessionParticipationPermissions},
+    user_for_principal, Error, PrincipalId, Result,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest as _, Sha256};
+
+const MAX_ACCESS_DEPENDENCIES: usize = 512;
+const VIEW: u8 = 1 << 0;
+const CONTRIBUTE: u8 = 1 << 1;
+const SUBMIT: u8 = 1 << 2;
+const CONTROL: u8 = 1 << 3;
+const MANAGE: u8 = 1 << 4;
+const ALL_COMPAT_PERMISSIONS: u8 = VIEW | CONTRIBUTE | SUBMIT | CONTROL | MANAGE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AgentKey<'a> {
@@ -28,6 +38,24 @@ pub struct AgentAccessEvidence {
     pub grant_revision: u64,
     pub acl_revision: u64,
     pub owner: bool,
+    pub access_generation: [u8; 32],
+}
+
+#[inline]
+fn access_action_bit(action: SessionParticipationAction) -> u8 {
+    match action {
+        SessionParticipationAction::View => VIEW,
+        SessionParticipationAction::Contribute => CONTRIBUTE,
+        SessionParticipationAction::Submit => SUBMIT,
+        SessionParticipationAction::Control => CONTROL,
+        SessionParticipationAction::Manage => MANAGE,
+    }
+}
+
+#[inline]
+fn hash_part(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }
 
 fn validate(agent: AgentKey<'_>) -> Result<()> {
@@ -373,60 +401,164 @@ pub(crate) fn authorize_access(
     validate(agent)?;
     let user = user_for_principal(connection, actor)?
         .ok_or(Error::Denied("Agent principal is inactive or unknown"))?;
-    let (owner, acl_revision): (String, u64) = db(connection.query_row(
-        "SELECT owner_handle,acl_rev FROM agent_state_current
-         WHERE session_id=?1 AND branch_id=?2",
-        params![agent.session, agent.branch],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+    let user_security_epoch: u64 = db(connection.query_row(
+        "SELECT security_epoch FROM users WHERE user_id=?1 AND status='active'",
+        [&user],
+        |row| row.get(0),
     ))?;
-    if user == owner {
-        let security_epoch: u64 = db(connection.query_row(
-            "SELECT security_epoch FROM users WHERE user_id=?1 AND status='active'",
-            [&user],
-            |row| row.get(0),
+    let (domain, owner_kind, owner_handle, acl_revision): (String, String, String, u64) =
+        db(connection.query_row(
+            "SELECT domain_handle,owner_kind,owner_handle,acl_rev
+             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+            params![agent.session, agent.branch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ))?;
+
+    let mut hash = Sha256::new();
+    hash.update(b"aw-agent-access-generation-v1\0");
+    for part in [
+        domain.as_bytes(),
+        agent.session.as_bytes(),
+        agent.branch.as_bytes(),
+        user.as_bytes(),
+        owner_kind.as_bytes(),
+        owner_handle.as_bytes(),
+    ] {
+        hash_part(&mut hash, part);
+    }
+    hash.update(user_security_epoch.to_be_bytes());
+    hash.update(acl_revision.to_be_bytes());
+
+    if owner_kind == "user" && owner_handle == user {
+        hash.update(b"owner:user\0");
+        hash.update([ALL_COMPAT_PERMISSIONS]);
         return Ok(AgentAccessEvidence {
-            grant_revision: security_epoch,
+            grant_revision: user_security_epoch,
             acl_revision,
             owner: true,
+            access_generation: hash.finalize().into(),
         });
     }
-    let row: Option<(i64, i64, i64, i64, i64, u64)> = db(connection
-        .query_row(
-            "SELECT can_view,can_contribute,can_submit,can_control,can_manage,grant_rev
-             FROM agent_acl_current
-             WHERE session_id=?1 AND branch_id=?2
-               AND principal_kind='user' AND principal_handle=?3",
-            params![agent.session, agent.branch, user],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )
-        .optional())?;
-    let Some((view, contribute, submit, control, manage, grant_revision)) = row else {
-        return Err(Error::Denied("Agent access is not granted"));
-    };
-    let allowed = match action {
-        SessionParticipationAction::View => view != 0,
-        SessionParticipationAction::Contribute => contribute != 0,
-        SessionParticipationAction::Submit => submit != 0,
-        SessionParticipationAction::Control => control != 0,
-        SessionParticipationAction::Manage => manage != 0,
-    };
-    if !allowed {
+
+    if owner_kind == "group" {
+        let group_revision: Option<u64> = db(connection
+            .query_row(
+                "SELECT g.rev
+                 FROM principal_groups g
+                 JOIN domain_principals p
+                   ON p.domain_id=g.domain_id AND p.principal_handle=g.principal_handle
+                 JOIN principal_group_members m
+                   ON m.domain_id=g.domain_id AND m.group_handle=g.principal_handle
+                 WHERE g.domain_id=?1 AND g.principal_handle=?2
+                   AND g.deleted_at IS NULL AND p.kind='group' AND p.status='active'
+                   AND m.member_handle=?3 AND m.state='active'",
+                params![domain, owner_handle, user],
+                |row| row.get(0),
+            )
+            .optional())?;
+        if let Some(group_revision) = group_revision {
+            hash.update(b"owner:group\0");
+            hash_part(&mut hash, owner_handle.as_bytes());
+            hash.update(group_revision.to_be_bytes());
+            hash.update([ALL_COMPAT_PERMISSIONS]);
+            return Ok(AgentAccessEvidence {
+                grant_revision: user_security_epoch.max(group_revision),
+                acl_revision,
+                owner: true,
+                access_generation: hash.finalize().into(),
+            });
+        }
+    }
+
+    let mut query = db(connection.prepare(
+        "SELECT x.principal_kind,x.principal_handle,
+                x.can_view,x.can_contribute,x.can_submit,x.can_control,x.can_manage,x.grant_rev,
+                CASE WHEN x.principal_kind='group' THEN g.rev ELSE NULL END
+         FROM agent_acl_current x
+         JOIN domain_principals p
+           ON p.domain_id=?1 AND p.principal_handle=x.principal_handle AND p.status='active'
+         LEFT JOIN principal_group_members m
+           ON x.principal_kind='group' AND m.domain_id=?1
+          AND m.group_handle=x.principal_handle AND m.member_handle=?2 AND m.state='active'
+         LEFT JOIN principal_groups g
+           ON g.domain_id=m.domain_id AND g.principal_handle=m.group_handle
+          AND g.deleted_at IS NULL
+         WHERE x.session_id=?3 AND x.branch_id=?4
+           AND (
+             (x.principal_kind='user' AND p.kind='user' AND p.user_id=?2
+              AND x.principal_handle=?2)
+             OR
+             (x.principal_kind='group' AND p.kind='group'
+              AND m.member_handle IS NOT NULL AND g.rev IS NOT NULL)
+           )
+         ORDER BY x.principal_kind,x.principal_handle
+         LIMIT ?5",
+    ))?;
+    let mut rows = db(query.query(params![
+        domain,
+        user,
+        agent.session,
+        agent.branch,
+        (MAX_ACCESS_DEPENDENCIES + 1) as i64
+    ]))?;
+    let mut permissions = 0u8;
+    let mut dependency_revision = user_security_epoch;
+    let mut dependencies = 0usize;
+    while let Some(row) = db(rows.next())? {
+        dependencies += 1;
+        if dependencies > MAX_ACCESS_DEPENDENCIES {
+            return Err(Error::Limit("Agent access dependency bound exceeded"));
+        }
+        let kind: String = row
+            .get(0)
+            .map_err(|_| Error::Storage("invalid Agent ACL kind"))?;
+        let handle: String = row
+            .get(1)
+            .map_err(|_| Error::Storage("invalid Agent ACL principal"))?;
+        let permission = |column, bit| -> Result<u8> {
+            Ok(
+                if row
+                    .get::<_, i64>(column)
+                    .map_err(|_| Error::Storage("invalid Agent ACL"))?
+                    != 0
+                {
+                    bit
+                } else {
+                    0
+                },
+            )
+        };
+        let mask = permission(2, VIEW)?
+            | permission(3, CONTRIBUTE)?
+            | permission(4, SUBMIT)?
+            | permission(5, CONTROL)?
+            | permission(6, MANAGE)?;
+        let grant_revision: u64 = row
+            .get(7)
+            .map_err(|_| Error::Storage("invalid Agent ACL revision"))?;
+        let group_revision: Option<u64> = row
+            .get(8)
+            .map_err(|_| Error::Storage("invalid group revision"))?;
+        permissions |= mask;
+        dependency_revision = dependency_revision.max(grant_revision);
+        if let Some(group_revision) = group_revision {
+            dependency_revision = dependency_revision.max(group_revision);
+        }
+        hash_part(&mut hash, kind.as_bytes());
+        hash_part(&mut hash, handle.as_bytes());
+        hash.update([mask]);
+        hash.update(grant_revision.to_be_bytes());
+        hash.update(group_revision.unwrap_or(0).to_be_bytes());
+    }
+    if permissions & access_action_bit(action) == 0 {
         return Err(Error::Denied("Agent access action is not granted"));
     }
+    hash.update([permissions]);
     Ok(AgentAccessEvidence {
-        grant_revision,
+        grant_revision: dependency_revision,
         acl_revision,
         owner: false,
+        access_generation: hash.finalize().into(),
     })
 }
 
@@ -466,6 +598,131 @@ pub(crate) fn changed_acl(
     expected_rev
         .checked_add(1)
         .ok_or(Error::Limit("Agent revision exhausted"))
+}
+
+pub(crate) fn collaboration_acl_permissions(
+    connection: &Connection,
+    agent: AgentKey<'_>,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<(SessionParticipationPermissions, Option<u64>)> {
+    validate(agent)?;
+    if !matches!(principal_kind, "user" | "group") {
+        return Err(Error::Denied("invalid Agent ACL principal kind"));
+    }
+    let current: Option<(i64, i64, i64, i64, i64, i64, i64, u64)> = db(connection
+        .query_row(
+            "SELECT can_view,can_contribute,can_submit,can_control,can_derive,can_share,
+                    can_manage,grant_rev
+             FROM agent_acl_current
+             WHERE session_id=?1 AND branch_id=?2
+               AND principal_kind=?3 AND principal_handle=?4",
+            params![
+                agent.session,
+                agent.branch,
+                principal_kind,
+                principal_handle
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional())?;
+    if current.as_ref().is_some_and(|row| row.4 != 0 || row.5 != 0) {
+        return Err(Error::Conflict(
+            "compatibility access cannot rewrite derive/share grants",
+        ));
+    }
+    Ok(
+        current.map_or((SessionParticipationPermissions::default(), None), |row| {
+            (
+                SessionParticipationPermissions {
+                    view: row.0 != 0,
+                    contribute: row.1 != 0,
+                    submit: row.2 != 0,
+                    control: row.3 != 0,
+                    manage: row.6 != 0,
+                },
+                Some(row.7),
+            )
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_collaboration_acl(
+    connection: &Connection,
+    agent: AgentKey<'_>,
+    principal_kind: &str,
+    principal_handle: &str,
+    permissions: SessionParticipationPermissions,
+    granted_by_handle: &str,
+    expected_rev: u64,
+) -> Result<(u64, u64, bool)> {
+    let permissions = permissions.validate()?;
+    if revision(connection, agent)? != expected_rev {
+        return Err(Error::Conflict("stale Agent revision"));
+    }
+    let (before, current_grant) =
+        collaboration_acl_permissions(connection, agent, principal_kind, principal_handle)?;
+    if before == permissions {
+        return Ok((expected_rev, current_grant.unwrap_or(1), false));
+    }
+    let next_grant = current_grant
+        .map_or(Some(1), |revision| revision.checked_add(1))
+        .ok_or(Error::Limit("Agent access grant revision exhausted"))?;
+    if permissions.is_empty() {
+        db(connection.execute(
+            "DELETE FROM agent_acl_current
+             WHERE session_id=?1 AND branch_id=?2
+               AND principal_kind=?3 AND principal_handle=?4",
+            params![
+                agent.session,
+                agent.branch,
+                principal_kind,
+                principal_handle
+            ],
+        ))?;
+    } else {
+        db(connection.execute(
+            "INSERT INTO agent_acl_current(
+                 session_id,branch_id,principal_kind,principal_handle,
+                 can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
+                 grant_rev,granted_by_handle,updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,?9,?10,?11,?12)
+             ON CONFLICT(session_id,branch_id,principal_kind,principal_handle) DO UPDATE SET
+                 can_view=excluded.can_view,can_contribute=excluded.can_contribute,
+                 can_submit=excluded.can_submit,can_control=excluded.can_control,
+                 can_derive=0,can_share=0,can_manage=excluded.can_manage,
+                 grant_rev=excluded.grant_rev,granted_by_handle=excluded.granted_by_handle,
+                 updated_at=excluded.updated_at",
+            params![
+                agent.session,
+                agent.branch,
+                principal_kind,
+                principal_handle,
+                i64::from(permissions.view),
+                i64::from(permissions.contribute),
+                i64::from(permissions.submit),
+                i64::from(permissions.control),
+                i64::from(permissions.manage),
+                next_grant,
+                granted_by_handle,
+                now(),
+            ],
+        ))?;
+    }
+    let next = changed_acl(connection, agent, expected_rev)?;
+    Ok((next, next_grant, true))
 }
 
 pub(crate) fn lifecycle(connection: &Connection, agent: AgentKey<'_>) -> Result<(String, String)> {

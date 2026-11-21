@@ -74,12 +74,19 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       backfill from Domain/Agent/ACL ownership, membership-insert registration, lazy authenticated
       user registration for group/direct grants, simple owner-managed non-nested groups with bounded
       complete-set replacement + monotonic rev, tombstone/no-handle-reuse deletion and no Agent-rev
-      fanout. Populated v38->v39 backfill and grouped lifecycle tests are green. Next: compose group
-      ownership/grants into Agent ACL effective authorization and derive opaque `access_generation`
-      from Agent `acl_rev` + exact group rev + relevant security epochs without Agent mutation
-      fanout. Then: full seven-permission access with derive/share; HistorySpan/Base/Grant +
-      DisclosureManifest/provenance/lazy sealing; minimal snapshots; rebuild Agent exposure from the
-      new owner. Add cursor/projection-head helpers only when one real consumer requires them.
+      fanout. Populated v38->v39 backfill and grouped lifecycle tests are green. **Group-aware Agent
+      access landed:** one bounded owner/direct-user/group-union authorization path, group-owner
+      membership support, shared direct/group compatibility ACL mutation primitive, and 32-byte
+      `access_generation` derived from Agent acl_rev + actor security epoch + exact grant/group
+      revisions + effective permissions. History cursors and wake v3 authority digests bind to it;
+      wake mint->persist revalidates the full generation without a new durable column; mixed exposure
+      candidate filtering is group-aware before authoritative recheck. End-to-end group removal/re-add
+      proves wake/history fencing with unchanged Agent rev. New group audience expansion is
+      intentionally fresh/quiescent-branch-only until HistoryGrant/share closure lands. Next: full
+      seven-permission `agent.access.*` + owner/config semantics with derive/share and HistorySpan/
+      Base/Grant + DisclosureManifest/provenance; then lazy sealing, minimal snapshots and rebuild
+      Agent exposure from owner state. Add cursor/projection-head helpers only when one real consumer
+      requires them.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

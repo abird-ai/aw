@@ -136,6 +136,7 @@ struct WakeAdmission {
     membership_epoch: u64,
     audience_epoch: u64,
     owner: bool,
+    access_generation: [u8; 32],
     authority: WakeAuthority,
 }
 
@@ -574,7 +575,7 @@ impl Router {
             aw_store::SessionParticipationAction::View,
         )?;
         let mut hash = Sha256::new();
-        hash.update(b"aw-agent-history-disclosure-v1\0");
+        hash.update(b"aw-agent-history-disclosure-v2\0");
         for part in [
             viewer.as_str().as_bytes(),
             binding.session_id.as_bytes(),
@@ -583,9 +584,7 @@ impl Router {
             hash.update((part.len() as u64).to_be_bytes());
             hash.update(part);
         }
-        hash.update(access.grant_revision.to_be_bytes());
-        hash.update(access.acl_revision.to_be_bytes());
-        hash.update([u8::from(access.owner)]);
+        hash.update(access.access_generation);
         Ok(hash.finalize().into())
     }
 
@@ -1129,14 +1128,12 @@ impl Router {
         recipient_ref: &str,
         actor: &PrincipalId,
         session_id: &str,
-        membership_epoch: u64,
-        audience_epoch: u64,
-        owner: bool,
+        access: &aw_store::AgentAccessEvidence,
         authority: &WakeAuthority,
     ) -> String {
         let source = authority.source();
         let mut hash = Sha256::new();
-        hash.update(b"aw-agent-wake-recipient-admission-v2\0");
+        hash.update(b"aw-agent-wake-recipient-admission-v3\0");
         for part in [
             recipient_ref.as_bytes(),
             actor.as_str().as_bytes(),
@@ -1149,9 +1146,10 @@ impl Router {
             hash.update((part.len() as u64).to_be_bytes());
             hash.update(part);
         }
-        hash.update(membership_epoch.to_be_bytes());
-        hash.update(audience_epoch.to_be_bytes());
-        hash.update([u8::from(owner)]);
+        hash.update(access.grant_revision.to_be_bytes());
+        hash.update(access.acl_revision.to_be_bytes());
+        hash.update([u8::from(access.owner)]);
+        hash.update(access.access_generation);
         hash.update(authority.registry_revision().to_be_bytes());
         hash.update(authority.authority_revision().to_be_bytes());
         hash.update(source.epoch.to_be_bytes());
@@ -1215,9 +1213,7 @@ impl Router {
             &canonical,
             &ctx.actor,
             execution.session_id(),
-            access.grant_revision,
-            access.acl_revision,
-            access.owner,
+            &access,
             &authority,
         );
         let admission = WakeAdmission {
@@ -1226,6 +1222,7 @@ impl Router {
             membership_epoch: access.grant_revision,
             audience_epoch: access.acl_revision,
             owner: access.owner,
+            access_generation: access.access_generation,
             authority,
         };
         let source = admission.authority.source();
@@ -1238,6 +1235,7 @@ impl Router {
                 membership_epoch: access.grant_revision,
                 audience_epoch: access.acl_revision,
                 owner: access.owner,
+                access_generation: access.access_generation,
                 tool_name: admission.authority.name().to_owned(),
                 source_kind: source.kind_label().to_owned(),
                 source_id: source.id.clone(),
@@ -1303,6 +1301,7 @@ impl Router {
             if access.grant_revision != receipt.membership_epoch
                 || access.acl_revision != receipt.audience_epoch
                 || access.owner != receipt.owner
+                || access.access_generation != receipt.access_generation
             {
                 return Err(Error::Denied(
                     "wake participant membership/audience changed after registration",
@@ -1349,9 +1348,7 @@ impl Router {
                 &receipt.recipient_ref,
                 &actor,
                 &receipt.session_id,
-                receipt.membership_epoch,
-                receipt.audience_epoch,
-                receipt.owner,
+                &access,
                 &authority,
             );
             if expected_ref != recipient.authority_ref {
@@ -1365,6 +1362,7 @@ impl Router {
                 membership_epoch: receipt.membership_epoch,
                 audience_epoch: receipt.audience_epoch,
                 owner: receipt.owner,
+                access_generation: access.access_generation,
                 authority,
             };
             let mut admissions = self
@@ -1391,6 +1389,7 @@ impl Router {
         if access.grant_revision != admission.membership_epoch
             || access.acl_revision != admission.audience_epoch
             || access.owner != admission.owner
+            || access.access_generation != admission.access_generation
         {
             return Err(Error::Denied(
                 "wake participant membership/audience changed after registration",
@@ -2176,7 +2175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_shared_participant_cannot_receive_committed_wake_or_reuse_history_cursor() {
+    async fn group_membership_change_fences_wake_and_history_without_agent_rev_fanout() {
         use aw_tools::job_event::{
             EventRule, EventRuleSet, JobEventKind, JobWakeMode, SourceEventBook,
         };
@@ -2185,6 +2184,33 @@ mod tests {
         let bob = PrincipalId::new("internal:fixture:e9-bob").unwrap();
         let store = SessionStore::in_memory().unwrap();
         let (session, branch) = store.create(&alice, "E9 shared Agent", binding()).unwrap();
+        let domain = store.default_domain(&alice).unwrap();
+        let group = store
+            .create_principal_group(
+                &alice,
+                Some(&domain.id),
+                "E9 reviewers",
+                std::slice::from_ref(&bob),
+            )
+            .unwrap();
+        let initial_rev = store
+            .agent_public_revision(&alice, &session.id, &branch.id)
+            .unwrap();
+        let group_grant_rev = store
+            .set_agent_group_collaboration_access(
+                &alice,
+                &session.id,
+                &branch.id,
+                &group.principal_handle,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    control: true,
+                    ..Default::default()
+                },
+                initial_rev,
+            )
+            .unwrap();
+        assert!(group_grant_rev > initial_rev);
         let (view, handle) = store.activate(&alice, &session.id, &branch.id).unwrap();
         let mut agent = Agent::builder(
             Arc::new(HistoryProvider),
@@ -2230,22 +2256,6 @@ mod tests {
         agent.register_host_tool(Arc::new(SubscribeTool)).unwrap();
         agent
             .permit_registered_host_tool(bob.clone(), "jobs_subscribe")
-            .unwrap();
-        let access_revision = store
-            .set_agent_collaboration_access(
-                &alice,
-                &session.id,
-                &branch.id,
-                &bob,
-                aw_store::SessionParticipationPermissions {
-                    view: true,
-                    control: true,
-                    ..Default::default()
-                },
-                store
-                    .agent_public_revision(&alice, &session.id, &branch.id)
-                    .unwrap(),
-            )
             .unwrap();
 
         let owner = crate::actor_owner::Service::attach_for_agent(
@@ -2329,16 +2339,27 @@ mod tests {
         assert_eq!(delivery.event_rev, 1);
         assert_eq!(delivery.subscription_generation, update.generation);
 
-        let revoked_revision = store
-            .set_agent_collaboration_access(
+        let agent_rev_before_membership = store
+            .agent_public_revision(&alice, &session.id, &branch.id)
+            .unwrap();
+        let removed = store
+            .edit_principal_group(
                 &alice,
-                &session.id,
-                &branch.id,
-                &bob,
-                aw_store::SessionParticipationPermissions::default(),
-                access_revision,
+                Some(&domain.id),
+                &group.principal_handle,
+                None,
+                Some(&[]),
+                group.rev,
             )
             .unwrap();
+        assert_eq!(removed.rev, group.rev + 1);
+        assert_eq!(
+            store
+                .agent_public_revision(&alice, &session.id, &branch.id)
+                .unwrap(),
+            agent_rev_before_membership,
+            "group membership change cannot fan out Agent revision"
+        );
 
         assert!(
             router.admit_event(delivery.clone()).await.is_err(),
@@ -2370,24 +2391,27 @@ mod tests {
             "revoked participant cannot disclose transcript history"
         );
 
-        let regrant_revision = store
-            .set_agent_collaboration_access(
+        let readded = store
+            .edit_principal_group(
                 &alice,
-                &session.id,
-                &branch.id,
-                &bob,
-                aw_store::SessionParticipationPermissions {
-                    view: true,
-                    control: true,
-                    ..Default::default()
-                },
-                revoked_revision,
+                Some(&domain.id),
+                &group.principal_handle,
+                None,
+                Some(std::slice::from_ref(&bob)),
+                removed.rev,
             )
             .unwrap();
-        assert!(regrant_revision > revoked_revision);
+        assert_eq!(readded.rev, removed.rev + 1);
+        assert_eq!(
+            store
+                .agent_public_revision(&alice, &session.id, &branch.id)
+                .unwrap(),
+            agent_rev_before_membership,
+            "group re-add cannot manufacture an Agent revision"
+        );
         assert!(
             router.admit_event(delivery.clone()).await.is_err(),
-            "re-grant must not revive an old wake admission generation"
+            "group re-add must not revive an old wake admission generation"
         );
         assert!(
             router
@@ -2404,7 +2428,7 @@ mod tests {
                 )
                 .await
                 .is_err(),
-            "re-grant must not revive a pre-revocation transcript cursor"
+            "group re-add must not revive a pre-removal transcript cursor"
         );
         assert_eq!(
             delivery.event_rev, 1,

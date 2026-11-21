@@ -498,11 +498,38 @@ fn visible_projection_page(
                AND ?7 IS NOT NULL
                AND (
                     (a.owner_kind='user' AND a.owner_handle=?7)
+                    OR (a.owner_kind='group' AND EXISTS(
+                        SELECT 1
+                        FROM principal_group_members m
+                        JOIN principal_groups g
+                          ON g.domain_id=m.domain_id AND g.principal_handle=m.group_handle
+                         AND g.deleted_at IS NULL
+                        JOIN domain_principals dp
+                          ON dp.domain_id=m.domain_id AND dp.principal_handle=m.group_handle
+                         AND dp.kind='group' AND dp.status='active'
+                        WHERE m.domain_id=a.domain_handle AND m.group_handle=a.owner_handle
+                          AND m.member_handle=?7 AND m.state='active'
+                    ))
                     OR EXISTS(
                         SELECT 1 FROM agent_acl_current p
                         WHERE p.session_id=e.session_id AND p.branch_id=e.branch_id
                           AND p.principal_kind='user' AND p.principal_handle=?7
                           AND p.can_view=1
+                    )
+                    OR EXISTS(
+                        SELECT 1
+                        FROM agent_acl_current p
+                        JOIN principal_group_members m
+                          ON m.domain_id=a.domain_handle AND m.group_handle=p.principal_handle
+                         AND m.member_handle=?7 AND m.state='active'
+                        JOIN principal_groups g
+                          ON g.domain_id=m.domain_id AND g.principal_handle=m.group_handle
+                         AND g.deleted_at IS NULL
+                        JOIN domain_principals dp
+                          ON dp.domain_id=m.domain_id AND dp.principal_handle=m.group_handle
+                         AND dp.kind='group' AND dp.status='active'
+                        WHERE p.session_id=e.session_id AND p.branch_id=e.branch_id
+                          AND p.principal_kind='group' AND p.can_view=1
                     )
                )
              ORDER BY e.position DESC,e.canonical_ref

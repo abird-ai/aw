@@ -91,19 +91,46 @@ handles are never reused. Group create/edit/delete publish immutable principal f
 changes deliberately do **not** fan out Agent writes or revisions. The minimal `domain_principal(s)`
 snapshot exposes principal kind/status/display identity without leaking a group roster.
 
-Phase 1 is still **underway**, not complete. Next owner slice is composing v39 groups into Agent ACL
-authorization plus opaque derived `access_generation` (Agent `acl_rev` + exact group rev + relevant
-user/security epochs) while preserving no Agent-rev fanout on membership edits. After that remain the
-full seven-permission `agent.access.*` surface including reviewed `derive/share`; HistorySpan/Base/
-Grant + scalable DisclosureManifest/provenance and lazy sealing; minimal authoritative snapshots;
+Group-aware Agent access is now live on top of v39 without another schema migration. One bounded
+`agent_owner::authorize_access` path computes effective five-permission compatibility authority as
+owner rights UNION direct user grant UNION every active matching group grant. Group-owned Agents are
+recognized through exact active membership as well. The hot authorization query streams at most 512
+ordered ACL dependencies rather than building a heap-side grant map.
+
+Every successful authorization returns one opaque 32-byte `access_generation` derived from the exact
+Agent + actor, Agent `acl_rev`, active user security epoch, owner kind/handle, direct/group grant
+revisions, exact group handles/revs and the effective permission mask. It is an observation/security
+fence, never an Agent mutation fence. Group membership/name edits advance only group rev; they do
+**not** advance Agent rev/acl_rev. Removing membership denies immediately; re-adding creates a new
+access generation even though the Agent revision remains unchanged.
+
+Agent history cursors now bind to that generation. Wake-recipient authority moved to digest domain
+v3 and commits the same generation; the in-memory mint receipt carries the full generation through
+the mint->persist boundary so the Store revalidates against a membership/security race, while the
+durable row needs no new column because `authority_ref` already cryptographically commits to it.
+Reload recomputes current authority and the v3 digest; older/stale receipt identities fail closed.
+Mixed Agent/finite-Job candidate SQL now recognizes group-owned/group-granted users before the same
+row-level authoritative access recheck.
+
+Direct-user and group compatibility ACL writes share one exact `agent_owner` mutation primitive, so
+`acl_rev + rev`, grant revisions and idempotence cannot drift. The group bridge deliberately permits
+a **new** group audience only on a fresh, quiescent branch; adding a group to existing history fails
+until the reviewed HistoryGrant/share closure exists. Once a group identity is safely granted, later
+membership follows that principal identity as sealed by the spec.
+
+Phase 1 is still **underway**, not complete. Next owner work is the full seven-permission
+`agent.access.*` surface with `derive/share` and ownership/config mutation semantics together with
+HistorySpan/Base/Grant + scalable DisclosureManifest/provenance; that removes the temporary
+fresh-branch group expansion restriction. Then remain lazy sealing, minimal authoritative snapshots,
 and rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/projection-head
 helpers only when one of those real consumers needs them; do not prebuild Phase-2/4 engines.
 
-Current focused evidence: populated **v37 -> v38** Agent-owner seed regression green; populated
-**v38 -> v39** user-principal backfill green; group create/edit/delete + principal metadata + no
-Agent-rev fanout green; root/fork owner separation, direct Agent ACL revoke/regrant, mixed exposure,
-coordination **24/24**, stable lifecycle/control and jobs_get wake remain green from prior checkpoints.
-Strict v39 `aw-store` all-target/all-feature Clippy, fmt and diff checks are green.
+Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
+backfill are green; group create/edit/delete remains green; the reused end-to-end AgentJobs test now
+proves group membership removal/re-add fences durable wake + history cursor authority while Agent rev
+stays unchanged; mixed exposure remains green. Coordination **24/24**, stable lifecycle/control and
+jobs_get wake remain green from prior checkpoints. Strict all-target/all-feature `aw-store` +
+`aw-cli` Clippy, fmt and diff checks are green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

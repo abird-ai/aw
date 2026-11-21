@@ -24,6 +24,10 @@ pub struct AgentJobWakeAdmission {
     pub membership_epoch: u64,
     pub audience_epoch: u64,
     pub owner: bool,
+    /// Current opaque Agent-access dependency generation. It is verified at
+    /// mint->persist time but need not be duplicated in the durable row because
+    /// authority_ref cryptographically commits to it.
+    pub access_generation: [u8; 32],
     pub tool_name: String,
     pub source_kind: String,
     pub source_id: String,
@@ -53,6 +57,7 @@ impl AgentJobWakeAdmission {
             || !bounded(&self.execution_site, 256)
             || self.membership_epoch == 0
             || self.audience_epoch == 0
+            || self.access_generation == [0; 32]
             || self.source_epoch == 0
             || self.authority_revision == 0
             || self.visible != self.registry_revision.is_some()
@@ -332,6 +337,7 @@ impl SessionStore {
         if access.grant_revision != receipt.membership_epoch
             || access.acl_revision != receipt.audience_epoch
             || access.owner != receipt.owner
+            || access.access_generation != receipt.access_generation
         {
             return Err(Error::Denied(
                 "Agent Job wake admission access changed before persistence",
@@ -395,7 +401,7 @@ impl SessionStore {
             return Err(Error::Denied("invalid Agent Job wake admission identity"));
         }
         let connection = self.connection()?;
-        let receipt = db(connection
+        let mut receipt = db(connection
             .query_row(
                 "SELECT recipient_ref,actor,authority_ref,session_id,membership_epoch,
                         audience_epoch,is_owner,tool_name,source_kind,source_id,source_epoch,
@@ -411,6 +417,7 @@ impl SessionStore {
                         membership_epoch: row.get(4)?,
                         audience_epoch: row.get(5)?,
                         owner: row.get::<_, i64>(6)? != 0,
+                        access_generation: [0; 32],
                         tool_name: row.get(7)?,
                         source_kind: row.get(8)?,
                         source_id: row.get(9)?,
@@ -424,7 +431,16 @@ impl SessionStore {
                 },
             )
             .optional())?;
-        if let Some(receipt) = &receipt {
+        if let Some(receipt) = &mut receipt {
+            let actor = PrincipalId::new(receipt.actor.clone())?;
+            let (session, branch) = agent_owner::key_for_ref(&connection, &receipt.recipient_ref)?;
+            let access = agent_owner::authorize_access(
+                &connection,
+                &actor,
+                agent_owner::AgentKey::new(&session, &branch),
+                SessionParticipationAction::Control,
+            )?;
+            receipt.access_generation = access.access_generation;
             receipt.validate()?;
         }
         Ok(receipt)
