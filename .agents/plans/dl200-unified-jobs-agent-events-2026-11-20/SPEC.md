@@ -1,8 +1,9 @@
 # DL-200 — unified Jobs, Agents, Events, History and Checkpoints
 
 Author: Prasanna Loganathar
-Date: 2026-11-20
-Status: **SEALED / IMPLEMENTATION PLAN READY — NOT PROMOTED**
+Opened: 2026-11-20
+Design revision: **R6 — architectural simplification, SEALED 2026-11-21**
+Status: **R6 SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS**
 
 ## 0. Relationship to DL-150
 
@@ -21,6 +22,232 @@ that surface. Everything else remains inherited.
 
 DL-150 remains an immutable historical design anchor; DL-200 is a separate specification
 so the evolution is reviewable and does not retroactively rewrite prior decisions.
+
+### 0.1 One truth source, one mutation boundary
+
+The architectural law is precise rather than metaphorical:
+
+> **One authoritative source for each semantic truth. Mutable truth has one Owner and one
+> linearization point; immutable truth has one stable Fact identity; an uncertain external
+> effect has one Operation custody. Everything derived is a Projection/Cursor/adapter, never
+> competing truth.**
+
+**Global identity; authoritative-store-local consistency.** Canonical Domain/Principal/
+Project/Agent/Turn/Job/Node/Sandbox refs may identify resources across the fleet. A ref
+does not imply a global transaction, ordered cursor, revision clock or execution scheduler.
+
+Within one authoritative store, an owner serializes and publishes its own mutations.
+Atomic admission, Store positions, contiguous projection coverage, cursor high-waters and
+ordered Event delivery are store-local. In v1, cross-store atomic mutation, ordered
+`jobs_list(tree)`, Event→Agent Input delivery and merged Event cursors fail explicitly.
+Product-owned multi-store workflows may use the existing explicit idempotent saga/outbox
+pattern. Never turn a local success into an implicit global-consistency claim.
+
+The common internal vocabulary describes **roles**, not six traits or services:
+
+| Role | Invariant | Examples |
+|---|---|---|
+| **Owner** | Sole mutable authority and linearization point | Agent state, Job owner, Sandbox, Agent Input |
+| **Fact** | Immutable authoritative evidence | HistorySpan, commit-log Event, ProcessTerminal |
+| **Operation** | Replay/recovery custody of an effect | Existing Prepared constructor/remote Start receipt |
+| **Projection** | Rebuildable read/index accelerator, never truth | Event subject index, Job exposure lookup |
+| **Cursor** | Private bounded observation/progress, never authority | Jobs page, Event reader/consumer |
+| **Scope** | One Process lifetime, independent of Sandbox state | Process child + platform containment |
+
+One resource can reference several roles without creating competing owners. In particular
+`agent_state_current` is **Owner** state after exclusive activation, not a projection;
+SessionStore remains the Turn/history owner. Commit-log Events are Facts, not a second
+Event runtime. Driver and registry definitions do not grant source/Tool/secret authority.
+
+### 0.2 Small reusable implementation mechanics (private)
+
+These are shared **mechanics**, not a generic framework, public API or new persistence
+service. Preserve every existing semantic owner; implement a helper when it removes real
+duplication. Existing typed owners may call the same helper with different policy and
+transition rules. Crate placement is governed by actual dependency direction, not this
+conceptual grouping.
+
+**Store identity and position.** Reuse `store_meta.store_id` as the persistent
+`StoreId`, and the existing `store_meta.restore_generation` as its incarnation fence:
+
+```text
+StoreScope = { StoreId, RestoreGeneration }
+StorePos(u64) = position in this scope's immutable commit_log.seq
+```
+
+Do not mint Event-/Jobs-specific Store IDs, restore epochs or global sequence clocks.
+Event indexed-through, Jobs publication/high-water and projection build-through use the
+same zero-cost `StorePos`, comparable **only within one StoreScope**. A same-store SQLite
+backup restore preserves `store_id` but advances `restore_generation`; a cursor, durable
+consumer position or projection generation from the prior incarnation must fail stale or
+be explicitly rebuilt/rebased from restored authoritative facts, never silently resume
+against reused numeric `commit_log.seq` values. Persist scope affinity with private
+ordered cursors and projection heads, not as a new public resource identity. Keep
+Agent/Process/Graph `rev`, source `event_rev`, staged `inputs_rev`, group/security
+generations and output byte offsets distinct. The `StoreScope` guard is a safety type,
+not a distributed transaction or universally comparable revision.
+
+**One owner-mutation discipline.** This is a review rule/helper sequence, not a generic
+TransactionManager:
+
+```text
+recover exact prior operation/result if this identity already exists
+-> for genuinely new work, preflight current Store-owned authority
+-> derive a stable operation-owned recovery identity (pure planning, no external effect)
+-> if anything external may have an uncertain effect, durably claim Prepared FIRST
+-> acquire external evidence/fence and execute exact prepared effect using that identity
+-> inside the real Owner transaction, revalidate Store-owned authority and external
+   immutable/held-through-commit evidence; publish Owner state + Facts + outcome atomically
+-> after commit, notify/wake/refresh reconstructible accelerators and release fences
+```
+
+Side-effect-free immutable evidence reads can precede `Prepared`. But issuing a provider
+lease, capability or reservation **may itself be an effect**; if so, it happens only after
+a durable Prepared claim with enough identity to inspect/reconcile it following failure.
+A provider `plan()` that itself has effects is not a pure recovery-planning step. Simple
+Store-only deterministic mutations skip Prepared/external-evidence ceremony. Pure
+read-only disclosure may use fenced evidence without a Prepared mutation claim. Each
+Agent/Input/policy/Start/constructor/Job owner keeps its real transaction and
+specialized transitions; common helpers encode only identity, evidence and factual
+outcomes.
+
+**One effect/replay discipline.** Authenticated original operation identity + canonical
+original-request fingerprint identifies the attempt. Exact replay returns retained
+factual identity or a disclosure-safe non-retry acknowledgment; changed semantics conflict.
+For an effect that may escape the Store, persist `Prepared` **before** that effect and
+recover by its stable operation/driver identity after uncertainty. `Applied`, `Rejected`
+and `Unknown` describe the shared effect outcome vocabulary, not a compulsory generic
+state machine replacing `PolicyAdmissionState`, guardian phases, Job statuses or
+`StopEvidence`. Store-only atomic mutations need no Prepared ceremony. The original
+policy/Start/constructor/Job owners retain replay and recovery truth. No universal
+OperationManager, global ledger or workflow engine is permitted.
+
+**One external-evidence rule.** Store-owned authority is verified inside the owner's
+final transaction. Externally mutable authority must instead supply either an immutable
+non-revocable/versioned proof or a provider-enforced live fence held **through the actual
+linearization/read decision**. Otherwise the result is Unknown/unavailable and the effect
+is not published, disclosed or retried blindly. Separate the *durable*, bounded, non-secret
+evidence/identity from the *live*, provider-owned fence handle; persisted descriptors never
+contain reusable credentials or pretend a pre-commit `valid()` call is a fence. Acquire
+the fence before a short Store transaction; do not perform unbounded provider I/O inside
+SQLite write locks. This rule governs prepared SourceDriver publication, Event read/Input
+disclosure, provider-backed projections and later Vault/provider integrations without
+becoming a second authorization engine.
+
+**One private projection-publication protocol.** A rebuild records its originating
+`StoreScope`, projection generation and `built_through: StorePos`, populates a private
+replacement and
+under the final authoritative write/swap fence either proves the publication head
+unchanged or catches up the intervening suffix before activation. A consumer never
+advances above a contiguous safe prefix or scans a half-built generation. Event indexing
+may publish incremental gap-free prefixes; Job exposure may build then atomically swap.
+Share only the Store helpers for generation, prefix, head/fence verification and swap:
+indexes, materialized columns, retention and query algorithms remain owner-specific.
+
+**One opaque cursor envelope, distinct algorithms.** Reuse private authenticated cursor
+identity, `StoreScope` affinity (StoreId + restore generation), selector/anchor binding,
+projection/placement generation checks, expiry and progress fencing. An Event cursor stores an ordered log position and separate disclosure
+checks; a Jobs cursor stores publication high-water, exact tuple and optionally a private
+tree frontier/ancestor-gate chain. Current authority is always revalidated at read/commit;
+a cursor is not a grant. Do not invent one generalized cursor traversal engine.
+
+**One Event scanning core.** `events.read`, recipient subscriptions and EventHandlers
+scan the same immutable Event projection through a bounded, source-first,
+authority-scoped, placement- and indexed-through-fenced scanner. The private scanner
+returns a candidate plus preliminary evidence, proven skip, blocked/unknown, stale or end;
+it does **not** commit EventInputs, call Handlers or publish progress. Proven-deny/nonmatch
+can advance privately; unavailable authority cannot. A public blocked response is
+candidate-oblivious. Recipient Input admission rechecks the candidate in its own
+same-store transaction with subscription generation, audience/manifest, causal budget
+and deterministic dedupe. Handler execution remains at-least-once with its own receipt
+and acknowledgment. Read response projection remains a separate pure consumer. This
+shares authorization/scanning correctness without a second delivery runtime.
+
+**One durable DriverKey.** Persist one stable typed key for built-in or Extension driver
+identity (`namespace/extension + local id`) in SourceBindings, SourceAnchors and
+RecoveryDescriptors. Persist the **artifact-specific schema beside that key** (`binding`,
+`anchor`, `recovery`, etc.); do not overload DriverKey with one version that accidentally
+couples unrelated formats. Runtime installation generation is a separate *live* fence and
+is never historical identity. Store-open/recovery resolve `DriverKey + artifact schema`
+through the existing registry compatibility check. This gives one durable driver identity
+while allowing anchor/recovery/binding schemas to evolve independently.
+Unresolved descriptors pin a compatible implementation until safe reconciliation. No
+separate driver directory/authority service.
+
+**One typed registry staging core.** The final leaf registries reuse small typed-key,
+collision, local-revision, staged snapshot and atomic-publication mechanics from their
+first consumer. An Extension registration stages several leaf changes and publishes
+one coherent root snapshot; no leaf is replaced during Phase-5 composition. Family-specific
+validation, durable pinning and activation/authority rules stay with their real owners.
+Do not preimplement dormant registries merely to fill out a taxonomy.
+
+**One dedicated `aw-process` crate.** This is the canonical, reusable, Agent-neutral
+**async Process runtime** for AW, dotlink and future embedding hosts. It owns exactly one
+private Scope and the actual child lifetime: prepared launch into containment, exact main
+child identity/readiness, stdin/EOF, stdout/stderr pipe readers, wait, graceful/forced
+stop, one bounded retry while the target is safe, pre-cleanup occupancy, bounded drain and
+one `ProcessTerminal`. A host cannot retain a parallel wait/reap/stop/pipe-drain manager.
+
+Crate direction is explicit:
+
+```text
+aw-tools                    ProcessTerminal / Occupancy / StopRecord facts (no OS runtime)
+aw-platform                 synchronous OS-specific DirectScope / containment operations
+       ^                        ^
+       |________________________|
+                  |
+aw-process                  async Scope + pipes + stop/wait/drain/settle
+       ^                        ^
+       |                        |
+AW tools/host adapter        dotlink shell/MCP adapter
+```
+
+`aw-process` depends downward only on the minimal `aw-tools` semantic feature set,
+`aw-platform` and required async/OS primitives; it must **not** depend on AgentCore,
+MCP, SessionStore, ToolPolicy or another process lifecycle owner. The AW adapter and
+dotlink prepare already-authorized executable/Sandbox/environment choices and transfer
+one prepared command **by value** into `aw-process`; the shared runtime then owns the
+lifecycle-sensitive finalization: containment setup, stdio ownership, spawn, exact child
+custody, read/drain lifetime, wait/stop/reap and terminal settlement. This keeps sealed
+executable/Bubblewrap preparation, Tool/Sandbox authorization and runtime-profile policy
+at the host edge without permitting `spawn -> attach later` to become the generic contract.
+
+The AW adapter and dotlink also retain product transport, operator logs, deadlines and
+output **storage/retention**. One small sink interface accepts pipe chunks and reports
+factual success/failure; the shared runtime owns bounded backpressure, cancellation and
+drain deadlines. A blocked or failed sink can never hold containment cleanup indefinitely;
+dropped/unretained bytes are represented as truncation/incomplete evidence and are never
+reported as fully captured output.
+
+`ProcessTerminal` is the canonical cross-host terminal Fact. AW's existing
+`ProcessReceipt` remains the single AW adapter envelope around that Fact plus AW-specific
+snapshot/spool access; dotlink retains its product JobCompletion/result envelope around the
+same Fact. Do **not** create a generic `SharedProcessReceipt` or move JobManager/ACK/quota/
+paging ownership into `aw-process`.
+
+`aw-process` owns DL-200 Process/Job execution lifetimes. The existing `aw-terminal`
+Terminal/PTY subsystem is a distinct custody resource with reviewed source-release/adoption
+semantics that may intentionally transfer child/PTY custody. It remains separate rather
+than forcing transferable release/disarm semantics into ordinary Process Scope. A tiny PTY
+compatibility adapter is not a second DL-200 Process Job runtime.
+
+This crate is **required in Phase 0**, not conditional on whether an existing module
+could technically hold the implementation. Create it to replace both AW's current
+`aw-tools-adapter::process` lifetime machinery and dotlink's guard/wait/reap path; only
+remove the old paths after real AW+dotlink compilation and behavioral parity prove the
+same owner. Do not wrap two pre-existing runtimes and call it shared.
+
+### 0.3 Non-collapsible distinctions and adoption
+
+Preserve: Agent ≠ Sandbox ≠ Scope; Agent owner ≠ internal Session journal; history ancestry
+≠ delegation lineage; disclosure provenance ≠ live grants; Event subscription ≠ Handler;
+definition ≠ activation; `rev` ≠ `event_rev` ≠ `StorePos`; Process physical exit ≠ stop
+evidence ≠ occupancy ≠ output completeness. These distinctions carry correctness.
+
+The shared primitives above land **inside the existing seven implementation phases**.
+No R6-only implementation phase, public API, second persistence owner or release gate is
+introduced. See `IMPLEMENTATION.md` for exact placement and grouped acceptance. R5
+remains the most recent sealed revision until this R6 proposal is explicitly accepted.
 
 ---
 
@@ -267,7 +494,13 @@ Rules:
 - selector/subscription complexity and delivered Event volume are bounded; broad
   patterns are indexed/projection-driven rather than expanded into per-source rules;
 - model-facing cross-Project/Principal/Domain patterns require corresponding current
-  source visibility and host-granted Event capability.
+  source visibility and host-granted Event capability;
+- **v1 cross-Domain patterns are supported only for Domains indexed by the same authoritative
+  Event store**. The exact concrete Domain, Principal, source and recipient policies are still
+  checked per Event. Domains whose Events reside in another store/host are not silently
+  federated into the local cursor; such a cross-store request is explicitly unavailable,
+  not a partial result disguised as a complete subscription/read. A future federated
+  cursor/merge transport needs its own reviewed owner contract, not a hidden aggregator.
 
 The namespace tree, Agent delegation relation and immutable-history ancestry are three
 distinct things. A child Agent is a new globally addressable Agent, normally a sibling
@@ -387,9 +620,65 @@ against the exact concrete target before it is returned. An Agent child that the
 cannot view is omitted and its Agent subtree is not recursively traversed; parent/delegation
 lineage therefore cannot reveal a private child's existence, Project or descendants.
 
-Pagination cursors retain any hidden scan position privately. Hidden rows do not change
-visible counts/offsets or create observable gaps. Direct `jobs_get/read/send/cancel` still
-reauthorize the exact target independently.
+Pagination cursors retain hidden scan/traversal state privately and are bound to the
+authenticated caller, exact anchor ref and normalized scope. The first page also captures
+an immutable **publication high-water position** from the existing authoritative exposure/
+publication ordering. Every later page considers only identities published at or below that
+high-water mark, with canonical ref as the deterministic tie-breaker. New children/work
+published afterward appear only in a fresh listing; no expensive database snapshot is
+promised.
+
+The canonical ordering is exactly (the position is one store-local `StorePos`
+projected from the existing `commit_log.seq`, not a second global sequence):
+
+```text
+publication_position DESC, canonical_ref ASC
+```
+
+The opaque cursor retains **both** tuple fields; a page boundary inside one shared
+publication position therefore cannot skip or repeat tied rows.
+
+For `children`/`turns`, the cursor keeps the private last scanned ordering tuple. For
+`scope=tree`, traversal is deterministic pre-order with each sibling set ordered by that
+same tuple, and the opaque cursor retains the traversal frontier/child scan positions plus
+the private Agent ancestor-gate chain needed to resume each queued subtree.
+
+A stored frontier is navigation state, never retained traversal authority. Before resuming
+or descending through a frontier Agent, reauthorize that Agent **and every still-relevant
+Agent ancestor gate on the queued path** under current authority. If any gate is no longer
+viewable, discard that entire queued subtree even if a descendant would be directly
+viewable through `jobs_get`; tree traversal cannot tunnel through a now-hidden ancestor.
+Hidden child rows are omitted and their subtree is not traversed. Gaining access later does
+not rewind already-scanned cursor state.
+
+Use the existing immutable publication/timeline position appropriate to the authoritative
+owner; if an exposure projection needs that key, store the owner's existing commit/
+publication position as projection data rather than minting another global sequence.
+
+One `jobs_list` traversal is **exposure-store local in v1**. Reuse the common
+private authenticated cursor envelope and `StoreScope + StorePos` provenance, but
+keep Jobs high-water/tree-frontier traversal separate from Event scanning. The opaque
+cursor binds the existing Store ID **and restore generation**; restoring an earlier
+same-Store backup makes pre-restore pages stale, even if their numeric position exists. parent/delegation edges used for recursive
+Jobs traversal must have traversal/publication evidence in that same store. A cross-store
+recursive selector is explicitly unsupported/fails closed rather than merging independent
+publication positions. The globally shaped namespace does not imply a federated Jobs
+cursor.
+
+Exposure-index rebuilds must never expose holes below a cursor high-water. Authoritative
+Agent/Process/Graph publication writes the exposure row transactionally when possible. A
+full rebuild constructs a replacement exposure index privately through a captured
+publication head `H`, but **must close the swap race** before activation: under the store's
+final write/swap fence, either verify `current_publication_head == H`, or catch the
+replacement up for `(H, current_head]` under that same fence, then atomically switch the
+active generation. If the head cannot be reconciled safely, abandon/retry the replacement;
+never swap a stale `H` generation over newer active rows. Consumers never scan a partially
+rebuilt generation. If a future implementation uses incremental online repair instead, it
+must provide the equivalent contiguous safe-prefix fence before issuing a high-water.
+This prevents duplicates/misses under concurrent publication/rebuild while keeping the
+cursor cheap and rebuildable.
+
+Direct `jobs_get/read/send/cancel` still reauthorize the exact target independently.
 
 ### 5.5 No initial `kind` / `state` filters
 
@@ -422,6 +711,12 @@ Purpose:
 
 If `rev` equals the current owner revision and `wait_ms > 0`, wait until that owner
 revision changes or the deadline/cancellation fires, then reauthorize and reread.
+**Efficient wait is mandatory:** subscribe to the existing owner-local revision notifier,
+recheck the authoritative revision after registration to close the lost-wakeup race, then
+await a change/deadline/cancellation without a fixed-interval database polling loop. A
+notification is only a hint; every returned snapshot and its disclosure are freshly
+validated by the real owner. Owner restart/notification loss falls back to one authoritative
+reread, not a second revision truth or notification service.
 
 `rev` is discussed normatively in section 12.
 
@@ -711,6 +1006,15 @@ Each Agent has its own revision. Child-Agent execution does not bubble every tra
 into parent Agents; only relationship/membership changes actually owned by the parent
 advance the parent's revision.
 
+**Session/Agent owner and initiating actor are different identities.** An Alice-owned
+Agent may accept Bob's policy-routed ToolCall only after AW validates Bob's current
+participation/ACL, writer/Turn claim, Bob's own source/ToolPolicy/provider/payer ceilings
+and the destination resource authority. Persist both the immutable resource owner and
+Bob's authenticated subject/participation epochs on the original invocation claim. The
+Session owner remains the storage/writer coordinator, never an implicit grant of Alice's
+provider/tools or disclosure to Bob. Revoking Bob prevents fresh effects and private
+receipt disclosure; it does not rewrite factual results of already admitted effects.
+
 ---
 
 ## 15. Host Agent input-plan API
@@ -908,6 +1212,9 @@ DL-200 semantic method signatures stay small; do **not** add an ad-hoc `request_
 to every create/set/send operation. The model/tool adapter or host RPC boundary supplies
 one authenticated bounded mutation identity from its existing request/tool-call envelope.
 The lower owner records/reuses it where replay could otherwise duplicate an effect.
+All owners reuse the private replay/evidence rules in section 0.2; the common mechanics
+never replace owner-specific `PolicyAdmissionState`, guardian/approval transitions, stop
+records or resource-specific receipt schemas.
 
 Conceptually:
 
@@ -918,8 +1225,13 @@ request_fingerprint = canonical hash of the complete semantic request
 
 Rules:
 
-- same replay key + same fingerprint -> return the same factual result/created resource IDs
-  or the same terminal receipt; do not repeat the mutation;
+- same replay key + same fingerprint -> **never repeat the mutation**. Effect/outcome identity
+  is stable; exact payload/detail is replayable only while retained and currently
+  disclosable. Constructors retain the exact created canonical resource identity/identities
+  in the resource/tombstone/replay owner for the full replay-identity lifetime, so replay
+  still names the same Agent/Sandbox/Checkpoint/Principal. Effectful operations whose full
+  receipt was compacted return the canonical compact non-retryable acknowledgement carrying
+  only the retained terminal fact/disclosure-safe detail;
 - same replay key + different fingerprint -> conflict/denied as request-identity reuse;
 - model calls naturally use their durable tool-call identity; host transports use their
   existing authenticated RPC/request identity;
@@ -935,6 +1247,42 @@ Rules:
   receipt; Event publication binds it to the persisted Event; input/control uses the
   existing queue/control facts. Logical close/delete/tombstone does not make the same
   request identity available to create a different resource later;
+- **replay lookup precedes contextual-ref resolution and current effect admission**.
+  Authenticate the original caller/request identity; find the claim by stable origin,
+  operation and ToolCall/request ID, then compare the *original* request fingerprint,
+  including its literal requested ref. A matching replay retains the stored canonical
+  target/accepted decision even after `^` reparenting, writer change or Policy revision;
+  it never creates another claim for a changed resolved target. Current disclosure is
+  checked **separately** before returning a cached payload, while factual success/Unknown
+  remains stored. Fresh invocations alone resolve contextual refs and revalidate current
+  grants, writer, payer, guardian budget and policy before effects;
+- policy admission and remote Start use their existing **indexed current replay owners**
+  (`policy_admission_current` and `remote_start_current`) backed by immutable audit. No
+  lifetime audit-event count or O(Session-history) JSON scan may determine whether an
+  otherwise valid **new** invocation is accepted. Per-active-Turn work remains bounded.
+  Replay retention has two representations in the **same owner**, never a second ledger:
+  a full recovery/receipt record while payload/detail is useful, then a compact replay
+  tombstone containing only the replay key, original semantic fingerprint, terminal
+  disposition (`Applied|Rejected|Unknown` or equivalent), and minimal integrity evidence
+  sufficient to guarantee that identity can never execute again. Large payloads/provider
+  details/current-authority snapshots may be dropped independently. The compact tombstone
+  may disappear only when that replay identity itself can no longer be legally presented;
+  if durable ToolCall/request identity lives with retained Agent/history indefinitely, the
+  compact tombstone lives with that identity rather than using a TTL that could re-enable
+  an old effect. Replay lifetime is explicit per identity namespace: a model ToolCall tied
+  to retained Agent/history keeps its tombstone with that retained identity; a host RPC
+  namespace may retire a tombstone only after its authenticated transport/owner guarantees
+  that old request IDs from that namespace are permanently rejected. If no such irreversible
+  presentation boundary exists, retain the compact tombstone. A TTL by itself never makes a
+  consumed identity executable again. Startup/migration backfill may scan audit once, but
+  ordinary admission cannot.
+- when an exact replay matches but current disclosure no longer permits its protected
+  content, return only a minimal **non-retryable replay acknowledgement**. It may reveal no
+  target ref, Job ID, provider details, output metadata, timestamps or protected payload.
+  Where even effect existence is protected, collapse this further to an opaque
+  prior-invocation/non-retryable response. Withholding content never erases replay identity
+  and never permits a replacement effect. Apply the same rule to policy Tool effects,
+  Remote Start and paid guardian receipts.
 - do not create a second generic replay ledger merely for DL-200.
 
 This applies uniformly to resource construction and additive mutations that can otherwise
@@ -946,26 +1294,63 @@ that invoke those canonical owners. A replayed custom Event returns the same per
 ### 17.2 Prepared construction and atomic public publication
 
 Constructors that span AW rows plus filesystem/provider materialization use one shared
-prepare/publish discipline. Do not expose a half-created resource and do not require a
-cross-provider distributed transaction.
+prepare/publish discipline. The private lower construction primitive exists **before** the
+first caller that needs multi-resource publication (`checkpoint.restore`); later public
+`agent.create` and model `agent(...)` expose/admit the same primitive rather than creating
+another constructor. Do not expose a half-created resource, add a restore-specific
+constructor, or require a cross-provider distributed transaction.
 
 ```text
-1. reserve/mint operation-owned candidate IDs privately
-2. preflight all current authority, disclosure and quota constraints
-3. prepare external/materialized state under non-public operation custody
-4. revalidate exact source identities/authority/fingerprints
-5. in one AW store transaction publish all authoritative current rows/grants/relations,
-   initial queued input where requested, commit-log Events and mutation-replay result
-6. only after commit make the canonical refs discoverable/dispatchable
-7. release temporary barriers; asynchronously/reconciliably clean abandoned preparation
+1. replay lookup + reserve/mint operation-owned candidate IDs privately
+2. preflight current authority, disclosure and quota constraints
+3. BEFORE the first external/materializing effect, durably claim the existing replay/
+   operation owner with {replay key, semantic fingerprint, candidate IDs, cleanup/recovery
+   identity, state=Prepared}
+4. perform external/materialized preparation under non-public operation custody
+5. revalidate prepared external evidence and enter/retain any source-mutation fences needed
+   for publication
+6. COMMIT one AW store transaction that **revalidates all AW-store-owned source/destination/
+   grant/ACL/lifecycle authority at the publication boundary**, publishes all authoritative
+   current rows/grants/relations, initial queued input where requested, commit-log Events and
+   transitions the same operation receipt to Applied — this commit is the **single public
+   linearization point**
+7. after commit, wake schedulers/waiters, refresh reconstructible caches/accelerators and
+   release temporary barriers; reconcile abandoned preparation asynchronously
 ```
 
+Before step 6, canonical refs are private/non-addressable. Immediately after the step-6
+commit succeeds, the Agent/Sandbox/Checkpoint and canonical refs are authoritative,
+discoverable and dispatchable subject only to ordinary current admission. There is no
+second visibility flag/publication owner. Post-commit wakes, caches and accelerators are
+reconstructible from committed state and may never control visibility.
+
+AW-store-owned authorization/freshness checks in step 6 are transactionally fenced with
+publication: revoke/source-replace/destination-close committed first denies publication;
+publication committed first retains the original factual result. Existing source-mutation
+barriers/fences acquired for an AW-owned source stay held through this commit.
+
+For externally owned sources that cannot participate in the AW transaction, the reviewed
+SourceDriver contract must provide immutable-version/source-fence authorization evidence
+bound to the RecoveryDescriptor. Step 5 validates that evidence and step 6 publishes only
+if the corresponding prepared evidence is still acceptable under current AW authority. If
+external freshness/ownership cannot be confirmed safely, leave the original operation
+`Prepared`/`Unknown` for inspection/reconciliation rather than publishing or repeating the
+external effect. No cross-provider distributed transaction is implied.
+
+The step-3 claim is **not** a public resource lifecycle or a second construction owner; it
+is the existing mutation/operation replay receipt below the resource. A crash during
+external preparation therefore leaves a durable `Prepared` claim meaning "the external
+effect may have started". Restart/replay inspects/recovers that exact candidate/cleanup
+identity and never blindly repeats preparation. A definitively failed prepare may transition
+the same claim to `Rejected`; an uncertain effect transitions/remains `Unknown` until
+inspection/reconciliation proves a safe continuation. The final public commit transitions
+the same claim to `Applied` atomically with resource publication.
+
 Prepared objects are **not** public Sandboxes/Agents/checkpoints and cannot be addressed by
-Jobs/Events/Views while preparation is incomplete. A crash before step 5 leaves no
+Jobs/Events/Views while preparation is incomplete. A crash before step 6 leaves no
 published AW resource; a reconciler identifies operation-owned prepared worktrees/provider
 materializations/temporary retention roots that are not reachable from a committed current
-row and cleans them idempotently. If an external prepare effect has an uncertain outcome,
-the operation remains factual `Unknown`/needs-inspection and is not blindly retried.
+row and cleans them idempotently.
 
 Concrete consequences:
 
@@ -1114,16 +1499,78 @@ SourceBinding
     checkpoint policy = required | ephemeral
 
 SourceDriver
-    capture(binding) -> immutable SourceAnchor
-    restore(anchor)  -> fresh mutable SourceBinding
+    // one private prepared-operation primitive is shared by capture and restore
+    plan(op = Capture(binding) | Restore(anchor), prepare_id) -> RecoveryDescriptor
+    execute(op, descriptor) -> Capture(SourceAnchor) | Restore(SourceBinding)
+    inspect(op, descriptor) -> not_started | completed(result/evidence) | unknown
+    cleanup(op, descriptor)
+
     retain/release/reconcile(anchor)
 
 SourceAnchor
     driver kind + immutable driver-specific identity/provenance
+
+RecoveryDescriptor
+    DriverKey + recovery_schema_version
+    bounded driver-specific recovery/cleanup identity, created before any external effect
+    immutable prepared source/version identity
+    publication evidence = immutable/non-revocable fact
+                         | opaque provider fence handle held through AW publication commit
+    // durable descriptor is non-secret: IDs/digests/version proofs/opaque handles only
 ```
 
-A source driver is valid only if it can fail closed and provide stable immutable restore
-semantics. There is deliberately no generic "tar whatever is at this path" fallback.
+Persist one stable internal **DriverKey** across SourceBinding, SourceAnchor and
+RecoveryDescriptor: built-in or Extension namespace + stable local driver ID **only**.
+Each persisted artifact carries its own adjacent schema (`binding_schema`, `anchor_schema`,
+`recovery_schema`, etc.). A runtime registry generation is a separate admission fence and
+is not historical driver identity. Store-open/replay resolves `DriverKey + that artifact's
+schema` against the same typed registry's compatible implementation; unresolved descriptors
+pin the required recovery schema until reconciliation. No driver-key database or second driver catalog is introduced.
+
+A source driver is valid only if it can fail closed and provide stable immutable capture/
+restore semantics. **Capture and restore are symmetric for crash recovery**: any path that
+can create an external snapshot/version/ref/object/materialization is executed through the
+same prepared-operation contract and receives a stable operation-owned preparation identity
+before the effect begins. Thus `checkpoint.create` is protected just like restore; Git
+synthetic commits/private refs and provider snapshot creation cannot be blindly repeated
+after a lost response. The exact Rust API may use a typed enum/generic helper or separate
+thin typed methods, but there is one recovery invariant/owner. After restart AW must inspect
+the exact attempted operation and clean/recover it rather than issue a second external
+effect blindly.
+
+For multi-source checkpoint/restore, the one existing operation receipt carries the bounded
+set of per-source RecoveryDescriptors; they are evidence owned by that operation, not a new
+coordinator/resource. V1 applies one host/runtime `max_sources_per_sandbox` limit to named
+SourceBindings and therefore to every derived/captured/restored SourceSet and descriptor set.
+Default implementation policy is **128 sources per Sandbox**, with a hard absolute ceiling of
+**1024**; hosts may choose a lower configured limit but never exceed the hard ceiling. This
+is admission/runtime policy, not a new per-request wire knob. Operations whose complete
+SourceSet would exceed the effective limit fail before external preparation begins. Each descriptor carries enough immutable-version/fence identity to
+validate that the exact captured/prepared materialization is still publishable.
+
+Publication evidence has only two acceptable shapes:
+
+1. an immutable/non-revocable provider/source fact whose validity cannot change during the
+   AW commit; or
+2. a provider-enforced fence/lease/capability that is **held and guaranteed valid through the
+   complete AW publication transaction**, then released afterward.
+
+A pre-commit `lease.valid()` observation is not enough. If the provider/driver cannot make
+one of those guarantees, publication stays `Prepared`/`Unknown` for reconciliation rather
+than racing the external authority boundary.
+
+A durable RecoveryDescriptor is **never secret custody**. It may contain opaque provider
+operation/fence IDs, content/version digests, immutable proofs and references to provider/
+Vault-held capability state, but never bearer tokens, signed credential URLs, raw secrets,
+private keys, serialized provider credentials or reusable fence credentials. If holding a
+publication fence requires privileged material, the provider/driver owns that material and
+the descriptor persists only its opaque recovery handle.
+
+Git can encode private worktree/ref paths plus exact OIDs/source fence; cloud/object/provider
+drivers can encode idempotency/object/materialization IDs plus immutable version or a held
+provider fence. A driver that cannot provide both recovery identity and publication-fence
+evidence cannot participate in effectful automatic capture/restore.
+There is deliberately no generic "tar whatever is at this path" fallback.
 
 A SourceBinding is `required` by default. `ephemeral` is an explicit trusted-host
 declaration for disposable caches/generated state that is not part of reproducible source
@@ -1584,22 +2031,49 @@ another protected resource. An immutable/queued fact may therefore retain bounde
 
 ```text
 DisclosureDependency {
-    source_resource / source_fact
+    source_fact                   // exact provenance/audit identity
+    authority_root               // stable disclosure-policy/source-authority root
     already_disclosed_principals[]   // user/group principals, groups not expanded
     source_policy/provenance evidence
 }
 
+DisclosureAuthorityRoot {
+    stable source/disclosure-policy identity
+    immutable dependency/provenance + maximum-ceiling evidence
+    // NOT a current authorization grant/result
+}
+
 DisclosureManifest {
-    immutable content-addressed id/digest
-    normalized deduplicated DisclosureDependency closure
+    immutable content-addressed root id/digest
+    persistent bounded-fanout immutable set/DAG nodes
+    exact provenance fact refs
+    deduplicated authority_root refs
 }
 ```
 
-`DisclosureManifest` is an internal immutable provenance structure, not another ACL/grant
-service or public resource API. HistoryGrant, Event, committed local facts and trusted
-projections may reference the same manifest/digest; unions create/reuse a normalized
-content-addressed manifest rather than copying an unbounded dependency array into every
-row. Retention follows the immutable facts/grants/Events that reference it.
+`DisclosureManifest` is an internal immutable provenance/authorization-closure structure,
+not another ACL/grant service or public resource API. Keep **exact fact provenance** and
+**authorization ceiling identity** distinct: many protected facts may share one stable
+`authority_root` when they are governed by the same effective disclosure/source-authority
+ceiling. Audit/provenance retains every exact source fact; ordinary expansion/fork/share
+checks deduplicate *which live authority owners must be consulted* over unique roots.
+
+An `authority_root` is **never cached current permission**. It identifies immutable
+provenance/maximum ceiling and the live policy/ACL/group/provider owners that must be
+re-resolved. Disclosing to a principal not already covered by immutable prior disclosure
+always rechecks current source policy/share authority and current referenced security/
+provider generations. Only an explicitly immutable export/disclosure grant whose own
+reviewed contract survives later revocation can avoid that live recheck. Manifest DAGs and
+indexes accelerate authorization dependency lookup; they never answer authorization by
+themselves.
+
+The manifest is represented as a persistent content-addressed set/DAG with bounded-fanout
+immutable nodes. A union reuses prior nodes and adds only newly introduced fact/authority
+roots; it never rewrites or recopies the whole historical closure. HistoryGrant, Event,
+committed local facts and trusted projections may reference the same root digest. A small
+rebuildable projection/cache may accelerate unique-authority-root checks, but exact facts
+and immutable DAG nodes remain authoritative. Retention follows immutable facts/grants/
+Events that reference the manifest.
 
 For example, an EventInput received from another Agent records the recipient disclosure
 principals to whom that fact was validly disclosed at admission. Later source ACL
@@ -1625,7 +2099,9 @@ so protected content cannot be laundered merely by changing representation:
 - a raw Vault file/env projection is potentially disclosive: Process/Tool output produced
   under that raw secret exposure carries the Vault disclosure ceiling unless the provider
   supplies a stronger safe brokered-result contract;
-- combining protected inputs unions dependencies rather than overwriting them;
+- combining protected inputs unions dependencies rather than overwriting them; union is
+  incremental/structurally shared and deduplicates authorization work at stable authority
+  roots while preserving every exact fact-provenance edge;
 - an Assistant/model output inherits the union of disclosure dependencies from the
   model-visible context/tool results that could have influenced it, because AW cannot
   prove the model did not paraphrase or reproduce them.
@@ -1635,8 +2111,14 @@ analysis. AW does not claim to infer arbitrary information flow through code, fi
 network side effects inside a Process; Sandbox/Vault/source capability separation remains
 the primary control for those effects. Dependencies may be removed only by an explicit
 trusted redaction/declassification/materialization operation producing a new immutable
-projection/base with its own provenance. Ordinary Hooks, model generation,
-summaries and exact forks never silently declassify.
+projection/base with its own provenance. Ordinary Hooks, model generation, summaries and
+exact forks never silently declassify.
+
+Scalability is structural rather than an arbitrary tiny hard cap: manifest DAG nodes have
+bounded fanout/encoded size and per-request union/authorization work is bounded. If a
+single operation would exceed those safety budgets it fails/defers rather than flattening a
+giant JSON/ACL mirror. Long-lived history may contain many exact provenance facts while the
+unique authority-root closure stays much smaller and structurally shared.
 
 A source with no new divergent local content reuses the exact same `HistoryBase`.
 When local history has diverged, the exact immutable local prefix is sealed as one
@@ -2640,7 +3122,7 @@ That is explicitly an implementation detail:
 - new public receipts/provenance use canonical Agent refs;
 - internal tables can be renamed/normalized later without changing the DL-200 surface.
 
-Add one authoritative current Agent projection rather than teaching every legacy Session
+Add one authoritative durable Agent-state owner rather than teaching every legacy Session
 table the new public semantics:
 
 ```text
@@ -2674,12 +3156,28 @@ migration and is **not** public Agent authority.
 
 #### Migration away from Session-audit revision
 
-Backfill one `agent_state_current` row for every existing public Agent binding and
-freeze its canonical handles. Seed its initial `rev` from the exact value the current
-bridge would return (`MAX(audit.seq)+1` for that backing Session) so a cutover does not
-manufacture an immediate stale-value discontinuity.
+Backfill/activation is an **exclusive store migration boundary**, not an online eventually-
+consistent copy. During the migration the store is under its existing schema/write exclusion:
+no serving/concurrent legacy Agent-envelope writes are admitted. In one migration transaction,
+backfill one `agent_state_current` + `agent_acl_current` state set for every existing public
+Agent binding, freeze canonical handles, seed each initial `rev` from the exact value the
+legacy bridge would return (`MAX(audit.seq)+1` for that backing Session), and publish the new
+schema/internal Agent-owner epoch **only after the complete seed is durable**. Commit makes
+the new owner active atomically; rollback leaves the legacy owner active.
 
-After the projection is activated:
+V1 deliberately does not implement online dual-write/catch-up for this cutover. If a future
+zero-downtime migration is required, it needs a separately reviewed protocol rather than
+quietly running both owners. This avoids a lifecycle/ACL/rev transition racing between seed
+and activation.
+
+After `agent_state_current` is activated, it is **authoritative durable Agent state**, not a
+rebuildable projection. Back it up/restore it as owner state. SessionStore remains the
+backing Turn/history owner, not a second Agent-envelope owner. Only derived lookup/list/
+exposure indexes over Agent state are rebuildable; they rebuild from `agent_state_current`
+and other authoritative owners, never by re-deriving Agent rev/lifecycle/lineage/ownership
+from legacy Session/audit state.
+
+After activation:
 
 - only logical Agent-owner transactions advance `agent_state_current.rev`;
 - audit/commit-log rows remain immutable evidence but no longer define Agent `rev`;
@@ -2741,7 +3239,18 @@ recovery and migration, but DL-200 exposes only Agent identity.
 ### 25.4 Logical Sandbox resource
 
 A `Sandbox` is a durable **logical mutable execution environment**, not one long-lived
-Bubblewrap/container/VM namespace.
+Bubblewrap/container/VM namespace and not the owner of Process lifetime.
+
+Keep Sandbox and Process Scope orthogonal:
+
+```text
+Sandbox    = where/how execution may run
+Scope      = what belongs to one Process lifetime
+```
+
+A Process may run with no logical Sandbox, with a Sandbox that only constrains
+filesystem/network/credentials, or with a Sandbox/launcher that can provide stronger
+process containment. None of those choices changes Process semantics or `ProcessTerminal`.
 
 Conceptually:
 
@@ -2805,7 +3314,9 @@ evidence and a policy reference/digest; the actual validated mount/network/devic
 remains owned by the existing Sandbox policy/grant layer and is revalidated at execution. Sandbox has no second user/group ACL in v1: creation/list/get/close
 authorize through the owning Project plus explicit Agent-to-Sandbox binding authority.
 Per-Agent execution rights remain in Sandbox/tool/Vault grants rather than a parallel
-Sandbox audience model. Sandbox lifecycle/binding changes and completed AW-owned write-capable source mutations
+Sandbox audience model. Sandbox policy may constrain what launch environment/capabilities
+are available, but the Process runtime remains the sole lifecycle/Terminal owner through
+its private Scope. Sandbox lifecycle/binding changes and completed AW-owned write-capable source mutations
 advance Sandbox `rev` once per logical mutation transaction and emit
 `s:<sandbox>.e:changed` (for example `data.aspect="sources"`). Sharing Agents do not
 receive synthetic Agent `rev` fanout. Sandbox `rev` is not a filesystem snapshot
@@ -3154,7 +3665,13 @@ trait Extension: Send + Sync + 'static {
 }
 ```
 
-`ExtensionRegistry` is the composition root and exposes typed subregistries:
+`ExtensionRegistry` is the composition/publishing root and exposes typed subregistries.
+The leaf registries are independent final owners and may be introduced before the root when
+a lower phase first needs them. Phase ordering must never create temporary registry types:
+`EventTypeRegistry`, `SourceDriverRegistry`, `SandboxDriverRegistry` and
+`VaultProviderRegistry` introduced earlier are the exact owners later composed here.
+
+The root exposes:
 
 ```text
 ExtensionRegistry
@@ -3179,7 +3696,9 @@ ExtensionRegistry
 ```
 
 These registries own or project **registered definitions**, never per-Agent grants or live
-authority. They are not duplicate databases/authority engines.
+authority. They are not duplicate databases/authority engines. Composition under
+`ExtensionRegistry` adds atomic extension-scoped staging/publication and root snapshot
+lifecycle; it does not replace or migrate leaf registry identity/state.
 
 For Tools specifically, `ToolRegistry` is the authoritative definition/catalog identity.
 The same definition-vs-binding rule applies to Hooks and other executable contributions:
@@ -3232,21 +3751,37 @@ Every registration is owned by the current Extension namespace. An Extension can
 remove/replace another Extension's registrations merely by naming them. Host/operator
 administration may remove an entire Extension.
 
-The `ExtensionRegistry` passed to `Extension::register` is an extension-scoped **staging
-transaction**, not a set of immediately-mutating registry references. All contributions
-from that call are validated together and published atomically as one generation. A
-collision, schema error, invalid authority declaration or failed subregistry validation
-aborts the whole registration; no half-installed Extension is visible.
+The registry implementation shares one private typed-key/snapshot/revision/stage core;
+individual registries retain their unique schema, dependency, removal and activation
+rules. The common core is not a Registry of registries, a new permission engine or a
+reason to implement dormant registry families before their first consumer.
+
+Every leaf registry uses the same private staged-mutation primitive from its **first**
+implementation; published leaf state is never mutated piecemeal. Before the root exists,
+Phase-2/3 users simply stage/validate/publish a one-leaf transaction. This may be implemented
+as a small shared `RegistryStage`/`RegistryTxn` mechanism or equivalent internal snapshot
+primitive; the name is not public API.
+
+The `ExtensionRegistry` passed to `Extension::register` later coordinates those same leaf
+stages as one extension-scoped **staging transaction**, not a set of immediately-mutating
+registry references. All contributions from that call are validated together and published
+atomically as one root generation. A collision, schema error, invalid authority declaration
+or failed subregistry validation aborts the whole registration; no half-installed
+Extension is visible. This composition adds no shadow registry and requires no migration of
+earlier leaf ownership.
 
 A later dynamic update uses the same extension-scoped, generation-fenced transaction
 model with an expected registry revision. This covers Pi-style dynamic registration
 without giving runtime callbacks unrestricted mutable access to global registries.
 
-Register/remove/reload advances one ExtensionRegistry generation. Subregistry `revision()`
-is the relevant typed projection of that root generation plus its local change revision;
-it is not a separate authority clock. In-flight work remains pinned to the exact registry
-+ authority generation under which it was admitted; newly admitted work sees the new
-generation.
+When the composition root exists, a multi-leaf register/remove/reload publishes one new
+ExtensionRegistry generation as **snapshot/publication metadata**. Each leaf still owns its
+local publication revision from first use. Typed Handle validity depends on that exact
+registration identity/type/schema/local revision, never on an unrelated root generation.
+Before Phase 5, one-leaf staged publication simply advances the leaf's local revision; no
+placeholder root clock is required. In-flight work remains pinned to the exact published
+registry snapshot + authority generation under which it was admitted; newly admitted work
+sees the new snapshot.
 
 Removing one registration or an entire Extension withdraws registered definitions but
 **does not destroy durable extension State, EventHandler cursors, product data, source
@@ -3256,11 +3791,37 @@ them only after current authority/schema revalidation. Destructive data cleanup 
 separate explicit host maintenance operation, never a side effect of registry removal.
 
 A definition registry may refuse removal when the implementation itself is required to
-keep live durable state valid. In particular, SourceDriver removal is refused while live
-SourceBindings/checkpoints depend on it unless a compatible replacement is published in
-the same atomic generation; SandboxDriver removal is refused while live execution depends
-on it. VaultProvider removal may make grants unavailable/fail-closed but never deletes or
-exports provider-held secret material.
+keep live durable state valid. In particular, SourceDriver removal/incompatible replacement
+is refused while **any** of these depend on that exact driver implementation/recovery schema:
+
+- live SourceBindings;
+- live Checkpoint SourceAnchors/retention;
+- unresolved `Prepared|Unknown` operation RecoveryDescriptors from capture/restore.
+
+Each RecoveryDescriptor records the exact driver registration identity + recovery schema
+version that can inspect/cleanup it. A replacement may take over an unresolved descriptor
+only when it explicitly declares/validates compatibility with that original descriptor
+schema and semantics in the same atomic registry generation. Otherwise the old driver stays
+pinned until reconciliation reaches a terminal state. This prevents retaining perfect
+recovery identity but losing the implementation required to use it.
+
+The same dependency contract is validated **durably at store-open/startup**, not only on an
+in-process `remove()`. Before serving/effectful source operations, compare every persisted
+live SourceBinding, live Checkpoint SourceAnchor/retention root and unresolved
+`Prepared|Unknown` RecoveryDescriptor against the installed SourceDriver registry. The exact
+durable driver identity/recovery schema must be present or explicitly covered by a
+compatible replacement that declares and validates support for that schema.
+
+If a required driver/schema is absent or incompatible after binary/config upgrade, affected
+source-dependent resources enter a fail-closed **degraded/recovery-required** state: no
+execution/checkpoint/capture/restore/reconciliation effect may reinterpret, clean up or retry
+that state through another driver. Read-only diagnostics/metadata may remain available where
+safe. Recovery requires reinstalling the exact compatible implementation or an explicitly
+compatible replacement, then normal inspection/reconciliation.
+
+SandboxDriver removal is likewise refused while live execution depends on it. VaultProvider
+removal may make grants unavailable/fail-closed but never deletes or exports provider-held
+secret material.
 
 Registering an Extension grants nothing by itself. **Installed/registered is not the same
 as active/bound.** Discovery/manifest loading only publishes definitions; trusted host
@@ -3688,7 +4249,12 @@ Agent permission to use an entry.
 
 `SandboxDriverRegistry` owns pluggable Sandbox realizations such as Bubblewrap,
 containers, VMs or remote workers. A Driver implements an existing logical Sandbox; it
-does not own Sandbox authority.
+does not own Sandbox authority **or Process lifetime**.
+
+A SandboxDriver may supply an opaque host-only launch capability/factory that lets the
+Process runtime choose a stronger private Scope backend (for example a Linux PID-namespace
+supervisor or a remote/container execution scope). That capability is implementation, not
+a second Process API. The Process runtime still owns wait/stop/Terminal semantics.
 
 #### Registry vs runtime context
 
@@ -3791,6 +4357,12 @@ start = now                 // default; atomically baseline at current Event tai
       | earliest_available  // explicit historical replay requirement
 ```
 
+EventHandler cursors use the same StoreId + **authority-scoped** selector placement-
+generation affinity under their explicit service authority. Hidden topology outside that
+authority cannot perturb their state. Store/placement mismatch within the authorized scope
+stops delivery and retention pinning and marks the Handler `lagged` until explicitly
+rebaselined; Handlers never create an implicit cross-store merge.
+
 For a product read-model bootstrap, the race-safe default is: enable an **active** `now`
 cursor first so its bounded backlog participates in retention, build the product's current
 state from authoritative AW snapshots, then drain delivery from that baseline. Snapshot/
@@ -3807,6 +4379,7 @@ event_handler_cursors_current
     extension_id + handler_id PRIMARY KEY
     handler revision/schema
     normalized pattern hash
+    StoreId + selector placement generation
     private commit_log position
     status = active | suspended | lagged
     authenticated service/host authority ref + generation
@@ -4240,9 +4813,10 @@ but it must remain explicit.
 
 The target DL-200 model is:
 
-- dynamic process Extensions run under host-selected isolated **process containment** by
-  default once the lower Sandbox implementation is promoted; they do not become Agents or
-  new Sandbox authority subjects merely because they are Extensions;
+- dynamic process Extensions run in a host-selected Sandbox environment with a fresh
+  Process Scope by default once the lower Sandbox implementation is promoted; the Sandbox
+  constrains environment/authority while Scope owns lifetime/Terminal semantics. Extensions
+  do not become Agents or new Sandbox authority subjects merely because they are Extensions;
 - a dedicated logical Sandbox is optional only when an Extension genuinely needs durable
   mutable source state;
 - no host environment/credentials/filesystem/network are ambiently inherited;
@@ -4300,58 +4874,21 @@ remain unchanged.
 This path gets JavaScript/TypeScript, Python, Rust and any other process-capable language
 with one small host implementation, while preserving an easy future WASM path.
 
-### 25.11 Shared Process settlement adopted from 0.17.6
+### 25.11 Process is one supervised execution scope
 
-The release/0.17 worktree established one additional shared fact that belongs in AW rather
-than dotlink presentation: when the waited command ended, did any live work remain in its
-contained process tree before cleanup?
+The reusable lesson from release/0.17.6 is broader than a better process-group guard:
+**AW owns one Process execution scope, not one leader PID.** The main command is only one
+member of that scope.
 
-Keep the shared API deliberately small.
-
-#### One new semantic fact: `Tree`
-
-`aw-tools` owns the host-neutral fact:
+Keep the semantic surface deliberately small:
 
 ```rust
-pub enum Tree {
+pub enum Occupancy {
     Empty,
     Live,
     Unknown,
 }
-```
 
-Meaning:
-
-```text
-Empty    AW proved no live contained work remained before cleanup
-Live     AW proved at least one live contained member remained
-Unknown  AW could not prove either
-```
-
-Do not infer `Live` from a successful kill. Tree occupancy and cleanup evidence are
-orthogonal.
-
-The platform layer stays simpler and does not depend on aw-tools. For directly managed
-process groups/Job Objects it exposes the existing tri-state I/O shape:
-
-```rust
-ManagedProcessGuard::observe() -> io::Result<bool>
-
-Ok(true)  -> Tree::Live
-Ok(false) -> Tree::Empty
-Err(_)    -> Tree::Unknown
-```
-
-Namespace/sandbox execution may provide the same observation through its backend-specific
-private mechanism; the adapter maps it into the same `Tree` value. No second public
-observation enum is added.
-
-#### Keep output metadata flat
-
-Do not introduce a separate stream metadata hierarchy. Refine the existing shared output
-record only enough to retain per-stream EOF/quiescence:
-
-```rust
 pub struct ProcessOutputMeta {
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
@@ -4361,104 +4898,289 @@ pub struct ProcessOutputMeta {
     pub stderr_complete: bool,
 }
 
-impl ProcessOutputMeta {
-    pub const fn complete(&self) -> bool {
-        self.stdout_complete && self.stderr_complete
-    }
-}
-```
-
-`*_bytes` means bytes observed by AW. When that stream is incomplete it is not a claim
-about the exact number of bytes the command produced. `truncated` continues to mean
-retention truncation only; it is independent from drain completeness.
-
-#### `ProcessTerminal` is the one final factual result
-
-The canonical shared terminal value becomes:
-
-```rust
 pub struct ProcessTerminal {
     pub exit: ProcessExit,
     pub stop: Option<StopRecord>,
-    pub tree: Tree,
+    pub occupancy: Occupancy,
     pub output: ProcessOutputMeta,
 }
 ```
 
-These four fields answer four independent questions:
+`Occupancy` is the immutable **pre-cleanup observation** of the semantic Process scope.
+It is captured once after the main-command terminal/stop boundary is established and
+**before cleanup changes the scope**, then carried unchanged into `ProcessTerminal`.
+`StopRecord` separately records what semantic/housekeeping cleanup proved. Cleanup success
+must never rewrite an earlier `Occupancy::Live` to `Empty`.
+
+`Occupancy` describes the **semantic Process scope**, not merely whichever lower containment
+primitive a backend happens to expose:
 
 ```text
-exit    how the waited command itself ended
-stop    what semantic/housekeeping stop AW proved, if any
-tree    whether live contained work existed before cleanup
-output  which output streams AW observed completely
+Empty    AW proved no other live workload remained in the Process scope
+Live     AW proved other live workload remained in the Process scope
+Unknown  AW could not prove complete Process-scope membership/occupancy
 ```
 
-`StopRecord` / `StopReason` / `StopEvidence` / `StopTracker` remain unchanged. Do not add
-parallel Cleanup/TreeStop/TargetGone types.
+Keep this meaning backend-independent. A weaker backend does **not** weaken `Empty` into
+"the observed process group is empty." `aw-platform::DirectScope` exposes synchronous,
+containment-local OS observations; `aw-process` is responsible for converting those facts
+into semantic `Occupancy` using the backend's containment strength. Direct Unix
+process-group/procfs observation can positively prove `Live`, but a negative group-local
+scan maps to `Occupancy::Unknown` whenever an escaped descendant (for example via `setsid`)
+cannot be excluded. That same narrower negative may still be used privately for safe
+cleanup decisions without being promoted to semantic occupancy evidence. Strong
+closed-containment backends such as a PID-namespace supervisor or Windows Job may normally
+prove `Empty|Live`.
 
-`ProcessReceipt` and `ProcessSettlement` should converge on `ProcessTerminal` as their
-single factual terminal truth. Existing `Outcome`, aggregate `output_complete`, `status`
-or product helpers may remain temporarily as compatibility projections during cutover, but
-must be derived rather than independently authored. The implementation should delete
-redundant stored facts where compatibility permits.
+A successful kill never implies `Occupancy::Live`; occupancy and stop evidence remain
+independent facts. The R5 **Rust source** still uses `Tree`; R6 renames the shared type and
+terminal field at the Phase-0 cutover. Dotlink's `tree` JSON is a compatibility projection
+only, never a second AW fact.
 
-#### One settlement order
+#### One private `Scope` owns lifetime
 
-Normal exit, timeout, cancel, runtime error and explicit termination converge on one shared
-settlement invariant:
+The dedicated **`aw-process`** crate owns one private `Scope` for each dispatch and
+provides the single Agent-neutral async spawn, pipe lifetime, stop, wait, drain and
+terminal implementation defined in section 0.2. AW and dotlink consume it rather than
+keeping separate guard/wait/reap/pipe-drain state machines. `aw-platform` continues to
+own synchronous OS facts. Policy, deadlines, output storage/retention, MCP projection
+and operator logs stay with the embedding host.
+
+The private Scope owns its one Process lifetime:
 
 ```text
-wait until command exit is ready / stop boundary reached
--> observe contained tree before cleanup
--> cleanup containment
--> if cleanup is Unknown, retry once immediately while the target identity is still safe
--> reap/finalize the waited command
--> drain stdout/stderr with bounded grace
--> publish ProcessTerminal
+Process
+├── Scope            private lifetime owner
+├── stdout/stderr
+└── ProcessTerminal
 ```
 
-On Unix, do not reap the process-group leader before the final observation/cleanup signal;
-use non-reaping exit readiness (`pidfd`/`waitid(...WNOWAIT)`/equivalent) so a reused numeric
-PGID cannot be signalled accidentally. Positive live-member evidence is easy; a negative
-Linux observation is accepted only when the observed `/proc` is the command's PID
-namespace and visibility is complete (`hidepid`/partial scans fail to `Unknown`). Zombies
-do not count as live, while live threads under an exited/zombie leader do.
+`Scope` owns the main child plus the platform containment identity. Higher layers do not
+own or manipulate a leader PID, process group, Job Object, pidfd, readiness primitive,
+occupancy observer or cleanup guard independently.
 
-On Windows, Job Object active-member accounting supplies the observation independently
-from `TerminateJobObject`; successful termination alone is not occupancy evidence.
+The compiled direct-host backend is an implementation detail called `DirectScope`, not a
+second semantic Process API:
 
-A racing forced cleanup must not overwrite an independently established command exit.
-Preserve AW's existing graceful-stop semantics, but for forced settlement an exit code or
-independently observed terminal signal that predates/contradicts the cleanup attempt remains
-the command's physical `exit` fact.
+```text
+Linux direct     pidfd when available (unreaped child PID fallback) + process group + trustworthy procfs fallback observation
+macOS direct     owned child identity + process group
+Windows direct   duplicated exact process HANDLE + Job Object
+```
 
-An unconfirmed cleanup never gets hidden by a later successful output drain. The guard
-remains fail-safe armed unless settlement has conclusively finalized/disarmed it.
+`DirectScope` provides synchronous kernel facts/operations to the private async `Scope`.
+There is no Tokio/runtime dependency in `aw-platform`, no public `child_exit_ready`, and no
+higher-layer `disarm`/`release` operation. The platform scope owns its bounded final
+termination attempt.
 
-Bubblewrap/PID-namespace observation is an implementation of this same contract and must
-ultimately live in the shared platform/Sandbox execution layer. Do not restore the
-release-local dotlink Guard/observer as a second semantic owner, and do not promote the
-frozen 017 mount plan merely to land this process-settlement work.
+The async runtime owns waiting policy:
 
-#### Dotlink owns the projection and turn horizon
+```text
+wake hint / readiness
+-> scope fact
+-> observe
+-> settle remaining scope
+-> reap main command
+-> settle output
+-> ProcessTerminal
+```
+
+Wake mechanisms are not authority/truth. Linux may use SIGCHLD today and pidfd async
+readiness later without changing Process semantics.
+
+#### Sandbox and Scope compose; neither owns the other
+
+The Process design must work identically with and without Sandbox isolation:
+
+```text
+                         Process
+                            │
+                 ┌──────────┴──────────┐
+                 │                     │
+            Environment             Lifetime
+                 │                     │
+              Sandbox                Scope
+                 │                     │
+      fs/network/credentials     direct / PID-1 /
+       mounts/devices/etc.         Job / remote
+                                         │
+                                  main + descendants
+                                         │
+                                  ProcessTerminal
+```
+
+The important invariants are:
+
+1. **Sandbox does not own Process lifecycle.** It may prepare an environment and provide an
+   opaque launch capability; it does not reap children, author `ProcessTerminal`, or invent
+   another stop/occupancy model.
+2. **Scope does not own Sandbox state.** It owns only one dispatch lifetime and cannot mutate
+   Sandbox bindings, Sources, Vault authority or durable Sandbox lineage.
+3. **Sandboxing is optional for Process semantics.** Unsandboxed/direct execution remains a
+   valid first-class path using `DirectScope`.
+4. **Sandboxed does not imply PID namespace.** A filesystem/network-only Sandbox may still
+   use `DirectScope`; a Sandbox/launcher with stronger containment may provide a stronger
+   Scope backend.
+5. **Scope backend selection is private.** Do not expose a model/user-facing
+   `direct|namespace|job|remote` selector merely to describe implementation. The trusted
+   launch plan carries the required containment guarantee and the host chooses an
+   authorized backend that satisfies it. The ordinary default may use the best available
+   backend, but when policy/grant requires **closed descendant containment**, lack/failure
+   of a PID-namespace/Job/equivalent closed backend rejects launch before effects; it never
+   silently downgrades to weaker `DirectScope` or retries through it.
+6. **Containment strength is factual.** `Occupancy::Empty` always means the full semantic Process
+   scope is proven empty. A weaker backend therefore maps inconclusive negative containment
+   observations to `Unknown`; a strong closed-containment backend should usually yield
+   `Empty|Live`. Never upgrade evidence because a Sandbox happens to exist.
+
+Typical realizations:
+
+```text
+Linux unsandboxed/direct             -> DirectScope
+Linux fs/network sandbox only        -> DirectScope
+Linux Sandbox + PID namespace        -> PID-1 supervisor Scope
+Windows sandboxed or unsandboxed     -> Job Object Scope
+macOS sandboxed or unsandboxed       -> direct process-group Scope
+remote/container/VM SandboxDriver    -> host-provided private Scope backend
+```
+
+Launch should establish environment and lifetime ownership **before the command can run**
+where the platform permits:
+
+```text
+prepare authorized Sandbox environment
+-> prepare/select Scope backend
+-> launch main command into that Scope
+-> publish Process ownership
+```
+
+Do not intentionally design a generic `spawn first -> attach containment later` contract.
+Windows already uses suspended launch -> Job attach -> resume; the strong Linux supervisor
+naturally launches the main command from inside the owned namespace. Direct Unix fallback
+uses pre-exec process-group setup and captures stable leader identity immediately after
+spawn because the platform does not offer the same atomic primitive.
+
+Changing Sandbox technology must not change Process semantics, and improving Process
+containment must not change Sandbox semantics.
+
+#### Strong Linux backend: tiny PID-1 supervisor
+
+The preferred strong Linux realization is a per-command AW-owned supervisor inside a
+per-command PID namespace:
+
+```text
+host AW
+└── Process scope / PID namespace
+    ├── PID 1  tiny AW supervisor
+    ├── PID 2  main command (for shell Tools, Bash)
+    └── PID N  descendants
+```
+
+The supervisor is an implementation detail, not an Agent, Job, daemon or public resource.
+It only owns Process lifetime: spawn the main command, reap children, retain the main
+command's physical exit, observe whether other workload remained, stop/reap the rest, and
+report the bounded terminal facts over one private bounded **unidirectional supervisor→host**
+channel independent of user stdin/stdout/stderr. The channel is not a general RPC protocol.
+Only the supervisor may own a writable report endpoint: before `exec` of the main command,
+the launcher/supervisor closes/removes that writer from the command and all descendant-
+inheritable fd tables (CLOEXEC plus explicit close/dup discipline as appropriate). The host
+owns only the read endpoint. User code must never be able to forge ProcessTerminal facts.
+The host validates bounded/versioned framing, exactly one terminal record for the launch,
+and the expected supervisor/launch identity established by the launcher/owned channel before
+accepting terminal facts; malformed, duplicated or unexpected reports are treated as report
+failure, not command facts.
+
+If the supervisor exits, crashes, or its report channel breaks before AW receives the main
+command's physical terminal fact, the supervisor's own exit must **never** masquerade as the
+command exit: `ProcessExit::Unknown` is the factual result. `Occupancy` remains any pre-cleanup
+occupancy already reported; if none was established, it is `Unknown`. Later namespace
+destruction may prove final containment quiescence/cleanup, but it never rewrites the
+historical pre-cleanup occupancy or reconstructs the lost command exit.
+
+This backend is stronger and simpler because daemonization/double-fork/`setsid` cannot
+escape the PID namespace; orphaned descendants remain owned by namespace PID 1. Supervisor
+failure also fails closed because terminating namespace PID 1 terminates remaining
+namespace processes.
+
+Do **not** force Bash itself to be PID 1.
+
+Because AW is a reusable Rust library, do **not** implement the PID-1 supervisor by running
+arbitrary Rust after `fork`, assuming a host utility exists, or teaching every embedding
+binary a hidden mode. The strong backend is instantiated by a real host/Sandbox launcher
+that can provide the tiny supervisor executable/entrypoint safely. The currently frozen
+017 mount/Bubblewrap plan is not implicitly promoted by this design.
+
+Until that launcher is promoted, direct execution uses the private `DirectScope` fallback.
+The fallback may be weaker (for example a Unix descendant may escape a process group with
+`setsid`), so `Occupancy::Unknown` and capability truth remain meaningful. Replacing
+`DirectScope` with the PID-namespace supervisor must require **no** change to
+`ProcessTerminal`, Jobs or dotlink's semantic API.
+
+Windows Job Objects already provide the strong containment shape without requiring a
+userspace PID-1 process. macOS remains a weaker direct supervisor/process-group backend.
+
+#### One terminal truth
+
+AW `ProcessReceipt` stores `ProcessTerminal` directly and may additionally carry its
+AW-specific output snapshot/spool access. `Outcome`, aggregate output completeness, stop
+helpers and Process status are derived projections rather than independently authored facts.
+Dotlink derives its product completion from the same `ProcessTerminal`; no cross-host
+`SharedProcessReceipt` is introduced.
+
+`ProcessSettlement` may still carry an independent Job-level `Status` when the Job result
+itself failed outside the Process (for example exact result retention failed). That is not
+a duplicate Process truth.
+
+`StopRecord` / `StopReason` / `StopEvidence` / `StopTracker` remain the one stop model. Do
+not add Cleanup/TreeStop/TargetGone/LeaderState types.
+
+The Process invariant is:
+
+```text
+Process is terminal only after
+    main command terminal fact is retained
+    + remaining execution scope is settled as far as the backend can prove
+    + output producers are settled/bounded
+```
+
+No model-facing Jobs tool and no DL-200 host method is added by this section.
+
+#### Dotlink is a thin consumer of the same Process owner
+
+Dotlink reuses the same shared Process lifetime/settlement owner that produces
+`ProcessTerminal`; it does **not** retain a second guard/wait/reap/cleanup-retry runtime and
+merely copy the resulting fields. If the current crate boundary is too AW-host-specific,
+move/factor that owner downward to the smallest sensible shared library boundary rather
+than duplicating it.
+
+Dotlink may retain shell/product concerns that are genuinely its own: launch/configuration
+projection, output transport, MCP/result shape, operator lifecycle wording and bounded-turn
+timeout policy.
 
 AW does **not** gain `tree="leftovers"`, `success`, signal-name JSON, lifecycle prose or a
-turn-horizon API. Dotlink derives its product/wire fields from the shared facts:
+turn-horizon API. Dotlink retains the **wire** name `tree` for compatibility, derived only from the shared
+`ProcessTerminal.occupancy` fact. AW never stores a second tree fact:
 
 ```text
-Tree::Empty    -> omit tree
-Tree::Live     -> tree="leftovers"
-Tree::Unknown  -> tree="unknown"
+Occupancy::Empty    -> omit tree
+Occupancy::Live     -> tree="leftovers"
+Occupancy::Unknown  -> tree="unknown"
 
 stdout_drain_incomplete = !output.stdout_complete
 stderr_drain_incomplete = !output.stderr_complete
 ```
 
-Dotlink may make `Tree::Live` clear its product `success` flag without rewriting the
-physical exit code or turning the MCP call into a generic tool error. Signal names remain
-a dotlink edge projection using the existing AW signal-name helper. One concise operator
+Dotlink may make `Occupancy::Live` clear its product `success` flag without rewriting the
+physical exit code or turning the MCP call into a generic tool error. Its
+`tree="leftovers"` projection means **live workload existed at the immutable pre-cleanup
+settlement boundary**; it does not claim that workload remains alive after cleanup.
+`StopRecord`/terminal completeness carry the cleanup evidence. Signal names remain a
+dotlink edge projection using the existing AW signal-name helper. One concise operator
 lifecycle line is likewise dotlink presentation, not shared process truth.
+
+Qualification is behavioral, not merely serialized-field parity: AW and dotlink must share
+exit/stop/occupancy/output semantics for clean/nonzero/signal exits, timeout/cancel, remaining
+children, inherited-pipe output and direct-Unix escaped-descendant uncertainty.
 
 Dotlink also restores the release runtime-horizon policy **at the dotlink layer only**:
 
@@ -4608,14 +5330,43 @@ A read cursor is a random opaque store record bound to:
 ```text
 authenticated principal
 normalized subject/pattern hash
+StoreId + RestoreGeneration  // existing StoreScope
+selector_placement_generation
 internal Event scan position
 created / last-used time
 ```
 
-It is not bound to a frozen ACL snapshot. Every concrete Event is reauthorized against
-**current** resource authority **and its immutable DisclosureManifest closure** at read
-time. The caller must currently satisfy the concrete source policy plus every manifest
-dependency; a pattern/cursor never bypasses protected payload provenance. Therefore:
+`StoreId` is the stable identity of the authoritative ordered `commit_log`/Event
+index; it is paired with existing `restore_generation` because backup restoration
+preserves StoreId but replaces log history. An old-incarnation cursor is stale, not
+replayed against a reused position. The placement token remains an independent
+**authority-scoped** selector-affinity check. `selector_placement_generation` is an **authority-
+scoped store-affinity token**, not a global topology generation: the existing Domain/
+placement owner derives it from the caller's currently authorized selector scope plus the
+bound StoreId. Hidden/unauthorized Domains/resources are excluded and must not change
+caller-observable cursor validity merely because they are created, moved or deleted. The
+token changes only when the caller's currently authorized selector scope can no longer be
+proven wholly served by the bound store (for example the caller gains authority to a
+matching Domain on another store, or an authorized Domain migrates). This is private
+cursor metadata, not a federation API or second Event owner.
+
+It is not bound to a frozen ACL snapshot. Authorization order is normative and privacy-
+preserving:
+
+1. resolve the cheap/current **exact source visibility gate first**;
+2. a proven source denial/nonmatch advances privately and **must not evaluate deeper
+   DisclosureManifest/provider dependencies**;
+3. only after the caller is permitted to observe that concrete source does AW evaluate the
+   Event's current audience plus immutable DisclosureManifest authority roots/dependencies;
+4. store-local authority is read under the current store snapshot/transactional owner;
+   externally mutable authority must supply either immutable/non-revocable authorization
+   evidence or a provider-enforced fence held valid through the authorization/read decision.
+   If neither is available, the result is indeterminate/`authorization_unavailable`.
+
+Thus every visible Event is authorized against **current** resource authority and its
+immutable DisclosureManifest closure, while hidden sources cannot trigger deeper provider
+work or observable transient errors merely by existing. A pattern/cursor never bypasses
+protected payload provenance. Therefore:
 
 - losing access hides unread matching Events immediately;
 - gaining access does not retroactively reveal rows the cursor already advanced past;
@@ -4624,8 +5375,19 @@ dependency; a pattern/cursor never bypasses protected payload provenance. Theref
   sequence numbers or gaps.
 
 One call scans at most 4096 underlying Event-index rows to produce up to the requested
-256 visible Events. Reaching that scan bound may return an empty page with a new opaque
-cursor; it does not disclose how many hidden rows were crossed.
+256 visible Events. Reaching that scan bound after only proven nonmatch/deny rows may return
+an empty page with a new opaque cursor; it does not disclose how many hidden rows were
+crossed.
+
+If the next candidate whose **source is already visible** cannot be authoritatively
+classified because group/security/DisclosureManifest/provider/placement authority is
+transiently unavailable or indeterminate, return the single retryable stream-level result/
+error **`authorization_unavailable`** and do **not** advance past that Event. The result is
+candidate-oblivious: it includes no Event ID, subject, source ref, position, hidden-row count,
+dependency identity or indication of which exact row caused the stall. The supplied opaque
+cursor remains valid/unchanged; when the call started with `after="now"`, the captured cursor
+is returned/retained as the retry point. This condition must never masquerade as an empty
+page or a proven denial.
 
 Read cursors expire after 24 hours of inactivity and are bounded to 64 live cursors per
 principal after opportunistic cleanup. The logical public Event retention floor keeps
@@ -4636,8 +5398,16 @@ longer; that does not promise indefinite public replay.
 If a cursor falls behind the logical retention floor, return `cursor_expired`. The
 caller rereads authoritative resource snapshots and resumes from `after="now"`.
 
-With `wait_ms`, the store uses the same cursor semantics plus a local wake accelerator;
-there is no poll race and no hidden source count leak.
+With `wait_ms`, the store may wait on the relevant authority/dependency wake plus the normal
+Event wake/deadline. If the blocking visible-source candidate is still indeterminate at the
+deadline, return `authorization_unavailable` with unchanged progress. This intentional head-
+of-line blocking preserves ordered no-loss semantics.
+
+The privacy guarantee is deliberately precise rather than absolute: AW directly exposes no
+hidden Event identity, subject, source, exact count or private log position. Because reads
+are bounded to finite scans/waits, callers may still infer **coarse aggregate timing/traffic
+volume** from latency, empty-page frequency or number of calls. V1 does not add per-user
+Event indexes, padding or constant-time scanning absent a stronger reviewed threat model.
 
 Events remain factual invalidation/coordination hints. Callers reread authoritative
 mutable resource state before acting.
@@ -4655,8 +5425,25 @@ subject=d:acme.i:compiler-team.e:changed
 data={aspect:"members", rev:5}
 ```
 
-Cross-Project, cross-Principal and cross-Domain observation uses the same grammar; only
-the concrete resource authorizer changes.
+Cross-Project, cross-Principal and **same-Event-store** cross-Domain observation uses the
+same grammar; only the concrete resource authorizer changes. V1 does not merge multiple
+independent `commit_log` positions into one cursor. A requested cross-store selector is
+explicitly unsupported/fails closed rather than silently returning an incomplete page.
+
+Every cursor use revalidates its StoreId + authority-scoped selector placement
+generation both before scanning **and before committing/returning cursor progress**. A
+concurrent scope/placement change therefore cannot advance the cursor through a page built
+under stale completeness assumptions: discard that page/progress and return `cursor_stale`.
+"Future matching resources" means future resources in the host's **authoritatively known
+Domain placement universe that are currently authorized for this caller** and remain wholly
+served by the bound Event store. Hidden Domains never perturb the token or reveal topology.
+If the caller later gains authority that makes the supported selector cross-store, or an
+authorized matching Domain moves stores, return `cursor_stale`; never ignore the newly
+authorized store or fabricate a merged position. For a broad selector such as `d:*`, v1
+never claims global exhaustiveness beyond the host's authoritative placement universe; if
+the placement owner cannot prove complete store placement for a Domain the caller is
+actually authorized to include, admission/progress fails closed rather than returning an
+apparently complete partial world.
 
 ### 26.3 Durable `events.subscribe`
 
@@ -4666,6 +5453,14 @@ lifecycle `open` plus current `control` or `manage` authority (or the equivalent
 model tool grant). Disabling/removing remains allowed during close for idempotent cleanup.
 The committed subscription retains the factual creating principal/tool-authority
 provenance used for later disclosure revalidation.
+
+**V1 Agent delivery is transactionally store-local.** The subscription/EventStore/causal
+budget owner and the recipient Agent's authoritative Input owner must participate in the
+same AW store transaction. Subscription creation/re-enable validates that internal store
+affinity. Cross-Project/Principal/Domain delivery remains supported when both endpoints are
+served by that same store; cross-store Agent delivery is explicitly unsupported/fails
+closed rather than weakening the single EventInput admission transaction. A future
+cross-store delivery protocol is separate design work, not an implicit saga hidden in v1.
 
 Host form:
 
@@ -4677,8 +5472,20 @@ events.subscribe(
 )
 ```
 
-`enabled=false` removes that exact recipient+normalized-subject subscription.
-Replacement/removal is idempotent and generation-fenced internally.
+`enabled` has exact idempotent semantics; no reset/seek/update verb is needed:
+
+```text
+current row                         request                 result
+active, same normalized subject     enabled=true            unchanged; preserve generation + baseline + scan
+absent/disabled                     enabled=true            create fresh generation + baseline at current Event tail
+lagged                              enabled=true            explicit rebaseline: fresh generation + fresh tail baseline
+active or lagged                    enabled=false           disable/remove and fence later admissions
+absent/disabled                     enabled=false           unchanged
+```
+
+A different normalized subject is a different subscription key, not an in-place edit.
+Repeated `enabled=true` on an active row must never reset the baseline or discard backlog.
+Replacement/removal/rebaseline is generation-fenced internally.
 
 Durable subscription state is inspectable without adding get/edit/delete micro-verbs:
 
@@ -4703,6 +5510,8 @@ on every matching source. Its current state is conceptually:
 EventSubscription {
     recipient Agent
     normalized pattern
+    StoreId + RestoreGeneration
+    selector_placement_generation
     generation
     baseline_position
     scan_position
@@ -4714,42 +5523,74 @@ EventSubscription {
 
 The committed baseline is the durable Event-log tail in the same transaction that
 creates/enables the subscription, so delivery is future-only with no subscribe race.
+Before every scan and again at admission/progress commit, the subscription revalidates its
+StoreId + **authority-scoped** selector placement generation under the creating-
+principal/tool authority retained by the row. Hidden Domains that authority cannot observe
+must not change the subscription's externally visible state. If the currently authorized
+selector moves stores or becomes cross-store, stop delivery and retention pinning, mark the
+existing row `lagged` with an internal stale-store reason, and require explicit
+re-enable/rebaseline. Never silently scan only the old store or merge positions.
 
 No queue/steer/interrupt/wake mode is part of the public subscription. A matched Event
 becomes one typed immutable `EventInput` in the recipient's existing Agent input owner;
 the host scheduler decides when/how that input is admitted.
 
 Backlog is **not copied per subscriber**. The shared immutable Event log plus each
-subscription's scan position is the backlog. For each candidate:
+subscription's scan position is the backlog. For each candidate, scanning may perform optimistic/preliminary checks, but the **only
+admission linearization point** is the existing replay-safe Agent input-owner transaction.
+That transaction receives the deterministic delivery identity plus expected subscription
+identity/generation/store-affinity evidence and atomically:
 
-1. match the normalized pattern;
-2. reauthorize the exact concrete source resource under the subscription's current
-   creating-principal/tool authority;
-3. revalidate the recipient Agent and the authority that installed the subscription;
-4. mint deterministic delivery identity
+1. confirms the subscription is still the same active generation and store-affinity scope;
+2. revalidates the recipient Agent is still open and the creating-principal/tool authority
+   still permits delivery;
+3. resolves the exact **source visibility gate first**; proven source denial returns a
+   terminal skip without touching deeper manifest/provider dependencies;
+4. for a visible source, reauthorizes the current recipient audience against every immutable
+   Event DisclosureManifest authority root/dependency, including any source `share`
+   requirement created by the current audience. Store-local authority is checked inside the
+   transaction. Any externally mutable dependency must provide immutable/non-revocable
+   authorization evidence or a provider-enforced fence held valid through **EventInput
+   transaction commit**. If neither is available, admission is `authorization_unavailable`/
+   Unknown and neither EventInput nor scan progress is committed;
+5. deduplicates the deterministic delivery identity
    `hash(subscription, generation, Event-log identity)`;
-5. validate disclosure into the **current recipient disclosure principals** (owner +
-   direct/group ACL principals, with a group treated as one live principal rather than
-   expanded members): each such principal must satisfy both the concrete source
-   Event/resource disclosure policy **and every immutable Event disclosure dependency**;
-   where a principal is not already disclosed, the installer must hold the required
-   current source `share`/equivalent authorities and each dependency policy must permit
-   expansion;
-6. admit that EventInput through the existing replay-safe Agent queue/input owner with the
-   union of the Event's source + transitive disclosure dependencies/provenance, recording
-   the current recipient disclosure principals as already disclosed;
-7. advance the subscription scan position only after accepted/deduplicated terminal
-   admission.
+6. charges the causal delivery budget only for a newly accepted input;
+7. appends the immutable `EventInput` with source + transitive disclosure provenance and
+   current recipient disclosure principals; and
+8. returns the terminal accepted/deduplicated/proven-denied/authorization-unavailable result
+   used to advance or hold the subscription scan.
 
-A crash between 6 and 7 safely replays the same deterministic admission. There is no
-second pending-message database.
+Unsubscribe, Agent close, authority revocation or incompatible audience change committed
+**before** this transaction denies new admission. An EventInput committed first remains a
+factual existing input and is never retroactively rewritten; later audience broadening is
+still subject to the retained disclosure dependencies before a new viewer can see it. This
+is ordinary transaction-winner semantics, not a second queue/notification subsystem.
 
-Unauthorized/nonmatching concrete Events, including Events whose disclosure is not valid
-for the recipient's current audience, advance the private subscription scan just as they
-do for `events.read`; later authority restoration or audience narrowing never
-retroactively discloses the skipped interval. Recipient ACL broadening later is separately
-checked against every retained EventInput/content disclosure dependency before the new
-viewer is admitted.
+A crash after accepted input but before scan-position persistence safely replays the same
+deterministic delivery and deduplicates it. There is no second pending-message database.
+
+Only **proven** nonmatching/unauthorized concrete Events advance the private subscription
+scan just as they do for `events.read`. Authorization/disclosure evaluation is internally
+three-way even though no public enum is required:
+
+```text
+allow      -> candidate may be returned/admitted
+ deny       -> proven hidden/unauthorized; advance private scan without disclosure
+ unknown    -> authority/dependency/store unavailable or indeterminate; DO NOT advance
+```
+
+A transient source-authorizer, group/security, disclosure-dependency or placement lookup
+failure is `unknown`, not denial. `events.read` returns the retryable
+`authorization_unavailable` result above without moving its cursor beyond that candidate. A
+durable subscription or Handler leaves its scan position at that candidate and retries with
+bounded backoff/wake-driven scheduling rather than hot-looping. This creates intentional
+head-of-line blocking for that ordered consumer. If retention eventually overtakes the
+blocked position, the existing `lagged` semantics take over; the Event is never silently
+skipped as though authorization were denied. Later authority restoration after a **proven denial** does
+not retroactively disclose the skipped interval. Recipient ACL broadening is separately
+checked against every retained EventInput/content disclosure dependency before a new viewer
+is admitted.
 
 A subscription whose recipient Agent enters `closing` is generation-fenced and removed/
 tombstoned equivalently to `enabled=false` by Agent lifecycle ownership; live subscription
@@ -4956,7 +5797,9 @@ disclosure.
 ### 26.6 One shared durable implementation
 
 The existing immutable `commit_log` is the durable ordering/history owner for DL-200
-Events. Do not create another Event database. The section 26.2 Event replay floor is a
+Events **within one authoritative Event store**, including multiple authorized Domains
+resident in that store. Do not create another Event database or pretend independent remote
+stores share one ordered scan position. Cross-store federation is deferred, not implicit. The section 26.2 Event replay floor is a
 logical Event-read/consumer availability contract; it is **not** authorization to prune
 non-Event commit/audit/recovery history that another store owner still retains. Event
 projection/index compaction and core commit-log retention remain separate concerns.
@@ -4967,6 +5810,7 @@ Generalize the current Job Event code by **splitting its responsibilities**:
 EventSourceState
     exact concrete source
     next source-local event_rev
+    delivery_cutover_rev?      // first revision whose delivery owner is DL-200
 
 commit_log
     immutable factual Event envelope + global private scan position
@@ -4975,21 +5819,64 @@ commit_log
 event_projection_index
     rebuildable parsed subject columns keyed by commit_log position
 
+event_projection_state
+    StoreId + RestoreGeneration       // existing StoreScope for indexed history
+    current index generation
+    indexed_through_commit_position   // contiguous, gap-free safe prefix
+
 event_subscriptions_current
-    recipient-owned normalized patterns + generation + scan position
+    recipient-owned normalized patterns + StoreScope + selector placement generation
+    + subscription generation + scan position
 
 event_read_cursors_current
-    opaque reader/pattern -> private scan position
+    opaque reader/pattern + StoreScope + selector placement generation
+    -> private scan position
 ```
 
+The single private **EventScan** mechanism under `events.read`, Agent subscriptions and
+EventHandlers performs bounded ordered projection scans, checks `StoreId + StorePos`
+affinity/placement and contiguous indexed-through progress, then checks source visibility
+**before** deeper disclosure dependencies. It yields one of: preliminary authorized
+candidate, proven skip, blocked/unknown, stale or end. It owns neither Handler execution
+nor EventInput admission, output projection, acknowledgment or cursor-progress commit;
+those remain in the distinct consumers and their existing owners. Every candidate must be
+revalidated at the consumer's final publication/disclosure transaction, including held
+external authority evidence. A blocked public response remains candidate-oblivious. Reuse
+one opaque cursor-envelope validator for Event readers, subscription/Handler positions and
+Jobs pages; retain their distinct scan algorithms and disposition rules. This is an
+internal pure/transaction-helper boundary, not a new Event worker or queue.
+
+The shared EventScan and all Event reader/subscription/Handler positions check
+`StoreScope` before advancing. On authoritative same-Store backup restore, old
+incarnation cursors fail stale; durable consumers reconcile or become lagged until
+explicit safe rebaseline. An index from the restored image may be validated/rebuilt
+from its restored authoritative commit log, but cannot silently claim coverage across
+the incarnation change. No new store ID/epoch or replay log is introduced.
+
 `event_projection_index` is an index/projection only; deleting/rebuilding it never
-deletes Event truth. Reuse the existing `commit_log.event_id` as stable `Event.id`. Do not
-stuff a potentially 2048-byte canonical resource ref/subject into legacy
-`commit_log.entity_id` (currently a compact internal identifier with a smaller bound): a
-DL-200 Event row stores its bounded canonical subject/data/provenance envelope in
-`payload_json`, while `kind/entity_type/entity_id` remain compact internal classification/
-index metadata. Existing historical commit rows are not rewritten; rows that have no
-DL-200 Event projection are simply skipped by the Event index/scanner.
+deletes Event truth. Its correctness contract is nevertheless **gap-free progress**:
+readers/subscriptions/Handlers may never advance a durable scan position beyond
+`event_projection_state.indexed_through_commit_position`. That watermark advances only
+across a contiguous commit-log prefix for which every DL-200 Event row has its deterministic
+projection entry (non-Event commit rows are explicitly classified/skipped). If an Event row
+is missing at/below the watermark, treat the projection as corrupt/unavailable and do not
+advance any consumer.
+
+For newly authored DL-200 Events, write the Event envelope and its projection row in the
+same authoritative store transaction whenever practical; advance the contiguous watermark
+only when no preceding gap exists. Recovery/backfill scans `commit_log` in order and moves
+the same watermark forward only after each prefix is complete. During a rebuild, consumers
+whose desired position is beyond the safe watermark wait/fail temporarily **without
+advancing or fabricating an empty page**. A rebuild may use a fresh internal index generation
+and atomically publish its safe prefix; it is not a second Event log/service.
+
+Reuse the existing `commit_log.event_id` as stable `Event.id`. Do not stuff a potentially
+2048-byte canonical resource ref/subject into legacy `commit_log.entity_id` (currently a
+compact internal identifier with a smaller bound): a DL-200 Event row stores its bounded
+canonical subject/data/provenance envelope in `payload_json`, while
+`kind/entity_type/entity_id` remain compact internal classification/index metadata. Existing
+historical commit rows are not rewritten; rows that have no DL-200 Event envelope are
+classified as non-Events and skipped by the indexer without creating a gap.
 
 Source lifecycle fields such as current Agent settled/result state remain with their
 resource owner, not in the generic Event service.
@@ -5006,21 +5893,62 @@ never durable Event truth.
 
 The current `agent_job_event_sources` rows mix three concerns: source Event revision,
 exact-source subscriptions, and copied pending deliveries. Migrate them without running
-two long-lived Event runtimes:
+two delivery owners for the same Event revision.
 
-1. start committing DL-200 Event envelopes for newly authoritative transitions while
-   retaining the old rows as compatibility state;
-2. translate each exact legacy rule into one exact normalized recipient subscription at
-   a baseline that cannot replay older source history;
-3. convert each already-pending legacy delivery once using a deterministic migration
-   EventInput ID; retain its old queue/steer/interrupt mode only as a one-time host
-   scheduling hint/provenance, never as a new public Event field;
-4. preserve the source's next `event_rev` so revision continuity is not reset;
-5. once all pending compatibility deliveries are acknowledged/drained and restart proof
+Cutover is serialized by the **existing source Event owner**. Inside that source-owner
+cutover transaction set, exactly:
+
+```text
+delivery_cutover_rev = current next_event_rev
+```
+
+before releasing the source owner. `delivery_cutover_rev` is therefore the first source-
+local Event revision whose delivery belongs exclusively to DL-200. Because one source
+transaction may emit several Event names at the same `event_rev`, the **entire revision** is
+owned by one side; individual Event names within a revision are never split across legacy
+and DL-200 delivery:
+
+```text
+event_rev <  delivery_cutover_rev  -> legacy delivery owner only
+ event_rev >= delivery_cutover_rev  -> DL-200 Event delivery owner only
+```
+
+The same cutover transaction reads the current `next_event_rev`, records that exact value as
+`delivery_cutover_rev`, installs/translates the DL-200 subscriptions/baseline needed for
+that revision and later, and fences the legacy admission path from accepting the cutover
+revision or later **before releasing source-owner serialization**. Event envelope projection
+may be introduced earlier for compatibility/inspection, but delivery ownership is determined
+only by this source-owner cutover revision, so envelope dual-writing cannot double-admit an
+Event.
+
+Migration then:
+
+1. classify legacy pending/accepted deliveries only for revisions **before** the cutover;
+2. accepted legacy Agent Inputs keep their original factual identity and are **never
+   re-admitted or re-minted**. Migration attaches one immutable compatibility disclosure/
+   provenance sidecar keyed by that existing input/fact identity. Derive the narrowest exact
+   source Event/resource dependency, already-disclosed audience and policy evidence available
+   from the legacy delivery. If complete reconstruction is impossible, attach a conservative
+   `legacy_protected`/source-root authority dependency whose ceiling preserves the already-
+   valid historical audience but causes any future audience expansion/fork/share check to
+   fail closed unless current source authority can explicitly authorize it. Missing legacy
+   provenance is never interpreted as unrestricted/declassified content;
+3. each genuinely pending, not-yet-accepted legacy delivery is converted at most once using
+   a deterministic bridge EventInput identity derived from the legacy delivery identity;
+   retain its old queue/steer/interrupt mode only as a one-time host scheduling hint/
+   provenance, never as a public Event field;
+4. post-cutover source revisions are delivered only through DL-200 subscriptions;
+5. once all pre-cutover compatibility deliveries are acknowledged/drained and restart proof
    is green, stop writing the old subscription/pending JSON and contract it later.
 
-The same deterministic input admission makes upgrade/restart replay safe. There is never
-a second semantic Event bus.
+The compatibility sidecar is migration provenance owned with the existing AgentInput/history
+fact, not a second Input or grant service. Historical readers within the already-valid
+legacy audience continue to see the factual Input; future audience expansion is governed by
+the reconstructed/conservative DisclosureManifest ceiling.
+
+Crash/restart simply rereads `delivery_cutover_rev` and the legacy delivery's factual
+accepted/pending state; it never guesses which path owns a revision. There is never a second
+semantic Event bus or a migration service.
 
 ---
 
@@ -5063,7 +5991,11 @@ jobs_get(
 Compact status/observation.
 
 `rev + wait_ms` means "I already observed this owner revision; wait efficiently for
-it to change, then reauthorize and reread."
+it to change, then reauthorize and reread." Use the authoritative Agent/Process/Graph
+owner's notification and a **register-then-recheck** revision sequence; never busy-poll
+Session/branch listings every 10 ms. Canonical Agent refs resolve through indexed exact
+Agent ownership. `jobs_list` uses indexed, cursor-bounded ordered exposure reads with
+per-row current authority, not full per-principal Session/branch scans and sorting.
 
 ### 27.3 `jobs_read`
 
@@ -5509,273 +6441,71 @@ source.
 
 ---
 
-## 30. Architectural invariants
+## 30. Normative invariant index
 
-1. Model-facing Jobs remain exactly six tools; durable Agent reaction is generic
-   `events_subscribe`.
-2. Host change observation uses the shared `events.read` stream rather than
-   resource-specific watch/long-poll APIs.
-3. Exact forks structurally share immutable history; they do not copy prior Turns.
-4. Agent is the public security/history/execution envelope; there is no public AW Session
-   resource or `session.*` API.
-5. Fresh and exact-history-fork construction use one host `agent.create(from=...)`
-   primitive; every exact fork creates a new globally addressable Agent.
-6. Exact forks preserve inherited identity/content/provenance.
-7. Redaction/anonymization creates a new projected HistoryBase, not an exact fork.
-8. Agent access uses one allow-only ACL over user/group principals.
-9. Groups are explicit reusable user sets; no implicit groups and no nesting in v1.
-10. Direct-user and group grants may coexist; effective permissions are an allow-only
-    union.
-11. Group-owned Agents are explicit team co-ownership; group management remains separate
-    from Agent management.
-12. Agent ACL/principal/security metadata stays outside PrefixContentKey unless actually
-    model-visible.
-13. Cache reuse is optimization, never authority.
-14. New Agents created from inherited history mint fresh ACL/security state.
-15. Active Turns, finite Job runtimes, watches and staged input drafts are never copied
-    into a history fork.
-16. Checkpoint identity is immutable history + immutable named SourceSet, never `rev`.
-17. Checkpoint restore is non-destructive, recreates the full captured SourceSet in a new
-    Sandbox and creates a new Agent.
-18. Settled Turn boundaries are reusable fork/cache seed points.
-19. Fanout needs no new API; repeated `agent.create(from=...)` calls structurally share
-    immutable history, and derive the same cache identity only when their effective
-    model-visible profiles are also identical.
-20. Recursive subagents use the same Agent constructor, Sandbox composition and existing
-    delegation limits.
-21. System and Agent-emitted notifications are one Event concept: bare Event names are
-    system-owned and `#name` is custom, so Agents cannot forge system Events.
-22. `jobs_send` remains the directed-input path; `events_publish/events_subscribe` are
-    source-scoped Event publication/reaction, not a bulk message transport.
-23. One lower Agent/history/Event owner model serves model tools, host APIs and recursive
-    delegation.
-24. Agent `rev` is owner-local; referenced group/security changes never cause fanout
-    writes to every Agent and are revalidated through independent access generations.
-25. The immutable `commit_log` is the one Event history/order owner; Event indexes,
-    cursors, subscriptions and durable consumer positions are projections/current state,
-    not another Event log.
-26. Event patterns never grant authority; every concrete read/delivery is authorized at
-    the exact resource and recipient boundaries.
-27. `i:<principal>` is one Domain handle namespace across user/group kinds; kind is
-    metadata, never a second public identifier grammar.
-28. Project is a principal-scoped public view over existing Workspace backing in v1;
-    DL-200 does not duplicate Workspace truth into a parallel Project service.
-29. Checkpoint SourceSet is typed and plural. Git is the mandatory first SourceDriver;
-    every driver must provide immutable fail-closed capture/restore semantics and there
-    is no generic archive snapshot fallback.
-30. Host staged input state owns `inputs_rev`; only Send crosses into Agent runtime
-    custody and Agent `rev`.
-31. History ancestry, Sandbox ancestry and Vault authority are orthogonal; none grants
-    the others.
-32. A Sandbox is logical mutable execution state, not a persistent OS namespace; each
-    Process receives fresh platform containment from current state + authority.
-33. Multiple Agents may share one Sandbox while retaining different Sandbox/Vault
-    authority.
-34. Checkpoints capture SourceSet state, never live Sandbox/Vault authority or secret
-    material.
-35. Extension is only the installed composition unit; ExtensionRegistry and its typed
-    subregistries register contributions but own no second authority/runtime.
-36. View is a namespaced bounded read-only pull facet; rich product data remains owned by
-    the embedding product.
-37. Durable EventHandlers consume the same `commit_log` at-least-once; they are not a
-    second Event bus and public `events.read` retention is not the product-indexing
-    contract.
-38. Agent-local extension State is bounded, namespaced and non-model-visible by default;
-    stored State/seq stays outside HistoryBase and Agent `rev` and is not inherited across
-    forks, while exact State-derived bytes explicitly projected to the model participate in
-    PrefixContentKey like any other model-visible context.
-39. Actions are explicit host/user operations; slash commands, shortcuts, buttons and RPC
-    bindings never create alternate mutation owners.
-40. `ctx.tools.set_visible` only selects among registered/currently authorized Tools; it
-    never manufactures Tool grants.
-41. Provider-sensitive interception uses ProviderHook; Process interception uses
-    ProcessHook, and extension execution always remains inside Sandbox/Jobs authority.
-42. Hook stages are interceptable in-flight boundaries only (`Turn/Step/Input/Context/Tool`);
-    committed Event/lifecycle observation uses EventHandler/AW Events, and Prompt/Signal
-    hook aliases do not exist.
-43. Native and dynamic Extensions feed the same ExtensionRegistry; process/WASM hosts are
-    runtime adapters, never parallel extension APIs or authority owners.
-44. The v1 dynamic ABI is the existing bounded stdio process direction generalized to one
-    active top-level callback plus scoped nested `ctx.*` calls; unsolicited child calls,
-    ambient credentials and blind retry after uncertainty are forbidden.
-45. V1 requires no npm/pip/cargo resolver, marketplace, embedded JavaScript runtime,
-    Wasmtime dependency or WIT world. WASM remains an optional later ExtensionHost.
-46. Parent/delegation lineage, namespace placement and immutable-history ancestry are
-    distinct; lineage never grants visibility, and exact history forks never fabricate
-    destination-local Job/Node runtimes for inherited historical work.
-47. HistoryBase identity contains immutable history/provenance only. PrefixContentKey is a
-    derived invocation projection, and lazy HistoryBase sealing/indexing is idempotent
-    internal memoization that never advances Agent `rev`.
-48. Public resource handles keep the canonical ExecutionRef grammar. Event routing uses a
-    reversible canonical token encoding (including `%2E` for literal `.`) rather than
-    weakening resource handles or ambiguously splitting tokens.
-49. Checkpoints retain exact SourceBinding layout metadata plus immutable source anchors;
-    every live Git checkpoint pins clean or dirty commit objects independently of user
-    branch reachability, and submodule contents require their own SourceBinding when they
-    must be retained.
-50. Agent->Sandbox binding is immutable in v1. Sandbox lifecycle is `open|closed`, source
-    rebinding is quiescent/all-or-nothing, and SandboxGrant/VaultGrant authority remains
-    actor-sensitive and independently revalidated.
-51. Vault projection kinds are provider/host-defined safe profiles, not arbitrary mount/env
-    injection. Grant removal governs future projections and never claims retroactive
-    erasure from already-running Processes.
-52. Disclosure dependencies are immutable transitive provenance represented by internal
-    content-addressed DisclosureManifests. History, Events, EventInputs, protected
-    Resources/Views/tool results and model outputs cannot silently drop/declassify them.
-53. Event read, Agent delivery and durable Handler delivery all authorize the exact source
-    plus the Event DisclosureManifest. Durable Event causal root/hop/delivery budgets
-    survive replay/restart and cannot be reset by descendants.
-54. One authenticated mutation replay identity/fingerprint protects constructors/additive
-    mutations from duplicate retry. Same identity + changed semantics conflicts; uncertain
-    external effects remain Unknown/no-blind-retry. No second replay ledger exists.
-55. Multi-resource construction uses private prepare -> one atomic AW publication ->
-    reconciled cleanup. Half-restored/half-created Agents/Sandboxes/checkpoints are never
-    public, and caller-owned explicit resources are never rolled back on unrelated failure.
-56. Extension registries own definitions, not activation/grants. Runtime bindings are
-    scoped; typed handles stale only on their own registration/type/schema change, not an
-    unrelated root generation change.
-57. Dynamic process Extensions reuse the bounded existing stdio ABI with explicit absolute
-    executables, one callback scope, same-process re-entry rejection and bounded nested
-    capability calls; manifest declarations never manufacture authority or narrow an
-    untrusted Tool effect classification.
-58. Views are optional enrichment: no View failure can hide/fail an already-authorized core
-    snapshot. EventHandler registration is inert until explicit activation and suspended
-    handlers do not pin Event retention indefinitely.
-59. AW promises atomicity only within its own authoritative store. Product/Extension stores
-    such as Histate compose AW mutations through idempotent saga/outbox reconciliation,
-    never a hidden distributed transaction.
-60. `commit_log.event_id` is reused as Event.id; bounded Event subject/envelope data lives
-    in payload/projection fields rather than overloading legacy compact `entity_id`, and
-    Event replay retention never authorizes pruning unrelated commit/audit truth.
-61. Closed Agents are terminal execution objects but remain readable/shareable history
-    roots; execution-adjacent mutable surfaces freeze at closing while title/access/
-    checkpoint/history management may continue under their independent authority.
-62. Tool/operation availability and resource authority are conjunctive; a broad Jobs or
-    Extension capability never grants cross-resource discovery/control by itself.
-63. Shared Process settlement has one additional fact only: `Tree::{Empty,Live,Unknown}`.
-    Tree occupancy is independent from StopEvidence; a delivered kill never proves that
-    live contained work existed.
-64. `ProcessTerminal` is the single shared factual terminal value: physical `exit`, final
-    `Option<StopRecord>`, pre-cleanup `tree` and per-stream output metadata. Compatibility
-    outcome/status/completeness projections are derived rather than independently authored.
-65. Process settlement observes/cleans containment before final reap/drain, retries one
-    Unknown cleanup immediately while target identity is safe, and never hides unresolved
-    cleanup behind a successful drain. Unix must not signal a reused PGID; trustworthy
-    negative Linux observation requires correct namespace + complete procfs visibility.
-66. Conversational turn horizons are dotlink product/runtime policy, not AW Process
-    semantics. Dotlink uses ~30-minute checkpoint guidance and a 35-minute hard command
-    horizon only for runtime profiles that declare a bounded conversational turn.
+This section is deliberately an **index, not a second statement of the rules**. A contract is
+defined once in its owning section; if any summary, example, historical handoff or ADR differs,
+the owning section wins.
 
+- **Architecture law / locality / shared mechanics:** sections 0.1–0.3.
+- **Jobs identity, traversal, paging and control:** sections 2–10 and consolidated section 27.
+- **Owner revisions, staged input and replay/publication:** sections 12, 15–17.
+- **Checkpoint, SourceDriver and reproducible source state:** section 18.
+- **History/fork/disclosure/cache/provenance:** sections 13 and 19–23.
+- **Principals, groups and Agent access:** section 24.
+- **Agent envelope / Session compatibility / Sandbox / Vault / Extensions / Process:** sections
+  25.1–25.11.
+- **Events, EventScan consumers, delivery, retention and migration:** section 26.
+- **Consolidated model/host APIs and legacy convergence:** sections 27–28.
+- **Examples:** section 29 is explanatory only; it creates no new contract.
+
+The non-collapsible distinctions in section 0.3 are the review checklist for attempted
+simplifications. Do not duplicate the full invariant set here.
 
 ---
 
-## 31. Resolved design items before seal
+## 31. Decision history
 
-The pre-implementation design questions are closed in this draft. They remain
-**unsealed** until explicit user review/approval.
+R1–R5 design-resolution history is preserved intact in
+[DL200-R1-R5-RESOLVED-DESIGN-CHECKLIST-2026-11-21.md](../../docs/DL200-R1-R5-RESOLVED-DESIGN-CHECKLIST-2026-11-21.md).
+It is historical evidence, not a second normative specification.
 
-1. **Cross-Agent HistoryBase/HistoryGrant storage/migration** — sections 19.2-19.3 define
-   immutable HistorySpan/Base/Grant links above the existing Session journal, lazy legacy
-   sealing, structural sharing and reachability GC. Session recovery remains the local
-   Turn/effect owner.
-2. **Owner-local Agent rev + group-driven ACL revision** — sections 12 and 24.5 keep
-   Agent `rev` strictly owner-local. Direct ACL edits bump it; group membership changes
-   only group `rev` and derived `access_generation`, with no Agent fanout writes.
-3. **Checkpoint SourceSet retention/restore semantics** — section 18 makes checkpoints
-   exact history + a plural named typed SourceSet. Git keeps the private-index synthetic
-   commit path; typed drivers admit versioned object/bucket manifests without a generic
-   archive fallback; multi-source capture is all-or-nothing and restore creates a fresh
-   Sandbox.
-4. **Model exact-fork default Project/access** — section 19.9 fixes the default to source
-   Project + inherited source direct ACL. Trusted host/delegation policy may narrow it;
-   redirect/broadening requires ordinary authority and is never model-selected.
-5. **Migration away from Session-audit-derived Agent rev** — section 25.1 defines
-   `agent_state_current`, one-time seed from the current bridge revision, then
-   transaction-owned persisted Agent rev independent from audit.
-6. **Generic Events substrate** — sections 26.3/26.6 make existing immutable
-   `commit_log` the single Event history/order, split source Event revision from
-   recipient-owned pattern subscriptions, and reuse deterministic Agent input admission.
-7. **Event bounds/disclosure/wildcards** — sections 3.3 and 26.1-26.5 fix grammar,
-   payload/read/subscription/causal limits, self-delivery suppression and exact
-   per-resource authorization. Bare names are system-owned; `#name` is structurally
-   custom, eliminating a reserved-name registry.
-8. **Event cursors/retention/authorization projection** — section 26.2 defines opaque
-   caller+pattern-bound cursors, hidden-row scanning, 24h idle cursor retention, the
-   7-day/65,536-row Event replay floor and `cursor_expired`; subscriptions use the same
-   floor and become explicitly `lagged`.
-9. **Legacy SDK observer/queue/process/pause/control convergence** — section 28.11 maps
-   every old semantic family to the canonical Jobs/Events/Agent-input/admission owners
-   while retaining lower Prepared/Unknown/CAS/no-retry facts.
-10. **Minimal Project/Principal/Domain metadata APIs** — section 24.7 defines only bounded
-    `list/get` host reads; Project is a principal-scoped projection of existing Workspace
-    backing rather than a second Project service.
-11. **Principal-kind storage under one `i:` namespace** — sections 24.1/24.7 define one
-    Domain principal registry keyed by a single handle across user/group kinds, with
-    group membership as an extension keyed by that same principal identity.
-12. **Unified Agent constructor** — sections 19/22/28 remove host `agent.fork`; fresh and
-    exact-history construction use `agent.create(from=...)`, while
-    `checkpoint.restore` remains the stronger exact history+SourceSet recovery API.
-13. **Logical Sandbox composition** — section 25.4 defines Project-base, shared, derived
-    and fresh Sandboxes independently from history, with per-Agent monotonic authority
-    and fresh physical containment for each Process.
-14. **Vault capability projection** — section 25.5 keeps secret values/provider lifecycle
-    out of Agent history/checkpoints while allowing revalidated broker/socket/file/env
-    projections through Agent-scoped VaultGrants.
-15. **Typed ExtensionRegistry composition / Pi parity / Histate seams** — sections
-    25.6-25.9 define one ExtensionRegistry with typed Tool/Hook/Action/Resource/View/
-    EventType/EventHandler/Provider/UI/Setting/State/Compactor/SourceDriver/SandboxDriver/
-    VaultProvider subregistries. Native
-    Rust registration preserves concrete types and returns typed handles; stable
-    Extension/local IDs + schema versions remain durable/wire identity and type erasure
-    occurs only at heterogeneous registry internals or real boundaries. Runtime callbacks
-    still use scoped `ctx.tools`, `ctx.state`, `ctx.ui`, etc. Histate keeps its durable
-    Build/Session/Decision/summary/semantic graph in its own typed store.
-16. **Custom Event namespace and inspection** — sections 3.3/26 use `e:#ready` for custom
-    Events, preserve NATS-style wildcard cardinality, expose stable Event identity for
-    provenance/idempotency and add bounded host subscription inspection without another
-    Event owner.
-17. **Minimal dynamic Extension host** — section 25.10 reuses/generalizes the existing
-    `aw-extensions` bounded stdio process ABI as the universal v1 dynamic host. TypeScript/
-    JavaScript is the first SDK, package installation stays with external ecosystems, v1
-    dynamic registrations are intentionally a safe subset of native registries, nested
-    child->host capability calls are bound to host-minted invocation scopes, and embedded
-    WASM/Wasmtime/WIT are deferred until real demand.
-18. **Fresh full pre-seal architecture audit** — the end-to-end audit hardened the design
-    across identity/privacy, revision ownership, exact history/fork identity, cache keys,
-    source/checkpoint retention, Sandbox/Vault revocation, mutation replay + atomic
-    publication, transitive disclosure manifests, Event token encoding/causal persistence,
-    commit-log compatibility, typed Extension activation/reload, dynamic process bounds,
-    State CAS, View failure isolation and Histate/product cross-store composition. The
-    audit removed public cache/revision/HistoryBase constructor knobs, resolved Graph-Node
-    cancel to reject in v1, and introduced no duplicate owner/service/runtime.
-19. **0.17.6 Process settlement adoption** — section 25.11 adopts only the reusable shared
-    facts learned from the release worktree: one `Tree` fact, per-stream completeness and
-    one `ProcessTerminal` truth with settlement-before-drain ordering. Platform observation
-    stays minimal; dotlink retains wire/log/success projection and its 30-minute advisory /
-    35-minute hard conversational runtime horizon. No new model or host API is introduced.
-
-The fresh **full pre-seal** contradiction/correctness/minimality review is complete and
-clean after the earlier naming, typed-registry and dynamic-host reviews. Live source/schema
-checks confirmed the current ToolBindingAuthority, Agent constructor replay, compaction
-projection, commit-log transaction and Job Event transaction seams can support the design
-without requiring parallel semantic owners.
-
-The subsequent 0.17.6 forensic review was folded in through section 25.11 with the smaller
-shared Process API above; no release-local semantic owner was restored.
+R6's proposed simplification is defined only by the current normative sections—especially
+0.1–0.3—and the phased implementation plan. Keep future rationale/alternatives in dated
+handoffs or ADR-style decision records rather than restating normative contracts here.
 
 ---
 
 ## 32. Seal
 
-DL-200 is **SEALED / IMPLEMENTATION PLAN READY — NOT PROMOTED**.
+DL-200 **R6 is SEALED / IMPLEMENTATION PROMOTED — PHASE 0 IN PROGRESS**.
 
-Explicit user approval to seal was given on **2026-11-20** in this conversation after the
-full pre-seal audit and the simplified 0.17.6 Process-settlement refinement.
+- R1 original seal: explicit user approval on **2026-11-20** after the full pre-seal audit.
+- R2-R4 amendment/reseals: 2026-11-21 prior Process/Event/replay/registry/construction/Jobs/
+  DisclosureManifest/store-recovery reviews.
+- R5 amendment/reseal: explicit user direction on **2026-11-21** to resolve the latest
+  external Event authority, supervisor-report, legacy-input-provenance, driver-startup,
+  Event-privacy/cardinality/descriptor and exact-cutover review cleanly in the plan.
+  **R5 is authoritative.**
 
-The phased implementation plan is
-[`IMPLEMENTATION.md`](IMPLEMENTATION.md). Sealing authorizes that plan to exist; it does
-**not** authorize source implementation, commit, push, release or deployment.
+**R6 seal (2026-11-21):** explicitly approved after the final live-owner review.
+Sections 0.1–0.3 consolidate the internal architecture into one-owner/store-local
+consistency, six descriptive roles, one `StorePos`, replay/Prepared and external-evidence
+rules, projection publication, opaque cursor validation, EventScan, durable DriverKey,
+typed registry staging and one required shared `aw-process` runtime. Section 25.11 renames
+`Tree` → `Occupancy` at the source cutover. The final review additionally fixed the
+implementation boundary: `ProcessTerminal` is the cross-host Fact while AW/dotlink retain
+their product receipt/output owners; hosts pass prepared commands by value; semantic weak-
+Unix negative occupancy maps to Unknown in `aw-process`; and transferable `aw-terminal`
+PTY custody remains a distinct Terminal resource rather than a second Process Job owner.
+The strong Linux PID-1 backend contract remains normative but its executable qualification
+belongs to the separately promoted launcher/backend gate. The public Agent/Jobs/Event/
+Sandbox/Checkpoint APIs, existing authoritative owners, seven phases and all R5 safety/
+retention/ACL/causal contracts stay unchanged. **R6 is authoritative; R1–R5 are historical
+design provenance.**
 
-Implementation begins only after a separate explicit user promotion, and may be promoted
-phase-by-phase. The frozen `017-sandbox-mount-convergence-2026-11-18` implementation remains
-outside this seal unless separately promoted.
+The phased implementation plan is [`IMPLEMENTATION.md`](IMPLEMENTATION.md). Source
+implementation was separately promoted by the user on 2026-11-21; Phase 0 is active.
+Commit, push, release and deployment remain separately gated. The frozen
+`017-sandbox-mount-convergence-2026-11-18` implementation remains outside this promotion
+unless separately promoted.

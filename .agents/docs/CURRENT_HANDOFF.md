@@ -1,12 +1,12 @@
 # CURRENT HANDOFF — AW live state + DL-200 design
 
 Canonical comprehensive handoff:
-[AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md).
+[AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md).
 
 Current copy-ready next-agent entrypoint:
-[AW-DL200-NEXT-AGENT-2026-11-20.md](AW-DL200-NEXT-AGENT-2026-11-20.md).
+[AW-DL200-R6-NEXT-AGENT-2026-11-21.md](AW-DL200-R6-NEXT-AGENT-2026-11-21.md).
 
-Sealed design specification:
+Active design specification (R6 sealed and authoritative):
 [`../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md`](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md).
 
 Phased implementation plan:
@@ -17,11 +17,33 @@ The previous
 is preserved and embedded verbatim in the new canonical handoff as historical
 implementation chronology. The dated 2026-11-19 017 handoff is likewise historical.
 
-**DL-200 is SEALED / IMPLEMENTATION PLAN READY / NOT PROMOTED. The fresh full pre-seal audit, simplified 0.17.6 Process-settlement adoption and phased `IMPLEMENTATION.md` are complete. No implementation source work begins until a separate explicit promotion.**
+**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R1–R5 remain historical design provenance. R6 was explicitly approved on 2026-11-21 after final live-owner review and is now authoritative. AW shared Process facts/direct observation are implemented in the current uncommitted worktree, but the `Tree -> Occupancy` cutover, weak-direct-Unix negative-to-Unknown correction, required `aw-process` extraction and real dotlink shared-owner compile remain Phase-0 gates. The Phase-0B replay/admission work is also in progress. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a requirement to thaw frozen sandbox work. This is not final Phase-0 acceptance.
+
+**R6 simplification seal (2026-11-21):** The canonical DL-200
+[README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md),
+[SPEC](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md),
+[IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
+and [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
+now contain a **review-ready, plan-only** R6 simplification pass. It standardizes one
+truth-source/one-mutation-boundary semantics, global identity with store-local consistency,
+existing StoreId **plus restore-generation-fenced StoreScope/StorePos**, a durable
+Prepared claim before any effectful external lease/reservation, shared replay/external-
+evidence/projection/cursor/EventScan/registry mechanics, and stable DriverKey plus
+artifact-specific schemas. **`crates/aw-process` is the chosen required Phase-0 crate**:
+one Agent-neutral async Scope/pipe/wait/stop/drain owner for AW and dotlink, with
+host-provided bounded output sinks and planned `Occupancy` naming. The normative SPEC
+is single-definition/indexed rather than repeating the R1–R5 invariant ledger; that history
+is preserved in [historical archive](DL200-R1-R5-RESOLVED-DESIGN-CHECKLIST-2026-11-21.md).
+R6 is the **sealed** implementation authority. Its final live-owner review also fixes the
+shared Process boundary: `ProcessTerminal` is the cross-host Fact; AW/dotlink keep their
+product receipt/output owners; prepared commands transfer by value into `aw-process`;
+weak direct-Unix negative containment maps to semantic Unknown; and `aw-terminal` PTY
+source-release/adoption remains a distinct Terminal resource. R6 is not yet implemented;
+source/test status above is unchanged. Commit/push remain separately gated.
 
 Author: coordinating design/implementation agent
 Owner: @pvl
-Updated: 2026-11-20
+Updated: 2026-11-21
 Source authority host: **L5 only**
 Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 
@@ -30,6 +52,176 @@ Canonical checkout: `/home/pvl/spaces/abird/src/aw`
 >
 > The November 15 comprehensive handoff is historical context for the Workspace
 > continuation. It is not the current Git-state record.
+
+## LIVE DL-200 checkpoint — original policy ToolCall replay, 2026-11-21
+
+Read `IMPLEMENTATION.md` Phase 0B for the owning contract and unresolved gates.
+The existing indexed `policy_admission_current` owner now finds accepted ToolCalls by
+immutable `(session, branch, Turn, call ID)` **before** resolving contextual refs or
+selecting current policy. The original operation+arguments fingerprint detects changed
+request identity, while mutable writer/policy/participation epochs remain admitted
+factual evidence. Exact replays retain the original canonical target after reparenting.
+A current participant `view` check gates replay lookup; fresh calls still require
+`submit` plus the real writer/tool/provider/payer authority. Reusing the same call ID
+for ambiguous legacy targets fails closed, and no additional replay ledger was added.
+
+Validation on L5: `aw-store --test store policy_admission` **2/2**; the filtered
+production `aw-cli` policy-operation router integration **1/1**; `cargo check`
+for AW Store/CLI green; strict affected all-target Clippy **green** after two
+behavior-preserving `needless_return` cleanups in the in-flight Unix Process
+observation code; policy-owner rustfmt and `git diff --check` green.
+
+Still open in Phase 0B: full participant-specific Tool/Provider/payer router
+qualification, current disclosure of cached remote effect payloads, lifetime-audit
+threshold/regression proof and the other concurrently implemented Phase-0B boundaries.
+Phase-0 dotlink projection/runtime horizon remains pending. No commit/push/release.
+
+## LIVE DL-200 implementation checkpoint — Phase 0A, 2026-11-21
+
+Current uncommitted AW implementation state:
+
+- added shared `Tree::{Empty,Live,Unknown}`;
+- `ProcessOutputMeta` carries per-stream completeness; aggregate completeness is derived;
+- `ProcessTerminal` now retains `exit + Option<StopRecord> + tree + output`;
+- `ProcessReceipt` now stores one ProcessTerminal directly; Outcome/completeness/status/stop
+  helpers are derived projections;
+- `PipeProcess` owns one private `Scope`; it no longer owns Child + PID + guard separately;
+- direct-host fallback is explicitly `aw_platform::DirectScope`: Linux prefers pidfd and falls back safely to the still-unreaped child PID plus process group; Windows owns duplicated leader HANDLE + Job Object; macOS owns child/group identity;
+- no public/free readiness API, no higher-layer disarm/release, and the bounded final retry is owned by DirectScope; Darwin EPERM is accepted as NoTarget only when the leader is terminal and remaining scope is proven empty;
+- Linux direct observation remains a fallback proof path (same PID namespace + unfiltered
+  procfs, zombies excluded, live threads counted), not the target architecture;
+- strong Linux target is a tiny AW PID-1 supervisor in a per-command PID namespace with
+  Bash/main command as PID 2, instantiated by a real host/Sandbox launcher when promoted;
+- Sandbox and Scope are explicitly orthogonal: Sandbox is the durable logical execution
+  environment; a fresh private Scope owns one Process lifetime. Unsandboxed/direct remains
+  first-class; a Sandbox may enable stronger containment without changing ProcessTerminal;
+- sandboxed does not imply PID namespace, Scope backend choice is private/host-owned, and
+  launch prefers prepare environment -> prepare Scope -> launch into Scope -> publish;
+- `Tree` is immutable pre-cleanup occupancy; cleanup never rewrites it. `Tree::Empty` is
+  backend-independent and means the full semantic Process scope is proven empty; direct
+  Unix negative group/procfs observation becomes `Unknown` whenever escaped descendants
+  cannot be excluded;
+- tree facts are not yet projected into compact result strings;
+- direct fallback settlement remains non-reaping where needed and settles scope before drain;
+- redirected background children are factually `Tree::Live` and are killed before drain;
+  inherited-pipe output now quiesces instead of timing out incomplete;
+- a launch requirement for closed descendant containment must reject before effects if no
+  closed backend is available; never silently downgrade to DirectScope;
+- PID-1 supervisor/report loss before the main-command exit fact yields
+  `ProcessExit::Unknown`; namespace cleanup never masquerades as the main exit or rewrites
+  Tree;
+- dotlink Bash/runtime-horizon/result projection is **next and not started**; dotlink must
+  consume the same shared Process lifetime owner/settlement semantics, not keep a parallel
+  guard/wait/reap runtime and merely copy fields.
+
+Focused green evidence below predates the latest stronger Tree qualification and is **not**
+Phase-0 acceptance. Two explicit implementation gates remain: current direct-Unix
+`Ok(false) -> Tree::Empty` semantic mapping must become Unknown for weak negative evidence,
+and the real dotlink consumer must compile against the shared Process owner without pulling
+the full Agent adapter solely for lifetime logic.
+
+Focused evidence:
+
+- affected shared crates compile, including `aw-platform-win`;
+- Unix managed-process tests 4/4;
+- aw-tools runner tests 4/4 with `full`;
+- strict affected all-target Clippy is green;
+- DirectScope tests 4/4 and adapter regressions green for redirected-background cleanup, inherited-pipe cleanup, external exit vs connector stop, external signal identity, cancellation, deadline and terminate-once/SIGTERM;
+- `git diff --check` clean.
+
+Workspace check note: low-parallel `cargo check --workspace` reached root `aw-cli` and hit
+two pre-existing Rust-2024 let-chain expressions in `src/subagents.rs`; those unrelated
+files were restored/left untouched and are outside this Phase-0A diff.
+
+Concurrent-work guard: `crates/aw-store/src/job_exposure.rs` became independently dirty
+during verification with substantial Job-exposure changes unrelated to Phase 0. It was
+not edited/reverted by this work and must be preserved.
+
+## LATEST DL-200 dependency/owner review refinement — 2026-11-21
+
+The external review was accepted with one stronger Process rule:
+
+- Phase 3 now lands the one private replay-safe prepare/publish/reconcile construction
+  primitive before `checkpoint.restore`; Phase 4 exposes/reuses it for host/model Agent
+  constructors rather than creating another path;
+- `Tree::Empty` retains its strong semantic Process-scope meaning. Weak direct-Unix negative
+  membership evidence is `Unknown` when escaped descendants cannot be excluded;
+- final typed leaf registries are introduced at first semantic use (`EventType` in Phase 2;
+  SourceDriver/SandboxDriver/VaultProvider in Phase 3) and Phase 5 composes those same
+  owners into ExtensionRegistry without migration/shadow registries;
+- dotlink must reuse the same shared Process lifetime owner and is behaviorally qualified,
+  not merely field-compatible;
+- nested Agents remain allowed within existing bounds, but direct/Agent-mediated/descendant
+  nested `batch` stays denied transitively while active Graph-node ownership exists. A later
+  independently admitted Turn after release regains ordinary top-level batch eligibility;
+- `agent_state_current` is authoritative durable Agent state after one-time **exclusive
+  store migration**: complete Agent+ACL seed and new owner/schema epoch activate atomically
+  under write exclusion; v1 has no online dual-write/catch-up. SessionStore remains
+  Turn/history owner and only Agent lookup/exposure indexes rebuild;
+- AW transaction commit is the sole constructor visibility point; post-commit wakes/caches
+  are reconstructible accelerators only;
+- replay owners compact full detail to minimal never-retry tombstones; replay without current
+  disclosure returns only minimal/opaque non-retry acknowledgement and never fresh effects;
+- Event cursors/subscriptions/Handlers bind StoreId + **authority-scoped** placement
+  generation: hidden Domains cannot perturb observable staleness; authorized cross-store
+  scope stales/lags explicitly and progress is revalidated at commit;
+- Event projection progress is fenced by one contiguous indexed-through commit position;
+  consumers never advance across a missing committed Event projection;
+- EventInput acceptance is the one delivery linearization point: subscription generation,
+  store affinity, current source/recipient/disclosure authority, dedupe and causal charge are
+  checked with input admission; unsubscribe/close/revocation races use transaction-winner
+  semantics. V1 Agent delivery requires Event/subscription/causal owner + recipient Input
+  owner in one transactional store; cross-store Agent delivery is rejected. Authorization is
+  source-first: proven hidden source skips privately without deeper manifest/provider work.
+  For an already-visible source, externally mutable disclosure authority must be immutable or
+  provider-fenced through acceptance; otherwise `events.read` returns candidate-oblivious
+  retryable `authorization_unavailable` with unchanged cursor and subscription/Handler holds
+  position with bounded backoff;
+- repeated `events.subscribe(..., enabled=true)` on an active same-subject row preserves
+  generation/baseline/backlog; lagged re-enable explicitly creates a fresh baseline;
+- v36 delivery migration sets `delivery_cutover_rev = current next_event_rev` inside the
+  serialized source-owner cutover; entire revisions are owned by one path. Already accepted
+  legacy Inputs retain identity and gain immutable compatibility disclosure/provenance
+  sidecars; incomplete provenance is conservative `legacy_protected`, while only pending
+  pre-cutover deliveries bridge once;
+- early leaf registries use the same private staged mutation primitive from first use, so
+  Phase 5 composes them atomically without wrappers/migration;
+- multi-resource constructors durably claim the existing operation receipt as Prepared
+  before the first external/materializing effect; **capture and restore share the same
+  prepared SourceDriver operation invariant**, with descriptor pinned to exact driver
+  registration + recovery schema. Named sources are bounded (default 128, hard 1024) and
+  durable descriptors are non-secret opaque IDs/digests/proofs/handles only. Crash/replay
+  inspects/reconciles that candidate instead of blindly repeating effects; live bindings/
+  checkpoints/unresolved descriptors block incompatible driver removal/reload, and store-open
+  validates persisted dependencies before source effects;
+- final publication revalidates all AW-store-owned source/destination/grant/ACL/lifecycle
+  authority **inside** the publication transaction and holds AW-owned source fences through
+  commit. External evidence must be immutable/non-revocable for the commit interval or a
+  provider-enforced fence/lease held valid through the entire AW commit; a pre-commit
+  `valid()` check is insufficient. Otherwise the operation stays Prepared/Unknown.
+  Revoke/replace-first denies; publish-first remains factual;
+- replay guarantees stable effect/created-resource identity rather than indefinite payload;
+  ToolCall tombstones follow retained Agent/history lifetime and host-RPC tombstones require
+  irreversible request-namespace retirement before deletion;
+- `jobs_list` is exposure-store-local and gap-safe. Page one captures publication high-water;
+  exact order/cursor key is `(publication_position DESC, canonical_ref ASC)`. A private
+  rebuild captures H and, under the final write/swap fence, must verify current head == H or
+  catch up `(H,current_head]` before activation; a stale replacement cannot erase newer
+  rows. A resumed tree
+  frontier is navigation only: every Agent ancestor gate is reauthorized and a now-hidden
+  parent discards its entire queued subtree even if a descendant is directly viewable;
+- DisclosureManifest is a persistent bounded-fanout content-addressed set/DAG: exact
+  provenance facts remain authoritative, while ordinary disclosure checks deduplicate over
+  structurally shared stable authority roots with bounded per-request work. An authority
+  root is dependency/maximum-ceiling identity only; it identifies the live policy/ACL/group/
+  provider owners to recheck and never caches current permission except for an explicitly
+  immutable export grant contract;
+- the future PID-1 report channel is unidirectional supervisor→host, command descendants
+  inherit no writable endpoint, and the host validates framing/launch identity/exactly one
+  terminal report so user code cannot forge ProcessTerminal facts;
+- Event read privacy promises no direct hidden identity/subject/exact-count/private-position
+  disclosure, not constant-time/constant-volume behavior; bounded scans may still permit
+  coarse aggregate traffic/timing inference.
 
 ## LATEST DL-200 design refinement — 2026-11-20
 
@@ -47,7 +239,7 @@ This section supersedes older DL-200 design summaries below where they conflict.
   Agent execution branch; it never enters Jobs/control `ExecutionRef` grammar;
 - Sandbox is logical mutable execution state. An Agent chooses one Sandbox at creation and
   does not live-rebind in v1; Agents can share one, branch one, or start fresh by creating
-  a new Agent; physical Process containment remains fresh per dispatch;
+  a new Agent; one fresh private Process Scope remains per dispatch;
 - named source attachment is only `sandbox.sources.list/set`; SourceRef never carries
   credentials, which remain Vault authority;
 - same Sandbox does not imply same authority;

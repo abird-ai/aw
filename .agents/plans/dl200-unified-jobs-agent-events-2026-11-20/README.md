@@ -1,216 +1,193 @@
-# DL-200 — unified Jobs, Agents, Events, History and Checkpoints
+# DL-200 — unified Agents, Jobs and Events
 
 Author: @pvl
 Co-authors: OpenAI GPT-5.6 Sol
 Owner: @pvl
 
-Status: **SEALED / IMPLEMENTATION PLAN READY — NOT PROMOTED**
-Opened: 2026-11-20
-Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
+**R6 SEALED (2026-11-21) / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.**
+R6 was explicitly approved for implementation checkpointing on 2026-11-21 after the
+final live-owner review. It keeps the public model/API/phases unchanged and tightens the
+internal ownership boundaries below. Commit/push/release/deploy remain separately gated.
 
-DL-200 is the successor design layer over the sealed DL-150 tool/runtime contracts.
+DL-200 succeeds the sealed DL-150 tool/runtime contracts. Its public resource model and
+seven-phase implementation sequence stay unchanged. R6 **removes repeated internal
+mechanics**; it does not add public resources, APIs, a new authority service or a global
+distributed transaction layer.
 
-It does **not** rewrite DL-150. It defines the next public/runtime architecture for:
+## Developer mental model
 
-- the simplified six-tool Jobs surface;
-- Agent as the public security/history/collaboration/execution envelope;
-- one global Domain/Principal/Project/Agent/Turn/Job/Node namespace;
-- user/group principal ownership and Agent ACLs;
-- one `agent.create(from=...)` constructor for fresh and exact-history forked Agents;
-- structurally shared immutable HistoryBase/HistoryGrant ancestry;
-- host staged input planning;
-- logical shared/derived/fresh Sandboxes independent from history;
-- Agent-scoped Vault grants for secret/service projection;
-- plural named typed SourceSets and source-aware checkpoints;
-- non-destructive checkpoint restore into a new Agent + Sandbox;
-- one generic NATS-style Event system for observation, publication and durable Agent
-  reactions;
-- one plain `Extension` unit registered through one typed `ExtensionRegistry`;
-- typed subregistries under that root: Tool/Hook/Action/Resource/View/EventType/
-  EventHandler/Provider/ProviderHook/ProcessHook/UI/Setting/State/Compactor registries plus
-  native SourceDriver/SandboxDriver/VaultProvider registries;
-- one small semantic vocabulary for the registered values: Hook, Handler, Action, Tool,
-  View, State, Resource, UI, Setting, Provider, Compactor, Driver and true Policy;
-- bounded View pull facets and durable EventHandler push handlers for embedding products
-  such as Histate;
-- one minimal dynamic Extension host: any explicitly selected executable speaking the
-  versioned AW Extension stdio protocol, with TypeScript/JavaScript as the first SDK;
-- WASM remains an optional later ExtensionHost behind the same registry contract rather
-  than a second extension API/runtime requirement.
+**One authoritative source for each semantic truth. Mutable truth has one Owner and one
+linearization point; immutable truth has one stable Fact identity; uncertain external work
+has one Operation custody.** Global names identify things; **consistency and total order
+belong to one authoritative store**. Everything derived is a capability, projection,
+bounded cursor or adapter—not competing truth.
 
-## Design
+| Public concept | What it owns or represents |
+|---|---|
+| **Agent** | Globally named collaboration/security envelope, history continuation and execution |
+| **Job** | Agent, Process or Graph work; Nodes belong to Graphs and Turns are an Agent timeline |
+| **Sandbox** | Durable logical mutable execution environment and named SourceBindings |
+| **Event** | Immutable source-scoped fact, ordered in one local Event store |
+| **Checkpoint** | Immutable history anchor plus exact captured named SourceSet (possibly empty) |
+| **Extension** | Installed typed definitions, never their runtime authority or activation |
 
-The public resource tree is:
+**Process Scope** is private: one dispatch lifetime. Sandbox answers *where/how* it may
+run; Scope answers *which processes belong to that lifetime*. Neither owns the other.
+Vault capabilities are separate grants, never Sandbox contents or checkpoint secrets.
+
+The public namespace remains:
 
 ```text
-/d:<domain>
-  /i:<principal>
-    /p:<project>
-      ├── /a:<agent>
-      │     /t:<turn>
-      │       /j:<job>
-      │         /n:<node>
-      └── /s:<sandbox>
+/d:<domain>/i:<principal>/p:<project>
+  ├── /a:<agent>[/t:<turn>[/j:<job>[/n:<node>]]]
+  └── /s:<sandbox>
 ```
 
-The Agent branch is the `ExecutionRef` hierarchy. `SandboxRef` is a distinct
-Project-level resource and never enters Jobs/control mutation APIs.
-
-`i:` is one user-or-group principal namespace.
-
-Agent is the public security/history/execution object. There is no public AW Session
-coordinate or `session.*` API. Existing SessionStore/session_id may remain internal
-persistence/recovery machinery during migration. A product such as Histate may still
-have its own product-level Session that references AW Agents/Sandboxes.
-
-Events project the same hierarchy to NATS-style dot subjects:
+`i:` is one user-or-group principal namespace. SandboxRef is not an ExecutionRef.
+The Event projection uses dot-separated canonical subject tokens, with reversible handle
+encoding and NATS-style single-token / terminal wildcards:
 
 ```text
-d:<domain>.i:<principal>.p:<project>.a:<agent>
-[.t:<turn>][.j:<job>][.n:<node>].e:<event>
+d:acme.i:alice.p:core.a:reviewer.e:changed   system Event
+d:acme.i:alice.p:core.a:reviewer.e:#ready    custom Agent Event
 ```
 
-with NATS-style wildcard cardinality/terminal semantics while preserving typed tokens.
-Literal handle payloads are reversibly encoded in Event subjects so existing canonical
-handles containing `.` remain one token (`foo.bar` -> `foo%2Ebar`):
+A global ref never confers visibility, Tool authority, disclosure, cross-store cursor
+ordering or an atomic multi-store commit. V1 cross-store Event→Agent delivery and
+cross-store ordered Jobs/Event traversal are explicitly unsupported; a product such as
+Histate composes stores through its own idempotent saga/outbox.
+
+## Public API, kept small
+
+Model Jobs uses exactly
+`jobs_list / jobs_get / jobs_read / jobs_send / jobs_ack / jobs_cancel`.
+`jobs_send` is directed Agent input or Process stdin/EOF; no queue/steer/interrupt
+send-mode variants or Jobs-only subscription API.
+
+Model Agent construction is `agent(task, from?)`, with one host
+`agent.create(from=...)` lower constructor for fresh/exact-history forks.
+`checkpoint.restore` uses that same constructor but additionally recreates the
+checkpoint's exact SourceSet in a **new** Agent and Sandbox. History ancestry,
+delegation lineage and Sandbox derivation remain distinct.
+
+Events use `events_publish` (custom `#name`) and `events_subscribe`; host/SDK
+exposes `events.read/subscribe/publish` and bounded subscription listing.
+Event subscriptions send typed EventInput to an Agent's existing Input owner; trusted
+EventHandlers consume the same log for product integrations. No Signals, topics or
+parallel Event bus.
+
+Host staged inputs use `list/add/edit/delete/send`; actual Send crosses the
+Agent Input admission boundary. Agent ACL is allow-only and user/group-based.
+Project remains a Workspace-backed view; there is no second Project database or
+public AW Session API. Extensions expose typed `registry.tools()/views()/...`;
+installed definitions never become grants without an explicit runtime binding.
+
+## Six internal roles, no base classes
+
+| Role | Truth/behavior | Example |
+|---|---|---|
+| **Owner** | Sole mutable authority and commit boundary | `agent_state_current`, Agent Input |
+| **Fact** | Immutable record of what happened | HistorySpan, commit-log Event, ProcessTerminal |
+| **Operation** | Durable replay/effect/recovery custody | Existing Prepared/Unknown claim |
+| **Projection** | Rebuildable index/derived view | Event subject index, Job exposure |
+| **Cursor** | Private bounded observation progress | Jobs high-water page, Event reader |
+| **Scope** | One Process lifetime | Private child/containment owner |
+
+Neither these role names nor their shared helpers become generic frameworks or new
+persistence owners.
+
+### Internal mechanics shared by real consumers
+
+| Mechanic | Canonical rule | Must **not** become |
+|---|---|---|
+| **`StoreScope + StorePos`** | Existing `store_id` + `restore_generation` fence `commit_log.seq` positions; a backup restore stales prior cursors | Global ordering or new Store identity |
+| **Replay / Prepared** | Original authenticated fingerprint, single effect, inspect Unknown, never blind retry | New replay ledger or policy-state replacement |
+| **`ExternalEvidence`** | Store-local authority at commit; external immutable proof or held provider fence through acceptance; else Unknown | Generic authorization engine, saved live credential |
+| **Projection publication** | Private generation, contiguous safe prefix, head verify/catch-up, atomic swap | Index becoming authoritative truth |
+| **Cursor envelope** | Caller, selector, Store affinity, revision/placement and progress checks | Universal cursor traversal engine |
+| **EventScan** | One source-first ordered scanner: candidate / proven skip / blocked / stale / end | Handler executor or Input scheduler |
+| **`DriverKey`** | Stable driver namespace/local ID only; each persisted binding/anchor/recovery artifact carries its own schema version | Separate driver database or one coupled schema clock |
+| **Registry staging** | Typed leaf definitions, local revision, immutable staged publication | Registry as policy/grant owner |
+| **`aw-process`** | Dedicated Agent-neutral async Scope, child, pipe, wait/stop/drain and terminal owner for AW/dotlink | Two guards hidden behind a wrapper |
+
+Keep `rev` (Agent/Process/Graph owner), `event_rev` (source-local), security/group
+generations, `inputs_rev` and output byte offsets separate from `StorePos`.
+A cursor is not authority. EventScan is not final authorization: the Agent Input owner
+rechecks subscription generation, current disclosure and causal budget atomically;
+Handlers retain at-least-once delivery and their own effect receipts.
+
+### Concrete crate ownership
 
 ```text
-a:* / s:* / p:* / i:* / d:* / e:*   exactly one token of that declared kind
->                              one-or-more trailing tokens, terminal only
+aw-tools                 host-neutral Jobs/Graph and ProcessTerminal/Occupancy facts
+aw-platform              synchronous, target-specific OS Process-scope operations
+aw-process               dedicated Agent-neutral async Scope + process/pipe lifetime,
+                         wait/stop/drain/settle; small bounded output-sink seam
+aw-store                 existing StoreId + restore_generation, StorePos, replay/Agent/
+                         Input owners, projection/cursor, EventScan and commit ordering
+aw-tools-adapter / host  AW tool policy, authorized launch, output storage and runtime binding
+dotlink                  aw-process consumer; MCP transport, output storage/logs,
+                         launch/profile and turn-horizon policy
+extension leaf owners    typed definitions + common staged registry publication
 ```
 
-System Event names are bare. Custom Agent Events are structurally prefixed with `#`:
+Dependency direction: `aw-process` depends only on minimal `aw-tools` facts,
+`aw-platform` and async primitives—not AgentCore, MCP, SessionStore or another Process
+owner. Hosts prepare an already-authorized command/environment and transfer that prepared
+command **by value** into `aw-process`; the shared crate owns lifecycle-sensitive finalization
+(containment setup, stdio ownership, spawn, child custody, wait/stop/reap and drain).
+Host adapters retain launch authorization, executable/Sandbox preparation, output
+storage/retention and bounded sink adapters. A blocked sink cannot hang cleanup or report
+dropped output as complete.
 
-```text
-e:changed
-e:settled
-e:#ready
-e:#tests_passed
-```
+`aw-process` owns DL-200 **Process/Job execution** lifetimes. `aw-terminal` remains the
+distinct Terminal/PTY custody resource because its reviewed source-release/adoption protocol
+can intentionally transfer child/PTY custody; that is not a second Process Job runtime and
+must not force release/disarm semantics into ordinary Process Scope. No second scheduler,
+transaction coordinator, cross-store Event merger or parallel Source/registry authority.
 
-There is no custom-only partial-token wildcard such as `e:#*`.
+## Implementation, no eighth phase
 
-## Key decisions
+| Phase | Coherent R6 work |
+|---|---|
+| **0 / 0B** | Rename `Tree` → `Occupancy`; create `aw-process` and converge AW/dotlink on one async Process/pipe lifetime; reuse replay/effect/external-evidence helpers with Prepared before external effects |
+| **1** | Authoritative Agent/ACL migration, existing StoreId + restore-generation scoped StorePos/cursor/projection helpers, immutable history and disclosure DAG |
+| **2** | One EventScan + consumer-specific read/Input/Handler completion, Event projection, cursor and EventType leaf |
+| **3** | DriverKey, recoverable capture/restore, Sandbox/Checkpoint/Vault owners and existing registry staging |
+| **4** | Jobs/Agent public cutover using shared cursor/StorePos/projection helpers; keep owner-specific tree traversal |
+| **5–6** | Compose typed leaf registries and dynamic Extensions; reuse the same Process owner |
+| **7** | Remove legacy compatibility paths, sync final status/handoffs, grouped cross-repo qualification |
 
-- Model-facing Jobs is exactly six tools:
-  `jobs_list/jobs_get/jobs_read/jobs_send/jobs_ack/jobs_cancel`.
-- `jobs_send` is directed Agent input or Process stdin/EOF only.
-- Agent queueing/steering/interruption belongs to the host input owner.
-- Host input staging is `list/add/edit/delete/send`.
-- `rev` is mutable owner-state version, never immutable-history identity or authority.
-- Referenced group membership changes do not fan out Agent `rev`; security revalidates
-  independent group/principal generations.
-- Fresh and exact-history fork construction use one host `agent.create(from=...)`
-  operation. Fork remains a semantic relation, not another constructor.
-- `checkpoint.restore` remains because it has a stronger contract: exact checkpoint
-  history **and** exact SourceSet are recreated in a new Agent + Sandbox.
-- Checkpoint = immutable history + immutable named typed SourceSet, possibly empty.
-- Git is the mandatory first SourceDriver. Clean Git uses exact commit OID; dirty Git uses
-  a hidden synthetic commit/tree built with a private index. Every live clean/dirty Git
-  checkpoint anchor has its own private retention ref so branch reset/rebase cannot GC it.
-- The SourceDriver contract also admits fail-closed immutable/versioned object/bucket
-  manifests without turning AW into a generic archive service.
-- Multi-source checkpoint capture is all-or-nothing at one fenced settled Agent boundary.
-- Sandbox is durable logical mutable execution state, not one persistent OS namespace.
-- An Agent selects one Sandbox at creation and does not live-rebind in v1. Agents may share
-  one, branch one structurally, or use a fresh Project Sandbox by creating a new Agent.
-- Named sources attach through only `sandbox.sources.list/set`; SourceRef is provider/
-  driver identity, while credentials remain Vault authority.
-- History ancestry and Sandbox ancestry are orthogonal.
-- Same Sandbox never implies same authority; per-Agent Sandbox/Vault/tool authority is
-  independently derived and revalidated.
-- Vaults are provider-backed secret/service capabilities. A Vault is never mounted
-  wholesale; selected entries project through provider/host-defined broker/socket/
-  ephemeral-file/env profiles, never arbitrary caller-chosen mount/env targets.
-- Checkpoints never contain Vault secrets, live leases or VaultGrant authority.
-- Exact history forks structurally share immutable HistoryBase/HistoryGrant links over
-  the existing Session journal and preserve attribution.
-- Model exact-history forks default to the source Project + inherited source ACL; trusted
-  host policy may narrow, never silently broaden.
-- HistoryBase identity is immutable history/provenance only. Prefix/cache identity is a
-  derived model-visible invocation projection and excludes Agent ACL/security identity
-  unless that metadata is actually projected to the model.
-- Agent access is one allow-only ACL over direct user/group principals.
-- `i:<principal>` is one Domain handle namespace; user/group kind is metadata.
-- Project is a principal-scoped public view over existing Workspace backing, not a
-  second Project database.
-- Events and prior Signals are one Event concept.
-- Bare Event names are system-owned forever; custom publication requires `#name`, so no
-  reserved-name registry or `aw_` prefix is needed.
-- Event patterns use the canonical resource namespace and NATS-style wildcards.
-- `events_publish` emits bounded custom `#...` Events from the current Agent.
-- `events_subscribe` is the model durable reaction API.
-- Host Event surface is `events.read`, `events.subscribe`, `events.publish` and bounded
-  `events.subscriptions.list`.
-- Existing immutable `commit_log` is the single Event history/order owner; subscriptions,
-  cursors, indexes, causal counters and durable handler positions are current projections,
-  not another Event log.
-- Events carry stable `Event.id`, causal root/hop and an internal immutable
-  DisclosureManifest ref where needed. Read, Agent delivery and durable Handlers all
-  reauthorize the exact source plus that disclosure closure; private scan positions stay
-  hidden.
-- No topic/channel creation, EventLink service or second durable Event bus/database.
-- Product data is not stuffed into arbitrary Agent metadata. Namespaced Views augment
-  authorized reads only when requested, and a View failure never hides/fails the core
-  authoritative snapshot.
-- Trusted durable EventHandlers may build permanent product projections/integrations over
-  the same commit log without depending on the finite public Event replay window.
-- Extension registries publish definitions; installation never means activation/grant.
-  Runtime `ctx.*` ports expose scoped current authority. Typed State uses per-key sequence/
-  CAS where snapshot-relative; cross-Agent/product graphs stay in the product's own store.
-- Commands/shortcuts/buttons converge on typed ActionRegistry entries; dynamic model Tool
-  exposure still uses scoped `ctx.tools` rather than a Loadout type.
-- Provider transport interception uses ProviderHook; Process launch interception uses
-  ProcessHook. Extensions do not receive raw credentials or an unsandboxed `exec` escape
-  hatch.
-- Histate owns Builds, product Sessions, Decisions/Evidence/summaries/semantic graphs and
-  commit classification; a product Session may reference many Agents/Sandboxes and a
-  product checkpoint may reference one/more AW Checkpoints. Cross-store mutation uses a
-  product-owned idempotent saga/outbox, not a hidden distributed transaction.
-- Dynamic Extensions reuse the existing `aw-extensions` process direction rather than an
-  embedded JS/WASM runtime: bounded full-duplex stdio + one registry manifest + scoped
-  `ctx.*` calls, absolute selected executables, no same-process re-entry, and bounded
-  nested calls. Node/Bun/Deno/Python/Rust/etc. can participate immediately.
-- AW does not own npm/pip/cargo installation or an extension marketplace in v1; the user
-  selects an already-installed executable/arguments.
-- Do not embed Wasmtime in v1 solely for extensions; a WASI extension may already run via
-  an external `wasmtime run ...` process speaking the same protocol.
-- One authenticated mutation replay identity/fingerprint protects constructors/additive
-  mutations without adding request IDs to every semantic API. Multi-resource creation uses
-  private prepare -> atomic AW publication -> reconciled cleanup; half-created resources
-  are never public.
-- Shared Process settlement adds only `Tree::{Empty,Live,Unknown}` plus per-stream output
-  completeness; `ProcessTerminal` remains the one factual exit/stop/tree/output result.
-- Dotlink alone owns the ~30-minute checkpoint guidance + 35-minute hard conversational
-  command horizon, result/log projection and non-login Bash policy; AW gains no turn API.
-- The existing `017-sandbox-mount-convergence-2026-11-18` plan remains frozen. DL-200
-  defines logical Sandbox/Vault composition only; lower mount/Bubblewrap implementation
-  still requires separate explicit promotion.
+Existing R5 constraints continue to apply: no nested `batch` while an Agent is owned by
+an active Graph node; same-store Event→Input admission; scoped causal budgets; disclosure
+manifest revalidation; no arbitrary mount/env injection; strong containment fails closed
+if required. No frozen 017 mount/config-v13 implementation is promoted here.
 
-## Read order
+R5's implemented Phase-0A code still spells the Process field `Tree`. R6 proposes
+`Occupancy::{Empty,Live,Unknown}` and `ProcessTerminal.occupancy` **in the source cutover**;
+dotlink retains its existing `tree="leftovers"|"unknown"` wire projection unchanged.
+Historical checks remain historical; the rename needs a fresh focused AW+dotlink gate.
 
-1. `../../docs/AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`
-2. `SPEC.md`
-3. `IMPLEMENTATION.md`
-4. `TODO.md`
-5. sealed DL-150 references under `../dotlink-tool-port/reference/`
-6. live source/tests before implementation.
+## Normative files and next handoff
 
-## References
+1. **`SPEC.md`** — normative contracts; section 0.1–0.3 is the single authority for shared
+   internal roles/semantics. Detailed owner contracts remain in their existing sections.
+2. **`IMPLEMENTATION.md`** — seven phases, implementation boundaries and grouped acceptance.
+3. **`TODO.md`** — short current work/approval gates; its design-resolution checklist is history.
+4. **`../../docs/AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md`** — current
+   comprehensive R6 context/chronology/next-agent handoff.
+5. **`../../docs/AW-DL200-R6-NEXT-AGENT-2026-11-21.md`** — copy-ready next-agent prompt.
+6. **`.agents/docs/`** — dated R1–R5 review history and release evidence.
+7. **Live source/tests** — outrank plans for claims of implemented behavior.
 
-- `../dotlink-tool-port/reference/DL150-LIVE-CA89F959-README.md`
-- `../../docs/UNIFIED-JOBS-AGENT-FINAL-HANDOFF-2026-11-14.md`
-- `../../docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`
-- `../../docs/AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`
+Historical references: `../dotlink-tool-port/reference/DL150-LIVE-CA89F959-README.md`,
+`../../docs/UNIFIED-JOBS-AGENT-FINAL-HANDOFF-2026-11-14.md`,
+`../../docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`, and
+`../../docs/AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`, and the
+[archived R1–R5 design checklist](../../docs/DL200-R1-R5-RESOLVED-DESIGN-CHECKLIST-2026-11-21.md).
 
-## Implementation gate
-
-DL-200 is sealed after the fresh full pre-seal architecture audit and the simplified
-0.17.6 Process-settlement adoption. The phased plan is `IMPLEMENTATION.md`.
-
-Implementation is **not promoted**. Until a separate explicit implementation promotion:
-
-- do not implement DL-200 source changes;
-- do not mutate the published 0.17 runtime merely to approximate the sealed design;
-- preserve current v36/current-main behavior;
-- keep sandbox/mount/config-v13 implementation frozen.
+**Design gate:** R6 is sealed and is now the normative DL-200 design. The prior separate
+implementation promotion remains in force for Phase 0. Do not report any R6 source behavior
+as implemented until the code and focused tests prove it. Work on L5 only, preserve unrelated
+changes, do not inspect `.agents/plans/ux/**`, and do not commit/push/release/deploy without
+separate user authorization.
