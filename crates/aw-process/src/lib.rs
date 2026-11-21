@@ -661,12 +661,18 @@ impl Process {
     }
 
     pub async fn terminate(&mut self) -> Result<ProcessResult> {
+        self.stop_with(StopReason::Cancelled).await
+    }
+
+    /// Host-requested semantic stop before wait ownership is consumed.
+    /// The shared runtime remains the only owner that signals/reaps the Process.
+    pub async fn stop_with(&mut self, reason: StopReason) -> Result<ProcessResult> {
         if !self.termination_available()? {
             return Err(Error::Conflict(
                 "Process already exited or had a termination attempt; inspect original receipt",
             ));
         }
-        let (stop, exit, occupancy) = self.stop(StopReason::Cancelled).await;
+        let (stop, exit, occupancy) = self.stop(reason).await;
         Ok(self.finish(exit, Some(stop), occupancy).await)
     }
 
