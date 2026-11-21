@@ -2,7 +2,7 @@
 
 Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
-Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION AMENDMENT SEALED / IMPLEMENTATION PROMOTED / PHASE-0 CORRECTIVE IMPLEMENTATION GATE PENDING**
+Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASE 1 UNDERWAY**
 
 ## Committed
 
@@ -12,6 +12,9 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION AMENDMENT SEALED / IMPLEMENTATI
       focused bounded-drain regression test only.
 - [x] dotlink source `16475e4` + handoff/main `fb1b7b9` — repinned to AW `7c16708`, real
       `aw-process` consumer cutover complete, old shell Process owner deleted.
+- [x] AW corrective R6/Phase-0 publication `20a63a4d4547cc20b2a154787823125b82f5e385`.
+- [x] dotlink R6 consumer/product-policy publication `85ceccc1088e201c98c994a46a68834440eeab32`,
+      atomically repinned to AW `20a63a4`; ordinary pinned qualification green.
 
 ## R6 design approval and real implementation queue
 
@@ -35,43 +38,17 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION AMENDMENT SEALED / IMPLEMENTATI
 
 **Next implementation slices (R6 sealed; no extra phase):**
 
-- [~] **Phase 0 shared cut accepted historically; corrective convergence pending** — `Occupancy`,
-      `crates/aw-process`, AW+dotlink consumption, no parallel Process guard/runtime, compatibility
-      `tree` projection and non-login Bash are live. The v0.17.7 Spawn Facility corrective gate is
-      separately pending as recorded below; old executable evidence remains valid for unchanged
-      semantics.
-- [~] **dotlink-main release convergence + product-policy + shared-Process consumer — source implemented locally; publication/repin + platform qualification pending.** Last audited release is exact **v0.17.9
-      `576d0a1`**; committed `81ef891..v0.17.9` diff SHA-256 `1aa632e3…`. Before the post-repin
-      consumer cut, re-diff the then-current release/0.17 from that tag and classify any new delta by
-      owner; never cherry-pick release runtime ownership.
-
-      Implemented locally on main against the existing AW pin: one `RuntimeSurfacePolicy` from
-      active transport constraints; 35m horizon - 10m report reserve = 25m/1500s bounded command
-      cap; current-surface `jobs_get.next`; startup/server guidance from the same constants; effective
-      cap in fresh execution authority; retained Job timeout immutable; AW receipt profile `ts=true`
-      with `checkpoint_minutes=None`. `created` remains Job-age/`elapsed_ms`; the absolute
-      `execution_deadline` is established at the canonical Running/Start checkpoint so queue,
-      preparation and output admission do not consume execution budget. Advice counts down from the
-      actual deadline only. No rendered-receipt parsing, duplicate canonical lifecycle, generic
-      callback/plugin or AW turn policy.
-
-      Consumer source is also implemented locally against the dirty AW checkout: dotlink's sole
-      `aw_process::Process::spawn` is async, passes the canonical Running deadline + level-triggered
-      Job cancellation through `SpawnControl`, and maps pre-spawn Cancelled/TimedOut to product
-      cancellation/timeout with `process_not_started=true` and **no ProcessTerminal**. Shared
-      settlement generalizes the old spawn-failure bit to the factual no-Process case without
-      inventing a second runtime owner.
-
-      Local evidence against local AW: shell **86/86**, Graph **13/13**, focused queued-lane
-      cancellation and pre-spawn-timeout projection tests, canonical spawn-refusal settlement, full
-      test-graph check, strict all-target/all-feature Clippy, fmt and diff-check green. The queued
-      cancellation test uses the real process-global Spawn Lane and proves the command never execs.
-      Validation used temporary local-path dependency substitution and restored Cargo.toml/Cargo.lock
-      byte-for-byte; the committed manifest still intentionally pins published `7c16708` until AW
-      publication/repin is authorized. Real Bubblewrap smoke was attempted with the opt-in enabled,
-      but L5's outer tool sandbox rejects `bwrap`'s `/proc` mount (`Operation not permitted`), so that
-      gate remains unavailable here rather than failed. Windows-native remains separately qualified.
-- [x] **Phase 0B COMPLETE locally** — existing policy/guardian/Remote Start owners now carry
+- [x] **Phase 0 shared corrective convergence published** — `Occupancy`, `aw-process`, the stable
+      Linux Spawn Facility/linearizable pre-spawn gate, strict child-terminal proof, stop/exit
+      reconciliation and Windows source correction are live in AW `20a63a4`; no parallel Process
+      owner was introduced.
+- [x] **dotlink-main v0.17.9 convergence + product policy + shared-Process consumer published** —
+      dotlink `85ceccc` pins AW `20a63a4`; exact release reference remains v0.17.9 `576d0a1`.
+      Ordinary pinned all-target/all-feature build, shell **86/86**, Graph **13/13**, queued real
+      Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical spawn refusal,
+      strict Clippy, fmt and diff-check are green. Real Bubblewrap worker-retirement and
+      Windows-native qualification were explicitly deferred by the user and remain follow-up evidence.
+- [x] **Phase 0B COMPLETE and published** — existing policy/guardian/Remote Start owners now carry
       original-invocation, actor, disclosure and lifetime replay correctness without a global replay
       database. Consumed AW policy rows compact only after a durable/effect recovery boundary into a
       <256-byte indexed tombstone while immutable audit retains full evidence; dotlink full Remote
@@ -79,9 +56,11 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION AMENDMENT SEALED / IMPLEMENTATI
       than deleting the authorization identity. Unknown outcomes remain tombstones. Long-lived
       admission no longer depends on Session-lifetime audit/event scans, and live capacities remain
       explicitly scoped to active Turns/subscriptions/exposures rather than retained history.
-- [ ] **Phase 1** — introduce `StoreScope` using existing `store_id` and
-      `restore_generation` plus `StorePos(commit_log.seq)` for cursor/projection helpers;
-      restore-stale old positions and finish Agent migration/history/disclosure without
+- [~] **Phase 1 UNDERWAY** — private `StoreScope` now reuses existing `store_id` + nonzero
+      `restore_generation`, and transparent `StorePos(u64)` carries internal `commit_log.seq` from
+      commit insertion through Job exposure projection without schema/public API churn. Coordination
+      reuses the same scope loader. Next: StoreScope-bound cursor/projection-head mechanics actually
+      needed by Agent migration/history/disclosure, then finish that Agent foundation without
       duplicate Session or revision ownership.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
@@ -122,17 +101,15 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
 - [x] Sandbox/mount/config-v13 implementation remains frozen.
 - [x] DL-200 R5 amendment/reseal recorded; R1–R4 retained as historical provenance.
 - [x] R6 design written across README/SPEC/IMPLEMENTATION/TODO and explicitly sealed;
-      Phase 0 remains in progress.
+      Phase 0 + 0B are published and Phase 1 is underway.
 - [x] `IMPLEMENTATION.md` updated for R6; implementation remains separately promoted on
       2026-11-21 and proceeds under sealed R6.
 - [x] R6 comprehensive handoff + copy-ready next-agent prompt created under `.agents/docs/`
       and wired as the canonical entrypoint from AW/dotlink CURRENT_HANDOFF.
-- [~] Phase 0 shared convergence was accepted against dotlink v0.17.6, but v0.17.7 exposed one
-      post-acceptance shared Process correctness gap: Linux `aw-process::Process::spawn` still
-      forks from the requesting Tokio worker, so thread-scoped `PDEATHSIG` launchers can receive
-      SIGKILL when that worker retires. Historical v0.17.6 evidence remains valid for unchanged
-      semantics, but the focused v0.17.7 corrective gate below must pass before Phase 1.
-- [~] Phase-0 shared Process/release-correction gate — **design SEALED / AW + DOTLINK CONSUMER SOURCE IMPLEMENTED LOCALLY 2026-11-21; publication/repin + real-Bubblewrap + Windows-native qualification pending**: one private logical Linux
+- [x] Phase 0 shared convergence corrective published after the v0.17.7 worker-retirement finding;
+      historical v0.17.6 evidence remains provenance for unchanged semantics, while the stable Spawn
+      Facility/launch-gate correction is live in AW `20a63a4` and consumed by dotlink `85ceccc`.
+- [x] Phase-0 shared Process/release-correction gate — **design SEALED / AW `20a63a4` + DOTLINK `85ceccc` PUBLISHED AND PINNED; real-Bubblewrap + Windows-native evidence explicitly deferred**: one private logical Linux
       Spawn Facility in `aw-process`, with O(1) fixed/add-only process-lifetime Spawn Lanes and
       **N=1 initially**, not one thread per Process. Spawn admission is async + bounded; only
       `Command::spawn` + exact `DirectScope` attach runs on a lane, while `Process: Send` remains an
@@ -156,8 +133,8 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       cancellation and expiry immediately before fork via a private linearizable launch gate.
       Cancelled/expired before `Launching` => no child, no ProcessTerminal/StopRecord/kill claim;
       once `Launching` wins, a real Process follows normal RAII/stop settlement. Spawn-lane queueing
-      consumes that same execution deadline; pre-Running product queue time does not. Repin dotlink
-      main and reuse the real Bubblewrap + Windows + stale-launch tests. No `spawn_blocking`/
+      consumes that same execution deadline; pre-Running product queue time does not. Dotlink main
+      is repinned; stale-launch tests are green while real Bubblewrap + Windows remain deferred. No `spawn_blocking`/
       `block_in_place` lifetime shortcut, local dotlink Process owner, launcher-process detour,
       generic spawn/pool framework, or thaw of frozen 017 sandbox/mount work. Local L5 evidence:
       aw-process 7/7; aw-platform-unix 18 executed + 1 explicit cross-UID ignore; aw-tools 126/126;
@@ -181,9 +158,11 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       uses HashMap lookup + amortized FIFO compaction (no lifetime O(n) scan), excludes payload-free
       tombstones from the active/full 4,096 receipt budget, and consolidated remote_start tests are
       16/16. Strict AW root + dotlink all-target/all-feature Clippy, test-graph checks, fmt/diff are
-      green. Remaining pre-Phase-1 blocker is now publication/repin plus platform qualification of
-      the already-implemented consumer: real Bubblewrap on a host that permits its mounts, and
-      Windows-native qualification.
-- [ ] Phase 1/4: exclusive Agent-state activation + exact indexed lookup, scalable live-authority-rechecked DisclosureManifest, store-local/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap catch-up and race-free revision waits.
+      green. Publication/repin is complete; real Bubblewrap and Windows-native qualification were
+      explicitly deferred by the user and no longer block Phase 1.
+- [~] Phase 1/4: StoreScope/StorePos foundation live; remaining work is exclusive Agent-state
+      activation + exact indexed lookup, scalable live-authority-rechecked DisclosureManifest, and
+      StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
+      catch-up and race-free revision waits.
 - [ ] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
 - [ ] Phase 3: bounded/non-secret symmetric capture/restore Prepared recovery descriptors + exact driver-schema pinning across store-open/restart + immutable/held-through-commit external publication evidence + publication-transaction authority fencing.

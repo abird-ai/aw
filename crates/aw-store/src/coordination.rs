@@ -1,4 +1,5 @@
 use super::{db, id, json, now};
+use crate::store_scope::StoreScope;
 use aw_agent_core::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -86,26 +87,6 @@ fn validate_scope(scope_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn store_identity(c: &Connection) -> Result<(String, u64)> {
-    let store_id: String = db(c.query_row(
-        "SELECT value FROM store_meta WHERE key='store_id'",
-        [],
-        |r| r.get(0),
-    ))?;
-    let generation: String = db(c.query_row(
-        "SELECT value FROM store_meta WHERE key='restore_generation'",
-        [],
-        |r| r.get(0),
-    ))?;
-    let generation = generation
-        .parse::<u64>()
-        .map_err(|_| Error::Storage("invalid restore generation"))?;
-    if generation == 0 {
-        return Err(Error::Storage("invalid restore generation"));
-    }
-    Ok((store_id, generation))
-}
-
 fn event(
     c: &Connection,
     process: Option<&ProcessIdentity>,
@@ -115,14 +96,14 @@ fn event(
     lease_generation: Option<u64>,
     payload: serde_json::Value,
 ) -> Result<()> {
-    let (store_id, store_generation) = store_identity(c)?;
+    let scope = StoreScope::load(c)?;
     db(c.execute(
         "INSERT INTO local_coordination_events(event_id,store_id,store_generation,process_id,kind,scope_kind,scope_key,lease_generation,payload_json,created_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             id("coord")?,
-            store_id,
-            store_generation,
+            scope.id().as_str(),
+            scope.restore_generation(),
             process.map(|p| p.process_id.as_str()),
             kind,
             scope_kind,
@@ -136,8 +117,8 @@ fn event(
 }
 
 fn validate_process_in(c: &Connection, process: &ProcessIdentity, at: i64) -> Result<()> {
-    let (_, store_generation) = store_identity(c)?;
-    if store_generation != process.store_generation {
+    let scope = StoreScope::load(c)?;
+    if scope.restore_generation() != process.store_generation {
         return Err(Error::Conflict(
             "store generation changed; stale local process is fenced",
         ));
@@ -196,7 +177,8 @@ fn register_process(
     process_kind: &str,
     heartbeat_ttl_micros: Option<i64>,
 ) -> Result<ProcessIdentity> {
-    let (store_id, store_generation) = store_identity(c)?;
+    let scope = StoreScope::load(c)?;
+    let store_generation = scope.restore_generation();
     let at = now();
     let expires_at = heartbeat_ttl_micros.map(|ttl| at.saturating_add(ttl));
     let process = ProcessIdentity {
@@ -226,7 +208,7 @@ fn register_process(
          VALUES(?1,?2,?3,?4,?5,?6,'active',?7,?7,?8)",
         params![
             process.process_id,
-            store_id,
+            scope.id().as_str(),
             store_generation,
             nonce,
             process_kind,
@@ -926,8 +908,9 @@ pub(crate) fn prepare_offline_cold_restore(
     expected_store_id: &str,
     expected_generation: u64,
 ) -> Result<u64> {
-    let (store_id, generation) = store_identity(c)?;
-    if store_id != expected_store_id || generation != expected_generation {
+    let scope = StoreScope::load(c)?;
+    let generation = scope.restore_generation();
+    if scope.id().as_str() != expected_store_id || generation != expected_generation {
         return Err(Error::Denied(
             "offline cold restore source Store identity/generation changed",
         ));
@@ -973,7 +956,11 @@ pub(crate) fn prepare_offline_cold_restore(
     // Store runnable. No migration, extra table, lease or new actor grant.
     db(tx.execute(
         "INSERT INTO store_meta(key,value) VALUES('cold_restore_quarantine',?1)",
-        [cold_quarantine_identity(&store_id, generation, next)],
+        [cold_quarantine_identity(
+            scope.id().as_str(),
+            generation,
+            next,
+        )],
     ))?;
     event(
         &tx,
@@ -1000,7 +987,8 @@ pub(crate) fn prepare_restore_snapshot(
         .checked_add(1)
         .ok_or(Error::Limit("restore generation exhausted"))?;
     let at = now();
-    let (store_id, copied_generation) = store_identity(c)?;
+    let scope = StoreScope::load(c)?;
+    let copied_generation = scope.restore_generation();
     if copied_generation != source_generation {
         return Err(Error::Storage(
             "restore staging snapshot generation changed during preparation",
@@ -1028,7 +1016,7 @@ pub(crate) fn prepare_restore_snapshot(
          VALUES(?1,?2,?3,?4,?5,?6,'active',?7,?7,?8)",
         params![
             next.process_id,
-            store_id,
+            scope.id().as_str(),
             next_generation,
             id("inc")?,
             process_kind,

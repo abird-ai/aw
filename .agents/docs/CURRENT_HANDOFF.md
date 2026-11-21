@@ -14,36 +14,40 @@ Normative R6 design:
 
 ## Current authoritative snapshot — 2026-11-21
 
-**R6 + the shared Process/release-correction amendment are SEALED. AW corrective Process source +
-dotlink v0.17.9 product-policy/controlled-Process consumer source are implemented locally and
-uncommitted. Phase 0B is COMPLETE locally. Publication/repin + real-Bubblewrap + Windows-native
-qualification remain before Phase 1.**
+**R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
+complete and published. Dotlink is repinned to the published corrective AW revision and the ordinary
+Git-pinned consumer gate is green. The user explicitly deferred real-Bubblewrap worker-retirement
+and Windows-native qualification, so Phase 1 is now underway.**
 
-Current refs:
+Current published refs:
 
 ```text
-AW HEAD      0d2dc10e20b62ebf0f064cdbc43615ae2d728ad7
-dotlink HEAD fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
-release/0.17 576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
-dotlink AW pin 7c1670821b15082821a0b9621cd1caccbe62f144
+AW R6/Phase-0 publication       20a63a4d4547cc20b2a154787823125b82f5e385
+dotlink R6 consumer publication 85ceccc1088e201c98c994a46a68834440eeab32
+release/0.17                    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
+dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
 
-Important publication-order state: current dotlink source uses the new local AW async Process API,
-but Cargo.toml/Cargo.lock intentionally still pin published `7c16708`. Ordinary pinned dotlink build
-therefore currently fails on the expected missing `SpawnControl` / async `Process::spawn` /
-pre-spawn error API. The source was validated green via temporary local-AW path substitution and
-Cargo files were restored. **Do not revert source to the old API.**
+Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
+**13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
+spawn refusal, strict Clippy, fmt and diff-check. Real Bubblewrap worker-retirement and
+Windows-native qualification remain explicitly deferred evidence, not claimed green.
 
-Phase 0B local closure includes replay disclosure, exact participant Provider/payer authority, AW
-policy admission post-boundary tombstones, dotlink Remote Start TTL tombstones, >8K audit-history
-qualification and O(1)/amortized replay owner behavior.
+Phase 1 first foundation slice is implemented in the current AW source: one private `StoreScope`
+loads the existing `store_meta.store_id` + nonzero `restore_generation`; transparent `StorePos(u64)`
+now carries internal `commit_log.seq` ordering through commit insertion -> Job exposure projection;
+public/persisted compatibility fields remain `u64`. Coordination reuses the same StoreScope owner
+instead of reparsing identity/generation independently. No schema, global clock, cursor engine or
+new service was added. Relevant evidence: StoreScope **2/2**, mixed Job exposure green,
+coordination **24/24**, strict all-target/all-feature aw-store Clippy/fmt/diff green.
 
-Next authorized sequence: publish AW -> repin dotlink -> re-diff release/0.17 from exact v0.17.9 ->
-rerun the consumer gate under the real Git pin -> real Bubblewrap worker-retirement on a suitable
-host -> Windows-native qualification -> review -> Phase 1.
+Next Phase 1 work: add only the private StoreScope-bound cursor/projection-head mechanics actually
+needed by Agent migration/history/disclosure, then implement the authoritative Agent-state migration
+and disclosure pieces from IMPLEMENTATION.md. Do not prebuild Phase-2/4 engines.
 
-No commit/push/tag/release/deploy unless explicitly asked. Use dotlink---l5 only; never touch
-`.agents/plans/ux/**`; 017 sandbox/mount/config-v13 remains frozen.
+The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
+separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017
+sandbox/mount/config-v13 remains frozen.
 
 > The dated sections below are preserved implementation chronology. When their old status wording
 > conflicts with the snapshot above or the canonical comprehensive handoff, the current snapshot +

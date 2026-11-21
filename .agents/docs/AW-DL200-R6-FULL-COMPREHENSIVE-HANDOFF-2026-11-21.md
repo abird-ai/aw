@@ -22,20 +22,19 @@ executed results outrank prose if anything conflicts.
 
 ### Current status in one paragraph
 
-DL-200 **R6 is sealed and authoritative**, including the later shared Process/release-correction
-amendment imported from dotlink v0.17.7–v0.17.9. The **AW corrective Process source is implemented
-locally and uncommitted**; the **dotlink v0.17.9 product-policy and async controlled-Process consumer
-source are also implemented locally and uncommitted**; **Phase 0B is locally complete**. Dotlink's
-manifest intentionally still pins the older published AW runtime `7c16708...`, so the current
-combined dotlink source **does not compile under its pinned Git dependency** until AW is published
-and dotlink is repinned. The consumer source was already validated successfully through temporary
-local-AW dependency substitution, and Cargo.toml/Cargo.lock were restored afterward. Remaining
-pre-Phase-1 work is therefore: explicit publication authorization -> publish AW -> repin dotlink ->
-re-diff release/0.17 from exact v0.17.9 -> rerun the already-green consumer gate under the real Git
-pin -> real Bubblewrap worker-retirement qualification on a host whose outer sandbox permits bwrap
-mounts -> Windows-native qualification -> review -> Phase 1.
+DL-200 **R6 is sealed, authoritative and published**, including the shared Process/release-correction
+amendment imported from dotlink v0.17.7–v0.17.9. AW published the corrective R6/Phase-0 source at
+`20a63a4d4547cc20b2a154787823125b82f5e385`; dotlink published the paired product-policy/async
+controlled-Process consumer at `85ceccc1088e201c98c994a46a68834440eeab32` and is pinned to that
+exact AW revision. The ordinary Git-pinned build, shell **86/86**, Graph **13/13**, real queued
+Spawn-Lane cancellation, pre-spawn timeout and spawn-refusal gates are green. Phase 0B is complete
+and published. The user explicitly deferred real Bubblewrap worker-retirement and Windows-native
+qualification, so those are follow-up evidence rather than a Phase-1 blocker. **Phase 1 is now
+underway**: its first local foundation slice introduces the private existing-store `StoreScope` and
+transparent `StorePos(u64)` and threads typed commit-log positions through the existing Job exposure
+projection without schema or public API churn.
 
-No commit, push, tag, release or deployment is authorized merely by this handoff.
+No tag, release or deployment is authorized merely by this handoff.
 
 ### Design status
 
@@ -45,8 +44,9 @@ No commit, push, tag, release or deployment is authorized merely by this handoff
   private mechanics/ownership/documentation.
 - The v0.17.7–v0.17.9 Process/release-correction amendment is part of sealed R6.
 - Broad architecture redesign should stop unless implementation evidence proves a real blocker.
-- Phase 0B replay/disclosure/provider/tombstone/lifetime work is locally complete.
-- Phase 1 has **not** started.
+- Phase 0B replay/disclosure/provider/tombstone/lifetime work is complete and published.
+- Phase 1 **has started** with the private StoreScope/StorePos foundation; Agent migration/history/
+  disclosure and StoreScope-bound cursor/projection mechanics remain.
 
 ## 1. Mandatory read order / authority order
 
@@ -1154,9 +1154,10 @@ ProcessTerminal appears. The artificial lane hold was reduced to ~250 ms after t
 version interfered with unrelated parallel timing tests; the original <900 ms assertions then pass
 unchanged.
 
-Validation used temporary local-path dependency substitution to the dirty AW tree and restored
-Cargo.toml/Cargo.lock exactly afterward. The current manifest still pins `7c16708`, so the ordinary
-pinned build correctly fails until publication/repin.
+Initial validation used temporary local-path dependency substitution and restored Cargo.toml/
+Cargo.lock exactly afterward. Publication is now complete: dotlink `85ceccc` pins published AW
+`20a63a4`, and the ordinary pinned all-target/all-feature build plus the named consumer gates are
+green.
 
 ### 10.5 real Bubblewrap and Windows gates
 
@@ -1248,9 +1249,13 @@ implemented locally. **Publication/repin + real-Bubblewrap + Windows-native qual
 
 ### Phase 1 — Agent identity/history/access foundation
 
-Not started. Next after the Process publication/repin/platform gate is reviewed.
+**Underway.** The first current-source slice introduces private `StoreScope` over the existing
+`store_id` + nonzero `restore_generation`, transparent `StorePos(u64)`, and typed commit-log
+position flow through the existing Job exposure projection. Public/persisted compatibility remains
+`u64`; no schema or generic cursor engine was added. StoreScope 2/2, mixed Job exposure,
+coordination 24/24, and strict aw-store Clippy/fmt/diff are green.
 
-Planned work:
+Remaining planned work:
 
 - `StoreScope`/`StoreId` + `StorePos(commit_log.seq)` cursor/projection helpers;
 - exclusive Agent+ACL owner activation;
@@ -1670,44 +1675,31 @@ Read first:
 11. dotlink/.agents/docs/CURRENT_HANDOFF.md
 12. live source/tests for every owner touched
 
-Current live refs at handoff creation:
-  AW HEAD:      0d2dc10e20b62ebf0f064cdbc43615ae2d728ad7
-  dotlink HEAD: fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
-  release ref:  576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
-
-Published dotlink AW pin remains:
-  7c1670821b15082821a0b9621cd1caccbe62f144
+Current published refs:
+  AW R6/Phase-0: 20a63a4d4547cc20b2a154787823125b82f5e385
+  dotlink R6:     85ceccc1088e201c98c994a46a68834440eeab32
+  release ref:    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
+  dotlink AW pin: 20a63a4d4547cc20b2a154787823125b82f5e385
 
 Important current state:
-- R6 + shared Process/release-correction amendment are sealed and authoritative.
-- AW corrective Process source is implemented locally/uncommitted and green.
-- dotlink v0.17.9 product-policy + async controlled-Process consumer source are implemented
-  locally/uncommitted and green only when validated against the dirty local AW source.
-- dotlink Cargo.toml/Cargo.lock intentionally still pin published AW 7c16708; ordinary pinned build
-  therefore currently fails on the new async API. Do not revert source to the old API.
-- Phase 0B is locally complete: replay disclosure, participant Provider/payer, AW policy tombstones,
-  dotlink Remote Start tombstones and lifetime-history qualification are done.
-- release/0.17 reference is exact v0.17.9 / 576d0a1 and read-only.
-- real Bubblewrap worker-retirement is unavailable on L5 because the outer sandbox rejects bwrap's
-  /proc mount; Windows-native qualification is also unavailable here.
+- R6 + shared Process/release-correction amendment are sealed, published and pinned.
+- Phase 0B is complete and published.
+- Ordinary pinned dotlink build, shell 86/86, Graph 13/13, stale-lane cancellation,
+  pre-spawn-timeout/no-Process and spawn-refusal consumer gates are green.
+- Real Bubblewrap worker-retirement and Windows-native qualification were explicitly deferred by the
+  user. They remain follow-up evidence; do not claim them green and do not block Phase 1 on them.
+- release/0.17 remains exact v0.17.9 / 576d0a1 and read-only.
+- Phase 1 is underway. Its first AW foundation slice introduces private StoreScope over the existing
+  store_id+restore_generation and transparent StorePos(u64), then threads typed commit_log.seq through
+  commit insertion -> Job exposure projection while preserving persisted/public u64 compatibility.
+- Relevant Phase-1 evidence is green: StoreScope 2/2, mixed Job exposure, coordination 24/24,
+  all-target/all-feature aw-store Clippy, fmt and diff-check.
 
-Do not redo already-complete source cuts.
+Do not redo already-complete Phase-0 source cuts.
 
-If the user asks to continue implementation without authorizing publication, only work on tasks that
-are genuinely unblocked and do not require pretending the old AW pin has the new API.
-
-If the user explicitly authorizes commit/publish/repin, the next sequence is:
-1. revalidate both dirty trees and exact release ref;
-2. commit/publish AW corrective source first;
-3. atomically repin all dotlink AW Git dependencies to that AW revision;
-4. re-diff release/0.17 from exact v0.17.9;
-5. run ordinary pinned dotlink build + the already-green shell 86/86, Graph 13/13, stale-lane
-   cancellation/pre-spawn-timeout/spawn-refusal consumer gates;
-6. run real Bubblewrap worker-retirement on a suitable host and Windows-native qualification;
-7. review; then begin Phase 1.
-
-Phase 1 starts only after that publication/platform gate is accepted. Phase 1 is the StoreScope /
-StoreId + StorePos / Agent migration-history-disclosure foundation described in IMPLEMENTATION.md.
+Continue Phase 1 from IMPLEMENTATION.md. Add only the StoreScope-bound cursor/projection-head
+mechanics actually needed by Agent migration/history/disclosure, then implement the authoritative
+Agent-state migration/history/disclosure foundation. Do not prebuild Phase-2/4 engines.
 
 Keep implementation turns around 30 minutes and checkpoint at the next coherent green point.
 Prefer simple owner-local Rust primitives, zero-cost/static abstractions and easy hot-path wins.

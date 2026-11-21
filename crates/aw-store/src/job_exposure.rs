@@ -6,6 +6,7 @@
 //! Agent lifecycle/history stay in SessionStore and finite lifecycle stays in
 //! JobManager.
 
+use crate::store_scope::StorePos;
 use crate::{
     agent_binding_in, context, db, durability, workspace_writer, AgentBindingInfo, Error,
     PrincipalId, Result, SessionStore,
@@ -148,7 +149,7 @@ fn project_agent(
     c: &rusqlite::Connection,
     session_id: &str,
     branch_id: &str,
-    position: u64,
+    position: StorePos,
 ) -> Result<()> {
     let binding = crate::agent_binding_unchecked(c, session_id, branch_id)?;
     let canonical_ref = root_ref(&binding);
@@ -172,7 +173,7 @@ fn project_agent(
             binding.project_handle,
             binding.session_id,
             binding.branch_id,
-            position,
+            position.get(),
         ],
     ))?;
     if changed != 1 {
@@ -183,14 +184,19 @@ fn project_agent(
     Ok(())
 }
 
-fn project_finite(c: &rusqlite::Connection, kind: &str, seq: u64, payload: &Payload) -> Result<()> {
+fn project_finite(
+    c: &rusqlite::Connection,
+    kind: &str,
+    seq: StorePos,
+    payload: &Payload,
+) -> Result<()> {
     let state = kind_state(kind)?;
     let position = match state {
         FiniteExposureState::Reserved => seq,
         FiniteExposureState::Published | FiniteExposureState::Released => {
-            payload.reservation_position.ok_or(Error::Storage(
+            StorePos::new(payload.reservation_position.ok_or(Error::Storage(
                 "finite Job exposure closure lacks reservation position",
-            ))?
+            ))?)
         }
     };
     let state = match state {
@@ -219,7 +225,7 @@ fn project_finite(c: &rusqlite::Connection, kind: &str, seq: u64, payload: &Payl
             payload.project_handle,
             payload.session_id,
             payload.branch_id,
-            position,
+            position.get(),
             state,
             payload.writer_epoch,
         ],
@@ -290,7 +296,7 @@ pub(crate) fn project_commit_event(
     entity_type: &str,
     entity_id: &str,
     payload: &Value,
-    position: u64,
+    position: StorePos,
 ) -> Result<()> {
     match (kind, entity_type) {
         ("session.created", "session") => {
@@ -342,7 +348,14 @@ pub(crate) fn backfill_current(c: &rusqlite::Connection) -> Result<()> {
     for row in rows {
         let (position, kind, entity_type, entity_id, encoded) = db(row)?;
         let payload: Value = crate::decode(&encoded)?;
-        project_commit_event(c, &kind, &entity_type, &entity_id, &payload, position)?;
+        project_commit_event(
+            c,
+            &kind,
+            &entity_type,
+            &entity_id,
+            &payload,
+            StorePos::new(position),
+        )?;
     }
     Ok(())
 }
@@ -716,7 +729,7 @@ impl SessionStore {
         db(tx.commit())?;
         Ok(FiniteExposure {
             canonical_ref: canonical_ref.to_owned(),
-            position,
+            position: position.get(),
             state: FiniteExposureState::Reserved,
             generation: generation.to_owned(),
             domain_handle: actual.domain_handle,

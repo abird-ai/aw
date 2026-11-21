@@ -32,45 +32,30 @@ Read first:
 11. dotlink/.agents/docs/CURRENT_HANDOFF.md
 12. live source/tests for every owner touched
 
-Current live refs:
-  AW HEAD:      0d2dc10e20b62ebf0f064cdbc43615ae2d728ad7
-  dotlink HEAD: fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
-  release ref:  576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
-
-Published dotlink AW pin remains:
-  7c1670821b15082821a0b9621cd1caccbe62f144
+Current published refs:
+  AW R6/Phase-0: 20a63a4d4547cc20b2a154787823125b82f5e385
+  dotlink R6:     85ceccc1088e201c98c994a46a68834440eeab32
+  release ref:    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
+  dotlink AW pin: 20a63a4d4547cc20b2a154787823125b82f5e385
 
 Important current state:
-- R6 + shared Process/release-correction amendment are sealed and authoritative.
-- AW corrective Process source is implemented locally/uncommitted and green.
-- dotlink v0.17.9 product-policy + async controlled-Process consumer source are implemented
-  locally/uncommitted and validated green only against the dirty local AW source.
-- dotlink Cargo.toml/Cargo.lock intentionally still pin published AW 7c16708. An ordinary pinned
-  build currently fails on the expected missing new async API (SpawnControl, async Process::spawn,
-  pre-spawn error variants). Do not revert consumer source to the old API.
-- Phase 0B is locally complete: replay disclosure, participant Provider/payer, AW policy tombstones,
-  dotlink Remote Start tombstones and lifetime-history qualification are done.
-- release/0.17 reference is exact v0.17.9 / 576d0a1 and read-only.
-- real Bubblewrap worker-retirement is unavailable on L5 because the outer sandbox rejects bwrap's
-  /proc mount; Windows-native qualification is also unavailable here.
+- R6 + shared Process/release-correction amendment are sealed, published and pinned.
+- Phase 0B is complete and published.
+- Ordinary pinned dotlink build, shell 86/86, Graph 13/13, real Spawn-Lane cancellation,
+  pre-spawn-timeout/no-Process and spawn-refusal gates are green.
+- Real Bubblewrap worker-retirement and Windows-native qualification were explicitly deferred by the
+  user; do not claim them green and do not block Phase 1 on them.
+- Phase 1 is underway. The first current AW slice adds one private StoreScope over existing
+  store_id+restore_generation and transparent StorePos(u64), and threads typed commit_log.seq through
+  commit insertion -> Job exposure projection while keeping persisted/public compatibility u64.
+- StoreScope 2/2, mixed Job exposure, coordination 24/24 and strict aw-store Clippy/fmt/diff are green.
+- release/0.17 remains exact v0.17.9 / 576d0a1 and read-only.
 
-Do not redo already-complete source cuts.
+Do not redo already-complete Phase-0 source cuts.
 
-If the user asks to continue implementation without authorizing publication, only work on tasks that
-are genuinely unblocked and do not require pretending the old AW pin has the new API.
-
-If the user explicitly authorizes commit/publish/repin, the next sequence is:
-1. revalidate both dirty trees and exact release ref;
-2. commit/publish AW corrective source first;
-3. atomically repin all dotlink AW Git dependencies to that AW revision;
-4. re-diff release/0.17 from exact v0.17.9;
-5. run ordinary pinned dotlink build + the already-green shell 86/86, Graph 13/13, real-Spawn-Lane
-   cancellation, pre-spawn-timeout and spawn-refusal consumer gates;
-6. run real Bubblewrap worker-retirement on a suitable host and Windows-native qualification;
-7. review; then begin Phase 1.
-
-Phase 1 starts only after that publication/platform gate is accepted. Phase 1 is the StoreScope /
-StoreId + StorePos / Agent migration-history-disclosure foundation described in IMPLEMENTATION.md.
+Continue Phase 1 from IMPLEMENTATION.md: add only the StoreScope-bound cursor/projection mechanics
+needed by the authoritative Agent migration/history/disclosure work, then implement that Agent
+foundation. Do not build generic cursor/transaction/replay engines or Phase-2/4 machinery early.
 
 Keep implementation turns around 30 minutes and checkpoint at the next coherent green point.
 Prefer simple owner-local Rust primitives, zero-cost/static abstractions and easy hot-path wins.

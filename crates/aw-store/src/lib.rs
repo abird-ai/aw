@@ -60,6 +60,7 @@ mod schedules;
 mod secret_custody_inventory;
 mod secret_store;
 mod session_participation;
+mod store_scope;
 mod subagents;
 #[cfg(feature = "pipelines")]
 mod teams;

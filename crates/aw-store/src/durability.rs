@@ -1,4 +1,5 @@
 use super::*;
+use crate::store_scope::{StoreId, StorePos};
 use serde::{Deserialize, Serialize};
 
 // Semantic commit-log envelope version. This is intentionally independent of
@@ -362,16 +363,11 @@ pub(crate) fn commit_event_position(
     entity_id: &str,
     actor: Option<&PrincipalId>,
     payload: serde_json::Value,
-) -> Result<u64> {
-    let store: String = db(c.query_row(
-        "SELECT value FROM store_meta WHERE key='store_id'",
-        [],
-        |r| r.get(0),
-    ))?;
+) -> Result<StorePos> {
+    let store = StoreId::load(c)?;
     let event = id("ev")?;
-    db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![event,store,tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
-    let position = u64::try_from(c.last_insert_rowid())
-        .map_err(|_| Error::Storage("commit log sequence overflow"))?;
+    db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![event,store.as_str(),tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
+    let position = StorePos::from_insert_rowid(c.last_insert_rowid())?;
     crate::job_exposure::project_commit_event(c, kind, entity_type, entity_id, &payload, position)?;
     Ok(position)
 }
