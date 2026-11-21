@@ -48,6 +48,7 @@ mod pipelines;
 #[cfg(all(feature = "pipelines", feature = "routing"))]
 mod planner;
 mod policy_admission;
+mod principal_groups;
 mod provider_credentials;
 mod remote_start;
 mod remote_view;
@@ -141,6 +142,7 @@ pub use policy_admission::{
     PolicyAdmissionFact, PolicyAdmissionRequest, PolicyAdmissionState, PolicyAdmissionSubject,
     PolicyGuardianJournal,
 };
+pub use principal_groups::*;
 pub use provider_credentials::*;
 pub use remote_start::RemoteStartPolicyAdmission;
 pub use remote_view::*;
@@ -236,8 +238,9 @@ pub const RUNTIME_ADMISSION_INDEX_SCHEMA: &str =
 pub const JOB_EXPOSURE_REPAIR_SCHEMA: &str =
     include_str!("../migrations/037_job_exposure_repair.sql");
 pub const AGENT_OWNER_SCHEMA: &str = include_str!("../migrations/038_agent_owner.sql");
+pub const DOMAIN_PRINCIPALS_SCHEMA: &str = include_str!("../migrations/039_domain_principals.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 38;
+const LATEST_SCHEMA_VERSION: i64 = 39;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -1585,6 +1588,12 @@ impl SessionStore {
             return Err(Error::Conflict("stale Agent revision"));
         }
         let participant_user = ensure_user_for_principal(&tx, participant)?;
+        principal_groups::ensure_user_principal_for_agent(
+            &tx,
+            session,
+            &branch.id,
+            &participant_user,
+        )?;
         let owner: String = db(tx.query_row(
             "SELECT owner_handle FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
             params![session, branch.id],
@@ -2785,6 +2794,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 37 {
         migrate_agent_owner(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 38 {
+        migrate_domain_principals(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -2914,6 +2927,80 @@ fn migrate_agent_owner(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 38))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_domain_principals(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='domain-principals',generation=generation+1,
+             target_epoch=39,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(DOMAIN_PRINCIPALS_SCHEMA))?;
+    principal_groups::backfill_user_principals(&tx)?;
+    let missing: u64 = db(tx.query_row(
+        "SELECT
+            (SELECT count(*) FROM domain_memberships m
+             WHERE NOT EXISTS(
+                 SELECT 1 FROM domain_principals p
+                 WHERE p.domain_id=m.domain_id AND p.principal_handle=m.user_id
+                   AND p.kind='user' AND p.user_id=m.user_id))
+          + (SELECT count(*) FROM agent_state_current a
+             WHERE a.owner_kind='user' AND NOT EXISTS(
+                 SELECT 1 FROM domain_principals p
+                 WHERE p.domain_id=a.domain_handle AND p.principal_handle=a.owner_handle
+                   AND p.kind='user' AND p.user_id=a.owner_handle))
+          + (SELECT count(*) FROM agent_acl_current x
+             JOIN agent_state_current a
+               ON a.session_id=x.session_id AND a.branch_id=x.branch_id
+             WHERE x.principal_kind='user' AND NOT EXISTS(
+                 SELECT 1 FROM domain_principals p
+                 WHERE p.domain_id=a.domain_handle AND p.principal_handle=x.principal_handle
+                   AND p.kind='user' AND p.user_id=x.principal_handle))",
+        [],
+        |row| row.get(0),
+    ))?;
+    if missing != 0 {
+        return Err(Error::Storage(
+            "Domain principal migration missed existing user principals",
+        ));
+    }
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Domain principal migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='39' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=39,activation_epoch=39,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=39,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 39))?;
     db(tx.commit())?;
     Ok(())
 }

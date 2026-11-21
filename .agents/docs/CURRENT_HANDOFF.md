@@ -75,19 +75,35 @@ it deliberately cannot rewrite/grant future `derive/share`. Exact Agent title CA
 only that Agent. Legacy `set_title(session)` and Session participation remain backing compatibility
 state and no longer define Agent revision or AgentJobs access.
 
-Phase 1 is still **underway**, not complete. Remaining owner work includes Domain principal/group
-registry + group/security generations and derived `access_generation`; the full seven-permission
-`agent.access.*` surface including reviewed `derive/share`; HistorySpan/Base/Grant + scalable
-DisclosureManifest/provenance and lazy sealing; minimal authoritative snapshots; and rebuilding the
-Agent lookup/exposure projection from `agent_state_current`. Add StoreScope cursor/projection-head
+Schema **v39** now owns the Domain principal namespace and v1 groups. `domain_principals` enforces
+one `(domain, handle)` namespace across user/group kinds; existing stable `usr_*` handles are
+backfilled from Domain membership, Agent ownership and direct Agent ACLs without renaming canonical
+Agent refs. Domain-membership inserts register user principals at the database boundary, while group
+membership/direct Agent grants can register authenticated non-member users on demand. Authentication
+status/security epochs remain owned by `users`; principal registration never becomes a second login
+or security owner.
+
+`principal_groups` + `principal_group_members` implement the sealed simple group model: one owning
+user, no nested groups, server-minted immutable handle, mutable presentation name, complete-set
+membership replacement under one monotonic group rev, bounded management reads/listing and tombstone
+deletion. Delete refuses current Agent ownership/ACL references; historical identity is retained and
+handles are never reused. Group create/edit/delete publish immutable principal facts, but membership
+changes deliberately do **not** fan out Agent writes or revisions. The minimal `domain_principal(s)`
+snapshot exposes principal kind/status/display identity without leaking a group roster.
+
+Phase 1 is still **underway**, not complete. Next owner slice is composing v39 groups into Agent ACL
+authorization plus opaque derived `access_generation` (Agent `acl_rev` + exact group rev + relevant
+user/security epochs) while preserving no Agent-rev fanout on membership edits. After that remain the
+full seven-permission `agent.access.*` surface including reviewed `derive/share`; HistorySpan/Base/
+Grant + scalable DisclosureManifest/provenance and lazy sealing; minimal authoritative snapshots;
+and rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/projection-head
 helpers only when one of those real consumers needs them; do not prebuild Phase-2/4 engines.
 
-Current focused evidence: populated **v37 -> v38** Agent-owner seed regression green; root/fork
-owner separation proves legacy Session title does not perturb Agent rev and exact title CAS changes
-only its target; direct Agent ACL revoke/regrant fences durable wake admission + history cursors;
-mixed Job exposure green; coordination **24/24** including killed-process recovery; stable-Agent
-survive/continue/close, revision-fenced Turn cancel, and jobs_get revision wake are green. Strict
-`aw-store` + `aw-cli` all-target/all-feature Clippy, fmt and diff checks are green.
+Current focused evidence: populated **v37 -> v38** Agent-owner seed regression green; populated
+**v38 -> v39** user-principal backfill green; group create/edit/delete + principal metadata + no
+Agent-rev fanout green; root/fork owner separation, direct Agent ACL revoke/regrant, mixed exposure,
+coordination **24/24**, stable lifecycle/control and jobs_get wake remain green from prior checkpoints.
+Strict v39 `aw-store` all-target/all-feature Clippy, fmt and diff checks are green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

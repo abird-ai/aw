@@ -69,11 +69,17 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       participation; exact title/access compatibility mutations CAS Agent rev and ACL changes advance
       `acl_rev + rev` together. Legacy Session title/participation remain backing compatibility only.
       Populated v37->v38 seed, branch-local rev/title isolation, direct ACL revoke/regrant fencing,
-      mixed exposure, coordination 24/24 and stable lifecycle/control regressions are green. Remaining
-      Phase-1 work: principal/groups + security/access generations; full seven-permission access with
-      derive/share; HistorySpan/Base/Grant + DisclosureManifest/provenance/lazy sealing; minimal
-      snapshots; rebuild Agent exposure from the new owner. Add cursor/projection-head helpers only
-      when one of those real consumers requires them.
+      mixed exposure, coordination 24/24 and stable lifecycle/control regressions are green. **v39
+      principal/group owner landed:** one Domain-scoped user/group handle namespace, stable-user
+      backfill from Domain/Agent/ACL ownership, membership-insert registration, lazy authenticated
+      user registration for group/direct grants, simple owner-managed non-nested groups with bounded
+      complete-set replacement + monotonic rev, tombstone/no-handle-reuse deletion and no Agent-rev
+      fanout. Populated v38->v39 backfill and grouped lifecycle tests are green. Next: compose group
+      ownership/grants into Agent ACL effective authorization and derive opaque `access_generation`
+      from Agent `acl_rev` + exact group rev + relevant security epochs without Agent mutation
+      fanout. Then: full seven-permission access with derive/share; HistorySpan/Base/Grant +
+      DisclosureManifest/provenance/lazy sealing; minimal snapshots; rebuild Agent exposure from the
+      new owner. Add cursor/projection-head helpers only when one real consumer requires them.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.
