@@ -2090,9 +2090,7 @@ impl JobHost {
         &self,
         id: &str,
         coordinate: usize,
-        exit: aw_tools::filesystem::runner::ProcessExit,
-        stop: Option<aw_tools::execution_stop::StopReason>,
-        process_output_complete: bool,
+        terminal: aw_tools::filesystem::runner::ProcessTerminal,
     ) -> Result<aw_tools::filesystem::runner::ProcessTerminal> {
         use aw_tools::filesystem::{
             job_manager::OutputStream,
@@ -2107,15 +2105,15 @@ impl JobHost {
             .output_summary(id, coordinate, OutputStream::Stderr)
             .map_err(|_| Error::Protocol("ShellNode stderr summary unavailable"))?;
         Ok(ProcessTerminal {
-            exit,
-            stop,
             output: ProcessOutputMeta {
                 stdout_bytes: stdout.total_bytes,
                 stderr_bytes: stderr.total_bytes,
                 stdout_truncated: stdout.truncated,
                 stderr_truncated: stderr.truncated,
-                complete: process_output_complete && stdout_finished && stderr_finished,
+                stdout_complete: terminal.output.stdout_complete && stdout_finished,
+                stderr_complete: terminal.output.stderr_complete && stderr_finished,
             },
+            ..terminal
         })
     }
 
@@ -2232,26 +2230,24 @@ impl JobHost {
                     Ok(receipt) => {
                         let primary = receipt.runner_status().primary;
                         let observed = receipt.runner_terminal();
-                        let terminal = self.retained_process_terminal(
-                            id,
-                            coordinate,
-                            observed.exit,
-                            observed.stop,
-                            observed.output.complete,
-                        )?;
+                        let terminal = self.retained_process_terminal(id, coordinate, observed)?;
                         (terminal, primary)
                     }
                     Err(_) => (
                         self.retained_process_terminal(
                             id,
                             coordinate,
-                            ProcessExit::Unknown,
-                            None,
-                            false,
+                            ProcessTerminal {
+                                exit: ProcessExit::Unknown,
+                                stop: None,
+                                tree: aw_tools::filesystem::runner::Tree::Unknown,
+                                output: Default::default(),
+                            },
                         )
                         .unwrap_or(ProcessTerminal {
                             exit: ProcessExit::Unknown,
                             stop: None,
+                            tree: aw_tools::filesystem::runner::Tree::Unknown,
                             output: Default::default(),
                         }),
                         Primary::Unknown,
@@ -2317,13 +2313,7 @@ impl JobHost {
         };
         let status = receipt.runner_status();
         let observed = receipt.runner_terminal();
-        let terminal = self.retained_process_terminal(
-            id,
-            coordinate,
-            observed.exit,
-            observed.stop,
-            observed.output.complete,
-        )?;
+        let terminal = self.retained_process_terminal(id, coordinate, observed)?;
         self.settle_shell_result(
             id,
             coordinate,

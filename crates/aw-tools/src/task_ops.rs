@@ -51,7 +51,7 @@ impl From<ProcessTerminal> for TaskTerminalDetail {
     fn from(terminal: ProcessTerminal) -> Self {
         Self {
             exit: terminal.exit,
-            stop: terminal.stop,
+            stop: terminal.stop_reason(),
         }
     }
 }

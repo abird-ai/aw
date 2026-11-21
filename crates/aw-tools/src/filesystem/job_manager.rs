@@ -4204,12 +4204,14 @@ mod tests {
                         terminal: ProcessTerminal {
                             exit: ProcessExit::Code(i32::MIN + coordinate as i32),
                             stop: None,
+                            tree: crate::filesystem::runner::Tree::Unknown,
                             output: ProcessOutputMeta {
                                 stdout_bytes: u64::MAX,
                                 stderr_bytes: u64::MAX,
                                 stdout_truncated: true,
                                 stderr_truncated: true,
-                                complete: false,
+                                stdout_complete: false,
+                                stderr_complete: false,
                             },
                         },
                         status: Status {
@@ -4479,12 +4481,14 @@ mod tests {
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(7),
             stop: None,
+            tree: crate::filesystem::runner::Tree::Empty,
             output: ProcessOutputMeta {
                 stdout_bytes: 11,
                 stderr_bytes: 3,
                 stdout_truncated: false,
                 stderr_truncated: true,
-                complete: true,
+                stdout_complete: true,
+                stderr_complete: true,
             },
         };
         manager
@@ -8697,13 +8701,17 @@ mod tests {
 
         let terminal = ProcessTerminal {
             exit: ProcessExit::Signal(9),
-            stop: Some(ProcessStopReason::Timeout),
+            stop: Some(crate::execution_stop::StopRecord::stopped(
+                ProcessStopReason::Timeout,
+            )),
+            tree: crate::filesystem::runner::Tree::Live,
             output: ProcessOutputMeta {
                 stdout_bytes: 10,
                 stderr_bytes: 2,
                 stdout_truncated: false,
                 stderr_truncated: false,
-                complete: true,
+                stdout_complete: true,
+                stderr_complete: true,
             },
         };
         manager

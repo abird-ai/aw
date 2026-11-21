@@ -405,12 +405,12 @@ impl Tool for NativeShell {
             let receipt = process
                 .wait(ctx.cancellation.cancelled(), prepared.timeout)
                 .await;
-            if !receipt.output_complete {
+            if !receipt.output_complete() {
                 return Err(Error::Transport(
                     "process output could not be fully drained; effects uncertain",
                 ));
             }
-            let (code, is_error) = match receipt.outcome {
+            let (code, is_error) = match receipt.outcome() {
                 ProcessOutcome::Exited(status) => (status.to_string(), status != 0),
                 ProcessOutcome::ExitedBySignal(signal) => (format!("signal:{signal}"), true),
                 ProcessOutcome::Cancelled => return Err(Error::Cancelled),

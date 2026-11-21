@@ -543,6 +543,7 @@ impl SessionStore {
                 ))?;
             }
         }
+        let txid = crate::durability::tx_id()?;
         let mut selected = None;
         for (i, b) in branches.iter().enumerate() {
             let head = mapped
@@ -555,7 +556,17 @@ impl SessionStore {
                 ))?;
                 selected = Some(default.id.clone());
             } else {
-                db(tx.execute("INSERT INTO branches(id,session_id,name,head,created_at) VALUES(?1,?2,?3,?4,?5)",params![id("b")?,created.id,b.name,head,now()]))?;
+                let branch_id = id("b")?;
+                db(tx.execute("INSERT INTO branches(id,session_id,name,head,created_at) VALUES(?1,?2,?3,?4,?5)",params![branch_id,created.id,b.name,head,now()]))?;
+                crate::job_exposure::publish_agent_branch_created(
+                    &tx,
+                    &txid,
+                    Some(owner),
+                    &created.id,
+                    &branch_id,
+                    head,
+                    &b.name,
+                )?;
             }
         }
         db(tx.execute(

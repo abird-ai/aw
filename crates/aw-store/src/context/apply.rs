@@ -114,6 +114,7 @@ impl SessionStore {
                 "additive import cannot be relabeled as compaction",
             ));
         }
+        let txid = crate::durability::tx_id()?;
         match &request.mode {
             ApplyMode::Fork { name } => {
                 label(name, 80)?;
@@ -130,6 +131,15 @@ impl SessionStore {
                 }
                 let bid = id("b")?;
                 db(tx.execute("INSERT INTO branches(id,session_id,name,head,created_at) VALUES(?1,?2,?3,?4,?5)",params![bid,session.id,name,request.target.head,now()]))?;
+                crate::job_exposure::publish_agent_branch_created(
+                    &tx,
+                    &txid,
+                    Some(actor),
+                    &session.id,
+                    &bid,
+                    &request.target.head,
+                    name,
+                )?;
                 branch = branch_in(&tx, &session.id, &bid)?;
             }
             ApplyMode::NewSession { title } => {
@@ -147,7 +157,6 @@ impl SessionStore {
             }
             _ => {}
         }
-        let txid = crate::durability::tx_id()?;
         let mut node_id = None;
         let mut pending_id = None;
         let mut reused = false;

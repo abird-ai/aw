@@ -17,6 +17,15 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 const ACTION: &str = "remote.start.authorized";
 const MAX_STARTS_PER_TURN: usize = 256;
 
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteStartPolicyAdmission<'a> {
+    pub id: &'a str,
+    pub current_policy_revision_sha256: &'a str,
+    pub current_authority_sha256: &'a str,
+    pub selected_route: Option<aw_policy::Strategy>,
+    pub authorized_narrow_ref: Option<&'a str>,
+}
+
 fn parse_digest(value: &str) -> Result<[u8; 32]> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Error::Denied("invalid remote Start digest provenance"));
@@ -147,8 +156,9 @@ fn session_action(
 impl SessionStore {
     /// Recover an already-committed Start by the context-independent original
     /// effect-attempt identity, before any current ToolBinding reauthorization or
-    /// contextual ref resolution. This does not make an expired proof executable;
-    /// the remote owner still validates its target-issued lease and generation.
+    /// contextual ref resolution. The remote owner resolves a retained exact receipt
+    /// before mutable lease/generation/trust checks; those checks authorize only a fresh
+    /// effect claim. A target restart may still fail closed if that receipt is unavailable.
     pub fn remote_start_lookup_attempt(
         &self,
         actor: &PrincipalId,
@@ -186,8 +196,8 @@ impl SessionStore {
     }
 
     /// Recover an already-committed Start without current effect reauthorization.
-    /// This does not make an expired proof executable; the remote owner still
-    /// validates its target-issued lease and live runtime generation.
+    /// Target lease/generation/trust remain fresh-effect authority only; a retained exact
+    /// target receipt is replayable after those mutable values change or expire.
     pub fn remote_start_lookup(
         &self,
         actor: &PrincipalId,
@@ -208,15 +218,15 @@ impl SessionStore {
         }
     }
 
-    /// Atomically recheck Store-owned participation/writer/Turn/policy evidence
-    /// and commit one immutable Start authorization. The caller must serialize
-    /// this call under the exact live ToolBinding read guard so source/site/grant
-    /// revocation cannot cross the commit boundary.
+    /// Atomically consume one executable policy admission and commit one immutable
+    /// Start authorization. Exact replay is resolved first; legacy Consumed-without-Start
+    /// rows may complete only while their original/current evidence still revalidates.
+    /// The caller holds the exact live ToolBinding read guard across this transaction.
     pub fn remote_start_authorize(
         &self,
         actor: &PrincipalId,
         session: &str,
-        policy_admission_id: &str,
+        policy_admission: RemoteStartPolicyAdmission<'_>,
         intent: RemoteStartIntent,
         source: RemoteStartSource,
         issuer: RemoteStartIssuer,
@@ -244,18 +254,27 @@ impl SessionStore {
             return Ok(existing);
         }
 
-        let policy = policy_admission::fact_in(&tx, session, policy_admission_id)?;
+        let policy = SessionStore::policy_admission_consume_in(
+            &tx,
+            session,
+            policy_admission.id,
+            policy_admission.current_policy_revision_sha256,
+            policy_admission.current_authority_sha256,
+            policy_admission.selected_route,
+            policy_admission.authorized_narrow_ref,
+        )?;
+        if policy.state != policy_admission::PolicyAdmissionState::Consumed {
+            db(tx.commit())?;
+            return Err(Error::Conflict(
+                "remote Start policy admission is no longer executable",
+            ));
+        }
         let resource_owner = crate::session_in(&tx, session)?.owner;
         if policy.id != policy_admission::admission_id(&resource_owner, &policy.request)
             || policy.request.subject.actor != *actor
         {
             return Err(Error::Denied(
                 "remote Start policy admission belongs to another subject or Session owner",
-            ));
-        }
-        if policy.state != policy_admission::PolicyAdmissionState::Consumed {
-            return Err(Error::Conflict(
-                "remote Start requires one consumed executable policy admission",
             ));
         }
         if policy.request.session_id != session
@@ -422,6 +441,19 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn policy(id: &str) -> RemoteStartPolicyAdmission<'_> {
+        RemoteStartPolicyAdmission {
+            id,
+            current_policy_revision_sha256:
+                "0404040404040404040404040404040404040404040404040404040404040404",
+            current_authority_sha256:
+                "0303030303030303030303030303030303030303030303030303030303030303",
+            selected_route: Some(Strategy::Local),
+            authorized_narrow_ref: None,
+        }
+    }
+
+    #[cfg(unix)]
     fn source() -> RemoteStartSource {
         RemoteStartSource {
             source_kind: "host".into(),
@@ -539,21 +571,7 @@ mod tests {
                 &digest(8),
             )
             .unwrap();
-        let consumed = store
-            .policy_admission_consume(
-                &session.id,
-                &decided.id,
-                &digest(4),
-                &digest(3),
-                Some(Strategy::Local),
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            consumed.state,
-            policy_admission::PolicyAdmissionState::Consumed
-        );
-        (temp, store, actor, session.id, consumed.id, request_digest)
+        (temp, store, actor, session.id, decided.id, request_digest)
     }
 
     #[cfg(unix)]
@@ -565,7 +583,7 @@ mod tests {
             .remote_start_authorize(
                 &actor,
                 &session,
-                &policy_id,
+                policy(&policy_id),
                 intent.clone(),
                 source(),
                 issuer(),
@@ -608,7 +626,7 @@ mod tests {
                 .remote_start_authorize(
                     &actor,
                     &session,
-                    &policy_id,
+                    policy(&policy_id),
                     intent.clone(),
                     source(),
                     issuer()
@@ -653,15 +671,30 @@ mod tests {
         let mut wrong = intent(request_digest);
         wrong.original_request_sha256 = [5; 32];
         assert!(store
-            .remote_start_authorize(&actor, &session, &policy_id, wrong, source(), issuer())
+            .remote_start_authorize(
+                &actor,
+                &session,
+                policy(&policy_id),
+                wrong,
+                source(),
+                issuer()
+            )
             .is_err());
+        assert_eq!(
+            store
+                .policy_admission_fact(&actor, &session, &policy_id)
+                .unwrap()
+                .state,
+            policy_admission::PolicyAdmissionState::Allowed,
+            "failed Start authorization must roll policy consumption back atomically"
+        );
 
         let valid = intent(request_digest);
         let authorization = store
             .remote_start_authorize(
                 &actor,
                 &session,
-                &policy_id,
+                policy(&policy_id),
                 valid.clone(),
                 source(),
                 issuer(),
@@ -680,7 +713,7 @@ mod tests {
             .remote_start_authorize(
                 &actor,
                 &session,
-                &policy_id,
+                policy(&policy_id),
                 changed_attempt,
                 wrong_source,
                 issuer()
@@ -697,7 +730,7 @@ mod tests {
             .remote_start_authorize(
                 &actor,
                 &session,
-                &policy_id,
+                policy(&policy_id),
                 intent.clone(),
                 source(),
                 issuer(),
@@ -721,6 +754,14 @@ mod tests {
                 serde_json::to_value(&legacy).unwrap(),
             )
             .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO branches(id,session_id,name,head,created_at)
+                     SELECT 'b_legacy_missing',id,'legacy-missing',root_node,created_at+1
+                     FROM sessions WHERE id=?1",
+                    [&session],
+                )
+                .unwrap();
             connection
                 .execute_batch(
                     "DROP TABLE policy_admission_current;
@@ -756,8 +797,20 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 36);
-        assert!(projected_agents >= 1);
+        let repaired_missing: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM job_exposure_current
+                 WHERE kind='agent' AND session_id=?1 AND branch_id='b_legacy_missing'",
+                [&session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 37);
+        assert!(projected_agents >= 2);
+        assert_eq!(
+            repaired_missing, 1,
+            "v37 must repair authoritative branches that never emitted v36 creation evidence"
+        );
         drop(connection);
 
         let replay = migrated
@@ -774,6 +827,41 @@ mod tests {
             replay.provenance.issuer.is_none(),
             "v35 historical Start must remain exact rather than minting v36 issuer evidence"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_consumed_policy_without_start_recovers_only_under_current_evidence() {
+        let (_temp, store, actor, session, policy_id, request_digest) = admitted_fixture().await;
+        let consumed = store
+            .policy_admission_consume(
+                &session,
+                &policy_id,
+                &digest(4),
+                &digest(3),
+                Some(Strategy::Local),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            consumed.state,
+            policy_admission::PolicyAdmissionState::Consumed
+        );
+        assert!(store
+            .remote_start_lookup_attempt(&actor, &session, "turn:1/call:remote-start", "attempt-1")
+            .unwrap()
+            .is_none());
+        let authorization = store
+            .remote_start_authorize(
+                &actor,
+                &session,
+                policy(&policy_id),
+                intent(request_digest),
+                source(),
+                issuer(),
+            )
+            .unwrap();
+        assert_eq!(authorization.provenance.policy_admission_id, policy_id);
     }
 
     #[cfg(unix)]
@@ -796,7 +884,7 @@ mod tests {
             .remote_start_authorize(
                 &actor,
                 &session,
-                &policy_id,
+                policy(&policy_id),
                 stale_writer,
                 source(),
                 issuer()
@@ -822,7 +910,7 @@ mod tests {
             .remote_start_authorize(
                 &actor,
                 &session,
-                &policy_id,
+                policy(&policy_id),
                 revoked_member,
                 source(),
                 issuer()

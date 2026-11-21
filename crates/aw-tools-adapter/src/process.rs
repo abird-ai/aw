@@ -8,7 +8,7 @@ use aw_tools::{
     },
     filesystem::{
         job_manager::OutputWriter,
-        runner::{ProcessExit as RunnerExit, ProcessOutputMeta, ProcessTerminal, StopProof},
+        runner::{ProcessExit as RunnerExit, ProcessOutputMeta, ProcessTerminal, StopProof, Tree},
     },
     task::{SpoolWriterLease, SpoolWriters, StreamSummary, TaskDisposition},
     task_fence::{FenceError, TaskFence, TaskIdentity, TaskTransition},
@@ -18,6 +18,7 @@ use aw_tools::{
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
+    io,
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -852,54 +853,92 @@ pub enum Outcome {
     Unknown,
 }
 pub struct ProcessReceipt {
-    pub outcome: Outcome,
-    exit: RunnerExit,
-    /// Final factual stop observation for this logical stop sequence.
-    ///
-    /// Attempt-level events may contain graceful/forced/cleanup records; this
-    /// value selects the final product-facing record without changing terminal
-    /// semantics. A reason-less value is housekeeping only.
-    stop_record: Option<StopRecord>,
+    /// One factual Process terminal truth. Outcome/status are projections.
+    pub terminal: ProcessTerminal,
     pub output: ProcessSnapshot,
-    pub output_complete: bool,
     /// Present only when the trusted host supplied durable output handles.
     /// Ownership is the original Process; no model-facing job ID exists.
     pub spools: Option<ProcessSpoolAccess>,
 }
 impl ProcessReceipt {
-    pub fn finished(&self) -> bool {
-        matches!(
-            self.outcome,
-            Outcome::Exited(_) | Outcome::ExitedBySignal(_)
-        ) && self.output_complete
-    }
-
-    pub const fn stop_record(&self) -> Option<StopRecord> {
-        self.stop_record
-    }
-
-    pub fn runner_terminal(&self) -> ProcessTerminal {
-        ProcessTerminal {
-            exit: self.exit,
-            stop: self.stop_record.and_then(StopRecord::terminal_reason),
+    fn new(
+        exit: RunnerExit,
+        stop: Option<StopRecord>,
+        tree: Tree,
+        output: ProcessSnapshot,
+        stdout_complete: bool,
+        stderr_complete: bool,
+        spools: Option<ProcessSpoolAccess>,
+    ) -> Self {
+        let terminal = ProcessTerminal {
+            exit,
+            stop,
+            tree,
             output: ProcessOutputMeta {
-                stdout_bytes: self.output.stdout.total_bytes,
-                stderr_bytes: self.output.stderr.total_bytes,
-                stdout_truncated: self.output.stdout.truncated,
-                stderr_truncated: self.output.stderr.truncated,
-                complete: self.output_complete,
+                stdout_bytes: output.stdout.total_bytes,
+                stderr_bytes: output.stderr.total_bytes,
+                stdout_truncated: output.stdout.truncated,
+                stderr_truncated: output.stderr.truncated,
+                stdout_complete,
+                stderr_complete,
             },
+        };
+        Self {
+            terminal,
+            output,
+            spools,
         }
     }
 
+    pub fn outcome(&self) -> Outcome {
+        if let Some(record) = self.terminal.stop {
+            if record.evidence == StopEvidence::Unknown {
+                return Outcome::Unknown;
+            }
+            match record.reason {
+                Some(ProcessStopReason::Cancelled) => return Outcome::Cancelled,
+                Some(ProcessStopReason::Timeout) => return Outcome::DeadlineExceeded,
+                Some(ProcessStopReason::RuntimeError) => return Outcome::Unknown,
+                None => {}
+            }
+        }
+        match self.terminal.exit {
+            RunnerExit::Code(code) => Outcome::Exited(code),
+            RunnerExit::Signal(signal) => Outcome::ExitedBySignal(signal),
+            RunnerExit::Unknown => Outcome::Unknown,
+        }
+    }
+
+    pub fn output_complete(&self) -> bool {
+        self.terminal.output.complete()
+    }
+
+    pub fn finished(&self) -> bool {
+        matches!(
+            self.outcome(),
+            Outcome::Exited(_) | Outcome::ExitedBySignal(_)
+        ) && self.output_complete()
+    }
+
+    pub const fn stop_record(&self) -> Option<StopRecord> {
+        self.terminal.stop
+    }
+
+    pub const fn runner_terminal(&self) -> ProcessTerminal {
+        self.terminal
+    }
+
     pub fn runner_status(&self) -> aw_tools::filesystem::batch::Status {
-        self.runner_terminal().status()
+        self.terminal.status()
     }
 
     pub fn stop_proof(&self) -> StopProof {
-        let terminal = self.runner_terminal();
-        if !terminal.output.complete
-            || (terminal.exit == RunnerExit::Unknown && terminal.stop.is_none())
+        let terminal = self.terminal;
+        if !terminal.output.complete()
+            || terminal
+                .stop
+                .is_some_and(|record| record.evidence == StopEvidence::Unknown)
+            || (terminal.exit == RunnerExit::Unknown && terminal.stop_reason().is_none())
         {
             StopProof::Unknown(terminal.output)
         } else {
@@ -917,7 +956,7 @@ enum SpawnOutputTarget {
     },
 }
 
-fn platform_stop_evidence(result: std::io::Result<bool>) -> StopEvidence {
+fn platform_stop_evidence(result: io::Result<bool>) -> StopEvidence {
     match result {
         Ok(true) => StopEvidence::Stopped,
         Ok(false) => StopEvidence::NoTarget,
@@ -925,9 +964,86 @@ fn platform_stop_evidence(result: std::io::Result<bool>) -> StopEvidence {
     }
 }
 
-pub struct PipeProcess {
+fn platform_tree(result: io::Result<bool>) -> Tree {
+    match result {
+        Ok(true) => Tree::Live,
+        Ok(false) => Tree::Empty,
+        Err(_) => Tree::Unknown,
+    }
+}
+
+/// Private lifetime owner for one Process execution scope.
+///
+/// `PipeProcess` owns I/O and semantic receipts; `Scope` alone owns the main
+/// child and platform containment identity.
+struct Scope {
+    platform: aw_platform::DirectScope,
     child: Child,
     pid: u32,
+}
+
+impl Scope {
+    fn new(platform: aw_platform::DirectScope, child: Child, pid: u32) -> Self {
+        Self {
+            platform,
+            child,
+            pid,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn ready(&self) -> io::Result<bool> {
+        self.platform.ready()
+    }
+
+    #[cfg(unix)]
+    async fn wait_ready(&self) -> io::Result<()> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // SIGCHLD is only a wake hint. The scope's stable leader identity is
+        // the authoritative non-consuming readiness fact.
+        let mut changes = signal(SignalKind::child())?;
+        while !self.platform.ready()? {
+            changes.recv().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "SIGCHLD stream closed")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn observe(&self) -> Tree {
+        platform_tree(self.platform.observe())
+    }
+
+    fn graceful(&self) -> StopEvidence {
+        platform_stop_evidence(self.platform.graceful())
+    }
+
+    fn terminate(&mut self) -> StopEvidence {
+        platform_stop_evidence(self.platform.terminate())
+    }
+
+    fn kill_main(&mut self) {
+        let _ = self.child.start_kill();
+    }
+
+    async fn reap(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+        self.kill_main();
+    }
+}
+
+pub struct PipeProcess {
+    scope: Scope,
     stdin: Option<ChildStdin>,
     stdout: Reader,
     stderr: Reader,
@@ -941,7 +1057,6 @@ pub struct PipeProcess {
     termination_attempted: bool,
     stop_state: aw_tools::execution_stop::StopTracker,
     event_sink: Option<Arc<dyn ExecutionEventSink>>,
-    guard: aw_platform::ManagedProcessGuard,
 }
 impl PipeProcess {
     pub async fn spawn(spec: PipeSpec) -> crate::Result<Self> {
@@ -1078,42 +1193,42 @@ impl PipeProcess {
             ));
         };
         #[cfg(unix)]
-        let mut guard = match aw_platform::ManagedProcessGuard::attach(pid) {
-            Ok(guard) => guard,
+        let mut platform = match aw_platform::DirectScope::attach(pid) {
+            Ok(scope) => scope,
             Err(_) => {
                 let _ = child.start_kill();
                 return Err(crate::Error::Transport(
-                    "process launched but process-group guard setup is uncertain",
+                    "process launched but Process scope setup is uncertain",
                 ));
             }
         };
         #[cfg(windows)]
-        let mut guard = {
+        let mut platform = {
             let Some(handle) = child.raw_handle() else {
                 let _ = child.start_kill();
                 return Err(crate::Error::Transport(
                     "process launched but Windows handle/setup outcome is uncertain",
                 ));
             };
-            match aw_platform::ManagedProcessGuard::attach(pid, handle) {
-                Ok(guard) => guard,
+            match aw_platform::DirectScope::attach(pid, handle) {
+                Ok(scope) => scope,
                 Err(_) => {
                     let _ = child.start_kill();
                     return Err(crate::Error::Transport(
-                        "process launched but Windows Job attachment outcome is uncertain",
+                        "process launched but Windows Process scope setup is uncertain",
                     ));
                 }
             }
         };
         let Some(stdout) = child.stdout.take() else {
-            let _ = guard.terminate();
+            let _ = platform.terminate();
             let _ = child.start_kill();
             return Err(crate::Error::Transport(
                 "process launched but stdout setup outcome is uncertain",
             ));
         };
         let Some(stderr) = child.stderr.take() else {
-            let _ = guard.terminate();
+            let _ = platform.terminate();
             let _ = child.start_kill();
             return Err(crate::Error::Transport(
                 "process launched but stderr setup outcome is uncertain",
@@ -1121,7 +1236,7 @@ impl PipeProcess {
         };
         let stdin = child.stdin.take();
         let Some([out_lease, err_lease]) = spool_writers.begin::<2>() else {
-            let _ = guard.terminate();
+            let _ = platform.terminate();
             let _ = child.start_kill();
             return Err(crate::Error::Transport(
                 "process launched but output-reader setup outcome is uncertain",
@@ -1130,8 +1245,7 @@ impl PipeProcess {
         let (out, out_task) = Reader::start(stdout, out_lease, stdout_sink);
         let (err, err_task) = Reader::start(stderr, err_lease, stderr_sink);
         Ok(Self {
-            child,
-            pid,
+            scope: Scope::new(platform, child, pid),
             stdin,
             stdout: out,
             stderr: err,
@@ -1141,7 +1255,6 @@ impl PipeProcess {
             termination_attempted: false,
             stop_state: aw_tools::execution_stop::StopTracker::default(),
             event_sink,
-            guard,
         })
     }
     pub fn mode(&self) -> ProcessMode {
@@ -1149,7 +1262,7 @@ impl PipeProcess {
     }
     pub fn snapshot(&self) -> ProcessSnapshot {
         ProcessSnapshot {
-            pid: self.pid,
+            pid: self.scope.pid(),
             stdout: self.stdout.snapshot(),
             stderr: self.stderr.snapshot(),
         }
@@ -1183,12 +1296,11 @@ impl PipeProcess {
     pub fn close_stdin(&mut self) {
         self.stdin.take();
     }
-    async fn drain_output(&mut self) -> bool {
+    async fn drain_output(&mut self) -> (bool, bool) {
         // No new reader may enter once terminal output settlement begins.
         // Await actual reader completion: cancellation of a future alone is
         // not evidence that its in-flight read/append stopped.
         self.spool_writers.seal();
-        let mut complete = true;
         for task in &mut self.readers {
             match timeout(READER_DRAIN_DEADLINE, &mut *task).await {
                 Ok(Ok(())) => {}
@@ -1197,17 +1309,15 @@ impl PipeProcess {
                     // Poll the abort to completion; if even cancellation
                     // cannot quiesce the reader, preserve an incomplete result.
                     let _ = timeout(READER_DRAIN_DEADLINE, &mut *task).await;
-                    complete = false;
                 }
             }
         }
-        let s = self.snapshot();
-        complete
-            && self.spool_writers.is_idle()
-            && s.stdout.closed
-            && s.stderr.closed
-            && !s.stdout.read_failed
-            && !s.stderr.read_failed
+        let snapshot = self.snapshot();
+        let writers_idle = self.spool_writers.is_idle();
+        (
+            writers_idle && snapshot.stdout.closed && !snapshot.stdout.read_failed,
+            writers_idle && snapshot.stderr.closed && !snapshot.stderr.read_failed,
+        )
     }
     fn record_stop(
         &mut self,
@@ -1221,57 +1331,76 @@ impl PipeProcess {
         record
     }
 
-    fn stop_tree(&mut self, reason: Option<ProcessStopReason>) -> StopRecord {
-        let evidence = platform_stop_evidence(self.guard.terminate());
+    fn stop_scope(&mut self, reason: Option<ProcessStopReason>) -> StopRecord {
+        let evidence = self.scope.terminate();
         self.record_stop(reason, evidence)
     }
 
-    fn stop_outcome(record: StopRecord, known: Outcome) -> Outcome {
-        if record.evidence == StopEvidence::Unknown {
-            Outcome::Unknown
-        } else {
-            known
-        }
+    #[cfg(unix)]
+    async fn settle_natural_exit(
+        &mut self,
+    ) -> crate::Result<(RunnerExit, Option<StopRecord>, Tree)> {
+        self.scope.wait_ready().await.map_err(crate::Error::Io)?;
+        let tree = self.scope.observe();
+        let cleanup = self.stop_scope(None);
+        let status = self.scope.reap().await.map_err(crate::Error::Io)?;
+        Ok((Self::exit_fact(status), Some(cleanup), tree))
     }
 
-    /// Keep the semantic stop record across a later reason-less cleanup.
-    ///
-    /// If an earlier attempt was Unknown, StopTracker carries its reason into
-    /// the retry; that reasoned retry is therefore the new final record.
-    fn merge_final_stop(current: &mut Option<StopRecord>, record: StopRecord) {
-        if current.is_none() || record.reason.is_some() {
-            *current = Some(record);
-        }
+    #[cfg(windows)]
+    async fn settle_natural_exit(
+        &mut self,
+    ) -> crate::Result<(RunnerExit, Option<StopRecord>, Tree)> {
+        // Job Object identity survives reaping the leader, so Windows can reap
+        // first and still observe/settle the exact remaining scope.
+        let status = self.scope.reap().await.map_err(crate::Error::Io)?;
+        let tree = self.scope.observe();
+        let cleanup = self.stop_scope(None);
+        Ok((Self::exit_fact(status), Some(cleanup), tree))
     }
 
-    async fn stop(&mut self, reason: ProcessStopReason) -> (StopRecord, RunnerExit) {
+    async fn stop(&mut self, reason: ProcessStopReason) -> (StopRecord, RunnerExit, Tree) {
         self.termination_attempted = true;
         self.stdin.take();
 
-        // Preserve graceful shutdown where supported, but only call it a
-        // stopped command if the signal reached a live group and the direct
-        // child then reaped. NoTarget stays positive absence, not our stop.
-        let graceful = platform_stop_evidence(aw_platform::terminate_process_group(self.pid));
+        // Preserve graceful shutdown where supported, but never reap the Unix
+        // group leader before observing/settling remaining members.
+        let graceful = self.scope.graceful();
         let graceful_record = self.record_stop(Some(reason), graceful);
-        if graceful != StopEvidence::Unknown {
-            if let Ok(Ok(status)) = timeout(GRACEFUL_TERM, self.child.wait()).await {
-                return (graceful_record, Self::status_facts(status).1);
-            }
+
+        #[cfg(unix)]
+        if graceful != StopEvidence::Unknown
+            && matches!(
+                timeout(GRACEFUL_TERM, self.scope.wait_ready()).await,
+                Ok(Ok(()))
+            )
+        {
+            let tree = self.scope.observe();
+            let cleanup = self.stop_scope(None);
+            let exit = match timeout(REAP_DEADLINE, self.scope.reap()).await {
+                Ok(Ok(status)) => Self::exit_fact(status),
+                _ => RunnerExit::Unknown,
+            };
+            let record = if cleanup.evidence == StopEvidence::Unknown {
+                StopRecord::new(reason, StopEvidence::Unknown)
+            } else {
+                graceful_record
+            };
+            return (record, exit, tree);
         }
 
-        // Forced containment stop uses the managed guard. Unknown evidence
-        // leaves it armed and retains the semantic reason for the Drop retry.
-        let record = self.stop_tree(Some(reason));
-        let _ = self.child.start_kill();
-        let exit = match timeout(REAP_DEADLINE, self.child.wait()).await {
-            Ok(Ok(status)) => Self::status_facts(status).1,
+        // Windows graceful process-group signaling is unsupported today. Keep
+        // the platform branch explicit rather than inventing a pseudo-grace.
+        #[cfg(windows)]
+        let _ = graceful;
+
+        let record = self.stop_scope(Some(reason));
+        self.scope.kill_main();
+        let exit = match timeout(REAP_DEADLINE, self.scope.reap()).await {
+            Ok(Ok(status)) => Self::exit_fact(status),
             _ => RunnerExit::Unknown,
         };
-        let record = graceful_record
-            .terminal_reason()
-            .map(StopRecord::stopped)
-            .unwrap_or(record);
-        (record, exit)
+        (record, exit, Tree::Unknown)
     }
     /// AW-P6-9D2B2B1: Only the already-authorized owning HOST may expose
     /// this to an individually grant-fenced and journaled model Tool. The
@@ -1283,7 +1412,10 @@ impl PipeProcess {
         if self.termination_attempted {
             return Ok(false);
         }
-        Ok(self.child.try_wait().map_err(crate::Error::Io)?.is_none())
+        self.scope
+            .ready()
+            .map(|ready| !ready)
+            .map_err(crate::Error::Io)
     }
     pub async fn terminate(&mut self) -> crate::Result<ProcessReceipt> {
         if !self.termination_available()? {
@@ -1292,24 +1424,17 @@ impl PipeProcess {
             ));
         }
         // stop() fences the attempt before the first possible OS signal.
-        let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
-        let outcome = Self::stop_outcome(record, Outcome::Cancelled);
-        let mut stop_record = Some(record);
-        let output_complete = self.drain_output().await;
-        if !output_complete {
-            // Same original descendant cleanup as wait(); never assert that
-            // a single exited direct child proves its group has stopped.
-            let cleanup = self.stop_tree(None);
-            Self::merge_final_stop(&mut stop_record, cleanup);
-        }
-        Ok(ProcessReceipt {
-            outcome,
+        let (record, exit, tree) = self.stop(ProcessStopReason::Cancelled).await;
+        let (stdout_complete, stderr_complete) = self.drain_output().await;
+        Ok(ProcessReceipt::new(
             exit,
-            stop_record,
-            output: self.snapshot(),
-            output_complete,
-            spools: self.spools.clone(),
-        })
+            Some(record),
+            tree,
+            self.snapshot(),
+            stdout_complete,
+            stderr_complete,
+            self.spools.clone(),
+        ))
     }
 
     /// Caller retains the resource across model steps if needed. Output drains
@@ -1319,51 +1444,34 @@ impl PipeProcess {
         cancellation: C,
         deadline: Duration,
     ) -> ProcessReceipt {
-        let (outcome, exit, mut stop_record) = tokio::select! {
+        let (exit, stop_record, tree) = tokio::select! {
             biased;
             _ = cancellation => {
-                let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
-                (
-                    Self::stop_outcome(record, Outcome::Cancelled),
-                    exit,
-                    Some(record),
-                )
+                let (record, exit, tree) = self.stop(ProcessStopReason::Cancelled).await;
+                (exit, Some(record), tree)
             },
-            result = timeout(deadline, self.child.wait()) => match result {
-                Ok(Ok(status)) => {
-                    let (outcome, exit) = Self::status_facts(status);
-                    (outcome, exit, None)
-                }
+            result = timeout(deadline, self.settle_natural_exit()) => match result {
+                Ok(Ok(settled)) => settled,
                 Ok(Err(_)) => {
-                    let (record, exit) = self.stop(ProcessStopReason::RuntimeError).await;
-                    (Outcome::Unknown, exit, Some(record))
+                    let (record, exit, tree) = self.stop(ProcessStopReason::RuntimeError).await;
+                    (exit, Some(record), tree)
                 }
                 Err(_) => {
-                    let (record, exit) = self.stop(ProcessStopReason::Timeout).await;
-                    (
-                        Self::stop_outcome(record, Outcome::DeadlineExceeded),
-                        exit,
-                        Some(record),
-                    )
+                    let (record, exit, tree) = self.stop(ProcessStopReason::Timeout).await;
+                    (exit, Some(record), tree)
                 }
             },
         };
-        let output_complete = self.drain_output().await;
-        if !output_complete {
-            // A descendant may still hold an inherited pipe after its parent
-            // has exited. Do not detach that group's possible external effects.
-            let cleanup = self.stop_tree(None);
-            Self::merge_final_stop(&mut stop_record, cleanup);
-        }
-        let output = self.snapshot();
-        ProcessReceipt {
-            outcome,
+        let (stdout_complete, stderr_complete) = self.drain_output().await;
+        ProcessReceipt::new(
             exit,
             stop_record,
-            output,
-            output_complete,
-            spools: self.spools.clone(),
-        }
+            tree,
+            self.snapshot(),
+            stdout_complete,
+            stderr_complete,
+            self.spools.clone(),
+        )
     }
 
     /// Interactive wait. The same runner retains sole custody of ChildStdin
@@ -1378,24 +1486,16 @@ impl PipeProcess {
         tokio::pin!(cancellation);
         let deadline = sleep(deadline);
         tokio::pin!(deadline);
-        let (outcome, exit, mut stop_record) = loop {
+        let (exit, stop_record, tree) = loop {
             tokio::select! {
                 biased;
                 _ = &mut cancellation => {
-                    let (record, exit) = self.stop(ProcessStopReason::Cancelled).await;
-                    break (
-                        Self::stop_outcome(record, Outcome::Cancelled),
-                        exit,
-                        Some(record),
-                    );
+                    let (record, exit, tree) = self.stop(ProcessStopReason::Cancelled).await;
+                    break (exit, Some(record), tree);
                 }
                 _ = &mut deadline => {
-                    let (record, exit) = self.stop(ProcessStopReason::Timeout).await;
-                    break (
-                        Self::stop_outcome(record, Outcome::DeadlineExceeded),
-                        exit,
-                        Some(record),
-                    );
+                    let (record, exit, tree) = self.stop(ProcessStopReason::Timeout).await;
+                    break (exit, Some(record), tree);
                 }
                 command = input.recv() => {
                     let Some(command) = command else {
@@ -1416,16 +1516,13 @@ impl PipeProcess {
                         }
                     }
                 }
-                result = self.child.wait() => {
+                result = self.settle_natural_exit() => {
                     break match result {
-                        Ok(status) => {
-                            let (outcome, exit) = Self::status_facts(status);
-                            (outcome, exit, None)
-                        }
+                        Ok(settled) => settled,
                         Err(_) => {
-                            let (record, exit) =
+                            let (record, exit, tree) =
                                 self.stop(ProcessStopReason::RuntimeError).await;
-                            (Outcome::Unknown, exit, Some(record))
+                            (exit, Some(record), tree)
                         }
                     };
                 }
@@ -1440,30 +1537,26 @@ impl PipeProcess {
             }
         }
         self.close_stdin();
-        let output_complete = self.drain_output().await;
-        if !output_complete {
-            let cleanup = self.stop_tree(None);
-            Self::merge_final_stop(&mut stop_record, cleanup);
-        }
-        let output = self.snapshot();
-        ProcessReceipt {
-            outcome,
+        let (stdout_complete, stderr_complete) = self.drain_output().await;
+        ProcessReceipt::new(
             exit,
             stop_record,
-            output,
-            output_complete,
-            spools: self.spools.clone(),
-        }
+            tree,
+            self.snapshot(),
+            stdout_complete,
+            stderr_complete,
+            self.spools.clone(),
+        )
     }
 
-    fn status_facts(status: ExitStatus) -> (Outcome, RunnerExit) {
+    fn exit_fact(status: ExitStatus) -> RunnerExit {
         if let Some(code) = status.code() {
-            return (Outcome::Exited(code), RunnerExit::Code(code));
+            return RunnerExit::Code(code);
         }
         if let Some(signal) = aw_platform::exit_signal(&status) {
-            return (Outcome::ExitedBySignal(signal), RunnerExit::Signal(signal));
+            return RunnerExit::Signal(signal);
         }
-        (Outcome::Unknown, RunnerExit::Unknown)
+        RunnerExit::Unknown
     }
 }
 impl Drop for PipeProcess {
@@ -1472,17 +1565,7 @@ impl Drop for PipeProcess {
         for task in &self.readers {
             task.abort();
         }
-        // Even after the direct child exited, inherited descendants may
-        // remain in its process group with stdout/stderr redirected. Preserve
-        // the old Bash guard's unconditional group teardown. Escaped children
-        // and same-UID code remain outside this best-effort boundary.
-        if self.guard.is_active() {
-            let _ = self.stop_tree(None);
-            // This is the final adapter-level fail-safe attempt. If its result
-            // is still Unknown, do not let the inner platform guard make an
-            // unobserved second Drop retry.
-            self.guard.disarm();
-        }
+        // Scope owns final process-lifetime cleanup and drops after this body.
     }
 }
 #[cfg(feature = "pty")]
@@ -1551,7 +1634,7 @@ mod tests {
             .await;
         assert_eq!(
             receipt.runner_terminal().stop,
-            Some(ProcessStopReason::Cancelled)
+            Some(StopRecord::stopped(ProcessStopReason::Cancelled))
         );
         assert_eq!(
             receipt.stop_record(),
@@ -1573,8 +1656,16 @@ mod tests {
             .await
             .unwrap();
         let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
-        assert_eq!(receipt.runner_terminal().stop, None);
         assert_eq!(receipt.runner_terminal().exit, RunnerExit::Signal(9));
+        assert_eq!(receipt.runner_terminal().tree, Tree::Empty);
+        assert_eq!(
+            receipt
+                .runner_terminal()
+                .stop
+                .and_then(|record| record.reason),
+            None,
+            "external process death may retain housekeeping cleanup but never a semantic stop"
+        );
         assert!(
             receipt
                 .stop_record()
@@ -1635,8 +1726,8 @@ mod tests {
         .unwrap();
         assert!(process.termination_available().unwrap());
         let receipt = process.terminate().await.unwrap();
-        assert_eq!(receipt.outcome, Outcome::Cancelled);
-        assert!(receipt.output_complete);
+        assert_eq!(receipt.outcome(), Outcome::Cancelled);
+        assert!(receipt.output_complete());
         assert!(!process.stdin_open());
         assert!(
             !process.termination_available().unwrap(),
@@ -1647,7 +1738,10 @@ mod tests {
             "post-settlement original Process must never receive a second signal"
         );
         let terminal = receipt.runner_terminal();
-        assert_eq!(terminal.stop, Some(ProcessStopReason::Cancelled));
+        assert_eq!(
+            terminal.stop,
+            Some(StopRecord::stopped(ProcessStopReason::Cancelled))
+        );
         #[cfg(unix)]
         match terminal.exit {
             RunnerExit::Signal(signal) => {
@@ -1668,7 +1762,7 @@ mod tests {
             let process = PipeProcess::spawn(spec(command)).await.unwrap();
             let receipt = process.wait(pending::<()>(), Duration::from_secs(5)).await;
             let terminal = receipt.runner_terminal();
-            (receipt.outcome, terminal.exit)
+            (receipt.outcome(), terminal.exit)
         }
 
         let killed = signalled("kill -KILL $$").await;
@@ -2277,7 +2371,7 @@ mod tests {
         .join();
         let result = process.wait(pending::<()>(), Duration::from_secs(3)).await;
         assert!(!result.finished(), "failed disk accounting is incomplete");
-        assert!(!result.output_complete);
+        assert!(!result.output_complete());
         let fenced = FencedProcessSpools::after_journal(task_binding(), 11, snapshot).unwrap();
         assert_eq!(
             fenced
@@ -2434,8 +2528,8 @@ mod tests {
             .await
             .unwrap();
         let receipt = p.wait(pending::<()>(), Duration::from_secs(4)).await;
-        assert_eq!(receipt.outcome, Outcome::Exited(0));
-        assert!(receipt.output_complete);
+        assert_eq!(receipt.outcome(), Outcome::Exited(0));
+        assert!(receipt.output_complete());
         assert_eq!(&receipt.output.stdout.head, b"hello");
         assert_eq!(&receipt.output.stderr.head, b"tail");
         assert!(receipt.finished());
@@ -2454,7 +2548,7 @@ mod tests {
     async fn nonzero_exit_is_factual() {
         let p = PipeProcess::spawn(spec("exit 9")).await.unwrap();
         let receipt = p.wait(pending::<()>(), Duration::from_secs(3)).await;
-        assert_eq!(receipt.outcome, Outcome::Exited(9));
+        assert_eq!(receipt.outcome(), Outcome::Exited(9));
         assert!(receipt.finished());
     }
     #[tokio::test]
@@ -2469,7 +2563,7 @@ mod tests {
             )
             .await;
         assert!(matches!(
-            receipt.outcome,
+            receipt.outcome(),
             Outcome::Cancelled | Outcome::Unknown
         ));
         assert!(!receipt.finished());
@@ -2483,7 +2577,7 @@ mod tests {
             .wait(pending::<()>(), Duration::from_millis(35))
             .await;
         assert!(matches!(
-            receipt.outcome,
+            receipt.outcome(),
             Outcome::DeadlineExceeded | Outcome::Unknown
         ));
         assert!(!receipt.finished());
@@ -2548,8 +2642,8 @@ mod tests {
             .await
             .unwrap();
         let receipt = p.wait(pending::<()>(), Duration::from_secs(5)).await;
-        assert_eq!(receipt.outcome, Outcome::Exited(0));
-        assert!(receipt.output_complete);
+        assert_eq!(receipt.outcome(), Outcome::Exited(0));
+        assert!(receipt.output_complete());
         let s = receipt.output.stdout;
         assert_eq!(s.head.len(), CAPTURE_HEAD);
         assert_eq!(s.tail.len(), CAPTURE_TAIL);
@@ -2565,7 +2659,7 @@ mod tests {
         assert_eq!(
             p.wait(pending::<()>(), Duration::from_secs(3))
                 .await
-                .outcome,
+                .outcome(),
             Outcome::Exited(0)
         );
         let mut s = spec("read -r line; printf '%s' \"$line\"");
@@ -2609,8 +2703,9 @@ mod tests {
             .insert("MARKER".into(), marker.to_string_lossy().into_owned());
         let resource = PipeProcess::spawn(launch).await.unwrap();
         let receipt = resource.wait(pending::<()>(), Duration::from_secs(4)).await;
-        assert_eq!(receipt.outcome, Outcome::Exited(0));
-        assert!(receipt.output_complete);
+        assert_eq!(receipt.outcome(), Outcome::Exited(0));
+        assert_eq!(receipt.runner_terminal().tree, Tree::Live);
+        assert!(receipt.output_complete());
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(
             !marker.exists(),
@@ -2619,14 +2714,15 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn open_inherited_output_pipe_is_explicitly_incomplete() {
+    async fn inherited_output_pipe_is_closed_before_drain() {
         let resource = PipeProcess::spawn(spec("(sleep 3) & printf parent"))
             .await
             .unwrap();
         let receipt = resource.wait(pending::<()>(), Duration::from_secs(4)).await;
-        assert_eq!(receipt.outcome, Outcome::Exited(0));
-        assert!(!receipt.output_complete);
-        assert!(!receipt.finished());
+        assert_eq!(receipt.outcome(), Outcome::Exited(0));
+        assert_eq!(receipt.runner_terminal().tree, Tree::Live);
+        assert!(receipt.output_complete());
+        assert!(receipt.finished());
     }
     #[cfg(feature = "pty")]
     #[test]

@@ -979,6 +979,44 @@ impl PolicyOperationRouter {
             }
         }
 
+        // An accepted ToolCall is located before contextual refs or new-policy
+        // preflight are evaluated. The original source/operation/arguments
+        // fingerprint is stable even when `^` or a relative target has moved.
+        let prior_admission = self.store.policy_admission_replay(
+            &ctx.actor,
+            &scope.session_id,
+            &scope.branch_id,
+            ctx.turn_id,
+            &ctx.call_id,
+            &Self::request_sha256(operation, &arguments),
+        )?;
+        if let Some(prior) = prior_admission.as_ref() {
+            match prior.state {
+                PolicyAdmissionState::Consumed => {
+                    return Err(Error::Conflict(
+                        "policy ToolCall is already consumed; recover its original effect receipt",
+                    ));
+                }
+                PolicyAdmissionState::Denied
+                | PolicyAdmissionState::AskDenied
+                | PolicyAdmissionState::AskExpired => {
+                    return Err(Error::Denied("operation denied by original policy admission"));
+                }
+                PolicyAdmissionState::AskPending
+                | PolicyAdmissionState::GuardianStarted
+                | PolicyAdmissionState::GuardianUnknown
+                | PolicyAdmissionState::GuardianSettled => {
+                    return Err(Error::Conflict(
+                        "original policy ToolCall is waiting/unknown; do not dispatch another attempt",
+                    ));
+                }
+                PolicyAdmissionState::Claimed
+                | PolicyAdmissionState::Allowed
+                | PolicyAdmissionState::AskApproved
+                | PolicyAdmissionState::Narrowed => {}
+            }
+        }
+
         original.validate(&arguments)?;
         if ctx.execution_site.is_empty() {
             return Err(Error::Denied(
@@ -989,7 +1027,10 @@ impl PolicyOperationRouter {
         let current = Self::current_agent_ref(&ctx)?;
         let project_scope = Self::project_scope(&current);
         let target_domain = Self::target_domain(&current);
-        let target = Self::canonical_target(operation, &ctx, &arguments)?;
+        let target = match &prior_admission {
+            Some(prior) => prior.request.canonical_target.clone(),
+            None => Self::canonical_target(operation, &ctx, &arguments)?,
+        };
         let evidence = AuthenticatedToolGrantEvidence::capture(
             &self.authority,
             &ctx.actor,
@@ -1149,29 +1190,35 @@ impl PolicyOperationRouter {
 
         if decided.state == PolicyAdmissionState::Consumed {
             let strategy = Self::selected_route(&decided, effective.strategy())?;
-            if strategy == aw_policy::Strategy::Local && Self::remote_effect(operation) {
+            if strategy == aw_policy::Strategy::Local {
                 if let Some(bridge) = self.remote_sites.get(&ctx.execution_site).cloned() {
                     let wire_arguments = Self::remote_arguments(operation, &target, &arguments)?;
-                    if let Some(authorization) = aw::policy_runtime::recover_remote_start(
-                        aw::policy_runtime::RemoteStartReplayRequest {
-                            store: &self.store,
-                            actor: &ctx.actor,
-                            session: &scope.session_id,
-                            policy_admission_id: &decided.id,
-                            original_invocation_id: &invocation,
-                            effect_attempt_id: &ctx.call_id,
-                            turn_id: ctx.turn_id,
-                            call_id: &ctx.call_id,
-                            operation: operation.semantic_name(),
-                            canonical_ref: &target,
-                            arguments_sha256: remote_arguments_sha256(&wire_arguments),
-                            original_request_sha256: Self::request_digest(operation, &arguments),
-                            session_action: Self::remote_session_action(operation)?,
-                        },
-                    )? {
-                        return bridge
-                            .call_effect(&ctx, operation, &wire_arguments, &authorization)
-                            .await;
+                    if Self::remote_read(operation) {
+                        evidence.revalidate(&self.authority)?;
+                        return bridge.call_read(&ctx, operation, &wire_arguments).await;
+                    }
+                    if Self::remote_effect(operation) {
+                        if let Some(authorization) = aw::policy_runtime::recover_remote_start(
+                            aw::policy_runtime::RemoteStartReplayRequest {
+                                store: &self.store,
+                                actor: &ctx.actor,
+                                session: &scope.session_id,
+                                policy_admission_id: &decided.id,
+                                original_invocation_id: &invocation,
+                                effect_attempt_id: &ctx.call_id,
+                                turn_id: ctx.turn_id,
+                                call_id: &ctx.call_id,
+                                operation: operation.semantic_name(),
+                                canonical_ref: &target,
+                                arguments_sha256: remote_arguments_sha256(&wire_arguments),
+                                original_request_sha256: Self::request_digest(operation, &arguments),
+                                session_action: Self::remote_session_action(operation)?,
+                            },
+                        )? {
+                            return bridge
+                                .call_effect(&ctx, operation, &wire_arguments, &authorization)
+                                .await;
+                        }
                     }
                 }
             }
@@ -1247,6 +1294,50 @@ impl PolicyOperationRouter {
         };
 
         evidence.revalidate(&self.authority)?;
+
+        if let Some(bridge) = remote_bridge {
+            let wire_arguments = remote_arguments
+                .as_ref()
+                .ok_or(Error::Protocol("remote arguments disappeared"))?;
+            if Self::remote_read(operation) {
+                let consumed = self.store.policy_admission_consume(
+                    &scope.session_id,
+                    &decided.id,
+                    &policy_sha,
+                    &authority_sha,
+                    Some(strategy),
+                    None,
+                )?;
+                if consumed.state != PolicyAdmissionState::Consumed {
+                    return Err(Error::Conflict(
+                        "policy admission did not reach executable consumed state",
+                    ));
+                }
+                return bridge.call_read(&ctx, operation, wire_arguments).await;
+            }
+            let (intent, issuer) =
+                remote_intent.ok_or(Error::Protocol("remote Start intent disappeared"))?;
+            let authorization = aw::policy_runtime::authorize_remote_start(
+                aw::policy_runtime::RemoteStartAdmissionRequest {
+                    store: &self.store,
+                    authority: &self.authority,
+                    actor: &ctx.actor,
+                    evidence: &evidence,
+                    session: &scope.session_id,
+                    policy_admission_id: &decided.id,
+                    current_policy_revision_sha256: &policy_sha,
+                    current_authority_sha256: &authority_sha,
+                    selected_route: strategy,
+                    authorized_narrow_ref: None,
+                    intent,
+                    issuer,
+                },
+            )?;
+            return bridge
+                .call_effect(&ctx, operation, wire_arguments, &authorization)
+                .await;
+        }
+
         let consumed = self.store.policy_admission_consume(
             &scope.session_id,
             &decided.id,
@@ -1259,32 +1350,6 @@ impl PolicyOperationRouter {
             return Err(Error::Conflict(
                 "policy admission did not reach executable consumed state",
             ));
-        }
-
-        if let Some(bridge) = remote_bridge {
-            let wire_arguments = remote_arguments
-                .as_ref()
-                .ok_or(Error::Protocol("remote arguments disappeared"))?;
-            if Self::remote_read(operation) {
-                return bridge.call_read(&ctx, operation, wire_arguments).await;
-            }
-            let (intent, issuer) =
-                remote_intent.ok_or(Error::Protocol("remote Start intent disappeared"))?;
-            let authorization = aw::policy_runtime::authorize_remote_start(
-                aw::policy_runtime::RemoteStartAdmissionRequest {
-                    store: &self.store,
-                    authority: &self.authority,
-                    actor: &ctx.actor,
-                    evidence: &evidence,
-                    session: &scope.session_id,
-                    policy_admission_id: &consumed.id,
-                    intent,
-                    issuer,
-                },
-            )?;
-            return bridge
-                .call_effect(&ctx, operation, wire_arguments, &authorization)
-                .await;
         }
 
         let original_executor = Arc::new(PreparedOriginalOperation {

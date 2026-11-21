@@ -250,6 +250,20 @@ fn hidden_finite_exposure_release_frees_capacity_without_reusing_position() {
     let first_ref = format!("{root}/t:1/j:hidden-one");
     let second_ref = format!("{root}/t:1/j:hidden-two");
 
+    for invalid in [
+        format!("{root}/t:1/j:bad/n:1"),
+        format!("{root}/j:bad"),
+        format!("{root}/t:1/j:bad/t:2"),
+        "t:1/j:contextual".to_owned(),
+    ] {
+        assert!(
+            store
+                .finite_job_exposure_reserve(&actor, &binding, "generation-cap", &invalid, 1,)
+                .is_err(),
+            "non-canonical or non-[Turn,Job] exposure unexpectedly accepted: {invalid}"
+        );
+    }
+
     let first = store
         .finite_job_exposure_reserve(&actor, &binding, "generation-cap", &first_ref, 1)
         .unwrap();
@@ -2243,6 +2257,20 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     assert_eq!(first.state, PolicyAdmissionState::Claimed);
     assert_eq!(
         store
+            .policy_admission_replay(
+                &actor,
+                &session.id,
+                &branch.id,
+                1,
+                "guardian-unknown",
+                &"a".repeat(64),
+            )
+            .unwrap(),
+        Some(first.clone()),
+        "router can recover a claim before current target/policy preflight"
+    );
+    assert_eq!(
+        store
             .policy_admission_claim(request("guardian-unknown", 'a', 'b'))
             .unwrap(),
         first,
@@ -2266,6 +2294,19 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
         first,
         "mutable writer/policy/participation evidence must not change replay identity"
     );
+    let mut reparented = request("guardian-unknown", 'a', 'e');
+    reparented.canonical_target = "/d:0/i:0/p:0/a:other/t:1/j:policy-target".into();
+    assert_eq!(
+        store.policy_admission_claim(reparented).unwrap(),
+        first,
+        "replaying the same original request must retain the admitted target after reparenting"
+    );
+    let mut changed_original = request("guardian-unknown", 'f', 'e');
+    changed_original.canonical_target = "/d:0/i:0/p:0/a:other/t:1/j:policy-target".into();
+    assert!(matches!(
+        store.policy_admission_claim(changed_original),
+        Err(Error::Conflict(_))
+    ));
 
     let started = store
         .policy_admission_start_guardian(&session.id, &first.id, &"3".repeat(64))
@@ -2435,6 +2476,126 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
     assert_eq!(
         settled.guardian_result_sha256.as_deref(),
         Some(format!("{:x}", Sha256::digest(result.text.as_bytes())).as_str())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn policy_admission_participant_replay_keeps_owner_and_current_disclosure_separate() {
+    let temp = Temp::new();
+    let (mut agent, _, _) = agent();
+    let alice = agent.actor().clone();
+    let bob = PrincipalId::new("internal:fixture:policy-participant-bob").unwrap();
+    let store = SessionStore::open(&temp.0).unwrap();
+    let (session, branch) = store.create(&alice, "shared policy", binding()).unwrap();
+    let (view, handle) = store.activate(&alice, &session.id, &branch.id).unwrap();
+    agent
+        .load_history(view.history, Some(Arc::new(handle.clone())))
+        .unwrap();
+    let identity = agent.default_identity().unwrap();
+    handle
+        .begin(TurnStart {
+            turn_id: 1,
+            prompt: "participant-policy admission".into(),
+            identity,
+        })
+        .await
+        .unwrap();
+    let writer_epoch = store
+        .workspace_writer(&alice, None, &session.workspace_id)
+        .unwrap()
+        .writer_epoch;
+    let grant = store
+        .set_session_participation(
+            &alice,
+            &session.id,
+            &bob,
+            SessionParticipationPermissions {
+                view: true,
+                submit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(!grant.owner);
+    let mut request = PolicyAdmissionRequest {
+        session_id: session.id.clone(),
+        branch_id: branch.id.clone(),
+        writer_epoch,
+        turn_id: 1,
+        call_id: "bob-read".into(),
+        canonical_target: "/d:local/i:alice/p:project/a:1/t:1/j:original".into(),
+        request_sha256: "a".repeat(64),
+        subject: PolicyAdmissionSubject::from_participation(&grant),
+        policy_revision_sha256: "b".repeat(64),
+        authority_sha256: "c".repeat(64),
+        candidate_local: true,
+        candidate_delegate_agent: false,
+        guardian_required: false,
+        guardian_identity: None,
+        guardian_site: None,
+        approval_scope: None,
+        authorized_approvers: Vec::new(),
+        approval_expires_at: None,
+    };
+    let accepted = store.policy_admission_claim(request.clone()).unwrap();
+    assert_eq!(accepted.request.subject.actor, bob);
+    assert!(!accepted.request.subject.owner);
+    assert_eq!(accepted.request.writer_epoch, writer_epoch);
+
+    store
+        .revoke_session_participation(&alice, &session.id, &bob)
+        .unwrap();
+    assert!(
+        store
+            .policy_admission_replay(
+                &bob,
+                &session.id,
+                &branch.id,
+                1,
+                "bob-read",
+                &"a".repeat(64),
+            )
+            .is_err(),
+        "direct replay lookup also checks the current recipient audience"
+    );
+    assert!(
+        store.policy_admission_claim(request.clone()).is_err(),
+        "replayed private receipt cannot bypass current recipient disclosure"
+    );
+    store
+        .set_session_participation(
+            &alice,
+            &session.id,
+            &bob,
+            SessionParticipationPermissions::VIEW_ONLY,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .policy_admission_replay(
+                &bob,
+                &session.id,
+                &branch.id,
+                1,
+                "bob-read",
+                &"a".repeat(64),
+            )
+            .unwrap(),
+        Some(accepted.clone())
+    );
+    request.canonical_target = "/d:local/i:alice/p:project/a:2/t:1/j:retargeted".into();
+    request.policy_revision_sha256 = "d".repeat(64);
+    request.writer_epoch = request.writer_epoch.saturating_add(1);
+    assert_eq!(
+        store.policy_admission_claim(request.clone()).unwrap(),
+        accepted,
+        "View-only regrant may inspect the old factual claim, never retarget it"
+    );
+    request.call_id = "bob-new-call".into();
+    assert!(
+        store.policy_admission_claim(request).is_err(),
+        "View-only participant cannot claim a new ToolCall"
     );
 }
 

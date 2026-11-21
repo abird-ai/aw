@@ -6,7 +6,15 @@
 //! incomplete reader/drain state is an independent `Status::incomplete` fact
 //! and never erases an otherwise known physical/semantic process outcome.
 use super::{batch::Status, status::Primary};
-use crate::execution_stop::StopReason;
+use crate::execution_stop::{StopReason, StopRecord};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Tree {
+    Empty,
+    Live,
+    #[default]
+    Unknown,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessExit {
@@ -20,26 +28,42 @@ pub enum ProcessExit {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessOutputMeta {
+    /// Bytes observed by AW. Exact produced bytes are known only when the stream is complete.
     pub stdout_bytes: u64,
+    /// Bytes observed by AW. Exact produced bytes are known only when the stream is complete.
     pub stderr_bytes: u64,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
-    /// False means the host could not prove both output readers/writers
-    /// quiesced after the process tree settlement attempt.
-    pub complete: bool,
+    pub stdout_complete: bool,
+    pub stderr_complete: bool,
+}
+
+impl ProcessOutputMeta {
+    pub const fn complete(&self) -> bool {
+        self.stdout_complete && self.stderr_complete
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessTerminal {
     pub exit: ProcessExit,
-    /// Semantic reason AW proved it stopped the process, if any.
-    pub stop: Option<StopReason>,
+    /// Final factual semantic/housekeeping stop record, if any.
+    pub stop: Option<StopRecord>,
+    /// Live contained work observed before final cleanup.
+    pub tree: Tree,
     pub output: ProcessOutputMeta,
 }
 
 impl ProcessTerminal {
+    pub const fn stop_reason(self) -> Option<StopReason> {
+        match self.stop {
+            Some(record) => record.terminal_reason(),
+            None => None,
+        }
+    }
+
     pub fn status(self) -> Status {
-        let primary = if self.stop.is_some() {
+        let primary = if self.stop.and_then(|record| record.reason).is_some() {
             Primary::Fail
         } else {
             match self.exit {
@@ -52,7 +76,10 @@ impl ProcessTerminal {
             primary,
             // Retained stdout/stderr truncation is observability only.
             more: false,
-            incomplete: !self.output.complete,
+            incomplete: !self.output.complete()
+                || self.stop.is_some_and(|record| {
+                    record.evidence == crate::execution_stop::StopEvidence::Unknown
+                }),
         }
     }
 
@@ -68,11 +95,14 @@ impl ProcessTerminal {
         if self.output.stderr_truncated {
             fields.push("stderr_truncated=true".into());
         }
-        if let Some(stop) = self.stop {
-            fields.push(format!("stop={}", stop.as_str()));
+        if let Some(reason) = self.stop.and_then(|record| record.reason) {
+            fields.push(format!("stop={}", reason.as_str()));
         }
-        if !self.output.complete {
-            fields.push("output_complete=false".into());
+        if !self.output.stdout_complete {
+            fields.push("stdout_complete=false".into());
+        }
+        if !self.output.stderr_complete {
+            fields.push("stderr_complete=false".into());
         }
         fields.join(" ")
     }
@@ -87,10 +117,11 @@ impl ProcessTerminal {
         };
         let stop = self
             .stop
+            .and_then(|record| record.reason)
             .map(|reason| format!(" stop={}", reason.as_str()))
             .unwrap_or_default();
         format!(
-            "{} {}{} stdout={} stderr={} stdout_truncated={} stderr_truncated={} output_complete={}",
+            "{} {}{} stdout={} stderr={} stdout_truncated={} stderr_truncated={} stdout_complete={} stderr_complete={}",
             self.status().primary.as_str(),
             exit,
             stop,
@@ -98,7 +129,8 @@ impl ProcessTerminal {
             self.output.stderr_bytes,
             self.output.stdout_truncated,
             self.output.stderr_truncated,
-            self.output.complete
+            self.output.stdout_complete,
+            self.output.stderr_complete
         )
     }
 }
@@ -128,6 +160,7 @@ impl StopProof {
             Self::Unknown(output) => ProcessTerminal {
                 exit: ProcessExit::Unknown,
                 stop: None,
+                tree: Tree::Unknown,
                 output,
             },
         }
@@ -144,7 +177,8 @@ mod tests {
             stderr_bytes: 7,
             stdout_truncated: truncated,
             stderr_truncated: false,
-            complete,
+            stdout_complete: complete,
+            stderr_complete: complete,
         }
     }
 
@@ -153,6 +187,7 @@ mod tests {
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(0),
             stop: None,
+            tree: Tree::Empty,
             output: output(true, true),
         };
         assert_eq!(
@@ -175,6 +210,7 @@ mod tests {
                 ProcessTerminal {
                     exit,
                     stop: None,
+                    tree: Tree::Empty,
                     output: output(true, false),
                 }
                 .status()
@@ -185,6 +221,7 @@ mod tests {
         let signal = ProcessTerminal {
             exit: ProcessExit::Signal(11),
             stop: None,
+            tree: Tree::Empty,
             output: output(true, false),
         };
         assert!(signal.status_detail().contains("exit=signal:11"));
@@ -209,6 +246,7 @@ mod tests {
             let status = ProcessTerminal {
                 exit,
                 stop: None,
+                tree: Tree::Unknown,
                 output: output(false, false),
             }
             .status();
@@ -222,7 +260,8 @@ mod tests {
     fn proven_stop_is_failure_even_when_physical_exit_is_unknown() {
         let terminal = ProcessTerminal {
             exit: ProcessExit::Unknown,
-            stop: Some(StopReason::Timeout),
+            stop: Some(StopRecord::stopped(StopReason::Timeout)),
+            tree: Tree::Empty,
             output: output(true, false),
         };
         assert_eq!(terminal.status().primary, Primary::Fail);

@@ -10,6 +10,7 @@ use crate::{
     agent_binding_in, context, db, durability, workspace_writer, AgentBindingInfo, Error,
     PrincipalId, Result, SessionStore,
 };
+use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -88,15 +89,26 @@ fn root_ref(binding: &AgentBindingInfo) -> String {
 }
 
 fn validate_ref(binding: &AgentBindingInfo, canonical_ref: &str) -> Result<()> {
-    let root = root_ref(binding);
-    if canonical_ref.len() > 2048
-        || !canonical_ref.is_ascii()
-        || canonical_ref.chars().any(char::is_control)
-        || !canonical_ref.starts_with(&(root + "/t:"))
-        || !canonical_ref.contains("/j:")
+    let parsed = ExecutionRef::parse(canonical_ref)
+        .map_err(|_| Error::Denied("invalid finite Job exposure ref"))?;
+    if !parsed.is_canonical() {
+        return Err(Error::Denied("finite Job exposure ref must be canonical"));
+    }
+    let resolved = parsed
+        .resolve(None, None)
+        .map_err(|_| Error::Denied("invalid canonical finite Job exposure ref"))?;
+    let agent = resolved.agent_ref();
+    if agent.domain.as_str() != binding.domain_handle
+        || agent.identity.as_str() != binding.identity_handle
+        || agent.project.as_str() != binding.project_handle
+        || agent.agent.as_str() != binding.agent_handle
+        || !matches!(
+            resolved.suffix(),
+            [ExecutionSegment::Turn(_), ExecutionSegment::Job(_)]
+        )
     {
         return Err(Error::Denied(
-            "finite Job exposure ref is outside the authoritative Agent owner",
+            "finite Job exposure ref is outside the exact authoritative Agent Turn/Job owner",
         ));
     }
     Ok(())
@@ -121,32 +133,15 @@ fn kind_state(kind: &str) -> Result<FiniteExposureState> {
     }
 }
 
-fn decode_event(kind: &str, seq: u64, encoded: &str) -> Result<FiniteExposure> {
-    let payload: Payload = crate::decode(encoded)?;
-    let state = kind_state(kind)?;
-    let position = match state {
-        FiniteExposureState::Reserved => seq,
-        FiniteExposureState::Published | FiniteExposureState::Released => {
-            payload.reservation_position.ok_or(Error::Storage(
-                "finite Job exposure closure lacks reservation position",
-            ))?
-        }
-    };
-    if position == 0 || payload.writer_epoch == 0 {
-        return Err(Error::Storage("invalid finite Job exposure event"));
+fn projection_state(state: &str) -> Result<FiniteExposureState> {
+    match state {
+        "reserved" => Ok(FiniteExposureState::Reserved),
+        "published" => Ok(FiniteExposureState::Published),
+        "released" => Ok(FiniteExposureState::Released),
+        _ => Err(Error::Storage(
+            "invalid finite Job exposure projection state",
+        )),
     }
-    Ok(FiniteExposure {
-        canonical_ref: payload.canonical_ref,
-        position,
-        state,
-        generation: payload.generation,
-        domain_handle: payload.domain_handle,
-        identity_handle: payload.identity_handle,
-        project_handle: payload.project_handle,
-        session_id: payload.session_id,
-        branch_id: payload.branch_id,
-        writer_epoch: payload.writer_epoch,
-    })
 }
 
 fn project_agent(
@@ -237,6 +232,58 @@ fn project_finite(c: &rusqlite::Connection, kind: &str, seq: u64, payload: &Payl
     Ok(())
 }
 
+pub(crate) fn publish_agent_branch_created(
+    c: &rusqlite::Connection,
+    txid: &str,
+    actor: Option<&PrincipalId>,
+    session_id: &str,
+    branch_id: &str,
+    head: &str,
+    name: &str,
+) -> Result<()> {
+    durability::commit_event(
+        c,
+        txid,
+        "branch.created",
+        "branch",
+        branch_id,
+        actor,
+        serde_json::json!({"session_id":session_id,"head":head,"name":name}),
+    )
+}
+
+pub(crate) fn repair_missing_agent_exposures(c: &rusqlite::Connection) -> Result<usize> {
+    let mut query = db(c.prepare(
+        "SELECT b.session_id,b.id,b.head,b.name,s.owner
+         FROM branches b JOIN sessions s ON s.id=b.session_id
+         LEFT JOIN job_exposure_current e
+           ON e.kind='agent' AND e.generation=''
+          AND e.session_id=b.session_id AND e.branch_id=b.id
+         WHERE e.canonical_ref IS NULL
+         ORDER BY b.created_at,b.session_id,b.id",
+    ))?;
+    let rows = db(query.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    }))?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(|_| Error::Storage("cannot enumerate missing Agent exposure bindings"))?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let txid = durability::tx_id()?;
+    for (session_id, branch_id, head, name, owner) in &rows {
+        let actor = PrincipalId::new(owner.clone())?;
+        publish_agent_branch_created(c, &txid, Some(&actor), session_id, branch_id, head, name)?;
+    }
+    Ok(rows.len())
+}
+
 pub(crate) fn project_commit_event(
     c: &rusqlite::Connection,
     kind: &str,
@@ -305,18 +352,68 @@ fn latest(
     generation: &str,
     canonical_ref: &str,
 ) -> Result<Option<FiniteExposure>> {
-    let key = entity_key(generation, canonical_ref);
-    let row: Option<(u64, String, String)> = db(c
+    let row: Option<(
+        String,
+        u64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        u64,
+    )> = db(c
         .query_row(
-            "SELECT seq,kind,payload_json FROM commit_log
-             WHERE entity_type=?1 AND entity_id=?2
-             ORDER BY seq DESC LIMIT 1",
-            params![ENTITY, key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT canonical_ref,position,state,generation,domain_handle,identity_handle,
+                    project_handle,session_id,branch_id,writer_epoch
+             FROM job_exposure_current
+             WHERE kind='finite' AND generation=?1 AND canonical_ref=?2",
+            params![generation, canonical_ref],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
         )
         .optional())?;
-    row.map(|(seq, kind, payload)| decode_event(&kind, seq, &payload))
-        .transpose()
+    row.map(
+        |(
+            canonical_ref,
+            position,
+            state,
+            generation,
+            domain_handle,
+            identity_handle,
+            project_handle,
+            session_id,
+            branch_id,
+            writer_epoch,
+        )| {
+            Ok(FiniteExposure {
+                canonical_ref,
+                position,
+                state: projection_state(&state)?,
+                generation,
+                domain_handle,
+                identity_handle,
+                project_handle,
+                session_id,
+                branch_id,
+                writer_epoch,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn authoritative_binding(
@@ -580,27 +677,15 @@ impl SessionStore {
         }
 
         let active: u64 = db(tx.query_row(
-            "WITH latest AS (
-                 SELECT entity_id,MAX(seq) AS seq
-                 FROM commit_log
-                 WHERE entity_type=?1
-                   AND json_extract(payload_json,'$.generation')=?2
-                   AND json_extract(payload_json,'$.domain_handle')=?3
-                   AND json_extract(payload_json,'$.identity_handle')=?4
-                   AND json_extract(payload_json,'$.project_handle')=?5
-                 GROUP BY entity_id
-             )
-             SELECT COUNT(*)
-             FROM commit_log c JOIN latest l ON c.seq=l.seq
-             WHERE c.kind IN (?6,?7)",
+            "SELECT COUNT(*) FROM job_exposure_current
+             WHERE kind='finite' AND generation=?1
+               AND domain_handle=?2 AND identity_handle=?3 AND project_handle=?4
+               AND state IN ('reserved','published')",
             params![
-                ENTITY,
                 generation,
                 actual.domain_handle,
                 actual.identity_handle,
                 actual.project_handle,
-                RESERVED,
-                PUBLISHED,
             ],
             |row| row.get(0),
         ))?;
@@ -759,45 +844,64 @@ impl SessionStore {
         let actual = authoritative_binding(&connection, actor, binding)?;
         context::authorize_tree(&connection, &actual.session_id, actor)?;
         let mut query = db(connection.prepare(
-            "WITH latest AS (
-                 SELECT entity_id,MAX(seq) AS seq
-                 FROM commit_log
-                 WHERE entity_type=?1
-                   AND json_extract(payload_json,'$.generation')=?2
-                   AND json_extract(payload_json,'$.domain_handle')=?3
-                   AND json_extract(payload_json,'$.identity_handle')=?4
-                   AND json_extract(payload_json,'$.project_handle')=?5
-                 GROUP BY entity_id
-             )
-             SELECT c.seq,c.kind,c.payload_json
-             FROM commit_log c JOIN latest l ON c.seq=l.seq
-             WHERE c.kind=?6
-             ORDER BY CAST(json_extract(c.payload_json,'$.reservation_position') AS INTEGER) DESC,
-                      json_extract(c.payload_json,'$.canonical_ref') ASC
-             LIMIT ?7",
+            "SELECT canonical_ref,position,state,generation,domain_handle,identity_handle,
+                    project_handle,session_id,branch_id,writer_epoch
+             FROM job_exposure_current
+             WHERE kind='finite' AND generation=?1
+               AND domain_handle=?2 AND identity_handle=?3 AND project_handle=?4
+               AND state='published'
+             ORDER BY position DESC,canonical_ref ASC
+             LIMIT ?5",
         ))?;
         let rows = db(query.query_map(
             params![
-                ENTITY,
                 generation,
                 actual.domain_handle,
                 actual.identity_handle,
                 actual.project_handle,
-                PUBLISHED,
                 limit as i64,
             ],
             |row| {
                 Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, u64>(9)?,
                 ))
             },
         ))?;
         let mut result = Vec::new();
         for row in rows {
-            let (seq, kind, payload) = db(row)?;
-            result.push(decode_event(&kind, seq, &payload)?);
+            let (
+                canonical_ref,
+                position,
+                state,
+                generation,
+                domain_handle,
+                identity_handle,
+                project_handle,
+                session_id,
+                branch_id,
+                writer_epoch,
+            ) = db(row)?;
+            result.push(FiniteExposure {
+                canonical_ref,
+                position,
+                state: projection_state(&state)?,
+                generation,
+                domain_handle,
+                identity_handle,
+                project_handle,
+                session_id,
+                branch_id,
+                writer_epoch,
+            });
         }
         Ok(result)
     }
@@ -811,15 +915,9 @@ impl SessionStore {
         let actual = authoritative_binding(&connection, actor, binding)?;
         let position: Option<u64> = db(connection
             .query_row(
-                "SELECT seq FROM commit_log
-                 WHERE (kind='session.created'
-                        AND entity_type='session'
-                        AND entity_id=?1
-                        AND json_extract(payload_json,'$.branch_id')=?2)
-                    OR (kind='branch.created'
-                        AND entity_type='branch'
-                        AND entity_id=?2)
-                 ORDER BY seq LIMIT 1",
+                "SELECT position FROM job_exposure_current
+                 WHERE kind='agent' AND generation='' AND state='published'
+                   AND session_id=?1 AND branch_id=?2",
                 params![actual.session_id, actual.branch_id],
                 |row| row.get(0),
             )

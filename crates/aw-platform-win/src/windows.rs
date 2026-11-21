@@ -13,7 +13,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree, HANDLE},
+    Foundation::{CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, HANDLE},
     Security::{
         Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
         TOKEN_USER,
@@ -269,14 +269,37 @@ fn resume_managed_process(pid: u32) -> io::Result<()> {
 
 /// Own the entire descendant Job Object of one specific child process.
 /// Dropping/terminating it cannot signal an unrelated reused PID.
-pub struct ManagedProcessGuard {
+pub struct DirectScope {
     job: std::os::windows::io::OwnedHandle,
+    leader: std::os::windows::io::OwnedHandle,
     active: bool,
 }
-impl ManagedProcessGuard {
+impl DirectScope {
     pub fn attach(pid: u32, child_handle: std::os::windows::io::RawHandle) -> io::Result<Self> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+        let current = unsafe { GetCurrentProcess() };
+        let mut leader = std::ptr::null_mut();
+        // SAFETY: duplicate the live child process handle into this process so
+        // readiness remains bound to the exact leader independently of Child.
+        if unsafe {
+            DuplicateHandle(
+                current,
+                child_handle,
+                current,
+                &mut leader,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: DuplicateHandle returned a fresh owned process handle.
+        let leader = unsafe { OwnedHandle::from_raw_handle(leader) };
+
         // SAFETY: null security/name create a fresh private unnamed job.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
@@ -288,30 +311,48 @@ impl ManagedProcessGuard {
         if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child_handle) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let guard = Self { job, active: true };
-        // On failure, the RAII guard kills the still-suspended process group.
+        let scope = Self {
+            job,
+            leader,
+            active: true,
+        };
+        // On failure, the direct scope kills the still-suspended process group.
         resume_managed_process(pid)?;
-        Ok(guard)
+        Ok(scope)
     }
-    /// Force-stop the owned Job Object while preserving live-target evidence.
+
+    /// Has the exact main command become terminal without consuming Child wait state?
+    pub fn ready(&self) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: leader is an owned duplicate of the exact child process handle.
+        match unsafe { WaitForSingleObject(self.leader.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other("unexpected child wait result")),
+        }
+    }
+
+    /// Observe whether live work remains in the owned Job Object after the
+    /// waited command is terminal.
     ///
-    /// `Ok(true)` proves a live member was terminated, `Ok(false)` proves the
-    /// job was already empty, and `Err` leaves the result unknown and the guard
-    /// armed for its final Drop attempt.
-    pub fn terminate(&mut self) -> io::Result<bool> {
+    /// `Ok(true)` proves at least one active remaining member, `Ok(false)` proves
+    /// none remains, and `Err` leaves the result unknown.
+    pub fn observe(&self) -> io::Result<bool> {
         if !self.active {
             return Ok(false);
         }
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::{
-            JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
         };
-
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: the job is owned by this guard and the output struct matches
-        // the requested information class.
-        let queried = unsafe {
+        // SAFETY: the Job Object is owned by this scope and the output struct
+        // matches the requested information class.
+        if unsafe {
             QueryInformationJobObject(
                 self.job.as_raw_handle(),
                 JobObjectBasicAccountingInformation,
@@ -319,38 +360,59 @@ impl ManagedProcessGuard {
                 std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
                 std::ptr::null_mut(),
             )
-        };
-        let query_error = (queried == 0).then(io::Error::last_os_error);
-        if queried != 0 && accounting.ActiveProcesses == 0 {
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(accounting.ActiveProcesses != 0)
+    }
+
+    /// Windows has no portable graceful Job-wide stop primitive.
+    pub fn graceful(&self) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows process-scope grace unsupported",
+        ))
+    }
+
+    /// Final bounded force-stop of the owned Job Object.
+    ///
+    /// `Ok(true)` proves a live member was terminated, `Ok(false)` proves the
+    /// Job was already empty, and `Err` leaves the factual result unknown. A
+    /// failed first termination is retried once immediately; afterward the
+    /// scope is inert so no later retry can target a different lifetime.
+    pub fn terminate(&mut self) -> io::Result<bool> {
+        if !self.active {
+            return Ok(false);
+        }
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        let observed = self.observe();
+        if matches!(observed, Ok(false)) {
             self.active = false;
             return Ok(false);
         }
 
-        // Always attempt termination even when membership could not be queried:
-        // fail-safe cleanup must not leave descendants running. A successful
-        // termination after a failed query is still unprovable, so return the
-        // query error and remain armed for Drop.
-        // SAFETY: the Job Object belongs exclusively to this invocation.
-        if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if let Some(error) = query_error {
-            return Err(error);
-        }
-
+        // Keep cleanup fail-safe even when membership observation is unknown.
+        // Retry one failed Job termination immediately while the owned Job
+        // handle is still exact, then finalize this scope regardless.
+        let terminate = || {
+            // SAFETY: the Job Object belongs exclusively to this invocation.
+            if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        let first = terminate();
+        let terminated = if first.is_err() { terminate() } else { first };
         self.active = false;
-        Ok(true)
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    pub fn disarm(&mut self) {
-        self.active = false;
+        terminated?;
+        observed.map(|_| true)
     }
 }
-impl Drop for ManagedProcessGuard {
+impl Drop for DirectScope {
     fn drop(&mut self) {
         if self.active {
             let _ = self.terminate();
@@ -359,7 +421,7 @@ impl Drop for ManagedProcessGuard {
 }
 
 #[cfg(test)]
-mod managed_process_tests {
+mod direct_scope_tests {
     use super::*;
     use std::os::windows::io::AsRawHandle;
 
@@ -372,7 +434,7 @@ mod managed_process_tests {
         configure_managed_process(&mut command);
         command.arg("/C").arg("exit /B 0");
         let mut child = command.spawn().expect("suspended child");
-        let job = ManagedProcessGuard::attach(child.id(), child.as_raw_handle())
+        let job = DirectScope::attach(child.id(), child.as_raw_handle())
             .expect("attach and resume only after Job Object membership");
         let status = child.wait().expect("child wait");
         assert!(status.success());
@@ -390,31 +452,22 @@ mod managed_process_tests {
         configure_managed_process(&mut live);
         live.arg("/C").arg("ping -n 30 127.0.0.1 >NUL");
         let mut child = live.spawn().expect("suspended live child");
-        let mut guard = ManagedProcessGuard::attach(child.id(), child.as_raw_handle())
-            .expect("attach live child");
-        assert!(guard.terminate().expect("terminate live job"));
-        assert!(!guard.is_active());
+        let mut scope =
+            DirectScope::attach(child.id(), child.as_raw_handle()).expect("attach live child");
+        assert!(scope.terminate().expect("terminate live job"));
+        assert!(!scope.terminate().expect("scope already finalized"));
         let _ = child.wait().expect("reap terminated child");
 
         let mut short = Command::new(program);
         configure_managed_process(&mut short);
         short.arg("/C").arg("exit /B 0");
         let mut child = short.spawn().expect("suspended short child");
-        let mut guard = ManagedProcessGuard::attach(child.id(), child.as_raw_handle())
-            .expect("attach short child");
+        let mut scope =
+            DirectScope::attach(child.id(), child.as_raw_handle()).expect("attach short child");
         assert!(child.wait().expect("reap short child").success());
-        assert!(!guard.terminate().expect("empty job"));
-        assert!(!guard.is_active());
+        assert!(!scope.terminate().expect("empty job"));
+        assert!(!scope.terminate().expect("scope already finalized"));
     }
-}
-
-/// Windows job-object graceful signaling is not currently supported; fail
-/// explicitly so a hosted supervisor can attempt a forced termination.
-pub fn terminate_process_group(_pid: u32) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Windows process-group grace unsupported",
-    ))
 }
 
 pub fn kill_process_group(pid: u32) {

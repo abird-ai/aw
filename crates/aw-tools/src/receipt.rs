@@ -73,7 +73,7 @@ fn append_terminal(content: &mut String, terminal: ProcessTerminal) {
         ProcessExit::Unknown => content.write_str("unknown"),
     }
     .expect("writing into a String never fails");
-    if let Some(stop) = terminal.stop {
+    if let Some(stop) = terminal.stop_reason() {
         write!(content, " stop={}", stop.as_str()).expect("writing into a String never fails");
     }
     write!(
@@ -88,7 +88,7 @@ fn append_terminal(content: &mut String, terminal: ProcessTerminal) {
     if terminal.output.stderr_truncated {
         content.push_str(" err_truncated");
     }
-    if !terminal.output.complete {
+    if !terminal.output.complete() {
         content.push_str(" output_incomplete");
     }
 }
@@ -412,18 +412,20 @@ false"
         use crate::filesystem::{
             batch::Status,
             job::{Lifecycle, NodeState},
-            runner::{ProcessExit, ProcessOutputMeta, ProcessTerminal},
+            runner::{ProcessExit, ProcessOutputMeta, ProcessTerminal, Tree},
             status::Primary,
         };
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(1),
             stop: None,
+            tree: Tree::Empty,
             output: ProcessOutputMeta {
                 stdout_bytes: 20_001,
                 stderr_bytes: 732,
                 stdout_truncated: true,
                 stderr_truncated: false,
-                complete: true,
+                stdout_complete: true,
+                stderr_complete: true,
             },
         };
         let snapshot = Snapshot {
@@ -459,7 +461,9 @@ false"
         };
         assert!(!render_plain(ordinary, 200).unwrap().contains("next="));
         let stopped = ProcessTerminal {
-            stop: Some(crate::execution_stop::StopReason::Timeout),
+            stop: Some(crate::execution_stop::StopRecord::stopped(
+                crate::execution_stop::StopReason::Timeout,
+            )),
             ..terminal
         };
         let stopped_receipt = Receipt::JobStatus {
@@ -474,12 +478,14 @@ false"
         let unknown_terminal = ProcessTerminal {
             exit: ProcessExit::Unknown,
             stop: None,
+            tree: Tree::Unknown,
             output: ProcessOutputMeta {
                 stdout_bytes: 0,
                 stderr_bytes: 3,
                 stdout_truncated: false,
                 stderr_truncated: true,
-                complete: false,
+                stdout_complete: false,
+                stderr_complete: false,
             },
         };
         let node = Receipt::NodeStatus {

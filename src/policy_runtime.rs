@@ -12,7 +12,7 @@ use aw_host::AuthenticatedToolGrantEvidence;
 use aw_policy::{AuthorizedPolicy, Decision, PolicyDecision, Strategy};
 use aw_store::{
     PolicyAdmissionFact, PolicyAdmissionRequest, PolicyAdmissionState, PolicyGuardianJournal,
-    SessionStore,
+    RemoteStartPolicyAdmission, SessionStore,
 };
 #[cfg(test)]
 use aw_store::{PolicyAdmissionSubject, SessionParticipationAction};
@@ -111,6 +111,10 @@ pub struct RemoteStartAdmissionRequest<'a> {
     pub evidence: &'a AuthenticatedToolGrantEvidence,
     pub session: &'a str,
     pub policy_admission_id: &'a str,
+    pub current_policy_revision_sha256: &'a str,
+    pub current_authority_sha256: &'a str,
+    pub selected_route: Strategy,
+    pub authorized_narrow_ref: Option<&'a str>,
     pub intent: RemoteStartIntent,
     pub issuer: RemoteStartIssuer,
 }
@@ -186,6 +190,10 @@ pub fn authorize_remote_start(
         evidence,
         session,
         policy_admission_id,
+        current_policy_revision_sha256,
+        current_authority_sha256,
+        selected_route,
+        authorized_narrow_ref,
         intent,
         issuer,
     } = request;
@@ -218,7 +226,20 @@ pub fn authorize_remote_start(
     };
 
     authority.with_revalidated_binding(actor, evidence.binding(), || {
-        store.remote_start_authorize(actor, session, policy_admission_id, intent, source, issuer)
+        store.remote_start_authorize(
+            actor,
+            session,
+            RemoteStartPolicyAdmission {
+                id: policy_admission_id,
+                current_policy_revision_sha256,
+                current_authority_sha256,
+                selected_route: Some(selected_route),
+                authorized_narrow_ref,
+            },
+            intent,
+            source,
+            issuer,
+        )
     })
 }
 
@@ -928,18 +949,6 @@ mod tests {
                 &"08".repeat(32),
             )
             .unwrap();
-        let consumed = store
-            .policy_admission_consume(
-                &session.id,
-                &decided.id,
-                &"04".repeat(32),
-                &evidence.authority_sha256(),
-                Some(Strategy::Local),
-                None,
-            )
-            .unwrap();
-        assert_eq!(consumed.state, PolicyAdmissionState::Consumed);
-
         let intent = RemoteStartIntent {
             version: REMOTE_START_VERSION,
             original_invocation_id: "turn:1/call:remote-start".into(),
@@ -969,11 +978,22 @@ mod tests {
             actor: &actor,
             evidence: &evidence,
             session: &session.id,
-            policy_admission_id: &consumed.id,
+            policy_admission_id: &decided.id,
+            current_policy_revision_sha256: &"04".repeat(32),
+            current_authority_sha256: &evidence.authority_sha256(),
+            selected_route: Strategy::Local,
+            authorized_narrow_ref: None,
             intent: intent.clone(),
             issuer: issuer.clone(),
         })
         .unwrap();
+        assert_eq!(
+            store
+                .policy_admission_fact(&actor, &session.id, &decided.id)
+                .unwrap()
+                .state,
+            PolicyAdmissionState::Consumed
+        );
 
         agent
             .revoke_registered_source_tool(&actor, "bash", &ToolSource::trusted_host())
@@ -982,7 +1002,7 @@ mod tests {
             store: &store,
             actor: &actor,
             session: &session.id,
-            policy_admission_id: &consumed.id,
+            policy_admission_id: &decided.id,
             original_invocation_id: &intent.original_invocation_id,
             effect_attempt_id: &intent.effect_attempt_id,
             turn_id: intent.turn_id,
@@ -1003,7 +1023,11 @@ mod tests {
             actor: &actor,
             evidence: &evidence,
             session: &session.id,
-            policy_admission_id: &consumed.id,
+            policy_admission_id: &decided.id,
+            current_policy_revision_sha256: &"04".repeat(32),
+            current_authority_sha256: &evidence.authority_sha256(),
+            selected_route: Strategy::Local,
+            authorized_narrow_ref: None,
             intent: intent.clone(),
             issuer: issuer.clone(),
         })
@@ -1018,7 +1042,11 @@ mod tests {
             actor: &actor,
             evidence: &evidence,
             session: &session.id,
-            policy_admission_id: &consumed.id,
+            policy_admission_id: &decided.id,
+            current_policy_revision_sha256: &"04".repeat(32),
+            current_authority_sha256: &evidence.authority_sha256(),
+            selected_route: Strategy::Local,
+            authorized_narrow_ref: None,
             intent: fresh,
             issuer,
         })

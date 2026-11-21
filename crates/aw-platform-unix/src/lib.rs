@@ -14,9 +14,14 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, OwnedFd};
+
+#[cfg(target_os = "linux")]
 pub mod fd_transfer;
 #[cfg(target_os = "linux")]
 pub mod pid_identity;
+#[cfg(target_os = "linux")]
+mod process_observation;
 pub mod pty_poll;
 pub use aw_tools_fs_unix::scoped_fs;
 
@@ -186,13 +191,6 @@ fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) -> io::Result<boo
     }
 }
 
-/// Graceful stop request for the explicitly spawned per-child process group.
-///
-/// The bool preserves live-target vs already-absent evidence for the caller.
-pub fn terminate_process_group(pid: u32) -> io::Result<bool> {
-    signal_process_group(checked_process_group(pid)?, libc::SIGTERM)
-}
-
 /// Forced stop of the explicitly spawned per-child process group.
 ///
 /// The bool preserves live-target vs already-absent evidence for the caller.
@@ -200,55 +198,196 @@ pub fn kill_process_group(pid: u32) -> io::Result<bool> {
     signal_process_group(checked_process_group(pid)?, libc::SIGKILL)
 }
 
-/// Owns the process group created for one child and provides a final RAII stop.
-///
-/// An unknown explicit stop stays armed so Drop can make one final attempt.
-/// This contains the process group only; an unsandboxed descendant may escape
-/// with `setsid`, which no process-group API can recover as contained.
-pub struct ManagedProcessGuard {
-    group: libc::pid_t,
-    active: bool,
+fn child_exit_ready(pid: libc::pid_t) -> io::Result<bool> {
+    loop {
+        // SAFETY: zeroed siginfo_t is valid writable storage for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: this queries our exact child PID and WNOWAIT preserves status.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            // SAFETY: waitid initialized the SIGCHLD union fields or left pid zero.
+            return Ok(unsafe { info.si_pid() } == pid);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
-impl ManagedProcessGuard {
+/// Low-level direct execution scope for one child invocation.
+///
+/// It owns stable leader identity plus the containment identity. Higher layers
+/// should treat this as a private Process backend, not as the Process model.
+pub struct DirectScope {
+    group: libc::pid_t,
+    #[cfg(target_os = "linux")]
+    leader: Option<OwnedFd>,
+    active: bool,
+}
+///
+/// This direct fallback contains one process group only; an unsandboxed
+/// descendant may escape with `setsid`. The strong Linux PID-namespace backend
+/// removes that limitation without changing Process semantics.
+impl DirectScope {
     pub fn attach(pid: u32) -> io::Result<Self> {
+        let group = checked_process_group(pid)?;
+        #[cfg(target_os = "linux")]
+        let leader = pid_identity::open(pid).ok();
         Ok(Self {
-            group: checked_process_group(pid)?,
+            group,
+            #[cfg(target_os = "linux")]
+            leader,
             active: true,
         })
     }
 
-    /// Force-stop the owned process group.
+    /// Has the exact main command become terminal without consuming its wait status?
+    pub fn ready(&self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Some(leader) = &self.leader {
+            return Ok(matches!(
+                pid_identity::inspect_exit(leader.as_fd())?,
+                pid_identity::ExitObservation::Exited { .. }
+            ));
+        }
+        child_exit_ready(self.group)
+    }
+
+    /// Observe whether live work remains after the waited group leader is terminal.
     ///
-    /// `Ok(true)` = delivered to a live group; `Ok(false)` = no group;
-    /// `Err` = unknown and the guard remains armed.
+    /// The terminal leader itself is excluded. `Ok(true)` proves at least one
+    /// live remaining member, `Ok(false)` proves no live remaining member, and
+    /// `Err` leaves the result unknown.
+    pub fn observe(&self) -> io::Result<bool> {
+        if !self.active {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            process_observation::group_has_live_member(self.group)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            mac_group_has_live_member(self.group)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process-group observation unsupported on this Unix target",
+            ))
+        }
+    }
+
+    /// Request graceful stop of the owned direct process group.
+    pub fn graceful(&self) -> io::Result<bool> {
+        if !self.active {
+            return Ok(false);
+        }
+        signal_process_group(self.group, libc::SIGTERM)
+    }
+
+    fn force_once(&self) -> io::Result<bool> {
+        match signal_process_group(self.group, libc::SIGKILL) {
+            #[cfg(target_os = "macos")]
+            Err(error)
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && matches!(self.ready(), Ok(true))
+                    && matches!(self.observe(), Ok(false)) =>
+            {
+                // Darwin killpg can report EPERM when only the terminal leader/
+                // unsignalable zombie remains. Proven-ready leader + empty scope
+                // is positive NoTarget, not an unbounded cleanup failure.
+                Ok(false)
+            }
+            result => result,
+        }
+    }
+
+    /// Final bounded force-stop of this direct execution scope.
+    ///
+    /// An unconfirmed first attempt is retried once immediately while leader
+    /// identity is still stable. After that final result the scope is inert;
+    /// callers retain `Err` as Unknown rather than retrying after leader reap.
     pub fn terminate(&mut self) -> io::Result<bool> {
         if !self.active {
             return Ok(false);
         }
-        match signal_process_group(self.group, libc::SIGKILL) {
-            Ok(delivered) => {
-                self.active = false;
-                Ok(delivered)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    pub fn disarm(&mut self) {
+        let first = self.force_once();
+        let result = match first {
+            Err(_) => self.force_once(),
+            other => other,
+        };
         self.active = false;
+        result
     }
 }
 
-impl Drop for ManagedProcessGuard {
+impl Drop for DirectScope {
     fn drop(&mut self) {
         if self.active {
             let _ = self.terminate();
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_group_has_live_member(group: libc::pid_t) -> io::Result<bool> {
+    let mut pids: Vec<libc::pid_t> = vec![0; 32];
+    loop {
+        let bytes = std::mem::size_of_val(&pids[..]);
+        // SAFETY: writable PID array of exactly `bytes` bytes.
+        let used =
+            unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), bytes as i32) };
+        if used <= 0 {
+            return Err(io::Error::other("cannot list command process group"));
+        }
+        let listed = &pids[..pids.len().min(used as usize)];
+        for &pid in listed {
+            // Settlement keeps the leader waitable; it is already terminal.
+            if pid <= 0 || pid == group {
+                continue;
+            }
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            // SAFETY: output storage matches the requested flavor and size.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if got != size {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: proc_pidinfo returned the complete structure.
+            let info = unsafe { info.assume_init() };
+            if info.pbi_pgid == group as u32 && info.pbi_status != libc::SZOMB {
+                return Ok(true);
+            }
+        }
+        if listed.len() < pids.len() {
+            return Ok(false);
+        }
+        if pids.len() >= 65_536 {
+            return Err(io::Error::other("incomplete process group listing"));
+        }
+        pids.resize(pids.len() * 2, 0);
     }
 }
 
@@ -641,7 +780,7 @@ impl Drop for LocalBoundSocket {
 }
 
 #[cfg(test)]
-mod managed_process_tests {
+mod direct_scope_tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -652,23 +791,45 @@ mod managed_process_tests {
     }
 
     #[test]
-    fn managed_guard_distinguishes_stopped_and_no_target() {
+    fn direct_scope_distinguishes_stopped_and_no_target() {
         let mut child = grouped_shell("sleep 30");
-        let mut guard = ManagedProcessGuard::attach(child.id()).expect("managed group");
-        assert!(guard.terminate().expect("force stop"));
-        assert!(!guard.is_active());
+        let mut scope = DirectScope::attach(child.id()).expect("direct scope");
+        assert!(scope.terminate().expect("force stop"));
+        assert!(!scope.terminate().expect("scope already finalized"));
         let status = child.wait().expect("reap");
         assert_eq!(exit_signal(&status), Some(libc::SIGKILL));
         assert_eq!(status.signal(), Some(libc::SIGKILL));
 
         let mut exited = grouped_shell("exit 0");
-        let pid = exited.id();
+        let mut absent = DirectScope::attach(exited.id()).expect("owned scope");
         let status = exited.wait().expect("reap exited");
         assert!(status.success());
         assert_eq!(exit_signal(&status), None);
-        let mut absent = ManagedProcessGuard::attach(pid).expect("absent group handle");
         assert!(!absent.terminate().expect("absent group"));
-        assert!(!absent.is_active());
+        assert!(!absent.terminate().expect("scope already finalized"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_scope_observes_remaining_group_members_not_the_leader() {
+        let mut leader_only = grouped_shell("sleep 30");
+        let mut scope = DirectScope::attach(leader_only.id()).expect("direct scope");
+        assert!(!scope.observe().expect("leader is excluded"));
+        assert!(scope.terminate().expect("cleanup leader"));
+        let _ = leader_only.wait();
+
+        let mut with_child = grouped_shell("sleep 30 & wait");
+        let mut scope = DirectScope::attach(with_child.id()).expect("direct scope");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !scope.observe().expect("complete procfs observation") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background member did not appear"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(scope.terminate().expect("cleanup group"));
+        let _ = with_child.wait();
     }
 
     #[test]
@@ -679,10 +840,10 @@ mod managed_process_tests {
     }
 
     #[test]
-    fn managed_guard_drop_is_final_fail_safe() {
+    fn direct_scope_drop_is_final_fail_safe() {
         let mut child = grouped_shell("sleep 30");
-        let guard = ManagedProcessGuard::attach(child.id()).expect("managed group");
-        drop(guard);
+        let scope = DirectScope::attach(child.id()).expect("direct scope");
+        drop(scope);
         assert_eq!(child.wait().expect("reap").signal(), Some(libc::SIGKILL));
     }
 }

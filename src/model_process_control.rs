@@ -229,9 +229,9 @@ impl Tool for TerminateTool {
             self.owner.verify_model_observation(&ctx)?;
             let termination = guard.terminate().await?;
             let completed = matches!(
-                termination.outcome,
+                termination.outcome(),
                 aw_tools_adapter::process::Outcome::Cancelled
-            ) && termination.output_complete;
+            ) && termination.output_complete();
             let terminal = if completed {
                 ModelProcessState::Applied
             } else {

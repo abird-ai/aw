@@ -221,9 +221,39 @@ fn replay_matches(a: &PolicyAdmissionRequest, b: &PolicyAdmissionRequest) -> boo
         && a.branch_id == b.branch_id
         && a.turn_id == b.turn_id
         && a.call_id == b.call_id
-        && a.canonical_target == b.canonical_target
+        // A contextual ref may resolve to a different canonical target after
+        // reparenting. The original request fingerprint is the stable intent;
+        // replay must retain the admitted target, never resolve it again.
         && a.request_sha256 == b.request_sha256
         && a.subject.same_identity(&b.subject)
+}
+
+/// Find the original claim before using the caller's *current* resolved target.
+/// This existing index also detects historical ambiguous call-ID reuse: never
+/// choose one of several prior targets or start another paid/effectful attempt.
+fn current_fact_for_call(
+    c: &rusqlite::Connection,
+    session: &str,
+    branch: &str,
+    turn_id: u64,
+    call_id: &str,
+) -> Result<Option<PolicyAdmissionFact>> {
+    let mut stmt = db(c.prepare(
+        "SELECT fact_json FROM policy_admission_current
+         WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3 AND call_id=?4
+         LIMIT 2",
+    ))?;
+    let mut rows = db(stmt.query(params![session, branch, turn_id, call_id]))?;
+    let Some(row) = db(rows.next())? else {
+        return Ok(None);
+    };
+    let encoded: String = db(row.get(0))?;
+    if db(rows.next())?.is_some() {
+        return Err(Error::Conflict(
+            "original policy ToolCall has ambiguous legacy replay targets",
+        ));
+    }
+    crate::decode(&encoded).map(Some)
 }
 
 fn current_fact(c: &rusqlite::Connection, id: &str) -> Result<Option<PolicyAdmissionFact>> {
@@ -250,18 +280,18 @@ fn store_current(c: &rusqlite::Connection, fact: &PolicyAdmissionFact) -> Result
     match current {
         None if fact.revision == 1 => {}
         Some((revision, existing)) if revision == fact.revision && existing == encoded => {
-            return Ok(())
+            return Ok(());
         }
         Some((revision, _)) if revision.checked_add(1) == Some(fact.revision) => {}
         None => {
             return Err(Error::Storage(
                 "policy admission projection must begin at revision one",
-            ))
+            ));
         }
         Some(_) => {
             return Err(Error::Storage(
                 "policy admission projection revision is not monotonic",
-            ))
+            ));
         }
     }
     db(c.execute(
@@ -645,6 +675,48 @@ impl AuxiliaryJournal for PolicyGuardianJournal {
 }
 
 impl SessionStore {
+    /// Recover a factual admission using the authenticated original ToolCall,
+    /// before selecting a new route, resolving a contextual target or checking
+    /// today's effect authority. This never authorizes a new execution.
+    pub fn policy_admission_replay(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        turn_id: u64,
+        call_id: &str,
+        original_request_sha256: &str,
+    ) -> Result<Option<PolicyAdmissionFact>> {
+        if !bounded_ascii(session, 128)
+            || !bounded_ascii(branch, 128)
+            || turn_id == 0
+            || !bounded_ascii(call_id, 256)
+            || !digest(original_request_sha256)
+        {
+            return Err(Error::Denied("invalid policy replay lookup identity"));
+        }
+        let connection = self.connection()?;
+        // Source/recipient audience is current even for historical facts.
+        session_participation::authorize_in(
+            &connection,
+            actor,
+            session,
+            session_participation::SessionParticipationAction::View,
+        )?;
+        let Some(existing) = current_fact_for_call(&connection, session, branch, turn_id, call_id)?
+        else {
+            return Ok(None);
+        };
+        if existing.request.subject.actor != *actor
+            || existing.request.request_sha256 != original_request_sha256
+        {
+            return Err(Error::Conflict(
+                "policy replay identity was reused with changed original ToolCall or actor",
+            ));
+        }
+        Ok(Some(existing))
+    }
+
     /// Claim the original replay identity and bounded guardian/approval slots
     /// before any auxiliary model call. Exact redelivery returns the same fact.
     pub fn policy_admission_claim(
@@ -664,13 +736,30 @@ impl SessionStore {
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let owner = crate::session_in(&tx, &request.session_id)?.owner;
+        // Replay lookup uses the immutable authenticated ToolCall identity,
+        // not its newly resolved target or changed writer/policy generations.
         let id = admission_id(&owner, &request);
-        if let Some(existing) = current_fact(&tx, &id)? {
+        if let Some(existing) = current_fact_for_call(
+            &tx,
+            &request.session_id,
+            &request.branch_id,
+            request.turn_id,
+            &request.call_id,
+        )? {
             if !replay_matches(&existing.request, &request) {
                 return Err(Error::Conflict(
                     "policy replay identity was reused with changed invocation/subject",
                 ));
             }
+            // Factual old work survives revocation; private receipt disclosure
+            // does not. The higher result projector also applies source and
+            // dependent-content disclosure before returning output bytes.
+            session_participation::authorize_in(
+                &tx,
+                &request.subject.actor,
+                &request.session_id,
+                session_participation::SessionParticipationAction::View,
+            )?;
             db(tx.commit())?;
             return Ok(existing);
         }
@@ -987,10 +1076,8 @@ impl SessionStore {
         Ok(next)
     }
 
-    /// Revalidate captured policy/authority generations immediately before the
-    /// owning executor may consume an Allow/Narrow/Approved decision.
-    pub fn policy_admission_consume(
-        &self,
+    pub(crate) fn policy_admission_consume_in(
+        connection: &rusqlite::Connection,
         session: &str,
         id: &str,
         current_policy_revision_sha256: &str,
@@ -1001,11 +1088,9 @@ impl SessionStore {
         if !digest(current_policy_revision_sha256) || !digest(current_authority_sha256) {
             return Err(Error::Denied("invalid current policy/authority digest"));
         }
-        let mut connection = self.connection()?;
-        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let current = fact_in(&tx, session, id)?;
-        let owner = crate::session_in(&tx, session)?.owner;
-        require_active_turn(&tx, &owner, &current.request)?;
+        let current = fact_in(connection, session, id)?;
+        let owner = crate::session_in(connection, session)?.owner;
+        require_active_turn(connection, &owner, &current.request)?;
         if current.request.policy_revision_sha256 != current_policy_revision_sha256
             || current.request.authority_sha256 != current_authority_sha256
         {
@@ -1032,7 +1117,6 @@ impl SessionStore {
             ));
         }
         if current.state == PolicyAdmissionState::Consumed {
-            db(tx.commit())?;
             return Ok(current);
         }
         if current.state == PolicyAdmissionState::AskApproved
@@ -1043,8 +1127,7 @@ impl SessionStore {
         {
             let mut expired = next_fact(&current, PolicyAdmissionState::AskExpired)?;
             expired.note = Some("approved policy admission expired before consumption".into());
-            audit_fact(&tx, &current.request.subject.actor, &expired)?;
-            db(tx.commit())?;
+            audit_fact(connection, &current.request.subject.actor, &expired)?;
             return Ok(expired);
         }
         if !current.state.executable() {
@@ -1053,8 +1136,33 @@ impl SessionStore {
             ));
         }
         let next = next_fact(&current, PolicyAdmissionState::Consumed)?;
-        audit_fact(&tx, &current.request.subject.actor, &next)?;
-        db(tx.commit())?;
+        audit_fact(connection, &current.request.subject.actor, &next)?;
         Ok(next)
+    }
+
+    /// Revalidate captured policy/authority generations immediately before the
+    /// owning executor may consume an Allow/Narrow/Approved decision.
+    pub fn policy_admission_consume(
+        &self,
+        session: &str,
+        id: &str,
+        current_policy_revision_sha256: &str,
+        current_authority_sha256: &str,
+        selected_route: Option<Strategy>,
+        authorized_narrow_ref: Option<&str>,
+    ) -> Result<PolicyAdmissionFact> {
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let fact = Self::policy_admission_consume_in(
+            &tx,
+            session,
+            id,
+            current_policy_revision_sha256,
+            current_authority_sha256,
+            selected_route,
+            authorized_narrow_ref,
+        )?;
+        db(tx.commit())?;
+        Ok(fact)
     }
 }

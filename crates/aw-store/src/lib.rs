@@ -139,6 +139,7 @@ pub use policy_admission::{
     PolicyGuardianJournal,
 };
 pub use provider_credentials::*;
+pub use remote_start::RemoteStartPolicyAdmission;
 pub use remote_view::*;
 pub use resources::{
     AwNetPeerInfo, DomainFederationInfo, DomainInfo, FederationLeaseInfo, FleetInfo,
@@ -229,8 +230,10 @@ pub const SHARED_SESSION_PARTICIPATION_SCHEMA: &str =
 pub const REMOTE_VIEW_TRUST_SCHEMA: &str = include_str!("../migrations/035_remote_view_trust.sql");
 pub const RUNTIME_ADMISSION_INDEX_SCHEMA: &str =
     include_str!("../migrations/036_runtime_admission_indexes.sql");
+pub const JOB_EXPOSURE_REPAIR_SCHEMA: &str =
+    include_str!("../migrations/037_job_exposure_repair.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 36;
+const LATEST_SCHEMA_VERSION: i64 = 37;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -1878,14 +1881,14 @@ impl SessionStore {
             "branch.fork",
             serde_json::json!({"branch":branch,"at":at}),
         )?;
-        durability::commit_event(
+        job_exposure::publish_agent_branch_created(
             &tx,
             &txid,
-            "branch.created",
-            "branch",
-            &branch,
             Some(actor),
-            serde_json::json!({"session_id":session,"head":at,"name":name}),
+            session,
+            &branch,
+            at,
+            name,
         )?;
         let out = branch_in(&tx, session, &branch)?;
         db(tx.commit())?;
@@ -2529,6 +2532,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 35 {
         migrate_runtime_admission_indexes(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 36 {
+        migrate_job_exposure_repair(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -2565,6 +2572,36 @@ fn add_coordination_column_if_missing(
     }
     let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
     db(c.execute_batch(&statement))?;
+    Ok(())
+}
+
+fn migrate_job_exposure_repair(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='job-exposure-repair',generation=generation+1,
+             target_epoch=37,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    job_exposure::repair_missing_agent_exposures(&tx)?;
+    db(tx.execute_batch(JOB_EXPOSURE_REPAIR_SCHEMA))?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |r| r.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Job exposure repair migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.commit())?;
     Ok(())
 }
 

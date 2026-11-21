@@ -1252,6 +1252,15 @@ fn preserve_divergence(
             Some(&divergence_id),
             txid,
         )?;
+        crate::job_exposure::publish_agent_branch_created(
+            c,
+            txid,
+            Some(actor),
+            session_id,
+            &preserved_id,
+            preserved_head,
+            &name,
+        )?;
     }
     db(c.execute("INSERT INTO workspace_replica_divergences(divergence_id,workspace_id,session_id,canonical_branch_id,preserved_branch_id,local_writer_epoch,incoming_writer_epoch,local_head,incoming_head,detected_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![divergence_id,workspace_id,session_id,canonical.id,preserved_id,local_epoch,incoming_epoch,canonical.head,incoming.head,now()]))?;
     Ok(true)
@@ -1771,6 +1780,15 @@ impl SessionStore {
                     )?;
                 } else {
                     db(tx.execute("INSERT INTO branches(id,session_id,name,head,revision,active_run,created_at) VALUES(?1,?2,?3,?4,?5,NULL,?6)",params![incoming.id,incoming.session_id,incoming.name,incoming.head,incoming.revision,now()]))?;
+                    crate::job_exposure::publish_agent_branch_created(
+                        &tx,
+                        &txid,
+                        Some(actor),
+                        &incoming.session_id,
+                        &incoming.id,
+                        &incoming.head,
+                        &incoming.name,
+                    )?;
                 }
             }
         }
@@ -2121,6 +2139,15 @@ impl SessionStore {
             "remote_writer_branch_created",
             Some(source_node_id),
             &txid,
+        )?;
+        crate::job_exposure::publish_agent_branch_created(
+            &tx,
+            &txid,
+            Some(actor),
+            session_id,
+            &branch,
+            at,
+            name,
         )?;
         audit(
             &tx,
