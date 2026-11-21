@@ -17,7 +17,7 @@ The previous
 is preserved and embedded verbatim in the new canonical handoff as historical
 implementation chronology. The dated 2026-11-19 017 handoff is likewise historical.
 
-**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R1–R5 remain historical design provenance. R6 was explicitly approved on 2026-11-21 after final live-owner review and is now authoritative. AW shared Process facts/direct observation are implemented in the current uncommitted worktree, but the `Tree -> Occupancy` cutover, weak-direct-Unix negative-to-Unknown correction, required `aw-process` extraction and real dotlink shared-owner compile remain Phase-0 gates. The Phase-0B replay/admission work is also in progress. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a requirement to thaw frozen sandbox work. This is not final Phase-0 acceptance.
+**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R1–R5 remain historical design provenance. R6 was explicitly approved on 2026-11-21 after final live-owner review and is now authoritative. AW R6 seal/docs are checkpointed at `7c3800c`; current Phase-0A Process plus Phase-0B owner hardening source is checkpointed at `c7cc948`. The `Tree -> Occupancy` cutover, weak-direct-Unix negative-to-Unknown correction, required `aw-process` extraction and real dotlink shared-owner compile remain Phase-0 gates. Dotlink Remote Start/replay hardening is checkpointed at `89ff3fb`, but its R6 shared-Process cutover has not begun. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a requirement to thaw frozen sandbox work. This is not final Phase-0 acceptance.
 
 **R6 simplification seal (2026-11-21):** The canonical DL-200
 [README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md),
@@ -38,8 +38,9 @@ R6 is the **sealed** implementation authority. Its final live-owner review also 
 shared Process boundary: `ProcessTerminal` is the cross-host Fact; AW/dotlink keep their
 product receipt/output owners; prepared commands transfer by value into `aw-process`;
 weak direct-Unix negative containment maps to semantic Unknown; and `aw-terminal` PTY
-source-release/adoption remains a distinct Terminal resource. R6 is not yet implemented;
-source/test status above is unchanged. Commit/push remain separately gated.
+source-release/adoption remains a distinct Terminal resource. R6 Phase 0 is not yet fully
+implemented; source/test status above remains the factual checkpoint. Commit/push/release
+remain separately gated.
 
 Author: coordinating design/implementation agent
 Owner: @pvl
@@ -78,7 +79,9 @@ Phase-0 dotlink projection/runtime horizon remains pending. No commit/push/relea
 
 ## LIVE DL-200 implementation checkpoint — Phase 0A, 2026-11-21
 
-Current uncommitted AW implementation state:
+Current AW source checkpoint: `c7cc948` (`Checkpoint DL-200 Phase 0 owner hardening`).
+It preserves both the pre-R6 Phase-0A Process slice and the independently developed
+Phase-0B owner-hardening slice. Phase-0A Process state:
 
 - added shared `Tree::{Empty,Live,Unknown}`;
 - `ProcessOutputMeta` carries per-stream completeness; aggregate completeness is derived;

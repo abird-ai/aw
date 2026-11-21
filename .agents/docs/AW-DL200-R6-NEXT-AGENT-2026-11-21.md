@@ -29,9 +29,10 @@ Read first:
 10. dotlink/.agents/docs/CURRENT_HANDOFF.md
 11. live source/tests for every owner touched
 
-Current boundary at handoff creation:
-  AW HEAD      132bfd7416a0a83e915ab18ffc10de9f6d3e2a2b
-  dotlink HEAD bbd29c13904b7255eb28e2ed6c776c3590ac122a
+Current implementation source checkpoints after reseal:
+  AW source      c7cc948
+  AW R6 seal     7c3800c
+  dotlink source 89ff3fb
   dotlink AW pin:
                b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
   read-only 017:
@@ -59,9 +60,10 @@ global replay ledger, distributed Event router, universal revision clock or unus
 registry implementations.
 
 Current source:
-  AW has uncommitted pre-R6 Phase-0A Process work and independent Phase-0B store/policy
-  work. Preserve both.
-  dotlink has unrelated dirty source and has NOT begun the R6 shared-Process cutover.
+  AW `c7cc948` checkpoints the pre-R6 Phase-0A Process work plus independent Phase-0B
+  store/policy/exposure work. Preserve both conceptual slices.
+  dotlink `89ff3fb` checkpoints Remote Start/replay hardening and has NOT begun the R6
+  shared-Process cutover.
 
 First revalidate current refs/status. Then follow the user's instruction.
 R6 is already sealed. Continue Phase 0 only; do not start Phase 1 before the coherent

@@ -84,12 +84,16 @@ sealed R6 design or live source.
 
 ### 3.1 AW
 
-Current checked-out head:
+Current implementation source checkpoint before this handoff sync:
 
-    132bfd7416a0a83e915ab18ffc10de9f6d3e2a2b
+    c7cc948 — Checkpoint DL-200 Phase 0 owner hardening
     branch: main
 
-This commit is the published R1 DL-200 plan/seal baseline, not the current R6 design state.
+The immediately preceding R6 seal/docs checkpoint is:
+
+    7c3800c — Seal DL-200 R6 architecture
+
+The older published R1 baseline remains `132bfd7416a0a83e915ab18ffc10de9f6d3e2a2b`.
 
 The DL-200 TODO still records the older implementation/design base:
 
@@ -99,72 +103,27 @@ The reusable AW implementation currently consumed by dotlink remains:
 
     b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
 
-The AW working tree is intentionally dirty. The important split is:
-
-R6/R2–R5 design/docs currently uncommitted:
-
-- .agents/plans/dl200-unified-jobs-agent-events-2026-11-20/README.md
-- .agents/plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md
-- .agents/plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md
-- .agents/plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md
-- .agents/plans/TODO.md
-- .agents/docs/CURRENT_HANDOFF.md
-- .agents/docs/AW-DL200-NEXT-AGENT-2026-11-20.md
-- .agents/docs/AW-DL200-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md
-- .agents/docs/DL200-R1-R5-RESOLVED-DESIGN-CHECKLIST-2026-11-21.md
-
-Phase-0 Process work currently uncommitted:
-
-- crates/aw-platform-unix/src/lib.rs
-- crates/aw-platform-unix/src/process_observation.rs
-- crates/aw-platform-win/src/windows.rs
-- crates/aw-tools-adapter/Cargo.toml
-- crates/aw-tools-adapter/src/process.rs
-- crates/aw-tools-adapter/src/job_host.rs
-- crates/aw-tools-adapter/src/shell.rs
-- crates/aw-tools/src/filesystem/job_manager.rs
-- crates/aw-tools/src/filesystem/runner.rs
-- crates/aw-tools/src/receipt.rs
-- crates/aw-tools/src/task_ops.rs
-- src/model_process_control.rs
-
-Concurrent Phase-0B / other source work that must be preserved as independently owned:
-
-- crates/aw-store/src/archive.rs
-- crates/aw-store/src/context/apply.rs
-- crates/aw-store/src/job_exposure.rs
-- crates/aw-store/src/lib.rs
-- crates/aw-store/src/policy_admission.rs
-- crates/aw-store/src/remote_start.rs
-- crates/aw-store/src/workspace_replica.rs
-- crates/aw-store/tests/store.rs
-- crates/aw-store/migrations/037_job_exposure_repair.sql
-- src/policy_runtime.rs
-- src/subagents.rs
-
-Do not casually reformat, restore or overwrite those concurrent files.
+The R6 plan/docs are checkpointed in `7c3800c`. The pre-R6 Phase-0A Process work and
+independent Phase-0B store/policy/exposure work are checkpointed together in `c7cc948` after
+focused compilation and owner-boundary tests. They remain conceptually separate slices even
+though the repository checkpoint preserves both. Do not casually rewrite either slice while
+performing the R6 `aw-process` cutover.
 
 ### 3.2 dotlink
 
-Current checked-out head:
+Current implementation source checkpoint before its handoff sync:
 
-    bbd29c13904b7255eb28e2ed6c776c3590ac122a
+    89ff3fb — Harden Remote Start replay admission
     branch: main
 
 Current AW Git dependency pin in dotlink Cargo.toml/Cargo.lock:
 
     b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
 
-Current dirty paths:
-
-- .agents/docs/CURRENT_HANDOFF.md
-- src/jobs.rs
-- src/mcp/tools/shell.rs
-- src/remote_start.rs
-
-These dirty source changes are not evidence that the R6 DL-200 Process cutover has begun.
-The current DL-200 TODO explicitly says the real dotlink Phase-0 consumer/projection work
-has not begun. Preserve the dirty files unless the active task explicitly owns them.
+The Remote Start/replay hardening previously dirty in `src/jobs.rs`,
+`src/mcp/tools/shell.rs` and `src/remote_start.rs` is checkpointed in `89ff3fb`. It is
+Phase-0B/replay hardening, **not** evidence that the R6 shared-Process consumer cutover has
+begun. The real dotlink `aw-process` migration remains pending.
 
 Published dotlink lineage immediately below current head includes:
 
@@ -1001,7 +960,7 @@ Do not accidentally reintroduce these.
 
 ### 10.1 implemented Phase-0A work
 
-The uncommitted AW tree contains the pre-R6 Process work:
+AW source checkpoint `c7cc948` contains the pre-R6 Process work:
 
 - ProcessTerminal has physical exit, StopRecord, Tree and per-stream output completeness;
 - ProcessReceipt stores ProcessTerminal as terminal truth;
@@ -1297,9 +1256,10 @@ Read first:
 10. dotlink/.agents/docs/CURRENT_HANDOFF.md
 11. live source/tests for every owner touched
 
-Current Git/source boundary at handoff creation:
-  AW HEAD      132bfd7416a0a83e915ab18ffc10de9f6d3e2a2b
-  dotlink HEAD bbd29c13904b7255eb28e2ed6c776c3590ac122a
+Current implementation source checkpoints after reseal:
+  AW source      c7cc948
+  AW R6 seal     7c3800c
+  dotlink source 89ff3fb
   dotlink AW implementation pin:
                b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
   read-only 017 reference:
@@ -1349,21 +1309,14 @@ Do not collapse:
   different Unknown semantics
 
 Current implementation reality:
-  Phase-0A Process work exists uncommitted in AW but is pre-R6 and still uses Tree.
+  AW `c7cc948` preserves the pre-R6 Phase-0A Process work and Phase-0B owner hardening;
+  it still uses Tree and has not performed the R6 shared-runtime extraction.
   Direct Unix still needs the R6 weak-negative -> Occupancy::Unknown semantic correction.
-  The real dotlink R6 shared-Process consumer cutover has not begun.
-  Concurrent Phase-0B aw-store/policy/runtime changes are independently dirty and must
-  be preserved.
-  dotlink also has unrelated dirty source; do not treat it as R6 evidence.
+  Dotlink `89ff3fb` preserves Remote Start/replay hardening; the real R6 shared-Process
+  consumer cutover has not begun.
 
-Before any implementation, revalidate current refs/status because source outranks this
-handoff.
-
-If the user has NOT explicitly approved/resealed R6:
-  continue design review only; do not migrate source to R6.
-
-If the user explicitly approves/reseals R6:
-  update R6 seal status consistently first, then start Phase 0 only:
+Before implementation, revalidate current refs/status because source outranks this handoff.
+R6 is already sealed. Continue Phase 0 only:
     Occupancy rename
     one shared Agent-neutral Process owner
     AW + real dotlink cutover
