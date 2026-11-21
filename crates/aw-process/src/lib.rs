@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -141,6 +141,7 @@ impl CaptureState {
 #[derive(Clone)]
 struct Reader {
     state: Arc<Mutex<CaptureState>>,
+    stop: Arc<Notify>,
 }
 
 impl Reader {
@@ -149,6 +150,10 @@ impl Reader {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .snapshot()
+    }
+
+    fn stop(&self) {
+        self.stop.notify_one();
     }
 
     fn start<R: AsyncRead + Unpin + Send + 'static>(
@@ -161,6 +166,8 @@ impl Reader {
 
         let state = Arc::new(Mutex::new(CaptureState::default()));
         let shared = state.clone();
+        let stop = Arc::new(Notify::new());
+        let reader_stop = stop.clone();
         let task = tokio::spawn(async move {
             let mut input = input;
             let (mut sender, writer) = if let Some(mut sink) = sink {
@@ -208,27 +215,33 @@ impl Reader {
             };
             let mut buffer = [0u8; PIPE_BUFFER];
             let mut failed = loop {
-                match input.read(&mut buffer).await {
-                    Ok(0) => break false,
-                    Ok(n) => {
-                        shared
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .append(&buffer[..n]);
-                        if let Some(ref tx) = sender {
-                            batch.extend_from_slice(&buffer[..n]);
-                            if batch.len() >= SINK_BATCH {
-                                let full =
-                                    std::mem::replace(&mut batch, Vec::with_capacity(SINK_BATCH));
-                                if tx.send(full).await.is_err() {
-                                    sender = None;
-                                    break true;
+                tokio::select! {
+                    biased;
+                    _ = reader_stop.notified() => break true,
+                    read = input.read(&mut buffer) => match read {
+                        Ok(0) => break false,
+                        Ok(n) => {
+                            shared
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .append(&buffer[..n]);
+                            if let Some(ref tx) = sender {
+                                batch.extend_from_slice(&buffer[..n]);
+                                if batch.len() >= SINK_BATCH {
+                                    let full = std::mem::replace(
+                                        &mut batch,
+                                        Vec::with_capacity(SINK_BATCH),
+                                    );
+                                    if tx.send(full).await.is_err() {
+                                        sender = None;
+                                        break true;
+                                    }
                                 }
                             }
                         }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break true,
                     }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break true,
                 }
             };
 
@@ -248,7 +261,7 @@ impl Reader {
             state.read_failed = failed;
         });
 
-        (Self { state }, task)
+        (Self { state, stop }, task)
     }
 }
 
@@ -839,21 +852,36 @@ impl Process {
         .await
         .is_ok();
         if !drained {
-            for task in &self.readers {
-                if !task.is_finished() {
-                    task.abort();
-                }
-            }
-            // Abortion is itself asynchronous; give all still-live readers one
-            // shared bounded quiescence window before publishing completeness.
-            let _ = timeout(READER_DRAIN_DEADLINE, async {
+            // The pipe is still open (commonly an inherited descendant FD).
+            // Ask both readers to stop at the same Process boundary so each can
+            // flush any bytes already captured in its partial sink batch.
+            self.stdout.stop();
+            self.stderr.stop();
+            let quiesced = timeout(READER_DRAIN_DEADLINE, async {
                 for task in &mut self.readers {
                     if !task.is_finished() {
                         let _ = task.await;
                     }
                 }
             })
-            .await;
+            .await
+            .is_ok();
+            if !quiesced {
+                for task in &self.readers {
+                    if !task.is_finished() {
+                        task.abort();
+                    }
+                }
+                // Sink failure must never hold containment cleanup forever.
+                let _ = timeout(READER_DRAIN_DEADLINE, async {
+                    for task in &mut self.readers {
+                        if !task.is_finished() {
+                            let _ = task.await;
+                        }
+                    }
+                })
+                .await;
+            }
         }
         let snapshot = self.snapshot();
         (
