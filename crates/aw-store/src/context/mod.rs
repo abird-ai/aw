@@ -336,15 +336,16 @@ pub(crate) fn block(c: &Connection, n: &Node, before_turn: usize) -> Result<Cont
         sources: artifact.plan.dependencies,
     })
 }
-pub(crate) fn projected_history(
+pub(crate) fn history_from_projected_nodes(
     c: &Connection,
     s: &SessionInfo,
-    b: &BranchInfo,
+    nodes: Vec<Node>,
+    next_turn: u64,
 ) -> Result<HistoryState> {
     let mut turns = Vec::new();
     let mut summary = None;
     let mut context_blocks = Vec::new();
-    for n in projected(c, &s.id, &b.head)? {
+    for n in nodes {
         match n.kind.as_str() {
             "turn" => turns.push(
                 serde_json::from_value(n.payload).map_err(|_| Error::Storage("invalid turn"))?,
@@ -380,13 +381,22 @@ pub(crate) fn projected_history(
         version: 2,
         turns,
         context_blocks,
-        next_turn_id: s.next_turn,
+        next_turn_id: next_turn,
         summary,
         compacted_through: 0,
         summary_provenance_sha256: None,
         needs_reconciliation: active > 0 || imported != 0,
     })
 }
+
+pub(crate) fn projected_history(
+    c: &Connection,
+    s: &SessionInfo,
+    b: &BranchInfo,
+) -> Result<HistoryState> {
+    history_from_projected_nodes(c, s, projected(c, &s.id, &b.head)?, s.next_turn)
+}
+
 pub(crate) fn evidence(
     c: &Connection,
     session: &SessionInfo,

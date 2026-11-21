@@ -152,21 +152,50 @@ allow expansion only when the target already has source visibility or the acting
 share non-private content. Materialized external-policy roots still fail closed because no reviewed
 principal-level source-share contract exists yet.
 
-Phase 1 is still **underway**, not complete. Next owner work is exact-history destination Agent
-construction/fork wiring using v40 HistoryBase/HistoryGrant pointers and current `derive` + destination
-`share` policy, with fresh Agent runtime/input/access state. After that remain provenance propagation
-for newly committed Event/Tool/Process facts, reachability/flatten acceleration, minimal authoritative
-snapshots, and rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/
-projection-head helpers only when one of those real consumers needs them; do not prebuild Phase-2/4
-engines.
+Exact-history **Agent-ref** destination construction is now live as one lower Store primitive:
+`create_agent_from_agent_history(..., access=private|inherit)`. It requires current source `derive`,
+seals the source Agent's exact latest committed boundary, validates the v40 disclosure closure, and
+creates the destination Session/Agent + HistoryGrant + ACL + Turn cursor in one transaction. The new
+Agent stays in the source Project with its Project owner in this cut, while the caller supplies the
+new execution binding explicitly; history ancestry therefore does not copy Sandbox/source state.
+
+The destination is a physically fresh Session containing only its own root node. Its Agent points at
+the shared immutable HistoryBase/HistoryGrant, `sessions.next_turn` starts at the inherited base's
+`next_turn`, and ordinary `history_in`/activation now render `flatten(inherited HistoryBase spans) +
+destination-local projected tail` through the existing context renderer. Every inherited backing node
+is re-hashed against the immutable digest recorded in its span before projection. `inherit` copies
+source direct user/group ACL rows as fresh destination-owned rows with grant rev 1; `private` carries
+only the canonical owner. The source and destination ACLs then evolve independently while shared
+group principals remain live references.
+
+An active source Agent is handled exactly: because Turn admission moves the branch head to an
+unresolved prompt, the constructor reads the active run's durable `produced_from_head` + `turn_id` and
+seals that prior committed boundary. Thus a fork created during Turn N inherits only through N-1 and
+starts its first divergent Turn at N. No active run, prompt, staged input, Process/Graph object, watch,
+or source Agent revision is inherited. Re-sealing uses the same content-addressed HistoryBase rows.
+
+Fork disclosure validation preserves immutable prior disclosure: for a principal already covered by
+the source's current HistoryGrant, previously granted legacy authority roots are not reauthorized;
+new roots are. Materialized/external roots remain fail-closed on every new destination because their
+revocable source-equivalent share contract is still not implemented. Destination HistoryGrants start
+a fresh lineage (`supersedes=NULL`); source grants are evidence only, never the destination's mutable
+security owner.
+
+Phase 1 is still **underway**, not complete. Next owner work is settled-Turn exact-boundary selection
+plus the host/model `agent.create(from=...)` selector adapters over this lower constructor (including
+trusted destination binding/access policy), then provenance propagation for newly committed
+Event/Tool/Process facts, reachability/flatten acceleration, minimal authoritative snapshots, and
+rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/projection-head
+helpers only when one of those real consumers needs them; do not prebuild Phase-2/4 engines.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
 backfill are green; group access/wake/history fencing remains green; v40 history-owner tests are now
-**3/3**, including full seven-permission list/set + immutable HistoryGrant supersession, share-required
-new disclosure, share-free re-add of an already-disclosed principal, idempotent revision-neutral
-sealing and 130-entry bounded-fanout content addressing. Existing group AgentJobs + principal-group
-regressions remain green. Coordination **24/24**, stable lifecycle/control and jobs_get wake remain
-green from prior checkpoints. Strict all-target/all-feature `aw-store` + `aw-cli` Clippy, fmt and
+**4/4**. The new exact-fork regression proves settled Turn 1 structural inheritance into a physically
+fresh Session, `next_turn=2`, runtime activation over inherited history, independent inherited ACL,
+source-ACL narrowing without destination mutation, and an active source Turn 2 fork that still
+inherits only committed Turn 1. The legacy same-Session `fork_shares_prefix_without_changing_original_head`
+regression remains green. Existing seven-permission/HistoryGrant, manifest and group regressions remain
+green. Strict all-target/all-feature `aw-store` + `aw-cli` Clippy, all-feature `aw-cli` check, fmt and
 diff checks are green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a

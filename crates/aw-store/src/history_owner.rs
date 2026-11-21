@@ -5,16 +5,19 @@
 //! HistoryBase rows and a content-addressed disclosure-manifest DAG.
 
 use crate::{
-    agent_owner, branch_in, context, db, id, json, now, principal_is_session_owner, session_in,
-    stable_user_principal, user_for_principal, Error, PrincipalId, Result,
+    agent_owner, branch_in, context, db, id, json, now, principal_is_session_owner, resources,
+    session_in, stable_user_principal, user_for_principal, Error, PrincipalId, Result,
+    SessionBinding, SessionStore,
 };
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
 const MANIFEST_FANOUT: usize = 64;
 const MAX_MANIFEST_INPUTS: usize = 16_384;
 const MAX_MANIFEST_WALK_NODES: usize = 16_384;
+const MAX_FORK_ACL_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HistoryBaseRef {
@@ -23,6 +26,13 @@ pub(crate) struct HistoryBaseRef {
     pub(crate) manifest_digest: String,
     pub(crate) total_turns: u64,
     pub(crate) next_turn: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHistoryForkAccess {
+    Private,
+    Inherit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -368,40 +378,115 @@ fn inherited_parent_for_seal(
     Ok(None)
 }
 
-fn projected_node_digests(
+fn inherited_projected_nodes(connection: &Connection, base_id: &str) -> Result<Vec<crate::Node>> {
+    let mut chain = Vec::new();
+    let mut cursor = Some(base_id.to_owned());
+    while let Some(base) = cursor {
+        if chain.len() >= crate::MAX_SESSION_NODES {
+            return Err(Error::Limit(
+                "HistoryBase ancestry exceeds projection bound",
+            ));
+        }
+        let (parent, span): (Option<String>, String) = db(connection.query_row(
+            "SELECT parent_base_id,local_span_id FROM history_bases WHERE base_id=?1",
+            [&base],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))?;
+        chain.push(span);
+        cursor = parent;
+    }
+    chain.reverse();
+
+    let mut nodes = Vec::new();
+    for span in chain {
+        let backing_session: String = db(connection.query_row(
+            "SELECT backing_session_id FROM history_spans WHERE span_id=?1",
+            [&span],
+            |row| row.get(0),
+        ))?;
+        let mut query = db(connection.prepare(
+            "SELECT node_id,node_digest FROM history_span_nodes
+             WHERE span_id=?1 ORDER BY ordinal LIMIT ?2",
+        ))?;
+        let rows = db(query.query_map(
+            params![span, (crate::MAX_SESSION_NODES + 1) as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ))?;
+        let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        if nodes.len().saturating_add(rows.len()) > crate::MAX_SESSION_NODES {
+            return Err(Error::Limit("inherited history exceeds projection bound"));
+        }
+        for (node_id, expected_digest) in rows {
+            let actual_digest = raw_node_digest(connection, &backing_session, &node_id)?;
+            if actual_digest != expected_digest {
+                return Err(Error::Storage("HistorySpan backing node digest changed"));
+            }
+            nodes.push(crate::node_in(connection, &backing_session, &node_id)?);
+        }
+    }
+    Ok(nodes)
+}
+
+pub(crate) fn effective_history(
     connection: &Connection,
     session: &crate::SessionInfo,
     branch: &crate::BranchInfo,
+) -> Result<aw_agent_core::HistoryState> {
+    let base_id: Option<String> = db(connection.query_row(
+        "SELECT history_base_id FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![session.id, branch.id],
+        |row| row.get(0),
+    ))?;
+    let Some(base_id) = base_id else {
+        return context::projected_history(connection, session, branch);
+    };
+    let mut nodes = inherited_projected_nodes(connection, &base_id)?;
+    let local = context::projected(connection, &session.id, &branch.head)?;
+    if nodes.len().saturating_add(local.len()) > crate::MAX_SESSION_NODES {
+        return Err(Error::Limit(
+            "effective Agent history exceeds projection bound",
+        ));
+    }
+    nodes.extend(local);
+    context::history_from_projected_nodes(connection, session, nodes, session.next_turn)
+}
+
+fn projected_node_digests(
+    connection: &Connection,
+    session_id: &str,
+    head: &str,
 ) -> Result<Vec<(String, String)>> {
-    context::projected(connection, &session.id, &branch.head)?
+    context::projected(connection, session_id, head)?
         .into_iter()
         .map(|node| {
-            let digest = raw_node_digest(connection, &session.id, &node.id)?;
+            let digest = raw_node_digest(connection, session_id, &node.id)?;
             Ok((node.id, digest))
         })
         .collect()
 }
 
-pub(crate) fn seal_in(
+fn seal_boundary_in(
     connection: &Connection,
     session_id: &str,
     branch_id: &str,
+    head: &str,
+    next_turn: u64,
 ) -> Result<HistoryBaseRef> {
-    let session = session_in(connection, session_id)?;
     let branch = branch_in(connection, session_id, branch_id)?;
     if branch.id != branch_id {
         return Err(Error::Denied(
             "history sealing requires exact branch identity",
         ));
     }
-    if branch.active_run.is_some() {
-        return Err(Error::Conflict(
-            "cannot seal history while the Agent has active work",
+    if next_turn == 0 {
+        return Err(Error::Storage(
+            "history sealing next-turn invariant violated",
         ));
     }
     let head_kind: String = db(connection.query_row(
         "SELECT kind FROM nodes WHERE session_id=?1 AND id=?2",
-        params![session_id, branch.head],
+        params![session_id, head],
         |row| row.get(0),
     ))?;
     if head_kind == "prompt" {
@@ -421,7 +506,7 @@ pub(crate) fn seal_in(
     let parent_base =
         inherited_parent_for_seal(connection, current_base.as_deref(), session_id, branch_id)?;
 
-    let projected = projected_node_digests(connection, &session, &branch)?;
+    let projected = projected_node_digests(connection, session_id, head)?;
     if projected.is_empty() {
         if let Some(parent) = parent_base.as_deref() {
             return base_row(connection, parent);
@@ -437,7 +522,7 @@ pub(crate) fn seal_in(
         .first()
         .map(|(node, _)| node.as_str())
         .unwrap_or(root_node.as_str());
-    let local_manifest = dependency_manifest(connection, &branch.head)?;
+    let local_manifest = dependency_manifest(connection, head)?;
     let manifest_digest = if let Some(parent) = parent_base.as_deref() {
         let inherited = base_row(connection, parent)?;
         union_manifests(connection, &inherited.manifest_digest, &local_manifest)?
@@ -458,7 +543,7 @@ pub(crate) fn seal_in(
             session_id,
             branch_id,
             local_root,
-            &branch.head,
+            head,
             &content_digest,
             &manifest_digest,
         ],
@@ -470,15 +555,14 @@ pub(crate) fn seal_in(
             session_id,
             branch_id,
             local_root,
-            &branch.head,
+            head,
             &content_digest,
             &provenance_digest,
             &manifest_digest,
         ],
     );
     let span_id = format!("hsp_{span_seal_key}");
-    let total_turns = session
-        .next_turn
+    let total_turns = next_turn
         .checked_sub(1)
         .ok_or(Error::Storage("Session next-turn invariant violated"))?;
     db(connection.execute(
@@ -494,12 +578,12 @@ pub(crate) fn seal_in(
             session_id,
             branch_id,
             local_root,
-            branch.head,
+            head,
             content_digest,
             provenance_digest,
             manifest_digest,
             total_turns,
-            session.next_turn,
+            next_turn,
             now()
         ],
     ))?;
@@ -534,7 +618,7 @@ pub(crate) fn seal_in(
             &base_content_digest,
             &manifest_digest,
             &total_turns.to_string(),
-            &session.next_turn.to_string(),
+            &next_turn.to_string(),
         ],
     );
     let base_id = format!("hb_{base_seal_key}");
@@ -549,7 +633,7 @@ pub(crate) fn seal_in(
             parent_base,
             span_id,
             total_turns,
-            session.next_turn,
+            next_turn,
             base_content_digest,
             manifest_digest,
             now()
@@ -558,10 +642,51 @@ pub(crate) fn seal_in(
     base_row(connection, &base_id)
 }
 
+pub(crate) fn seal_in(
+    connection: &Connection,
+    session_id: &str,
+    branch_id: &str,
+) -> Result<HistoryBaseRef> {
+    let session = session_in(connection, session_id)?;
+    let branch = branch_in(connection, session_id, branch_id)?;
+    if branch.active_run.is_some() {
+        return Err(Error::Conflict(
+            "cannot seal current history while the Agent has active work",
+        ));
+    }
+    seal_boundary_in(
+        connection,
+        session_id,
+        branch_id,
+        &branch.head,
+        session.next_turn,
+    )
+}
+
+pub(crate) fn seal_latest_committed_in(
+    connection: &Connection,
+    session_id: &str,
+    branch_id: &str,
+) -> Result<HistoryBaseRef> {
+    let session = session_in(connection, session_id)?;
+    let branch = branch_in(connection, session_id, branch_id)?;
+    let (head, next_turn) = if let Some(run) = branch.active_run.as_deref() {
+        db(connection.query_row(
+            "SELECT produced_from_head,turn_id FROM runs
+             WHERE id=?1 AND session_id=?2 AND branch_id=?3 AND status='running'",
+            params![run, session_id, branch_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        ))?
+    } else {
+        (branch.head, session.next_turn)
+    };
+    seal_boundary_in(connection, session_id, branch_id, &head, next_turn)
+}
+
 fn manifest_authority_roots(
     connection: &Connection,
     manifest: &str,
-) -> Result<Vec<(String, String, String)>> {
+) -> Result<Vec<(String, String, String, String)>> {
     let mut stack = vec![manifest.to_owned()];
     let mut visited = BTreeSet::new();
     let mut roots = BTreeSet::new();
@@ -621,7 +746,7 @@ fn manifest_authority_roots(
                 "SELECT kind,stable_key,evidence_json
                  FROM disclosure_authority_roots WHERE root_digest=?1",
                 [&root],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((root.clone(), row.get(0)?, row.get(1)?, row.get(2)?)),
             ))
         })
         .collect()
@@ -730,7 +855,7 @@ fn validate_manifest_expansion(
     principal_kind: &str,
     principal_handle: &str,
 ) -> Result<()> {
-    for (kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)? {
+    for (_root, kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)? {
         match kind.as_str() {
             "legacy_session" => validate_legacy_session_expansion(
                 connection,
@@ -752,6 +877,142 @@ fn validate_manifest_expansion(
         }
     }
     Ok(())
+}
+
+fn validate_fork_manifest_for_principal(
+    connection: &Connection,
+    actor: &PrincipalId,
+    new_manifest: &str,
+    prior_grant: Option<&str>,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<()> {
+    let prior_roots = if let Some(grant) = prior_grant {
+        if !grant_covers(connection, grant, principal_kind, principal_handle)? {
+            BTreeSet::new()
+        } else {
+            let prior_manifest: String = db(connection.query_row(
+                "SELECT manifest_digest FROM history_grants WHERE grant_id=?1",
+                [grant],
+                |row| row.get(0),
+            ))?;
+            manifest_authority_roots(connection, &prior_manifest)?
+                .into_iter()
+                .map(|(root, _, _, _)| root)
+                .collect()
+        }
+    } else {
+        BTreeSet::new()
+    };
+
+    for (root, kind, stable_key, _evidence) in manifest_authority_roots(connection, new_manifest)? {
+        match kind.as_str() {
+            // Explicitly revocable/materialized source policy is stronger than
+            // immutable prior disclosure and must be revalidated on every new
+            // destination. No principal-level source-share contract exists yet.
+            "materialized_policy" => {
+                return Err(Error::Denied(
+                    "materialized external history cannot be forked without source share authority",
+                ));
+            }
+            "legacy_session" if prior_roots.contains(&root) => {}
+            "legacy_session" => validate_legacy_session_expansion(
+                connection,
+                actor,
+                &stable_key,
+                principal_kind,
+                principal_handle,
+            )?,
+            _ => {
+                return Err(Error::Denied(
+                    "history disclosure authority root has no reviewed fork/share contract",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn direct_acl_rows(
+    connection: &Connection,
+    agent: agent_owner::AgentKey<'_>,
+) -> Result<Vec<(String, String, agent_owner::AgentPermissions)>> {
+    let mut query = db(connection.prepare(
+        "SELECT principal_kind,principal_handle,
+                can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage
+         FROM agent_acl_current
+         WHERE session_id=?1 AND branch_id=?2
+         ORDER BY principal_kind,principal_handle LIMIT ?3",
+    ))?;
+    let rows = db(query.query_map(
+        params![
+            agent.session,
+            agent.branch,
+            (MAX_FORK_ACL_ENTRIES + 1) as i64
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                agent_owner::AgentPermissions {
+                    view: row.get::<_, i64>(2)? != 0,
+                    contribute: row.get::<_, i64>(3)? != 0,
+                    submit: row.get::<_, i64>(4)? != 0,
+                    control: row.get::<_, i64>(5)? != 0,
+                    derive: row.get::<_, i64>(6)? != 0,
+                    share: row.get::<_, i64>(7)? != 0,
+                    manage: row.get::<_, i64>(8)? != 0,
+                },
+            ))
+        },
+    ))?;
+    let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    if rows.len() > MAX_FORK_ACL_ENTRIES {
+        return Err(Error::Limit("Agent fork ACL bound exceeded"));
+    }
+    rows.into_iter()
+        .map(|(kind, handle, permissions)| Ok((kind, handle, permissions.validate()?)))
+        .collect()
+}
+
+fn mint_destination_grant(
+    connection: &Connection,
+    actor: &PrincipalId,
+    base: &HistoryBaseRef,
+    source_agent_ref: &str,
+    destination_agent_ref: &str,
+    audience: &BTreeSet<(String, String)>,
+) -> Result<String> {
+    if audience.len() > MAX_MANIFEST_INPUTS {
+        return Err(Error::Limit("HistoryGrant principal bound exceeded"));
+    }
+    let grant_id = id("hgrant")?;
+    let created_by = user_for_principal(connection, actor)?
+        .ok_or(Error::Denied("HistoryGrant creator identity is inactive"))?;
+    db(connection.execute(
+        "INSERT INTO history_grants(
+             grant_id,base_id,source_agent_ref,destination_agent_ref,manifest_digest,
+             created_by_handle,supersedes_grant_id,created_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,NULL,?7)",
+        params![
+            grant_id,
+            base.id,
+            source_agent_ref,
+            destination_agent_ref,
+            base.manifest_digest,
+            created_by,
+            now()
+        ],
+    ))?;
+    for (ordinal, (kind, handle)) in audience.iter().enumerate() {
+        db(connection.execute(
+            "INSERT INTO history_grant_principals(
+                 grant_id,ordinal,principal_kind,principal_handle
+             ) VALUES(?1,?2,?3,?4)",
+            params![grant_id, ordinal as u64, kind, handle],
+        ))?;
+    }
+    Ok(grant_id)
 }
 
 /// Validate and durably record one genuinely new history audience principal.
@@ -842,10 +1103,207 @@ pub(crate) fn prepare_disclosure_expansion(
     Ok(Some(grant_id))
 }
 
+impl SessionStore {
+    /// Trusted lower constructor for a structurally shared exact-history Agent.
+    /// History ancestry is independent from execution/Sandbox ancestry: callers
+    /// supply the destination binding explicitly. The destination remains in the
+    /// source Project and uses that Project's current user owner in this cut.
+    pub fn create_agent_from_agent_history(
+        &self,
+        actor: &PrincipalId,
+        source_session: &str,
+        source_branch: &str,
+        title: &str,
+        binding: SessionBinding,
+        access: AgentHistoryForkAccess,
+    ) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+        crate::label(title, 160)?;
+        crate::validate_binding(&binding)?;
+        let mut connection = self.connection()?;
+        let tx =
+            db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+        let source_branch_info = branch_in(&tx, source_session, source_branch)?;
+        if source_branch_info.id != source_branch {
+            return Err(Error::Denied(
+                "exact-history Agent creation requires an exact source branch ID",
+            ));
+        }
+        let source_agent = agent_owner::AgentKey::new(source_session, source_branch);
+        agent_owner::authorize_permission(
+            &tx,
+            actor,
+            source_agent,
+            agent_owner::AgentPermission::Derive,
+        )?;
+        let base = seal_latest_committed_in(&tx, source_session, source_branch)?;
+        let (owner_kind, owner_handle, workspace, source_ref, source_grant): (
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = db(tx.query_row(
+            "SELECT a.owner_kind,a.owner_handle,s.workspace_id,
+                    '/d:' || a.domain_handle || '/i:' || a.identity_handle ||
+                    '/p:' || a.project_handle || '/a:' || a.agent_handle,
+                    a.history_grant_id
+             FROM agent_state_current a
+             JOIN sessions s ON s.id=a.session_id
+             WHERE a.session_id=?1 AND a.branch_id=?2",
+            params![source_session, source_branch],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        ))?;
+        if owner_kind != "user" {
+            return Err(Error::Denied(
+                "exact-history constructor currently requires a user-owned source Project",
+            ));
+        }
+        let workspace = workspace.ok_or(Error::Storage(
+            "source Agent is missing its authoritative Project binding",
+        ))?;
+        let destination_owner = stable_user_principal(&owner_handle)?;
+        let inherited_acl = match access {
+            AgentHistoryForkAccess::Private => Vec::new(),
+            AgentHistoryForkAccess::Inherit => direct_acl_rows(&tx, source_agent)?,
+        };
+        let mut audience = BTreeSet::from([("user".to_owned(), owner_handle.clone())]);
+        for (kind, handle, permissions) in &inherited_acl {
+            if permissions.view {
+                audience.insert((kind.clone(), handle.clone()));
+            }
+        }
+        for (kind, handle) in &audience {
+            validate_fork_manifest_for_principal(
+                &tx,
+                actor,
+                &base.manifest_digest,
+                source_grant.as_deref(),
+                kind,
+                handle,
+            )?;
+        }
+
+        let (destination_session, destination_branch) = resources::create_in_workspace_tx(
+            &tx,
+            &destination_owner,
+            title,
+            &binding,
+            &workspace,
+            None,
+        )?;
+        let destination_ref: String = db(tx.query_row(
+            "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
+                    '/p:' || project_handle || '/a:' || agent_handle
+             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+            params![destination_session.id, destination_branch.id],
+            |row| row.get(0),
+        ))?;
+        let created_by = user_for_principal(&tx, actor)?
+            .ok_or(Error::Denied("Agent fork creator identity is inactive"))?;
+        for (kind, handle, permissions) in &inherited_acl {
+            db(tx.execute(
+                "INSERT INTO agent_acl_current(
+                     session_id,branch_id,principal_kind,principal_handle,
+                     can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
+                     grant_rev,granted_by_handle,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12,?13)",
+                params![
+                    destination_session.id,
+                    destination_branch.id,
+                    kind,
+                    handle,
+                    i64::from(permissions.view),
+                    i64::from(permissions.contribute),
+                    i64::from(permissions.submit),
+                    i64::from(permissions.control),
+                    i64::from(permissions.derive),
+                    i64::from(permissions.share),
+                    i64::from(permissions.manage),
+                    created_by,
+                    now(),
+                ],
+            ))?;
+        }
+        let grant_id =
+            mint_destination_grant(&tx, actor, &base, &source_ref, &destination_ref, &audience)?;
+        let changed = db(tx.execute(
+            "UPDATE agent_state_current
+             SET history_base_id=?1,history_grant_id=?2,updated_at=?3
+             WHERE session_id=?4 AND branch_id=?5",
+            params![
+                base.id,
+                grant_id,
+                now(),
+                destination_session.id,
+                destination_branch.id
+            ],
+        ))?;
+        if changed != 1 {
+            return Err(Error::Storage(
+                "destination Agent history pointer initialization failed",
+            ));
+        }
+        let session_changed = db(tx.execute(
+            "UPDATE sessions SET next_turn=?1,updated_at=?2 WHERE id=?3",
+            params![base.next_turn, now(), destination_session.id],
+        ))?;
+        if session_changed != 1 {
+            return Err(Error::Storage(
+                "destination Session inherited Turn cursor initialization failed",
+            ));
+        }
+        crate::audit(
+            &tx,
+            &destination_session.id,
+            actor,
+            "agent.history_inherited",
+            serde_json::json!({
+                "source_agent":source_ref,
+                "destination_agent":destination_ref,
+                "history_content_digest":base.content_digest,
+                "access":access,
+            }),
+        )?;
+        let txid = crate::durability::tx_id()?;
+        crate::durability::commit_event(
+            &tx,
+            &txid,
+            "agent.history_inherited",
+            "agent",
+            &destination_ref,
+            Some(actor),
+            serde_json::json!({
+                "session_id":destination_session.id,
+                "branch_id":destination_branch.id,
+                "source_agent":source_ref,
+                "history_content_digest":base.content_digest,
+            }),
+        )?;
+        let result = (
+            session_in(&tx, &destination_session.id)?,
+            branch_in(&tx, &destination_session.id, &destination_branch.id)?,
+        );
+        db(tx.commit())?;
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{PrincipalId, SessionBinding, SessionStore};
+    use aw_agent_core::{
+        AccountOwner, BillingOwner, CredentialCustody, InvocationIdentity, Outcome, Turn,
+        TurnJournal, TurnStart,
+    };
     use std::path::PathBuf;
 
     fn binding() -> SessionBinding {
@@ -856,6 +1314,20 @@ mod tests {
             profile_hint: "fixture".into(),
             model_hint: "model".into(),
             destination_fingerprint: "0".repeat(64),
+        }
+    }
+
+    fn identity(actor: &PrincipalId) -> InvocationIdentity {
+        InvocationIdentity {
+            actor: actor.clone(),
+            account_id: "fixture".into(),
+            account_owner: AccountOwner::User(actor.clone()),
+            payer: BillingOwner::User(actor.clone()),
+            credential_custody: CredentialCustody::UserDevice("fixture".into()),
+            credential_version: None,
+            inference_executor: "local".into(),
+            model: "fixture".into(),
+            grant_revision: 1,
         }
     }
 
@@ -1033,6 +1505,197 @@ mod tests {
             rev4,
             "failed new disclosure cannot advance Agent revision"
         );
+    }
+
+    #[tokio::test]
+    async fn exact_history_fork_uses_fresh_session_and_latest_committed_boundary() {
+        let store = SessionStore::in_memory().unwrap();
+        let owner = PrincipalId::new("internal:fixture:fork-owner").unwrap();
+        let bob = PrincipalId::new("internal:fixture:fork-bob").unwrap();
+        let (source, source_branch) = store.create(&owner, "source", binding()).unwrap();
+        let domain = store.default_domain(&owner).unwrap();
+        let bob_ref = {
+            let connection = store.connection().unwrap();
+            let bob_user = crate::ensure_user_for_principal(&connection, &bob).unwrap();
+            format!("/d:{}/i:{bob_user}", domain.id)
+        };
+        let source_rev = store
+            .agent_public_revision(&owner, &source.id, &source_branch.id)
+            .unwrap();
+        store
+            .agent_access_set(
+                &owner,
+                &source.id,
+                &source_branch.id,
+                &bob_ref,
+                Some(crate::AgentPermissions {
+                    view: true,
+                    derive: true,
+                    ..Default::default()
+                }),
+                source_rev,
+            )
+            .unwrap();
+
+        let (_, source_handle) = store
+            .activate(&owner, &source.id, &source_branch.id)
+            .unwrap();
+        let identity = identity(&owner);
+        source_handle
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "committed seed".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        source_handle
+            .finish(Turn {
+                id: 1,
+                prompt: "committed seed".into(),
+                answer: "seed answer".into(),
+                model: identity.model.clone(),
+                profile: identity.account_id.clone(),
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(owner.clone()),
+                tool_records: Vec::new(),
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+
+        let (inherited, inherited_branch) = store
+            .create_agent_from_agent_history(
+                &owner,
+                &source.id,
+                &source_branch.id,
+                "inherited",
+                binding(),
+                AgentHistoryForkAccess::Inherit,
+            )
+            .unwrap();
+        assert_ne!(inherited.id, source.id);
+        assert_eq!(inherited.workspace_id, source.workspace_id);
+        assert_eq!(inherited.next_turn, 2);
+        assert_eq!(inherited_branch.name, "main");
+        assert!(inherited_branch.active_run.is_none());
+        let inherited_view = store
+            .read_agent_branch_view(&owner, &inherited.id, &inherited_branch.id)
+            .unwrap();
+        assert_eq!(inherited_view.history.turns.len(), 1);
+        assert_eq!(inherited_view.history.turns[0].id, 1);
+        assert_eq!(inherited_view.history.turns[0].answer, "seed answer");
+        assert_eq!(inherited_view.history.next_turn_id, 2);
+        let (activated_view, _) = store
+            .activate(&owner, &inherited.id, &inherited_branch.id)
+            .unwrap();
+        assert_eq!(activated_view.history.turns.len(), 1);
+        assert_eq!(activated_view.history.next_turn_id, 2);
+        assert!(store
+            .authorize_agent_permission(
+                &bob,
+                &inherited.id,
+                &inherited_branch.id,
+                crate::AgentPermission::Derive,
+            )
+            .is_ok());
+        let inherited_rev = store
+            .agent_public_revision(&owner, &inherited.id, &inherited_branch.id)
+            .unwrap();
+        assert_eq!(inherited_rev, 1, "fork starts with fresh Agent revision");
+        {
+            let connection = store.connection().unwrap();
+            let local_nodes: u64 = connection
+                .query_row(
+                    "SELECT count(*) FROM nodes WHERE session_id=?1",
+                    [&inherited.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                local_nodes, 1,
+                "inherited history is not copied into the new Session"
+            );
+        }
+
+        let current_source_rev = store
+            .agent_public_revision(&owner, &source.id, &source_branch.id)
+            .unwrap();
+        store
+            .agent_access_set(
+                &owner,
+                &source.id,
+                &source_branch.id,
+                &bob_ref,
+                None,
+                current_source_rev,
+            )
+            .unwrap();
+        assert!(store
+            .authorize_agent_permission(
+                &bob,
+                &source.id,
+                &source_branch.id,
+                crate::AgentPermission::View,
+            )
+            .is_err());
+        assert!(store
+            .authorize_agent_permission(
+                &bob,
+                &inherited.id,
+                &inherited_branch.id,
+                crate::AgentPermission::View,
+            )
+            .is_ok());
+
+        source_handle
+            .begin(TurnStart {
+                turn_id: 2,
+                prompt: "still running".into(),
+                identity,
+            })
+            .await
+            .unwrap();
+        let (private, private_branch) = store
+            .create_agent_from_agent_history(
+                &owner,
+                &source.id,
+                &source_branch.id,
+                "private busy fork",
+                binding(),
+                AgentHistoryForkAccess::Private,
+            )
+            .unwrap();
+        assert_eq!(private.next_turn, 2);
+        let private_view = store
+            .read_agent_branch_view(&owner, &private.id, &private_branch.id)
+            .unwrap();
+        assert_eq!(private_view.history.turns.len(), 1);
+        assert_eq!(private_view.history.turns[0].id, 1);
+        assert_eq!(private_view.history.next_turn_id, 2);
+        assert!(store
+            .authorize_agent_permission(
+                &bob,
+                &private.id,
+                &private_branch.id,
+                crate::AgentPermission::View,
+            )
+            .is_err());
+        {
+            let connection = store.connection().unwrap();
+            let local_nodes: u64 = connection
+                .query_row(
+                    "SELECT count(*) FROM nodes WHERE session_id=?1",
+                    [&private.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(local_nodes, 1);
+        }
     }
 
     #[test]

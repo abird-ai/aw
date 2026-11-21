@@ -123,6 +123,7 @@ pub use durability::{
 };
 pub use extension_secret::{SecretSettingScope, SecretSettingState, SecretSettingView};
 use fs2::FileExt;
+pub use history_owner::AgentHistoryForkAccess;
 pub use identity_continuity::*;
 pub use job_exposure::{FiniteExposure, FiniteExposureState};
 pub use journal::SessionHandle;
@@ -3914,7 +3915,7 @@ fn migrate_durable_runtime(c: &mut Connection) -> Result<()> {
     db(tx.commit())?;
     Ok(())
 }
-fn validate_binding(b: &SessionBinding) -> Result<()> {
+pub(crate) fn validate_binding(b: &SessionBinding) -> Result<()> {
     if !b.working_directory.is_absolute() || !b.tool_root.is_absolute() {
         return Err(Error::Config(
             "stored execution paths must be absolute".into(),
@@ -4228,7 +4229,7 @@ fn read_branch_view_in(
 }
 
 pub(crate) fn history_in(c: &Connection, s: &SessionInfo, b: &BranchInfo) -> Result<HistoryState> {
-    context::projected_history(c, s, b)
+    history_owner::effective_history(c, s, b)
 }
 pub(crate) fn private_new(path: &Path) -> Result<File> {
     aw_platform::open_private_new(path).map_err(Into::into)

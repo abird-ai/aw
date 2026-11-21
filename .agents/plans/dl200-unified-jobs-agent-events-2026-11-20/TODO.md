@@ -96,11 +96,19 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       same transaction; already-disclosed principals can be re-added without share, narrowing never
       rewrites grants, and materialized external-policy expansion fails closed pending a reviewed
       source-share contract. Same-branch base layers are replaced rather than duplicated on reseal.
-      History owner tests 3/3 + existing group AgentJobs/principal tests + strict aw-store/aw-cli
-      Clippy are green. Next: exact-history destination Agent construction/fork wiring using current
-      derive + destination share policy and v40 base/grant pointers; then propagate manifests through
-      newly committed Event/Tool/Process facts, add reachability/flatten acceleration as real
-      consumers require, minimal snapshots and rebuild Agent exposure from owner state.
+      Existing HistoryGrant/group AgentJobs/principal tests + strict aw-store/aw-cli Clippy remain
+      green. **Exact Agent-ref history fork landed:** one lower
+      `create_agent_from_agent_history(private|inherit)` transaction requires current derive, seals
+      latest committed source history (using active run `produced_from_head`/turn when source is busy),
+      validates disclosure roots, creates a physically fresh destination Session/Agent, fresh rev/
+      runtime/input state, fresh independent ACL rows, new destination HistoryGrant lineage, inherited
+      `next_turn`, and no copied history nodes. `history_in`/activation now resolve structurally shared
+      HistoryBase spans + local tail with recorded-node digest verification. Inherit/private ACL
+      profiles are non-broadening; source/destination ACLs diverge independently. History-owner tests
+      are 4/4 and legacy same-Session fork remains green. Next: settled-Turn exact boundary selection
+      and host/model `agent.create(from=...)` adapters over this constructor; then propagate manifests
+      through new Event/Tool/Process facts, add reachability/flatten acceleration as consumers require,
+      minimal snapshots and rebuild Agent exposure from owner state.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.
