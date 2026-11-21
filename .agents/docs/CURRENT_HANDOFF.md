@@ -42,26 +42,32 @@ non-root Agents, followed by the existing current authorization/binding recheck;
 Sessions/branches to discover a canonical Agent.
 
 A private zero-allocation `agent_owner` cutover seam now centralizes exact branch-bound Agent
-revision reads and logical owner commits **without changing legacy persistence yet**. Today
-`revision()` still returns the historical `MAX(audit.seq)+1`, and `commit()` is the same SQLite
-commit with stack-array mutation metadata; no audit row or second state owner is created. Exact
-paths already crossing the seam are Agent create/fork, Turn admission, durable result settlement +
-branch attachment settlement, changed-only Agent subscriptions, delegated child publication
-(parent change + child creation with immutable parent Agent lineage), stable-Agent close request,
-and exact stable-Agent settlement. Idempotent subscription replacement remains a plain commit and
-provably does not advance revision. Session-only subagent runtime bookkeeping (`running`, legacy
-failure/settlement) is deliberately not mislabeled as DL-200 Agent lifecycle.
+revision reads and owner mutations **without changing legacy persistence yet**. Today `revision()`
+still returns the historical `MAX(audit.seq)+1`; `created()`/`changed()` are in-transaction zero-work
+markers that the exclusive cutover can replace with the authoritative row insert/rev bump. No audit
+row or second state owner is created. Exact paths already crossing the seam are Agent create/fork,
+Turn admission, durable result settlement + branch attachment settlement, changed-only Agent
+subscriptions, delegated child publication (parent change + child creation with immutable parent
+Agent lineage), stable-Agent close request, and exact stable-Agent settlement. Idempotent
+subscription replacement remains revision-neutral. Session-only subagent runtime bookkeeping
+(`running`, legacy failure/settlement) is deliberately not mislabeled as DL-200 Agent lifecycle.
 
-Do **not** activate `agent_state_current` yet. Remaining cutover blockers include recovery that may
-settle several exact branches in one transaction, the final committed-input boundary above
-ActorQueue, and legacy Session-level title/ACL compatibility paths whose semantics cannot be
-silently projected onto one branch Agent. Those must either gain an exact Agent owner boundary or be
-retired/blocked by the exclusive cutover before the one Agent-state+ACL seed/activation transaction.
+Recovery is now exact too: the existing single recovery transaction records every recovered or
+pending-attachment `(session, branch)`, deduplicates those keys in a cold-path `BTreeSet`, and marks
+each Agent exactly once before the same recovery commit. Hot mutation paths stay allocation-free and
+there is no generic transaction/mutation framework.
+
+Do **not** activate `agent_state_current` yet. Remaining cutover blockers are the final
+committed-input custody/admission boundary above ActorQueue and legacy Session-level title/ACL
+compatibility paths whose semantics cannot be silently projected onto one branch Agent. Those must
+either gain an exact Agent owner boundary or be retired/blocked by the exclusive cutover before the
+one Agent-state+ACL seed/activation transaction.
 Only add cursor/projection-head mechanics when a real consumer requires them; do not prebuild
 Phase-2/4 engines.
 
 Current focused evidence: StoreScope **2/2**, mixed Job exposure/root lookup green, coordination
-**24/24**, Agent Job-event/idempotent-subscription test green, delegated child relation/budget tests
+**24/24** including killed-process result-before-attach recovery, restart unknown-model recovery
+green, Agent Job-event/idempotent-subscription test green, delegated child relation/budget tests
 green, stable-Agent survive/continue/close regression green, `aw-cli` all-feature check green, and
 strict all-target/all-feature `aw-store` Clippy/fmt/diff green.
 

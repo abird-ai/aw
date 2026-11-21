@@ -3,7 +3,10 @@ use aw_agent_core::{
     AuthorityBoundaryKind, AuthoritySegment, InvocationRecord, JournalEntry, JournalFuture,
     ToolEffect, ToolRecord, ToolStatus, Turn, TurnJournal, TurnStart,
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 #[derive(Clone)]
 pub struct SessionHandle {
@@ -551,12 +554,8 @@ impl SessionHandle {
             params![now(), self.session],
         ))?;
         let next = branch_in(&tx, &self.session, &b.id)?;
-        crate::agent_owner::commit(
-            tx,
-            [crate::agent_owner::AgentMutation::Changed(
-                crate::agent_owner::AgentKey::new(&self.session, &b.id),
-            )],
-        )?;
+        crate::agent_owner::changed(&tx, crate::agent_owner::AgentKey::new(&self.session, &b.id))?;
+        db(tx.commit())?;
         *cursor = next;
         Ok(())
     }
@@ -1126,24 +1125,22 @@ impl SessionHandle {
             // The result/attempt fact commits before the branch attachment CAS so a
             // crash cannot erase a paid provider result.
             persist_finish_in(&tx, &run, turn, false)?;
-            crate::agent_owner::commit(
-                tx,
-                [crate::agent_owner::AgentMutation::Changed(
-                    crate::agent_owner::AgentKey::new(&self.session, &cursor.id),
-                )],
+            crate::agent_owner::changed(
+                &tx,
+                crate::agent_owner::AgentKey::new(&self.session, &cursor.id),
             )?;
+            db(tx.commit())?;
             run
         };
         phase34_after_result_commit_crash_hook();
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         attach_settled_run(&tx, &run)?;
         let next = branch_in(&tx, &self.session, &cursor.id)?;
-        crate::agent_owner::commit(
-            tx,
-            [crate::agent_owner::AgentMutation::Changed(
-                crate::agent_owner::AgentKey::new(&self.session, &cursor.id),
-            )],
+        crate::agent_owner::changed(
+            &tx,
+            crate::agent_owner::AgentKey::new(&self.session, &cursor.id),
         )?;
+        db(tx.commit())?;
         *cursor = next;
         Ok(())
     }
@@ -2084,6 +2081,7 @@ impl SessionStore {
     pub(crate) fn recover(&self) -> Result<()> {
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let mut changed_agents = BTreeSet::<(String, String)>::new();
         self.recover_subagent_execution_bindings_after_owner_restart(&tx)?;
         self.recover_subagents_after_owner_restart(&tx)?;
         #[cfg(feature = "pipelines")]
@@ -2107,7 +2105,7 @@ impl SessionStore {
                 }
             }
             let sql = if direct {
-                "SELECT r.id,r.session_id,r.turn_id,r.prompt_node,r.identity_json,r.possible_effect
+                "SELECT r.id,r.session_id,r.branch_id,r.turn_id,r.prompt_node,r.identity_json,r.possible_effect
                  FROM runs r
                  LEFT JOIN local_process_incarnations p ON p.process_id=r.owner_process_id
                  WHERE r.status='running'
@@ -2117,7 +2115,7 @@ impl SessionStore {
                         OR (p.lease_expires_at IS NOT NULL AND p.lease_expires_at<=?1))
                  ORDER BY r.started_at"
             } else {
-                "SELECT r.id,r.session_id,r.turn_id,r.prompt_node,r.identity_json,r.possible_effect
+                "SELECT r.id,r.session_id,r.branch_id,r.turn_id,r.prompt_node,r.identity_json,r.possible_effect
                  FROM runs r
                  LEFT JOIN local_process_incarnations p ON p.process_id=r.owner_process_id
                  WHERE r.status='running'
@@ -2131,16 +2129,17 @@ impl SessionStore {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, u64>(2)?,
-                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u64>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             };
             let rows = db(q.query_map([now()], map))?;
             db(rows.collect::<rusqlite::Result<Vec<_>>>())?
         };
-        for (run, session, turn_id, prompt_node, identity, possible) in runs {
+        for (run, session, branch, turn_id, prompt_node, identity, possible) in runs {
             let identity: aw_agent_core::InvocationIdentity = decode(&identity)?;
             let prompt = node_in(&tx, &session, &prompt_node)?.payload["prompt"]
                 .as_str()
@@ -2159,16 +2158,25 @@ impl SessionStore {
                 "run.recovered",
                 serde_json::json!({"run_id":run,"effects_unknown":possible!=0}),
             )?;
+            changed_agents.insert((session, branch));
         }
         let pending_attachments = {
             let mut q = db(tx.prepare(
-                "SELECT id FROM runs WHERE status<>'running' AND attach_status='pending' ORDER BY ended_at,id",
+                "SELECT id,session_id,branch_id FROM runs
+                 WHERE status<>'running' AND attach_status='pending' ORDER BY ended_at,id",
             ))?;
-            let rows = db(q.query_map([], |r| r.get::<_, String>(0)))?;
+            let rows = db(q.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            }))?;
             db(rows.collect::<rusqlite::Result<Vec<_>>>())?
         };
-        for run in pending_attachments {
+        for (run, session, branch) in pending_attachments {
             attach_settled_run(&tx, &run)?;
+            changed_agents.insert((session, branch));
         }
         // Phase 40 routing classifiers are paid external effects separate from
         // Chat turns. A dead/fenced owner can only convert a started attempt to
@@ -2269,6 +2277,9 @@ impl SessionStore {
                             OR (p.lease_expires_at IS NOT NULL AND p.lease_expires_at<=?1))))",
                 [at],
             ))?;
+        }
+        for (session, branch) in &changed_agents {
+            crate::agent_owner::changed(&tx, crate::agent_owner::AgentKey::new(session, branch))?;
         }
         db(tx.commit())?;
         Ok(())

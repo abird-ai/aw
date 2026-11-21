@@ -1467,13 +1467,12 @@ impl SessionStore {
         let (_, workspace) = resources::ensure_default_domain_workspace(&tx, &user, &realm)?;
         let result =
             resources::create_in_workspace_tx(&tx, owner, title, &binding, &workspace, None)?;
-        agent_owner::commit(
-            tx,
-            [agent_owner::AgentMutation::Created {
-                agent: agent_owner::AgentKey::new(&result.0.id, &result.1.id),
-                parent: None,
-            }],
+        agent_owner::created(
+            &tx,
+            agent_owner::AgentKey::new(&result.0.id, &result.1.id),
+            None,
         )?;
+        db(tx.commit())?;
         Ok(result)
     }
     pub fn session(&self, actor: &PrincipalId, session: &str) -> Result<SessionInfo> {
@@ -1893,13 +1892,8 @@ impl SessionStore {
             name,
         )?;
         let out = branch_in(&tx, session, &branch)?;
-        agent_owner::commit(
-            tx,
-            [agent_owner::AgentMutation::Created {
-                agent: agent_owner::AgentKey::new(session, &out.id),
-                parent: None,
-            }],
-        )?;
+        agent_owner::created(&tx, agent_owner::AgentKey::new(session, &out.id), None)?;
+        db(tx.commit())?;
         Ok(out)
     }
     /// Explicit human-authored summary: keeps all original nodes, cuts only the

@@ -2460,16 +2460,13 @@ impl SessionStore {
             }),
         )?;
         let parent_agent = crate::agent_owner::AgentKey::new(parent_session, &branch.id);
-        crate::agent_owner::commit(
-            tx,
-            [
-                crate::agent_owner::AgentMutation::Changed(parent_agent),
-                crate::agent_owner::AgentMutation::Created {
-                    agent: crate::agent_owner::AgentKey::new(&child.id, &child_branch.id),
-                    parent: Some(parent_agent),
-                },
-            ],
+        crate::agent_owner::changed(&tx, parent_agent)?;
+        crate::agent_owner::created(
+            &tx,
+            crate::agent_owner::AgentKey::new(&child.id, &child_branch.id),
+            Some(parent_agent),
         )?;
+        db(tx.commit())?;
         let info = row(&c, &subagent_id)?;
         Ok((info, child, child_branch))
     }
@@ -2925,12 +2922,11 @@ impl SessionStore {
                 "parent_branch_id": relation.parent_branch_id,
             }),
         )?;
-        crate::agent_owner::commit(
-            tx,
-            [crate::agent_owner::AgentMutation::Changed(
-                crate::agent_owner::AgentKey::new(child_session, &child_branch.id),
-            )],
+        crate::agent_owner::changed(
+            &tx,
+            crate::agent_owner::AgentKey::new(child_session, &child_branch.id),
         )?;
+        db(tx.commit())?;
         Ok(())
     }
 
@@ -3190,15 +3186,12 @@ impl SessionStore {
             serde_json::json!({"state":state}),
         )?;
         if let Some(child_branch) = child_branch {
-            crate::agent_owner::commit(
-                tx,
-                [crate::agent_owner::AgentMutation::Changed(
-                    crate::agent_owner::AgentKey::new(&info.child_session_id, child_branch),
-                )],
+            crate::agent_owner::changed(
+                &tx,
+                crate::agent_owner::AgentKey::new(&info.child_session_id, child_branch),
             )?;
-        } else {
-            db(tx.commit())?;
         }
+        db(tx.commit())?;
         row(&c, id)
     }
 

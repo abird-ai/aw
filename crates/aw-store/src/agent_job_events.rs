@@ -517,15 +517,9 @@ impl SessionStore {
                     "active": update.active,
                 }),
             )?;
-            agent_owner::commit(
-                tx,
-                [agent_owner::AgentMutation::Changed(
-                    agent_owner::AgentKey::new(session, &binding.branch_id),
-                )],
-            )?;
-        } else {
-            db(tx.commit())?;
+            agent_owner::changed(&tx, agent_owner::AgentKey::new(session, &binding.branch_id))?;
         }
+        db(tx.commit())?;
         Ok((source, update))
     }
 
