@@ -1,7 +1,7 @@
-//! Shared post-launch process contract for Graph-owned ShellNodes.
+//! Shared Process facts for Graph-owned ShellNodes.
 //!
-//! Hosts retain process-launch policy, OS handles and reattachment custody.
-//! After launch they report only these bounded facts to the common Job runtime,
+//! Hosts retain launch policy while the shared Process runtime owns the OS
+//! lifetime and reports only these bounded facts to the common Job runtime,
 //! which owns status classification. Output truncation is observability only;
 //! incomplete reader/drain state is an independent `Status::incomplete` fact
 //! and never erases an otherwise known physical/semantic process outcome.
@@ -9,7 +9,7 @@ use super::{batch::Status, status::Primary};
 use crate::execution_stop::{StopReason, StopRecord};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Tree {
+pub enum Occupancy {
     Empty,
     Live,
     #[default]
@@ -50,7 +50,7 @@ pub struct ProcessTerminal {
     /// Final factual semantic/housekeeping stop record, if any.
     pub stop: Option<StopRecord>,
     /// Live contained work observed before final cleanup.
-    pub tree: Tree,
+    pub occupancy: Occupancy,
     pub output: ProcessOutputMeta,
 }
 
@@ -160,7 +160,7 @@ impl StopProof {
             Self::Unknown(output) => ProcessTerminal {
                 exit: ProcessExit::Unknown,
                 stop: None,
-                tree: Tree::Unknown,
+                occupancy: Occupancy::Unknown,
                 output,
             },
         }
@@ -187,7 +187,7 @@ mod tests {
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(0),
             stop: None,
-            tree: Tree::Empty,
+            occupancy: Occupancy::Empty,
             output: output(true, true),
         };
         assert_eq!(
@@ -210,7 +210,7 @@ mod tests {
                 ProcessTerminal {
                     exit,
                     stop: None,
-                    tree: Tree::Empty,
+                    occupancy: Occupancy::Empty,
                     output: output(true, false),
                 }
                 .status()
@@ -221,7 +221,7 @@ mod tests {
         let signal = ProcessTerminal {
             exit: ProcessExit::Signal(11),
             stop: None,
-            tree: Tree::Empty,
+            occupancy: Occupancy::Empty,
             output: output(true, false),
         };
         assert!(signal.status_detail().contains("exit=signal:11"));
@@ -246,7 +246,7 @@ mod tests {
             let status = ProcessTerminal {
                 exit,
                 stop: None,
-                tree: Tree::Unknown,
+                occupancy: Occupancy::Unknown,
                 output: output(false, false),
             }
             .status();
@@ -261,7 +261,7 @@ mod tests {
         let terminal = ProcessTerminal {
             exit: ProcessExit::Unknown,
             stop: Some(StopRecord::stopped(StopReason::Timeout)),
-            tree: Tree::Empty,
+            occupancy: Occupancy::Empty,
             output: output(true, false),
         };
         assert_eq!(terminal.status().primary, Primary::Fail);

@@ -2240,14 +2240,14 @@ impl JobHost {
                             ProcessTerminal {
                                 exit: ProcessExit::Unknown,
                                 stop: None,
-                                tree: aw_tools::filesystem::runner::Tree::Unknown,
+                                occupancy: aw_tools::filesystem::runner::Occupancy::Unknown,
                                 output: Default::default(),
                             },
                         )
                         .unwrap_or(ProcessTerminal {
                             exit: ProcessExit::Unknown,
                             stop: None,
-                            tree: aw_tools::filesystem::runner::Tree::Unknown,
+                            occupancy: aw_tools::filesystem::runner::Occupancy::Unknown,
                             output: Default::default(),
                         }),
                         Primary::Unknown,

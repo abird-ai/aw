@@ -412,13 +412,13 @@ false"
         use crate::filesystem::{
             batch::Status,
             job::{Lifecycle, NodeState},
-            runner::{ProcessExit, ProcessOutputMeta, ProcessTerminal, Tree},
+            runner::{Occupancy, ProcessExit, ProcessOutputMeta, ProcessTerminal},
             status::Primary,
         };
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(1),
             stop: None,
-            tree: Tree::Empty,
+            occupancy: Occupancy::Empty,
             output: ProcessOutputMeta {
                 stdout_bytes: 20_001,
                 stderr_bytes: 732,
@@ -478,7 +478,7 @@ false"
         let unknown_terminal = ProcessTerminal {
             exit: ProcessExit::Unknown,
             stop: None,
-            tree: Tree::Unknown,
+            occupancy: Occupancy::Unknown,
             output: ProcessOutputMeta {
                 stdout_bytes: 0,
                 stderr_bytes: 3,

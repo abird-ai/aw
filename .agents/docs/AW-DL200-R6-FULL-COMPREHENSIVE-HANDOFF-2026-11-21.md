@@ -103,11 +103,13 @@ The reusable AW implementation currently consumed by dotlink remains:
 
     b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
 
-The R6 plan/docs are checkpointed in `7c3800c`. The pre-R6 Phase-0A Process work and
-independent Phase-0B store/policy/exposure work are checkpointed together in `c7cc948` after
-focused compilation and owner-boundary tests. They remain conceptually separate slices even
-though the repository checkpoint preserves both. Do not casually rewrite either slice while
-performing the R6 `aw-process` cutover.
+The R6 plan/docs are checkpointed in `7c3800c`; published AW main is `3191e62`. The
+pre-R6 Phase-0A Process work and independent Phase-0B store/policy/exposure work are
+checkpointed together in `c7cc948`. The current **uncommitted** working tree advances only
+the R6 Process side: `Occupancy`, minimal `crates/aw-process`, weak-Unix negative Unknown,
+and AW adapter consumption are implemented and grouped-check green. Preserve the Phase-0B
+owner-hardening semantics while continuing this cut; dotlink publication/repin is still
+separate.
 
 ### 3.2 dotlink
 
@@ -1309,18 +1311,20 @@ Do not collapse:
   different Unknown semantics
 
 Current implementation reality:
-  AW `c7cc948` preserves the pre-R6 Phase-0A Process work and Phase-0B owner hardening;
-  it still uses Tree and has not performed the R6 shared-runtime extraction.
-  Direct Unix still needs the R6 weak-negative -> Occupancy::Unknown semantic correction.
+  Published AW main is `3191e62`; the current uncommitted AW working tree has completed the
+  R6 Process-side extraction: `Occupancy`, weak direct-Unix negative Unknown, minimal
+  `crates/aw-process`, and AW adapter consumption are green. The adapter no longer owns a
+  parallel Scope/Child/Reader/wait/stop/drain engine; AW product policy/storage/receipt
+  ownership remains at the edge. PTY Terminal custody remains separate in `aw-terminal`.
   Dotlink `89ff3fb` preserves Remote Start/replay hardening; the real R6 shared-Process
-  consumer cutover has not begun.
+  consumer cutover has not begun and dotlink still pins published AW `b8a46a94...`.
 
-Before implementation, revalidate current refs/status because source outranks this handoff.
+Before continuing, revalidate current refs/status because source outranks this handoff.
 R6 is already sealed. Continue Phase 0 only:
-    Occupancy rename
-    one shared Agent-neutral Process owner
-    AW + real dotlink cutover
-    preserve dotlink wire projection
+    explicitly authorized AW publication
+    dotlink repin + aw-process consumer cutover
+    preserve dotlink tree=leftovers|unknown compatibility projection
+    non-login Bash + product-owned 30/35-minute horizon
     one grouped AW+dotlink behavior gate
 
 Keep implementation turns around 30 minutes and stop at the next coherent checkpoint.

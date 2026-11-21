@@ -17,14 +17,14 @@ The previous
 is preserved and embedded verbatim in the new canonical handoff as historical
 implementation chronology. The dated 2026-11-19 017 handoff is likewise historical.
 
-**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R1–R5 remain historical design provenance. R6 was explicitly approved on 2026-11-21 after final live-owner review and is now authoritative. AW R6 seal/docs are checkpointed at `7c3800c`; current Phase-0A Process plus Phase-0B owner hardening source is checkpointed at `c7cc948`. The `Tree -> Occupancy` cutover, weak-direct-Unix negative-to-Unknown correction, required `aw-process` extraction and real dotlink shared-owner compile remain Phase-0 gates. Dotlink Remote Start/replay hardening is checkpointed at `89ff3fb`, but its R6 shared-Process cutover has not begun. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a requirement to thaw frozen sandbox work. This is not final Phase-0 acceptance.
+**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R1–R5 remain historical design provenance. R6 was explicitly approved on 2026-11-21 and is authoritative. Published AW remains `3191e62`; the current **uncommitted** AW Phase-0 working tree now completes the R6 `Tree -> Occupancy` rename, weak-direct-Unix negative-to-Unknown correction, required `crates/aw-process` extraction, and the AW adapter cutover to that sole async Process/pipe lifetime owner. Dotlink Remote Start/replay hardening remains published at `89ff3fb`, but dotlink still consumes published AW `b8a46a94...`; its real `aw-process` consumer/repin is the remaining cross-repo Phase-0 Process gate. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a reason to thaw frozen sandbox work. This is not final Phase-0 acceptance.
 
 **R6 simplification seal (2026-11-21):** The canonical DL-200
 [README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md),
 [SPEC](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md),
 [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 and [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
-now contain a **review-ready, plan-only** R6 simplification pass. It standardizes one
+contain the **sealed** R6 simplification. It standardizes one
 truth-source/one-mutation-boundary semantics, global identity with store-local consistency,
 existing StoreId **plus restore-generation-fenced StoreScope/StorePos**, a durable
 Prepared claim before any effectful external lease/reservation, shared replay/external-
@@ -38,9 +38,47 @@ R6 is the **sealed** implementation authority. Its final live-owner review also 
 shared Process boundary: `ProcessTerminal` is the cross-host Fact; AW/dotlink keep their
 product receipt/output owners; prepared commands transfer by value into `aw-process`;
 weak direct-Unix negative containment maps to semantic Unknown; and `aw-terminal` PTY
-source-release/adoption remains a distinct Terminal resource. R6 Phase 0 is not yet fully
-implemented; source/test status above remains the factual checkpoint. Commit/push/release
-remain separately gated.
+source-release/adoption remains a distinct Terminal resource. R6 Phase 0 is not yet fully implemented because the dotlink consumer/repin remains pending;
+the current uncommitted AW source/test checkpoint below is the factual boundary.
+Commit/push/release remain separately gated.
+
+## LIVE DL-200 R6 Process extraction checkpoint — AW green, uncommitted, 2026-11-21
+
+The current AW working tree has crossed the R6 Process ownership boundary cleanly:
+
+- `Tree` / `ProcessTerminal.tree` is now `Occupancy` / `.occupancy` throughout the shared
+  Process facts and AW consumers; there is no semantic Process-`Tree` residue;
+- new `crates/aw-process` is the sole Agent-neutral async owner of prepared-command
+  containment finalization, stdio, spawn, exact Child/Scope custody, stdin, pipe capture,
+  wait/stop/reap, bounded drain and `ProcessTerminal` settlement;
+- `aw-process` depends only on minimal `aw-tools` Process facts (`batch`), `aw-platform`,
+  Tokio and `thiserror`; it has no AgentCore, Store, MCP, ToolPolicy or product receipt owner;
+- AW passes an already-authorized prepared `tokio::process::Command` by value. The adapter
+  keeps `PipeSpec` validation, Tool/policy authority, legacy spool and Job `OutputWriter`
+  storage, paging/ACK, and the AW-specific `ProcessReceipt` envelope;
+- the output seam is one small `OutputSink` contract. No-sink foreground capture allocates
+  no 64-KiB sink batches; retained output uses one bounded queue and one blocking writer per
+  stream. Sink failure still drains the OS pipe, always finalizes writer custody, and marks
+  output incomplete rather than inventing success;
+- direct Unix positive group evidence maps to `Occupancy::Live`; negative group/procfs
+  evidence maps to `Occupancy::Unknown` because `setsid(2)` escape cannot be excluded.
+  Windows Job Object negative evidence remains a real `Occupancy::Empty` proof;
+- the adapter no longer contains a duplicate `Scope`, `Reader`, Child/ChildStdin owner,
+  wait/stop/reap/drain state machine or DirectScope choreography;
+- `aw-terminal` PTY custody is untouched and remains deliberately separate.
+
+Focused grouped evidence (no fixture expansion): `aw-process` **2/2**; shared runner **4/4**;
+AW adapter Process suite **27/27**; affected/root `cargo check` green through `aw-cli` and
+`aw-platform-win`; strict affected all-target Clippy `-D warnings` green; rustfmt and
+`git diff --check` green. L5 externally SIGKILLed two cold/warmed compilation attempts during
+this work; both corresponding commands passed on immediate warmed reruns with no Rust error.
+The installed Rust sysroot has no Windows std target, so the new Windows-only `aw-process`
+branch was not cross-target compiled on L5; the unchanged `aw-platform-win` package and root
+consumer graph compile on this host.
+
+**Next coherent Phase-0 step:** publish this AW cut only when explicitly authorized, repin
+and migrate dotlink to `aw-process`, then qualify AW/dotlink parity plus dotlink non-login Bash
+and its product-owned 30/35-minute horizon. Do not start Phase 1 yet.
 
 Author: coordinating design/implementation agent
 Owner: @pvl

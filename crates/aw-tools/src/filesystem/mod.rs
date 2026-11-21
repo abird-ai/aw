@@ -27,7 +27,7 @@ pub mod private_artifact;
 pub mod progress;
 #[cfg(feature = "rw")]
 pub mod request;
-#[cfg(all(feature = "batch", feature = "durable"))]
+#[cfg(feature = "batch")]
 pub mod runner;
 pub mod schema;
 pub mod status;

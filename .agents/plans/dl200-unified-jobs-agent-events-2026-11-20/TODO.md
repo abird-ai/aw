@@ -7,9 +7,11 @@ Status: **R6 SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS**
 ## Committed
 
 - [x] `132bfd7` — published R1 DL-200 seal/implementation-plan baseline.
-- [ ] R6 plan-only simplifications and ongoing Phase-0 source changes are uncommitted.
-      No commit/push without separate authorization; Phase-0A focused evidence is historical,
-      not the R6 Process rename/dotlink convergence gate.
+- [x] `7c3800c` / `3191e62` — R6 sealed and current handoff published.
+- [~] Current AW R6 Phase-0 Process cut is **green but uncommitted**: Occupancy rename,
+      weak-Unix Unknown semantics, `aw-process`, and AW consumer extraction are complete.
+      Dotlink shared-runtime consumer/repin remains the Process convergence gate. No
+      commit/push without separate authorization.
 
 ## R6 design approval and real implementation queue
 
@@ -74,10 +76,11 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
 ## Tests and verification
 
 - [x] Design work performed on L5 only.
-- [x] Phase-0A AW shared Process facts are implemented and focused-checked in the
-      uncommitted working tree; Phase-0B source work from the parallel agent is preserved.
-- [x] DL-200 dotlink Phase-0 consumer/projection work has not begun; unrelated dotlink
-      source changes are not DL-200 implementation evidence.
+- [x] AW R6 Process cut is implemented and grouped-check green in the uncommitted working
+      tree: `Occupancy`, `aw-process`, weak-Unix Unknown, and AW adapter consumption.
+- [x] Phase-0B source checkpoint from the prior owner-hardening slice is preserved.
+- [x] DL-200 dotlink Phase-0 shared-Process consumer/projection work has not begun; published
+      dotlink replay hardening is not evidence of the Process cutover.
 - [x] No AW `.agents/plans/ux/**` content inspected or modified.
 - [x] Sandbox/mount/config-v13 implementation remains frozen.
 - [x] DL-200 R5 amendment/reseal recorded; R1–R4 retained as historical provenance.

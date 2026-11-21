@@ -1,14 +1,18 @@
-//! Host-owned process I/O service: no model tool, sandbox or second Agent.
-//! A trusted caller must authenticate grants and journal Process intent
-//! before spawn. Pipes and optional PTYs share lifecycle ownership.
+//! Host-owned Process adapter: no model tool, sandbox or second Agent.
+//! A trusted caller authenticates grants and journals Process intent before
+//! spawn. Pipe lifetimes delegate to aw-process; PTY Terminal custody remains
+//! a distinct aw-terminal resource.
+pub use aw_process::{
+    OutputPageError, OutputStream, ProcessOutputPage, ProcessSnapshot, StreamSnapshot,
+    CAPTURE_HEAD, CAPTURE_TAIL, MAX_PROCESS_PAGE_BYTES,
+};
 use aw_tools::{
     execution_stop::{
-        ExecutionEventSink, ExecutionLifecycleEvent, StopEvidence, StopReason as ProcessStopReason,
-        StopRecord,
+        ExecutionEventSink, StopEvidence, StopReason as ProcessStopReason, StopRecord,
     },
     filesystem::{
         job_manager::OutputWriter,
-        runner::{ProcessExit as RunnerExit, ProcessOutputMeta, ProcessTerminal, StopProof, Tree},
+        runner::{ProcessExit as RunnerExit, ProcessTerminal, StopProof},
     },
     task::{SpoolWriterLease, SpoolWriters, StreamSummary, TaskDisposition},
     task_fence::{FenceError, TaskFence, TaskIdentity, TaskTransition},
@@ -16,77 +20,33 @@ use aw_tools::{
     task_spool::{BoundedFileSpool, SessionQuota, SpoolError},
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     fs::File,
-    io,
     path::PathBuf,
-    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-    time::{sleep, timeout},
-};
+use tokio::process::Command;
 
-const CAPTURE_HEAD: usize = 48 * 1024;
-const CAPTURE_TAIL: usize = 64 * 1024;
-const MAX_STDIN_WRITE: usize = 64 * 1024;
-const REAP_DEADLINE: Duration = Duration::from_secs(2);
-const READER_DRAIN_DEADLINE: Duration = Duration::from_millis(600);
-const GRACEFUL_TERM: Duration = Duration::from_millis(350);
-const PROCESS_INPUT_QUEUE: usize = 16;
+#[cfg(test)]
+use aw_tools::{execution_stop::ExecutionLifecycleEvent, filesystem::runner::Occupancy};
 
-pub(crate) enum ProcessInputCommand {
-    Write {
-        bytes: Vec<u8>,
-        reply: oneshot::Sender<crate::Result<()>>,
-    },
-    Close {
-        reply: oneshot::Sender<crate::Result<()>>,
-    },
-}
-
-/// Cloneable control endpoint for the one runner that owns the PipeProcess.
-/// It never exposes a PID/ChildStdin and does not create another Process owner.
 #[derive(Clone)]
-pub(crate) struct ProcessInput {
-    tx: mpsc::Sender<ProcessInputCommand>,
-}
+pub(crate) struct ProcessInput(aw_process::ProcessInput);
 
 impl ProcessInput {
     pub async fn write(&self, bytes: Vec<u8>) -> crate::Result<()> {
-        if bytes.len() > MAX_STDIN_WRITE {
-            return Err(crate::Error::Limit("process input exceeds 64KiB"));
-        }
-        let (reply, result) = oneshot::channel();
-        self.tx
-            .send(ProcessInputCommand::Write { bytes, reply })
-            .await
-            .map_err(|_| crate::Error::Denied("process input is closed"))?;
-        result
-            .await
-            .map_err(|_| crate::Error::Transport("process input owner disappeared"))?
+        self.0.write(bytes).await.map_err(map_process_error)
     }
 
     pub async fn close(&self) -> crate::Result<()> {
-        let (reply, result) = oneshot::channel();
-        self.tx
-            .send(ProcessInputCommand::Close { reply })
-            .await
-            .map_err(|_| crate::Error::Denied("process input is closed"))?;
-        result
-            .await
-            .map_err(|_| crate::Error::Transport("process input owner disappeared"))?
+        self.0.close().await.map_err(map_process_error)
     }
 }
 
-pub(crate) fn process_input_channel() -> (ProcessInput, mpsc::Receiver<ProcessInputCommand>) {
-    let (tx, rx) = mpsc::channel(PROCESS_INPUT_QUEUE);
-    (ProcessInput { tx }, rx)
+pub(crate) fn process_input_channel() -> (ProcessInput, aw_process::ProcessInputReceiver) {
+    let (input, receiver) = aw_process::process_input_channel();
+    (ProcessInput(input), receiver)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,57 +98,6 @@ impl PipeSpec {
             ));
         }
         Ok(())
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StreamSnapshot {
-    /// First 48 KiB retained for coding-tool results.
-    pub head: Vec<u8>,
-    /// Last 64 KiB retained independently for background inspection.
-    pub tail: Vec<u8>,
-    pub total_bytes: u64,
-    pub truncated: bool,
-    pub closed: bool,
-    pub read_failed: bool,
-}
-#[derive(Default)]
-struct CaptureState {
-    head: Vec<u8>,
-    tail: VecDeque<u8>,
-    total: u64,
-    closed: bool,
-    read_failed: bool,
-}
-impl CaptureState {
-    fn append(&mut self, bytes: &[u8]) {
-        self.total = self.total.saturating_add(bytes.len() as u64);
-        let take = bytes
-            .len()
-            .min(CAPTURE_HEAD.saturating_sub(self.head.len()));
-        self.head.extend_from_slice(&bytes[..take]);
-        if bytes.len() >= CAPTURE_TAIL {
-            self.tail.clear();
-            self.tail
-                .extend(bytes[bytes.len() - CAPTURE_TAIL..].iter().copied());
-        } else {
-            let excess = self
-                .tail
-                .len()
-                .saturating_add(bytes.len())
-                .saturating_sub(CAPTURE_TAIL);
-            self.tail.drain(..excess);
-            self.tail.extend(bytes.iter().copied());
-        }
-    }
-    fn snapshot(&self) -> StreamSnapshot {
-        StreamSnapshot {
-            head: self.head.clone(),
-            tail: self.tail.iter().copied().collect(),
-            total_bytes: self.total,
-            truncated: self.total > self.head.len() as u64,
-            closed: self.closed,
-            read_failed: self.read_failed,
-        }
     }
 }
 /// The host opens uniquely-owned spool file capabilities before calling
@@ -512,287 +421,96 @@ impl HostTaskOperations for BoundProcessTaskHost<'_> {
     }
 }
 
-#[derive(Clone)]
-enum RetainedSink {
+enum RetainedSinkKind {
     Legacy(Arc<Mutex<BoundedFileSpool>>),
     Job(OutputWriter),
 }
+
+struct RetainedSink {
+    inner: RetainedSinkKind,
+    // The shared SpoolWriters gate remains an AW storage concern. Holding this
+    // lease through the shared sink worker keeps legacy spool readiness tied to
+    // the actual pipe-reader lifetime without teaching aw-process about spools.
+    _reader_lease: Option<SpoolWriterLease>,
+}
+
 impl RetainedSink {
-    fn discard_if_full(&self, seen: u64) -> Result<bool, ()> {
-        match self {
-            Self::Legacy(spool) => spool
+    fn legacy(spool: Arc<Mutex<BoundedFileSpool>>, lease: SpoolWriterLease) -> Self {
+        Self {
+            inner: RetainedSinkKind::Legacy(spool),
+            _reader_lease: Some(lease),
+        }
+    }
+
+    fn job(writer: OutputWriter) -> Self {
+        Self {
+            inner: RetainedSinkKind::Job(writer),
+            _reader_lease: None,
+        }
+    }
+}
+
+impl aw_process::OutputSink for RetainedSink {
+    fn discard_if_full(&mut self, seen: u64) -> Result<bool, aw_process::SinkError> {
+        match &self.inner {
+            RetainedSinkKind::Legacy(spool) => spool
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .discard_if_full(seen)
-                .map_err(|_| ()),
-            Self::Job(writer) => writer.discard_if_full(seen).map_err(|_| ()),
+                .map_err(|_| aw_process::SinkError),
+            RetainedSinkKind::Job(writer) => writer
+                .discard_if_full(seen)
+                .map_err(|_| aw_process::SinkError),
         }
     }
 
-    fn append(&self, bytes: &[u8]) -> Result<usize, ()> {
-        match self {
-            Self::Legacy(spool) => spool
+    fn append(&mut self, bytes: &[u8]) -> Result<usize, aw_process::SinkError> {
+        match &self.inner {
+            RetainedSinkKind::Legacy(spool) => spool
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .append(bytes)
-                .map_err(|_| ()),
-            Self::Job(writer) => writer.append(bytes).map_err(|_| ()),
+                .map_err(|_| aw_process::SinkError),
+            RetainedSinkKind::Job(writer) => {
+                writer.append(bytes).map_err(|_| aw_process::SinkError)
+            }
         }
     }
 
-    fn observe_after_failure(&self, seen: u64) -> Result<(), ()> {
-        match self {
-            Self::Legacy(spool) => spool
+    fn observe_after_failure(&mut self, seen: u64) -> Result<(), aw_process::SinkError> {
+        match &self.inner {
+            RetainedSinkKind::Legacy(spool) => spool
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .observe_after_failure(seen)
-                .map_err(|_| ()),
-            Self::Job(writer) => writer.observe_after_failure(seen).map_err(|_| ()),
+                .map_err(|_| aw_process::SinkError),
+            RetainedSinkKind::Job(writer) => writer
+                .observe_after_failure(seen)
+                .map_err(|_| aw_process::SinkError),
         }
     }
 
-    fn mark_failed(&self) {
-        match self {
-            Self::Legacy(spool) => spool
+    fn mark_failed(&mut self) {
+        match &self.inner {
+            RetainedSinkKind::Legacy(spool) => spool
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .mark_writer_failed(),
-            Self::Job(writer) => {
+            RetainedSinkKind::Job(writer) => {
                 let _ = writer.mark_failed();
             }
         }
     }
 
-    fn finish(&self) -> Result<(), ()> {
-        match self {
-            Self::Legacy(spool) => spool
+    fn finish(&mut self) -> Result<(), aw_process::SinkError> {
+        match &self.inner {
+            RetainedSinkKind::Legacy(spool) => spool
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .finish_writer()
-                .map_err(|_| ()),
-            Self::Job(writer) => writer.finish().map_err(|_| ()),
+                .map_err(|_| aw_process::SinkError),
+            RetainedSinkKind::Job(writer) => writer.finish().map_err(|_| aw_process::SinkError),
         }
-    }
-}
-
-#[derive(Clone)]
-struct Reader {
-    state: Arc<Mutex<CaptureState>>,
-}
-impl Reader {
-    fn snapshot(&self) -> StreamSnapshot {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .snapshot()
-    }
-    fn start<R: AsyncRead + Unpin + Send + 'static>(
-        input: R,
-        writer_lease: SpoolWriterLease,
-        spool: Option<RetainedSink>,
-    ) -> (Self, JoinHandle<()>) {
-        const PIPE_BUFFER: usize = 16 * 1024;
-        const SPOOL_BATCH: usize = 64 * 1024;
-        const SPOOL_QUEUE: usize = 4;
-        let state = Arc::new(Mutex::new(CaptureState::default()));
-        let shared = state.clone();
-        let task = tokio::spawn(async move {
-            let _lease = writer_lease;
-            let mut input = input;
-            let (mut sender, writer) = if let Some(spool) = spool {
-                // One fixed blocking writer per stream, bounded in-flight
-                // buffering; no per-chunk worker spawning.
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(SPOOL_QUEUE);
-                let worker = tokio::task::spawn_blocking(move || -> Result<(), SpoolError> {
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut failed = false;
-                        while let Some(chunk) = rx.blocking_recv() {
-                            let result = if failed {
-                                spool.observe_after_failure(chunk.len() as u64).map(|_| 0)
-                            } else {
-                                match spool.discard_if_full(chunk.len() as u64) {
-                                    Ok(true) => Ok(0),
-                                    Ok(false) => spool.append(&chunk),
-                                    Err(()) => Err(()),
-                                }
-                            };
-                            if result.is_err() {
-                                failed = true;
-                            }
-                        }
-                        failed
-                    }));
-                    // A panicking writer cannot leave its output writer open.
-                    // Mark failure and finish regardless of producer outcome.
-                    let failed = outcome.unwrap_or(true);
-                    if failed {
-                        spool.mark_failed();
-                    }
-                    let sync = spool.finish();
-                    if failed {
-                        return Err(SpoolError::WriteFailed);
-                    }
-                    sync.map_err(|_| SpoolError::WriteFailed)
-                });
-                (Some(tx), Some(worker))
-            } else {
-                (None, None)
-            };
-            // Foreground Process without durable spooling pays no extra
-            // batch allocation; the queue exists only in the opt-in path.
-            let mut batch = if sender.is_some() {
-                Vec::with_capacity(SPOOL_BATCH)
-            } else {
-                Vec::new()
-            };
-            let mut buffer = [0u8; PIPE_BUFFER];
-            let mut failed = loop {
-                match input.read(&mut buffer).await {
-                    Ok(0) => break false,
-                    Ok(n) => {
-                        shared
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .append(&buffer[..n]);
-                        if let Some(ref tx) = sender {
-                            batch.extend_from_slice(&buffer[..n]);
-                            if batch.len() >= SPOOL_BATCH {
-                                let full =
-                                    std::mem::replace(&mut batch, Vec::with_capacity(SPOOL_BATCH));
-                                if tx.send(full).await.is_err() {
-                                    sender = None;
-                                    break true;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break true,
-                }
-            };
-            if let Some(tx) = sender {
-                if !batch.is_empty() && tx.send(batch).await.is_err() {
-                    failed = true;
-                }
-            }
-            if let Some(worker) = writer {
-                if !matches!(worker.await, Ok(Ok(()))) {
-                    failed = true;
-                }
-            }
-            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-            state.closed = true;
-            state.read_failed = failed;
-        });
-        (Self { state }, task)
-    }
-}
-/// A bounded, exact byte-range read from the existing host-owned capture.
-/// Unlike a durable disk spool, the head/tail ring may contain an unavailable
-/// middle range. No page is invented or silently rewound across that gap.
-pub const MAX_PROCESS_PAGE_BYTES: usize = 48 * 1024;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutputStream {
-    Stdout,
-    Stderr,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcessOutputPage {
-    pub offset: u64,
-    pub next_offset: u64,
-    pub total_bytes: u64,
-    pub data: Vec<u8>,
-    /// Unrecoverable captured-output gap, if the head and tail don't meet.
-    pub missing_range: Option<(u64, u64)>,
-    pub stream_closed: bool,
-    pub read_failed: bool,
-    pub at_eof: bool,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutputPageError {
-    InvalidLimit,
-    PastEnd,
-    Gap { start: u64, end: u64 },
-}
-impl StreamSnapshot {
-    fn retained_gap(&self) -> Option<(u64, u64)> {
-        let head = self.head.len() as u64;
-        let start = self.total_bytes.saturating_sub(self.tail.len() as u64);
-        if head < start {
-            Some((head, start))
-        } else {
-            None
-        }
-    }
-    /// Returns only original bytes; reads never cross a missing middle.
-    pub fn page(&self, offset: u64, limit: usize) -> Result<ProcessOutputPage, OutputPageError> {
-        if limit == 0 || limit > MAX_PROCESS_PAGE_BYTES {
-            return Err(OutputPageError::InvalidLimit);
-        }
-        if offset > self.total_bytes {
-            return Err(OutputPageError::PastEnd);
-        }
-        let gap = self.retained_gap();
-        if let Some((start, end)) = gap {
-            if (start..end).contains(&offset) {
-                return Err(OutputPageError::Gap { start, end });
-            }
-        }
-        let target_end = self.total_bytes.min(offset.saturating_add(limit as u64));
-        let end = gap.map_or(target_end, |(start, _)| {
-            if offset < start {
-                target_end.min(start)
-            } else {
-                target_end
-            }
-        });
-        let mut data = Vec::with_capacity((end - offset) as usize);
-        let head_end = self.head.len() as u64;
-        if offset < head_end {
-            let next = end.min(head_end);
-            data.extend_from_slice(&self.head[offset as usize..next as usize]);
-        }
-        let suffix_start = self.total_bytes.saturating_sub(self.tail.len() as u64);
-        let tail_from = offset.max(head_end).max(suffix_start);
-        if tail_from < end {
-            let begin = (tail_from - suffix_start) as usize;
-            let len = (end - tail_from) as usize;
-            data.extend_from_slice(&self.tail[begin..begin + len]);
-        }
-        debug_assert_eq!(data.len(), (end - offset) as usize);
-        Ok(ProcessOutputPage {
-            offset,
-            next_offset: end,
-            total_bytes: self.total_bytes,
-            data,
-            missing_range: gap,
-            stream_closed: self.closed,
-            read_failed: self.read_failed,
-            at_eof: end == self.total_bytes,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcessSnapshot {
-    pub pid: u32,
-    pub stdout: StreamSnapshot,
-    pub stderr: StreamSnapshot,
-}
-impl ProcessSnapshot {
-    pub fn output(&self, stream: OutputStream) -> &StreamSnapshot {
-        match stream {
-            OutputStream::Stdout => &self.stdout,
-            OutputStream::Stderr => &self.stderr,
-        }
-    }
-    pub fn page(
-        &self,
-        stream: OutputStream,
-        offset: u64,
-        limit: usize,
-    ) -> Result<ProcessOutputPage, OutputPageError> {
-        self.output(stream).page(offset, limit)
     }
 }
 
@@ -861,31 +579,10 @@ pub struct ProcessReceipt {
     pub spools: Option<ProcessSpoolAccess>,
 }
 impl ProcessReceipt {
-    fn new(
-        exit: RunnerExit,
-        stop: Option<StopRecord>,
-        tree: Tree,
-        output: ProcessSnapshot,
-        stdout_complete: bool,
-        stderr_complete: bool,
-        spools: Option<ProcessSpoolAccess>,
-    ) -> Self {
-        let terminal = ProcessTerminal {
-            exit,
-            stop,
-            tree,
-            output: ProcessOutputMeta {
-                stdout_bytes: output.stdout.total_bytes,
-                stderr_bytes: output.stderr.total_bytes,
-                stdout_truncated: output.stdout.truncated,
-                stderr_truncated: output.stderr.truncated,
-                stdout_complete,
-                stderr_complete,
-            },
-        };
+    fn from_runtime(result: aw_process::ProcessResult, spools: Option<ProcessSpoolAccess>) -> Self {
         Self {
-            terminal,
-            output,
+            terminal: result.terminal,
+            output: result.output,
             spools,
         }
     }
@@ -956,108 +653,30 @@ enum SpawnOutputTarget {
     },
 }
 
-fn platform_stop_evidence(result: io::Result<bool>) -> StopEvidence {
-    match result {
-        Ok(true) => StopEvidence::Stopped,
-        Ok(false) => StopEvidence::NoTarget,
-        Err(_) => StopEvidence::Unknown,
-    }
+struct RuntimeOutput {
+    spools: Option<ProcessSpoolAccess>,
+    stdout: Option<Box<dyn aw_process::OutputSink>>,
+    stderr: Option<Box<dyn aw_process::OutputSink>>,
 }
 
-fn platform_tree(result: io::Result<bool>) -> Tree {
-    match result {
-        Ok(true) => Tree::Live,
-        Ok(false) => Tree::Empty,
-        Err(_) => Tree::Unknown,
-    }
-}
-
-/// Private lifetime owner for one Process execution scope.
-///
-/// `PipeProcess` owns I/O and semantic receipts; `Scope` alone owns the main
-/// child and platform containment identity.
-struct Scope {
-    platform: aw_platform::DirectScope,
-    child: Child,
-    pid: u32,
-}
-
-impl Scope {
-    fn new(platform: aw_platform::DirectScope, child: Child, pid: u32) -> Self {
-        Self {
-            platform,
-            child,
-            pid,
+fn map_process_error(error: aw_process::Error) -> crate::Error {
+    match error {
+        aw_process::Error::Io(error) => crate::Error::Io(error),
+        aw_process::Error::SetupUncertain(message) | aw_process::Error::OwnerGone(message) => {
+            crate::Error::Transport(message)
         }
-    }
-
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    fn ready(&self) -> io::Result<bool> {
-        self.platform.ready()
-    }
-
-    #[cfg(unix)]
-    async fn wait_ready(&self) -> io::Result<()> {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        // SIGCHLD is only a wake hint. The scope's stable leader identity is
-        // the authoritative non-consuming readiness fact.
-        let mut changes = signal(SignalKind::child())?;
-        while !self.platform.ready()? {
-            changes.recv().await.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "SIGCHLD stream closed")
-            })?;
-        }
-        Ok(())
-    }
-
-    fn observe(&self) -> Tree {
-        platform_tree(self.platform.observe())
-    }
-
-    fn graceful(&self) -> StopEvidence {
-        platform_stop_evidence(self.platform.graceful())
-    }
-
-    fn terminate(&mut self) -> StopEvidence {
-        platform_stop_evidence(self.platform.terminate())
-    }
-
-    fn kill_main(&mut self) {
-        let _ = self.child.start_kill();
-    }
-
-    async fn reap(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
-    }
-}
-
-impl Drop for Scope {
-    fn drop(&mut self) {
-        let _ = self.terminate();
-        self.kill_main();
+        aw_process::Error::Limit(message) => crate::Error::Limit(message),
+        aw_process::Error::InputClosed(message) => crate::Error::Denied(message),
+        aw_process::Error::Conflict(message) => crate::Error::Conflict(message),
+        aw_process::Error::Timeout => crate::Error::Timeout,
     }
 }
 
 pub struct PipeProcess {
-    scope: Scope,
-    stdin: Option<ChildStdin>,
-    stdout: Reader,
-    stderr: Reader,
-    readers: Vec<JoinHandle<()>>,
-    /// Host-owned output lifetime; no independent job or task ledger.
-    spool_writers: Arc<SpoolWriters>,
+    process: aw_process::Process,
     spools: Option<ProcessSpoolAccess>,
-    /// Fenced original OS termination attempt. A second attempt on this
-    /// live host-owned PipeProcess is always refused, even after an unknown
-    /// Process exit or a cancelled caller; never silently resend a signal.
-    termination_attempted: bool,
-    stop_state: aw_tools::execution_stop::StopTracker,
-    event_sink: Option<Arc<dyn ExecutionEventSink>>,
 }
+
 impl PipeProcess {
     pub async fn spawn(spec: PipeSpec) -> crate::Result<Self> {
         Self::spawn_inner(spec, SpawnOutputTarget::None, None).await
@@ -1069,8 +688,7 @@ impl PipeProcess {
     ) -> crate::Result<Self> {
         Self::spawn_inner(spec, SpawnOutputTarget::None, Some(event_sink)).await
     }
-    /// Opt-in host-authorized durable spooling. Host constructs handles and
-    /// journals Process intent; no new background task or model grant.
+
     pub async fn spawn_with_host_spools(
         spec: PipeSpec,
         files: HostSpoolFiles,
@@ -1078,9 +696,6 @@ impl PipeProcess {
         Self::spawn_inner(spec, SpawnOutputTarget::Legacy(files), None).await
     }
 
-    /// V2 Job/ShellNode path: stdout/stderr writers are already admitted by
-    /// the shared JobManager before process launch. The same process reader
-    /// loop feeds them; paging/ACK ownership stays in JobManager.
     pub async fn spawn_with_job_outputs(
         spec: PipeSpec,
         stdout: OutputWriter,
@@ -1109,12 +724,11 @@ impl PipeProcess {
         event_sink: Option<Arc<dyn ExecutionEventSink>>,
     ) -> crate::Result<Self> {
         spec.validate()?;
-        let spool_writers = Arc::new(SpoolWriters::default());
-        // Validate/reserve output capabilities before external spawn.
-        let (spools, stdout_sink, stderr_sink) = match target {
+
+        // Validate/reserve product-owned output capabilities before external
+        // spawn. Only the tiny OutputSink adapter crosses into aw-process.
+        let output = match target {
             SpawnOutputTarget::Legacy(files) => {
-                // Do not launch a child with an already-poisoned accounting
-                // owner; a later poison becomes a durable output failure.
                 {
                     let _quota_check = files.session_quota.lock().map_err(|_| {
                         crate::Error::Denied(
@@ -1122,8 +736,6 @@ impl PipeProcess {
                         )
                     })?;
                 }
-                // Shared descriptor identity is stable on Unix and Windows.
-                // Verify link count and R/W access before spawning a child.
                 let a = aw_tools::task_spool::spool_file_identity(&files.stdout)
                     .map_err(|_| crate::Error::Denied("invalid host stdout spool"))?;
                 let b = aw_tools::task_spool::spool_file_identity(&files.stderr)
@@ -1133,6 +745,8 @@ impl PipeProcess {
                         "stdout and stderr require distinct spool files",
                     ));
                 }
+
+                let spool_writers = Arc::new(SpoolWriters::default());
                 let out = BoundedFileSpool::new(
                     files.stdout,
                     files.session_quota.clone(),
@@ -1142,432 +756,120 @@ impl PipeProcess {
                 let err =
                     BoundedFileSpool::new(files.stderr, files.session_quota, spool_writers.clone())
                         .map_err(|_| crate::Error::Denied("invalid host stderr spool"))?;
+                let Some([out_lease, err_lease]) = spool_writers.begin::<2>() else {
+                    return Err(crate::Error::Denied(
+                        "host spool writers are already sealed",
+                    ));
+                };
+                // All legitimate writer/reader leases are now reserved. No
+                // Process path may register a writer after external spawn.
+                spool_writers.seal();
+
                 let stdout = Arc::new(Mutex::new(out));
                 let stderr = Arc::new(Mutex::new(err));
                 let access = ProcessSpoolAccess {
                     stdout: stdout.clone(),
                     stderr: stderr.clone(),
                 };
-                (
-                    Some(access),
-                    Some(RetainedSink::Legacy(stdout)),
-                    Some(RetainedSink::Legacy(stderr)),
-                )
-            }
-            SpawnOutputTarget::Job { stdout, stderr } => (
-                None,
-                Some(RetainedSink::Job(stdout)),
-                Some(RetainedSink::Job(stderr)),
-            ),
-            SpawnOutputTarget::None => (None, None, None),
-        };
-        // Only trusted host config sets these values. The existing Agent
-        // journals and revalidates Process grants before calling this port.
-        let mut cmd = Command::new(spec.program);
-        cmd.args(spec.args)
-            .current_dir(spec.root)
-            .env_clear()
-            .stdin(if spec.stdin_open {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        for (key, value) in spec.env {
-            cmd.env(key, value);
-        }
-        #[cfg(unix)]
-        aw_platform::configure_child_group(cmd.as_std_mut());
-        #[cfg(windows)]
-        aw_platform::configure_managed_process(cmd.as_std_mut());
-        let mut child = cmd.spawn().map_err(crate::Error::Io)?;
-        // From this point onward a real external process may already have run.
-        // Any host setup failure is therefore ambiguous for arbitrary side
-        // effects: kill best-effort, but never report an ordinary launch fail.
-        let Some(pid) = child.id() else {
-            let _ = child.start_kill();
-            return Err(crate::Error::Transport(
-                "process launched but PID/setup outcome is uncertain",
-            ));
-        };
-        #[cfg(unix)]
-        let mut platform = match aw_platform::DirectScope::attach(pid) {
-            Ok(scope) => scope,
-            Err(_) => {
-                let _ = child.start_kill();
-                return Err(crate::Error::Transport(
-                    "process launched but Process scope setup is uncertain",
-                ));
-            }
-        };
-        #[cfg(windows)]
-        let mut platform = {
-            let Some(handle) = child.raw_handle() else {
-                let _ = child.start_kill();
-                return Err(crate::Error::Transport(
-                    "process launched but Windows handle/setup outcome is uncertain",
-                ));
-            };
-            match aw_platform::DirectScope::attach(pid, handle) {
-                Ok(scope) => scope,
-                Err(_) => {
-                    let _ = child.start_kill();
-                    return Err(crate::Error::Transport(
-                        "process launched but Windows Process scope setup is uncertain",
-                    ));
+                RuntimeOutput {
+                    spools: Some(access),
+                    stdout: Some(Box::new(RetainedSink::legacy(stdout, out_lease))),
+                    stderr: Some(Box::new(RetainedSink::legacy(stderr, err_lease))),
                 }
             }
+            SpawnOutputTarget::Job { stdout, stderr } => RuntimeOutput {
+                spools: None,
+                stdout: Some(Box::new(RetainedSink::job(stdout))),
+                stderr: Some(Box::new(RetainedSink::job(stderr))),
+            },
+            SpawnOutputTarget::None => RuntimeOutput {
+                spools: None,
+                stdout: None,
+                stderr: None,
+            },
         };
-        let Some(stdout) = child.stdout.take() else {
-            let _ = platform.terminate();
-            let _ = child.start_kill();
-            return Err(crate::Error::Transport(
-                "process launched but stdout setup outcome is uncertain",
-            ));
-        };
-        let Some(stderr) = child.stderr.take() else {
-            let _ = platform.terminate();
-            let _ = child.start_kill();
-            return Err(crate::Error::Transport(
-                "process launched but stderr setup outcome is uncertain",
-            ));
-        };
-        let stdin = child.stdin.take();
-        let Some([out_lease, err_lease]) = spool_writers.begin::<2>() else {
-            let _ = platform.terminate();
-            let _ = child.start_kill();
-            return Err(crate::Error::Transport(
-                "process launched but output-reader setup outcome is uncertain",
-            ));
-        };
-        let (out, out_task) = Reader::start(stdout, out_lease, stdout_sink);
-        let (err, err_task) = Reader::start(stderr, err_lease, stderr_sink);
+
+        // The host chooses and authorizes executable/root/arguments/environment.
+        // Lifecycle-sensitive stdio/containment/spawn is finalized by aw-process.
+        let mut command = Command::new(spec.program);
+        command.args(spec.args).current_dir(spec.root).env_clear();
+        for (key, value) in spec.env {
+            command.env(key, value);
+        }
+
+        let process = aw_process::Process::spawn(
+            command,
+            aw_process::SpawnOptions {
+                stdin_open: spec.stdin_open,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                event_sink,
+            },
+        )
+        .map_err(map_process_error)?;
+
         Ok(Self {
-            scope: Scope::new(platform, child, pid),
-            stdin,
-            stdout: out,
-            stderr: err,
-            readers: vec![out_task, err_task],
-            spool_writers,
-            spools,
-            termination_attempted: false,
-            stop_state: aw_tools::execution_stop::StopTracker::default(),
-            event_sink,
+            process,
+            spools: output.spools,
         })
     }
+
     pub fn mode(&self) -> ProcessMode {
         ProcessMode::Pipes
     }
+
     pub fn snapshot(&self) -> ProcessSnapshot {
-        ProcessSnapshot {
-            pid: self.scope.pid(),
-            stdout: self.stdout.snapshot(),
-            stderr: self.stderr.snapshot(),
-        }
+        self.process.snapshot()
     }
-    /// Stdin write is itself an external effect. Only the current owner,
-    /// having journaled this separate operation, may call it; no replay.
+
     pub async fn write(&mut self, bytes: &[u8]) -> crate::Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        if bytes.len() > MAX_STDIN_WRITE {
-            return Err(crate::Error::Limit("process input too large"));
-        }
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or(crate::Error::Denied("stdin not open"))?;
-        timeout(Duration::from_secs(2), async {
-            stdin.write_all(bytes).await?;
-            stdin.flush().await
-        })
-        .await
-        .map_err(|_| crate::Error::Timeout)??;
-        Ok(())
+        self.process.write(bytes).await.map_err(map_process_error)
     }
-    /// Inert snapshot of the existing original PipeProcess input state.
-    /// It is not a subprocess capability or a guarantee of peer acceptance.
+
     pub fn stdin_open(&self) -> bool {
-        self.stdin.is_some()
+        self.process.stdin_open()
     }
+
     pub fn close_stdin(&mut self) {
-        self.stdin.take();
-    }
-    async fn drain_output(&mut self) -> (bool, bool) {
-        // No new reader may enter once terminal output settlement begins.
-        // Await actual reader completion: cancellation of a future alone is
-        // not evidence that its in-flight read/append stopped.
-        self.spool_writers.seal();
-        for task in &mut self.readers {
-            match timeout(READER_DRAIN_DEADLINE, &mut *task).await {
-                Ok(Ok(())) => {}
-                _ => {
-                    task.abort();
-                    // Poll the abort to completion; if even cancellation
-                    // cannot quiesce the reader, preserve an incomplete result.
-                    let _ = timeout(READER_DRAIN_DEADLINE, &mut *task).await;
-                }
-            }
-        }
-        let snapshot = self.snapshot();
-        let writers_idle = self.spool_writers.is_idle();
-        (
-            writers_idle && snapshot.stdout.closed && !snapshot.stdout.read_failed,
-            writers_idle && snapshot.stderr.closed && !snapshot.stderr.read_failed,
-        )
-    }
-    fn record_stop(
-        &mut self,
-        reason: Option<ProcessStopReason>,
-        evidence: StopEvidence,
-    ) -> StopRecord {
-        let record = self.stop_state.record(reason, evidence);
-        if let Some(sink) = &self.event_sink {
-            sink.record(ExecutionLifecycleEvent::ProcessStop { record });
-        }
-        record
+        self.process.close_stdin();
     }
 
-    fn stop_scope(&mut self, reason: Option<ProcessStopReason>) -> StopRecord {
-        let evidence = self.scope.terminate();
-        self.record_stop(reason, evidence)
+    pub fn termination_available(&self) -> crate::Result<bool> {
+        self.process
+            .termination_available()
+            .map_err(map_process_error)
     }
 
-    #[cfg(unix)]
-    async fn settle_natural_exit(
-        &mut self,
-    ) -> crate::Result<(RunnerExit, Option<StopRecord>, Tree)> {
-        self.scope.wait_ready().await.map_err(crate::Error::Io)?;
-        let tree = self.scope.observe();
-        let cleanup = self.stop_scope(None);
-        let status = self.scope.reap().await.map_err(crate::Error::Io)?;
-        Ok((Self::exit_fact(status), Some(cleanup), tree))
-    }
-
-    #[cfg(windows)]
-    async fn settle_natural_exit(
-        &mut self,
-    ) -> crate::Result<(RunnerExit, Option<StopRecord>, Tree)> {
-        // Job Object identity survives reaping the leader, so Windows can reap
-        // first and still observe/settle the exact remaining scope.
-        let status = self.scope.reap().await.map_err(crate::Error::Io)?;
-        let tree = self.scope.observe();
-        let cleanup = self.stop_scope(None);
-        Ok((Self::exit_fact(status), Some(cleanup), tree))
-    }
-
-    async fn stop(&mut self, reason: ProcessStopReason) -> (StopRecord, RunnerExit, Tree) {
-        self.termination_attempted = true;
-        self.stdin.take();
-
-        // Preserve graceful shutdown where supported, but never reap the Unix
-        // group leader before observing/settling remaining members.
-        let graceful = self.scope.graceful();
-        let graceful_record = self.record_stop(Some(reason), graceful);
-
-        #[cfg(unix)]
-        if graceful != StopEvidence::Unknown
-            && matches!(
-                timeout(GRACEFUL_TERM, self.scope.wait_ready()).await,
-                Ok(Ok(()))
-            )
-        {
-            let tree = self.scope.observe();
-            let cleanup = self.stop_scope(None);
-            let exit = match timeout(REAP_DEADLINE, self.scope.reap()).await {
-                Ok(Ok(status)) => Self::exit_fact(status),
-                _ => RunnerExit::Unknown,
-            };
-            let record = if cleanup.evidence == StopEvidence::Unknown {
-                StopRecord::new(reason, StopEvidence::Unknown)
-            } else {
-                graceful_record
-            };
-            return (record, exit, tree);
-        }
-
-        // Windows graceful process-group signaling is unsupported today. Keep
-        // the platform branch explicit rather than inventing a pseudo-grace.
-        #[cfg(windows)]
-        let _ = graceful;
-
-        let record = self.stop_scope(Some(reason));
-        self.scope.kill_main();
-        let exit = match timeout(REAP_DEADLINE, self.scope.reap()).await {
-            Ok(Ok(status)) => Self::exit_fact(status),
-            _ => RunnerExit::Unknown,
-        };
-        (record, exit, Tree::Unknown)
-    }
-    /// AW-P6-9D2B2B1: Only the already-authorized owning HOST may expose
-    /// this to an individually grant-fenced and journaled model Tool. The
-    /// original PipeProcess performs the same bounded stop/group cleanup as
-    /// the original timeout/cancellation path. A subsequent attempt is denied
-    /// even if a previous OS signal or output drain returned Unknown.
-    /// This does NOT allow a model to choose a PID/program/process group.
-    pub fn termination_available(&mut self) -> crate::Result<bool> {
-        if self.termination_attempted {
-            return Ok(false);
-        }
-        self.scope
-            .ready()
-            .map(|ready| !ready)
-            .map_err(crate::Error::Io)
-    }
     pub async fn terminate(&mut self) -> crate::Result<ProcessReceipt> {
-        if !self.termination_available()? {
-            return Err(crate::Error::Conflict(
-                "Process already exited or had a termination attempt; inspect original receipt",
-            ));
-        }
-        // stop() fences the attempt before the first possible OS signal.
-        let (record, exit, tree) = self.stop(ProcessStopReason::Cancelled).await;
-        let (stdout_complete, stderr_complete) = self.drain_output().await;
-        Ok(ProcessReceipt::new(
-            exit,
-            Some(record),
-            tree,
-            self.snapshot(),
-            stdout_complete,
-            stderr_complete,
-            self.spools.clone(),
-        ))
+        let result = self.process.terminate().await.map_err(map_process_error)?;
+        Ok(ProcessReceipt::from_runtime(result, self.spools.clone()))
     }
 
-    /// Caller retains the resource across model steps if needed. Output drains
-    /// while no one polls the process. Unknown effects never auto-replay.
     pub async fn wait<C: core::future::Future<Output = ()>>(
-        mut self,
+        self,
         cancellation: C,
         deadline: Duration,
     ) -> ProcessReceipt {
-        let (exit, stop_record, tree) = tokio::select! {
-            biased;
-            _ = cancellation => {
-                let (record, exit, tree) = self.stop(ProcessStopReason::Cancelled).await;
-                (exit, Some(record), tree)
-            },
-            result = timeout(deadline, self.settle_natural_exit()) => match result {
-                Ok(Ok(settled)) => settled,
-                Ok(Err(_)) => {
-                    let (record, exit, tree) = self.stop(ProcessStopReason::RuntimeError).await;
-                    (exit, Some(record), tree)
-                }
-                Err(_) => {
-                    let (record, exit, tree) = self.stop(ProcessStopReason::Timeout).await;
-                    (exit, Some(record), tree)
-                }
-            },
-        };
-        let (stdout_complete, stderr_complete) = self.drain_output().await;
-        ProcessReceipt::new(
-            exit,
-            stop_record,
-            tree,
-            self.snapshot(),
-            stdout_complete,
-            stderr_complete,
-            self.spools.clone(),
-        )
+        let Self { process, spools } = self;
+        ProcessReceipt::from_runtime(process.wait(cancellation, deadline).await, spools)
     }
 
-    /// Interactive wait. The same runner retains sole custody of ChildStdin
-    /// and serializes every bounded write/close request.
     pub(crate) async fn wait_interactive<C: core::future::Future<Output = ()>>(
-        mut self,
+        self,
         cancellation: C,
         deadline: Duration,
-        mut input: mpsc::Receiver<ProcessInputCommand>,
+        input: aw_process::ProcessInputReceiver,
     ) -> ProcessReceipt {
-        let cancellation = cancellation;
-        tokio::pin!(cancellation);
-        let deadline = sleep(deadline);
-        tokio::pin!(deadline);
-        let (exit, stop_record, tree) = loop {
-            tokio::select! {
-                biased;
-                _ = &mut cancellation => {
-                    let (record, exit, tree) = self.stop(ProcessStopReason::Cancelled).await;
-                    break (exit, Some(record), tree);
-                }
-                _ = &mut deadline => {
-                    let (record, exit, tree) = self.stop(ProcessStopReason::Timeout).await;
-                    break (exit, Some(record), tree);
-                }
-                command = input.recv() => {
-                    let Some(command) = command else {
-                        self.close_stdin();
-                        continue;
-                    };
-                    match command {
-                        ProcessInputCommand::Write { bytes, reply } => {
-                            let _ = reply.send(self.write(&bytes).await);
-                        }
-                        ProcessInputCommand::Close { reply } => {
-                            if self.stdin_open() {
-                                self.close_stdin();
-                                let _ = reply.send(Ok(()));
-                            } else {
-                                let _ = reply.send(Err(crate::Error::Denied("process input is closed")));
-                            }
-                        }
-                    }
-                }
-                result = self.settle_natural_exit() => {
-                    break match result {
-                        Ok(settled) => settled,
-                        Err(_) => {
-                            let (record, exit, tree) =
-                                self.stop(ProcessStopReason::RuntimeError).await;
-                            (exit, Some(record), tree)
-                        }
-                    };
-                }
-            }
-        };
-        input.close();
-        while let Ok(command) = input.try_recv() {
-            match command {
-                ProcessInputCommand::Write { reply, .. } | ProcessInputCommand::Close { reply } => {
-                    let _ = reply.send(Err(crate::Error::Denied("process input is closed")));
-                }
-            }
-        }
-        self.close_stdin();
-        let (stdout_complete, stderr_complete) = self.drain_output().await;
-        ProcessReceipt::new(
-            exit,
-            stop_record,
-            tree,
-            self.snapshot(),
-            stdout_complete,
-            stderr_complete,
-            self.spools.clone(),
+        let Self { process, spools } = self;
+        ProcessReceipt::from_runtime(
+            process
+                .wait_interactive(cancellation, deadline, input)
+                .await,
+            spools,
         )
     }
+}
 
-    fn exit_fact(status: ExitStatus) -> RunnerExit {
-        if let Some(code) = status.code() {
-            return RunnerExit::Code(code);
-        }
-        if let Some(signal) = aw_platform::exit_signal(&status) {
-            return RunnerExit::Signal(signal);
-        }
-        RunnerExit::Unknown
-    }
-}
-impl Drop for PipeProcess {
-    fn drop(&mut self) {
-        self.spool_writers.seal();
-        for task in &self.readers {
-            task.abort();
-        }
-        // Scope owns final process-lifetime cleanup and drops after this body.
-    }
-}
 #[cfg(feature = "pty")]
 pub struct PtyProcess {
     terminal: aw_terminal::Terminal,
@@ -1657,7 +959,10 @@ mod tests {
             .unwrap();
         let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
         assert_eq!(receipt.runner_terminal().exit, RunnerExit::Signal(9));
-        assert_eq!(receipt.runner_terminal().tree, Tree::Empty);
+        #[cfg(unix)]
+        assert_eq!(receipt.runner_terminal().occupancy, Occupancy::Unknown);
+        #[cfg(windows)]
+        assert_eq!(receipt.runner_terminal().occupancy, Occupancy::Empty);
         assert_eq!(
             receipt
                 .runner_terminal()
@@ -2498,31 +1803,6 @@ mod tests {
         let _ = std::fs::remove_file(err_path);
     }
     #[tokio::test]
-    async fn process_writer_leases_seal_and_quiesce_before_terminal_receipt() {
-        let process = PipeProcess::spawn(spec("printf first; sleep 0.02; printf second >&2"))
-            .await
-            .unwrap();
-        let writer_gate = process.spool_writers.clone();
-        assert!(!writer_gate.is_sealed());
-        assert!(!writer_gate.is_idle());
-        let receipt = process.wait(pending::<()>(), Duration::from_secs(3)).await;
-        assert!(receipt.finished());
-        assert!(writer_gate.is_sealed());
-        assert!(writer_gate.is_idle());
-        assert!(
-            writer_gate.begin::<1>().is_none(),
-            "late writer cannot publish into a terminal Process snapshot"
-        );
-    }
-    #[tokio::test]
-    async fn dropped_process_seals_registration_without_claiming_terminal_output() {
-        let process = PipeProcess::spawn(spec("sleep 2")).await.unwrap();
-        let writer_gate = process.spool_writers.clone();
-        drop(process);
-        assert!(writer_gate.is_sealed());
-        assert!(writer_gate.begin::<1>().is_none());
-    }
-    #[tokio::test]
     async fn process_spawns_drains_and_receipts_exit() {
         let p = PipeProcess::spawn(spec("printf hello; sleep 0.05; printf tail >&2"))
             .await
@@ -2704,7 +1984,7 @@ mod tests {
         let resource = PipeProcess::spawn(launch).await.unwrap();
         let receipt = resource.wait(pending::<()>(), Duration::from_secs(4)).await;
         assert_eq!(receipt.outcome(), Outcome::Exited(0));
-        assert_eq!(receipt.runner_terminal().tree, Tree::Live);
+        assert_eq!(receipt.runner_terminal().occupancy, Occupancy::Live);
         assert!(receipt.output_complete());
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(
@@ -2720,7 +2000,7 @@ mod tests {
             .unwrap();
         let receipt = resource.wait(pending::<()>(), Duration::from_secs(4)).await;
         assert_eq!(receipt.outcome(), Outcome::Exited(0));
-        assert_eq!(receipt.runner_terminal().tree, Tree::Live);
+        assert_eq!(receipt.runner_terminal().occupancy, Occupancy::Live);
         assert!(receipt.output_complete());
         assert!(receipt.finished());
     }

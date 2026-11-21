@@ -552,6 +552,16 @@ name = "aw-policy"
 version = "0.15.0"
 
 [[package]]
+name = "aw-process"
+version = "0.15.0"
+dependencies = [
+ "aw-platform",
+ "aw-tools",
+ "thiserror 2.0.17",
+ "tokio",
+]
+
+[[package]]
 name = "aw-process-extension-rust-example"
 version = "0.15.0"
 dependencies = [
@@ -758,6 +768,7 @@ dependencies = [
  "anyhow",
  "aw-agent-core",
  "aw-platform",
+ "aw-process",
  "aw-terminal",
  "aw-tools",
  "base64 0.22.1",

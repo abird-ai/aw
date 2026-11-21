@@ -29,9 +29,11 @@ Read first:
 10. dotlink/.agents/docs/CURRENT_HANDOFF.md
 11. live source/tests for every owner touched
 
-Current implementation source checkpoints after reseal:
+Published implementation checkpoints after reseal:
+  AW main        3191e62
   AW source      c7cc948
   AW R6 seal     7c3800c
+  dotlink main   f5deaa6
   dotlink source 89ff3fb
   dotlink AW pin:
                b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b
@@ -60,10 +62,17 @@ global replay ledger, distributed Event router, universal revision clock or unus
 registry implementations.
 
 Current source:
-  AW `c7cc948` checkpoints the pre-R6 Phase-0A Process work plus independent Phase-0B
-  store/policy/exposure work. Preserve both conceptual slices.
+  AW has an uncommitted green R6 Phase-0 Process cut on top of published `3191e62`:
+    - Tree -> Occupancy / ProcessTerminal.occupancy
+    - weak direct-Unix negative -> Occupancy::Unknown
+    - new minimal crates/aw-process owns async Scope/Child/stdin/pipes/wait/stop/reap/drain
+    - aw-tools-adapter is a thin consumer and retains policy/storage/ProcessReceipt only
+    - aw-terminal PTY custody remains separate
+  Grouped evidence: aw-process 2/2, runner 4/4, adapter Process 27/27, root check and strict
+  affected all-target Clippy green, rustfmt/diff-check green.
+  Preserve the earlier Phase-0B owner-hardening semantics already published in `c7cc948`.
   dotlink `89ff3fb` checkpoints Remote Start/replay hardening and has NOT begun the R6
-  shared-Process cutover.
+  shared-Process cutover; it still pins AW `b8a46a94...`.
 
 First revalidate current refs/status. Then follow the user's instruction.
 R6 is already sealed. Continue Phase 0 only; do not start Phase 1 before the coherent

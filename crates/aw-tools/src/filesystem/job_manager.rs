@@ -4204,7 +4204,7 @@ mod tests {
                         terminal: ProcessTerminal {
                             exit: ProcessExit::Code(i32::MIN + coordinate as i32),
                             stop: None,
-                            tree: crate::filesystem::runner::Tree::Unknown,
+                            occupancy: crate::filesystem::runner::Occupancy::Unknown,
                             output: ProcessOutputMeta {
                                 stdout_bytes: u64::MAX,
                                 stderr_bytes: u64::MAX,
@@ -4481,7 +4481,7 @@ mod tests {
         let terminal = ProcessTerminal {
             exit: ProcessExit::Code(7),
             stop: None,
-            tree: crate::filesystem::runner::Tree::Empty,
+            occupancy: crate::filesystem::runner::Occupancy::Empty,
             output: ProcessOutputMeta {
                 stdout_bytes: 11,
                 stderr_bytes: 3,
@@ -8704,7 +8704,7 @@ mod tests {
             stop: Some(crate::execution_stop::StopRecord::stopped(
                 ProcessStopReason::Timeout,
             )),
-            tree: crate::filesystem::runner::Tree::Live,
+            occupancy: crate::filesystem::runner::Occupancy::Live,
             output: ProcessOutputMeta {
                 stdout_bytes: 10,
                 stderr_bytes: 2,

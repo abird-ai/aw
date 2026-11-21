@@ -73,6 +73,32 @@ requalify unchanged primitives at every step.
 
 Status: **IN PROGRESS**.
 
+### R6 AW Process extraction checkpoint — green, uncommitted (2026-11-21)
+
+The current AW working tree now implements the R6 shared-runtime side of Phase 0:
+
+- `Tree` is renamed to `Occupancy`, including `ProcessTerminal.occupancy`;
+- `crates/aw-process` is the sole async Pipe Process owner for containment/spawn/stdin/
+  stdout/stderr/wait/stop/reap/drain and canonical `ProcessTerminal` settlement;
+- hosts transfer authorized prepared commands by value; AW keeps policy, durable output
+  storage/paging/ACK and its `ProcessReceipt` envelope at the edge;
+- weak direct-Unix negative membership evidence maps to `Occupancy::Unknown`; Windows Job
+  negative remains `Empty`;
+- the AW adapter has no parallel Scope/Child/Reader/wait/stop/drain implementation;
+- PTY Terminal custody remains in `aw-terminal` and is not folded into Process Scope;
+- bounded retained-output sink failure always releases/finalizes writer custody and cannot
+  turn incomplete output into success.
+
+Grouped evidence: `aw-process` 2/2; `aw-tools` runner 4/4; adapter Process 27/27; affected
+and root compile through `aw-cli`; strict affected all-target Clippy `-D warnings`; rustfmt
+and diff-check all green. The L5 sysroot does not include a Windows std target, so the new
+Windows-only branch cannot be cross-target checked here; `aw-platform-win` remains in the
+successful root package check.
+
+Remaining Process gate: explicitly authorized AW publication, then dotlink repin + real
+`aw-process` consumer cutover/parity. Phase 0 is not accepted until that cross-repo gate is
+green. The stronger PID-1 launcher/backend remains separately promoted future work.
+
 ### Phase 0A checkpoint — shared facts + direct observation complete (2026-11-21)
 
 Implemented in the current uncommitted AW working tree:
