@@ -79,13 +79,21 @@ fn validate_generation(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn agent_ref(
+    domain_handle: &str,
+    identity_handle: &str,
+    project_handle: &str,
+    agent_handle: &str,
+) -> String {
+    format!("/d:{domain_handle}/i:{identity_handle}/p:{project_handle}/a:{agent_handle}")
+}
+
 fn root_ref(binding: &AgentBindingInfo) -> String {
-    format!(
-        "/d:{}/i:{}/p:{}/a:{}",
-        binding.domain_handle,
-        binding.identity_handle,
-        binding.project_handle,
-        binding.agent_handle,
+    agent_ref(
+        &binding.domain_handle,
+        &binding.identity_handle,
+        &binding.project_handle,
+        &binding.agent_handle,
     )
 }
 
@@ -569,37 +577,18 @@ impl SessionStore {
         for value in [domain_handle, identity_handle, project_handle, agent_handle] {
             crate::validate_agent_handle_component(value)?;
         }
+        let canonical_ref = agent_ref(domain_handle, identity_handle, project_handle, agent_handle);
         let connection = self.connection()?;
-        let candidate: Option<(String, String)> = if agent_handle == "0" {
-            db(connection
-                .query_row(
-                    "SELECT s.id,b.id
-                     FROM sessions s
-                     JOIN workspaces w ON w.workspace_id=s.workspace_id
-                     JOIN nodes root ON root.session_id=s.id AND root.id=s.root_node
-                     JOIN branches b ON b.session_id=s.id
-                     WHERE s.workspace_id=?1 AND s.owner_user_id=?2 AND w.domain_id=?3
-                     ORDER BY root.seq,b.created_at,b.id
-                     LIMIT 1",
-                    params![project_handle, identity_handle, domain_handle],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional())?
-        } else {
-            db(connection
-                .query_row(
-                    "SELECT s.id,b.id
-                     FROM branches b
-                     JOIN sessions s ON s.id=b.session_id
-                     JOIN workspaces w ON w.workspace_id=s.workspace_id
-                     WHERE b.id=?1 AND s.workspace_id=?2
-                       AND s.owner_user_id=?3 AND w.domain_id=?4
-                     LIMIT 1",
-                    params![agent_handle, project_handle, identity_handle, domain_handle],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional())?
-        };
+        let candidate: Option<(String, String)> = db(connection
+            .query_row(
+                "SELECT session_id,branch_id
+                 FROM job_exposure_current
+                 WHERE kind='agent' AND generation='' AND canonical_ref=?1
+                   AND state='published'",
+                [&canonical_ref],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional())?;
         let (session_id, branch_id) =
             candidate.ok_or(Error::Denied("Agent ref is unavailable or not authorized"))?;
         let binding = crate::agent_binding_in(&connection, actor, &session_id, &branch_id)?;

@@ -6,8 +6,8 @@
 //! deliveries until the existing Agent Job router attempts receiver admission.
 
 use crate::{
-    agent_binding_in, audit, db, now, session_in, session_participation, Error, PrincipalId,
-    Result, SessionStore,
+    agent_binding_in, agent_owner, audit, db, now, session_in, session_participation, Error,
+    PrincipalId, Result, SessionStore,
 };
 use aw_store_api::AgentBindingInfo;
 use aw_tools::job_event::{
@@ -88,16 +88,6 @@ fn canonical(binding: &AgentBindingInfo) -> String {
 fn source_ref(binding: &AgentBindingInfo, turn: Option<u64>) -> String {
     let root = canonical(binding);
     turn.map_or(root.clone(), |turn| format!("{root}/t:{turn}"))
-}
-
-fn current_revision(c: &rusqlite::Connection, session: &str) -> Result<u64> {
-    let seq: u64 = db(c.query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM audit WHERE session_id=?1",
-        [session],
-        |row| row.get(0),
-    ))?;
-    seq.checked_add(1)
-        .ok_or(Error::Limit("Agent public revision exhausted"))
 }
 
 fn latest_attached_turn(c: &rusqlite::Connection, session: &str, branch: &str) -> Result<u64> {
@@ -462,7 +452,9 @@ impl SessionStore {
         )?;
         let binding = agent_binding_in(&tx, actor, session, branch)?;
         if let Some(expected) = expected_revision {
-            if current_revision(&tx, session)? != expected {
+            if agent_owner::revision(&tx, agent_owner::AgentKey::new(session, &binding.branch_id))?
+                != expected
+            {
                 return Err(Error::Conflict("stale Agent revision"));
             }
         }
@@ -525,8 +517,15 @@ impl SessionStore {
                     "active": update.active,
                 }),
             )?;
+            agent_owner::commit(
+                tx,
+                [agent_owner::AgentMutation::Changed(
+                    agent_owner::AgentKey::new(session, &binding.branch_id),
+                )],
+            )?;
+        } else {
+            db(tx.commit())?;
         }
-        db(tx.commit())?;
         Ok((source, update))
     }
 
@@ -685,6 +684,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(root_update.generation, 1);
+        let revision = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        let (_, unchanged) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &session.id,
+                &branch.id,
+                None,
+                Some(revision),
+                recipient,
+                authority,
+                EventRuleSet::new([EventRule::new(JobEventKind::Result, JobWakeMode::Queue)])
+                    .unwrap(),
+                8,
+            )
+            .unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.generation, root_update.generation);
+        assert_eq!(
+            store
+                .agent_public_revision(&actor, &session.id, &branch.id)
+                .unwrap(),
+            revision,
+            "idempotent subscription replacement must not advance Agent revision"
+        );
 
         let turn_rules = EventRuleSet::new([
             EventRule::new(JobEventKind::Result, JobWakeMode::Queue),

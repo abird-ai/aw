@@ -551,7 +551,12 @@ impl SessionHandle {
             params![now(), self.session],
         ))?;
         let next = branch_in(&tx, &self.session, &b.id)?;
-        db(tx.commit())?;
+        crate::agent_owner::commit(
+            tx,
+            [crate::agent_owner::AgentMutation::Changed(
+                crate::agent_owner::AgentKey::new(&self.session, &b.id),
+            )],
+        )?;
         *cursor = next;
         Ok(())
     }
@@ -1121,14 +1126,24 @@ impl SessionHandle {
             // The result/attempt fact commits before the branch attachment CAS so a
             // crash cannot erase a paid provider result.
             persist_finish_in(&tx, &run, turn, false)?;
-            db(tx.commit())?;
+            crate::agent_owner::commit(
+                tx,
+                [crate::agent_owner::AgentMutation::Changed(
+                    crate::agent_owner::AgentKey::new(&self.session, &cursor.id),
+                )],
+            )?;
             run
         };
         phase34_after_result_commit_crash_hook();
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         attach_settled_run(&tx, &run)?;
         let next = branch_in(&tx, &self.session, &cursor.id)?;
-        db(tx.commit())?;
+        crate::agent_owner::commit(
+            tx,
+            [crate::agent_owner::AgentMutation::Changed(
+                crate::agent_owner::AgentKey::new(&self.session, &cursor.id),
+            )],
+        )?;
         *cursor = next;
         Ok(())
     }

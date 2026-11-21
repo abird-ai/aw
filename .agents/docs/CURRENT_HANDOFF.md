@@ -33,17 +33,37 @@ Pinned qualification is green: ordinary all-target/all-feature build, shell **86
 spawn refusal, strict Clippy, fmt and diff-check. Real Bubblewrap worker-retirement and
 Windows-native qualification remain explicitly deferred evidence, not claimed green.
 
-Phase 1 first foundation slice is implemented in the current AW source: one private `StoreScope`
-loads the existing `store_meta.store_id` + nonzero `restore_generation`; transparent `StorePos(u64)`
-now carries internal `commit_log.seq` ordering through commit insertion -> Job exposure projection;
-public/persisted compatibility fields remain `u64`. Coordination reuses the same StoreScope owner
-instead of reparsing identity/generation independently. No schema, global clock, cursor engine or
-new service was added. Relevant evidence: StoreScope **2/2**, mixed Job exposure green,
-coordination **24/24**, strict all-target/all-feature aw-store Clippy/fmt/diff green.
+Phase 1 foundation is underway. One private `StoreScope` loads the existing
+`store_meta.store_id` + nonzero `restore_generation`; transparent `StorePos(u64)` carries internal
+`commit_log.seq` ordering through commit insertion -> Job exposure projection; public/persisted
+compatibility remains `u64`. Coordination loads identity+generation in one SQLite statement. Exact
+Agent-ref lookup uses the existing `job_exposure_current` primary-key projection for both `a:0` and
+non-root Agents, followed by the existing current authorization/binding recheck; it no longer scans
+Sessions/branches to discover a canonical Agent.
 
-Next Phase 1 work: add only the private StoreScope-bound cursor/projection-head mechanics actually
-needed by Agent migration/history/disclosure, then implement the authoritative Agent-state migration
-and disclosure pieces from IMPLEMENTATION.md. Do not prebuild Phase-2/4 engines.
+A private zero-allocation `agent_owner` cutover seam now centralizes exact branch-bound Agent
+revision reads and logical owner commits **without changing legacy persistence yet**. Today
+`revision()` still returns the historical `MAX(audit.seq)+1`, and `commit()` is the same SQLite
+commit with stack-array mutation metadata; no audit row or second state owner is created. Exact
+paths already crossing the seam are Agent create/fork, Turn admission, durable result settlement +
+branch attachment settlement, changed-only Agent subscriptions, delegated child publication
+(parent change + child creation with immutable parent Agent lineage), stable-Agent close request,
+and exact stable-Agent settlement. Idempotent subscription replacement remains a plain commit and
+provably does not advance revision. Session-only subagent runtime bookkeeping (`running`, legacy
+failure/settlement) is deliberately not mislabeled as DL-200 Agent lifecycle.
+
+Do **not** activate `agent_state_current` yet. Remaining cutover blockers include recovery that may
+settle several exact branches in one transaction, the final committed-input boundary above
+ActorQueue, and legacy Session-level title/ACL compatibility paths whose semantics cannot be
+silently projected onto one branch Agent. Those must either gain an exact Agent owner boundary or be
+retired/blocked by the exclusive cutover before the one Agent-state+ACL seed/activation transaction.
+Only add cursor/projection-head mechanics when a real consumer requires them; do not prebuild
+Phase-2/4 engines.
+
+Current focused evidence: StoreScope **2/2**, mixed Job exposure/root lookup green, coordination
+**24/24**, Agent Job-event/idempotent-subscription test green, delegated child relation/budget tests
+green, stable-Agent survive/continue/close regression green, `aw-cli` all-feature check green, and
+strict all-target/all-feature `aw-store` Clippy/fmt/diff green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

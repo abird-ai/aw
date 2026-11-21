@@ -12,16 +12,20 @@ use std::num::NonZeroU64;
 pub(crate) struct StoreId(String);
 
 impl StoreId {
+    fn new(value: String) -> Result<Self> {
+        if value.is_empty() {
+            return Err(Error::Storage("invalid Store identity"));
+        }
+        Ok(Self(value))
+    }
+
     pub(crate) fn load(connection: &Connection) -> Result<Self> {
         let value: String = db(connection.query_row(
             "SELECT value FROM store_meta WHERE key='store_id'",
             [],
             |row| row.get(0),
         ))?;
-        if value.is_empty() {
-            return Err(Error::Storage("invalid Store identity"));
-        }
-        Ok(Self(value))
+        Self::new(value)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -34,12 +38,7 @@ impl StoreId {
 struct RestoreGeneration(NonZeroU64);
 
 impl RestoreGeneration {
-    fn load(connection: &Connection) -> Result<Self> {
-        let value: String = db(connection.query_row(
-            "SELECT value FROM store_meta WHERE key='restore_generation'",
-            [],
-            |row| row.get(0),
-        ))?;
+    fn new(value: &str) -> Result<Self> {
         let generation = value
             .parse::<u64>()
             .ok()
@@ -61,9 +60,18 @@ pub(crate) struct StoreScope {
 
 impl StoreScope {
     pub(crate) fn load(connection: &Connection) -> Result<Self> {
+        // One statement keeps the frequent coordination path to two indexed
+        // point lookups without paying two SQLite prepare/step round trips.
+        let (id, restore_generation): (String, String) = db(connection.query_row(
+            "SELECT
+                (SELECT value FROM store_meta WHERE key='store_id'),
+                (SELECT value FROM store_meta WHERE key='restore_generation')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))?;
         Ok(Self {
-            id: StoreId::load(connection)?,
-            restore_generation: RestoreGeneration::load(connection)?,
+            id: StoreId::new(id)?,
+            restore_generation: RestoreGeneration::new(&restore_generation)?,
         })
     }
 

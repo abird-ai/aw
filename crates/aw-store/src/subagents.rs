@@ -2459,7 +2459,17 @@ impl SessionStore {
                 "depth": depth,
             }),
         )?;
-        db(tx.commit())?;
+        let parent_agent = crate::agent_owner::AgentKey::new(parent_session, &branch.id);
+        crate::agent_owner::commit(
+            tx,
+            [
+                crate::agent_owner::AgentMutation::Changed(parent_agent),
+                crate::agent_owner::AgentMutation::Created {
+                    agent: crate::agent_owner::AgentKey::new(&child.id, &child_branch.id),
+                    parent: Some(parent_agent),
+                },
+            ],
+        )?;
         let info = row(&c, &subagent_id)?;
         Ok((info, child, child_branch))
     }
@@ -2864,6 +2874,7 @@ impl SessionStore {
         &self,
         actor: &PrincipalId,
         child_session: &str,
+        child_branch: &str,
         request_id: &str,
     ) -> Result<()> {
         if request_id.len() != 67
@@ -2882,6 +2893,7 @@ impl SessionStore {
         let relation = row(&tx, &id)?;
         authorize(&tx, &relation.parent_session_id, actor, false)?;
         authorize(&tx, child_session, actor, false)?;
+        let child_branch = branch_in(&tx, child_session, child_branch)?;
         if relation.identity.actor != *actor {
             return Err(Error::Denied("Agent close belongs to another actor"));
         }
@@ -2913,7 +2925,12 @@ impl SessionStore {
                 "parent_branch_id": relation.parent_branch_id,
             }),
         )?;
-        db(tx.commit())?;
+        crate::agent_owner::commit(
+            tx,
+            [crate::agent_owner::AgentMutation::Changed(
+                crate::agent_owner::AgentKey::new(child_session, &child_branch.id),
+            )],
+        )?;
         Ok(())
     }
 
@@ -3172,7 +3189,16 @@ impl SessionStore {
             Some(actor),
             serde_json::json!({"state":state}),
         )?;
-        db(tx.commit())?;
+        if let Some(child_branch) = child_branch {
+            crate::agent_owner::commit(
+                tx,
+                [crate::agent_owner::AgentMutation::Changed(
+                    crate::agent_owner::AgentKey::new(&info.child_session_id, child_branch),
+                )],
+            )?;
+        } else {
+            db(tx.commit())?;
+        }
         row(&c, id)
     }
 

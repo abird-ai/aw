@@ -1941,6 +1941,7 @@ impl AgentJobRouter for Router {
                     self.store.request_subagent_close(
                         &self.actor,
                         &binding.session_id,
+                        &binding.branch_id,
                         &request_id,
                     )?;
                     let live = self.live_owner(&canonical)?;

@@ -15,6 +15,7 @@ mod actor_notice;
 mod actor_peer;
 mod actor_queue;
 mod agent_job_events;
+mod agent_owner;
 mod archive;
 mod auth_session;
 mod authority;
@@ -1466,7 +1467,13 @@ impl SessionStore {
         let (_, workspace) = resources::ensure_default_domain_workspace(&tx, &user, &realm)?;
         let result =
             resources::create_in_workspace_tx(&tx, owner, title, &binding, &workspace, None)?;
-        db(tx.commit())?;
+        agent_owner::commit(
+            tx,
+            [agent_owner::AgentMutation::Created {
+                agent: agent_owner::AgentKey::new(&result.0.id, &result.1.id),
+                parent: None,
+            }],
+        )?;
         Ok(result)
     }
     pub fn session(&self, actor: &PrincipalId, session: &str) -> Result<SessionInfo> {
@@ -1510,14 +1517,8 @@ impl SessionStore {
     ) -> Result<u64> {
         let c = self.connection()?;
         context::authorize_tree(&c, session, actor)?;
-        let _ = branch_in(&c, session, branch)?;
-        let seq: u64 = db(c.query_row(
-            "SELECT COALESCE(MAX(seq),0) FROM audit WHERE session_id=?1",
-            [session],
-            |row| row.get(0),
-        ))?;
-        seq.checked_add(1)
-            .ok_or(Error::Limit("Agent public revision exhausted"))
+        let branch = branch_in(&c, session, branch)?;
+        agent_owner::revision(&c, agent_owner::AgentKey::new(session, &branch.id))
     }
     pub fn set_title(
         &self,
@@ -1892,7 +1893,13 @@ impl SessionStore {
             name,
         )?;
         let out = branch_in(&tx, session, &branch)?;
-        db(tx.commit())?;
+        agent_owner::commit(
+            tx,
+            [agent_owner::AgentMutation::Created {
+                agent: agent_owner::AgentKey::new(session, &out.id),
+                parent: None,
+            }],
+        )?;
         Ok(out)
     }
     /// Explicit human-authored summary: keeps all original nodes, cuts only the

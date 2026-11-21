@@ -210,6 +210,18 @@ fn mixed_job_exposure_positions_interleave_agents_and_finite_jobs_without_duplic
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].position, first_position);
 
+    let root = store
+        .agent_binding_by_handles(
+            &actor,
+            &first.domain_handle,
+            &first.identity_handle,
+            &first.project_handle,
+            &first.agent_handle,
+        )
+        .unwrap();
+    assert_eq!(root.session_id, first.session_id);
+    assert_eq!(root.branch_id, first.branch_id);
+
     let resolved = store
         .agent_binding_by_handles(
             &actor,

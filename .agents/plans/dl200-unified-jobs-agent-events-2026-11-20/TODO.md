@@ -56,12 +56,19 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       than deleting the authorization identity. Unknown outcomes remain tombstones. Long-lived
       admission no longer depends on Session-lifetime audit/event scans, and live capacities remain
       explicitly scoped to active Turns/subscriptions/exposures rather than retained history.
-- [~] **Phase 1 UNDERWAY** — private `StoreScope` now reuses existing `store_id` + nonzero
-      `restore_generation`, and transparent `StorePos(u64)` carries internal `commit_log.seq` from
-      commit insertion through Job exposure projection without schema/public API churn. Coordination
-      reuses the same scope loader. Next: StoreScope-bound cursor/projection-head mechanics actually
-      needed by Agent migration/history/disclosure, then finish that Agent foundation without
-      duplicate Session or revision ownership.
+- [~] **Phase 1 UNDERWAY** — private `StoreScope` reuses existing `store_id` + nonzero
+      `restore_generation`; transparent `StorePos(u64)` carries internal `commit_log.seq`; exact
+      Agent lookup reuses indexed `job_exposure_current` with current-authority recheck. A private
+      branch-bound `agent_owner` seam now owns legacy revision reads + logical Agent commit points
+      with stack-array metadata/no heap or new persistence. Wired exact paths: create/fork, Turn
+      admission, durable result + attachment settlement, changed-only subscription, delegated
+      parent/child publication with immutable parent lineage, stable close request, exact stable
+      settlement. Legacy revision remains `MAX(audit.seq)+1` until exclusive activation; no audit
+      rows were added. Do not activate `agent_state_current` while recovery, committed-input
+      admission and Session-level title/ACL compatibility still lack an exact final owner boundary.
+      Next: close those remaining owner seams or explicitly retire/block the compatibility writers,
+      then perform one exclusive Agent-state+ACL seed/activation transaction. Add shared cursor/
+      projection-head mechanics only when an actual Phase-1 consumer needs them.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.
