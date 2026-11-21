@@ -557,6 +557,7 @@ version = "0.15.0"
 dependencies = [
  "aw-platform",
  "aw-tools",
+ "libc",
  "thiserror 2.0.17",
  "tokio",
 ]

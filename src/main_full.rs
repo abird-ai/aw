@@ -4013,6 +4013,7 @@ impl Host {
             } else if remote_execution.is_some() {
                 Some(subagents::PolicyOperationRouter::local(
                     persistent.store.clone(),
+                    agent.provider_accounts(),
                     agent.tool_binding_authority(),
                     subagents::PolicyOperationConfig::passthrough(),
                 )?)

@@ -105,6 +105,11 @@ pub struct PolicyAdmissionFact {
     pub request: PolicyAdmissionRequest,
     pub state: PolicyAdmissionState,
     pub revision: u64,
+    /// True when the indexed replay owner retained only the immutable
+    /// never-retry identity/outcome tombstone. Mutable policy/provider/approval
+    /// detail in `request` is then non-authoritative placeholder data.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compacted: bool,
     pub guardian_process_id: Option<String>,
     pub guardian_store_generation: Option<u64>,
     pub guardian_input_sha256: Option<String>,
@@ -116,6 +121,33 @@ pub struct PolicyAdmissionFact {
     pub narrow_ref: Option<String>,
     pub approval_decided_by: Option<String>,
     pub note: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyAdmissionTombstone {
+    replay_tombstone_version: u8,
+    state: PolicyAdmissionState,
+    decision_route: Option<String>,
+    narrow_ref: Option<String>,
+}
+
+#[derive(Debug)]
+struct PolicyAdmissionCurrentRow {
+    admission_id: String,
+    session_id: String,
+    branch_id: String,
+    turn_id: u64,
+    call_id: String,
+    canonical_target: String,
+    subject_actor: String,
+    request_sha256: String,
+    revision: u64,
+    fact_json: String,
 }
 
 fn bounded_ascii(value: &str, max: usize) -> bool {
@@ -231,6 +263,83 @@ fn replay_matches(a: &PolicyAdmissionRequest, b: &PolicyAdmissionRequest) -> boo
 /// Find the original claim before using the caller's *current* resolved target.
 /// This existing index also detects historical ambiguous call-ID reuse: never
 /// choose one of several prior targets or start another paid/effectful attempt.
+fn current_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyAdmissionCurrentRow> {
+    Ok(PolicyAdmissionCurrentRow {
+        admission_id: row.get(0)?,
+        session_id: row.get(1)?,
+        branch_id: row.get(2)?,
+        turn_id: row.get(3)?,
+        call_id: row.get(4)?,
+        canonical_target: row.get(5)?,
+        subject_actor: row.get(6)?,
+        request_sha256: row.get(7)?,
+        revision: row.get(8)?,
+        fact_json: row.get(9)?,
+    })
+}
+
+fn decode_current(row: PolicyAdmissionCurrentRow) -> Result<PolicyAdmissionFact> {
+    let value: serde_json::Value = serde_json::from_str(&row.fact_json)
+        .map_err(|_| Error::Storage("cannot decode policy admission current row"))?;
+    if value.get("replay_tombstone_version").is_none() {
+        return serde_json::from_value(value)
+            .map_err(|_| Error::Storage("cannot decode policy admission fact"));
+    }
+    let tombstone: PolicyAdmissionTombstone = serde_json::from_value(value)
+        .map_err(|_| Error::Storage("cannot decode policy admission replay tombstone"))?;
+    if tombstone.replay_tombstone_version != 1 || tombstone.state != PolicyAdmissionState::Consumed
+    {
+        return Err(Error::Storage(
+            "unsupported policy admission replay tombstone",
+        ));
+    }
+    let actor = PrincipalId::new(row.subject_actor)?;
+    let candidate_local = tombstone.decision_route.as_deref() != Some("delegate_agent");
+    let candidate_delegate_agent = tombstone.decision_route.as_deref() == Some("delegate_agent");
+    Ok(PolicyAdmissionFact {
+        id: row.admission_id,
+        request: PolicyAdmissionRequest {
+            session_id: row.session_id,
+            branch_id: row.branch_id,
+            writer_epoch: 1,
+            turn_id: row.turn_id,
+            call_id: row.call_id,
+            canonical_target: row.canonical_target,
+            request_sha256: row.request_sha256,
+            subject: PolicyAdmissionSubject {
+                actor,
+                membership_epoch: 1,
+                audience_epoch: 1,
+                owner: false,
+            },
+            policy_revision_sha256: "0".repeat(64),
+            authority_sha256: "0".repeat(64),
+            candidate_local,
+            candidate_delegate_agent,
+            guardian_required: false,
+            guardian_identity: None,
+            guardian_site: None,
+            approval_scope: None,
+            authorized_approvers: Vec::new(),
+            approval_expires_at: None,
+        },
+        state: tombstone.state,
+        revision: row.revision,
+        compacted: true,
+        guardian_process_id: None,
+        guardian_store_generation: None,
+        guardian_input_sha256: None,
+        guardian_result_sha256: None,
+        guardian_meta: None,
+        decision_revision: None,
+        decision_sha256: None,
+        decision_route: tombstone.decision_route,
+        narrow_ref: tombstone.narrow_ref,
+        approval_decided_by: None,
+        note: None,
+    })
+}
+
 fn current_fact_for_call(
     c: &rusqlite::Connection,
     session: &str,
@@ -239,7 +348,9 @@ fn current_fact_for_call(
     call_id: &str,
 ) -> Result<Option<PolicyAdmissionFact>> {
     let mut stmt = db(c.prepare(
-        "SELECT fact_json FROM policy_admission_current
+        "SELECT admission_id,session_id,branch_id,turn_id,call_id,canonical_target,
+                subject_actor,request_sha256,revision,fact_json
+         FROM policy_admission_current
          WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3 AND call_id=?4
          LIMIT 2",
     ))?;
@@ -247,24 +358,54 @@ fn current_fact_for_call(
     let Some(row) = db(rows.next())? else {
         return Ok(None);
     };
-    let encoded: String = db(row.get(0))?;
+    let row = current_row(row).map_err(|_| Error::Storage("cannot read policy admission row"))?;
     if db(rows.next())?.is_some() {
         return Err(Error::Conflict(
             "original policy ToolCall has ambiguous legacy replay targets",
         ));
     }
-    crate::decode(&encoded).map(Some)
+    decode_current(row).map(Some)
 }
 
 fn current_fact(c: &rusqlite::Connection, id: &str) -> Result<Option<PolicyAdmissionFact>> {
-    let encoded: Option<String> = db(c
+    let row: Option<PolicyAdmissionCurrentRow> = db(c
         .query_row(
-            "SELECT fact_json FROM policy_admission_current WHERE admission_id=?1",
+            "SELECT admission_id,session_id,branch_id,turn_id,call_id,canonical_target,
+                    subject_actor,request_sha256,revision,fact_json
+             FROM policy_admission_current WHERE admission_id=?1",
             [id],
-            |row| row.get(0),
+            current_row,
         )
         .optional())?;
-    encoded.map(|value| crate::decode(&value)).transpose()
+    row.map(decode_current).transpose()
+}
+
+fn compact_consumed_current(c: &rusqlite::Connection, fact: &PolicyAdmissionFact) -> Result<()> {
+    if fact.state != PolicyAdmissionState::Consumed {
+        return Err(Error::Storage(
+            "only consumed policy admissions may compact to replay tombstones",
+        ));
+    }
+    let tombstone = PolicyAdmissionTombstone {
+        replay_tombstone_version: 1,
+        state: fact.state,
+        decision_route: fact.decision_route.clone(),
+        narrow_ref: fact.narrow_ref.clone(),
+    };
+    let encoded = serde_json::to_string(&tombstone)
+        .map_err(|_| Error::Storage("cannot serialize policy admission replay tombstone"))?;
+    let changed = db(c.execute(
+        "UPDATE policy_admission_current
+         SET fact_json=?1,updated_at=?2
+         WHERE admission_id=?3 AND revision=?4",
+        params![encoded, now(), fact.id, fact.revision],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Storage(
+            "policy admission replay tombstone lost its exact current row",
+        ));
+    }
+    Ok(())
 }
 
 fn store_current(c: &rusqlite::Connection, fact: &PolicyAdmissionFact) -> Result<()> {
@@ -781,6 +922,7 @@ impl SessionStore {
             request,
             state: PolicyAdmissionState::Claimed,
             revision: 1,
+            compacted: false,
             guardian_process_id: None,
             guardian_store_generation: None,
             guardian_input_sha256: None,
@@ -1089,6 +1231,14 @@ impl SessionStore {
             return Err(Error::Denied("invalid current policy/authority digest"));
         }
         let current = fact_in(connection, session, id)?;
+        if current.state == PolicyAdmissionState::Consumed {
+            return Ok(current);
+        }
+        if current.compacted {
+            return Err(Error::Storage(
+                "non-consumed policy admission unexpectedly compacted",
+            ));
+        }
         let owner = crate::session_in(connection, session)?.owner;
         require_active_turn(connection, &owner, &current.request)?;
         if current.request.policy_revision_sha256 != current_policy_revision_sha256
@@ -1116,9 +1266,6 @@ impl SessionStore {
                 "unexpected argument-revision proof for a non-Narrow decision",
             ));
         }
-        if current.state == PolicyAdmissionState::Consumed {
-            return Ok(current);
-        }
         if current.state == PolicyAdmissionState::AskApproved
             && current
                 .request
@@ -1138,6 +1285,33 @@ impl SessionStore {
         let next = next_fact(&current, PolicyAdmissionState::Consumed)?;
         audit_fact(connection, &current.request.subject.actor, &next)?;
         Ok(next)
+    }
+
+    pub(crate) fn policy_admission_compact_consumed_in(
+        connection: &rusqlite::Connection,
+        session: &str,
+        id: &str,
+    ) -> Result<()> {
+        let current = fact_in(connection, session, id)?;
+        if current.compacted {
+            return Ok(());
+        }
+        if current.state != PolicyAdmissionState::Consumed {
+            return Err(Error::Conflict(
+                "only consumed policy admissions may compact",
+            ));
+        }
+        compact_consumed_current(connection, &current)
+    }
+
+    /// Best-effort replay-detail compaction after the effect has crossed a
+    /// durable recovery boundary. Failure leaves the full replay row intact.
+    pub fn policy_admission_compact_consumed(&self, session: &str, id: &str) -> Result<()> {
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        Self::policy_admission_compact_consumed_in(&tx, session, id)?;
+        db(tx.commit())?;
+        Ok(())
     }
 
     /// Revalidate captured policy/authority generations immediately before the

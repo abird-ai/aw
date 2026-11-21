@@ -63,7 +63,7 @@ impl ProcessTerminal {
     }
 
     pub fn status(self) -> Status {
-        let primary = if self.stop.and_then(|record| record.reason).is_some() {
+        let primary = if self.stop_reason().is_some() {
             Primary::Fail
         } else {
             match self.exit {
@@ -95,7 +95,7 @@ impl ProcessTerminal {
         if self.output.stderr_truncated {
             fields.push("stderr_truncated=true".into());
         }
-        if let Some(reason) = self.stop.and_then(|record| record.reason) {
+        if let Some(reason) = self.stop_reason() {
             fields.push(format!("stop={}", reason.as_str()));
         }
         if !self.output.stdout_complete {
@@ -116,8 +116,7 @@ impl ProcessTerminal {
             ProcessExit::Unknown => "exit=unknown".into(),
         };
         let stop = self
-            .stop
-            .and_then(|record| record.reason)
+            .stop_reason()
             .map(|reason| format!(" stop={}", reason.as_str()))
             .unwrap_or_default();
         format!(

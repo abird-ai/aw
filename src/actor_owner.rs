@@ -495,25 +495,14 @@ impl Service {
             branch,
             turn_id,
         } = request;
-        selected.revalidate()?;
-        if selected.identity().actor != *participant
-            || participation.actor != *participant
+        provider_accounts.select_exact(participant, selected.identity())?;
+        if participation.actor != *participant
             || participation.session_id != self.session
             || participation.owner
             || !participation.permissions.allows(action)
         {
             return Err(Error::Denied(
                 "participant action requires exact current collaboration/provider authority",
-            ));
-        }
-        let current = provider_accounts.select(
-            participant,
-            &selected.identity().account_id,
-            &selected.identity().model,
-        )?;
-        if current.identity() != selected.identity() {
-            return Err(Error::Denied(
-                "participant provider/account/model authority changed before admission",
             ));
         }
         self.store.authorize_participant_model_context(
@@ -3021,18 +3010,11 @@ impl Service {
                         "participant Submit/audience authority changed before Turn claim",
                     ));
                 }
-                let current = agent.provider_accounts().select(
-                    &participant.actor,
-                    &participant.identity.account_id,
-                    &participant.identity.model,
-                )?;
-                current.revalidate()?;
-                if current.identity() != &participant.identity {
-                    return Err(Error::Denied(
-                        "participant provider/account/model authority changed before dispatch",
-                    ));
-                }
-                Ok(Some(current))
+                Ok(Some(
+                    agent
+                        .provider_accounts()
+                        .select_exact(&participant.actor, &participant.identity)?,
+                ))
             } else {
                 Ok(None)
             }

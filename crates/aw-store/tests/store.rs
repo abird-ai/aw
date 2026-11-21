@@ -520,6 +520,95 @@ async fn subagent_relation_is_bound_to_active_parent_turn_and_child_session() {
     assert_eq!(relation.tool_mode, "off");
     assert_eq!(store.visible_subagents(&actor).unwrap().len(), 1);
 
+    let participant = PrincipalId::new("participant-delegate").unwrap();
+    store
+        .set_session_participation(
+            &actor,
+            &parent.id,
+            &participant,
+            SessionParticipationPermissions {
+                view: true,
+                contribute: false,
+                submit: true,
+                control: false,
+                manage: false,
+            },
+        )
+        .unwrap();
+    let mut participant_identity = identity.clone();
+    participant_identity.actor = participant.clone();
+    participant_identity.account_id = "participant-account".into();
+    participant_identity.account_owner = AccountOwner::User(participant.clone());
+    participant_identity.payer = BillingOwner::User(participant.clone());
+    let (_, participant_allocation) = reserve_child(&store, &actor, &parent, &branch);
+    let (participant_relation, participant_child, _) = store
+        .create_participant_policy_delegate_session(
+            &actor,
+            &parent.id,
+            &branch.id,
+            1,
+            "Participant policy delegate",
+            &format!("{:x}", Sha256::digest(b"participant policy task")),
+            &participant_identity,
+            &root.id,
+            &participant_allocation.id,
+            1,
+            "off",
+            None,
+            SubagentMode::Foreground,
+        )
+        .unwrap();
+    assert_eq!(participant_relation.identity, participant_identity);
+    assert_eq!(participant_child.owner, actor);
+    store
+        .mark_subagent_running(&actor, &participant_relation.id)
+        .unwrap();
+    store
+        .reserve_delegation_model_attempt(
+            &actor,
+            &root.id,
+            &participant_child.id,
+            1,
+            1,
+            &participant_identity,
+        )
+        .unwrap();
+    store
+        .mark_delegation_model_attempt_unknown(
+            &actor,
+            &root.id,
+            &participant_child.id,
+            1,
+            1,
+            "fixture participant attempt",
+        )
+        .unwrap();
+    store
+        .settle_subagent(&actor, &participant_relation.id, "completed", None)
+        .unwrap();
+
+    store
+        .revoke_session_participation(&actor, &parent.id, &participant)
+        .unwrap();
+    let (_, revoked_allocation) = reserve_child(&store, &actor, &parent, &branch);
+    assert!(store
+        .create_participant_policy_delegate_session(
+            &actor,
+            &parent.id,
+            &branch.id,
+            1,
+            "Revoked participant delegate",
+            &format!("{:x}", Sha256::digest(b"revoked participant task")),
+            &participant_identity,
+            &root.id,
+            &revoked_allocation.id,
+            1,
+            "off",
+            None,
+            SubagentMode::Foreground,
+        )
+        .is_err());
+
     let member = PrincipalId::new("member").unwrap();
     store
         .grant(&actor, &parent.id, &member, Some(true))
@@ -2420,19 +2509,90 @@ async fn policy_admission_claim_guardian_ask_and_replay_are_single_owner_fenced(
         )
         .unwrap();
     assert_eq!(consumed.state, PolicyAdmissionState::Consumed);
-    assert_eq!(
-        store
-            .policy_admission_consume(
-                &session.id,
-                &ask.id,
-                &"1".repeat(64),
-                &"c".repeat(64),
-                Some(Strategy::Local),
-                None,
-            )
-            .unwrap(),
-        consumed
+    assert!(
+        !consumed.compacted,
+        "the consuming executor receives the full fact once"
     );
+    store
+        .policy_admission_compact_consumed(&session.id, &ask.id)
+        .unwrap();
+
+    let mut db = rusqlite::Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+    let encoded: String = db
+        .query_row(
+            "SELECT fact_json FROM policy_admission_current WHERE admission_id=?1",
+            [&ask.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tombstone: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(tombstone["replay_tombstone_version"], 1);
+    assert_eq!(tombstone["state"], "consumed");
+    assert_eq!(tombstone["decision_route"], "local");
+    assert!(
+        encoded.len() < 256,
+        "replay tombstone must stay tiny: {encoded}"
+    );
+
+    let replayed = store
+        .policy_admission_consume(
+            &session.id,
+            &ask.id,
+            &"e".repeat(64),
+            &"d".repeat(64),
+            Some(Strategy::DelegateAgent),
+            Some("obsolete-proof"),
+        )
+        .unwrap();
+    assert!(replayed.compacted);
+    assert_eq!(replayed.state, PolicyAdmissionState::Consumed);
+    assert_eq!(replayed.id, consumed.id);
+    assert_eq!(
+        replayed.request.canonical_target,
+        consumed.request.canonical_target
+    );
+    assert_eq!(
+        replayed.request.request_sha256,
+        consumed.request.request_sha256
+    );
+    assert_eq!(
+        replayed.request.subject.actor,
+        consumed.request.subject.actor
+    );
+    assert_eq!(replayed.decision_route, consumed.decision_route);
+    assert!(replayed.request.guardian_identity.is_none());
+
+    let replay = store
+        .policy_admission_replay(
+            &actor,
+            &session.id,
+            &branch.id,
+            1,
+            "guardian-ask",
+            &"f".repeat(64),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(replay.compacted);
+    assert_eq!(replay.id, ask.id);
+
+    {
+        let tx = db.transaction().unwrap();
+        for i in 0..8_205_u64 {
+            tx.execute(
+                "INSERT INTO audit(session_id,actor,action,data_json,created_at) VALUES(?1,?2,'fixture.noise',?3,?4)",
+                rusqlite::params![session.id, actor.as_str(), format!("{{\"i\":{i}}}"), i as i64 + 1],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    drop(db);
+    let long_history = store
+        .policy_admission_claim(request("long-history", '8', '9'))
+        .unwrap();
+    assert_eq!(long_history.state, PolicyAdmissionState::Claimed);
+    assert!(!long_history.compacted);
 
     assert_eq!(
         calls.load(Ordering::SeqCst),

@@ -13,6 +13,16 @@ pub enum SourceKind {
     Extension,
 }
 
+impl SourceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Mcp => "mcp",
+            Self::Extension => "extension",
+        }
+    }
+}
+
 /// Policy-level effect vocabulary mirrors the semantic operation effect without
 /// importing an Agent/tool executor into this pure crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

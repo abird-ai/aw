@@ -4,7 +4,7 @@ Author: @pvl
 Co-authors: OpenAI GPT-5.6 Sol
 Owner: @pvl
 
-**R6 SEALED (2026-11-21) / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.**
+**R6 SEALED (2026-11-21), INCLUDING THE SEALED SHARED PROCESS/RELEASE-CORRECTION AMENDMENT / IMPLEMENTATION PROMOTED / PHASE 0 CORRECTIVE GATE PENDING.**
 R6 was explicitly approved for implementation checkpointing on 2026-11-21 after the
 final live-owner review. It keeps the public model/API/phases unchanged and tightens the
 internal ownership boundaries below. Commit/push/release/deploy remain separately gated.
@@ -108,7 +108,7 @@ persistence owners.
 | **EventScan** | One source-first ordered scanner: candidate / proven skip / blocked / stale / end | Handler executor or Input scheduler |
 | **`DriverKey`** | Stable driver namespace/local ID only; each persisted binding/anchor/recovery artifact carries its own schema version | Separate driver database or one coupled schema clock |
 | **Registry staging** | Typed leaf definitions, local revision, immutable staged publication | Registry as policy/grant owner |
-| **`aw-process`** | Dedicated Agent-neutral async Scope, child, pipe, wait/stop/drain and terminal owner for AW/dotlink | Two guards hidden behind a wrapper |
+| **`aw-process`** | Dedicated Agent-neutral async Scope, child, pipe, wait/stop/drain and terminal owner for AW/dotlink; Linux launch crosses one private logical Spawn Facility with O(1) stable process-lifetime lanes (N=1 initially), while Processes remain O(n) movable async tasks | Two guards hidden behind a wrapper, thread-per-Process, or host-local launcher runtime |
 
 Keep `rev` (Agent/Process/Graph owner), `event_rev` (source-local), security/group
 generations, `inputs_rev` and output byte offsets separate from `StorePos`.
@@ -120,14 +120,18 @@ Handlers retain at-least-once delivery and their own effect receipts.
 
 ```text
 aw-tools                 host-neutral Jobs/Graph and ProcessTerminal/Occupancy facts
-aw-platform              synchronous, target-specific OS Process-scope operations
+aw-platform              synchronous, target-specific OS Process-scope operations + strict
+                         child-terminal facts/launch flags; no Tokio dependency
 aw-process               dedicated Agent-neutral async Scope + process/pipe lifetime,
-                         wait/stop/drain/settle; small bounded output-sink seam
+                         wait/stop/drain/settle; private Linux Spawn Facility with fixed/add-only
+                         process-lifetime lanes (N=1 initially) + async bounded admission;
+                         small bounded output-sink seam
 aw-store                 existing StoreId + restore_generation, StorePos, replay/Agent/
                          Input owners, projection/cursor, EventScan and commit ordering
 aw-tools-adapter / host  AW tool policy, authorized launch, output storage and runtime binding
-dotlink                  aw-process consumer; MCP transport, output storage/logs,
-                         launch/profile and turn-horizon policy
+dotlink                  aw-process/aw-tools consumer; MCP transport, output storage/logs,
+                         launch/profile plus current-surface bounded-turn projection
+                         (v0.17.8: 35m horizon, 10m report reserve, 25m command cap)
 extension leaf owners    typed definitions + common staged registry publication
 ```
 
@@ -138,7 +142,25 @@ command **by value** into `aw-process`; the shared crate owns lifecycle-sensitiv
 (containment setup, stdio ownership, spawn, child custody, wait/stop/reap and drain).
 Host adapters retain launch authorization, executable/Sandbox preparation, output
 storage/retention and bounded sink adapters. A blocked sink cannot hang cleanup or report
-dropped output as complete.
+dropped output as complete. Linux `aw-process` never forks a prepared command from an arbitrary
+Tokio worker: one private logical Spawn Facility owns a small fixed/add-only set of stable
+process-lifetime OS-thread lanes and async bounded admission. Start with one lane. Only the short
+spawn + exact `DirectScope` attachment occurs there; the resulting `Process: Send` remains a
+lightweight O(n) async object whose wait/stdin/cancel/output work can migrate normally across Tokio
+workers. Cancellation-safe RAII transfers `{Child, DirectScope, pid}` atomically enough that a
+vanished receiver cannot orphan a child. Lanes never retire/shrink while the process lives; a
+panic poisons future launch admission without killing the lifetime-anchor thread. N>1 is internal,
+benchmark-driven only, never user configuration.
+
+Dotlink v0.17.9 (`576d0a1`) tightens the same seam: the runner establishes one
+absolute execution deadline when it enters Running; cancellation/expiry is rechecked on the Spawn
+Lane immediately before fork; stale queued launches create no Process/terminal/kill fact; and a
+real launched Process keeps that same deadline rather than receiving a fresh timeout after spawn.
+Job age may include earlier queueing without consuming execution timeout. Pidfd/SIGCHLD readiness
+is only a wake; cleanup waits for a strict non-reaping child terminal fact. Windows non-PTY managed
+launch uses `CREATE_SUSPENDED | CREATE_NO_WINDOW`, then Job attach + resume, and its post-exit Job
+accounting settle is async + cancel/deadline-preemptible so transient console infrastructure cannot
+become false leftovers or delay an actual stop.
 
 `aw-process` owns DL-200 **Process/Job execution** lifetimes. `aw-terminal` remains the
 distinct Terminal/PTY custody resource because its reviewed source-release/adoption protocol
@@ -150,7 +172,7 @@ transaction coordinator, cross-store Event merger or parallel Source/registry au
 
 | Phase | Coherent R6 work |
 |---|---|
-| **0 / 0B** | Rename `Tree` → `Occupancy`; create `aw-process` and converge AW/dotlink on one async Process/pipe lifetime; reuse replay/effect/external-evidence helpers with Prepared before external effects |
+| **0 / 0B** | Rename `Tree` → `Occupancy`; create `aw-process` and converge AW/dotlink on one async Process/pipe lifetime; apply the sealed v0.17.7 Spawn Facility/strict-terminal/stop-causality correction plus v0.17.9 stale-launch/absolute-deadline/interruptible-Windows-settle refinements; on the dotlink repin port v0.17.8+ surface policy as a dotlink projection over shared Job facts; reuse replay/effect/external-evidence helpers with Prepared before external effects |
 | **1** | Authoritative Agent/ACL migration, existing StoreId + restore-generation scoped StorePos/cursor/projection helpers, immutable history and disclosure DAG |
 | **2** | One EventScan + consumer-specific read/Input/Handler completion, Event projection, cursor and EventType leaf |
 | **3** | DriverKey, recoverable capture/restore, Sandbox/Checkpoint/Vault owners and existing registry staging |

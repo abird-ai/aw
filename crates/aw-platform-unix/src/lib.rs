@@ -145,6 +145,14 @@ pub fn configure_child_group(command: &mut Command) {
     command.process_group(0);
 }
 
+/// Whether one waited Unix exit is physically compatible with our direct
+/// Process stop signal. A different signal or any exit code is independent
+/// evidence and must not acquire timeout/cancel attribution.
+pub fn stop_exit_matches(status: &ExitStatus, force: bool) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal() == Some(if force { libc::SIGKILL } else { libc::SIGTERM })
+}
+
 /// Launch an explicit, foreground-independent local owner in a new OS
 /// session. The caller must close inherited stdio, bound its lifetime, and
 /// supply a private rendezvous; this never implicitly starts a service.
@@ -254,7 +262,7 @@ impl DirectScope {
         #[cfg(target_os = "linux")]
         if let Some(leader) = &self.leader {
             return Ok(matches!(
-                pid_identity::inspect_exit(leader.as_fd())?,
+                pid_identity::inspect_child_exit(leader.as_fd())?,
                 pid_identity::ExitObservation::Exited { .. }
             ));
         }

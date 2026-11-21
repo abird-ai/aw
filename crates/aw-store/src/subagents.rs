@@ -1,7 +1,7 @@
 use crate::{
     audit, authorize, branch_in, db, decode, durability, ensure_user_for_principal, id, json,
-    label, now, principal_is_session_owner, resources, session_in, SessionBinding, SessionInfo,
-    SessionStore,
+    label, now, principal_is_session_owner, resources, session_in, session_participation,
+    SessionBinding, SessionInfo, SessionParticipationAction, SessionStore,
 };
 #[cfg(feature = "routing")]
 use aw_agent_core::RoutingResult;
@@ -19,6 +19,12 @@ const AGENT_CONSTRUCTOR_ACTION: &str = "agent.constructor";
 pub enum SubagentMode {
     Foreground,
     Background,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildIdentityAuthority {
+    Owner,
+    ParticipantSubmit,
 }
 impl SubagentMode {
     fn as_str(self) -> &'static str {
@@ -1342,26 +1348,31 @@ impl SessionStore {
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let root = delegation_root_row(&tx, root_id)?;
-        if !principal_is_session_owner(&tx, &root.root_session_id, actor)?
-            || identity.actor != *actor
-        {
+        if !principal_is_session_owner(&tx, &root.root_session_id, actor)? {
             return Err(Error::Denied(
                 "delegation model attempt belongs to another owner",
             ));
         }
-        let linked: bool = db(tx.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM subagent_sessions s
-                JOIN delegation_child_allocations a ON a.id=s.delegation_allocation_id
-                WHERE s.child_session_id=?1 AND s.delegation_root_id=?2
-                  AND s.state='running' AND a.state='running'
-             )",
-            params![child_session_id, root_id],
-            |r| r.get(0),
-        ))?;
-        if !linked {
+        let linked_identity: Option<String> = db(tx
+            .query_row(
+                "SELECT s.invocation_identity_json
+                 FROM subagent_sessions s
+                 JOIN delegation_child_allocations a ON a.id=s.delegation_allocation_id
+                 WHERE s.child_session_id=?1 AND s.delegation_root_id=?2
+                   AND s.state='running' AND a.state='running'",
+                params![child_session_id, root_id],
+                |r| r.get(0),
+            )
+            .optional())?;
+        let Some(linked_identity) = linked_identity else {
             return Err(Error::Denied(
                 "child is not a running member of this delegation root",
+            ));
+        };
+        let linked_identity: InvocationIdentity = decode(&linked_identity)?;
+        if linked_identity != *identity {
+            return Err(Error::Denied(
+                "delegation model attempt identity differs from the bound child",
             ));
         }
         let existing: Option<String> = db(tx
@@ -1951,6 +1962,43 @@ impl SessionStore {
             tool_mode,
             execution_binding_id,
             mode,
+            ChildIdentityAuthority::Owner,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_participant_policy_delegate_session(
+        &self,
+        owner: &PrincipalId,
+        parent_session: &str,
+        parent_branch: &str,
+        parent_turn_id: u64,
+        title: &str,
+        task_sha256: &str,
+        identity: &InvocationIdentity,
+        delegation_root_id: &str,
+        delegation_allocation_id: &str,
+        depth: u8,
+        tool_mode: &str,
+        execution_binding_id: Option<&str>,
+        mode: SubagentMode,
+    ) -> Result<(SubagentInfo, SessionInfo, crate::BranchInfo)> {
+        self.create_subagent_session_inner(
+            owner,
+            parent_session,
+            parent_branch,
+            parent_turn_id,
+            title,
+            task_sha256,
+            identity,
+            delegation_root_id,
+            delegation_allocation_id,
+            depth,
+            tool_mode,
+            execution_binding_id,
+            mode,
+            ChildIdentityAuthority::ParticipantSubmit,
             None,
         )
     }
@@ -1995,6 +2043,7 @@ impl SessionStore {
             tool_mode,
             execution_binding_id,
             mode,
+            ChildIdentityAuthority::Owner,
             Some((constructor_call_id, constructor_fingerprint)),
         )
     }
@@ -2015,6 +2064,7 @@ impl SessionStore {
         tool_mode: &str,
         execution_binding_id: Option<&str>,
         mode: SubagentMode,
+        identity_authority: ChildIdentityAuthority,
         constructor_replay: Option<(&str, &str)>,
     ) -> Result<(SubagentInfo, SessionInfo, crate::BranchInfo)> {
         label(title, 160)?;
@@ -2025,15 +2075,42 @@ impl SessionStore {
                 "Phase 42 does not grant trusted shell tools to child Agents",
             ));
         }
-        if parent_turn_id == 0 || identity.actor != *actor {
+        if parent_turn_id == 0 {
             return Err(Error::Denied(
-                "subagent admission must use the exact current actor/parent turn",
+                "subagent admission requires a current parent turn",
             ));
         }
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let (parent, branch) =
             require_active_parent_turn(&tx, actor, parent_session, parent_branch, parent_turn_id)?;
+        match identity_authority {
+            ChildIdentityAuthority::Owner => {
+                if identity.actor != *actor {
+                    return Err(Error::Denied(
+                        "subagent admission must use the exact current owner identity",
+                    ));
+                }
+            }
+            ChildIdentityAuthority::ParticipantSubmit => {
+                if identity.actor == *actor || depth != 1 || constructor_replay.is_some() {
+                    return Err(Error::Denied(
+                        "participant policy delegation must be a top-level non-owner transient child",
+                    ));
+                }
+                let participation = session_participation::authorize_in(
+                    &tx,
+                    &identity.actor,
+                    parent_session,
+                    SessionParticipationAction::Submit,
+                )?;
+                if participation.owner {
+                    return Err(Error::Denied(
+                        "participant policy delegation unexpectedly resolved as owner",
+                    ));
+                }
+            }
+        }
         if let Some((call_id, fingerprint)) = constructor_replay {
             let existing: Option<String> = db(tx
                 .query_row(
@@ -2067,6 +2144,13 @@ impl SessionStore {
         }
         let root = delegation_root_row(&tx, delegation_root_id)?;
         let allocation = delegation_allocation_row(&tx, delegation_allocation_id)?;
+        if identity_authority == ChildIdentityAuthority::ParticipantSubmit
+            && root.child_routing_revision_id.is_some()
+        {
+            return Err(Error::Denied(
+                "participant policy delegation cannot change provider identity through child routing",
+            ));
+        }
         if root.state != "active"
             || now() >= root.deadline_at
             || depth == 0
@@ -2177,7 +2261,9 @@ impl SessionStore {
                     |r| r.get(0),
                 ))?;
                 let parent_identity: InvocationIdentity = decode(&parent_identity_json)?;
-                if parent_identity != *identity {
+                if identity_authority == ChildIdentityAuthority::Owner
+                    && parent_identity != *identity
+                {
                     return Err(Error::Denied(
                         "inherit-mode child must keep the exact root parent account/model identity",
                     ));
@@ -2887,10 +2973,8 @@ impl SessionStore {
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let info = row(&tx, id)?;
-        if !principal_is_session_owner(&tx, &info.parent_session_id, actor)?
-            || info.identity.actor != *actor
-        {
-            return Err(Error::Denied("subagent lifecycle belongs to another actor"));
+        if !principal_is_session_owner(&tx, &info.parent_session_id, actor)? {
+            return Err(Error::Denied("subagent lifecycle belongs to another owner"));
         }
         let at = now();
         if let (Some(root_id), Some(allocation_id)) = (
@@ -2953,10 +3037,8 @@ impl SessionStore {
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let info = row(&tx, id)?;
-        if !principal_is_session_owner(&tx, &info.parent_session_id, actor)?
-            || info.identity.actor != *actor
-        {
-            return Err(Error::Denied("subagent lifecycle belongs to another actor"));
+        if !principal_is_session_owner(&tx, &info.parent_session_id, actor)? {
+            return Err(Error::Denied("subagent lifecycle belongs to another owner"));
         }
         let at = now();
         let changed = db(tx.execute(
@@ -3027,10 +3109,8 @@ impl SessionStore {
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let info = row(&tx, id)?;
-        if !principal_is_session_owner(&tx, &info.parent_session_id, actor)?
-            || info.identity.actor != *actor
-        {
-            return Err(Error::Denied("subagent lifecycle belongs to another actor"));
+        if !principal_is_session_owner(&tx, &info.parent_session_id, actor)? {
+            return Err(Error::Denied("subagent lifecycle belongs to another owner"));
         }
         let at = now();
         let changed = db(tx.execute(

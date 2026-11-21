@@ -15,18 +15,23 @@ use aw_tools::{
 };
 use std::{
     collections::VecDeque,
+    future::Future,
     io,
+    pin::Pin,
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
 use thiserror::Error;
+#[cfg(target_os = "linux")]
+mod linux_spawn;
+
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
     sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
-    time::{sleep, timeout},
+    time::{sleep_until, timeout, Instant},
 };
 
 pub const CAPTURE_HEAD: usize = 48 * 1024;
@@ -37,6 +42,10 @@ pub const MAX_STDIN_WRITE: usize = 64 * 1024;
 const REAP_DEADLINE: Duration = Duration::from_secs(2);
 const READER_DRAIN_DEADLINE: Duration = Duration::from_millis(600);
 const GRACEFUL_TERM: Duration = Duration::from_millis(350);
+#[cfg(windows)]
+const WINDOWS_OCCUPANCY_SETTLE: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const WINDOWS_OCCUPANCY_POLL: Duration = Duration::from_millis(10);
 const PROCESS_INPUT_QUEUE: usize = 16;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -55,6 +64,10 @@ pub enum Error {
     OwnerGone(&'static str),
     #[error("{0}")]
     Conflict(&'static str),
+    #[error("process launch cancelled before spawn")]
+    CancelledBeforeSpawn,
+    #[error("process launch deadline expired before spawn")]
+    TimedOutBeforeSpawn,
     #[error("process input deadline exceeded")]
     Timeout,
 }
@@ -76,12 +89,47 @@ pub trait OutputSink: Send + 'static {
     fn finish(&mut self) -> std::result::Result<(), SinkError>;
 }
 
+pub struct SpawnControl {
+    deadline: Instant,
+    cancelled: Box<dyn Fn() -> bool + Send + 'static>,
+    cancelled_signal: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+}
+
+impl SpawnControl {
+    pub fn new(
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            deadline,
+            cancelled: Box::new(cancelled),
+            cancelled_signal: Box::pin(cancelled_signal),
+        }
+    }
+
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    fn check(&self) -> Result<()> {
+        if (self.cancelled)() {
+            return Err(Error::CancelledBeforeSpawn);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Error::TimedOutBeforeSpawn);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub struct SpawnOptions {
     pub stdin_open: bool,
     pub stdout: Option<Box<dyn OutputSink>>,
     pub stderr: Option<Box<dyn OutputSink>>,
     pub event_sink: Option<Arc<dyn ExecutionEventSink>>,
+    pub control: Option<SpawnControl>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,8 +551,15 @@ impl Scope {
         stop_evidence(self.platform.terminate())
     }
 
-    fn kill_main(&mut self) {
-        let _ = self.child.start_kill();
+    fn kill_main(&mut self) -> StopEvidence {
+        #[cfg(unix)]
+        let result = self.child.start_kill();
+        #[cfg(windows)]
+        let result = self.platform.kill_leader();
+        match result {
+            Ok(()) => StopEvidence::Stopped,
+            Err(_) => StopEvidence::Unknown,
+        }
     }
 
     async fn reap(&mut self) -> io::Result<ExitStatus> {
@@ -531,6 +586,9 @@ pub struct Process {
     stdout: Reader,
     stderr: Reader,
     readers: [JoinHandle<()>; 2],
+    execution_deadline: Option<Instant>,
+    known_exit: Option<ProcessExit>,
+    known_occupancy: Option<Occupancy>,
     termination_attempted: bool,
     stop_state: StopTracker,
     event_sink: Option<Arc<dyn ExecutionEventSink>>,
@@ -541,9 +599,18 @@ impl Process {
     ///
     /// The caller must not preconfigure process containment or stdio ownership;
     /// those are lifetime-sensitive and are owned here.
-    pub fn spawn(mut command: Command, options: SpawnOptions) -> Result<Self> {
+    pub async fn spawn(mut command: Command, options: SpawnOptions) -> Result<Self> {
+        let SpawnOptions {
+            stdin_open,
+            stdout,
+            stderr,
+            event_sink,
+            control,
+        } = options;
+        let execution_deadline = control.as_ref().map(SpawnControl::deadline);
+
         command
-            .stdin(if options.stdin_open {
+            .stdin(if stdin_open {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -557,34 +624,55 @@ impl Process {
         #[cfg(windows)]
         aw_platform::configure_managed_process(command.as_std_mut());
 
-        let mut child = command.spawn()?;
-        let Some(pid) = child.id() else {
-            let _ = child.start_kill();
-            return Err(Error::SetupUncertain(
-                "process launched but PID/setup outcome is uncertain",
-            ));
+        #[cfg(target_os = "linux")]
+        let (mut platform, mut child, pid) = {
+            let spawned = linux_spawn::spawn(command, control).await?;
+            (spawned.platform, spawned.child, spawned.pid)
         };
 
-        #[cfg(unix)]
-        let mut platform = match aw_platform::DirectScope::attach(pid) {
-            Ok(scope) => scope,
-            Err(_) => {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let (mut platform, mut child, pid) = {
+            if let Some(control) = control.as_ref() {
+                control.check()?;
+            }
+            let mut child = command.spawn()?;
+            let Some(pid) = child.id() else {
                 let _ = child.start_kill();
                 return Err(Error::SetupUncertain(
-                    "process launched but Process scope setup is uncertain",
+                    "process launched but PID/setup outcome is uncertain",
                 ));
-            }
+            };
+            let platform = match aw_platform::DirectScope::attach(pid) {
+                Ok(scope) => scope,
+                Err(_) => {
+                    let _ = child.start_kill();
+                    return Err(Error::SetupUncertain(
+                        "process launched but Process scope setup is uncertain",
+                    ));
+                }
+            };
+            (platform, child, pid)
         };
 
         #[cfg(windows)]
-        let mut platform = {
+        let (mut platform, mut child, pid) = {
+            if let Some(control) = control.as_ref() {
+                control.check()?;
+            }
+            let mut child = command.spawn()?;
+            let Some(pid) = child.id() else {
+                let _ = child.start_kill();
+                return Err(Error::SetupUncertain(
+                    "process launched but PID/setup outcome is uncertain",
+                ));
+            };
             let Some(handle) = child.raw_handle() else {
                 let _ = child.start_kill();
                 return Err(Error::SetupUncertain(
                     "process launched but Windows handle/setup outcome is uncertain",
                 ));
             };
-            match aw_platform::DirectScope::attach(pid, handle) {
+            let platform = match aw_platform::DirectScope::attach(pid, handle) {
                 Ok(scope) => scope,
                 Err(_) => {
                     let _ = child.start_kill();
@@ -592,17 +680,18 @@ impl Process {
                         "process launched but Windows Process scope setup is uncertain",
                     ));
                 }
-            }
+            };
+            (platform, child, pid)
         };
 
-        let Some(stdout) = child.stdout.take() else {
+        let Some(stdout_pipe) = child.stdout.take() else {
             let _ = platform.terminate();
             let _ = child.start_kill();
             return Err(Error::SetupUncertain(
                 "process launched but stdout setup outcome is uncertain",
             ));
         };
-        let Some(stderr) = child.stderr.take() else {
+        let Some(stderr_pipe) = child.stderr.take() else {
             let _ = platform.terminate();
             let _ = child.start_kill();
             return Err(Error::SetupUncertain(
@@ -611,8 +700,8 @@ impl Process {
         };
         let stdin = child.stdin.take();
 
-        let (stdout_reader, stdout_task) = Reader::start(stdout, options.stdout);
-        let (stderr_reader, stderr_task) = Reader::start(stderr, options.stderr);
+        let (stdout_reader, stdout_task) = Reader::start(stdout_pipe, stdout);
+        let (stderr_reader, stderr_task) = Reader::start(stderr_pipe, stderr);
 
         Ok(Self {
             scope: Scope::new(platform, child, pid),
@@ -620,9 +709,12 @@ impl Process {
             stdout: stdout_reader,
             stderr: stderr_reader,
             readers: [stdout_task, stderr_task],
+            execution_deadline,
+            known_exit: None,
+            known_occupancy: None,
             termination_attempted: false,
             stop_state: StopTracker::default(),
-            event_sink: options.event_sink,
+            event_sink,
         })
     }
 
@@ -636,6 +728,14 @@ impl Process {
             stdout: self.stdout.snapshot(),
             stderr: self.stderr.snapshot(),
         }
+    }
+
+    fn wait_deadline(&self, fallback: Duration) -> Instant {
+        self.execution_deadline.unwrap_or_else(|| {
+            Instant::now()
+                .checked_add(fallback)
+                .unwrap_or_else(Instant::now)
+        })
     }
 
     pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
@@ -694,20 +794,25 @@ impl Process {
         cancellation: C,
         deadline: Duration,
     ) -> ProcessResult {
+        let absolute = self.wait_deadline(deadline);
+        let timer = sleep_until(absolute);
+        tokio::pin!(timer);
+        let cancellation = cancellation;
+        tokio::pin!(cancellation);
         let (exit, stop, occupancy) = tokio::select! {
             biased;
-            _ = cancellation => {
+            _ = &mut cancellation => {
                 let (record, exit, occupancy) = self.stop(StopReason::Cancelled).await;
                 (exit, Some(record), occupancy)
             },
-            result = timeout(deadline, self.settle_natural_exit()) => match result {
-                Ok(Ok(settled)) => settled,
-                Ok(Err(_)) => {
-                    let (record, exit, occupancy) = self.stop(StopReason::RuntimeError).await;
-                    (exit, Some(record), occupancy)
-                }
+            _ = &mut timer => {
+                let (record, exit, occupancy) = self.stop(StopReason::Timeout).await;
+                (exit, Some(record), occupancy)
+            },
+            result = self.settle_natural_exit() => match result {
+                Ok(settled) => settled,
                 Err(_) => {
-                    let (record, exit, occupancy) = self.stop(StopReason::Timeout).await;
+                    let (record, exit, occupancy) = self.stop(StopReason::RuntimeError).await;
                     (exit, Some(record), occupancy)
                 }
             },
@@ -723,7 +828,7 @@ impl Process {
     ) -> ProcessResult {
         let cancellation = cancellation;
         tokio::pin!(cancellation);
-        let deadline = sleep(deadline);
+        let deadline = sleep_until(self.wait_deadline(deadline));
         tokio::pin!(deadline);
 
         let (exit, stop, occupancy) = loop {
@@ -903,15 +1008,48 @@ impl Process {
         self.record_stop(reason, evidence)
     }
 
+    fn remember_exit(&mut self, status: ExitStatus) -> ProcessExit {
+        let exit = exit_fact(status);
+        self.known_exit = Some(exit);
+        exit
+    }
+
     #[cfg(unix)]
     async fn settle_natural_exit(
         &mut self,
     ) -> Result<(ProcessExit, Option<StopRecord>, Occupancy)> {
         self.scope.wait_ready().await?;
         let occupancy = self.scope.observe();
+        self.known_occupancy = Some(occupancy);
         let cleanup = self.stop_scope(None);
         let status = self.scope.reap().await?;
-        Ok((exit_fact(status), Some(cleanup), occupancy))
+        let exit = self.remember_exit(status);
+        Ok((exit, Some(cleanup), occupancy))
+    }
+
+    #[cfg(windows)]
+    async fn settle_windows_occupancy(&mut self) -> Occupancy {
+        let until = Instant::now() + WINDOWS_OCCUPANCY_SETTLE;
+        loop {
+            match self.scope.observe() {
+                Occupancy::Empty => {
+                    self.known_occupancy = Some(Occupancy::Empty);
+                    return Occupancy::Empty;
+                }
+                Occupancy::Unknown => {
+                    self.known_occupancy = Some(Occupancy::Unknown);
+                    return Occupancy::Unknown;
+                }
+                Occupancy::Live if Instant::now() >= until => {
+                    self.known_occupancy = Some(Occupancy::Live);
+                    return Occupancy::Live;
+                }
+                Occupancy::Live => {
+                    let next = (Instant::now() + WINDOWS_OCCUPANCY_POLL).min(until);
+                    sleep_until(next).await;
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -919,14 +1057,44 @@ impl Process {
         &mut self,
     ) -> Result<(ProcessExit, Option<StopRecord>, Occupancy)> {
         let status = self.scope.reap().await?;
-        let occupancy = self.scope.observe();
+        let exit = self.remember_exit(status);
+        let occupancy = self.settle_windows_occupancy().await;
         let cleanup = self.stop_scope(None);
-        Ok((exit_fact(status), Some(cleanup), occupancy))
+        Ok((exit, Some(cleanup), occupancy))
+    }
+
+    async fn settle_preexisting_exit(&mut self) -> (StopRecord, ProcessExit, Occupancy) {
+        #[cfg(unix)]
+        let occupancy = self.known_occupancy.unwrap_or_else(|| self.scope.observe());
+
+        #[cfg(windows)]
+        let occupancy = self
+            .known_occupancy
+            .unwrap_or_else(|| match self.scope.observe() {
+                Occupancy::Empty => Occupancy::Empty,
+                Occupancy::Live | Occupancy::Unknown => Occupancy::Unknown,
+            });
+
+        self.known_occupancy = Some(occupancy);
+        let cleanup = self.stop_scope(None);
+        let exit = if let Some(exit) = self.known_exit {
+            exit
+        } else {
+            match timeout(REAP_DEADLINE, self.scope.reap()).await {
+                Ok(Ok(status)) => self.remember_exit(status),
+                _ => ProcessExit::Unknown,
+            }
+        };
+        (cleanup, exit, occupancy)
     }
 
     async fn stop(&mut self, reason: StopReason) -> (StopRecord, ProcessExit, Occupancy) {
         self.termination_attempted = true;
         self.stdin.take();
+
+        if self.known_exit.is_some() || matches!(self.scope.ready(), Ok(true)) {
+            return self.settle_preexisting_exit().await;
+        }
 
         let graceful = self.scope.graceful();
         let graceful_record = self.record_stop(Some(reason), graceful);
@@ -939,15 +1107,20 @@ impl Process {
             )
         {
             let occupancy = self.scope.observe();
+            self.known_occupancy = Some(occupancy);
             let cleanup = self.stop_scope(None);
-            let exit = match timeout(REAP_DEADLINE, self.scope.reap()).await {
-                Ok(Ok(status)) => exit_fact(status),
-                _ => ProcessExit::Unknown,
+            let status = match timeout(REAP_DEADLINE, self.scope.reap()).await {
+                Ok(Ok(status)) => Some(status),
+                _ => None,
             };
+            let exit = status
+                .as_ref()
+                .map_or(ProcessExit::Unknown, |status| exit_fact(*status));
+            self.known_exit = Some(exit);
             let record = if cleanup.evidence == StopEvidence::Unknown {
                 StopRecord::new(reason, StopEvidence::Unknown)
             } else {
-                graceful_record
+                reconcile_stop(graceful_record, status.as_ref(), false)
             };
             return (record, exit, occupancy);
         }
@@ -955,12 +1128,26 @@ impl Process {
         #[cfg(windows)]
         let _ = graceful;
 
-        let record = self.stop_scope(Some(reason));
-        self.scope.kill_main();
-        let exit = match timeout(REAP_DEADLINE, self.scope.reap()).await {
-            Ok(Ok(status)) => exit_fact(status),
-            _ => ProcessExit::Unknown,
+        // The leader may have become terminal while graceful settlement was
+        // pending. Physical status established before the force stop wins.
+        if matches!(self.scope.ready(), Ok(true)) {
+            return self.settle_preexisting_exit().await;
+        }
+
+        let mut record = self.stop_scope(Some(reason));
+        if record.evidence != StopEvidence::Stopped {
+            let fallback = self.scope.kill_main();
+            record = self.record_stop(Some(reason), fallback);
+        }
+        let status = match timeout(REAP_DEADLINE, self.scope.reap()).await {
+            Ok(Ok(status)) => Some(status),
+            _ => None,
         };
+        let exit = status
+            .as_ref()
+            .map_or(ProcessExit::Unknown, |status| exit_fact(*status));
+        self.known_exit = Some(exit);
+        record = reconcile_stop(record, status.as_ref(), true);
         (record, exit, Occupancy::Unknown)
     }
 }
@@ -985,6 +1172,19 @@ fn exit_fact(status: ExitStatus) -> ProcessExit {
     ProcessExit::Unknown
 }
 
+fn reconcile_stop(mut record: StopRecord, status: Option<&ExitStatus>, force: bool) -> StopRecord {
+    if record.reason.is_some()
+        && record.evidence == StopEvidence::Stopped
+        && status.is_some_and(|status| !aw_platform::stop_exit_matches(status, force))
+    {
+        // The stop operation reached live containment, but this physical main
+        // exit is incompatible with our signal/marker. Retain operation evidence
+        // without falsely attributing the command ending to timeout/cancel.
+        record.reason = None;
+    }
+    record
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,6 +1198,146 @@ mod tests {
             occupancy(Err(io::Error::other("unavailable"))),
             Occupancy::Unknown
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_lane_rechecks_cancellation_before_exec() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let cancellation = probes.clone();
+        let control = SpawnControl::new(
+            Instant::now() + Duration::from_secs(3),
+            move || cancellation.fetch_add(1, Ordering::SeqCst) != 0,
+            std::future::pending(),
+        );
+        let command = Command::new("/definitely/not/an/aw-process-command");
+        let error = match Process::spawn(
+            command,
+            SpawnOptions {
+                control: Some(control),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("lane-side recheck must suppress exec"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::CancelledBeforeSpawn));
+        assert!(probes.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn controlled_spawn_reuses_one_absolute_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 5"]);
+        let process = Process::spawn(
+            command,
+            SpawnOptions {
+                control: Some(SpawnControl::new(
+                    deadline,
+                    || false,
+                    std::future::pending(),
+                )),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let result = process
+            .wait(std::future::pending::<()>(), Duration::from_secs(5))
+            .await;
+        assert_eq!(result.terminal.stop_reason(), Some(StopReason::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "wait restarted the full fallback timeout"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_lifetime_spawn_parent_survives_submitting_thread_exit() {
+        use std::{
+            os::unix::process::CommandExt as _,
+            path::PathBuf,
+            sync::mpsc,
+            thread,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker: PathBuf =
+            std::env::temp_dir().join(format!("aw-process-parent-{}-{suffix}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "sleep 0.15; printf survived > '{}'; sleep 5",
+            marker.display()
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let process = runtime.block_on(async move {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", &script]);
+                // SAFETY: prctl is async-signal-safe and this callback performs
+                // no allocation or lock acquisition in the child.
+                unsafe {
+                    command.as_std_mut().pre_exec(|| {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                Process::spawn(command, SpawnOptions::default())
+                    .await
+                    .unwrap()
+            });
+            tx.send(process).unwrap();
+            // Dropping this runtime and ending this OS thread would kill the
+            // child if the request thread itself were still the fork parent.
+        })
+        .join()
+        .unwrap();
+
+        let process = rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"survived");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut process = process;
+            let _ = process.terminate().await;
+        });
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incompatible_exit_does_not_acquire_stop_cause() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let status = ExitStatus::from_raw(0);
+        let record = reconcile_stop(
+            StopRecord::stopped(StopReason::Cancelled),
+            Some(&status),
+            true,
+        );
+        assert_eq!(record.reason, None);
+        assert_eq!(record.evidence, StopEvidence::Stopped);
     }
 
     #[derive(Clone)]

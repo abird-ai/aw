@@ -65,7 +65,7 @@ pub enum Action {
     Claim,
     Start,
     Settle(Status),
-    /// Original host proved a claimed runner never launched.
+    /// Original host proved an in-flight runner never launched.
     UnlaunchedSkip,
     Skip,
     Cancel,
@@ -366,7 +366,12 @@ impl Job {
                 Some(NodeState::Running { .. }) => result.primary != Primary::Skip,
                 _ => false,
             },
-            (Some(_), Action::UnlaunchedSkip) => matches!(current, Some(NodeState::Claimed { .. })),
+            (Some(_), Action::UnlaunchedSkip) => {
+                matches!(
+                    current,
+                    Some(NodeState::Claimed { .. } | NodeState::Running { .. })
+                )
+            }
             (Some(coordinate), Action::Skip) => {
                 current == Some(NodeState::Pending)
                     && (self.state != Lifecycle::Running || self.ready(coordinate)? == Some(false))
@@ -621,26 +626,26 @@ impl Job {
         }
         self.persist(Some(coordinate), Action::Settle(result), sequence, persist)
     }
-    /// A claimed node can be skipped only after the original Process
-    /// host positively verifies no effect or runner was launched.
+    /// An in-flight node can be skipped only after the original Process host
+    /// positively verifies no effect or runner was launched.
     pub fn settle_unlaunched(
         &mut self,
         coordinate: usize,
-        claimed_sequence: u64,
+        expected: NodeState,
         sequence: u64,
         prove_no_launch: impl FnOnce([u8; 32], u64) -> Result<(), Error>,
         persist: impl FnOnce(Transition) -> Result<(), JournalError>,
     ) -> Result<(), Error> {
-        if self.state(coordinate)
-            != Some(NodeState::Claimed {
-                sequence: claimed_sequence,
-            })
-        {
+        let expected_sequence = match expected {
+            NodeState::Claimed { sequence } | NodeState::Running { sequence } => sequence,
+            NodeState::Pending | NodeState::Terminal { .. } => return Err(Error::InvalidState),
+        };
+        if self.state(coordinate) != Some(expected) {
             return Err(Error::StaleGeneration);
         }
         let key = self.node_key(coordinate)?;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prove_no_launch(key, claimed_sequence)
+            prove_no_launch(key, expected_sequence)
         }))
         .map_err(|_| Error::NotPermitted)??;
         self.persist(Some(coordinate), Action::UnlaunchedSkip, sequence, persist)
@@ -898,7 +903,7 @@ mod tests {
         );
         j.settle_unlaunched(
             1,
-            6,
+            NodeState::Claimed { sequence: 6 },
             8,
             |_, claim| {
                 assert_eq!(claim, 6);
@@ -924,6 +929,28 @@ mod tests {
             ),
             Err(Error::InvalidState)
         );
+        running
+            .settle_unlaunched(
+                1,
+                NodeState::Running { sequence: 7 },
+                8,
+                |_, sequence| {
+                    assert_eq!(sequence, 7);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(matches!(
+            running.state(1),
+            Some(NodeState::Terminal {
+                status: Status {
+                    primary: Primary::Skip,
+                    ..
+                },
+                ..
+            })
+        ));
     }
     #[test]
     fn cancelling_escalates_to_revocation_and_is_durably_recorded() {
@@ -975,7 +1002,7 @@ mod tests {
         assert_eq!(
             j.settle_unlaunched(
                 1,
-                6,
+                NodeState::Claimed { sequence: 6 },
                 7,
                 |_, _| Err(Error::NotPermitted),
                 |_| panic!("proof denied")
@@ -984,8 +1011,14 @@ mod tests {
         );
         assert_eq!(j.state(1), Some(NodeState::Claimed { sequence: 6 }));
         assert_eq!(j.sequence(), 6);
-        j.settle_unlaunched(1, 6, 7, |_, _| Ok(()), |_| Ok(()))
-            .unwrap();
+        j.settle_unlaunched(
+            1,
+            NodeState::Claimed { sequence: 6 },
+            7,
+            |_, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(
             j.state(1),
             Some(NodeState::Terminal {

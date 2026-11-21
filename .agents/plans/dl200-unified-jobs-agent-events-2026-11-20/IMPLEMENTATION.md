@@ -2,7 +2,7 @@
 
 Base design: [SPEC.md](SPEC.md)
 
-Status: **R6 SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS**
+Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION AMENDMENT SEALED / IMPLEMENTATION PROMOTED / PHASE-0 CORRECTIVE IMPLEMENTATION GATE PENDING**
 
 Original R1 seal: explicit user approval on 2026-11-20.
 R2 amendment/reseal: 2026-11-21 after the Process/Event/replay/registry/owner-boundary reviews.
@@ -69,9 +69,18 @@ requalify unchanged primitives at every step.
   over-granulate fixtures/evidence.
 - No commit, push, tag, release or deploy unless separately requested.
 
-## Phase 0 — shared Process settlement + dotlink 0.17.6 convergence
+## Phase 0 — shared Process settlement + dotlink 0.17.7 convergence
 
-Status: **IN PROGRESS**.
+Status: **SHARED CUT COMPLETE / AW + DOTLINK PROCESS CONSUMER SOURCE IMPLEMENTED LOCALLY / PHASE 0B COMPLETE LOCALLY / PUBLICATION + REPIN + REAL-BUBBLEWRAP + WINDOWS-NATIVE QUALIFICATION PENDING**.
+
+The earlier Phase-0 acceptance remains valid historical evidence for the v0.17.6 convergence,
+but dotlink **v0.17.7** (`aefe5e7`, fix `64e3bd8`) exposed one shared Linux launch-lifetime bug
+that the accepted `aw-process` source still contains: `Process::spawn` directly calls Tokio
+`Command::spawn()` on the requesting worker. A launcher using Linux `PR_SET_PDEATHSIG` (Bubblewrap
+`--die-with-parent`) therefore follows that retireable worker thread, not the host process. This is
+a focused post-acceptance correction, not a re-run of all Phase 0 and not a new public phase. It
+must be resolved before Phase 1; do not explain later SIGKILLs as external host noise until this
+shared path is fixed/qualified.
 
 ### R6 shared-Process cross-repo checkpoint — published source (2026-11-21)
 
@@ -86,21 +95,129 @@ The R6 shared-runtime source cut is complete across AW and dotlink:
   writes, and bounded reader quiescence that flushes already-captured partial sink batches;
 - AW adapter and dotlink contain no parallel Scope/Child/Reader/wait/stop/drain owner;
 - dotlink `16475e4` deletes `src/shell_process.rs`, stores canonical optional ProcessTerminal in
-  JobCompletion, retains exact `tree=leftovers|unknown` compatibility projection, uses non-login
-  Bash, and owns the 30-minute guidance / 35-minute hard conversational horizon;
+  JobCompletion, retains exact `tree=leftovers|unknown` compatibility projection and uses non-login
+  Bash. Its historical 30/35 turn projection is superseded by the pending audited v0.17.8
+  dotlink-only 25/35/10 convergence below;
 - PTY Terminal custody remains in `aw-terminal` and is not folded into Process Scope.
 
 Grouped evidence remains intentionally compact: AW `aw-process` 3/3, runner 4/4 and adapter
 Process 27/27 are green; dotlink final all-target/all-feature source graph and strict Clippy
-`-D warnings` are green; rustfmt/diff checks are green. A real dotlink shell executable run
-reached 133 pass / 1 fail before the last shared drain-flush fix; that sole failure is now the
-focused AW regression test. L5 externally SIGKILLs the final dotlink test/binary during codegen/
-link before execution after pin changes. Do not fragment the suite to manufacture acceptance.
+`-D warnings` are green; rustfmt/diff checks are green. The final L5 executable rerun is also
+green: shell **134/134** plus child-env **1/1**, Process **18/18** plus two process integration
+tests, and Remote Start/replay **16/16**. Those successful reruns remain valid for unchanged
+semantics. Earlier cold codegen/link SIGKILLs are no longer attributed to the external host after
+the v0.17.7 parent-thread discovery; they are inconclusive infrastructure interruptions that may
+have been caused by the retireable-worker spawn bug. No fixture fragmentation was needed.
 
-Remaining Process gate: rerun the grouped shell/Process/Remote-Start executable qualification
-on a host where dotlink linking is not externally killed. Phase 0 is not accepted until that
-behavior gate is green. The stronger PID-1 launcher/backend remains separately promoted future
-work.
+The original v0.17.6 convergence gate was accepted. **That acceptance is now amended only for the
+post-v0.17.7 Process-launch correctness items below.** The stronger PID-1 launcher/backend remains
+separately promoted future work and is not part of this corrective gate.
+
+### Shared Process/release-correction amendment — **SEALED 2026-11-21**, origin v0.17.7 / required before further DL-200 implementation
+
+Port the release semantics **down into the existing shared owners**, never by resurrecting
+`dotlink::shell_process` on main. The sealed high-concurrency refinement is one logical private
+Linux Spawn Facility with stable process-lifetime lanes—not one thread per Process and not one
+Process pinned to one lane:
+
+1. **Linux Spawn Facility, O(1) lanes / O(n) Processes.** `aw-process` owns one private logical
+   facility with a small fixed/add-only set of process-lifetime OS-thread Spawn Lanes. Start with
+   **N=1**. Every Linux non-PTY spawn crosses this facility; only the short `Command::spawn` + exact
+   `DirectScope` attachment executes on a lane. The resulting `Process` remains `Send` and all
+   stdin/wait/cancel/output/settlement work remains ordinary Tokio work that may migrate between
+   workers. A long-running command never occupies its Spawn Lane after custody transfer.
+2. **Async bounded admission + linearizable stale-launch rejection.** Change/use the shared spawn
+   handoff as an async operation. Hosts transfer the authorized `tokio::process::Command` **by
+   value** through bounded async admission/backpressure. Do not use `block_in_place`,
+   `spawn_blocking` or a synchronous caller rendezvous; runtime-managed blocking workers can retire
+   and do not satisfy the parent-lifetime contract. Each request carries the originating Tokio
+   `Handle` only so the lane can enter that runtime for child registration.
+
+   Import the **v0.17.9 (`576d0a1`)** rule: cancellation/expiry is rechecked on the Spawn Lane
+   immediately before fork because a request may become stale while queued behind another launch.
+   Keep `aw-process` Agent-neutral by using a private linearizable launch gate rather than importing
+   a product cancellation-token type. Conceptually the async side and lane race on
+   `Pending | Cancelled | TimedOut | Launching`; the lane CASes `Pending -> Launching` immediately
+   before `Command::spawn`. `Cancelled`/`TimedOut` wins => **no child is created** and the shared
+   spawn result reports a pre-spawn outcome, never a Process stop. `Launching` wins => any later
+   cancellation/deadline is handled by normal Process settlement.
+
+   The runner establishes one **absolute execution deadline** when it enters Running, before Spawn
+   Facility admission. The same deadline fences the lane and the later Process wait: Spawn-Lane
+   queueing consumes execution budget; pre-Running product queue/preparation time does not. Do not
+   restart a fresh full timeout after spawn.
+3. **RAII custody before publication.** The lane spawns exactly once only after its final launch
+   gate succeeds, obtains child identity, attaches the exact `DirectScope`, then constructs private
+   `Spawned { Child, DirectScope, pid }`. Only this complete package may cross back to the caller.
+   If the reply receiver vanished, failed transfer returns/retains `Spawned` and RAII settles the
+   just-created scope. If cancellation/expiry wins before `Launching`, discard the unexecuted
+   Command and return `CancelledBeforeSpawn`/`TimedOutBeforeSpawn` (names descriptive): no
+   `ProcessTerminal`, `StopRecord`, occupancy, signal or "killed" claim exists because no Process
+   existed. If `Launching` won and the caller disappears, RAII cleans the real child; never orphan
+   or retry it. `kill_on_drop` remains only the final child fail-safe; `DirectScope` owns
+   containment.
+4. **Lane lifetime/failure semantics.** Spawn Lanes never retire, shrink or recycle while the host
+   process lives; otherwise their still-running `PDEATHSIG` children may be killed. Future scaling
+   may use a fixed `N>1` or monotonic add-only lanes, never shrink. Per-request launch code is
+   panic-contained: RAII cleans partial state, the facility becomes poisoned/fails closed for new
+   launches, but the lane thread stays alive/parked so existing children survive. Failure to create
+   a lane before any accepted request may retry. Established-lane failure, facility poison, or a
+   lost reply after effectful submission is `SetupUncertain`/restart-required and is never repaired
+   by silently replacing the lane and replaying a Command.
+5. **No public pool/tuning surface.** Lane count is an internal performance property, never a
+   user/model/profile/API knob. Implement `N=1`; add lanes only if the focused spawn benchmark shows
+   material admission queueing. Benchmark concurrency `1/8/32/128` against lanes `1/2/4`, measuring
+   spawn throughput, queue-wait p50/p99, spawn-handshake p50/p99 and CPU. Prefer `N=1` unless those
+   measurements justify more. Do not build a generic pool scheduler in advance.
+6. **Wake != terminal fact.** Keep SIGCHLD/pidfd readiness only as wakeups. Tighten Linux
+   `DirectScope` so cleanup eligibility requires strict parent-owned non-reaping
+   `waitid(WEXITED|WNOHANG|WNOWAIT)` for the main child. Do not use the generic nonchild
+   pidfd-readiness fallback (`ECHILD -> poll`) to authorize a group sweep. Retain the leader
+   unreaped through occupancy observation + final group signal, then reap.
+7. **Exit and stop remain independent facts.** `StopRecord` records a containment stop operation;
+   delivered stop evidence alone does not prove it caused `ProcessExit`. A status published first
+   or physically incompatible with the delivered termination wins. Leftover cleanup never
+   relabels the main ending. Replace/avoid projections that infer `stopped_by` from
+   `StopRecord::terminal_reason()` alone; derive causal wording from the complete
+   `ProcessTerminal`. A signal without reconciled shared stop is *unattributed*, not proven
+   external. Keep first-requester caller/connector attribution at the dotlink host edge, recorded
+   before firing its cancellation token; shared AW still carries only semantic `Cancelled`.
+8. **Windows noninteractive launch + interruptible occupancy settling.**
+   `aw-platform-win::configure_managed_process` uses `CREATE_SUSPENDED | CREATE_NO_WINDOW`, then
+   existing Job Object attach + resume. Do not use `DETACHED_PROCESS`; PTY launch remains separate
+   in `aw-terminal`. Port the post-v0.17.8 `81ef891` rule plus the v0.17.9 refinement into the
+   shared owner: after the exact main process is terminal, do not publish `Occupancy::Live` from the
+   first nonzero Job accounting sample because transient no-window console/job infrastructure may
+   still be leaving. `aw-platform-win` supplies instantaneous exact active-member accounting;
+   `aw-process` performs a bounded async settle (initial reference: <=2s, ~10ms cadence): zero at
+   any query => Empty, nonzero for the whole **uninterrupted** bound => Live, query failure =>
+   Unknown. Cancellation or the execution deadline preempts this grace and sweeps immediately;
+   unless Empty was already proven, interrupted settling publishes Occupancy Unknown while
+   preserving the main command's physical exit. A nonblocking/try-wait path may accept immediate
+   zero as Empty but must treat immediate nonzero as Unknown unless it performs the full settle.
+   No image-name/conhost exemptions, and never sleep the settle window directly on a Tokio worker.
+9. **One focused consumer gate, not fixture proliferation.** AW: force the requesting Tokio worker
+   to retire and prove a `PDEATHSIG` child survives while its async Process task can continue on
+   another worker; queue a launch behind the lane, cancel it and separately expire its absolute
+   deadline before the lane claims it, and prove no exec occurs and no Process stop fact is
+   fabricated; race cancellation after `Launching` and prove any real child follows normal RAII/
+   Process settlement; prove a poisoned launch request does not terminate the lane/existing
+   children; prove Spawn-Lane delay consumes the same absolute execution deadline rather than
+   granting a fresh timeout; prove spurious pidfd readiness cannot authorize cleanup; prove an
+   earlier/incompatible physical exit is not overwritten by a racing stop; cross-target/type-check
+   Windows launch flags; on Windows prove a clean `CREATE_NO_WINDOW` command with transient
+   console/job infrastructure settles to Empty, a real leftover remains Live through the settle
+   bound, and cancellation/deadline interrupts the grace immediately with Unknown rather than false
+   Live. Dotlink main then repins the fixed AW runtime and reuses the real v0.17.7 Bubblewrap,
+   post-v0.17.8 Windows and v0.17.9 stale-launch behavior gates. Re-run the existing grouped
+   Process/shell gate; do not copy a second launcher/observation state machine into dotlink.
+
+A dedicated launcher process is deliberately rejected for this direct fallback: making another
+process the kernel parent would move wait/reap/pipes/pidfds across IPC/SCM_RIGHTS and duplicate much
+of the separately promoted PID-1 supervisor. This correction does not thaw
+`017-sandbox-mount-convergence`, change `ProcessTerminal`'s public shape, add a generic
+`SpawnBroker`/pool API, or promote that future supervisor. It is a private sealed implementation
+correction inside the existing `aw-process`/`aw-platform` boundaries.
 
 ### Phase 0A checkpoint — shared facts + direct observation complete (2026-11-21)
 
@@ -198,10 +315,9 @@ The Process design was deliberately reopened before dotlink cutover and simplifi
 Focused existing Process regressions remain green after the ownership refactor; platform
 crates and adapter compile on Unix + Windows.
 
-**Resume boundary:** shared Process source convergence is complete. Rerun the final grouped
-executable shell/Process/Remote-Start gate on a host where linking succeeds and continue the
-outstanding Phase 0B replay/admission/exposure remediation without disturbing this owner.
-Do not start DL-200 Phase 1 yet.
+**Resume boundary:** Phase 0 shared Process convergence and executable acceptance are complete.
+Continue the outstanding Phase 0B replay/admission/exposure remediation without disturbing this
+owner. Do not start DL-200 Phase 1 until Phase 0B is resolved/reviewed.
 
 This phase is intentionally first. It fixes current reusable Process semantics before
 DL-200 builds more Jobs/Agent behavior on them.
@@ -331,7 +447,7 @@ DL-200 builds more Jobs/Agent behavior on them.
    - `Occupancy::Empty -> omit tree`;
    - per-stream drain-incomplete flags;
    - signal names via AW helper;
-   - `stopped_by` from semantic StopRecord;
+   - causal `stopped_by` derived from the reconciled full `ProcessTerminal`, never StopRecord alone;
    - one concise lifecycle log line.
 
 5. Product result policy:
@@ -344,17 +460,46 @@ DL-200 builds more Jobs/Agent behavior on them.
    - Windows equivalent: `Wait-Process`;
    - state process-group/Job containment boundaries honestly.
 
-7. Restore dotlink-owned bounded conversational runtime policy:
-   - recommended coherent checkpoint ≈ **30 minutes**;
-   - hard conversational command horizon = **35 minutes**;
-   - one runtime-profile source of truth drives model/server guidance, shell schema maximum
-     and runtime validation;
-   - effective shell deadline = min(configured shell policy, hard turn horizon);
-   - profiles without a bounded conversational turn keep the configured Process deadline
-     and omit turn-horizon guidance;
-   - `background=true` changes observation, not the command lifetime bound.
-
-8. Keep the turn horizon out of AW Process semantics.
+7. Port audited dotlink **v0.17.8** bounded-turn policy cleanly on top of the AW-backed main
+   runtime after the shared Process correction/repin:
+   - one dotlink-local `RuntimeSurfacePolicy` derived from `ActiveTransports.constraints()`;
+   - bounded turn horizon = **35 minutes**;
+   - hand-back/report reserve = **10 minutes**;
+   - bounded new-command ceiling = **25 minutes / 1500 s** (`horizon - reserve`), further narrowed
+     by the configured shell timeout;
+   - from minute 25, server instructions say open no new work: land/park current work, leave tree/
+     notes reportable, state done/pending and hand back before minute 35;
+   - `sync_hold.is_some()` is the capability that enables this policy; local-only uncapped runtimes
+     keep configured Process limits and no turn advice; the tightest active transport constraint
+     wins when transports share one machine/schema;
+   - effective command ceiling/transport constraint participates in execution-authority fingerprint
+     for **new** effects; current advisory capability is rebound at every machine construction and
+     does not rewrite/reclassify an already-running Job's immutable timeout;
+   - keep `background=true` as observation/handoff only; it never extends the admitted deadline;
+   - derive startup warning, server instructions, shell schema/runtime validation and near-deadline
+     Job advice from the same local policy values—no duplicated 25/35/10 constants.
+8. Keep the bounded-turn policy out of AW Process/Job semantics and use AW extension points by
+   composition:
+   - `aw-tools::JobManager` remains canonical for Job lifecycle/revision/output/ACK facts and stays
+     clock-/transport-policy-free;
+   - dotlink keeps only narrow local monotonic Job timing: `created` for observational
+     `elapsed_ms`, immutable admitted `timeout_secs`, and `execution_deadline: Option<Instant>` set
+     exactly when the runner enters Running; product queue/preparation age does not consume the
+     execution timeout, while Spawn-Facility queueing after Running does;
+   - use typed `runtime_snapshot`/ProcessTerminal/output facts; never parse a shared rendered receipt
+     and never mirror canonical lifecycle state locally merely to produce advice;
+   - AW `ReceiptProfile` provides factual `ts`, but dotlink bounded runtime sets
+     `checkpoint_minutes=None` so the generic AW ~checkpoint instruction cannot conflict with the
+     exact 25/35/10 product policy;
+   - v0.17.9 correction: `jobs_get` near-deadline note uses the runner's actual absolute
+     `execution_deadline`, never `timeout_secs - elapsed_ms`; Queued has no deadline/advice, Running
+     warns only inside `min(timeout/5, 5m)`, reached/cancelled deadlines are quiet, and the wording
+     names the execution deadline. Prepend the ordinary `next`; remain absent from list/read/ack/
+     cancel and terminal/cancelling/revoked/journal-Unknown views;
+   - if direct use of the shared jobs adapter blocks this composition later, factor only the
+     smallest typed factual Job-status projection seam at the first real consumer. Shared default
+     renderer and dotlink renderer consume the same facts; no arbitrary callback/plugin, generic
+     Job-policy trait, host clock in `aw-tools`, or second Job runtime.
 
 ### Phase-0 qualification
 
@@ -394,8 +539,24 @@ Use focused semantic tests, not a large fixture expansion:
   drains; never accept false output completeness or stop/drain hangs, and do not qualify
   only serialized-field parity;
 - direct + Bubblewrap non-login Bash;
-- 30-minute guidance / 35-minute hard-horizon projection in bounded dotlink runtime;
-- unbounded runtime profile retains configured Process limit.
+- v0.17.8 dotlink product projection: bounded surface derives 25-minute command cap + 10-minute
+  report reserve inside the 35-minute turn from one `RuntimeSurfacePolicy`; stdio/HTTP-only
+  uncapped runtime retains configured Process limit and no turn advice;
+- effective ceiling participates in new-effect authority while a transport/advisory rebind cannot
+  rewrite an existing Job timeout or factual shared lifecycle;
+- v0.17.9 stale-launch gate: queue a Process launch, cancel/expire it before the stable lane
+  claims `Launching`, and prove no exec/ProcessTerminal/StopRecord/kill attribution occurs; when
+  `Launching` wins first, any later stop follows normal Process semantics; the same absolute
+  execution deadline spans Spawn-Facility queueing + Process runtime and is never restarted;
+- v0.17.9 deadline projection: Queued Job age may grow in `elapsed_ms` with no advice; runner
+  publishes one `execution_deadline` at Running, and `jobs_get.next` counts down from that deadline
+  (not `timeout_secs - elapsed_ms`) only inside `min(timeout/5, 5m)` on a hand-back-capable surface;
+- Windows settle is preemptible: clean transient infrastructure => Empty, persistent full-window
+  member => Live, query failure or cancel/deadline-interrupted nonzero settle => Unknown, with main
+  physical exit preserved and immediate cleanup on interruption;
+- shared AW receipts keep `ts` but no competing generic checkpoint schedule for dotlink;
+- port uses canonical `aw-tools` Job facts and dotlink projection only—no local canonical lifecycle
+  fork or rendered-text parsing.
 
 Checkpoint when AW shared semantics are green and dotlink is a thin consumer of the same
 Process lifetime owner again.
@@ -508,9 +669,54 @@ is green after removing two unnecessary `return` statements from the in-progress
 Process observation paths (same behavior). The policy admission owner passes its standalone
 `rustfmt --check`, and `git diff --check` is clean. Existing unrelated Phase-0A/source
 formatting drift is not widened by this checkpoint.
-**This is a slice checkpoint, not a completed Phase 0B/Phase 0 gate.** Remaining grouped
-qualification includes full routed participant Tool/Provider/payer behavior, remote cached
-payload disclosure, lifetime-audit thresholds and the other in-flight Phase 0B fixes.
+**Replay-disclosure owner checkpoint (2026-11-21):** immutable replay identity remains with the
+existing Store/target replay owners while payload disclosure is composed across the two real
+hosts. AW first requires current Session View + ToolBinding + Actor Envelope source/effect/site.
+Dotlink then requires current issuer trust and its own concrete resource authority before exposing
+the cached receipt: prepared native filesystem mutation capability, shell ToolPolicy, or Job
+control ToolPolicy + exact retained Job availability. Expired leases and old runtime generations
+remain fresh-effect fences only. Failed disclosure returns only the shared opaque/minimal non-
+retryable acknowledgement and can neither erase the replay claim nor dispatch another effect.
+
+The implementation deliberately adds no cross-host preflight interface and no generic Tool hook.
+AW reuses `SourceKind::as_str()`. Dotlink reuses the existing canonical filesystem request,
+`access_paths()`, prepared `CapabilitySet`, `SecuredFilesystem::preflight_mutation`, ToolPolicy
+lookup and `standalone_status`; the FS check resolves authority only and never reads/locks/stages/
+commits payload. This keeps filesystem/Job authority at dotlink, rather than falsely projecting
+AW-local resources onto a remote target.
+
+AW production compile, policy owner **2/2** and AW Remote Start owner **5/5** remain green.
+Dotlink grouped Remote Start/replay is **16/16**, strict all-target/all-feature Clippy is green,
+and fmt/diff checks are green. The routed AW root integration linker still receives an
+unattributed SIGKILL before assertions; v0.17.7 makes the retireable-worker launcher bug a
+plausible infrastructure cause, so do not classify it as an outside-host kill and do not split the
+test merely to manufacture evidence.
+
+**Participant Provider/payer checkpoint (2026-11-21):** one shared
+`ProviderAccounts::select_exact(actor, captured_identity)` now reselects current authority and
+requires full `InvocationIdentity` equality (account owner, payer, custody/version, executor,
+model, grant revision). Policy replay lookup remains before this check; every fresh policy
+admission uses it, guardian reuses that exact selection, subagent/participant owners use the same
+primitive, and the service-less remote router receives the same ProviderAccounts owner. No
+Session-owner account or payer can be unioned into a participant.
+
+For paid policy delegation, durable resource ownership and paid identity are explicitly separate:
+the parent Session owner owns root/allocation/child Session/journal/lifecycle; the participant's
+exact identity owns provider/payer/model/tool work. The Store exposes only a narrow top-level
+participant-policy-delegate creation path: transaction-local current `Submit`, non-owner, depth 1,
+no child routing, no constructor replay. Ordinary/recursive children retain their existing owner
+identity contract. Delegation model-attempt admission now checks the exact identity stored on the
+running child relation instead of equating provider actor with resource owner; lifecycle mutations
+check the resource owner only. Child Actor attach rechecks both exact ProviderSelection and current
+participant `Submit`.
+
+Qualification reuses existing tests: account publication **1/1**, Store subagent/delegation
+**1/1**, policy replay **2/2**, all root test code type-checks, strict affected all-target Clippy is
+green, fmt/diff clean. The existing Bob local/delegate policy-router test now includes Bob-owned
+payer/provider, revoke/no-owner-fallback, explicit regrant/reselection and Bob-paid delegation;
+its root executable still receives an unattributed SIGKILL during L5 linking before assertions
+and was not split into fixtures. The v0.17.7 shared Process corrective gate now precedes the
+remaining compact tombstone + lifetime-threshold Phase-0B work.
 
 ---
 

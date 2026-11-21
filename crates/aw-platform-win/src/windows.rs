@@ -215,10 +215,18 @@ pub fn configure_child_group(_command: &mut Command) {
 
 /// Managed native-tool processes differ from Git/helper processes: the
 /// caller will attach an OS Job Object before allowing any command to run.
+pub const MANAGED_TERMINATION_EXIT_CODE: u32 = 0xD071_1A7E;
+
 pub fn configure_managed_process(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
-    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-    command.creation_flags(CREATE_SUSPENDED);
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+    command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
+}
+
+/// Whether a waited Windows exit carries the private marker used by the owned
+/// Job Object termination path. Ordinary command exits remain independent.
+pub fn stop_exit_matches(status: &ExitStatus, _force: bool) -> bool {
+    status.code() == Some(MANAGED_TERMINATION_EXIT_CODE as i32)
 }
 
 /// Resume only the suspended primary thread after the child is job-bound.
@@ -367,6 +375,18 @@ impl DirectScope {
         Ok(accounting.ActiveProcesses != 0)
     }
 
+    /// Final leader fallback using the same private marker as Job termination.
+    pub fn kill_leader(&self) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: leader is our owned duplicate of the exact managed child.
+        if unsafe { TerminateProcess(self.leader.as_raw_handle(), MANAGED_TERMINATION_EXIT_CODE) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Windows has no portable graceful Job-wide stop primitive.
     pub fn graceful(&self) -> io::Result<bool> {
         Err(io::Error::new(
@@ -399,7 +419,10 @@ impl DirectScope {
         // handle is still exact, then finalize this scope regardless.
         let terminate = || {
             // SAFETY: the Job Object belongs exclusively to this invocation.
-            if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
+            if unsafe {
+                TerminateJobObject(self.job.as_raw_handle(), MANAGED_TERMINATION_EXIT_CODE)
+            } == 0
+            {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(())

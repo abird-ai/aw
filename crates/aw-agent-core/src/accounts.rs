@@ -385,6 +385,28 @@ impl ProviderAccounts {
             })
         }
     }
+
+    /// Re-select one host-captured invocation identity under current account
+    /// authority. Full identity equality includes owner, payer, custody/version,
+    /// executor, model and grant revision; there is never account fallback.
+    pub fn select_exact(
+        &self,
+        actor: &PrincipalId,
+        identity: &InvocationIdentity,
+    ) -> Result<ProviderSelection> {
+        if &identity.actor != actor {
+            return Err(Error::Denied(
+                "provider invocation actor differs from authenticated caller",
+            ));
+        }
+        let selected = self.select(actor, &identity.account_id, &identity.model)?;
+        if selected.identity() != identity {
+            return Err(Error::Denied(
+                "provider/account/payer authority changed; select again explicitly",
+            ));
+        }
+        Ok(selected)
+    }
 }
 /// No secret fields and no public constructor. Selected for ONE caller/run;
 /// not stored as a shared conversation-global provider preference.
@@ -545,6 +567,7 @@ mod publication_tests {
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         pool.revoke("main").unwrap();
         assert!(pool.select(&actor, "main", "m").is_err());
+        assert!(pool.select_exact(&actor, selected.identity()).is_err());
         check.send(()).unwrap();
         assert!(result.recv_timeout(Duration::from_secs(5)).unwrap());
         task.join().unwrap();
@@ -552,6 +575,13 @@ mod publication_tests {
         assert!(selected.reader().unwrap().revalidate().is_err());
         let fresh = pool.select(&actor, "main", "m").unwrap();
         assert!(fresh.identity().grant_revision > selected.identity().grant_revision);
+        assert!(pool.select_exact(&actor, selected.identity()).is_err());
+        assert_eq!(
+            pool.select_exact(&actor, fresh.identity())
+                .unwrap()
+                .identity(),
+            fresh.identity()
+        );
         fresh.reader().unwrap().revalidate().unwrap();
     }
 

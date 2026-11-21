@@ -211,11 +211,7 @@ pub fn authorize_remote_start(
             "remote Start differs from the exact authenticated ToolBinding",
         ));
     }
-    let source_kind = match operation.source_kind {
-        aw_policy::SourceKind::Host => "host",
-        aw_policy::SourceKind::Mcp => "mcp",
-        aw_policy::SourceKind::Extension => "extension",
-    };
+    let source_kind = operation.source_kind.as_str();
     let source = RemoteStartSource {
         source_kind: source_kind.into(),
         source_id: operation.source_id.to_owned(),

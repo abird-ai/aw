@@ -22,11 +22,12 @@ use aw_tools::{
 use std::{
     collections::BTreeMap,
     fs::File,
+    future::Future,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::process::Command;
+use tokio::{process::Command, time::Instant};
 
 #[cfg(test)]
 use aw_tools::{execution_stop::ExecutionLifecycleEvent, filesystem::runner::Occupancy};
@@ -588,16 +589,18 @@ impl ProcessReceipt {
     }
 
     pub fn outcome(&self) -> Outcome {
-        if let Some(record) = self.terminal.stop {
-            if record.evidence == StopEvidence::Unknown {
-                return Outcome::Unknown;
-            }
-            match record.reason {
-                Some(ProcessStopReason::Cancelled) => return Outcome::Cancelled,
-                Some(ProcessStopReason::Timeout) => return Outcome::DeadlineExceeded,
-                Some(ProcessStopReason::RuntimeError) => return Outcome::Unknown,
-                None => {}
-            }
+        if self
+            .terminal
+            .stop
+            .is_some_and(|record| record.evidence == StopEvidence::Unknown)
+        {
+            return Outcome::Unknown;
+        }
+        match self.terminal.stop_reason() {
+            Some(ProcessStopReason::Cancelled) => return Outcome::Cancelled,
+            Some(ProcessStopReason::Timeout) => return Outcome::DeadlineExceeded,
+            Some(ProcessStopReason::RuntimeError) => return Outcome::Unknown,
+            None => {}
         }
         match self.terminal.exit {
             RunnerExit::Code(code) => Outcome::Exited(code),
@@ -668,7 +671,10 @@ fn map_process_error(error: aw_process::Error) -> crate::Error {
         aw_process::Error::Limit(message) => crate::Error::Limit(message),
         aw_process::Error::InputClosed(message) => crate::Error::Denied(message),
         aw_process::Error::Conflict(message) => crate::Error::Conflict(message),
-        aw_process::Error::Timeout => crate::Error::Timeout,
+        aw_process::Error::CancelledBeforeSpawn => crate::Error::Cancelled,
+        aw_process::Error::TimedOutBeforeSpawn | aw_process::Error::Timeout => {
+            crate::Error::Timeout
+        }
     }
 }
 
@@ -679,21 +685,40 @@ pub struct PipeProcess {
 
 impl PipeProcess {
     pub async fn spawn(spec: PipeSpec) -> crate::Result<Self> {
-        Self::spawn_inner(spec, SpawnOutputTarget::None, None).await
+        Self::spawn_inner(spec, SpawnOutputTarget::None, None, None).await
+    }
+
+    pub async fn spawn_until(
+        spec: PipeSpec,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+    ) -> crate::Result<Self> {
+        Self::spawn_inner(
+            spec,
+            SpawnOutputTarget::None,
+            None,
+            Some(aw_process::SpawnControl::new(
+                deadline,
+                cancelled,
+                cancelled_signal,
+            )),
+        )
+        .await
     }
 
     pub async fn spawn_with_event_sink(
         spec: PipeSpec,
         event_sink: Arc<dyn ExecutionEventSink>,
     ) -> crate::Result<Self> {
-        Self::spawn_inner(spec, SpawnOutputTarget::None, Some(event_sink)).await
+        Self::spawn_inner(spec, SpawnOutputTarget::None, Some(event_sink), None).await
     }
 
     pub async fn spawn_with_host_spools(
         spec: PipeSpec,
         files: HostSpoolFiles,
     ) -> crate::Result<Self> {
-        Self::spawn_inner(spec, SpawnOutputTarget::Legacy(files), None).await
+        Self::spawn_inner(spec, SpawnOutputTarget::Legacy(files), None, None).await
     }
 
     pub async fn spawn_with_job_outputs(
@@ -701,7 +726,28 @@ impl PipeProcess {
         stdout: OutputWriter,
         stderr: OutputWriter,
     ) -> crate::Result<Self> {
-        Self::spawn_inner(spec, SpawnOutputTarget::Job { stdout, stderr }, None).await
+        Self::spawn_inner(spec, SpawnOutputTarget::Job { stdout, stderr }, None, None).await
+    }
+
+    pub async fn spawn_with_job_outputs_until(
+        spec: PipeSpec,
+        stdout: OutputWriter,
+        stderr: OutputWriter,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+    ) -> crate::Result<Self> {
+        Self::spawn_inner(
+            spec,
+            SpawnOutputTarget::Job { stdout, stderr },
+            None,
+            Some(aw_process::SpawnControl::new(
+                deadline,
+                cancelled,
+                cancelled_signal,
+            )),
+        )
+        .await
     }
 
     pub async fn spawn_with_job_outputs_and_event_sink(
@@ -714,6 +760,7 @@ impl PipeProcess {
             spec,
             SpawnOutputTarget::Job { stdout, stderr },
             Some(event_sink),
+            None,
         )
         .await
     }
@@ -722,6 +769,7 @@ impl PipeProcess {
         spec: PipeSpec,
         target: SpawnOutputTarget,
         event_sink: Option<Arc<dyn ExecutionEventSink>>,
+        control: Option<aw_process::SpawnControl>,
     ) -> crate::Result<Self> {
         spec.validate()?;
 
@@ -804,8 +852,10 @@ impl PipeProcess {
                 stdout: output.stdout,
                 stderr: output.stderr,
                 event_sink,
+                control,
             },
         )
+        .await
         .map_err(map_process_error)?;
 
         Ok(Self {

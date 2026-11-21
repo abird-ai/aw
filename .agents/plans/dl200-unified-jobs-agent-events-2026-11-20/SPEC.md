@@ -2,8 +2,8 @@
 
 Author: Prasanna Loganathar
 Opened: 2026-11-20
-Design revision: **R6 — architectural simplification, SEALED 2026-11-21**
-Status: **R6 SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS**
+Design revision: **R6 — architectural simplification, SEALED 2026-11-21, including the sealed shared Process/release-correction amendment**
+Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION AMENDMENT SEALED / IMPLEMENTATION PROMOTED / PHASE-0 CORRECTIVE IMPLEMENTATION GATE PENDING**
 
 ## 0. Relationship to DL-150
 
@@ -4986,7 +4986,15 @@ wake hint / readiness
 ```
 
 Wake mechanisms are not authority/truth. Linux may use SIGCHLD today and pidfd async
-readiness later without changing Process semantics.
+readiness later without changing Process semantics. **A wake never authorizes cleanup.** For the
+owned main child, Linux direct settlement must confirm terminal state with a non-reaping parent
+fact (`waitid(..., WEXITED | WNOHANG | WNOWAIT)`, preferably by the already-owned pidfd) before
+observing/sweeping the process group. Pidfd poll/AsyncFd readability is only a wake hint; a
+spurious readable edge must simply recheck the non-reaping child fact. The more general
+`pid_identity` support for nonchildren may use pidfd readiness to say an identity is no longer
+live, but that weaker observation must never be reused as the cleanup-authorizing main-child fact.
+If the strict parent fact is unavailable/`ECHILD` where `DirectScope` expected its own child, the
+settlement is uncertain; do not infer exit and sweep a possibly live command.
 
 #### Sandbox and Scope compose; neither owns the other
 
@@ -5063,6 +5071,236 @@ spawn because the platform does not offer the same atomic primitive.
 Changing Sandbox technology must not change Process semantics, and improving Process
 containment must not change Sandbox semantics.
 
+#### Shared Process launch/settlement release-correction amendment — origin v0.17.7
+
+Linux launch has one additional lifetime fact that is below Sandbox policy but above the raw
+`fork/exec`: **the thread that forks a launcher can itself be part of the launch contract**.
+Bubblewrap `--die-with-parent` is implemented with `PR_SET_PDEATHSIG`, and on Linux that parent is
+the specific forking thread. A Tokio worker may retire while the host process is perfectly alive;
+therefore directly calling `tokio::process::Command::spawn()` from an arbitrary runtime worker can
+SIGKILL an otherwise healthy sandbox seconds later.
+
+**SEALED Spawn Facility core (origin: dotlink v0.17.7, 2026-11-21).** R6 does **not** require one OS thread
+per Process. The invariant is only that the thread which performs a parent-death-sensitive
+`fork/exec` remains alive for at least as long as every child it parented. Agent/Job execution
+continues to use ordinary `Send` futures and may migrate freely across Tokio workers before and
+after launch.
+
+R6 therefore requires one private logical **Linux Spawn Facility** inside `aw-process` with a
+small fixed/add-only set of process-lifetime **Spawn Lanes**. A lane is an OS thread used only for
+the short launch critical section; it never waits for, reads from, cancels, cleans up or otherwise
+runs the Process after ownership transfer:
+
+```text
+many ordinary Tokio tasks / Jobs                    process lifetime
+      │        │        │                                │
+      └────────┴────────┴── bounded async admission ─────┤
+                                                        ▼
+                                             Linux Spawn Facility
+                                          ┌─────────────┴─────────────┐
+                                          │ fixed stable Spawn Lanes │
+                                          │ N=1 initially            │
+                                          └─────────────┬─────────────┘
+                                                        │
+                                      fork/spawn + exact DirectScope attach
+                                                        │
+                                                        ▼
+                                                  Spawned RAII
+                                           Child + DirectScope + pid
+                                                        │
+                                                        ▼
+                                            ordinary private Process Scope
+                                                        │
+                               wait / stop / observe / reap / drain on Tokio
+```
+
+The complexity target is explicit:
+
+```text
+stable Spawn Lane OS threads = O(1)      (initially exactly 1)
+running Processes             = O(n)
+Tokio Job/Process tasks        = O(n), lightweight and scheduler-migratable
+```
+
+A long-running command occupies a Spawn Lane only for spawn/custody establishment, **not** for the
+command lifetime. There is no affinity between a live Process and the Tokio worker that submitted
+it, and no requirement that later stdin/wait/cancel/output operations execute on its Spawn Lane.
+`Process` must remain `Send`; worker stealing/migration is part of the intended high-concurrency
+server design.
+
+The shared spawn entry is asynchronous. Hosts already have an async `PipeProcess::spawn` boundary;
+`aw-process` should expose/consume an async spawn handoff rather than blocking a Tokio worker with
+`block_in_place`, `spawn_blocking` or a synchronous rendezvous. The facility owns **bounded async
+admission/backpressure** and transfers the already-authorized `tokio::process::Command` by value.
+Each accepted request carries the originating Tokio `Handle` only so the stable lane can enter that
+runtime for `Command::spawn` registration; the lane is not a runtime worker and does no unrelated
+async work.
+
+The ownership transfer is cancellation-safe, deadline-safe and effect-safe. The staged
+dotlink **v0.17.9 (`576d0a1`)** adds an important refinement: a launch may become stale while
+waiting behind another Spawn Lane request, so cancellation/expiry must be rechecked on the lane
+**immediately before fork**, not only before queue admission.
+
+Use one private linearizable launch gate per request. Conceptually:
+
+```text
+LaunchState = Pending | Cancelled | TimedOut | Launching
+```
+
+The async spawn future and the Spawn Lane race only on this private state. The caller supplies the
+same semantic cancellation signal and one **absolute host-selected execution deadline** used for the
+subsequent Process lifetime. No AgentCore type crosses into `aw-process`: the async side can drive the
+private atomic state from any cancellation future, while the lane sees only that tiny state plus the
+absolute deadline.
+
+```text
+caller owns prepared Command
+        │
+        ▼
+runner establishes absolute execution deadline
+        │
+        ▼
+bounded async Spawn Facility admission
+        │
+        ▼
+request waits in lane queue as Pending
+        │
+        ├── cancellation wins Pending -> Cancelled
+        ├── deadline wins Pending -> TimedOut
+        │
+        ▼
+Spawn Lane immediately before fork:
+        compare deadline + CAS Pending -> Launching
+        │
+        ├── already Cancelled -> no spawn, CancelledBeforeSpawn
+        ├── already TimedOut / deadline expired -> no spawn, TimedOutBeforeSpawn
+        └── Launching wins -> spawn exactly once
+              -> obtain child id
+              -> establish exact DirectScope / stable kernel identity
+              -> build private Spawned { Child, DirectScope, pid }
+              -> reply
+                    ├── receiver accepts -> Process takes ownership
+                    └── receiver disappeared -> Spawned RAII cleans scope/child
+```
+
+A skipped stale launch created **no Process**. It therefore produces no synthetic
+`ProcessTerminal`, no `StopRecord`, no "killed" evidence and no fake signal/occupancy fact. The
+host Job may settle as cancelled/timed-out from its own pre-spawn admission fact, but it must not
+claim a Process was stopped.
+
+Once `Pending -> Launching` wins, cancellation/deadline can no longer retroactively claim "never
+started". A race after that point may create a real child; the complete RAII package is retained and
+immediately enters the normal Process stop/settlement path (or is cleaned on failed reply transfer),
+so any actual Process has factual Process semantics. The command is never implicitly retried.
+`kill_on_drop` remains a final child fail-safe; `DirectScope` remains the containment cleanup owner.
+
+The absolute deadline is also the one used after spawn; Spawn-Lane queueing after the Job enters
+Running must **consume** that execution budget rather than silently granting a fresh full timeout
+when `Process::wait` begins. Prefer an absolute-deadline shared API (`wait_until`/equivalent) or
+explicitly derive remaining duration from that same deadline exactly once. Do not create separate
+spawn and run timeout clocks.
+
+This does **not** mean all Job age consumes execution timeout. Product/job queueing and preparation
+before the runner enters Running may still count toward observational `elapsed_ms` while not
+consuming `timeout_secs`. The owner that transitions to Running establishes the execution deadline;
+from that point, Spawn Facility queueing + actual execution share one deadline.
+
+A request handler panic must not kill the lifetime anchor. Lane request processing should be
+contained with a panic boundary: partially-created RAII state unwinds/cleans, the **facility is
+poisoned/fails closed for new launches**, but the Spawn Lane thread itself stays alive/parked so
+existing `PDEATHSIG` children are not killed merely because launch code panicked. Likewise, an
+established lane/facility failure or a lost reply after an effectful submission is
+`SetupUncertain`/restart-required; it is never repaired by silently respawning the lane and
+retrying the command. Failure to create a lane before any request is accepted may be retried
+because no external effect occurred.
+
+Spawn Lanes are **process-lifetime anchors**. They may never be dynamically retired, shrunk or
+recycled while the host process lives: doing so can deliver `PDEATHSIG` to every qualifying child
+that lane parented. Future implementations may use a fixed `N>1` or add lanes monotonically, but
+must never shrink the set. Lane count is an internal performance property, not a user/model/API
+configuration knob.
+
+Initial implementation is intentionally **N=1**. One lane serializes only process creation and
+custody establishment, which is normally tiny relative to Process lifetime and avoids needless
+fork/exec contention and permanent threads. Do not build a spawn-pool scheduler pre-emptively. If
+real server benchmarks show admission queueing is material, `N=2` or `N=4` may be adopted without
+changing `Process`, `Scope`, `ProcessTerminal`, dotlink, Sandbox or any public API. The focused
+benchmark matrix is concurrency `1/8/32/128` against lanes `1/2/4`, measuring only spawn throughput,
+queue-wait p50/p99, spawn-handshake p50/p99 and CPU. Stop at `N=1` unless those measurements justify
+more lanes.
+
+`spawn_blocking` and `block_in_place` are explicitly insufficient: their pool threads are still
+runtime-managed and may retire, which is exactly the lifetime property this amendment removes. A
+separate launcher **process** is also deliberately rejected for this fallback path: making another
+process the kernel parent would move wait/reap/pipe/pidfd ownership across IPC/SCM_RIGHTS and
+recreate much of the future strong PID-1 supervisor. That stronger backend remains separately
+promoted and should reuse its own clear parent/terminal protocol rather than complicating direct
+spawn merely to fix thread lifetime.
+
+The Linux Spawn Facility is deliberately **not** a public service, Job, Sandbox, Actor, scheduler,
+runtime owner, `SpawnBroker` trait or new execution framework. It is a private implementation
+mechanic of the already-required `aw-process` owner. `aw-platform` remains synchronous and
+Tokio-free; it owns launch flags/kernel facts and constructs/attaches `DirectScope`. The facility
+makes any future host-prepared launcher carrying `PDEATHSIG` safe without teaching `aw-process`
+Bubblewrap/product semantics.
+
+Whole-process death still ends every Spawn Lane and therefore preserves launcher parent-death
+protection; Tokio worker retirement does not. This amendment does **not** promote the frozen 017
+Sandbox/mount design and does not make the Spawn Facility the strong Linux containment backend.
+The future PID-1 supervisor remains separately promoted. PTY custody remains `aw-terminal` and is
+not forced through this non-PTY Process launch path.
+
+On Windows, the corresponding noninteractive Process launch primitive is
+`CREATE_SUSPENDED | CREATE_NO_WINDOW`, followed by Job Object assignment and primary-thread
+resume. `DETACHED_PROCESS` is not an acceptable substitute: PowerShell can successfully exit
+without executing the requested command. `CREATE_NO_WINDOW` is a launch-detail of the existing
+non-PTY Process backend; PTY/interactive terminal launch remains separate.
+
+A post-v0.17.8 release-branch correction (`81ef891`) adds one more **shared Occupancy** rule.
+`CREATE_NO_WINDOW` can transiently keep console/job infrastructure inside the Job Object after the
+main process has become terminal, and Windows accounting may clear the exited leader slightly after
+`wait` returns. An immediate `ActiveProcesses != 0` query can therefore falsely publish
+`Occupancy::Live` for a clean command. Do not fix this with process-name/image exemptions.
+
+After the exact main-command terminal fact is established, Windows pre-cleanup occupancy uses a
+bounded **settling observation** over the owned Job Object:
+
+```text
+query active Job members
+    0                         -> Occupancy::Empty immediately
+    >0 before settle bound    -> wait briefly, query again
+    >0 for full settle bound  -> Occupancy::Live
+    query failure             -> Occupancy::Unknown
+```
+
+The initial reference bound is two seconds with a short (~10 ms) poll cadence, matching the
+release evidence. v0.17.9 (`576d0a1`) sharpens this further: this is a bounded
+**natural-exit observation grace**, not extra authority to delay a cancellation or execution
+deadline. The settle future must remain inside the same outer cancellation/deadline selection as
+natural Process settlement.
+
+If cancellation or the execution deadline fires while a nonzero Job count is still settling:
+
+```text
+Empty was already proven      -> preserve Occupancy::Empty
+nonzero/error was inconclusive -> Occupancy::Unknown
+then sweep/stop immediately
+```
+
+Do not wait out the remaining two seconds before honoring the stop. A real leftover is
+`Occupancy::Live` only when nonzero membership survives the **entire uninterrupted settle window**.
+Likewise, a nonblocking/`try_wait` path that sees the main command terminal may return Empty on an
+immediate zero, but an immediate nonzero must remain Unknown unless the full settle proof is
+performed; transient infrastructure is not yet evidence of semantic leftovers. The main command's
+already-established physical exit is preserved regardless of whether the settle is interrupted.
+
+Keep the ownership split clean: `aw-platform-win::DirectScope` exposes the cheap synchronous exact
+Job-accounting query/kernel handles; `aw-process` owns the async bounded settle loop and the outer
+cancel/deadline race, converting only completed evidence to semantic `Occupancy`. Never sleep for
+the settle window directly on a Tokio worker, and do not add Windows process-name knowledge to
+shared Process semantics. Cleanup follows either the completed stabilized observation or an
+interrupt immediately; it never rewrites the pre-cleanup fact afterward.
+
 #### Strong Linux backend: tiny PID-1 supervisor
 
 The preferred strong Linux realization is a per-command AW-owned supervisor inside a
@@ -5134,6 +5372,29 @@ a duplicate Process truth.
 `StopRecord` / `StopReason` / `StopEvidence` / `StopTracker` remain the one stop model. Do
 not add Cleanup/TreeStop/TargetGone/LeaderState types.
 
+A v0.17.7 correction sharpens what that model means: a `StopRecord` is factual evidence about a
+semantic/housekeeping **stop operation against the containment scope**. Even
+`StopEvidence::Stopped` does not, by itself, prove that stop caused the main command's physical
+`ProcessExit`. The two facts remain independent until the Process owner reconciles them. An exit
+status already established before a later stop remains authoritative; likewise a physical ending
+incompatible with the runtime's delivered termination cannot be relabelled as timeout/cancel/
+runtime-error merely because a group/Job stop also reached some live member. Cleanup of leftovers
+never rewrites the main ending.
+
+Do not add another stored cause field merely to express this. Causal `stopped_by`/operator wording
+is a **derived projection over the whole `ProcessTerminal`**, not `StopRecord::terminal_reason()`
+read in isolation. The shared implementation should retire/avoid any helper whose name implies
+that `StopRecord` alone proves the main command's terminal cause. A signal with no reconciled
+shared stop is **unattributed**; it is not proof of an "external sender" because kernel mechanisms
+such as `PDEATHSIG` can generate the signal in the parent's kernel context without a userspace
+`kill()` caller.
+
+Host-specific cancellation origin remains outside the shared Process fact. If a product needs to
+distinguish caller vs connector/shutdown, the host records the **first requester before firing the
+cancellation token** and later projects that origin only when the shared terminal facts support a
+cancel stop. A later requester cannot overwrite it. `aw-process` continues to receive only the
+semantic `StopReason::Cancelled`.
+
 The Process invariant is:
 
 ```text
@@ -5180,25 +5441,147 @@ lifecycle line is likewise dotlink presentation, not shared process truth.
 
 Qualification is behavioral, not merely serialized-field parity: AW and dotlink must share
 exit/stop/occupancy/output semantics for clean/nonzero/signal exits, timeout/cancel, remaining
-children, inherited-pipe output and direct-Unix escaped-descendant uncertainty.
+children, inherited-pipe output and direct-Unix escaped-descendant uncertainty. The post-v0.17.7
+Process gate additionally proves, without fixture proliferation: (1) force retirement of the Tokio
+worker that requested a Linux spawn and verify a `PDEATHSIG` child remains alive under the shared
+Spawn Facility while the `Process: Send` future continues on another worker; (2) process death still terminates a parent-death launcher; (3) an artificial/spurious
+pidfd wake cannot make a live child cleanup-eligible; (4) a previously established exit code or
+incompatible signal is not overwritten by a racing stop; (5) Windows noninteractive managed launch
+actually executes under `CREATE_NO_WINDOW` while preserving suspended Job attachment; and (6) a
+clean Windows command whose transient console/job infrastructure briefly remains does **not** become
+`Occupancy::Live`, while a real leftover that remains through the bounded settle window does.
+Dotlink should reuse its v0.17.7 Bubblewrap/process-lifetime and post-v0.17.8 Windows occupancy tests
+as real consumer gates rather than duplicating a second local launcher/observation implementation.
 
-Dotlink also restores the release runtime-horizon policy **at the dotlink layer only**:
+#### Dotlink bounded-turn surface policy — v0.17.8 convergence
+
+The audited dotlink **v0.17.8** release (`60e04d3`) refines the bounded conversational policy and
+remains deliberately **dotlink-owned** rather than AW Process/Job truth:
 
 ```text
-recommended coherent checkpoint  ~= 30 minutes
-hard conversational command horizon = 35 minutes
+turn horizon             = 35 minutes
+hand-back/report reserve = 10 minutes
+new-command ceiling      = 25 minutes = horizon - reserve
+checkpoint mode begins   = minute 25
 ```
 
-For a host/runtime profile that declares the bounded conversational horizon, dotlink uses
-one source of truth to derive server/model guidance, shell schema maximum and runtime
-validation; the effective command deadline is the tighter of configured shell policy and
-the 35-minute horizon. A runtime profile without a bounded conversational turn keeps its
-normal configured Process limit and omits turn-horizon guidance. `background=true` changes
-observation/hand-off behavior, not this command-lifetime bound.
+A bounded turn is useful only if the result still has time to be reported. A single command may
+therefore never consume the whole 35-minute horizon. On the bounded surface, effective new-command
+timeout is:
 
-This policy is intentionally absent from AW. AW continues to accept explicit host-selected
-Process deadlines and keeps `ReceiptProfile.checkpoint_minutes` advisory rather than an
-execution-authority primitive.
+```text
+min(configured shell timeout, 25 minutes)
+```
+
+The final 10 minutes belong to landing/parking current work, leaving the tree/report state coherent,
+reading retained output and handing the turn back. `background=true` changes observation/handoff,
+not the execution deadline already assigned to the Job. An uncapped/local-only runtime keeps the
+configured Process timeout and emits no turn/checkpoint advisory.
+
+This policy composes with AW through **facts and projection**, not a generic callback framework.
+The canonical split is:
+
+```text
+aw-tools::JobManager / aw-process
+    lifecycle, revision, ProcessTerminal, retained output, ACK/release truth
+                         │
+                         │ typed facts
+                         ▼
+dotlink Job host projection
+    local monotonic created-at + immutable timeout_secs
+    + current RuntimeSurfacePolicy
+    + transport/product wording
+                         │
+                         ▼
+    server instructions / shell ceiling / job_get.next / operator warning
+```
+
+`aw-tools::JobManager` remains clock-free and product-policy-free. It must not learn a turn horizon,
+hand-back reserve, OpenAI tunnel identity or prose such as "checkpoint what it produced". The
+explicit Process deadline still reaches `aw-process` as the host-selected absolute deadline/
+equivalent remaining budget; AW enforces it without knowing why the host chose it. Dotlink may
+retain narrow local monotonic **timing projection** because that is host runtime observation/policy,
+not a second Job lifecycle or Process outcome owner:
+
+```text
+created: Instant                  // Job age / elapsed_ms, includes product queueing
+execution_deadline: Option<Instant> // set once when the runner enters Running
+immutable timeout_secs            // execution budget selected for this Job
+```
+
+Do not derive `execution_deadline = created + timeout_secs`: queue/preparation time before Running
+is observational age but is not execution budget.
+
+Dotlink should converge on one small local **`RuntimeSurfacePolicy`** (name descriptive, not a
+public API) derived once from `ActiveTransports.constraints()`. Conceptually it owns only:
+
+```text
+sync_hold: Option<Duration>       // can this runtime hand a call back mid-work?
+turn_horizon: Option<Duration>    // 35m only when bounded
+handback_reserve: Duration        // 10m when bounded
+effective_command_ceiling(profile_timeout)
+turn_advice_enabled()
+```
+
+The active transport set contributes capabilities, not deployment names. `sync_hold.is_some()` is
+the relevant fact: a runtime that can hand a durable handle back mid-work has a conversational turn
+to checkpoint into. If multiple transports share one `LocalMachine`, the tightest active transport
+constraint wins for the shared schema/execution environment. A stdio/HTTP-only runtime remains
+uncapped unless one of its active transports itself declares such a bound.
+
+The **effective command ceiling is execution authority**. It (or the transport constraint from which
+it is deterministically derived) participates in dotlink's prepared execution-authority fingerprint
+for **fresh effects**. Changing the active bounded-surface constraint may therefore change fresh
+command admission. It must **not** make a previously consumed request identity executable again:
+exact retained Ready/Unknown replay remains factual/no-rerun under the existing replay owner, and
+only current disclosure/presentation is re-evaluated. By contrast, whether the current surface
+renders a near-deadline advisory is **presentation state**, not replay identity: bind/rebind it on
+every `LocalMachine` construction so a surviving/reused Job/session never inherits stale advice
+after transport changes. An already-running Job retains the `timeout_secs` it was admitted with;
+current presentation never rewrites it.
+
+The v0.17.8 advisory plus v0.17.9 correction is also dotlink projection only. It is computed
+from current surface capability + the **runner's actual execution deadline** + immutable
+`timeout_secs` + canonical shared lifecycle. Queue age must never be subtracted from the execution
+budget:
+
+- a Queued Job has no execution deadline and never warns, even if `elapsed_ms` is large;
+- when the runner enters Running, publish/store the exact absolute execution deadline before launch;
+- only a known Running, non-cancelling Job with that deadline can warn;
+- compute remaining time as `execution_deadline - now`, not `timeout_secs - elapsed_ms`;
+- warn inside `min(timeout_secs / 5, 300s)` of the actual execution deadline;
+- do not warn for a one-second/no-actionable-margin cap or once the deadline is already reached;
+- wording should name the **execution deadline** so it cannot be confused with Job age/turn age;
+- prepend the deadline/checkpoint sentence to the ordinary `jobs_get.next` follow-up;
+- do **not** repeat it on `jobs_list`, `jobs_read`, `jobs_ack` or cancellation receipts;
+- terminal, cancelling, revoked or journal-Unknown state suppresses the predictive advisory.
+
+No rendered shared receipt is parsed to implement this. Dotlink reads canonical typed Job facts
+(`runtime_snapshot`/equivalent), combines them with its narrow local timing projection
+(`created`/`execution_deadline`/`timeout_secs`) and surface policy, and renders its own product
+metadata. If the later DL-200 cutover uses the shared AW `jobs_get` adapter so directly
+that composition is blocked, factor only the smallest **typed factual projection seam** needed by
+the first real consumer: shared code produces the Job status facts/default rendering, and dotlink
+may add bounded host-owned metadata such as a `next` prefix before final serialization. Do not add
+a generic renderer plugin, arbitrary string callback, Job-policy trait, clock to `aw-tools`, or a
+parallel dotlink lifecycle state machine.
+
+Dotlink's typed AW receipt profile should provide the factual timestamp needed to anchor the turn
+(`unix_ts=true` on the relevant Process/Jobs receipts), but **must not simultaneously emit a second
+generic checkpoint schedule**. For this bounded dotlink runtime use `checkpoint_minutes=None` and
+let `RuntimeSurfacePolicy` own the exact 25/35/10 guidance in one place. Other AW embeddings may
+continue using generic `ReceiptProfile.checkpoint_minutes` when that simpler advisory is appropriate.
+
+One dotlink-owned policy source must derive all product projections that need these numbers:
+
+1. server/model instructions (35m horizon, checkpoint mode from 25m, 10m reporting reserve);
+2. effective shell timeout/schema/runtime validation (max 1500s on the bounded surface);
+3. startup warning when operator configuration is narrowed;
+4. current-surface `jobs_get.next` near-deadline warning;
+5. execution-authority fingerprint input for new effects.
+
+This prevents 25/35/10 from drifting across descriptions, runtime enforcement and Job projection,
+while preserving AW's reusable clock-free semantics.
 
 Direct and Bubblewrap dotlink Bash invocation should converge with AW on non-login,
 non-profile execution (`--noprofile --norc -c`).
@@ -6478,7 +6861,7 @@ handoffs or ADR-style decision records rather than restating normative contracts
 
 ## 32. Seal
 
-DL-200 **R6 is SEALED / IMPLEMENTATION PROMOTED — PHASE 0 IN PROGRESS**.
+DL-200 **R6 + the shared Process/release-correction amendment are SEALED / IMPLEMENTATION PROMOTED — PHASE-0 CORRECTIVE IMPLEMENTATION GATE PENDING**.
 
 - R1 original seal: explicit user approval on **2026-11-20** after the full pre-seal audit.
 - R2-R4 amendment/reseals: 2026-11-21 prior Process/Event/replay/registry/construction/Jobs/
@@ -6498,6 +6881,26 @@ implementation boundary: `ProcessTerminal` is the cross-host Fact while AW/dotli
 their product receipt/output owners; hosts pass prepared commands by value; semantic weak-
 Unix negative occupancy maps to Unknown in `aw-process`; and transferable `aw-terminal`
 PTY custody remains a distinct Terminal resource rather than a second Process Job owner.
+
+**Shared Process/release-correction amendment seal (2026-11-21):** explicitly approved through the
+v0.17.7 parent-lifetime review and subsequent user-directed imports of the newer 0.17.x fixes.
+Section 25.11 fixes the Linux launch contract as one private logical Spawn Facility with O(1)
+fixed/add-only process-lifetime lanes (N=1 initially), async bounded admission, complete RAII
+custody transfer, freely worker-migratable `Process: Send` lifetimes, no lane retirement/shrink,
+poison-without-anchor-exit failure handling, and benchmark-only internal scaling. It rejects
+thread-per-Process, `spawn_blocking`/`block_in_place` lifetime anchors, public pool configuration and
+a launcher-process detour.
+
+The same sealed amendment now also includes the later audited release corrections: strict
+non-reaping child-terminal proof, independent stop-vs-exit attribution, Windows
+`CREATE_SUSPENDED | CREATE_NO_WINDOW`, bounded/interruptible Windows Job-accounting settlement,
+and the v0.17.9 stale-launch rule. One absolute execution deadline is established when the
+runner enters Running and is shared by Spawn-Facility queueing + Process execution; cancellation/
+expiry is rechecked on the lane immediately before fork. A stale launch skipped before
+`Launching` creates no Process and therefore no ProcessTerminal/StopRecord/kill claim. Product Job
+age remains separate from the execution deadline, and dotlink deadline advice counts down from the
+runner's actual deadline rather than from Job age. **This amendment is authoritative and sealed.**
+
 The strong Linux PID-1 backend contract remains normative but its executable qualification
 belongs to the separately promoted launcher/backend gate. The public Agent/Jobs/Event/
 Sandbox/Checkpoint APIs, existing authoritative owners, seven phases and all R5 safety/

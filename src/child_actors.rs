@@ -15,7 +15,7 @@ use aw_agent_kernel::{
     envelope::{Access, Envelope, Network},
     message::{ActorMessage, ControlKind, Kind, Scope, TurnTarget},
 };
-use aw_store::{SessionStore, SubagentInfo};
+use aw_store::{SessionParticipationAction, SessionStore, SubagentInfo};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -373,6 +373,18 @@ impl Service {
         delegated_gate: Option<(&str, Effect)>,
     ) -> Result<ChildLease> {
         selected.revalidate()?;
+        if delegated_gate.is_some() && selected.identity().actor != self.inner.owner {
+            let participation = self.inner.store.authorize_session_participation(
+                &selected.identity().actor,
+                &durable.parent_session_id,
+                SessionParticipationAction::Submit,
+            )?;
+            if participation.owner {
+                return Err(Error::Denied(
+                    "delegated participant identity unexpectedly resolves as Session owner",
+                ));
+            }
+        }
         let info = self.inner.store.subagent(&self.inner.owner, &durable.id)?;
         if info.id != durable.id
             || info.state != "running"
@@ -387,7 +399,7 @@ impl Service {
             || info.delegation_root_id != durable.delegation_root_id
             || info.delegation_allocation_id != durable.delegation_allocation_id
             || info.identity != *selected.identity()
-            || info.identity.actor != self.inner.owner
+            || (delegated_gate.is_none() && info.identity.actor != self.inner.owner)
             || info.identity != agent.default_identity()?
             || next_turn != agent.history_state().next_turn_id
             || next_turn == 0

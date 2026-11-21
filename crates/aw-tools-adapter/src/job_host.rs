@@ -1912,6 +1912,27 @@ impl JobHost {
     }
 
     fn settle_unlaunched(&self, id: &str, coordinate: usize, claimed_sequence: u64) -> Result<()> {
+        self.settle_proven_unlaunched(
+            id,
+            coordinate,
+            NodeState::Claimed {
+                sequence: claimed_sequence,
+            },
+        )
+    }
+
+    fn settle_proven_unlaunched(
+        &self,
+        id: &str,
+        coordinate: usize,
+        expected: NodeState,
+    ) -> Result<()> {
+        let expected_sequence = match expected {
+            NodeState::Claimed { sequence } | NodeState::Running { sequence } => sequence,
+            NodeState::Pending | NodeState::Terminal { .. } => {
+                return Err(Error::Protocol("Job no-launch settlement state is invalid"));
+            }
+        };
         let _gate = self
             .transition_gate
             .lock()
@@ -1921,10 +1942,10 @@ impl JobHost {
             .settle_unlaunched(
                 id,
                 coordinate,
-                claimed_sequence,
+                expected,
                 sequence,
-                |_node, observed_claim| {
-                    if observed_claim == claimed_sequence {
+                |_node, observed_sequence| {
+                    if observed_sequence == expected_sequence {
                         Ok(())
                     } else {
                         Err(aw_tools::filesystem::job::Error::StaleGeneration)
@@ -2196,33 +2217,60 @@ impl JobHost {
                     return Err(error);
                 }
             };
+        // Running is the execution-budget boundary: prior Job admission and
+        // preparation age do not consume this timeout; Spawn Facility queueing does.
+        let execution_deadline = tokio::time::Instant::now() + prepared.timeout;
 
-        let mut process =
-            match process::PipeProcess::spawn_with_job_outputs(prepared.spec, stdout, stderr).await
-            {
-                Ok(process) => process,
-                Err(error) => {
-                    self.finish_shell_streams(id, coordinate);
-                    let detail = aw_tools::task::bounded_task_error(error.to_string());
-                    let primary = if matches!(error, Error::Transport(_)) {
-                        Primary::Unknown
-                    } else {
-                        Primary::Fail
-                    };
-                    return self.settle_shell_result(
-                        id,
-                        coordinate,
-                        running_sequence,
-                        format!("{} launch={detail}", primary.as_str()),
-                        None,
-                        Status {
-                            primary,
-                            more: false,
-                            incomplete: false,
-                        },
-                    );
-                }
-            };
+        let spawn_cancel = cancellation.clone();
+        let spawn_cancel_signal = cancellation.clone();
+        let mut process = match process::PipeProcess::spawn_with_job_outputs_until(
+            prepared.spec,
+            stdout,
+            stderr,
+            execution_deadline,
+            move || spawn_cancel.is_cancelled(),
+            async move { spawn_cancel_signal.cancelled().await },
+        )
+        .await
+        {
+            Ok(process) => process,
+            Err(Error::Cancelled) => {
+                self.cancel(id)?;
+                self.settle_proven_unlaunched(
+                    id,
+                    coordinate,
+                    NodeState::Running {
+                        sequence: running_sequence,
+                    },
+                )?;
+                return Ok(Status {
+                    primary: Primary::Skip,
+                    more: false,
+                    incomplete: false,
+                });
+            }
+            Err(error) => {
+                self.finish_shell_streams(id, coordinate);
+                let detail = aw_tools::task::bounded_task_error(error.to_string());
+                let primary = if matches!(error, Error::Transport(_)) {
+                    Primary::Unknown
+                } else {
+                    Primary::Fail
+                };
+                return self.settle_shell_result(
+                    id,
+                    coordinate,
+                    running_sequence,
+                    format!("{} launch={detail}", primary.as_str()),
+                    None,
+                    Status {
+                        primary,
+                        more: false,
+                        incomplete: false,
+                    },
+                );
+            }
+        };
         if let Some(stdin) = &prepared.stdin {
             if let Err(write_error) = process.write(stdin).await {
                 let stop = process.terminate().await;

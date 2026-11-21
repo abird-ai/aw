@@ -356,6 +356,14 @@ impl SessionStore {
                 .map_err(|_| Error::Storage("cannot serialize remote Start authorization"))?,
         )?;
         db(tx.commit())?;
+        // Reuse the already-owned store connection: taking a second SessionStore
+        // connection here would re-enter the store lock. Compaction is maintenance,
+        // so failure simply leaves the full consumed replay row intact.
+        let _ = SessionStore::policy_admission_compact_consumed_in(
+            &connection,
+            session,
+            policy_admission.id,
+        );
         Ok(authorization)
     }
 }

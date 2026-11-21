@@ -4,35 +4,38 @@ use aw::{
 };
 use aw_agent_core::{
     AgentExecutionBinding, AuxiliaryInput, AuxiliaryKind, ExecutionOwnershipLease,
-    InvocationIdentity, JournalEntry, JournalFuture, ProviderAccounts, ProviderSelection, Tool,
-    ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSpec, TurnJournal, TurnStart,
+    InvocationIdentity, JournalEntry, JournalFuture, PrincipalId, ProviderAccounts,
+    ProviderSelection, Tool, ToolContext, ToolEffect, ToolFuture, ToolOutput, ToolSpec,
+    TurnJournal, TurnStart,
 };
 #[cfg(feature = "routing")]
-use aw_agent_core::{InvocationContext, RoutingExecutor, RoutingInput, RoutingJournal, RoutingResult};
-#[cfg(feature = "routing")]
-use aw_routing::{target as routing_target, RoutingMode};
-use aw_store::{
-    DelegationLimits, PolicyAdmissionRequest, PolicyAdmissionState, PolicyAdmissionSubject,
-    QueueState, SessionParticipationAction, SessionStore, SubagentInfo, SubagentMode,
+use aw_agent_core::{
+    InvocationContext, RoutingExecutor, RoutingInput, RoutingJournal, RoutingResult,
 };
 use aw_host::{
     execute_with_strategy, AuthenticatedToolGrantEvidence, DelegateAdmissionAuthority,
     DelegateAgentPort, DelegateExecution, DelegatedExecutionGate, DelegationRequest,
     HostExecutionFuture, OriginalOperationExecutor,
 };
+#[cfg(feature = "routing")]
+use aw_routing::{target as routing_target, RoutingMode};
+use aw_store::{
+    DelegationLimits, PolicyAdmissionRequest, PolicyAdmissionState, PolicyAdmissionSubject,
+    QueueState, SessionParticipationAction, SessionStore, SubagentInfo, SubagentMode,
+};
+#[cfg(feature = "routing")]
+use aw_store::{RoutingSelectionSource, RoutingStrategyRevisionInfo};
 use aw_store_api::SessionBackend;
 use aw_tools::{
     execution_ref::{ExecutionRef, ExecutionSegment, Handle, ResolvedExecutionRef},
     filesystem::schema::Tool as FsTool,
     operation::OperationId,
     remote_start::{
-        RemoteSessionAction, RemoteStartIntent, REMOTE_START_VERSION,
-        arguments_sha256 as remote_arguments_sha256,
+        arguments_sha256 as remote_arguments_sha256, RemoteSessionAction, RemoteStartAuthorization,
+        RemoteStartIntent, REMOTE_START_VERSION,
     },
 };
 use aw_tools_adapter::operation_router::OperationRouter;
-#[cfg(feature = "routing")]
-use aw_store::{RoutingSelectionSource, RoutingStrategyRevisionInfo};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -116,7 +119,8 @@ impl ChildRoutingConfig {
                 "subagent routing strategy must have role=worker".into(),
             ));
         }
-        let profiles = crate::routing_runtime::preflight_strategy(file_config, &strategy.definition)?;
+        let profiles =
+            crate::routing_runtime::preflight_strategy(file_config, &strategy.definition)?;
         Ok(Self {
             strategy,
             profiles,
@@ -190,7 +194,7 @@ impl ServiceConfig {
     /// durable child Sessions; the ordinary child path remains unchanged.
     #[allow(dead_code)] // AW-P6-7 hosted opt-in until AW-P6-9 root Session owner wiring
     pub fn with_child_actors(mut self, service: crate::child_actors::Service) -> Self {
-        self.child_actors=Some(service);
+        self.child_actors = Some(service);
         self
     }
 }
@@ -225,7 +229,10 @@ impl TurnJournal for BudgetJournal {
     fn validate_context(&self) -> JournalFuture<'_, ()> {
         self.inner.validate_context()
     }
-    fn validate_context_as<'a>(&'a self, identity: &'a InvocationIdentity) -> JournalFuture<'a, ()> {
+    fn validate_context_as<'a>(
+        &'a self,
+        identity: &'a InvocationIdentity,
+    ) -> JournalFuture<'a, ()> {
         self.inner.validate_context_as(identity)
     }
     fn additional_context(&self) -> JournalFuture<'_, Vec<aw_agent_core::ContextBlock>> {
@@ -273,7 +280,9 @@ impl TurnJournal for BudgetJournal {
             }
             if let Err(error) = self.inner.append(turn_id, entry.clone()).await {
                 if let JournalEntry::InvocationStarted { ordinal, .. } = &entry {
-                    let detail = format!("ordinary invocation intent failed after budget reservation: {error}");
+                    let detail = format!(
+                        "ordinary invocation intent failed after budget reservation: {error}"
+                    );
                     let bounded = detail.chars().take(2048).collect::<String>();
                     let _ = self.store.mark_delegation_model_attempt_unknown(
                         &self.actor,
@@ -407,7 +416,6 @@ struct AgentConstructor {
     service: Service,
 }
 
-
 #[derive(Clone)]
 struct PolicyGateSpec {
     tool: Arc<dyn Tool>,
@@ -447,7 +455,10 @@ impl Tool for DelegatedOriginalTool {
     }
 
     fn validate(&self, arguments: &Value) -> Result<()> {
-        if arguments.as_object().is_none_or(|object| !object.is_empty()) {
+        if arguments
+            .as_object()
+            .is_none_or(|object| !object.is_empty())
+        {
             return Err(Error::Denied(
                 "delegated original execution tool accepts no model-controlled arguments",
             ));
@@ -505,8 +516,6 @@ fn kernel_effect(effect: &ToolEffect) -> aw_agent_kernel::capability::Effect {
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug)]
 pub struct PolicyOperationConfig {
     policy: aw_policy::Policy,
@@ -548,7 +557,6 @@ impl PolicyOperationConfig {
             guardian: false,
         })
     }
-
 }
 
 struct PreparedOriginalOperation {
@@ -573,6 +581,7 @@ impl OriginalOperationExecutor for PreparedOriginalOperation {
 pub struct PolicyOperationRouter {
     store: SessionStore,
     service: Option<Service>,
+    accounts: ProviderAccounts,
     authority: aw_agent_core::tool::ToolBindingAuthority,
     config: PolicyOperationConfig,
     remote_sites: BTreeMap<String, aw_mcp::RemoteBridge>,
@@ -589,6 +598,7 @@ impl PolicyOperationRouter {
         }
         Ok(Self {
             store: service.inner.store.clone(),
+            accounts: service.inner.accounts.clone(),
             service: Some(service),
             authority,
             config,
@@ -598,6 +608,7 @@ impl PolicyOperationRouter {
 
     pub fn local(
         store: SessionStore,
+        accounts: ProviderAccounts,
         authority: aw_agent_core::tool::ToolBindingAuthority,
         config: PolicyOperationConfig,
     ) -> Result<Self> {
@@ -607,6 +618,7 @@ impl PolicyOperationRouter {
         Ok(Self {
             store,
             service: None,
+            accounts,
             authority,
             config,
             remote_sites: BTreeMap::new(),
@@ -637,12 +649,9 @@ impl PolicyOperationRouter {
     }
 
     fn current_agent_ref(ctx: &ToolContext) -> Result<ResolvedExecutionRef> {
-        let owner = ctx
-            .execution_owner
-            .as_ref()
-            .ok_or(Error::Denied(
-                "policy operation routing requires a bound Agent owner",
-            ))?;
+        let owner = ctx.execution_owner.as_ref().ok_or(Error::Denied(
+            "policy operation routing requires a bound Agent owner",
+        ))?;
         ExecutionRef::parse(owner.canonical_ref())
             .map_err(|_| Error::Denied("invalid bound Agent execution ref"))?
             .resolve(None, None)
@@ -665,9 +674,9 @@ impl PolicyOperationRouter {
     ) -> Result<String> {
         let current = Self::current_agent_ref(ctx)?;
         let ref_value = match operation {
-            OperationId::JobsGet
-            | OperationId::JobsRead
-            | OperationId::JobsSend => arguments.get("ref").and_then(Value::as_str).or(Some(".")),
+            OperationId::JobsGet | OperationId::JobsRead | OperationId::JobsSend => {
+                arguments.get("ref").and_then(Value::as_str).or(Some("."))
+            }
             OperationId::JobsAck | OperationId::JobsCancel => {
                 arguments.get("ref").and_then(Value::as_str)
             }
@@ -765,10 +774,9 @@ impl PolicyOperationRouter {
         canonical_target: &str,
         arguments: &Value,
     ) -> Result<Value> {
-        let mut remote = arguments
-            .as_object()
-            .cloned()
-            .ok_or(Error::Denied("remote operation arguments must be an object"))?;
+        let mut remote = arguments.as_object().cloned().ok_or(Error::Denied(
+            "remote operation arguments must be an object",
+        ))?;
         match operation {
             OperationId::JobsGet
             | OperationId::JobsRead
@@ -786,16 +794,18 @@ impl PolicyOperationRouter {
             | OperationId::Pwsh
             | OperationId::Powershell
             | OperationId::Batch => {}
-            _ => return Err(Error::Denied("operation has no initial dotlink bridge mapping")),
+            _ => {
+                return Err(Error::Denied(
+                    "operation has no initial dotlink bridge mapping",
+                ))
+            }
         }
         Ok(Value::Object(remote))
     }
 
     fn remote_read(operation: OperationId) -> bool {
         match operation {
-            OperationId::Fs(tool) => {
-                tool.action() == aw_tools::filesystem::access::Action::Read
-            }
+            OperationId::Fs(tool) => tool.action() == aw_tools::filesystem::access::Action::Read,
             OperationId::JobsList | OperationId::JobsGet | OperationId::JobsRead => true,
             _ => false,
         }
@@ -803,9 +813,7 @@ impl PolicyOperationRouter {
 
     fn remote_effect(operation: OperationId) -> bool {
         match operation {
-            OperationId::Fs(tool) => {
-                tool.action() != aw_tools::filesystem::access::Action::Read
-            }
+            OperationId::Fs(tool) => tool.action() != aw_tools::filesystem::access::Action::Read,
             OperationId::Bash
             | OperationId::Pwsh
             | OperationId::Powershell
@@ -837,6 +845,79 @@ impl PolicyOperationRouter {
         }
     }
 
+    /// Upstream disclosure check for an immutable committed remote effect.
+    /// This never authorizes/retries the effect. The remote owner independently
+    /// revalidates its concrete filesystem/Job/shell resource before releasing
+    /// the retained receipt.
+    fn remote_replay_payload_disclosed(
+        &self,
+        ctx: &ToolContext,
+        operation: OperationId,
+        authorization: &RemoteStartAuthorization,
+    ) -> Result<bool> {
+        authorization
+            .validate()
+            .map_err(|_| Error::Storage("persisted remote Start authorization is invalid"))?;
+        let scope = ctx.scope.as_ref().ok_or(Error::Denied(
+            "remote replay disclosure requires a durable Session/branch",
+        ))?;
+        if authorization.provenance.actor != ctx.actor.as_str()
+            || authorization.provenance.session_id != scope.session_id
+            || authorization.provenance.branch_id != scope.branch_id
+            || authorization.intent.operation != operation.semantic_name()
+            || authorization.intent.canonical_ref != authorization.provenance.source.resource_scope
+        {
+            return Ok(false);
+        }
+
+        match self.store.authorize_session_participation(
+            &ctx.actor,
+            &scope.session_id,
+            SessionParticipationAction::View,
+        ) {
+            Ok(_) => {}
+            Err(Error::Denied(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+
+        let current = Self::current_agent_ref(ctx)?;
+        let evidence = match AuthenticatedToolGrantEvidence::capture(
+            &self.authority,
+            &ctx.actor,
+            operation.model_name(),
+            operation.semantic_name(),
+            Self::target_domain(&current),
+            authorization.intent.canonical_ref.clone(),
+            Self::project_scope(&current),
+        ) {
+            Ok(evidence) => evidence,
+            Err(Error::Denied(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let binding = evidence.binding();
+        if ctx.authorize_peer_tool(binding).is_err() {
+            return Ok(false);
+        }
+        let current_source = evidence.operation_context();
+        let source = &authorization.provenance.source;
+        let source_kind = current_source.source_kind.as_str();
+        Ok(binding.source == ctx.source
+            && binding.effect == ctx.effect
+            && binding.execution_site == ctx.execution_site
+            && current_source.operation == authorization.intent.operation
+            && source_kind == source.source_kind
+            && current_source.source_id == source.source_id
+            && current_source.source_epoch == source.source_epoch
+            && current_source.site == source.site
+            && current_source.resource_scope == source.resource_scope)
+    }
+
+    fn withheld_remote_replay() -> ToolOutput {
+        ToolOutput::text(
+            "request identity is already consumed; protected replay content is unavailable under current disclosure; do not retry",
+        )
+    }
+
     fn policy_sha256(&self) -> String {
         let policy = self.config.policy;
         let mut hash = Sha256::new();
@@ -858,11 +939,7 @@ impl PolicyOperationRouter {
         format!("{:x}", hash.finalize())
     }
 
-    fn decision_digest(
-        revision: u64,
-        route: aw_policy::Strategy,
-        label: &str,
-    ) -> String {
+    fn decision_digest(revision: u64, route: aw_policy::Strategy, label: &str) -> String {
         let mut hash = Sha256::new();
         hash.update(b"aw-policy-operation-decision-v1\0");
         hash.update(revision.to_be_bytes());
@@ -913,12 +990,7 @@ impl PolicyOperationRouter {
             .map_err(|_| Error::Denied("invalid delegated control target"))?
             .resolve(Some(current.agent_ref()), None)
             .map_err(|_| Error::Denied("delegated control target needs context"))?;
-        request = request.with_control_target(
-            target,
-            current_turn,
-            vec![current],
-            Vec::new(),
-        )?;
+        request = request.with_control_target(target, current_turn, vec![current], Vec::new())?;
         Ok(request)
     }
 
@@ -945,7 +1017,9 @@ impl PolicyOperationRouter {
             ));
         }
 
-        if ctx.actor != ctx.identity.actor || ctx.source != aw_agent_core::ToolSource::trusted_host() {
+        if ctx.actor != ctx.identity.actor
+            || ctx.source != aw_agent_core::ToolSource::trusted_host()
+        {
             return Err(Error::Denied(
                 "policy operation source/actor is not an authenticated Host invocation",
             ));
@@ -965,14 +1039,17 @@ impl PolicyOperationRouter {
                         "remote Start replay identity was reused with a changed original request",
                     ));
                 }
+                let remote_arguments =
+                    Self::remote_arguments(operation, &existing.intent.canonical_ref, &arguments)?;
+                if !self.remote_replay_payload_disclosed(&ctx, operation, &existing)? {
+                    return Ok(Self::withheld_remote_replay());
+                }
                 let bridge = self
                     .remote_sites
                     .get(&existing.provenance.source.site)
                     .ok_or(Error::Conflict(
                         "committed remote Start site is no longer connected; preserve the original attempt",
                     ))?;
-                let remote_arguments =
-                    Self::remote_arguments(operation, &existing.intent.canonical_ref, &arguments)?;
                 return bridge
                     .call_effect(&ctx, operation, &remote_arguments, &existing)
                     .await;
@@ -1000,7 +1077,9 @@ impl PolicyOperationRouter {
                 PolicyAdmissionState::Denied
                 | PolicyAdmissionState::AskDenied
                 | PolicyAdmissionState::AskExpired => {
-                    return Err(Error::Denied("operation denied by original policy admission"));
+                    return Err(Error::Denied(
+                        "operation denied by original policy admission",
+                    ));
                 }
                 PolicyAdmissionState::AskPending
                 | PolicyAdmissionState::GuardianStarted
@@ -1017,6 +1096,7 @@ impl PolicyOperationRouter {
             }
         }
 
+        let current_selection = self.accounts.select_exact(&ctx.actor, &ctx.identity)?;
         original.validate(&arguments)?;
         if ctx.execution_site.is_empty() {
             return Err(Error::Denied(
@@ -1078,21 +1158,15 @@ impl PolicyOperationRouter {
             &scope.session_id,
             SessionParticipationAction::Submit,
         )?;
-        let writer = self.store.workspace_writer(
-            &session.owner,
-            None,
-            &session.workspace_id,
-        )?;
+        let writer = self
+            .store
+            .workspace_writer(&session.owner, None, &session.workspace_id)?;
         if writer.state != "active" {
             return Err(Error::Denied("policy operation writer is no longer active"));
         }
         let policy_sha = self.policy_sha256();
         let authority_sha = evidence.authority_sha256();
-        let selected_for_guardian = if self.config.guardian {
-            Some(self.delegation_service()?.exact_selection(&ctx)?)
-        } else {
-            None
-        };
+        let selected_for_guardian = self.config.guardian.then_some(current_selection);
         let request = PolicyAdmissionRequest {
             session_id: scope.session_id.clone(),
             branch_id: scope.branch_id.clone(),
@@ -1195,7 +1269,11 @@ impl PolicyOperationRouter {
                     let wire_arguments = Self::remote_arguments(operation, &target, &arguments)?;
                     if Self::remote_read(operation) {
                         evidence.revalidate(&self.authority)?;
-                        return bridge.call_read(&ctx, operation, &wire_arguments).await;
+                        let result = bridge.call_read(&ctx, operation, &wire_arguments).await;
+                        let _ = self
+                            .store
+                            .policy_admission_compact_consumed(&scope.session_id, &decided.id);
+                        return result;
                     }
                     if Self::remote_effect(operation) {
                         if let Some(authorization) = aw::policy_runtime::recover_remote_start(
@@ -1211,10 +1289,19 @@ impl PolicyOperationRouter {
                                 operation: operation.semantic_name(),
                                 canonical_ref: &target,
                                 arguments_sha256: remote_arguments_sha256(&wire_arguments),
-                                original_request_sha256: Self::request_digest(operation, &arguments),
+                                original_request_sha256: Self::request_digest(
+                                    operation, &arguments,
+                                ),
                                 session_action: Self::remote_session_action(operation)?,
                             },
                         )? {
+                            if !self.remote_replay_payload_disclosed(
+                                &ctx,
+                                operation,
+                                &authorization,
+                            )? {
+                                return Ok(Self::withheld_remote_replay());
+                            }
                             return bridge
                                 .call_effect(&ctx, operation, &wire_arguments, &authorization)
                                 .await;
@@ -1268,7 +1355,9 @@ impl PolicyOperationRouter {
             && !Self::remote_read(operation)
             && !Self::remote_effect(operation)
         {
-            return Err(Error::Denied("operation is not supported by the initial dotlink bridge"));
+            return Err(Error::Denied(
+                "operation is not supported by the initial dotlink bridge",
+            ));
         }
         let remote_intent = match remote_bridge.as_ref() {
             Some(bridge) if Self::remote_effect(operation) => {
@@ -1276,19 +1365,22 @@ impl PolicyOperationRouter {
                 let wire_arguments = remote_arguments
                     .as_ref()
                     .ok_or(Error::Protocol("remote arguments disappeared"))?;
-                Some((RemoteStartIntent {
-                    version: REMOTE_START_VERSION,
-                    original_invocation_id: invocation.clone(),
-                    turn_id: ctx.turn_id,
-                    call_id: ctx.call_id.clone(),
-                    effect_attempt_id: ctx.call_id.clone(),
-                    operation: operation.semantic_name().into(),
-                    canonical_ref: target.clone(),
-                    arguments_sha256: remote_arguments_sha256(wire_arguments),
-                    original_request_sha256: Self::request_digest(operation, &arguments),
-                    session_action: Self::remote_session_action(operation)?,
-                    target: lease.target,
-                }, lease.issuer))
+                Some((
+                    RemoteStartIntent {
+                        version: REMOTE_START_VERSION,
+                        original_invocation_id: invocation.clone(),
+                        turn_id: ctx.turn_id,
+                        call_id: ctx.call_id.clone(),
+                        effect_attempt_id: ctx.call_id.clone(),
+                        operation: operation.semantic_name().into(),
+                        canonical_ref: target.clone(),
+                        arguments_sha256: remote_arguments_sha256(wire_arguments),
+                        original_request_sha256: Self::request_digest(operation, &arguments),
+                        session_action: Self::remote_session_action(operation)?,
+                        target: lease.target,
+                    },
+                    lease.issuer,
+                ))
             }
             _ => None,
         };
@@ -1313,7 +1405,11 @@ impl PolicyOperationRouter {
                         "policy admission did not reach executable consumed state",
                     ));
                 }
-                return bridge.call_read(&ctx, operation, wire_arguments).await;
+                let result = bridge.call_read(&ctx, operation, wire_arguments).await;
+                let _ = self
+                    .store
+                    .policy_admission_compact_consumed(&scope.session_id, &consumed.id);
+                return result;
             }
             let (intent, issuer) =
                 remote_intent.ok_or(Error::Protocol("remote Start intent disappeared"))?;
@@ -1369,7 +1465,7 @@ impl PolicyOperationRouter {
         } else {
             None
         };
-        execute_with_strategy(
+        let result = execute_with_strategy(
             strategy,
             operation,
             original_executor,
@@ -1377,7 +1473,14 @@ impl PolicyOperationRouter {
             self.authority.clone(),
             delegated,
         )
-        .await
+        .await;
+        // Detail compaction is post-effect maintenance. A failed compaction
+        // leaves the full consumed replay row intact and must not replace the
+        // executor's factual result.
+        let _ = self
+            .store
+            .policy_admission_compact_consumed(&scope.session_id, &consumed.id);
+        result
     }
 }
 
@@ -1393,7 +1496,6 @@ impl OperationRouter for PolicyOperationRouter {
         Box::pin(async move { self.route(operation, ctx, arguments, original).await })
     }
 }
-
 
 #[derive(Clone)]
 pub struct PolicyDelegateAdmission {
@@ -1411,13 +1513,9 @@ impl DelegateAdmissionAuthority for PolicyDelegateAdmission {
                 "transient AW policy delegate admission cannot retarget an existing Agent",
             ));
         }
-        let scope = self
-            .parent_context
-            .scope
-            .as_ref()
-            .ok_or(Error::Denied(
-                "policy delegation requires a durable parent Session/branch",
-            ))?;
+        let scope = self.parent_context.scope.as_ref().ok_or(Error::Denied(
+            "policy delegation requires a durable parent Session/branch",
+        ))?;
         let owner = self
             .parent_context
             .execution_owner
@@ -1515,7 +1613,7 @@ impl DelegateAgentPort for PolicyDelegatePort {
                 .await?;
             if prepared.actor_lease.is_none() {
                 let _ = self.service.inner.store.settle_subagent(
-                    &self.parent_context.actor,
+                    &prepared.resource_owner,
                     &prepared.info.id,
                     "failed",
                     Some("policy delegation requires the authenticated child Actor runtime"),
@@ -1526,11 +1624,7 @@ impl DelegateAgentPort for PolicyDelegatePort {
             }
 
             let authority = prepared.agent.tool_binding_authority();
-            gate.bind_delegate_tool(
-                &authority,
-                &self.parent_context.actor,
-                &name,
-            )?;
+            gate.bind_delegate_tool(&authority, &self.parent_context.actor, &name)?;
 
             let result = Service::run_prepared(
                 self.service.inner.clone(),
@@ -1557,7 +1651,9 @@ struct LiveAgentWakeHandle {
 impl aw::agent_jobs::LiveAgentWake for LiveAgentWakeHandle {
     fn wake(&self) -> Result<()> {
         if self.closing.load(Ordering::Acquire) {
-            return Err(Error::Conflict("Agent is closing and accepts no future input"));
+            return Err(Error::Conflict(
+                "Agent is closing and accepts no future input",
+            ));
         }
         self.sender
             .send(LiveAgentCommand::Wake)
@@ -1589,6 +1685,7 @@ impl Drop for ActiveBackground {
 
 struct Prepared {
     info: SubagentInfo,
+    resource_owner: PrincipalId,
     agent: Agent,
     selection: ProviderSelection,
     task: String,
@@ -1633,9 +1730,7 @@ impl Service {
         }
         #[cfg(not(feature = "routing"))]
         if child_routing.is_some() {
-            return Err(Error::Denied(
-                "this build does not include child routing",
-            ));
+            return Err(Error::Denied("this build does not include child routing"));
         }
         #[cfg(not(feature = "workspace"))]
         if child_tool_mode != ToolMode::Off {
@@ -1648,7 +1743,9 @@ impl Service {
             None
         } else {
             let git = _trusted_git.ok_or_else(|| {
-                Error::Config("tool-enabled subagents require an explicit trusted Git executable".into())
+                Error::Config(
+                    "tool-enabled subagents require an explicit trusted Git executable".into(),
+                )
             })?;
             if !git.is_absolute() || !git.is_file() {
                 return Err(Error::Config(
@@ -1699,10 +1796,7 @@ impl Service {
         }
     }
 
-    pub fn policy_delegate_port(
-        &self,
-        parent_context: &ToolContext,
-    ) -> Arc<dyn DelegateAgentPort> {
+    pub fn policy_delegate_port(&self, parent_context: &ToolContext) -> Arc<dyn DelegateAgentPort> {
         Arc::new(PolicyDelegatePort {
             service: self.clone(),
             parent_context: parent_context.clone(),
@@ -1765,16 +1859,7 @@ impl Service {
         Ok(())
     }
     fn exact_selection(&self, ctx: &ToolContext) -> Result<ProviderSelection> {
-        let selected = self
-            .inner
-            .accounts
-            .select(&ctx.actor, &ctx.identity.account_id, &ctx.identity.model)?;
-        if selected.identity() != &ctx.identity {
-            return Err(Error::Denied(
-                "parent provider/account/model authority changed; spawn was not dispatched",
-            ));
-        }
-        Ok(selected)
+        self.inner.accounts.select_exact(&ctx.actor, &ctx.identity)
     }
 
     fn child_routing_revision_id(&self) -> Option<&str> {
@@ -1919,16 +2004,8 @@ impl Service {
                     }
                 }
                 RoutingMode::RouteEachPrompt => {
-                    self.classify_child_target(
-                        ctx,
-                        root,
-                        allocation,
-                        &scratch,
-                        config,
-                        input,
-                        None,
-                    )
-                    .await?
+                    self.classify_child_target(ctx, root, allocation, &scratch, config, input, None)
+                        .await?
                 }
             };
             self.inner.store.routing_consume_for_delegation(
@@ -2042,7 +2119,9 @@ impl Service {
         let target_id = result
             .proposal
             .as_ref()
-            .ok_or(Error::Protocol("completed child routing decision has no candidate"))?
+            .ok_or(Error::Protocol(
+                "completed child routing decision has no candidate",
+            ))?
             .candidate_id
             .clone();
         if strategy.mode == RoutingMode::RouteOnce {
@@ -2083,9 +2162,7 @@ impl Service {
 
     fn validate_agent_args(arguments: &Value) -> Result<AgentSpawnArgs> {
         let args: AgentSpawnArgs = serde_json::from_value(arguments.clone()).map_err(|_| {
-            Error::Denied(
-                "agent arguments must contain task, optional title, optional background",
-            )
+            Error::Denied("agent arguments must contain task, optional title, optional background")
         })?;
         if args.task.trim().is_empty()
             || args.task.len() > aw::config::MAX_PROMPT_BYTES
@@ -2096,10 +2173,7 @@ impl Service {
             ));
         }
         if let Some(title) = &args.title {
-            if title.trim().is_empty()
-                || title.len() > 160
-                || title.chars().any(char::is_control)
-            {
+            if title.trim().is_empty() || title.len() > 160 || title.chars().any(char::is_control) {
                 return Err(Error::Config(
                     "agent title needs 1..160 printable bytes".into(),
                 ));
@@ -2108,18 +2182,13 @@ impl Service {
         Ok(args)
     }
 
-    fn agent_constructor_fingerprint(
-        ctx: &ToolContext,
-        args: &AgentSpawnArgs,
-    ) -> Result<String> {
-        let owner = ctx
-            .execution_owner
-            .as_ref()
-            .ok_or(Error::Denied("agent constructor requires a bound parent Agent"))?;
-        let scope = ctx
-            .scope
-            .as_ref()
-            .ok_or(Error::Denied("agent constructor requires a durable parent scope"))?;
+    fn agent_constructor_fingerprint(ctx: &ToolContext, args: &AgentSpawnArgs) -> Result<String> {
+        let owner = ctx.execution_owner.as_ref().ok_or(Error::Denied(
+            "agent constructor requires a bound parent Agent",
+        ))?;
+        let scope = ctx.scope.as_ref().ok_or(Error::Denied(
+            "agent constructor requires a durable parent scope",
+        ))?;
         let request = json!({
             "task": args.task,
             "title": args.title,
@@ -2186,12 +2255,7 @@ impl Service {
             }
             if inner
                 .active_background
-                .compare_exchange(
-                    current,
-                    current + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return Ok(ActiveBackground {
@@ -2220,8 +2284,10 @@ impl Service {
         let git = inner.git.as_ref().ok_or(Error::Denied(
             "tool-enabled subagents require a trusted Git executable",
         ))?;
-        let repo = aw_git::Repository::discover(git, &parent.binding.tool_root)
-            .map_err(|error| Error::Config(format!("cannot prepare isolated child worktree: {error}")))?;
+        let repo =
+            aw_git::Repository::discover(git, &parent.binding.tool_root).map_err(|error| {
+                Error::Config(format!("cannot prepare isolated child worktree: {error}"))
+            })?;
         let repo_root = repo.root().canonicalize()?;
         let parent_cwd = parent.binding.working_directory.canonicalize()?;
         let parent_tool_root = parent.binding.tool_root.canonicalize()?;
@@ -2299,9 +2365,10 @@ impl Service {
             }
             Err(error) => {
                 let detail = format!("managed worktree creation outcome unknown: {error}");
-                let _ = inner
-                    .store
-                    .mark_subagent_execution_unknown(&ctx.actor, &binding_id, &detail);
+                let _ =
+                    inner
+                        .store
+                        .mark_subagent_execution_unknown(&ctx.actor, &binding_id, &detail);
                 Err(Error::Storage(
                     "managed worktree creation outcome requires inspection; no automatic retry",
                 ))
@@ -2326,11 +2393,7 @@ impl Service {
         }
     }
 
-    async fn prepare(
-        &self,
-        ctx: &ToolContext,
-        request: PrepareRequest,
-    ) -> Result<Prepared> {
+    async fn prepare(&self, ctx: &ToolContext, request: PrepareRequest) -> Result<Prepared> {
         let PrepareRequest {
             args,
             mode,
@@ -2349,23 +2412,34 @@ impl Service {
         let scope = ctx.scope.as_ref().ok_or(Error::Denied(
             "subagents require a durable parent Session/branch",
         ))?;
+        let resource_owner = if policy_gate.is_some() {
+            inner.store.authorize_session_participation(
+                &ctx.actor,
+                &scope.session_id,
+                SessionParticipationAction::Submit,
+            )?;
+            inner.store.session(&ctx.actor, &scope.session_id)?.owner
+        } else {
+            ctx.actor.clone()
+        };
+        let participant_policy_delegate = policy_gate.is_some() && resource_owner != ctx.actor;
+        if participant_policy_delegate && self.lineage.is_some() {
+            return Err(Error::Denied(
+                "participant policy delegation requires the root Agent Session",
+            ));
+        }
+        let child_routing_revision_id = if policy_gate.is_some() {
+            None
+        } else {
+            self.child_routing_revision_id()
+        };
         let execution_scope = ctx.execution_scope.clone();
         let execution_lease = execution_scope
             .as_ref()
             .map(|scope| scope.acquire())
             .transpose()?;
 
-        let parent_selection = {
-            let selected = inner
-                .accounts
-                .select(&ctx.actor, &ctx.identity.account_id, &ctx.identity.model)?;
-            if selected.identity() != &ctx.identity {
-                return Err(Error::Denied(
-                    "parent provider/account/model authority changed; spawn was not dispatched",
-                ));
-            }
-            selected
-        };
+        let parent_selection = inner.accounts.select_exact(&ctx.actor, &ctx.identity)?;
 
         let title = args
             .title
@@ -2377,43 +2451,40 @@ impl Service {
                 return Err(Error::Limit("delegation recursive depth limit reached"));
             }
             inner.store.reserve_delegation_descendant(
-                &ctx.actor,
+                &resource_owner,
                 &lineage.root_id,
                 &lineage.allocation_id,
                 &scope.session_id,
                 &scope.branch_id,
                 ctx.turn_id,
                 inner.budget.limits,
-                self.child_routing_revision_id(),
+                child_routing_revision_id,
                 &ctx.identity,
             )?
         } else {
             inner.store.reserve_delegation_child(
-                &ctx.actor,
+                &resource_owner,
                 &scope.session_id,
                 &scope.branch_id,
                 ctx.turn_id,
                 inner.budget.limits,
-                self.child_routing_revision_id(),
+                child_routing_revision_id,
                 1,
             )?
         };
-        let selected = match self
-            .select_child_target(
-                ctx,
-                &root,
-                &allocation,
-                parent_selection,
-                &args.task,
-            )
-            .await
-        {
+        let selected_result = if policy_gate.is_some() {
+            Ok(parent_selection)
+        } else {
+            self.select_child_target(ctx, &root, &allocation, parent_selection, &args.task)
+                .await
+        };
+        let selected = match selected_result {
             Ok(selection) => selection,
             Err(error) => {
                 let detail = error.to_string();
                 let bounded = detail.chars().take(2048).collect::<String>();
                 let _ = inner.store.fail_delegation_child_allocation(
-                    &ctx.actor,
+                    &resource_owner,
                     &allocation.id,
                     &bounded,
                 );
@@ -2431,17 +2502,17 @@ impl Service {
                 let detail = error.to_string();
                 let bounded = detail.chars().take(2048).collect::<String>();
                 let _ = inner.store.fail_delegation_child_allocation(
-                    &ctx.actor,
+                    &resource_owner,
                     &allocation.id,
                     &bounded,
                 );
                 return Err(error);
             }
         };
-        let tool_mode=child_tool_mode.storage_label().to_owned();
+        let tool_mode = child_tool_mode.storage_label().to_owned();
         let creation = if let Some(fingerprint) = constructor_fingerprint {
             inner.store.create_agent_job_session(
-                &ctx.actor,
+                &resource_owner,
                 &scope.session_id,
                 &scope.branch_id,
                 ctx.turn_id,
@@ -2457,9 +2528,25 @@ impl Service {
                 &ctx.call_id,
                 fingerprint,
             )
+        } else if participant_policy_delegate {
+            inner.store.create_participant_policy_delegate_session(
+                &resource_owner,
+                &scope.session_id,
+                &scope.branch_id,
+                ctx.turn_id,
+                &title,
+                &task_sha256,
+                selected.identity(),
+                &root.id,
+                &allocation.id,
+                allocation.depth,
+                &tool_mode,
+                execution_binding_id.as_deref(),
+                mode,
+            )
         } else {
             inner.store.create_subagent_session(
-                &ctx.actor,
+                &resource_owner,
                 &scope.session_id,
                 &scope.branch_id,
                 ctx.turn_id,
@@ -2480,7 +2567,7 @@ impl Service {
                 let detail = error.to_string();
                 let bounded = detail.chars().take(2048).collect::<String>();
                 let _ = inner.store.fail_delegation_child_allocation(
-                    &ctx.actor,
+                    &resource_owner,
                     &allocation.id,
                     &bounded,
                 );
@@ -2503,7 +2590,8 @@ impl Service {
             ToolMode::Trusted => unreachable!("constructor rejects trusted child tools"),
         };
         let recursive_scope = if !allow_recursive_tools {
-            "You cannot create or delegate to another Agent in this operation-scoped child.".to_owned()
+            "You cannot create or delegate to another Agent in this operation-scoped child."
+                .to_owned()
         } else if allocation.depth < root.limits.max_depth {
             format!(
                 "You may delegate bounded sub-tasks through the subagent tool. Descendants share this root's limits and you cannot choose their provider/model/root/tool authority. Current depth {}/{}.",
@@ -2524,7 +2612,9 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         let remaining_micros = root.deadline_at.saturating_sub(unix_micros());
         if remaining_micros <= 0 {
             let detail = "delegation root deadline expired before child start";
-            let _ = inner.store.fail_admitted_subagent(&ctx.actor, &info.id, detail);
+            let _ = inner
+                .store
+                .fail_admitted_subagent(&resource_owner, &info.id, detail);
             return Err(Error::Limit("delegation root deadline is exhausted"));
         }
         options.request_timeout = inner
@@ -2533,12 +2623,12 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             .min(Duration::from_micros(remaining_micros as u64));
         options.max_output_bytes = inner.settings.max_output_bytes;
 
-        if let Err(error) = inner.store.mark_subagent_running(&ctx.actor, &info.id) {
+        if let Err(error) = inner.store.mark_subagent_running(&resource_owner, &info.id) {
             let detail = error.to_string();
             let bounded = detail.chars().take(2048).collect::<String>();
             let _ = inner
                 .store
-                .fail_admitted_subagent(&ctx.actor, &info.id, &bounded);
+                .fail_admitted_subagent(&resource_owner, &info.id, &bounded);
             return Err(error);
         }
         let setup = (|| -> Result<Agent> {
@@ -2602,20 +2692,22 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                     agent.register_host_tool(descendant_service.agent_tool())?;
                 }
             }
-            let (view, handle) = inner
-                .store
-                .activate(&ctx.actor, &child.id, &child_branch.id)?;
+            let (view, handle) =
+                inner
+                    .store
+                    .activate(&resource_owner, &child.id, &child_branch.id)?;
             let journal: Arc<dyn TurnJournal> = Arc::new(BudgetJournal {
                 inner: Arc::new(handle),
                 store: inner.store.clone(),
-                actor: ctx.actor.clone(),
+                actor: resource_owner.clone(),
                 root_id: root.id.clone(),
                 child_session_id: child.id.clone(),
             });
             agent.load_history(view.history, Some(journal))?;
-            let execution = inner
-                .store
-                .agent_binding(&ctx.actor, &child.id, &child_branch.id)?;
+            let execution =
+                inner
+                    .store
+                    .agent_binding(&resource_owner, &child.id, &child_branch.id)?;
             agent.bind_execution_owner(AgentExecutionBinding::from_trusted_host(
                 format!(
                     "/d:{}/i:{}/p:{}/a:{}",
@@ -2634,47 +2726,57 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             Err(error) => {
                 let detail = error.to_string();
                 let bounded = detail.chars().take(2048).collect::<String>();
-                let _ = inner
-                    .store
-                    .settle_subagent(&ctx.actor, &info.id, "failed", Some(&bounded));
+                let _ = inner.store.settle_subagent(
+                    &resource_owner,
+                    &info.id,
+                    "failed",
+                    Some(&bounded),
+                );
                 return Err(error);
             }
         };
 
-        let actor_lease=if attach_legacy_child_actor {
-            if let Some(service)=&inner.child_actors {
-            let turn=agent.history_state().next_turn_id;
-            let attached = if let Some(gate) = policy_gate.as_ref() {
-                service.attach_delegated(crate::child_actors::DelegatedAttachRequest {
-                    durable: &info,
-                    agent: &agent,
-                    selected: &selected,
-                    task: &args.task,
-                    next_turn: turn,
-                    gate_name: &gate.name,
-                    gate_effect: kernel_effect(&gate.effect),
-                })
-            } else {
-                service.attach(&info, &agent, &selected, &args.task, turn)
-            };
-            match attached {
-                Ok(lease)=>Some(lease),
-                Err(error)=>{
-                    // The normal SessionStore remains the owner of lifecycle
-                    // facts. No unbound Actor may silently execute a child.
-                    let note=error.to_string();
-                    let bounded=note.chars().take(2048).collect::<String>();
-                    let _=inner.store.settle_subagent(&ctx.actor,&info.id,
-                        "failed",Some(&bounded));
-                    return Err(error);
+        let actor_lease = if attach_legacy_child_actor {
+            if let Some(service) = &inner.child_actors {
+                let turn = agent.history_state().next_turn_id;
+                let attached = if let Some(gate) = policy_gate.as_ref() {
+                    service.attach_delegated(crate::child_actors::DelegatedAttachRequest {
+                        durable: &info,
+                        agent: &agent,
+                        selected: &selected,
+                        task: &args.task,
+                        next_turn: turn,
+                        gate_name: &gate.name,
+                        gate_effect: kernel_effect(&gate.effect),
+                    })
+                } else {
+                    service.attach(&info, &agent, &selected, &args.task, turn)
+                };
+                match attached {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        // The normal SessionStore remains the owner of lifecycle
+                        // facts. No unbound Actor may silently execute a child.
+                        let note = error.to_string();
+                        let bounded = note.chars().take(2048).collect::<String>();
+                        let _ = inner.store.settle_subagent(
+                            &resource_owner,
+                            &info.id,
+                            "failed",
+                            Some(&bounded),
+                        );
+                        return Err(error);
+                    }
                 }
+            } else {
+                None
             }
-        } else {None}
         } else {
             None
         };
         Ok(Prepared {
             info,
+            resource_owner,
             agent,
             selection: selected,
             task: args.task,
@@ -2694,24 +2796,23 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         (answer[..end].to_owned(), true)
     }
 
-
     fn replay_agent_constructor(
         &self,
         ctx: &ToolContext,
         args: &AgentSpawnArgs,
         fingerprint: &str,
     ) -> Result<Option<ToolOutput>> {
-        let scope = ctx
-            .scope
-            .as_ref()
-            .ok_or(Error::Denied("Agent constructor replay requires durable parent scope"))?;
+        let scope = ctx.scope.as_ref().ok_or(Error::Denied(
+            "Agent constructor replay requires durable parent scope",
+        ))?;
         let Some((relation, stored_fingerprint)) = self.inner.store.agent_constructor_replay(
             &ctx.actor,
             &scope.session_id,
             &scope.branch_id,
             ctx.turn_id,
             &ctx.call_id,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         if stored_fingerprint != fingerprint {
@@ -2815,12 +2916,9 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 "stable Agent must not share the legacy one-shot child Actor owner",
             ));
         }
-        let binding = prepared
-            .agent
-            .execution_binding()
-            .ok_or(Error::Storage(
-                "stable Agent is missing its immutable Session-derived identity",
-            ))?;
+        let binding = prepared.agent.execution_binding().ok_or(Error::Storage(
+            "stable Agent is missing its immutable Session-derived identity",
+        ))?;
         if binding.session_id() != prepared.info.child_session_id {
             return Err(Error::Denied(
                 "stable Agent relation and execution identity differ",
@@ -2855,10 +2953,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         })
     }
 
-    async fn deliver_stable_agent_events(
-        router: &aw::agent_jobs::Router,
-        canonical_ref: &str,
-    ) {
+    async fn deliver_stable_agent_events(router: &aw::agent_jobs::Router, canonical_ref: &str) {
         let _ = aw_tools_adapter::agent_jobs::AgentJobRouter::deliver_source_events(
             router,
             canonical_ref,
@@ -2884,10 +2979,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             ))
     }
 
-    fn finish_scoped_initial_turn(
-        prepared: &mut Prepared,
-        result: &Result<aw_agent_core::Turn>,
-    ) {
+    fn finish_scoped_initial_turn(prepared: &mut Prepared, result: &Result<aw_agent_core::Turn>) {
         if let Some(scope) = prepared.agent.execution_scope().cloned() {
             let unresolved = match result {
                 Ok(turn) => turn.needs_reconciliation,
@@ -2909,12 +3001,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         if owner.admit_next_queued(&prepared.agent)?.is_none() {
             return Ok(false);
         }
-        let _ = Self::run_stable_claimed_turn(
-            prepared,
-            owner,
-            CancellationToken::new(),
-        )
-        .await?;
+        let _ = Self::run_stable_claimed_turn(prepared, owner, CancellationToken::new()).await?;
         Ok(true)
     }
 
@@ -2925,31 +3012,30 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         reason: &str,
     ) -> Result<()> {
         runtime.closing.store(true, Ordering::Release);
-        let (_principal, session, branch, _site, _epoch) =
-            runtime.owner.bound_peer_scope();
+        let (_principal, session, branch, _site, _epoch) = runtime.owner.bound_peer_scope();
         for fact in runtime.owner.queue_list()? {
             if fact.state != QueueState::Pending {
                 continue;
             }
             let request_id = fact.request.request_id.clone();
-            runtime.owner.operate(
-                aw::actor_owner::ActorOperation::DeleteQueue {
+            runtime
+                .owner
+                .operate(aw::actor_owner::ActorOperation::DeleteQueue {
                     request_id: request_id.clone(),
-                },
-            )?;
+                })?;
             if request_id.starts_with("jc_") {
                 // Queue custody is already deleted. A failed budget-release
                 // audit leaks capacity conservatively but can never resurrect
                 // runnable work or permit overspend.
                 let _ = inner.store.cancel_delegation_continuation(
-                    &prepared.info.identity.actor,
+                    &prepared.resource_owner,
                     session,
                     &request_id,
                 );
             }
         }
         inner.store.settle_agent_job(
-            &prepared.info.identity.actor,
+            &prepared.resource_owner,
             &prepared.info.id,
             branch,
             "cancelled",
@@ -2968,7 +3054,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         let bounded = detail.chars().take(2048).collect::<String>();
         let (_principal, _session, branch, _site, _epoch) = runtime.owner.bound_peer_scope();
         let _ = inner.store.settle_agent_job(
-            &prepared.info.identity.actor,
+            &prepared.resource_owner,
             &prepared.info.id,
             branch,
             "failed",
@@ -2985,13 +3071,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
     ) -> Result<()> {
         let name = format!(
             "aw-agent-{}",
-            prepared
-                .info
-                .id
-                .chars()
-                .rev()
-                .take(8)
-                .collect::<String>()
+            prepared.info.id.chars().rev().take(8).collect::<String>()
         );
         let spawn = thread::Builder::new().name(name).spawn(move || {
             let _active = active;
@@ -3067,16 +3147,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
         let name = format!(
             "aw-agent-{}",
-            prepared
-                .info
-                .id
-                .chars()
-                .rev()
-                .take(8)
-                .collect::<String>()
+            prepared.info.id.chars().rev().take(8).collect::<String>()
         );
         let cleanup_inner = inner.clone();
-        let cleanup_actor = prepared.info.identity.actor.clone();
+        let cleanup_actor = prepared.resource_owner.clone();
         let cleanup_id = prepared.info.id.clone();
         let cleanup_router = runtime_state.router.clone();
         let cleanup_ref = runtime_state.canonical_ref.clone();
@@ -3094,12 +3168,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 Err(error) => {
                     let detail = format!("cannot start stable Agent runtime: {error}");
                     let _ = ready_tx.send(Err(detail.clone()));
-                    Self::fail_stable_worker_creation(
-                        &inner,
-                        &prepared,
-                        &runtime_state,
-                        &detail,
-                    );
+                    Self::fail_stable_worker_creation(&inner, &prepared, &runtime_state, &detail);
                     return;
                 }
             };
@@ -3109,12 +3178,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             {
                 let detail = format!("cannot admit stable Agent initial Turn: {error}");
                 let _ = ready_tx.send(Err(detail.clone()));
-                Self::fail_stable_worker_creation(
-                    &inner,
-                    &prepared,
-                    &runtime_state,
-                    &detail,
-                );
+                Self::fail_stable_worker_creation(&inner, &prepared, &runtime_state, &detail);
                 return;
             }
             // The handoff caller cannot return before this exact durable Input
@@ -3140,9 +3204,9 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             ));
             Self::finish_scoped_initial_turn(&mut prepared, &first);
             runtime.block_on(Self::deliver_stable_agent_events(
-                            runtime_state.router.as_ref(),
-                            &runtime_state.canonical_ref,
-                        ));
+                runtime_state.router.as_ref(),
+                &runtime_state.canonical_ref,
+            ));
 
             loop {
                 match runtime_state.receiver.recv() {
@@ -3211,18 +3275,29 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         mut prepared: Prepared,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let actor = prepared.info.identity.actor.clone();
-        let result = if let Some(lease)=prepared.actor_lease.as_ref() {
-            lease.run_once(&mut prepared.agent,&prepared.selection,cancellation).await
+        let actor = prepared.resource_owner.clone();
+        let result = if let Some(lease) = prepared.actor_lease.as_ref() {
+            lease
+                .run_once(&mut prepared.agent, &prepared.selection, cancellation)
+                .await
         } else {
-            prepared.agent.prompt_as(&prepared.selection,prepared.task,
-                cancellation.cancelled(), |_|Ok(())).await
+            prepared
+                .agent
+                .prompt_as(
+                    &prepared.selection,
+                    prepared.task,
+                    cancellation.cancelled(),
+                    |_| Ok(()),
+                )
+                .await
         };
 
         match result {
             Ok(turn) if turn.outcome == aw::conversation::Outcome::Completed => {
-                inner.store.settle_subagent(&actor,&prepared.info.id,"completed",None)?;
-                if let Some(lease)=&prepared.actor_lease {
+                inner
+                    .store
+                    .settle_subagent(&actor, &prepared.info.id, "completed", None)?;
+                if let Some(lease) = &prepared.actor_lease {
                     lease.observe_settled(turn.needs_reconciliation)?;
                 }
                 let (answer, truncated) = Self::bounded_answer(&turn.answer);
@@ -3245,8 +3320,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                     .error
                     .as_deref()
                     .unwrap_or("subagent did not complete successfully");
-                inner.store.settle_subagent(&actor,&prepared.info.id,state,Some(detail))?;
-                if let Some(lease)=&prepared.actor_lease {
+                inner
+                    .store
+                    .settle_subagent(&actor, &prepared.info.id, state, Some(detail))?;
+                if let Some(lease) = &prepared.actor_lease {
                     lease.observe_settled(turn.needs_reconciliation)?;
                 }
                 Ok(ToolOutput::error(
@@ -3267,13 +3344,15 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 };
                 let detail = error.to_string();
                 let bounded = detail.chars().take(2048).collect::<String>();
-                let settled=inner.store.settle_subagent(
-                    &actor,&prepared.info.id,state,Some(&bounded));
+                let settled =
+                    inner
+                        .store
+                        .settle_subagent(&actor, &prepared.info.id, state, Some(&bounded));
                 if settled.is_ok() {
-                    if let Some(lease)=&prepared.actor_lease {
+                    if let Some(lease) = &prepared.actor_lease {
                         // Aborted provider/effect may be unknown, never
                         // misreported as an independently settled Actor.
-                        let _=lease.observe_settled(true);
+                        let _ = lease.observe_settled(true);
                     }
                 }
                 Err(error)
@@ -3281,7 +3360,6 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         }
     }
 }
-
 
 impl Tool for AgentConstructor {
     fn spec(&self) -> ToolSpec {
@@ -3311,26 +3389,24 @@ impl Tool for AgentConstructor {
             let args = Service::validate_agent_args(arguments)?;
             self.service.exact_selection(&ctx)?;
             let fingerprint = Service::agent_constructor_fingerprint(&ctx, &args)?;
-            if let Some(replay) = self
-                .service
-                .replay_agent_constructor(&ctx, &args, &fingerprint)?
+            if let Some(replay) =
+                self.service
+                    .replay_agent_constructor(&ctx, &args, &fingerprint)?
             {
                 return Ok(replay);
             }
             // Reserve the live-worker slot before creating any child Session.
             // A constructor that cannot retain the Agent must fail pre-effect.
             let active = Service::reserve_background(&self.service.inner)?;
-            let (mut prepared, background) = self
-                .service
-                .prepare_agent(&ctx, args, &fingerprint)
-                .await?;
+            let (mut prepared, background) =
+                self.service.prepare_agent(&ctx, args, &fingerprint).await?;
             let runtime_state = match self.service.attach_stable_agent_runtime(&prepared) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     let detail = error.to_string();
                     let bounded = detail.chars().take(2048).collect::<String>();
                     let _ = self.service.inner.store.settle_subagent(
-                        &prepared.info.identity.actor,
+                        &prepared.resource_owner,
                         &prepared.info.id,
                         "failed",
                         Some(&bounded),
@@ -3441,9 +3517,9 @@ mod tests {
     use super::*;
     use aw::config;
     use aw_agent_core::{
-        AccountDescriptor, CompletionFuture, CompletionMeta, DeltaSink, InvocationScope, JournalEntry,
-        PrincipalId, Provider, ToolCall, ToolContext, ToolEffect, ToolRecord, ToolStatus,
-        TurnJournal, TurnStart, Usage,
+        AccountDescriptor, CompletionFuture, CompletionMeta, DeltaSink, InvocationScope,
+        JournalEntry, PrincipalId, Provider, ToolCall, ToolContext, ToolEffect, ToolRecord,
+        ToolStatus, TurnJournal, TurnStart, Usage,
     };
     use aw_agent_core::{Message, ModelFuture, ModelReply, Role};
     #[cfg(feature = "workspace")]
@@ -3470,10 +3546,9 @@ mod tests {
             )?))?;
         }
         if ctx.execution_owner.is_none() {
-            let scope = ctx
-                .scope
-                .as_ref()
-                .ok_or(Error::Denied("Agent fixture requires a durable parent scope"))?;
+            let scope = ctx.scope.as_ref().ok_or(Error::Denied(
+                "Agent fixture requires a durable parent scope",
+            ))?;
             ctx.execution_owner = Some(aw_agent_core::AgentExecutionBinding::from_trusted_host(
                 "/d:0/i:0/p:0/a:0",
                 scope.session_id.clone(),
@@ -3546,7 +3621,9 @@ mod tests {
                 .rev()
                 .find(|message| message.role == Role::Tool)
                 .map(|message| message.content.as_str())
-                .ok_or(Error::Protocol("model-first fixture expected factual tool result"))
+                .ok_or(Error::Protocol(
+                    "model-first fixture expected factual tool result",
+                ))
         }
 
         fn capture_job_ref(&self, messages: &[Message]) -> Result<String> {
@@ -3558,7 +3635,9 @@ mod tests {
                     reference.starts_with("j:")
                         || (reference.starts_with("/d:") && reference.contains("/j:"))
                 })
-                .ok_or(Error::Protocol("Bash handoff did not return compact/canonical Job ref"))?
+                .ok_or(Error::Protocol(
+                    "Bash handoff did not return compact/canonical Job ref",
+                ))?
                 .to_owned();
             *self.job_ref.lock().unwrap() = Some(reference.clone());
             Ok(reference)
@@ -3576,7 +3655,11 @@ mod tests {
             _: &'a str,
             _: &'a mut DeltaSink<'_>,
         ) -> CompletionFuture<'a> {
-            Box::pin(async { Err(Error::Protocol("model-first fixture requires tool protocol")) })
+            Box::pin(async {
+                Err(Error::Protocol(
+                    "model-first fixture requires tool protocol",
+                ))
+            })
         }
 
         fn stream_tools<'a>(
@@ -3592,8 +3675,18 @@ mod tests {
                     .iter()
                     .map(|tool| tool.name.as_str())
                     .collect::<std::collections::BTreeSet<_>>();
-                for removed in ["job_start", "job_restart", "subagent", "team", "plan", "review_release"] {
-                    assert!(!names.contains(removed), "removed route leaked into provider catalog: {removed}");
+                for removed in [
+                    "job_start",
+                    "job_restart",
+                    "subagent",
+                    "team",
+                    "plan",
+                    "review_release",
+                ] {
+                    assert!(
+                        !names.contains(removed),
+                        "removed route leaked into provider catalog: {removed}"
+                    );
                 }
                 let reply = match (self.workflow, round) {
                     (ModelFirstWorkflow::Read, 0) => {
@@ -3666,7 +3759,9 @@ mod tests {
                             .split_whitespace()
                             .find_map(|part| part.strip_prefix("offset="))
                             .and_then(|value| value.parse::<u64>().ok())
-                            .ok_or(Error::Protocol("jobs_read did not expose continuation offset"))?;
+                            .ok_or(Error::Protocol(
+                                "jobs_read did not expose continuation offset",
+                            ))?;
                         assert_eq!(offset, 4);
                         let reference = self
                             .job_ref
@@ -3836,8 +3931,7 @@ mod tests {
         assert_eq!(first_valid, workflow_count);
         println!(
             "model-first first_valid_call_rate={}/{} deterministic_schema_valid=100%",
-            first_valid,
-            workflow_count
+            first_valid, workflow_count
         );
     }
 
@@ -3849,9 +3943,9 @@ mod tests {
 
     impl ModelFirstAgentProvider {
         fn is_child(messages: &[Message]) -> bool {
-            messages
-                .iter()
-                .any(|message| message.role == Role::User && message.content == "model-first child task")
+            messages.iter().any(|message| {
+                message.role == Role::User && message.content == "model-first child task"
+            })
         }
     }
 
@@ -3878,7 +3972,9 @@ mod tests {
                         },
                     });
                 }
-                Err(Error::Protocol("parent Agent workflow requires tool protocol"))
+                Err(Error::Protocol(
+                    "parent Agent workflow requires tool protocol",
+                ))
             })
         }
 
@@ -3895,7 +3991,10 @@ mod tests {
                     assert!(
                         tools.iter().all(|tool| tool.name == "jobs_subscribe"),
                         "stable model-only child may expose only jobs_subscribe: {:?}",
-                        tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>()
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>()
                     );
                     sink("model-first child answer")?;
                     return Ok(ModelReply {
@@ -3946,7 +4045,9 @@ mod tests {
                             .iter()
                             .rev()
                             .find(|message| message.role == Role::Tool)
-                            .ok_or(Error::Protocol("parent Agent workflow missing child result"))?;
+                            .ok_or(Error::Protocol(
+                                "parent Agent workflow missing child result",
+                            ))?;
                         assert!(result.content.contains("model-first child answer"));
                         sink("parent Agent workflow complete")?;
                         Ok(ModelReply {
@@ -4200,11 +4301,17 @@ mod tests {
                 if is_delegate {
                     self.delegate_calls.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(
-                        tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>(),
                         vec!["batch"],
                         "whole-Graph coordinator gets exactly one opaque original-execution gate"
                     );
-                    if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                    if messages
+                        .last()
+                        .is_some_and(|message| message.role == Role::Tool)
+                    {
                         let tool_result = messages.last().unwrap();
                         assert_eq!(
                             tool_result.tool_call_id.as_deref(),
@@ -4245,12 +4352,12 @@ mod tests {
 
                 self.parent_calls.fetch_add(1, Ordering::SeqCst);
                 assert!(tools.iter().any(|tool| tool.name == "batch"));
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Tool)
+                {
                     let result = messages.last().unwrap();
-                    assert_eq!(
-                        result.tool_call_id.as_deref(),
-                        Some("whole-graph-batch")
-                    );
+                    assert_eq!(result.tool_call_id.as_deref(), Some("whole-graph-batch"));
                     assert!(!result.content.is_empty());
                     assert!(!result
                         .content
@@ -4307,7 +4414,11 @@ mod tests {
             _model: &'a str,
             _sink: &'a mut DeltaSink<'_>,
         ) -> CompletionFuture<'a> {
-            Box::pin(async { Err(Error::Protocol("policy delegate fixture requires tool protocol")) })
+            Box::pin(async {
+                Err(Error::Protocol(
+                    "policy delegate fixture requires tool protocol",
+                ))
+            })
         }
 
         fn stream_tools<'a>(
@@ -4325,10 +4436,16 @@ mod tests {
                         .contains("operation-scoped execution delegate")
                 }));
                 assert_eq!(
-                    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+                    tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>(),
                     vec!["read"]
                 );
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Tool)
+                {
                     assert_eq!(
                         messages.last().unwrap().tool_call_id.as_deref(),
                         Some("delegate-original")
@@ -4416,8 +4533,12 @@ mod tests {
         ) -> CompletionFuture<'a> {
             Box::pin(async move {
                 assert_eq!(model, "fixture-model");
-                assert!(messages.iter().any(|message| message.content == "research task"));
-                assert!(!messages.iter().any(|message| message.content == "parent secret text"));
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content == "research task"));
+                assert!(!messages
+                    .iter()
+                    .any(|message| message.content == "parent secret text"));
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 sink("child answer")?;
                 Ok(CompletionMeta {
@@ -4500,7 +4621,10 @@ mod tests {
                         tools.iter().any(|tool| tool.name == "agent"),
                         "depth-1 child must inherit the same bounded Agent constructor"
                     );
-                    if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                    if messages
+                        .last()
+                        .is_some_and(|message| message.role == Role::Tool)
+                    {
                         let result = messages.last().unwrap();
                         assert_eq!(result.tool_call_id.as_deref(), Some("nested-agent"));
                         assert!(result.content.contains("level2 graph answer"));
@@ -4554,7 +4678,10 @@ mod tests {
                     !node_names.iter().any(|name| name == "batch"),
                     "nested batch must stay absent"
                 );
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Tool)
+                {
                     let result = messages.last().unwrap();
                     assert_eq!(result.tool_call_id.as_deref(), Some("graph-agent-batch"));
                     assert!(result.content.contains("level1 graph answer"));
@@ -4617,7 +4744,9 @@ mod tests {
         ) -> CompletionFuture<'a> {
             Box::pin(async move {
                 assert_eq!(model, "fixture-model");
-                assert!(messages.iter().any(|message| message.content == "level2 task"));
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content == "level2 task"));
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 sink("level2 answer")?;
                 Ok(CompletionMeta {
@@ -4638,8 +4767,14 @@ mod tests {
         ) -> ModelFuture<'a> {
             Box::pin(async move {
                 assert_eq!(model, "fixture-model");
-                let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
-                if messages.iter().any(|message| message.content == "level2 task") {
+                let names = tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>();
+                if messages
+                    .iter()
+                    .any(|message| message.content == "level2 task")
+                {
                     assert_eq!(names, vec!["jobs_subscribe"]);
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     sink("level2 answer")?;
@@ -4655,13 +4790,26 @@ mod tests {
                     });
                 }
                 assert_eq!(names, vec!["agent", "jobs_subscribe"]);
-                assert!(messages.iter().any(|message| message.content == "level1 task"));
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content == "level1 task"));
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Tool)
+                {
                     let result = messages.last().unwrap();
                     assert_eq!(result.tool_call_id.as_deref(), Some("recursive-leaf"));
-                    assert!(result.content.contains(" agent idle "), "{}", result.content);
-                    assert!(result.content.contains("level2 answer"), "{}", result.content);
+                    assert!(
+                        result.content.contains(" agent idle "),
+                        "{}",
+                        result.content
+                    );
+                    assert!(
+                        result.content.contains("level2 answer"),
+                        "{}",
+                        result.content
+                    );
                     sink("level1 answer")?;
                     Ok(ModelReply {
                         meta: CompletionMeta {
@@ -4724,12 +4872,18 @@ mod tests {
         ) -> ModelFuture<'a> {
             Box::pin(async move {
                 assert_eq!(model, "fixture-model");
-                let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+                let names = tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>();
                 assert_eq!(names, vec!["edit", "jobs_subscribe", "read", "write"]);
                 assert!(!names.contains(&"agent"));
                 assert!(!names.contains(&"bash"));
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Tool)
+                {
                     let result = messages.last().unwrap();
                     assert_eq!(result.tool_call_id.as_deref(), Some("child-write"));
                     assert!(!result.content.starts_with("ERROR:"));
@@ -4791,9 +4945,15 @@ mod tests {
             sink: &'a mut DeltaSink<'_>,
         ) -> ModelFuture<'a> {
             Box::pin(async move {
-                let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+                let names = tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>();
                 assert_eq!(names, vec!["jobs_subscribe", "read"]);
-                if messages.last().is_some_and(|message| message.role == Role::Tool) {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == Role::Tool)
+                {
                     assert!(messages.last().unwrap().content.contains("parent bytes"));
                     sink("read-only child answer")?;
                     Ok(ModelReply {
@@ -5033,22 +5193,28 @@ mod tests {
 
         let mut widened = LocalToolLimits::default();
         widened.schema.text_write_bytes += 1;
-        assert!(ServiceConfig::new(
-            ToolMode::ReadOnly,
-            BudgetConfig::default(),
-            PathBuf::from("/tmp"),
-            None,
-        )
-        .with_child_tool_runtime(concurrency, widened)
-        .is_ok(), "read-only child must ignore dormant write limits");
-        assert!(ServiceConfig::new(
-            ToolMode::Workspace,
-            BudgetConfig::default(),
-            PathBuf::from("/tmp"),
-            None,
-        )
-        .with_child_tool_runtime(concurrency, widened)
-        .is_err(), "workspace child exposes write and must reject widening");
+        assert!(
+            ServiceConfig::new(
+                ToolMode::ReadOnly,
+                BudgetConfig::default(),
+                PathBuf::from("/tmp"),
+                None,
+            )
+            .with_child_tool_runtime(concurrency, widened)
+            .is_ok(),
+            "read-only child must ignore dormant write limits"
+        );
+        assert!(
+            ServiceConfig::new(
+                ToolMode::Workspace,
+                BudgetConfig::default(),
+                PathBuf::from("/tmp"),
+                None,
+            )
+            .with_child_tool_runtime(concurrency, widened)
+            .is_err(),
+            "workspace child exposes write and must reject widening"
+        );
     }
 
     fn settings() -> Settings {
@@ -5205,12 +5371,7 @@ mod tests {
         );
     }
 
-
-
-
-
-
-                    #[tokio::test]
+    #[tokio::test]
     async fn policy_operation_router_local_and_delegate_share_one_factual_executor() {
         let actor = PrincipalId::new("local:policy-operation").unwrap();
         let provider_calls = Arc::new(AtomicUsize::new(0));
@@ -5269,6 +5430,27 @@ mod tests {
         });
         parent_agent.register_host_tool(native.clone()).unwrap();
         let participant = PrincipalId::new("local:policy-participant").unwrap();
+        let participant_provider_calls = Arc::new(AtomicUsize::new(0));
+        let participant_provider = Arc::new(PolicyDelegateProvider {
+            calls: participant_provider_calls.clone(),
+        });
+        let participant_descriptor = AccountDescriptor::personal(
+            "participant-account",
+            participant.clone(),
+            "local",
+            ["fixture-model".into()],
+        );
+        accounts
+            .register(participant_descriptor.clone(), participant_provider.clone())
+            .unwrap();
+        let participant_selected = accounts
+            .select(&participant, "participant-account", "fixture-model")
+            .unwrap();
+        assert_eq!(
+            participant_selected.identity().payer,
+            aw_agent_core::BillingOwner::User(participant.clone())
+        );
+        assert_ne!(participant_selected.identity().payer, identity.payer);
         store
             .set_session_participation(
                 &actor,
@@ -5297,16 +5479,10 @@ mod tests {
             .await
             .unwrap();
 
-        let child_runtime = actor_owner_for_mode(
-            &store,
-            &actor,
-            &parent.id,
-            2,
-            ToolMode::ReadOnly,
-        );
+        let child_runtime = actor_owner_for_mode(&store, &actor, &parent.id, 2, ToolMode::ReadOnly);
         let service = Service::new(
             store.clone(),
-            accounts,
+            accounts.clone(),
             settings(),
             ServiceConfig::new(
                 ToolMode::Off,
@@ -5370,7 +5546,7 @@ mod tests {
 
         let mut participant_context = base_context.clone();
         participant_context.actor = participant.clone();
-        participant_context.identity.actor = participant.clone();
+        participant_context.identity = participant_selected.identity().clone();
         participant_context.call_id = "policy-participant".into();
         let participant_result = local_router
             .execute(
@@ -5383,6 +5559,35 @@ mod tests {
             .unwrap();
         assert_eq!(participant_result.content, "native:participant.txt");
         assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(participant_provider_calls.load(Ordering::SeqCst), 0);
+
+        accounts.revoke("participant-account").unwrap();
+        participant_context.call_id = "policy-participant-no-provider".into();
+        assert!(
+            local_router
+                .execute(
+                    OperationId::Fs(FsTool::Read),
+                    participant_context.clone(),
+                    &json!({"path":"must-not-run-with-revoked-provider.txt"}),
+                    native.clone(),
+                )
+                .await
+                .is_err(),
+            "fresh participant effect requires that participant's exact provider/payer identity"
+        );
+        assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(participant_provider_calls.load(Ordering::SeqCst), 0);
+
+        accounts
+            .register(participant_descriptor, participant_provider)
+            .unwrap();
+        participant_context.identity = accounts
+            .select(&participant, "participant-account", "fixture-model")
+            .unwrap()
+            .identity()
+            .clone();
 
         parent_agent
             .revoke_registered_source_tool(
@@ -5417,7 +5622,7 @@ mod tests {
             local_router
                 .execute(
                     OperationId::Fs(FsTool::Read),
-                    participant_context,
+                    participant_context.clone(),
                     &json!({"path":"must-not-run-after-revoke.txt"}),
                     native.clone(),
                 )
@@ -5434,12 +5639,63 @@ mod tests {
             require_preferred: true,
             max_model_rounds: Some(2),
         };
+        store
+            .set_session_participation(
+                &actor,
+                &parent.id,
+                &participant,
+                aw_store::SessionParticipationPermissions {
+                    view: true,
+                    contribute: false,
+                    submit: true,
+                    control: false,
+                    manage: false,
+                },
+            )
+            .unwrap();
         let delegate_router = PolicyOperationRouter::new(
             service,
             authority,
             PolicyOperationConfig::deterministic(delegate_policy, 12).unwrap(),
         )
         .unwrap();
+        participant_context.call_id = "policy-participant-delegate".into();
+        let participant_delegate_args = json!({"path":"participant-delegated.txt"});
+        let participant_delegated = delegate_router
+            .execute(
+                OperationId::Fs(FsTool::Read),
+                participant_context.clone(),
+                &participant_delegate_args,
+                native.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            participant_delegated.content,
+            "native:participant-delegated.txt"
+        );
+        assert_eq!(native_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            participant_provider_calls.load(Ordering::SeqCst),
+            2,
+            "participant delegate must use the participant's provider/payer, never the Session owner's"
+        );
+        assert!(
+            delegate_router
+                .execute(
+                    OperationId::Fs(FsTool::Read),
+                    participant_context,
+                    &participant_delegate_args,
+                    native.clone(),
+                )
+                .await
+                .is_err(),
+            "participant consumed admission must not repeat the native effect or paid delegate"
+        );
+        assert_eq!(native_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(participant_provider_calls.load(Ordering::SeqCst), 2);
+
         let mut delegate_context = base_context.clone();
         delegate_context.call_id = "policy-delegate".into();
         let delegate_args = json!({"path":"sealed-parent-argument.txt"});
@@ -5455,7 +5711,7 @@ mod tests {
         assert_eq!(delegated.content, "native:sealed-parent-argument.txt");
         assert_eq!(
             native_calls.load(Ordering::SeqCst),
-            3,
+            4,
             "delegate must execute the original factual operation exactly once"
         );
         assert_eq!(
@@ -5475,8 +5731,9 @@ mod tests {
                 .is_err(),
             "consumed admission replay must not repeat the native effect"
         );
-        assert_eq!(native_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 4);
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(participant_provider_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -5570,10 +5827,7 @@ mod tests {
             &parent.id,
             2,
             ToolMode::Off,
-            &[(
-                "batch",
-                aw_agent_kernel::capability::Effect::Control,
-            )],
+            &[("batch", aw_agent_kernel::capability::Effect::Control)],
         );
         let service = Service::new(
             store.clone(),
@@ -5743,9 +5997,8 @@ mod tests {
         );
         service.bind_agent_jobs_router(router.clone()).unwrap();
 
-        let graph_host_tools = Arc::new(
-            aw_tools_adapter::operation_router::GraphHostToolSlot::default(),
-        );
+        let graph_host_tools =
+            Arc::new(aw_tools_adapter::operation_router::GraphHostToolSlot::default());
         let mut tools = LocalToolOptions::new(&workspace, ToolMode::ReadOnly);
         tools.allow_agent_graph = true;
         tools.graph_host_tools = graph_host_tools.clone();
@@ -5790,11 +6043,9 @@ mod tests {
 
         let turn = tokio::time::timeout(
             Duration::from_secs(8),
-            agent.prompt(
-                "parent graph agent",
-                std::future::pending::<()>(),
-                |_| Ok(()),
-            ),
+            agent.prompt("parent graph agent", std::future::pending::<()>(), |_| {
+                Ok(())
+            }),
         )
         .await
         .expect("nested Agent Graph must not deadlock on the parent controller")
@@ -5821,7 +6072,10 @@ mod tests {
             .delegation_root_id
             .clone()
             .expect("Graph child must have one delegation root");
-        assert_eq!(relations[1].delegation_root_id.as_deref(), Some(root_id.as_str()));
+        assert_eq!(
+            relations[1].delegation_root_id.as_deref(),
+            Some(root_id.as_str())
+        );
         assert_eq!(
             relations[1].parent_session_id, relations[0].child_session_id,
             "nested Agent must be owned by the depth-1 Graph Agent"
@@ -6051,18 +6305,14 @@ mod tests {
             execution_scope: None,
             live_step_gate: None,
         };
-        let event_recipient =
-            aw_tools_adapter::agent_jobs::AgentJobRouter::wake_recipient(
-                router.as_ref(),
-                &child_wake_ctx,
-            )
-            .unwrap()
-            .expect("stable child must expose bounded jobs_subscribe wake authority");
+        let event_recipient = aw_tools_adapter::agent_jobs::AgentJobRouter::wake_recipient(
+            router.as_ref(),
+            &child_wake_ctx,
+        )
+        .unwrap()
+        .expect("stable child must expose bounded jobs_subscribe wake authority");
         assert_eq!(event_recipient.canonical_ref, canonical);
-        let event_source = format!(
-            "{}/t:1/j:event-source",
-            parent_owner.canonical_ref()
-        );
+        let event_source = format!("{}/t:1/j:event-source", parent_owner.canonical_ref());
         for (event, mode) in [
             (
                 aw_tools::job_event::JobEventKind::Result,
@@ -6161,9 +6411,7 @@ mod tests {
                 reference: canonical.clone(),
                 revision: None,
                 mode: aw_tools_adapter::agent_jobs::AgentSendMode::Auto,
-                input: aw_tools_adapter::agent_jobs::AgentSendInput::Text(
-                    "continue child".into(),
-                ),
+                input: aw_tools_adapter::agent_jobs::AgentSendInput::Text("continue child".into()),
             },
         )
         .await
@@ -6295,7 +6543,7 @@ mod tests {
         assert_eq!(closed_root.model_attempts_finished, 3);
     }
 
-            #[tokio::test]
+    #[tokio::test]
     async fn recursive_model_only_child_delegates_to_depth_two_under_same_root() {
         let actor = PrincipalId::new("local:recursive-off").unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6333,10 +6581,14 @@ mod tests {
         // tool intent; interrupted-parent fixtures preserve that ordering.
         let mut assistant = Message::text(2, Role::Assistant, "");
         assistant.tool_calls = vec![ToolCall {
-            id: "call-recursive-root".into(), name: "agent".into(),
+            id: "call-recursive-root".into(),
+            name: "agent".into(),
             arguments: json!({"task":"level1 task"}),
         }];
-        handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
+        handle
+            .append(1, JournalEntry::Assistant { message: assistant })
+            .await
+            .unwrap();
         handle
             .append(
                 1,
@@ -6357,7 +6609,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let actor_service=actor_owner(&store,&actor,&parent.id,2);
+        let actor_service = actor_owner(&store, &actor, &parent.id, 2);
         let service = Service::new(
             store.clone(),
             accounts,
@@ -6367,35 +6619,45 @@ mod tests {
                 BudgetConfig::new(4, 2, 8, 2, 3600).unwrap(),
                 PathBuf::from("/tmp"),
                 None,
-            ).with_child_actors(actor_service.clone()),
+            )
+            .with_child_actors(actor_service.clone()),
         )
         .unwrap();
-        let output = execute_agent_fixture(&service,
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity,
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                    live_step_gate: None,
-                },
-                &json!({"task":"level1 task","title":"First child","background":false}),
-            )
-            .await
-            .unwrap();
+        let output = execute_agent_fixture(
+            &service,
+            ToolContext {
+                actor: actor.clone(),
+                turn_id: 1,
+                call_id: "host-direct".into(),
+                source: aw_agent_core::ToolSource::trusted_host(),
+                effect: aw_agent_core::ToolEffect::Unknown,
+                execution_site: "local".into(),
+                cancellation: CancellationToken::new(),
+                result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+                identity,
+                scope: Some(InvocationScope {
+                    session_id: parent.id.clone(),
+                    branch_id: branch.id.clone(),
+                }),
+                execution_owner: None,
+                execution_scope: None,
+                live_step_gate: None,
+            },
+            &json!({"task":"level1 task","title":"First child","background":false}),
+        )
+        .await
+        .unwrap();
         assert!(!output.is_error);
-        assert!(output.content.contains(" agent idle "), "{}", output.content);
-        assert!(output.content.contains("level1 answer"), "{}", output.content);
+        assert!(
+            output.content.contains(" agent idle "),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("level1 answer"),
+            "{}",
+            output.content
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
         let first = store
@@ -6415,8 +6677,8 @@ mod tests {
         assert_eq!(second.depth, Some(2));
         assert_eq!(second.state, "running");
         assert_eq!(second.parent_session_id, first.child_session_id);
-        assert_eq!(store.subagent(&actor,&first.id).unwrap().state,"running");
-        assert_eq!(store.subagent(&actor,&second.id).unwrap().state,"running");
+        assert_eq!(store.subagent(&actor, &first.id).unwrap().state, "running");
+        assert_eq!(store.subagent(&actor, &second.id).unwrap().state, "running");
 
         assert_eq!(second.delegation_root_id, first.delegation_root_id);
         let root = store
@@ -6521,33 +6783,34 @@ mod tests {
             .with_child_actors(actor_service.clone()),
         )
         .unwrap();
-        let output = execute_agent_fixture(&service,
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity,
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                    live_step_gate: None,
-                },
-                &json!({
-                    "task":"workspace task",
-                    "title":"Editing child",
-                    "background":false
+        let output = execute_agent_fixture(
+            &service,
+            ToolContext {
+                actor: actor.clone(),
+                turn_id: 1,
+                call_id: "host-direct".into(),
+                source: aw_agent_core::ToolSource::trusted_host(),
+                effect: aw_agent_core::ToolEffect::Unknown,
+                execution_site: "local".into(),
+                cancellation: CancellationToken::new(),
+                result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+                identity,
+                scope: Some(InvocationScope {
+                    session_id: parent.id.clone(),
+                    branch_id: branch.id.clone(),
                 }),
-            )
-            .await
-            .unwrap();
+                execution_owner: None,
+                execution_scope: None,
+                live_step_gate: None,
+            },
+            &json!({
+                "task":"workspace task",
+                "title":"Editing child",
+                "background":false
+            }),
+        )
+        .await
+        .unwrap();
         assert!(!output.is_error);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(!fixture.repo.join("child-created.txt").exists());
@@ -6563,7 +6826,7 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(relation.state, "running");
-        assert_eq!(relation.tool_mode,"workspace");
+        assert_eq!(relation.tool_mode, "workspace");
         let execution = store
             .subagent_execution_binding_for_subagent(&actor, &relation.id)
             .unwrap()
@@ -6640,10 +6903,14 @@ mod tests {
         // tool intent; interrupted-parent fixtures preserve that ordering.
         let mut assistant = Message::text(2, Role::Assistant, "");
         assistant.tool_calls = vec![ToolCall {
-            id: "call-subagent-read-only".into(), name: "agent".into(),
+            id: "call-subagent-read-only".into(),
+            name: "agent".into(),
             arguments: json!({"task":"read task"}),
         }];
-        handle.append(1, JournalEntry::Assistant { message: assistant }).await.unwrap();
+        handle
+            .append(1, JournalEntry::Assistant { message: assistant })
+            .await
+            .unwrap();
         handle
             .append(
                 1,
@@ -6676,30 +6943,35 @@ mod tests {
             ),
         )
         .unwrap();
-        let output = execute_agent_fixture(&service,
-                ToolContext {
-                    actor: actor.clone(),
-                    turn_id: 1,
-                    call_id: "host-direct".into(),
-                    source: aw_agent_core::ToolSource::trusted_host(),
-                    effect: aw_agent_core::ToolEffect::Unknown,
-                    execution_site: "local".into(),
-                    cancellation: CancellationToken::new(),
-                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
-                    identity,
-                    scope: Some(InvocationScope {
-                        session_id: parent.id.clone(),
-                        branch_id: branch.id.clone(),
-                    }),
-                    execution_owner: None,
-                    execution_scope: None,
-                    live_step_gate: None,
-                },
-                &json!({"task":"read task","background":false}),
-            )
-            .await
-            .unwrap();
-        assert!(output.content.contains(" agent idle "), "{}", output.content);
+        let output = execute_agent_fixture(
+            &service,
+            ToolContext {
+                actor: actor.clone(),
+                turn_id: 1,
+                call_id: "host-direct".into(),
+                source: aw_agent_core::ToolSource::trusted_host(),
+                effect: aw_agent_core::ToolEffect::Unknown,
+                execution_site: "local".into(),
+                cancellation: CancellationToken::new(),
+                result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+                identity,
+                scope: Some(InvocationScope {
+                    session_id: parent.id.clone(),
+                    branch_id: branch.id.clone(),
+                }),
+                execution_owner: None,
+                execution_scope: None,
+                live_step_gate: None,
+            },
+            &json!({"task":"read task","background":false}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.content.contains(" agent idle "),
+            "{}",
+            output.content
+        );
         assert!(
             output.content.contains("read-only child answer"),
             "{}",
@@ -6721,5 +6993,4 @@ mod tests {
         assert!(execution.execution_root.join("base.txt").exists());
         assert!(store.session(&actor, &relation.child_session_id).is_ok());
     }
-
 }

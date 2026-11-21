@@ -125,6 +125,20 @@ pub enum ExitObservation {
     Exited { status: Option<ChildExit> },
 }
 
+/// Strict nonblocking child-exit observation without consuming wait status.
+///
+/// Unlike [`inspect_exit`], `ECHILD` is an error: callers using this helper are
+/// explicitly relying on parent-owned wait authority and must never downgrade
+/// to generic pidfd readability to authorize cleanup.
+pub fn inspect_child_exit(pidfd: BorrowedFd<'_>) -> io::Result<ExitObservation> {
+    match wait_child(pidfd, libc::WNOWAIT)? {
+        Some(status) => Ok(ExitObservation::Exited {
+            status: Some(status),
+        }),
+        None => Ok(ExitObservation::Running),
+    }
+}
+
 /// Nonblocking observation without consuming the original parent's wait
 /// status. SCM_RIGHTS does not change parentage. ECHILD alone is not exit.
 /// No procfs/PID lookup, subreaper installation, or signal is performed.
@@ -247,6 +261,10 @@ mod tests {
             inspect_exit(identity.as_fd()).unwrap(),
             ExitObservation::Running
         );
+        assert_eq!(
+            inspect_child_exit(identity.as_fd()).unwrap(),
+            ExitObservation::Running
+        );
         assert_eq!(reap_child(identity.as_fd()).unwrap(), None);
         target.0.stdin.take().unwrap().write_all(b"done\n").unwrap();
         let expected = ExitObservation::Exited {
@@ -254,6 +272,7 @@ mod tests {
         };
         assert_eq!(await_exit(identity.as_fd()), expected);
         assert_eq!(inspect_exit(identity.as_fd()).unwrap(), expected);
+        assert_eq!(inspect_child_exit(identity.as_fd()).unwrap(), expected);
         assert_eq!(
             reap_child(identity.as_fd()).unwrap(),
             Some(ChildExit::Code(37))

@@ -3666,22 +3666,24 @@ impl JobManager {
         &self,
         id: &str,
         coordinate: usize,
-        claimed_sequence: u64,
+        expected: NodeState,
         sequence: u64,
         prove_no_launch: impl FnOnce([u8; 32], u64) -> Result<(), JobError>,
         persist: impl FnOnce(&str, Transition) -> Result<(), JournalError>,
     ) -> Result<(), Error> {
+        let expected_sequence = match expected {
+            NodeState::Claimed { sequence } | NodeState::Running { sequence } => sequence,
+            NodeState::Pending | NodeState::Terminal { .. } => {
+                return Err(Error::Job(JobError::InvalidState));
+            }
+        };
         let (proposal, key) = {
             let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
             let managed = state.jobs.get_mut(id).ok_or(Error::NotFound)?;
             if managed.transition_inflight.is_some() {
                 return Err(Error::Busy);
             }
-            if managed.job.state(coordinate)
-                != Some(NodeState::Claimed {
-                    sequence: claimed_sequence,
-                })
-            {
+            if managed.job.state(coordinate) != Some(expected) {
                 return Err(Error::Job(JobError::StaleGeneration));
             }
             let proposal =
@@ -3693,7 +3695,7 @@ impl JobManager {
             (proposal, key)
         };
         let proof =
-            std::panic::catch_unwind(AssertUnwindSafe(|| prove_no_launch(key, claimed_sequence)));
+            std::panic::catch_unwind(AssertUnwindSafe(|| prove_no_launch(key, expected_sequence)));
         if !matches!(proof, Ok(Ok(()))) {
             let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
             if let Some(managed) = state.jobs.get_mut(id) {
@@ -3943,7 +3945,7 @@ mod tests {
             .settle_unlaunched(
                 "unlaunched-output",
                 1,
-                2,
+                NodeState::Claimed { sequence: 2 },
                 3,
                 |_, observed_claim| {
                     assert_eq!(observed_claim, 2);
@@ -3983,7 +3985,7 @@ mod tests {
             .settle_unlaunched(
                 "unlaunched-attach-race",
                 1,
-                2,
+                NodeState::Claimed { sequence: 2 },
                 3,
                 |_, observed_claim| {
                     assert_eq!(observed_claim, 2);
@@ -4031,7 +4033,7 @@ mod tests {
             .settle_unlaunched(
                 "unlaunched-failed-output",
                 1,
-                2,
+                NodeState::Claimed { sequence: 2 },
                 3,
                 |_, observed_claim| {
                     assert_eq!(observed_claim, 2);
@@ -6823,7 +6825,7 @@ mod tests {
             .settle_unlaunched(
                 "skip-no-output",
                 1,
-                2,
+                NodeState::Claimed { sequence: 2 },
                 3,
                 |_, observed_claim| {
                     assert_eq!(observed_claim, 2);

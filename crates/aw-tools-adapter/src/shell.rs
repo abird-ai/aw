@@ -397,7 +397,18 @@ impl Tool for NativeShell {
             if ctx.cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let mut process = PipeProcess::spawn(prepared.spec).await?;
+            let deadline = tokio::time::Instant::now()
+                .checked_add(prepared.timeout)
+                .ok_or(Error::Timeout)?;
+            let spawn_cancel = ctx.cancellation.clone();
+            let spawn_cancel_signal = ctx.cancellation.clone();
+            let mut process = PipeProcess::spawn_until(
+                prepared.spec,
+                deadline,
+                move || spawn_cancel.is_cancelled(),
+                async move { spawn_cancel_signal.cancelled().await },
+            )
+            .await?;
             if let Some(stdin) = &prepared.stdin {
                 process.write(stdin).await?;
                 process.close_stdin();

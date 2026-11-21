@@ -1,43 +1,53 @@
-# CURRENT HANDOFF — AW live state + DL-200 design
+# CURRENT HANDOFF — AW live state + DL-200 R6
 
-Canonical comprehensive handoff:
+Canonical comprehensive handoff (**read this first after AGENTS.md**):
 [AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md).
 
-Current copy-ready next-agent entrypoint:
+Copy-ready next-agent prompt:
 [AW-DL200-R6-NEXT-AGENT-2026-11-21.md](AW-DL200-R6-NEXT-AGENT-2026-11-21.md).
 
-Active design specification (R6 sealed and authoritative):
-[`../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md`](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md).
+Normative R6 design:
+- [README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md)
+- [SPEC](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md)
+- [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
+- [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-Phased implementation plan:
-[`../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md`](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md).
+## Current authoritative snapshot — 2026-11-21
 
-The previous
-[AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md](AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md)
-is preserved and embedded verbatim in the new canonical handoff as historical
-implementation chronology. The dated 2026-11-19 017 handoff is likewise historical.
+**R6 + the shared Process/release-correction amendment are SEALED. AW corrective Process source +
+dotlink v0.17.9 product-policy/controlled-Process consumer source are implemented locally and
+uncommitted. Phase 0B is COMPLETE locally. Publication/repin + real-Bubblewrap + Windows-native
+qualification remain before Phase 1.**
 
-**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 CROSS-REPO PROCESS CUTOVER COMPLETE IN SOURCE.** R1–R5 remain historical design provenance. AW shared runtime is published through `7c1670821b15082821a0b9621cd1caccbe62f144`; AW main is `59d67babaa846fa9b60e39a27170ac9d148e3b6f`, whose only later delta is the focused bounded-drain regression test. Dotlink source `16475e4` consumes `aw-process` directly and dotlink main/handoff is `fb1b7b9`; all eight direct/transitive AW Git packages resolve to the exact `7c16708...` runtime pin. The parallel dotlink shell Process owner is deleted. The strong Linux PID-1 backend remains a future separately promoted launcher/backend gate, not a reason to thaw frozen sandbox work. Final Phase-0 acceptance still requires the grouped executable gate on a host where dotlink test linking is not externally SIGKILLed.
+Current refs:
 
-**R6 simplification seal (2026-11-21):** The canonical DL-200
-[README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md),
-[SPEC](../plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md),
-[IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
-and [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
-contain the **sealed** R6 simplification. It standardizes one
-truth-source/one-mutation-boundary semantics, global identity with store-local consistency,
-existing StoreId **plus restore-generation-fenced StoreScope/StorePos**, a durable
-Prepared claim before any effectful external lease/reservation, shared replay/external-
-evidence/projection/cursor/EventScan/registry mechanics, and stable DriverKey plus
-artifact-specific schemas. **`crates/aw-process` is the chosen required Phase-0 crate**:
-one Agent-neutral async Scope/pipe/wait/stop/drain owner for AW and dotlink, with
-host-provided bounded output sinks and planned `Occupancy` naming. The normative SPEC
-is single-definition/indexed rather than repeating the R1–R5 invariant ledger; that history
-is preserved in [historical archive](DL200-R1-R5-RESOLVED-DESIGN-CHECKLIST-2026-11-21.md).
-R6 is the **sealed** implementation authority. `ProcessTerminal` is the cross-host Fact;
-AW/dotlink keep product receipt/output authority at their edges; prepared commands transfer by
-value into `aw-process`; weak direct-Unix negative containment maps to semantic Unknown; and
-`aw-terminal` PTY source-release/adoption remains a distinct Terminal resource.
+```text
+AW HEAD      0d2dc10e20b62ebf0f064cdbc43615ae2d728ad7
+dotlink HEAD fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
+release/0.17 576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
+dotlink AW pin 7c1670821b15082821a0b9621cd1caccbe62f144
+```
+
+Important publication-order state: current dotlink source uses the new local AW async Process API,
+but Cargo.toml/Cargo.lock intentionally still pin published `7c16708`. Ordinary pinned dotlink build
+therefore currently fails on the expected missing `SpawnControl` / async `Process::spawn` /
+pre-spawn error API. The source was validated green via temporary local-AW path substitution and
+Cargo files were restored. **Do not revert source to the old API.**
+
+Phase 0B local closure includes replay disclosure, exact participant Provider/payer authority, AW
+policy admission post-boundary tombstones, dotlink Remote Start TTL tombstones, >8K audit-history
+qualification and O(1)/amortized replay owner behavior.
+
+Next authorized sequence: publish AW -> repin dotlink -> re-diff release/0.17 from exact v0.17.9 ->
+rerun the consumer gate under the real Git pin -> real Bubblewrap worker-retirement on a suitable
+host -> Windows-native qualification -> review -> Phase 1.
+
+No commit/push/tag/release/deploy unless explicitly asked. Use dotlink---l5 only; never touch
+`.agents/plans/ux/**`; 017 sandbox/mount/config-v13 remains frozen.
+
+> The dated sections below are preserved implementation chronology. When their old status wording
+> conflicts with the snapshot above or the canonical comprehensive handoff, the current snapshot +
+> live source + sealed SPEC win.
 
 ## LIVE DL-200 R6 shared-Process cross-repo checkpoint — published source, 2026-11-21
 
@@ -56,23 +66,186 @@ The Phase-0 Process ownership cut is now published across both repos:
   Live=>`tree="leftovers"`, Unknown=>`tree="unknown"`;
 - Live leftovers clear dotlink product `success` without rewriting factual exit/status into a
   generic tool error; weak-Unix escaped descendants remain Occupancy Unknown;
-- direct + Bubblewrap Bash converge on non-login/non-profile `-c`; dotlink's one runtime profile
-  owns 30-minute checkpoint guidance and a 35-minute hard conversational shell horizon, with
-  effective deadline `min(configured policy, 35m)`. AW remains horizon-free;
+- direct + Bubblewrap Bash converge on non-login/non-profile `-c`; current dotlink main still has
+  the historical pre-v0.17.8 30/35 bounded-turn projection. The target v0.17.8 convergence below
+  supersedes it with one dotlink-owned 35m horizon / 10m report reserve / 25m command cap policy;
+  AW remains horizon-free;
 - dotlink product stdin authority/revision fencing remains local, but actual ChildStdin custody
   never leaves `aw-process`; initial stdin is chunked through the shared 64-KiB primitive.
 
 Qualification stayed grouped: final dotlink all-target/all-feature source graph type-checks;
-strict all-target/all-feature Clippy `-D warnings`, rustfmt and diff-check are green. A real
-shell executable run during the cut reached **133 passed / 1 failed**; that single inherited-FD
-partial-batch failure is the exact shared regression now proven by AW's 3/3 test. L5 repeatedly
-SIGKILLs the final dotlink test/binary during dotlink codegen/link after pin changes, before any
-test executes, so final executable parity remains an explicit environment qualification gap.
-Do not split the suite into fixture fragments to manufacture evidence.
+strict all-target/all-feature Clippy `-D warnings`, rustfmt and diff-check are green. The final
+v0.17.6-era L5 executable rerun was green: shell filter **134/134** plus child-env **1/1**; Process
+filter **18/18** plus its two process-related integration tests; Remote Start/replay **16/16**.
+That remains valid evidence for unchanged semantics, but later SIGKILL attribution is amended by
+the v0.17.7 audit below.
 
-**Next coherent Phase-0 step:** on a host where dotlink test linking is not externally killed,
-rerun the grouped shell/Process/Remote-Start executable gate. Continue outstanding Phase-0B
-owner/evidence work as already planned, but **do not start Phase 1 until Phase 0 is accepted**.
+### Shared Process/release correction — AW + dotlink consumer source implemented locally, publication/platform gate pending
+
+The current audited release tag is **v0.17.9** (`576d0a1`). Its exact `81ef891..v0.17.9` diff has
+SHA-256 `1aa632e35d9c…`, identical to the staged candidate already imported into this plan. Its
+underlying v0.17.7 Process fix (`64e3bd8`) is *stop a retiring Tokio worker from killing the
+sandbox*. Bubblewrap `--die-with-parent` uses Linux
+`PR_SET_PDEATHSIG`, whose parent is the **forking thread**, not merely the process. A command
+spawned on a Tokio worker can therefore receive SIGKILL when that worker retires even though
+dotlink remains alive. This matches the long-running L5 symptom pattern closely enough that prior
+"external host SIGKILL" wording is withdrawn: those interrupted compile/link runs are
+**inconclusive infrastructure failures**, not evidence of an outside sender and not AW test
+failures.
+
+Current uncommitted AW source now implements the sealed correction without sacrificing Tokio's
+lightweight scheduling. `aw-process::Process::spawn` is async; Linux non-PTY launch crosses one
+private bounded process-lifetime Spawn Facility with one stable lane initially. `Process: Send`
+remains an O(n) movable async lifetime; only spawn + exact `DirectScope` attachment runs on the
+stable lane. `block_in_place`/`spawn_blocking` are not used as lifetime anchors.
+
+The implementation transfers private RAII `Spawned { DirectScope, Child, pid }`; a vanished reply
+cleans the exact scope/child, lane panic poisons future launch admission without exiting the anchor,
+and the lane never retires. The runner's absolute execution deadline is reused across Spawn-Lane
+queueing + Process wait; a level-triggered cancellation probe is rechecked on the lane immediately
+before fork, so stale pre-spawn cancellation creates no ProcessTerminal/StopRecord. Linux
+`DirectScope::ready` now uses strict parent-owned non-reaping `waitid` with no ECHILD→pidfd-poll
+cleanup fallback. Stop evidence is reconciled against physical exit before causal projection.
+Windows source uses `CREATE_SUSPENDED | CREATE_NO_WINDOW` and a private Job termination marker;
+`aw-process` contains the async interruptible occupancy-settle path. Native Windows execution is
+not qualified on L5 because this toolchain has only the Linux target installed.
+
+The dotlink-specific pieces remain at its edge: caller-vs-connector cancel origin, lifecycle prose,
+`by=external` wording and wire projection. An unclaimed signal means only "no recorded shared stop",
+never proof of an outside sender. The frozen 017 Sandbox/mount work and future PID-1 backend remain
+unpromoted.
+
+### v0.17.8 + post-release dotlink convergence — planned after AW Process repin
+
+The currently audited release checkpoint is exact **v0.17.9 (`576d0a1`)**. Its committed
+`81ef891..v0.17.9` diff SHA-256 is `1aa632e35d9c…`, exactly matching the staged candidate previously
+audited. The release branch may continue moving, so the future dotlink-main port must still re-diff
+from this exact tag before editing. At the actual dotlink-main convergence step, first re-diff
+the then-current read-only `release/0.17` from this checkpoint and classify every new delta by
+owner: shared Process/Job factual semantics go into AW first; transport/product policy and wire/
+operator projection stay in dotlink over AW facts; frozen sandbox/config changes remain deferred
+unless separately promoted; relevant tests/docs are reused. Never blind-cherry-pick a release
+runtime implementation into main.
+
+The v0.17.8/v0.17.9 dotlink-only bounded-turn refinement is now **implemented locally on dotlink
+main against the existing published AW pin**, still as projection over shared Job facts rather than
+another Jobs/Process owner:
+
+- one local `RuntimeSurfacePolicy` derived from `ActiveTransports.constraints()`;
+- bounded turn = 35m, with 10m reserved for reporting/hand-back, so new command cap = 25m/1500s;
+- `sync_hold.is_some()` enables the bounded surface; local-only stdio/HTTP stays uncapped unless a
+  transport itself declares a bound;
+- one policy source derives server instructions, effective shell ceiling/schema/validation, startup
+  warning and near-deadline `jobs_get.next`;
+- effective new-command ceiling/transport constraint participates in execution-authority
+  fingerprinting; current advisory capability is rebound on every machine construction and never
+  rewrites an existing Job's admitted timeout;
+- v0.17.9 fixes the advisory clock: `created` remains Job-age/`elapsed_ms` (including product
+  queueing), but the runner publishes one absolute `execution_deadline` when it enters Running;
+  Queued has no deadline advice and `jobs_get` counts down from `execution_deadline - now`, never
+  `timeout_secs - elapsed_ms`. Advice still appears only inside `min(timeout/5, 5m)` on the bounded
+  surface and is absent from list/read/ack/cancel and terminal/unknown/cancelling states;
+- AW `ReceiptProfile` supplies factual `ts` only for dotlink (`checkpoint_minutes=None`) so generic
+  AW checkpoint prose cannot conflict with exact 25/35/10 product guidance;
+- if the future shared Jobs adapter blocks this composition, factor only a narrow typed factual
+  Job-status projection seam. No rendered receipt parsing, arbitrary callback/plugin, AW clock/turn
+  policy, or duplicate dotlink lifecycle state.
+
+The post-release `81ef891` delta plus v0.17.9 refinement is **shared Occupancy correctness**,
+not dotlink presentation. Windows `CREATE_NO_WINDOW` can leave transient console/job infrastructure
+counted briefly after the main process exits. AW therefore performs bounded post-terminal Job-
+accounting settling before publishing pre-cleanup Occupancy: zero at any sample => Empty; query
+failure => Unknown; nonzero for the full **uninterrupted** reference bound (<=2s, ~10ms cadence) =>
+Live. Cancellation or execution deadline preempts the grace and sweeps immediately; unless Empty
+was already proven, the interrupted observation is Unknown and the main physical exit remains
+unchanged. `aw-platform-win` owns only the cheap synchronous exact accounting query; `aw-process`
+owns the async settle/cancel/deadline race. No conhost/image-name exception and no blocking Tokio
+sleep. Dotlink later consumes that shared fact and retains only its `tree`/`success` compatibility
+projection.
+
+v0.17.9 (`576d0a1`) also tightens **shared Spawn Facility admission**: when a runner enters
+Running it establishes one absolute execution deadline before Spawn Facility admission. A request
+queued behind another lane may become stale; cancellation/expiry is rechecked on the stable lane
+immediately before fork through a private linearizable launch gate. Stale-before-`Launching` means
+no child and therefore no ProcessTerminal/StopRecord/kill claim. Once `Launching` wins, any real
+child follows ordinary RAII/Process settlement. Spawn-Lane queueing consumes the same deadline;
+pre-Running product queue age does not.
+
+**Local qualification:** `aw-process` 7/7; `aw-platform-unix` 18 executed + 1 explicit cross-UID
+ignore; `aw-tools` 126/126; adapter Process 27/27 using the real Nix Bash; focused foreground shell,
+shell cancellation, Graph ShellNode cancellation and Graph nonzero-exit smokes all green; root
+`aw-cli --tests` type-check green; strict affected all-target/all-feature Clippy, rustfmt and
+diff-check green. No Windows target is installed on L5, so no native/cross Windows pass is claimed.
+
+**Dotlink product-policy source checkpoint:** against the current old AW pin, Jobs 121/121,
+shared-native 15/15 and Graph 13/13 are green; focused shell queue/timeout/schema tests and bounded-
+turn/deadline tests are green; full test graph type-checks; strict all-target/all-feature Clippy,
+fmt and diff-check are green. The exact Running/Start checkpoint now establishes the local absolute
+execution deadline; local surfaces remain uncapped/quiet and hand-back surfaces derive one
+25m/35m/10m policy source.
+
+### Phase-0B compact replay/lifetime checkpoint — complete locally
+
+AW's indexed `policy_admission_current` remains the sole hot replay owner: the immutable replay key,
+actor, canonical target, original request digest and revision stay in indexed columns; after a
+consumed effect crosses a durable recovery boundary, the full current-row detail compacts best-
+effort to a versioned <256-byte never-retry tombstone. Immutable audit retains the full evidence.
+A failed compaction leaves the full row and never changes the effect result. Legacy
+Consumed-without-Start remains full until Remote Start commits, preserving exact recovery.
+
+Grouped qualification extends the existing policy-admission owner test: the first consume returns
+full evidence, explicit post-boundary compaction retains exact identity/target/route, replay cannot
+become executable under changed policy/authority, and a fresh admission still succeeds after 8,205
+unrelated Session audit rows. AW Remote Start owner tests are 5/5; policy-runtime replay tests 4/4;
+root strict all-target/all-feature Clippy, test type-check, fmt and diff-check are green.
+
+Dotlink's existing in-memory `remote_starts` owner now follows the same rule without a new ledger:
+full `Mcp`/`JobMcp` receipts retain ordinary TTL, then compact to `RemoteStartReceipt::Compacted`
+instead of deleting the authorization-id claim; Unknown is already a payload-free tombstone. Claim
+lookup remains HashMap O(1), full-receipt retention compaction is amortized through a FIFO, and
+payload-free tombstones do not consume the 4,096 active/full receipt budget. Current disclosure
+still gates replay projection: filesystem/shell may return a generic compacted acknowledgement only
+under current source/tool disclosure; Job/Graph controls without a retained exact Job ref return the
+opaque withheld acknowledgement. Consolidated dotlink `remote_start` tests are 16/16 and strict
+all-target/all-feature Clippy/test-graph/fmt/diff are green.
+
+R6 Event/Job capacities remaining in source are live-resource bounds, not lifetime-history limits:
+Agent Job Events caps current subscription count; finite Job Exposure counts only current
+reserved/published rows in one generation/project; policy/Remote Start limits are per active Turn.
+They are intentionally retained.
+
+### Dotlink shared-Process consumer cut — implemented locally against local AW
+
+Dotlink's sole shared Process launch now awaits `aw_process::Process::spawn` and passes the exact
+Running/Start deadline plus a level-triggered cloned `JobCancel` through `SpawnControl`. Lane-side
+`CancelledBeforeSpawn` and `TimedOutBeforeSpawn` project directly to product cancelled/timed-out
+results with `process_not_started=true`; they carry no `ProcessTerminal`, stop evidence, signal or
+synthetic Process fact. Definitive OS spawn refusal remains no-Process Failed. Other post-launch/
+setup uncertainty remains Unknown as before. The internal old `spawn_failed` boolean is generalized
+to `process_not_started`, and shared settlement uses ordinary status settlement when no Process
+existed instead of calling `settle_process`.
+
+Focused consumer qualification uses the real process-global Spawn Lane: one test briefly holds the
+lane, lets a second Job reach Running and queue, cancels it, and proves no marker command executes,
+product status is Cancelled, caller origin is preserved and no ProcessTerminal exists. The timeout
+sibling uses the same projection helper without monopolizing the global lane. Against the local AW
+checkout, full shell tests are **86/86**, Graph **13/13**, canonical spawn-refusal settlement is
+green, full test-graph check is green, and strict all-target/all-feature Clippy/fmt/diff are green.
+Validation temporarily substituted local AW paths and restored Cargo.toml/Cargo.lock exactly; the
+manifest still pins published `7c16708`, so the current combined source intentionally requires the
+future AW publication/repin before an ordinary dotlink build can consume this API.
+
+A real Bubblewrap smoke was explicitly attempted (`DOTLINK_TEST_BWRAP=1`) and reached the installed
+`bwrap`, but L5's outer tool sandbox rejects mounting `/proc` with `Operation not permitted`. This is
+an unavailable host capability, not a passing/failing Bubblewrap product qualification. AW's generic
+`PDEATHSIG` parent-thread regression is green; real-Bubblewrap worker-retirement remains to run on a
+host that permits Bubblewrap mounts. Windows-native qualification likewise remains unavailable on
+L5.
+
+**Next coherent sequence:** when explicitly authorized, publish AW and repin dotlink to this exact
+shared source; re-diff release/0.17 from exact v0.17.9; rerun the already-green consumer gate under
+the real pin, plus real Bubblewrap worker-retirement on a suitable host and Windows-native
+qualification. After that review, Phase 1 is the next implementation phase.
 
 Author: coordinating design/implementation agent
 Owner: @pvl
@@ -104,10 +277,64 @@ for AW Store/CLI green; strict affected all-target Clippy **green** after two
 behavior-preserving `needless_return` cleanups in the in-flight Unix Process
 observation code; policy-owner rustfmt and `git diff --check` green.
 
-Still open in Phase 0B: full participant-specific Tool/Provider/payer router
-qualification, current disclosure of cached remote effect payloads, lifetime-audit
-threshold/regression proof and the other concurrently implemented Phase-0B boundaries.
-Phase-0 dotlink projection/runtime horizon remains pending. No commit/push/release.
+### Phase-0B replay payload disclosure checkpoint — cross-host owners composed, uncommitted
+
+Replay identity and payload disclosure are now separate at the correct owners. AW revalidates
+current **Session View audience** plus exact **ToolBinding + Actor Envelope source/effect/site**
+before asking for a retained remote receipt. Dotlink then independently revalidates the concrete
+target-side disclosure before releasing cached content: current issuer trust, current prepared
+filesystem mutation capability for canonical native FS requests, current shell ToolPolicy, or
+current Job-control ToolPolicy plus exact retained Job availability. Lease expiry and old runtime
+generation still block only new effects; they do not erase a factual replay. If either host loses
+current disclosure, the caller receives only one generic non-retryable prior-invocation
+acknowledgement—no target/ref, Job ID, output size, timestamp, provider/site metadata or protected
+payload—and the replay claim remains consumed.
+
+No cross-host preflight protocol, Tool trait hook, replay service or table was added. AW adds only
+zero-cost `SourceKind::as_str()` reuse plus its existing source/audience projector. Dotlink reuses
+its existing `ValidatedRemoteStart`, prepared `CapabilitySet`, canonical request `access_paths()`,
+`SecuredFilesystem::preflight_mutation`, `has_tool_for_policy`, and `JobManager::standalone_status`.
+The filesystem replay path performs only authority resolution/preflight: no payload read, lock,
+stage or commit. This keeps concrete authority on the machine that actually owns the resource.
+
+Validation on L5: AW production bin check is green; prior policy owner **2/2** and AW Remote Start
+owner **5/5** remain green. Dotlink compiles, grouped Remote Start/replay is **16/16**, strict
+all-target/all-feature Clippy `-D warnings` is green, and rustfmt/`git diff --check` are green. The
+existing routed AW integration binary remains subject to the unresolved L5 SIGKILL during linking;
+after the v0.17.7 audit this is treated as an unattributed/infrastructure interruption, not a
+proven external-host kill, and the test was not fragmented into replacement fixtures.
+
+### Phase-0B participant Provider/payer checkpoint — complete, uncommitted
+
+Fresh policy admission now reselects the authenticated participant through one shared
+`ProviderAccounts::select_exact(actor, identity)` primitive. Full `InvocationIdentity` equality
+covers account owner, **payer**, custody/version, executor, model and grant revision; there is no
+Session-owner account/payer fallback. Replay lookup still happens first, so a factual consumed
+operation never becomes fresh merely because provider authority changed. Guardian/delegate paths
+reuse the same exact selection, and the service-less remote router receives the same
+`ProviderAccounts` owner directly.
+
+Policy delegation now separates the two principals that were previously conflated: the parent
+Session owner owns the delegation root/child Session/journal/lifecycle, while the initiating
+participant owns provider/payer/model/tool identity. The participant path is deliberately narrow:
+current `Submit` is rechecked transactionally, depth is exactly 1, child routing/constructor replay
+are forbidden, and recursive widening remains unchanged/denied. Store model-attempt budgeting
+binds the paid identity to the child relation's stored `InvocationIdentity` rather than assuming it
+matches the Session owner. Lifecycle mutations authorize the resource owner only. The child Actor
+attach path independently rechecks participant `Submit` and the exact ProviderSelection.
+
+Focused evidence without new fixtures: account publication/revoke/regrant **1/1**; Store
+participant child creation → running → Bob-identity model-attempt → settlement + revoke denial
+**1/1**; policy admission replay **2/2**; `cargo check --offline --locked -j1 -p aw-cli --tests`
+green; strict affected all-target Clippy `-D warnings` green; fmt/diff green. The existing
+end-to-end policy-router test includes Bob's own payer/provider, revoke/no-fallback and paid
+delegate assertions and type-checks, but its root test executable still receives an unattributed
+SIGKILL while linking on L5 before assertions. The v0.17.7 parent-thread bug is now a plausible
+infrastructure cause, so this is not classified as an outside-host kill and the test was not split
+into replacement fixtures.
+
+**Remaining Phase 0B:** compact replay tombstones + removal/qualification of former lifetime audit
+ceilings. No commit/push/release.
 
 ## LIVE DL-200 implementation checkpoint — Phase 0A, 2026-11-21
 
@@ -412,10 +639,12 @@ Final repinned dotlink qualification on L5:
 - strict all-target/all-feature Clippy `-D warnings`: green;
 - fmt/diff, Alejandra and Markdown (**0 issues / 86 files**): green.
 
-Two combined all-feature test invocations were externally SIGKILLed by L5
-before producing test output or Rust diagnostics. The complete main binary and
-all six integration targets were then run serially and are green. Those kills
-are infrastructure noise, not source failures.
+Two combined all-feature test invocations received unattributed SIGKILL before
+producing test output or Rust diagnostics. The complete main binary and all six
+integration targets were then run serially and are green. At the time these were
+treated as infrastructure noise; dotlink v0.17.7 later identified the retireable-
+Tokio-worker parent-death bug as a plausible mechanism. They remain non-source
+failures, but are no longer attributed to an external host.
 
 Remaining boundaries are external/deferred only:
 
