@@ -731,7 +731,38 @@ impl Process {
                     };
                     match command {
                         InputCommand::Write { bytes, reply } => {
-                            let _ = reply.send(self.write(&bytes).await);
+                            enum WriteOutcome {
+                                Complete(Result<()>),
+                                Cancelled,
+                                Timeout,
+                            }
+                            let outcome = {
+                                let write = self.write(&bytes);
+                                tokio::pin!(write);
+                                tokio::select! {
+                                    biased;
+                                    _ = &mut cancellation => WriteOutcome::Cancelled,
+                                    _ = &mut deadline => WriteOutcome::Timeout,
+                                    result = &mut write => WriteOutcome::Complete(result),
+                                }
+                            };
+                            match outcome {
+                                WriteOutcome::Complete(result) => {
+                                    let _ = reply.send(result);
+                                }
+                                WriteOutcome::Cancelled => {
+                                    let _ = reply.send(Err(Error::InputClosed("process input is closed")));
+                                    let (record, exit, occupancy) =
+                                        self.stop(StopReason::Cancelled).await;
+                                    break (exit, Some(record), occupancy);
+                                }
+                                WriteOutcome::Timeout => {
+                                    let _ = reply.send(Err(Error::Timeout));
+                                    let (record, exit, occupancy) =
+                                        self.stop(StopReason::Timeout).await;
+                                    break (exit, Some(record), occupancy);
+                                }
+                            }
                         }
                         InputCommand::Close { reply } => {
                             if self.stdin_open() {
