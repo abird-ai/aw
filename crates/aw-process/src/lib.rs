@@ -1000,6 +1000,65 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl OutputSink for RecordingSink {
+        fn discard_if_full(&mut self, _seen: u64) -> std::result::Result<bool, SinkError> {
+            Ok(false)
+        }
+
+        fn append(&mut self, bytes: &[u8]) -> std::result::Result<usize, SinkError> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn observe_after_failure(&mut self, _seen: u64) -> std::result::Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn mark_failed(&mut self) {}
+
+        fn finish(&mut self) -> std::result::Result<(), SinkError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_stop_flushes_partial_sink_batch_before_incomplete() {
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let (mut producer, input) = tokio::io::duplex(64);
+        let (reader, task) = Reader::start(input, Some(Box::new(RecordingSink(retained.clone()))));
+
+        producer.write_all(b"done").await.unwrap();
+        for _ in 0..32 {
+            if reader.snapshot().total_bytes == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(reader.snapshot().total_bytes, 4);
+
+        // Keep the producer open: this models an inherited descendant FD that
+        // prevents EOF after the main command has already exited.
+        reader.stop();
+        task.await.unwrap();
+
+        assert_eq!(
+            retained
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            b"done"
+        );
+        let snapshot = reader.snapshot();
+        assert!(snapshot.closed);
+        assert!(snapshot.read_failed, "forced bounded drain is incomplete");
+    }
+
     #[test]
     fn capture_page_never_crosses_missing_middle() {
         let mut capture = CaptureState::default();
