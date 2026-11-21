@@ -82,11 +82,17 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       wake mint->persist revalidates the full generation without a new durable column; mixed exposure
       candidate filtering is group-aware before authoritative recheck. End-to-end group removal/re-add
       proves wake/history fencing with unchanged Agent rev. New group audience expansion is
-      intentionally fresh/quiescent-branch-only until HistoryGrant/share closure lands. Next: full
-      seven-permission `agent.access.*` + owner/config semantics with derive/share and HistorySpan/
-      Base/Grant + DisclosureManifest/provenance; then lazy sealing, minimal snapshots and rebuild
-      Agent exposure from owner state. Add cursor/projection-head helpers only when one real consumer
-      requires them.
+      intentionally fresh/quiescent-branch-only until HistoryGrant/share closure lands. **v40
+      immutable history owner landed:** additive lazy `HistorySpan`/`HistoryBase`/`HistoryGrant`
+      storage; normalized grant principals; persistent SHA-256 content-addressed DisclosureManifest
+      leaves/branches + authority roots with fanout 64; conservative extraction of exact legacy-node
+      and materialized-fact provenance; parent/local structural manifest composition; exact checkpoint
+      seal memoization in the existing transaction with no Agent rev/Event. History owner tests 2/2
+      plus existing checkpoint regressions and strict Clippy are green. Next: full seven-permission
+      `agent.access.*` + derive/share HistoryGrant validation and exact-history destination Agent
+      construction using v40 base/grant pointers; then propagate manifests through newly committed
+      Event/Tool/Process facts, add reachability/flatten acceleration as real consumers require,
+      minimal snapshots and rebuild Agent exposure from owner state.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

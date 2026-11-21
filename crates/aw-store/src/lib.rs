@@ -34,6 +34,7 @@ pub mod context;
 mod coordination;
 pub mod durability;
 mod extension_secret;
+mod history_owner;
 mod identity_continuity;
 mod job_exposure;
 mod journal;
@@ -239,8 +240,9 @@ pub const JOB_EXPOSURE_REPAIR_SCHEMA: &str =
     include_str!("../migrations/037_job_exposure_repair.sql");
 pub const AGENT_OWNER_SCHEMA: &str = include_str!("../migrations/038_agent_owner.sql");
 pub const DOMAIN_PRINCIPALS_SCHEMA: &str = include_str!("../migrations/039_domain_principals.sql");
+pub const HISTORY_OWNER_SCHEMA: &str = include_str!("../migrations/040_history_owner.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 39;
+const LATEST_SCHEMA_VERSION: i64 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2148,6 +2150,7 @@ impl SessionStore {
             serde_json::json!({"node":node,"previous_head":b.head}),
         )?;
         let out = branch_in(&tx, session, &b.id)?;
+        let _sealed = history_owner::seal_in(&tx, session, &out.id)?;
         db(tx.commit())?;
         Ok(out)
     }
@@ -2729,6 +2732,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 38 {
         migrate_domain_principals(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 39 {
+        migrate_history_owner(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -2932,6 +2939,52 @@ fn migrate_domain_principals(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 39))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_history_owner(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='history-owner',generation=generation+1,
+             target_epoch=40,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(HISTORY_OWNER_SCHEMA))?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "History owner migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='40' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=40,activation_epoch=40,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=40,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 40))?;
     db(tx.commit())?;
     Ok(())
 }

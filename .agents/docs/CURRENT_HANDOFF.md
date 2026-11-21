@@ -118,19 +118,45 @@ a **new** group audience only on a fresh, quiescent branch; adding a group to ex
 until the reviewed HistoryGrant/share closure exists. Once a group identity is safely granted, later
 membership follows that principal identity as sealed by the spec.
 
+Schema **v40** now installs the immutable history/disclosure owner lazily, with no eager Session
+rewrite. `history_spans` retain exact backing Session/branch/root/head boundaries plus raw immutable
+node-content/provenance digests; `history_bases` structurally compose parent base + local span and
+retain total/next Turn coordinates. `history_grants` + normalized disclosed-principal rows are now
+durable immutable owner shapes ready for the access/fork cut, but grant authorization/public fork is
+not yet enabled.
+
+`DisclosureManifest` is represented as a persistent content-addressed bounded-fanout DAG rather
+than flattened JSON: immutable authority roots, leaf entries and branch child links use SHA-256
+content identities; 64-way nodes structurally share prior roots. Current legacy provenance extraction
+conservatively captures transitive `node_dependencies` as exact source-node facts + stable legacy
+Session authority roots, and materialized facts as exact fact hashes + materialization-policy roots.
+The per-seal extraction bound is 16,384 inputs and fails safely rather than flattening an unbounded
+closure. Parent/local manifest composition reuses the existing parent root and adds the local root;
+future authorization traversal can deduplicate repeated authority roots without rewriting history.
+
+Lazy sealing is now a real production path: successful exact-branch `checkpoint` sealing happens in
+the same SQLite transaction after the new checkpoint head is established. Seal keys memoize the
+exact boundary so repeated sealers converge; sealing emits no Agent change and never advances Agent
+`rev`. The HistoryBase content digest includes local fact content, provenance digest and manifest
+identity, preventing identical bytes under different protected provenance from aliasing. Rows reject
+mutation but remain GC-able for the later reachability reconciler.
+
 Phase 1 is still **underway**, not complete. Next owner work is the full seven-permission
-`agent.access.*` surface with `derive/share` and ownership/config mutation semantics together with
-HistorySpan/Base/Grant + scalable DisclosureManifest/provenance; that removes the temporary
-fresh-branch group expansion restriction. Then remain lazy sealing, minimal authoritative snapshots,
-and rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/projection-head
-helpers only when one of those real consumers needs them; do not prebuild Phase-2/4 engines.
+`agent.access.*` surface with `derive/share` plus HistoryGrant disclosure validation and exact-history
+fork creation; that removes the temporary fresh-branch group expansion restriction and starts using
+v40 grant/base pointers on destination Agents. After that remain provenance propagation for newly
+committed Event/Tool/Process facts, reachability/lazy-base flatten acceleration, minimal authoritative
+snapshots, and rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/
+projection-head helpers only when one of those real consumers needs them; do not prebuild Phase-2/4
+engines.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
-backfill are green; group create/edit/delete remains green; the reused end-to-end AgentJobs test now
-proves group membership removal/re-add fences durable wake + history cursor authority while Agent rev
-stays unchanged; mixed exposure remains green. Coordination **24/24**, stable lifecycle/control and
-jobs_get wake remain green from prior checkpoints. Strict all-target/all-feature `aw-store` +
-`aw-cli` Clippy, fmt and diff checks are green.
+backfill are green; group access/wake/history fencing remains green; v40 history owner tests **2/2**
+prove idempotent revision-neutral sealing and 130-entry bounded-fanout content addressing; existing
+`checkpoints_preserve_tree_but_cut_future_context` and `checkpoint_revision_is_compared` pass through
+the new production seal hook. Mixed exposure remains green. Coordination **24/24**, stable lifecycle/
+control and jobs_get wake remain green from prior checkpoints. Strict v40 `aw-store` all-target/all-
+feature Clippy, fmt and diff checks are green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017
