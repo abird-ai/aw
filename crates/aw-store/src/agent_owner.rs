@@ -10,6 +10,7 @@ use crate::{
     user_for_principal, Error, PrincipalId, Result,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const MAX_ACCESS_DEPENDENCIES: usize = 512;
@@ -17,8 +18,143 @@ const VIEW: u8 = 1 << 0;
 const CONTRIBUTE: u8 = 1 << 1;
 const SUBMIT: u8 = 1 << 2;
 const CONTROL: u8 = 1 << 3;
-const MANAGE: u8 = 1 << 4;
-const ALL_COMPAT_PERMISSIONS: u8 = VIEW | CONTRIBUTE | SUBMIT | CONTROL | MANAGE;
+const DERIVE: u8 = 1 << 4;
+const SHARE: u8 = 1 << 5;
+const MANAGE: u8 = 1 << 6;
+const ALL_PERMISSIONS: u8 = VIEW | CONTRIBUTE | SUBMIT | CONTROL | DERIVE | SHARE | MANAGE;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPermission {
+    View,
+    Contribute,
+    Submit,
+    Control,
+    Derive,
+    Share,
+    Manage,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPermissions {
+    pub view: bool,
+    pub contribute: bool,
+    pub submit: bool,
+    pub control: bool,
+    pub derive: bool,
+    pub share: bool,
+    pub manage: bool,
+}
+
+impl AgentPermissions {
+    pub const ALL: Self = Self {
+        view: true,
+        contribute: true,
+        submit: true,
+        control: true,
+        derive: true,
+        share: true,
+        manage: true,
+    };
+
+    pub const VIEW_ONLY: Self = Self {
+        view: true,
+        contribute: false,
+        submit: false,
+        control: false,
+        derive: false,
+        share: false,
+        manage: false,
+    };
+
+    #[inline]
+    pub const fn allows(self, permission: AgentPermission) -> bool {
+        match permission {
+            AgentPermission::View => self.view,
+            AgentPermission::Contribute => self.contribute,
+            AgentPermission::Submit => self.submit,
+            AgentPermission::Control => self.control,
+            AgentPermission::Derive => self.derive,
+            AgentPermission::Share => self.share,
+            AgentPermission::Manage => self.manage,
+        }
+    }
+
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        !self.view
+            && !self.contribute
+            && !self.submit
+            && !self.control
+            && !self.derive
+            && !self.share
+            && !self.manage
+    }
+
+    pub(crate) fn validate(self) -> Result<Self> {
+        if !self.view
+            && (self.contribute
+                || self.submit
+                || self.control
+                || self.derive
+                || self.share
+                || self.manage)
+        {
+            return Err(Error::Denied(
+                "Agent permissions require explicit view authority",
+            ));
+        }
+        Ok(self)
+    }
+
+    #[inline]
+    const fn from_mask(mask: u8) -> Self {
+        Self {
+            view: mask & VIEW != 0,
+            contribute: mask & CONTRIBUTE != 0,
+            submit: mask & SUBMIT != 0,
+            control: mask & CONTROL != 0,
+            derive: mask & DERIVE != 0,
+            share: mask & SHARE != 0,
+            manage: mask & MANAGE != 0,
+        }
+    }
+}
+
+impl From<SessionParticipationPermissions> for AgentPermissions {
+    fn from(value: SessionParticipationPermissions) -> Self {
+        Self {
+            view: value.view,
+            contribute: value.contribute,
+            submit: value.submit,
+            control: value.control,
+            derive: false,
+            share: false,
+            manage: value.manage,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAccessEntry {
+    pub principal_ref: String,
+    pub principal_kind: String,
+    pub permissions: AgentPermissions,
+    pub grant_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAccessSnapshot {
+    pub owner_ref: String,
+    pub entries: Vec<AgentAccessEntry>,
+    pub rev: u64,
+    pub acl_rev: u64,
+    pub caller_permissions: AgentPermissions,
+    pub access_generation: [u8; 32],
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AgentKey<'a> {
@@ -38,17 +174,20 @@ pub struct AgentAccessEvidence {
     pub grant_revision: u64,
     pub acl_revision: u64,
     pub owner: bool,
+    pub effective_permissions: AgentPermissions,
     pub access_generation: [u8; 32],
 }
 
 #[inline]
-fn access_action_bit(action: SessionParticipationAction) -> u8 {
-    match action {
-        SessionParticipationAction::View => VIEW,
-        SessionParticipationAction::Contribute => CONTRIBUTE,
-        SessionParticipationAction::Submit => SUBMIT,
-        SessionParticipationAction::Control => CONTROL,
-        SessionParticipationAction::Manage => MANAGE,
+fn permission_bit(permission: AgentPermission) -> u8 {
+    match permission {
+        AgentPermission::View => VIEW,
+        AgentPermission::Contribute => CONTRIBUTE,
+        AgentPermission::Submit => SUBMIT,
+        AgentPermission::Control => CONTROL,
+        AgentPermission::Derive => DERIVE,
+        AgentPermission::Share => SHARE,
+        AgentPermission::Manage => MANAGE,
     }
 }
 
@@ -392,11 +531,11 @@ pub(crate) fn revision(connection: &Connection, agent: AgentKey<'_>) -> Result<u
     ))
 }
 
-pub(crate) fn authorize_access(
+pub(crate) fn authorize_permission(
     connection: &Connection,
     actor: &PrincipalId,
     agent: AgentKey<'_>,
-    action: SessionParticipationAction,
+    permission: AgentPermission,
 ) -> Result<AgentAccessEvidence> {
     validate(agent)?;
     let user = user_for_principal(connection, actor)?
@@ -415,7 +554,7 @@ pub(crate) fn authorize_access(
         ))?;
 
     let mut hash = Sha256::new();
-    hash.update(b"aw-agent-access-generation-v1\0");
+    hash.update(b"aw-agent-access-generation-v2\0");
     for part in [
         domain.as_bytes(),
         agent.session.as_bytes(),
@@ -431,11 +570,12 @@ pub(crate) fn authorize_access(
 
     if owner_kind == "user" && owner_handle == user {
         hash.update(b"owner:user\0");
-        hash.update([ALL_COMPAT_PERMISSIONS]);
+        hash.update([ALL_PERMISSIONS]);
         return Ok(AgentAccessEvidence {
             grant_revision: user_security_epoch,
             acl_revision,
             owner: true,
+            effective_permissions: AgentPermissions::ALL,
             access_generation: hash.finalize().into(),
         });
     }
@@ -460,11 +600,12 @@ pub(crate) fn authorize_access(
             hash.update(b"owner:group\0");
             hash_part(&mut hash, owner_handle.as_bytes());
             hash.update(group_revision.to_be_bytes());
-            hash.update([ALL_COMPAT_PERMISSIONS]);
+            hash.update([ALL_PERMISSIONS]);
             return Ok(AgentAccessEvidence {
                 grant_revision: user_security_epoch.max(group_revision),
                 acl_revision,
                 owner: true,
+                effective_permissions: AgentPermissions::ALL,
                 access_generation: hash.finalize().into(),
             });
         }
@@ -472,7 +613,8 @@ pub(crate) fn authorize_access(
 
     let mut query = db(connection.prepare(
         "SELECT x.principal_kind,x.principal_handle,
-                x.can_view,x.can_contribute,x.can_submit,x.can_control,x.can_manage,x.grant_rev,
+                x.can_view,x.can_contribute,x.can_submit,x.can_control,x.can_derive,x.can_share,
+                x.can_manage,x.grant_rev,
                 CASE WHEN x.principal_kind='group' THEN g.rev ELSE NULL END
          FROM agent_acl_current x
          JOIN domain_principals p
@@ -532,12 +674,14 @@ pub(crate) fn authorize_access(
             | permission(3, CONTRIBUTE)?
             | permission(4, SUBMIT)?
             | permission(5, CONTROL)?
-            | permission(6, MANAGE)?;
+            | permission(6, DERIVE)?
+            | permission(7, SHARE)?
+            | permission(8, MANAGE)?;
         let grant_revision: u64 = row
-            .get(7)
+            .get(9)
             .map_err(|_| Error::Storage("invalid Agent ACL revision"))?;
         let group_revision: Option<u64> = row
-            .get(8)
+            .get(10)
             .map_err(|_| Error::Storage("invalid group revision"))?;
         permissions |= mask;
         dependency_revision = dependency_revision.max(grant_revision);
@@ -550,16 +694,33 @@ pub(crate) fn authorize_access(
         hash.update(grant_revision.to_be_bytes());
         hash.update(group_revision.unwrap_or(0).to_be_bytes());
     }
-    if permissions & access_action_bit(action) == 0 {
-        return Err(Error::Denied("Agent access action is not granted"));
+    if permissions & permission_bit(permission) == 0 {
+        return Err(Error::Denied("Agent permission is not granted"));
     }
     hash.update([permissions]);
     Ok(AgentAccessEvidence {
         grant_revision: dependency_revision,
         acl_revision,
         owner: false,
+        effective_permissions: AgentPermissions::from_mask(permissions),
         access_generation: hash.finalize().into(),
     })
+}
+
+pub(crate) fn authorize_access(
+    connection: &Connection,
+    actor: &PrincipalId,
+    agent: AgentKey<'_>,
+    action: SessionParticipationAction,
+) -> Result<AgentAccessEvidence> {
+    let permission = match action {
+        SessionParticipationAction::View => AgentPermission::View,
+        SessionParticipationAction::Contribute => AgentPermission::Contribute,
+        SessionParticipationAction::Submit => AgentPermission::Submit,
+        SessionParticipationAction::Control => AgentPermission::Control,
+        SessionParticipationAction::Manage => AgentPermission::Manage,
+    };
+    authorize_permission(connection, actor, agent, permission)
 }
 
 pub(crate) fn key_for_ref(connection: &Connection, reference: &str) -> Result<(String, String)> {
@@ -600,12 +761,12 @@ pub(crate) fn changed_acl(
         .ok_or(Error::Limit("Agent revision exhausted"))
 }
 
-pub(crate) fn collaboration_acl_permissions(
+pub(crate) fn acl_permissions(
     connection: &Connection,
     agent: AgentKey<'_>,
     principal_kind: &str,
     principal_handle: &str,
-) -> Result<(SessionParticipationPermissions, Option<u64>)> {
+) -> Result<(AgentPermissions, Option<u64>)> {
     validate(agent)?;
     if !matches!(principal_kind, "user" | "group") {
         return Err(Error::Denied("invalid Agent ACL principal kind"));
@@ -637,34 +798,29 @@ pub(crate) fn collaboration_acl_permissions(
             },
         )
         .optional())?;
-    if current.as_ref().is_some_and(|row| row.4 != 0 || row.5 != 0) {
-        return Err(Error::Conflict(
-            "compatibility access cannot rewrite derive/share grants",
-        ));
-    }
-    Ok(
-        current.map_or((SessionParticipationPermissions::default(), None), |row| {
-            (
-                SessionParticipationPermissions {
-                    view: row.0 != 0,
-                    contribute: row.1 != 0,
-                    submit: row.2 != 0,
-                    control: row.3 != 0,
-                    manage: row.6 != 0,
-                },
-                Some(row.7),
-            )
-        }),
-    )
+    Ok(current.map_or((AgentPermissions::default(), None), |row| {
+        (
+            AgentPermissions {
+                view: row.0 != 0,
+                contribute: row.1 != 0,
+                submit: row.2 != 0,
+                control: row.3 != 0,
+                derive: row.4 != 0,
+                share: row.5 != 0,
+                manage: row.6 != 0,
+            },
+            Some(row.7),
+        )
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn set_collaboration_acl(
+pub(crate) fn set_acl(
     connection: &Connection,
     agent: AgentKey<'_>,
     principal_kind: &str,
     principal_handle: &str,
-    permissions: SessionParticipationPermissions,
+    permissions: AgentPermissions,
     granted_by_handle: &str,
     expected_rev: u64,
 ) -> Result<(u64, u64, bool)> {
@@ -673,7 +829,7 @@ pub(crate) fn set_collaboration_acl(
         return Err(Error::Conflict("stale Agent revision"));
     }
     let (before, current_grant) =
-        collaboration_acl_permissions(connection, agent, principal_kind, principal_handle)?;
+        acl_permissions(connection, agent, principal_kind, principal_handle)?;
     if before == permissions {
         return Ok((expected_rev, current_grant.unwrap_or(1), false));
     }
@@ -698,13 +854,13 @@ pub(crate) fn set_collaboration_acl(
                  session_id,branch_id,principal_kind,principal_handle,
                  can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
                  grant_rev,granted_by_handle,updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,?9,?10,?11,?12)
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(session_id,branch_id,principal_kind,principal_handle) DO UPDATE SET
                  can_view=excluded.can_view,can_contribute=excluded.can_contribute,
                  can_submit=excluded.can_submit,can_control=excluded.can_control,
-                 can_derive=0,can_share=0,can_manage=excluded.can_manage,
-                 grant_rev=excluded.grant_rev,granted_by_handle=excluded.granted_by_handle,
-                 updated_at=excluded.updated_at",
+                 can_derive=excluded.can_derive,can_share=excluded.can_share,
+                 can_manage=excluded.can_manage,grant_rev=excluded.grant_rev,
+                 granted_by_handle=excluded.granted_by_handle,updated_at=excluded.updated_at",
             params![
                 agent.session,
                 agent.branch,
@@ -714,6 +870,8 @@ pub(crate) fn set_collaboration_acl(
                 i64::from(permissions.contribute),
                 i64::from(permissions.submit),
                 i64::from(permissions.control),
+                i64::from(permissions.derive),
+                i64::from(permissions.share),
                 i64::from(permissions.manage),
                 next_grant,
                 granted_by_handle,
@@ -723,6 +881,84 @@ pub(crate) fn set_collaboration_acl(
     }
     let next = changed_acl(connection, agent, expected_rev)?;
     Ok((next, next_grant, true))
+}
+
+pub(crate) fn access_snapshot(
+    connection: &Connection,
+    actor: &PrincipalId,
+    agent: AgentKey<'_>,
+) -> Result<AgentAccessSnapshot> {
+    let caller = authorize_permission(connection, actor, agent, AgentPermission::Manage)?;
+    let (domain, owner_handle, rev, acl_rev): (String, String, u64, u64) = db(connection
+        .query_row(
+            "SELECT domain_handle,owner_handle,rev,acl_rev FROM agent_state_current
+             WHERE session_id=?1 AND branch_id=?2",
+            params![agent.session, agent.branch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ))?;
+    let owner_ref = format!("/d:{domain}/i:{owner_handle}");
+    let mut query = db(connection.prepare(
+        "SELECT principal_kind,principal_handle,
+                can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
+                grant_rev
+         FROM agent_acl_current
+         WHERE session_id=?1 AND branch_id=?2
+         ORDER BY principal_kind,principal_handle LIMIT ?3",
+    ))?;
+    let rows = db(query.query_map(
+        params![
+            agent.session,
+            agent.branch,
+            (MAX_ACCESS_DEPENDENCIES + 1) as i64
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, u64>(9)?,
+            ))
+        },
+    ))?;
+    let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    if rows.len() > MAX_ACCESS_DEPENDENCIES {
+        return Err(Error::Limit("Agent ACL list bound exceeded"));
+    }
+    let entries = rows
+        .into_iter()
+        .map(|row| {
+            let permissions = AgentPermissions {
+                view: row.2 != 0,
+                contribute: row.3 != 0,
+                submit: row.4 != 0,
+                control: row.5 != 0,
+                derive: row.6 != 0,
+                share: row.7 != 0,
+                manage: row.8 != 0,
+            }
+            .validate()?;
+            Ok(AgentAccessEntry {
+                principal_ref: format!("/d:{domain}/i:{}", row.1),
+                principal_kind: row.0,
+                permissions,
+                grant_revision: row.9,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(AgentAccessSnapshot {
+        owner_ref,
+        entries,
+        rev,
+        acl_rev,
+        caller_permissions: caller.effective_permissions,
+        access_generation: caller.access_generation,
+    })
 }
 
 pub(crate) fn lifecycle(connection: &Connection, agent: AgentKey<'_>) -> Result<(String, String)> {

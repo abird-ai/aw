@@ -91,39 +91,40 @@ handles are never reused. Group create/edit/delete publish immutable principal f
 changes deliberately do **not** fan out Agent writes or revisions. The minimal `domain_principal(s)`
 snapshot exposes principal kind/status/display identity without leaking a group roster.
 
-Group-aware Agent access is now live on top of v39 without another schema migration. One bounded
-`agent_owner::authorize_access` path computes effective five-permission compatibility authority as
-owner rights UNION direct user grant UNION every active matching group grant. Group-owned Agents are
-recognized through exact active membership as well. The hot authorization query streams at most 512
-ordered ACL dependencies rather than building a heap-side grant map.
+Group-aware Agent access now uses the **full seven-permission** owner model without another schema
+migration. `AgentPermissions` covers `view/contribute/submit/control/derive/share/manage`; owner
+rights UNION direct user grant UNION every active matching group grant are resolved by one bounded
+`agent_owner::authorize_permission` path. Existing Jobs five-action callers are a zero-policy adapter
+over that same function. Group-owned Agents remain authorized through exact live membership. The hot
+query streams at most 512 ordered ACL dependencies rather than building a heap-side grant map.
 
-Every successful authorization returns one opaque 32-byte `access_generation` derived from the exact
-Agent + actor, Agent `acl_rev`, active user security epoch, owner kind/handle, direct/group grant
-revisions, exact group handles/revs and the effective permission mask. It is an observation/security
-fence, never an Agent mutation fence. Group membership/name edits advance only group rev; they do
-**not** advance Agent rev/acl_rev. Removing membership denies immediately; re-adding creates a new
-access generation even though the Agent revision remains unchanged.
+Every successful authorization returns the caller's full effective permission set plus one opaque
+32-byte `access_generation` derived from the exact Agent + actor, Agent `acl_rev`, active user security
+epoch, owner kind/handle, direct/group grant revisions, exact group handles/revs and all seven
+effective permission bits. The generation digest moved to v2 for the expanded permission vocabulary;
+it remains an observation/security fence, never an Agent mutation fence. Group membership/name edits
+advance only group rev and never Agent rev/acl_rev.
 
-Agent history cursors now bind to that generation. Wake-recipient authority moved to digest domain
-v3 and commits the same generation; the in-memory mint receipt carries the full generation through
-the mint->persist boundary so the Store revalidates against a membership/security race, while the
-durable row needs no new column because `authority_ref` already cryptographically commits to it.
-Reload recomputes current authority and the v3 digest; older/stale receipt identities fail closed.
-Mixed Agent/finite-Job candidate SQL now recognizes group-owned/group-granted users before the same
-row-level authoritative access recheck.
+`agent_access_list` is the bounded management snapshot: canonical owner principal, direct user/group
+ACL rows, Agent `rev`, `acl_rev`, caller effective permissions and `access_generation`, without group
+roster expansion. `agent_access_set` resolves one canonical `/d:/i:` principal through the v39
+registry, replaces/removes its complete seven-permission grant under Agent-rev CAS, and advances
+`acl_rev + rev` exactly once. Stored non-view permissions still require explicit `view`; owner ACL
+rows remain forbidden. The previous direct-user/group five-permission setters are now thin identity
+adapters into this canonical path; their duplicate ACL SQL/policy path is gone.
 
-Direct-user and group compatibility ACL writes share one exact `agent_owner` mutation primitive, so
-`acl_rev + rev`, grant revisions and idempotence cannot drift. The group bridge deliberately permits
-a **new** group audience only on a fresh, quiescent branch; adding a group to existing history fails
-until the reviewed HistoryGrant/share closure exists. Once a group identity is safely granted, later
-membership follows that principal identity as sealed by the spec.
+Agent history cursors and wake v3 authority continue to bind to `access_generation`; because the
+seven-bit set participates in that generation, derive/share or group/security changes fence old
+security observations without manufacturing Agent revisions. Mixed Agent/finite-Job candidate SQL
+remains group-aware before exact row-level authorization.
 
 Schema **v40** now installs the immutable history/disclosure owner lazily, with no eager Session
 rewrite. `history_spans` retain exact backing Session/branch/root/head boundaries plus raw immutable
-node-content/provenance digests; `history_bases` structurally compose parent base + local span and
-retain total/next Turn coordinates. `history_grants` + normalized disclosed-principal rows are now
-durable immutable owner shapes ready for the access/fork cut, but grant authorization/public fork is
-not yet enabled.
+node-content/provenance digests; `history_bases` structurally compose inherited foreign prefix + one
+complete local branch tail and retain total/next Turn coordinates. Re-sealing a branch now skips any
+same-branch base layers before choosing the inherited parent, so repeated seals/compactions replace
+rather than duplicate that local tail. `history_grants` + normalized disclosed-principal rows are now
+actively used by ACL audience expansion; public exact-history fork construction remains the next cut.
 
 `DisclosureManifest` is represented as a persistent content-addressed bounded-fanout DAG rather
 than flattened JSON: immutable authority roots, leaf entries and branch child links use SHA-256
@@ -134,29 +135,39 @@ The per-seal extraction bound is 16,384 inputs and fails safely rather than flat
 closure. Parent/local manifest composition reuses the existing parent root and adds the local root;
 future authorization traversal can deduplicate repeated authority roots without rewriting history.
 
-Lazy sealing is now a real production path: successful exact-branch `checkpoint` sealing happens in
-the same SQLite transaction after the new checkpoint head is established. Seal keys memoize the
-exact boundary so repeated sealers converge; sealing emits no Agent change and never advances Agent
-`rev`. The HistoryBase content digest includes local fact content, provenance digest and manifest
-identity, preventing identical bytes under different protected provenance from aliasing. Rows reject
-mutation but remain GC-able for the later reachability reconciler.
+Lazy sealing is a production path: successful exact-branch `checkpoint` sealing happens in the same
+SQLite transaction after the new checkpoint head is established. Seal keys memoize exact boundaries;
+sealing emits no Agent change and never advances Agent `rev`. HistoryBase content identity includes
+local fact content, provenance and manifest identity, so identical bytes under different protected
+provenance cannot alias.
 
-Phase 1 is still **underway**, not complete. Next owner work is the full seven-permission
-`agent.access.*` surface with `derive/share` plus HistoryGrant disclosure validation and exact-history
-fork creation; that removes the temporary fresh-branch group expansion restriction and starts using
-v40 grant/base pointers on destination Agents. After that remain provenance propagation for newly
-committed Event/Tool/Process facts, reachability/lazy-base flatten acceleration, minimal authoritative
+A genuinely new ACL viewer on an Agent with committed/inherited history now goes through v40
+HistoryGrant expansion in the **same ACL transaction**. The caller must hold current Agent `share`;
+the exact current history boundary is sealed; the manifest's deduplicated authority roots are walked
+under bounded work; already-disclosed user/group principal identities are preserved; and a new
+immutable superseding HistoryGrant is minted before the single ACL rev bump. Re-adding a principal
+already present in the current immutable grant does not require `share`, because that history was
+already factually disclosed. Narrow/removal never rewrites old grants. Legacy-Session authority roots
+allow expansion only when the target already has source visibility or the acting source owner may
+share non-private content. Materialized external-policy roots still fail closed because no reviewed
+principal-level source-share contract exists yet.
+
+Phase 1 is still **underway**, not complete. Next owner work is exact-history destination Agent
+construction/fork wiring using v40 HistoryBase/HistoryGrant pointers and current `derive` + destination
+`share` policy, with fresh Agent runtime/input/access state. After that remain provenance propagation
+for newly committed Event/Tool/Process facts, reachability/flatten acceleration, minimal authoritative
 snapshots, and rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/
 projection-head helpers only when one of those real consumers needs them; do not prebuild Phase-2/4
 engines.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
-backfill are green; group access/wake/history fencing remains green; v40 history owner tests **2/2**
-prove idempotent revision-neutral sealing and 130-entry bounded-fanout content addressing; existing
-`checkpoints_preserve_tree_but_cut_future_context` and `checkpoint_revision_is_compared` pass through
-the new production seal hook. Mixed exposure remains green. Coordination **24/24**, stable lifecycle/
-control and jobs_get wake remain green from prior checkpoints. Strict v40 `aw-store` all-target/all-
-feature Clippy, fmt and diff checks are green.
+backfill are green; group access/wake/history fencing remains green; v40 history-owner tests are now
+**3/3**, including full seven-permission list/set + immutable HistoryGrant supersession, share-required
+new disclosure, share-free re-add of an already-disclosed principal, idempotent revision-neutral
+sealing and 130-entry bounded-fanout content addressing. Existing group AgentJobs + principal-group
+regressions remain green. Coordination **24/24**, stable lifecycle/control and jobs_get wake remain
+green from prior checkpoints. Strict all-target/all-feature `aw-store` + `aw-cli` Clippy, fmt and
+diff checks are green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

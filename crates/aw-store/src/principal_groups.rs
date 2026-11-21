@@ -139,6 +139,50 @@ fn can_manage_group(
     }
 }
 
+pub(crate) fn resolve_principal_ref(
+    c: &Connection,
+    expected_domain: &str,
+    reference: &str,
+) -> Result<(String, String)> {
+    let body = reference
+        .strip_prefix("/d:")
+        .ok_or(Error::Denied("invalid canonical principal ref"))?;
+    let (domain, handle) = body
+        .split_once("/i:")
+        .ok_or(Error::Denied("invalid canonical principal ref"))?;
+    if domain != expected_domain || domain.is_empty() || handle.is_empty() || handle.contains('/') {
+        return Err(Error::Denied(
+            "principal ref is outside the Agent Domain or malformed",
+        ));
+    }
+    crate::validate_agent_handle_component(domain)?;
+    crate::validate_agent_handle_component(handle)?;
+    let mut kind: Option<String> = db(c
+        .query_row(
+            "SELECT kind FROM domain_principals
+             WHERE domain_id=?1 AND principal_handle=?2 AND status='active'",
+            params![domain, handle],
+            |row| row.get(0),
+        )
+        .optional())?;
+    if kind.is_none() {
+        let active_user: bool = db(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE user_id=?1 AND status='active')",
+            [handle],
+            |row| row.get(0),
+        ))?;
+        if active_user {
+            ensure_user_principal(c, domain, handle)?;
+            kind = Some("user".to_owned());
+        }
+    }
+    let kind = kind.ok_or(Error::Denied("principal unavailable"))?;
+    if !matches!(kind.as_str(), "user" | "group") {
+        return Err(Error::Storage("unknown stored principal kind"));
+    }
+    Ok((kind, handle.to_owned()))
+}
+
 pub(crate) fn ensure_user_principal(c: &Connection, domain: &str, user: &str) -> Result<()> {
     crate::validate_agent_handle_component(user)?;
     let exists: bool = db(c.query_row(
@@ -549,10 +593,8 @@ impl SessionStore {
         group_row(&connection, &domain.id, handle)
     }
 
-    /// Exact-branch bridge for the five collaboration permissions currently
-    /// implemented by Agent Jobs. A new group audience is admitted only while
-    /// the branch is fresh and quiescent; inherited/history disclosure expansion
-    /// remains owned by the later HistoryGrant/share cut.
+    /// Compatibility adapter for the five legacy collaboration permissions.
+    /// Canonical ACL mutation/disclosure semantics live in `agent_access_set`.
     pub fn set_agent_group_collaboration_access(
         &self,
         requestor: &PrincipalId,
@@ -564,87 +606,25 @@ impl SessionStore {
     ) -> Result<u64> {
         let permissions = permissions.validate()?;
         crate::validate_agent_handle_component(group_handle)?;
-        let mut connection = self.connection()?;
-        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let branch = crate::branch_in(&tx, session, branch)?;
-        let agent = crate::agent_owner::AgentKey::new(session, &branch.id);
-        crate::agent_owner::authorize_access(
-            &tx,
-            requestor,
-            agent,
-            crate::SessionParticipationAction::Manage,
-        )?;
-        if crate::agent_owner::revision(&tx, agent)? != expected_rev {
-            return Err(Error::Conflict("stale Agent revision"));
-        }
-        let (domain, owner_kind, owner_handle): (String, String, String) = db(tx.query_row(
-            "SELECT domain_handle,owner_kind,owner_handle FROM agent_state_current
-             WHERE session_id=?1 AND branch_id=?2",
-            params![session, branch.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ))?;
-        let group_active: bool = db(tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM principal_groups g
-                 JOIN domain_principals p
-                   ON p.domain_id=g.domain_id AND p.principal_handle=g.principal_handle
-                 WHERE g.domain_id=?1 AND g.principal_handle=?2 AND g.deleted_at IS NULL
-                   AND p.kind='group' AND p.status='active'
-             )",
-            params![domain, group_handle],
-            |row| row.get(0),
-        ))?;
-        if !group_active {
-            return Err(Error::Denied("group principal is unavailable"));
-        }
-        if owner_kind == "group" && owner_handle == group_handle {
-            return Err(Error::Denied("Agent owner access is implicit"));
-        }
-        let (before, _) =
-            crate::agent_owner::collaboration_acl_permissions(&tx, agent, "group", group_handle)?;
-        if !before.view && permissions.view {
-            let fresh: bool = db(tx.query_row(
-                "SELECT b.head=s.root_node AND b.active_run IS NULL
-                 FROM branches b JOIN sessions s ON s.id=b.session_id
-                 WHERE b.session_id=?1 AND b.id=?2",
+        let domain: String = {
+            let connection = self.connection()?;
+            let branch = crate::branch_in(&connection, session, branch)?;
+            db(connection.query_row(
+                "SELECT domain_handle FROM agent_state_current
+                 WHERE session_id=?1 AND branch_id=?2",
                 params![session, branch.id],
                 |row| row.get(0),
-            ))?;
-            if !fresh {
-                return Err(Error::Conflict(
-                    "group disclosure expansion requires HistoryGrant/share authority",
-                ));
-            }
-        }
-        let manager = user_for_principal(&tx, requestor)?
-            .ok_or(Error::Denied("Agent manager identity is inactive"))?;
-        let (next, grant_rev, changed) = crate::agent_owner::set_collaboration_acl(
-            &tx,
-            agent,
-            "group",
-            group_handle,
-            permissions,
-            &manager,
+            ))?
+        };
+        let principal_ref = canonical_ref(&domain, group_handle);
+        self.agent_access_set(
+            requestor,
+            session,
+            branch,
+            &principal_ref,
+            Some(permissions.into()),
             expected_rev,
-        )?;
-        if changed {
-            crate::audit(
-                &tx,
-                session,
-                requestor,
-                "agent.access.changed",
-                serde_json::json!({
-                    "branch_id":branch.id,
-                    "principal_kind":"group",
-                    "principal_handle":group_handle,
-                    "permissions":permissions,
-                    "grant_rev":grant_rev,
-                    "rev":next,
-                }),
-            )?;
-        }
-        db(tx.commit())?;
-        Ok(next)
+        )
     }
 
     pub fn delete_principal_group(

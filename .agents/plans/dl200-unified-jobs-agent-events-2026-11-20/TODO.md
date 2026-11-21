@@ -87,12 +87,20 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       storage; normalized grant principals; persistent SHA-256 content-addressed DisclosureManifest
       leaves/branches + authority roots with fanout 64; conservative extraction of exact legacy-node
       and materialized-fact provenance; parent/local structural manifest composition; exact checkpoint
-      seal memoization in the existing transaction with no Agent rev/Event. History owner tests 2/2
-      plus existing checkpoint regressions and strict Clippy are green. Next: full seven-permission
-      `agent.access.*` + derive/share HistoryGrant validation and exact-history destination Agent
-      construction using v40 base/grant pointers; then propagate manifests through newly committed
-      Event/Tool/Process facts, add reachability/flatten acceleration as real consumers require,
-      minimal snapshots and rebuild Agent exposure from owner state.
+      seal memoization in the existing transaction with no Agent rev/Event. **Full seven-permission
+      Agent ACL landed:** one `AgentPermissions`/authorization owner for view/contribute/submit/control/
+      derive/share/manage; bounded `agent_access_list`; canonical principal-ref `agent_access_set`
+      replacing complete user/group grants under rev CAS; old five-permission setters reduced to thin
+      adapters over the same path. New history audience expansion requires current Agent share,
+      bounded manifest-root reauthorization and mints one immutable superseding HistoryGrant in the
+      same transaction; already-disclosed principals can be re-added without share, narrowing never
+      rewrites grants, and materialized external-policy expansion fails closed pending a reviewed
+      source-share contract. Same-branch base layers are replaced rather than duplicated on reseal.
+      History owner tests 3/3 + existing group AgentJobs/principal tests + strict aw-store/aw-cli
+      Clippy are green. Next: exact-history destination Agent construction/fork wiring using current
+      derive + destination share policy and v40 base/grant pointers; then propagate manifests through
+      newly committed Event/Tool/Process facts, add reachability/flatten acceleration as real
+      consumers require, minimal snapshots and rebuild Agent exposure from owner state.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

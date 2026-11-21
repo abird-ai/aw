@@ -4,13 +4,17 @@
 //! exact settled Agent boundary into structurally shared immutable HistorySpan /
 //! HistoryBase rows and a content-addressed disclosure-manifest DAG.
 
-use crate::{branch_in, context, db, json, now, session_in, Error, Result};
+use crate::{
+    agent_owner, branch_in, context, db, id, json, now, principal_is_session_owner, session_in,
+    stable_user_principal, user_for_principal, Error, PrincipalId, Result,
+};
 use rusqlite::{params, Connection};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
 const MANIFEST_FANOUT: usize = 64;
 const MAX_MANIFEST_INPUTS: usize = 16_384;
+const MAX_MANIFEST_WALK_NODES: usize = 16_384;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HistoryBaseRef {
@@ -338,6 +342,32 @@ fn base_row(connection: &Connection, base_id: &str) -> Result<HistoryBaseRef> {
     ))
 }
 
+fn inherited_parent_for_seal(
+    connection: &Connection,
+    current_base: Option<&str>,
+    session_id: &str,
+    branch_id: &str,
+) -> Result<Option<String>> {
+    let mut cursor = current_base.map(str::to_owned);
+    while let Some(base_id) = cursor {
+        let (parent, span_session, span_branch): (Option<String>, String, String) = db(connection
+            .query_row(
+                "SELECT b.parent_base_id,s.backing_session_id,s.backing_branch_id
+                 FROM history_bases b
+                 JOIN history_spans s ON s.span_id=b.local_span_id
+                 WHERE b.base_id=?1",
+                [&base_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ))?;
+        if span_session == session_id && span_branch == branch_id {
+            cursor = parent;
+        } else {
+            return Ok(Some(base_id));
+        }
+    }
+    Ok(None)
+}
+
 fn projected_node_digests(
     connection: &Connection,
     session: &crate::SessionInfo,
@@ -380,7 +410,7 @@ pub(crate) fn seal_in(
         ));
     }
 
-    let (parent_base, source_agent): (Option<String>, String) = db(connection.query_row(
+    let (current_base, source_agent): (Option<String>, String) = db(connection.query_row(
         "SELECT history_base_id,
                 '/d:' || domain_handle || '/i:' || identity_handle ||
                 '/p:' || project_handle || '/a:' || agent_handle
@@ -388,11 +418,13 @@ pub(crate) fn seal_in(
         params![session_id, branch_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ))?;
+    let parent_base =
+        inherited_parent_for_seal(connection, current_base.as_deref(), session_id, branch_id)?;
 
     let projected = projected_node_digests(connection, &session, &branch)?;
     if projected.is_empty() {
-        if let Some(parent) = parent_base {
-            return base_row(connection, &parent);
+        if let Some(parent) = parent_base.as_deref() {
+            return base_row(connection, parent);
         }
     }
 
@@ -526,6 +558,290 @@ pub(crate) fn seal_in(
     base_row(connection, &base_id)
 }
 
+fn manifest_authority_roots(
+    connection: &Connection,
+    manifest: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stack = vec![manifest.to_owned()];
+    let mut visited = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_MANIFEST_WALK_NODES {
+            return Err(Error::Limit("disclosure manifest walk bound exceeded"));
+        }
+        let kind: String = db(connection.query_row(
+            "SELECT node_kind FROM disclosure_manifest_nodes WHERE node_digest=?1",
+            [&node],
+            |row| row.get(0),
+        ))?;
+        match kind.as_str() {
+            "leaf" => {
+                let mut query = db(connection.prepare(
+                    "SELECT entry_ref FROM disclosure_manifest_entries
+                     WHERE node_digest=?1 AND entry_kind='authority_root'
+                     ORDER BY ordinal LIMIT ?2",
+                ))?;
+                let rows = db(query
+                    .query_map(params![node, (MANIFEST_FANOUT + 1) as i64], |row| {
+                        row.get::<_, String>(0)
+                    }))?;
+                let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+                if rows.len() > MANIFEST_FANOUT {
+                    return Err(Error::Storage("disclosure manifest leaf fanout corrupted"));
+                }
+                roots.extend(rows);
+            }
+            "branch" => {
+                let mut query = db(connection.prepare(
+                    "SELECT child_digest FROM disclosure_manifest_children
+                     WHERE node_digest=?1 ORDER BY ordinal LIMIT ?2",
+                ))?;
+                let rows = db(query
+                    .query_map(params![node, (MANIFEST_FANOUT + 1) as i64], |row| {
+                        row.get::<_, String>(0)
+                    }))?;
+                let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+                if rows.len() > MANIFEST_FANOUT {
+                    return Err(Error::Storage(
+                        "disclosure manifest branch fanout corrupted",
+                    ));
+                }
+                stack.extend(rows.into_iter().rev());
+            }
+            _ => return Err(Error::Storage("unknown disclosure manifest node kind")),
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| {
+            db(connection.query_row(
+                "SELECT kind,stable_key,evidence_json
+                 FROM disclosure_authority_roots WHERE root_digest=?1",
+                [&root],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ))
+        })
+        .collect()
+}
+
+fn grant_covers(
+    connection: &Connection,
+    grant: &str,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<bool> {
+    db(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM history_grant_principals
+             WHERE grant_id=?1 AND principal_kind=?2 AND principal_handle=?3
+         )",
+        params![grant, principal_kind, principal_handle],
+        |row| row.get(0),
+    ))
+}
+
+fn current_disclosed_principals(
+    connection: &Connection,
+    agent: agent_owner::AgentKey<'_>,
+    current_grant: Option<&str>,
+) -> Result<BTreeSet<(String, String)>> {
+    let mut principals = BTreeSet::new();
+    if let Some(grant) = current_grant {
+        let mut query = db(connection.prepare(
+            "SELECT principal_kind,principal_handle FROM history_grant_principals
+             WHERE grant_id=?1 ORDER BY ordinal LIMIT ?2",
+        ))?;
+        let rows = db(
+            query.query_map(params![grant, (MAX_MANIFEST_INPUTS + 1) as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }),
+        )?;
+        let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        if rows.len() > MAX_MANIFEST_INPUTS {
+            return Err(Error::Limit("HistoryGrant principal bound exceeded"));
+        }
+        principals.extend(rows);
+        return Ok(principals);
+    }
+
+    let (owner_kind, owner_handle): (String, String) = db(connection.query_row(
+        "SELECT owner_kind,owner_handle FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![agent.session, agent.branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    principals.insert((owner_kind, owner_handle));
+    let mut query = db(connection.prepare(
+        "SELECT principal_kind,principal_handle FROM agent_acl_current
+         WHERE session_id=?1 AND branch_id=?2 AND can_view=1
+         ORDER BY principal_kind,principal_handle LIMIT ?3",
+    ))?;
+    let rows = db(query.query_map(
+        params![
+            agent.session,
+            agent.branch,
+            (MAX_MANIFEST_INPUTS + 1) as i64
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ))?;
+    let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    if rows.len() > MAX_MANIFEST_INPUTS {
+        return Err(Error::Limit("Agent audience bound exceeded"));
+    }
+    principals.extend(rows);
+    Ok(principals)
+}
+
+fn validate_legacy_session_expansion(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source_session: &str,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<()> {
+    if principal_kind == "user" {
+        let target = stable_user_principal(principal_handle)?;
+        match context::authorize_tree(connection, source_session, &target) {
+            Ok(()) => return Ok(()),
+            Err(Error::Denied(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let private: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM context_private_sessions WHERE session_id=?1)",
+        [source_session],
+        |row| row.get(0),
+    ))?;
+    if private || !principal_is_session_owner(connection, source_session, actor)? {
+        return Err(Error::Denied(
+            "history disclosure dependency does not permit the expanded audience",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_expansion(
+    connection: &Connection,
+    actor: &PrincipalId,
+    manifest: &str,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<()> {
+    for (kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)? {
+        match kind.as_str() {
+            "legacy_session" => validate_legacy_session_expansion(
+                connection,
+                actor,
+                &stable_key,
+                principal_kind,
+                principal_handle,
+            )?,
+            "materialized_policy" => {
+                return Err(Error::Denied(
+                    "materialized external history cannot expand audience without source share authority",
+                ));
+            }
+            _ => {
+                return Err(Error::Denied(
+                    "history disclosure authority root has no reviewed share contract",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate and durably record one genuinely new history audience principal.
+/// Returns the new grant id when history existed and a new disclosure was minted.
+pub(crate) fn prepare_disclosure_expansion(
+    connection: &Connection,
+    actor: &PrincipalId,
+    agent: agent_owner::AgentKey<'_>,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<Option<String>> {
+    let (current_base, current_grant, destination_agent): (Option<String>, Option<String>, String) =
+        db(connection.query_row(
+            "SELECT history_base_id,history_grant_id,
+                    '/d:' || domain_handle || '/i:' || identity_handle ||
+                    '/p:' || project_handle || '/a:' || agent_handle
+             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+            params![agent.session, agent.branch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ))?;
+    if let Some(grant) = current_grant.as_deref() {
+        if grant_covers(connection, grant, principal_kind, principal_handle)? {
+            return Ok(None);
+        }
+    }
+
+    let session = session_in(connection, agent.session)?;
+    let branch = branch_in(connection, agent.session, agent.branch)?;
+    let local_history = !context::projected(connection, &session.id, &branch.head)?.is_empty();
+    if current_base.is_none() && !local_history {
+        return Ok(None);
+    }
+
+    agent_owner::authorize_permission(
+        connection,
+        actor,
+        agent,
+        agent_owner::AgentPermission::Share,
+    )?;
+    let base = seal_in(connection, agent.session, agent.branch)?;
+    validate_manifest_expansion(
+        connection,
+        actor,
+        &base.manifest_digest,
+        principal_kind,
+        principal_handle,
+    )?;
+
+    let mut principals = current_disclosed_principals(connection, agent, current_grant.as_deref())?;
+    principals.insert((principal_kind.to_owned(), principal_handle.to_owned()));
+    if principals.len() > MAX_MANIFEST_INPUTS {
+        return Err(Error::Limit("HistoryGrant principal bound exceeded"));
+    }
+    let grant_id = id("hgrant")?;
+    let created_by = user_for_principal(connection, actor)?
+        .ok_or(Error::Denied("HistoryGrant creator identity is inactive"))?;
+    db(connection.execute(
+        "INSERT INTO history_grants(
+             grant_id,base_id,source_agent_ref,destination_agent_ref,manifest_digest,
+             created_by_handle,supersedes_grant_id,created_at
+         ) VALUES(?1,?2,?3,?3,?4,?5,?6,?7)",
+        params![
+            grant_id,
+            base.id,
+            destination_agent,
+            base.manifest_digest,
+            created_by,
+            current_grant,
+            now()
+        ],
+    ))?;
+    for (ordinal, (kind, handle)) in principals.iter().enumerate() {
+        db(connection.execute(
+            "INSERT INTO history_grant_principals(
+                 grant_id,ordinal,principal_kind,principal_handle
+             ) VALUES(?1,?2,?3,?4)",
+            params![grant_id, ordinal as u64, kind, handle],
+        ))?;
+    }
+    let changed = db(connection.execute(
+        "UPDATE agent_state_current SET history_base_id=?1,history_grant_id=?2
+         WHERE session_id=?3 AND branch_id=?4",
+        params![base.id, grant_id, agent.session, agent.branch],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Storage("Agent history grant pointer update failed"));
+    }
+    Ok(Some(grant_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +881,157 @@ mod tests {
                 .unwrap(),
             rev,
             "lazy sealing cannot manufacture an Agent revision"
+        );
+    }
+
+    #[test]
+    fn full_agent_access_mints_and_reuses_history_disclosure_grants() {
+        let store = SessionStore::in_memory().unwrap();
+        let owner = PrincipalId::new("internal:fixture:access-owner").unwrap();
+        let manager = PrincipalId::new("internal:fixture:access-manager").unwrap();
+        let bob = PrincipalId::new("internal:fixture:access-bob").unwrap();
+        let newcomer = PrincipalId::new("internal:fixture:access-newcomer").unwrap();
+        let (session, branch) = store.create(&owner, "history access", binding()).unwrap();
+        let domain = store.default_domain(&owner).unwrap();
+        let (manager_ref, bob_ref, newcomer_ref) = {
+            let connection = store.connection().unwrap();
+            let manager_user = crate::ensure_user_for_principal(&connection, &manager).unwrap();
+            let bob_user = crate::ensure_user_for_principal(&connection, &bob).unwrap();
+            let newcomer_user = crate::ensure_user_for_principal(&connection, &newcomer).unwrap();
+            (
+                format!("/d:{}/i:{manager_user}", domain.id),
+                format!("/d:{}/i:{bob_user}", domain.id),
+                format!("/d:{}/i:{newcomer_user}", domain.id),
+            )
+        };
+        let checkpoint = store
+            .checkpoint(
+                &owner,
+                &session.id,
+                &branch.id,
+                branch.revision,
+                "sealed history",
+            )
+            .unwrap();
+        assert_eq!(checkpoint.id, branch.id);
+
+        let grant_pointer = || {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT history_grant_id FROM agent_state_current
+                     WHERE session_id=?1 AND branch_id=?2",
+                    params![session.id, branch.id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+        };
+        let rev0 = store
+            .agent_public_revision(&owner, &session.id, &branch.id)
+            .unwrap();
+        let rev1 = store
+            .agent_access_set(
+                &owner,
+                &session.id,
+                &branch.id,
+                &manager_ref,
+                Some(crate::AgentPermissions {
+                    view: true,
+                    manage: true,
+                    ..Default::default()
+                }),
+                rev0,
+            )
+            .unwrap();
+        let first_grant =
+            grant_pointer().expect("first history audience expansion must mint grant");
+
+        let bob_permissions = crate::AgentPermissions {
+            view: true,
+            derive: true,
+            ..Default::default()
+        };
+        let rev2 = store
+            .agent_access_set(
+                &owner,
+                &session.id,
+                &branch.id,
+                &bob_ref,
+                Some(bob_permissions),
+                rev1,
+            )
+            .unwrap();
+        let second_grant = grant_pointer().expect("second expansion must retain a current grant");
+        assert_ne!(second_grant, first_grant);
+        let supersedes: Option<String> = {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT supersedes_grant_id FROM history_grants WHERE grant_id=?1",
+                    [&second_grant],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(supersedes.as_deref(), Some(first_grant.as_str()));
+
+        let snapshot = store
+            .agent_access_list(&owner, &session.id, &branch.id)
+            .unwrap();
+        let bob_entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.principal_ref == bob_ref)
+            .expect("Bob grant must be listed");
+        assert_eq!(bob_entry.permissions, bob_permissions);
+        assert!(store
+            .authorize_agent_permission(
+                &bob,
+                &session.id,
+                &branch.id,
+                crate::AgentPermission::Derive,
+            )
+            .is_ok());
+        assert!(store
+            .authorize_agent_permission(
+                &bob,
+                &session.id,
+                &branch.id,
+                crate::AgentPermission::Share,
+            )
+            .is_err());
+
+        let rev3 = store
+            .agent_access_set(&manager, &session.id, &branch.id, &bob_ref, None, rev2)
+            .unwrap();
+        assert_eq!(grant_pointer().as_deref(), Some(second_grant.as_str()));
+        let rev4 = store
+            .agent_access_set(
+                &manager,
+                &session.id,
+                &branch.id,
+                &bob_ref,
+                Some(bob_permissions),
+                rev3,
+            )
+            .expect("already-disclosed Bob can be re-added without share authority");
+        assert_eq!(grant_pointer().as_deref(), Some(second_grant.as_str()));
+        assert!(store
+            .agent_access_set(
+                &manager,
+                &session.id,
+                &branch.id,
+                &newcomer_ref,
+                Some(crate::AgentPermissions::VIEW_ONLY),
+                rev4,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .agent_public_revision(&owner, &session.id, &branch.id)
+                .unwrap(),
+            rev4,
+            "failed new disclosure cannot advance Agent revision"
         );
     }
 

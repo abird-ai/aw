@@ -88,7 +88,9 @@ pub use actor_queue::{
     ModelQueueDispositionRequest, QueueClaim, QueueState, QueueTarget,
 };
 pub use agent_job_events::AgentJobWakeAdmission;
-pub use agent_owner::AgentAccessEvidence;
+pub use agent_owner::{
+    AgentAccessEntry, AgentAccessEvidence, AgentAccessSnapshot, AgentPermission, AgentPermissions,
+};
 pub use auth_session::*;
 pub use authority::{
     domain_authority_vote_transcript, DomainAuthorityElectionInfo, DomainAuthorityGrantBundle,
@@ -1510,6 +1512,23 @@ impl SessionStore {
         Ok(turn)
     }
 
+    pub fn authorize_agent_permission(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        permission: AgentPermission,
+    ) -> Result<AgentAccessEvidence> {
+        let c = self.connection()?;
+        let branch = branch_in(&c, session, branch)?;
+        agent_owner::authorize_permission(
+            &c,
+            actor,
+            agent_owner::AgentKey::new(session, &branch.id),
+            permission,
+        )
+    }
+
     pub fn authorize_agent_access(
         &self,
         actor: &PrincipalId,
@@ -1543,6 +1562,88 @@ impl SessionStore {
         )
     }
 
+    pub fn agent_access_list(
+        &self,
+        actor: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<AgentAccessSnapshot> {
+        let c = self.connection()?;
+        let branch = branch_in(&c, session, branch)?;
+        agent_owner::access_snapshot(&c, actor, agent_owner::AgentKey::new(session, &branch.id))
+    }
+
+    pub fn agent_access_set(
+        &self,
+        requestor: &PrincipalId,
+        session: &str,
+        branch: &str,
+        principal_ref: &str,
+        permissions: Option<AgentPermissions>,
+        expected_rev: u64,
+    ) -> Result<u64> {
+        let permissions = permissions.unwrap_or_default().validate()?;
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let branch = branch_in(&tx, session, branch)?;
+        let agent = agent_owner::AgentKey::new(session, &branch.id);
+        agent_owner::authorize_permission(&tx, requestor, agent, AgentPermission::Manage)?;
+        if agent_owner::revision(&tx, agent)? != expected_rev {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+        let (domain, owner_kind, owner_handle): (String, String, String) = db(tx.query_row(
+            "SELECT domain_handle,owner_kind,owner_handle FROM agent_state_current
+             WHERE session_id=?1 AND branch_id=?2",
+            params![session, branch.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ))?;
+        let (principal_kind, principal_handle) =
+            principal_groups::resolve_principal_ref(&tx, &domain, principal_ref)?;
+        if principal_kind == owner_kind && principal_handle == owner_handle {
+            return Err(Error::Denied("Agent owner access is implicit"));
+        }
+        let (before, _) =
+            agent_owner::acl_permissions(&tx, agent, &principal_kind, &principal_handle)?;
+        if !before.view && permissions.view {
+            history_owner::prepare_disclosure_expansion(
+                &tx,
+                requestor,
+                agent,
+                &principal_kind,
+                &principal_handle,
+            )?;
+        }
+        let manager = user_for_principal(&tx, requestor)?
+            .ok_or(Error::Denied("Agent manager identity is inactive"))?;
+        let (next, grant_rev, changed) = agent_owner::set_acl(
+            &tx,
+            agent,
+            &principal_kind,
+            &principal_handle,
+            permissions,
+            &manager,
+            expected_rev,
+        )?;
+        if changed {
+            audit(
+                &tx,
+                session,
+                requestor,
+                "agent.access.changed",
+                serde_json::json!({
+                    "branch_id":branch.id,
+                    "principal":principal_ref,
+                    "principal_kind":principal_kind,
+                    "permissions":permissions,
+                    "grant_rev":grant_rev,
+                    "rev":next,
+                }),
+            )?;
+        }
+        db(tx.commit())?;
+        Ok(next)
+    }
+
     pub fn agent_public_revision(
         &self,
         actor: &PrincipalId,
@@ -1569,8 +1670,8 @@ impl SessionStore {
         agent_owner::lifecycle(&c, agent)
     }
 
-    /// Exact-branch compatibility bridge for the five collaboration permissions
-    /// already implemented by Session participation. It never grants derive/share.
+    /// Compatibility adapter for the five legacy collaboration permissions.
+    /// Canonical ACL mutation/disclosure semantics live in `agent_access_set`.
     pub fn set_agent_collaboration_access(
         &self,
         requestor: &PrincipalId,
@@ -1581,64 +1682,34 @@ impl SessionStore {
         expected_rev: u64,
     ) -> Result<u64> {
         let permissions = permissions.validate()?;
-        let mut c = self.connection()?;
-        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let branch = branch_in(&tx, session, branch)?;
-        let agent = agent_owner::AgentKey::new(session, &branch.id);
-        agent_owner::authorize_access(&tx, requestor, agent, SessionParticipationAction::Manage)?;
-        if agent_owner::revision(&tx, agent)? != expected_rev {
-            return Err(Error::Conflict("stale Agent revision"));
-        }
-        let participant_user = ensure_user_for_principal(&tx, participant)?;
-        principal_groups::ensure_user_principal_for_agent(
-            &tx,
-            session,
-            &branch.id,
-            &participant_user,
-        )?;
-        let (owner_kind, owner_handle): (String, String) = db(tx.query_row(
-            "SELECT owner_kind,owner_handle FROM agent_state_current
-             WHERE session_id=?1 AND branch_id=?2",
-            params![session, branch.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ))?;
-        if owner_kind == "user" && participant_user == owner_handle {
-            return Err(Error::Denied("Agent owner access is implicit"));
-        }
-        let (before, _) =
-            agent_owner::collaboration_acl_permissions(&tx, agent, "user", &participant_user)?;
-        if !before.view && permissions.view {
-            context::authorize_dependencies_for_grant(&tx, session, participant)?;
-        }
-        let manager = user_for_principal(&tx, requestor)?
-            .ok_or(Error::Denied("Agent manager identity is inactive"))?;
-        let (next, grant_rev, changed) = agent_owner::set_collaboration_acl(
-            &tx,
-            agent,
-            "user",
-            &participant_user,
-            permissions,
-            &manager,
-            expected_rev,
-        )?;
-        if changed {
-            audit(
+        let principal_ref = {
+            let mut c = self.connection()?;
+            let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let branch = branch_in(&tx, session, branch)?;
+            let participant_user = ensure_user_for_principal(&tx, participant)?;
+            principal_groups::ensure_user_principal_for_agent(
                 &tx,
                 session,
-                requestor,
-                "agent.access.changed",
-                serde_json::json!({
-                    "branch_id":branch.id,
-                    "principal_kind":"user",
-                    "principal_handle":participant_user,
-                    "permissions":permissions,
-                    "grant_rev":grant_rev,
-                    "rev":next,
-                }),
+                &branch.id,
+                &participant_user,
             )?;
-        }
-        db(tx.commit())?;
-        Ok(next)
+            let domain: String = db(tx.query_row(
+                "SELECT domain_handle FROM agent_state_current
+                 WHERE session_id=?1 AND branch_id=?2",
+                params![session, branch.id],
+                |row| row.get(0),
+            ))?;
+            db(tx.commit())?;
+            format!("/d:{domain}/i:{participant_user}")
+        };
+        self.agent_access_set(
+            requestor,
+            session,
+            branch,
+            &principal_ref,
+            Some(permissions.into()),
+            expected_rev,
+        )
     }
 
     pub fn set_agent_title(
