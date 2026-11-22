@@ -59,6 +59,7 @@ mod resources;
 mod reviews;
 #[cfg(feature = "routing")]
 mod routing;
+mod sandbox_owner;
 #[cfg(feature = "pipelines")]
 mod schedules;
 mod secret_custody_inventory;
@@ -166,6 +167,7 @@ pub use reviews::*;
 #[cfg(feature = "routing")]
 pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+pub use sandbox_owner::{SandboxLifecycle, SandboxSnapshot};
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
 pub use secret_custody_inventory::ActiveSecretCustodyInventory;
@@ -249,8 +251,9 @@ pub const JOB_EXPOSURE_REPAIR_SCHEMA: &str =
 pub const AGENT_OWNER_SCHEMA: &str = include_str!("../migrations/038_agent_owner.sql");
 pub const DOMAIN_PRINCIPALS_SCHEMA: &str = include_str!("../migrations/039_domain_principals.sql");
 pub const HISTORY_OWNER_SCHEMA: &str = include_str!("../migrations/040_history_owner.sql");
+pub const SANDBOX_OWNER_SCHEMA: &str = include_str!("../migrations/041_sandbox_owner.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 40;
+const LATEST_SCHEMA_VERSION: i64 = 41;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2813,6 +2816,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 39 {
         migrate_history_owner(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 40 {
+        migrate_sandbox_owner(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -3062,6 +3069,74 @@ fn migrate_history_owner(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 40))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_sandbox_owner(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='sandbox-owner',generation=generation+1,
+             target_epoch=41,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(SANDBOX_OWNER_SCHEMA))?;
+    let seeded = sandbox_owner::seed_existing_agents(&tx)?;
+    let agents: u64 = db(
+        tx.query_row("SELECT count(*) FROM agent_state_current", [], |row| {
+            row.get(0)
+        }),
+    )?;
+    let invalid: u64 = db(tx.query_row(
+        "SELECT count(*)
+         FROM agent_state_current a
+         LEFT JOIN sandboxes_current s ON s.sandbox_id=a.sandbox_id
+         WHERE a.sandbox_id IS NULL OR s.sandbox_id IS NULL
+            OR s.domain_handle<>a.domain_handle
+            OR s.identity_handle<>a.identity_handle
+            OR s.project_handle<>a.project_handle",
+        [],
+        |row| row.get(0),
+    ))?;
+    if seeded as u64 != agents || invalid != 0 {
+        return Err(Error::Storage(
+            "Sandbox owner migration did not bind every authoritative Agent",
+        ));
+    }
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Sandbox owner migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='41' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=41,activation_epoch=41,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=41,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 41))?;
     db(tx.commit())?;
     Ok(())
 }

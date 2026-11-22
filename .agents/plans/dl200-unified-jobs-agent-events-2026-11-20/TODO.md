@@ -155,8 +155,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       canonical stable-user principal (personal/OAuth stay owner-only; persisted server accounts retain
       current Store grants), `Router::for_actor` gives root/local and child/stable principals exact-actor
       facades over one shared live registry, exact replay uses live-owner fast-path + insert-if-absent, and
-      stdio exposes only the sealed create fields with RPC id as durable request identity. Still open before
-      the host shell is complete: explicit logical Sandbox refs/`auto` policy owner, reviewed cross-Project
+      stdio exposes only the sealed create fields with RPC id as durable request identity. **Logical Sandbox
+      ownership + Agent binding are now implemented in v41:** canonical SandboxRef is the durable ID;
+      Project+layout state owns `rev/open|closed`, migration binds every existing Agent without collapsing
+      distinct layouts, generic constructors auto-bind only once v41 exists, trusted `sandbox=auto` uses the
+      current Agent's immutable Sandbox, explicit refs must be open + exact destination Project + exact
+      trusted layout, and no Agent rebind verb exists. Store `sandbox_get/list/create_fresh/close` primitives
+      are present; SourceBindings/SandboxGrant/driver realization remain deferred and frozen 017 is untouched.
+      Still open before the host shell is complete: stdio/host `sandbox.list/get/create/close` exposure,
+      derived `sandbox.create(from=...)` once SourceDriver/checkpoint semantics exist, reviewed cross-Project
       redirect authority, broader non-current Agent close routing, and staged `agent.inputs.*`. After that
       propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

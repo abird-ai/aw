@@ -417,6 +417,7 @@ pub(crate) fn created(
     ))?;
     if inserted == 1 {
         seed_acl_for_agent(connection, agent)?;
+        crate::sandbox_owner::bind_auto_if_available(connection, agent.session, agent.branch)?;
         return Ok(());
     }
 
@@ -466,7 +467,9 @@ pub(crate) fn created(
         _ => Err(Error::Conflict(
             "Agent owner already exists with different creation lineage",
         )),
-    }
+    }?;
+    crate::sandbox_owner::bind_auto_if_available(connection, agent.session, agent.branch)?;
+    Ok(())
 }
 
 /// Advance one exact Agent-owned revision in the caller's transaction.

@@ -137,6 +137,9 @@ pub struct AgentCreateContext {
     pub current_project_ref: String,
     pub current_agent_ref: Option<String>,
     pub binding: SessionBinding,
+    /// Trusted current-host Sandbox policy for sandbox=auto. This is an
+    /// immutable current Agent binding, never history-derived or model-chosen.
+    pub auto_sandbox_ref: Option<String>,
     /// Stable authenticated host/RPC request identity. Required only for
     /// task-bearing construction because it owns prepared external custody.
     pub request_id: Option<String>,
@@ -329,6 +332,7 @@ fn agent_create_fingerprint(
         "task_sha256":task_sha256,
         "access":request.access,
         "sandbox":request.sandbox,
+        "auto_sandbox":context.auto_sandbox_ref,
         "binding":context.binding,
         "execution_site":context.execution_site,
     });
@@ -822,11 +826,6 @@ impl SessionStore {
         }) {
             return Err(Error::Denied("invalid initial Agent task"));
         }
-        if let AgentSandboxSelection::Existing(_) = request.sandbox {
-            return Err(Error::Denied(
-                "explicit Sandbox refs require the logical Sandbox owner",
-            ));
-        }
         let title = request.title.as_deref().unwrap_or("Agent");
         crate::label(title, 160)?;
 
@@ -855,6 +854,10 @@ impl SessionStore {
                 "fresh Agent destination must match the trusted current Project",
             ));
         }
+        let requested_sandbox = match &request.sandbox {
+            AgentSandboxSelection::Auto => context.auto_sandbox_ref.as_deref(),
+            AgentSandboxSelection::Existing(reference) => Some(reference.as_str()),
+        };
         if matches!(request.access, AgentCreateAccess::Inherit)
             && !source
                 .as_ref()
@@ -913,6 +916,15 @@ impl SessionStore {
                         canonical_source,
                     )?;
                 }
+                crate::sandbox_owner::preflight_initial_selection(
+                    &connection,
+                    actor,
+                    &selected_project.domain,
+                    &selected_project.identity,
+                    &selected_project.project,
+                    &context.binding,
+                    requested_sandbox,
+                )?;
                 let (session, branch) = key_for_ref_in(&connection, &parent_ref)?;
                 agent_owner::authorize_permission(
                     &connection,
@@ -975,6 +987,15 @@ impl SessionStore {
                         canonical_source,
                     )?;
                 }
+                crate::sandbox_owner::preflight_initial_selection(
+                    &tx,
+                    actor,
+                    &selected_project.domain,
+                    &selected_project.identity,
+                    &selected_project.project,
+                    &context.binding,
+                    requested_sandbox,
+                )?;
                 let (session, branch) = key_for_ref_in(&tx, &parent_ref)?;
                 if session != parent_session || branch != parent_branch {
                     return Err(Error::Conflict(
@@ -1133,6 +1154,14 @@ impl SessionStore {
                     }
                 };
 
+            let selected_sandbox = crate::sandbox_owner::select_initial_agent_sandbox(
+                &tx,
+                actor,
+                &session.id,
+                &branch.id,
+                requested_sandbox,
+            )?;
+
             if let AgentCreateAccess::Custom(grants) = &request.access {
                 install_initial_custom_access(&tx, actor, &session.id, &branch.id, grants)?;
             }
@@ -1184,7 +1213,7 @@ impl SessionStore {
                     "from":request.from,
                     "project":selected_project.canonical(),
                     "access":request.access,
-                    "sandbox":"auto",
+                    "sandbox":selected_sandbox,
                     "initial_task":prepared_task.as_ref().map(|(_,_,preparation,_)| preparation.queue_request_id.as_str()),
                 }),
             )?;
@@ -1466,10 +1495,16 @@ mod tests {
             "/d:{}/i:{}/p:{}",
             root_binding.domain_handle, root_binding.identity_handle, root_binding.project_handle
         );
+        let root_sandbox = store
+            .agent_get(&actor, &root_ref)
+            .unwrap()
+            .sandbox_ref
+            .expect("v41 root Agent must have a Sandbox");
         let context = AgentCreateContext {
             current_project_ref: project_ref.clone(),
             current_agent_ref: Some(root_ref.clone()),
             binding: binding(),
+            auto_sandbox_ref: Some(root_sandbox.clone()),
             request_id: None,
             execution_site: "local".into(),
         };
@@ -1488,6 +1523,45 @@ mod tests {
         assert_eq!(created.lifecycle, AgentLifecycle::Open);
         assert_eq!(created.admission, AgentAdmission::Open);
         assert_ne!(created.canonical_ref, root_ref);
+        assert_eq!(created.sandbox_ref.as_deref(), Some(root_sandbox.as_str()));
+
+        let explicit = store
+            .sandbox_create_fresh(&actor, &project_ref, &binding())
+            .unwrap();
+        let explicit_child = store
+            .agent_create(
+                &actor,
+                &context,
+                AgentCreateRequest {
+                    title: Some("explicit sandbox child".into()),
+                    sandbox: AgentSandboxSelection::Existing(explicit.canonical_ref.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            explicit_child.sandbox_ref.as_deref(),
+            Some(explicit.canonical_ref.as_str())
+        );
+
+        let mut other_layout = binding();
+        other_layout.working_directory = PathBuf::from("/var/tmp");
+        other_layout.tool_root = PathBuf::from("/var/tmp");
+        let incompatible = store
+            .sandbox_create_fresh(&actor, &project_ref, &other_layout)
+            .unwrap();
+        assert!(matches!(
+            store.agent_create(
+                &actor,
+                &context,
+                AgentCreateRequest {
+                    title: Some("wrong sandbox layout".into()),
+                    sandbox: AgentSandboxSelection::Existing(incompatible.canonical_ref),
+                    ..Default::default()
+                },
+            ),
+            Err(Error::Conflict(_))
+        ));
 
         let (_, subscription) = store
             .replace_agent_job_subscription(
@@ -1630,6 +1704,7 @@ mod tests {
             current_project_ref: project_ref.clone(),
             current_agent_ref: Some(root_ref.clone()),
             binding: binding(),
+            auto_sandbox_ref: None,
             request_id: Some("host-task-create-1".into()),
             execution_site: "local".into(),
         };

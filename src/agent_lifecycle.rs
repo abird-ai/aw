@@ -502,6 +502,7 @@ pub struct HostAgentCreator {
     caller: PrincipalId,
     current_agent_ref: String,
     current_project_ref: String,
+    auto_sandbox_ref: String,
     binding: SessionBinding,
     execution_site: String,
     activation: HostAgentActivation,
@@ -518,6 +519,9 @@ impl HostAgentCreator {
     ) -> Result<Self> {
         let current_agent_ref = current_agent_ref.into();
         let current = store.agent_get(&caller, &current_agent_ref)?;
+        let auto_sandbox_ref = current.sandbox_ref.clone().ok_or(Error::Storage(
+            "current Agent is missing its authoritative Sandbox binding",
+        ))?;
         let stable_user = store.current_user(&caller)?;
         let canonical_owner = aw_store::stable_user_principal(&stable_user.user_id)?;
         if activation.actor != canonical_owner {
@@ -538,6 +542,7 @@ impl HostAgentCreator {
             caller,
             current_agent_ref,
             current_project_ref: current.project_ref,
+            auto_sandbox_ref,
             binding,
             execution_site,
             activation,
@@ -551,6 +556,7 @@ impl HostAgentCreator {
                 current_project_ref: self.current_project_ref.clone(),
                 current_agent_ref: Some(self.current_agent_ref.clone()),
                 binding: self.binding.clone(),
+                auto_sandbox_ref: Some(self.auto_sandbox_ref.clone()),
                 request_id: Some(request_id.to_owned()),
                 execution_site: self.execution_site.clone(),
             },

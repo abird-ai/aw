@@ -309,14 +309,36 @@ Explicit `--account` has the same precedence as root prompt dispatch; otherwise 
 profile policy is used. A frame containing an authority-bearing extra field such as `provider` is rejected
 before the create port executes.
 
-This checkpoint still does **not** claim the complete §28.3/§28 host shell. `sandbox=auto` currently means
-the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because that
-later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed trusted
-Project authority. Current-root `agent.close`, stable-child close, native/public current-Project
-`agent.create`, atomic initial-task custody/publication, and post-commit live dispatch are complete. The
-broader §28 shell still needs explicit Sandbox ownership/`auto` policy, reviewed cross-Project redirect
-authority, later staged `agent.inputs.*`, and broader host routing for non-current Agent refs. History
-ancestry still grants none of those authorities.
+Logical Sandbox ownership and Agent binding are now real Phase-1 state rather than an implied execution
+binding. Schema v41 adds one minimal `sandboxes_current` owner whose `sandbox_id` is the canonical
+`/d:/i:/p:/s:` ref itself. It owns only Project identity, immutable logical execution layout
+(`working_directory` + `tool_root` + digest), optional parent ref, `rev`, and `open|closed` lifecycle.
+It does **not** prebuild SourceBindings, SandboxGrant policy, mount/network/device realization, Vault
+rights or Process lifetime. Those remain separate later owners, and frozen dotlink 017 sandbox/mount work
+is untouched.
+
+The v40 -> v41 migration transactionally binds every existing authoritative Agent. Exact Project+layout
+peers share one Sandbox, the first Project layout gets `/s:0`, and distinct mutable layouts never collapse.
+The generic Agent constructor auto-binds only when the v41 table exists, so older v38-v40 migrations remain
+valid; v41 then seeds the historical rows. New constructors after v41 always get a logical Sandbox. Store
+now exposes reusable `sandbox_get`, bounded `sandbox_list`, trusted-layout `sandbox_create_fresh`, and
+idempotent `sandbox_close`; close refuses while any `open|closing` Agent is still bound. Derived
+`sandbox.create(from=...)` remains intentionally unimplemented until the SourceDriver/checkpoint owner can
+preserve required source state correctly.
+
+Agent Sandbox selection is immutable at creation. `HostAgentCreator` captures the current root Agent's
+already-authoritative Sandbox ref as trusted `sandbox=auto` policy. `agent.create` may instead name an
+explicit Sandbox ref, but Store revalidates that it is open, belongs to the **exact destination Project**,
+and has the exact trusted execution layout. The choice is written inside the Agent publication transaction
+without an Agent rev bump and there is still no `agent.sandbox.set`/rebind path. History ancestry never
+selects or grants a Sandbox. Binding the Sandbox grants no new tool/source/network/device authority.
+
+This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current-root `agent.close`,
+stable-child close, native/public current-Project `agent.create`, atomic initial-task custody/publication,
+post-commit live dispatch, and the lower logical Sandbox owner/auto+explicit binding policy are complete.
+The broader shell still needs stdio/host exposure of `sandbox.list/get/create/close`, reviewed cross-Project
+redirect authority, later staged `agent.inputs.*`, and broader host routing for non-current Agent refs.
+History ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -325,17 +347,17 @@ snapshots only where a real consumer needs them, and normalization/rebuild of Ag
 Do not prebuild Phase-2/4 engines.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
-backfill remain green; group access/wake/history fencing remains green. The exact-history owner suite is
-**4/4** after the constructor factoring, Actor admission is **2/2**, and the consolidated host shell
-regression proves fresh create/list/get projection, title CAS, access snapshot, admission hold,
-close-request fencing, non-reopen after closing, and fail-closed initial-task creation without a
-half-published Agent. The existing model `agent(from=...)`/no-`from` replay evidence remains the prior
-published evidence. `cargo check -p aw-store`, strict all-target `aw-store` Clippy and repository fmt are
-green for this cut. A broader `cargo test -p aw-store --lib` sweep reached **222/225**; the three
-failures are older remote-start/remote-view migration fixtures that downgrade an already-current test
-schema to v34/v35 without removing later v38+ tables, then re-run initialization and collide with those
-still-existing tables. They reproduce individually and are outside this Agent-owned cut; they are not
-claimed green or repaired here. The required focused Agent/history/admission regressions remain green.
+backfill remain green; group access/wake/history fencing remains green. The focused **v40 -> v41**
+Sandbox-owner regression is green: same-layout Agents share one migrated Sandbox, distinct layouts remain
+distinct, `/s:0` is seeded for the first Project layout, bound Sandbox close conflicts, and an unbound
+fresh Sandbox closes/idempotently replays. The exact-history owner regression remains green after the
+generic constructor started auto-binding Sandboxes, and Actor admission remains green. The consolidated
+host shell regression now additionally proves trusted `auto` shares the current Sandbox, an explicit
+same-Project/same-layout Sandbox binds exactly, and an incompatible layout is rejected before Agent
+publication. Task-bearing atomic publication/live dispatch remains green. `cargo check -p aw-store -p
+aw-cli --tests`, strict all-target Clippy and repository fmt are green for this cut. A broader historical
+Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
+fixtures remain outside this focused Agent/Sandbox cut.
 The stable-Agent close regression now additionally covers a provider attempt that never completes on
 its own: close preempts the active Turn and reaches factual cancelled child settlement within the test
 bound, while the existing create/continue/idle-close regression remains green. Existing event-source
