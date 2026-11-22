@@ -138,9 +138,10 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       complete without a new lifecycle owner:** trusted host close can cancel the exact active Actor Turn
       through the existing durable Actor Control owner keyed by close revision, and the Store can publish
       `closed` only from `closing` after rechecking that no journaled Turn is active. The Store terminal
-      seam deliberately does not inspect finite Jobs. Still open before the host shell is complete: retain
-      the configured root JobRuntime in native Host and compose Actor Control + `close_owner` + terminal
-      Store transition for root/default close, then live initial `task` dispatch, explicit logical Sandbox
+      seam deliberately does not inspect finite Jobs. Native Host now retains the exact configured root
+      JobRuntime; still open before the host shell is complete is only the orchestration of Actor Control +
+      `close_owner` + terminal Store transition for root/default close, then live initial `task` dispatch,
+      explicit logical Sandbox
       refs/`auto` policy owner, reviewed
       cross-Project redirect authority and staged `agent.inputs.*`. After that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

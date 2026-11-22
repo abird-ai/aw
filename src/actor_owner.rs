@@ -2823,6 +2823,95 @@ impl Service {
         self.control(request_id, ActorControlAction::CancelTurn, message_id)
     }
 
+    /// Trusted host lifecycle cancellation for the exact current Turn.
+    ///
+    /// This is deliberately not a model Tool path and therefore does not
+    /// synthesize a ToolContext or require a jobs_cancel grant. The durable
+    /// Agent close revision supplies the stable host mutation identity; the
+    /// existing Actor Control owner still owns Prepared/Applied/Unknown.
+    pub fn cancel_active_turn_for_agent_close(
+        &self,
+        close_revision: u64,
+    ) -> Result<Option<ActorControlFact>> {
+        if close_revision == 0 {
+            return Err(Error::Denied("invalid Agent close revision"));
+        }
+        let input = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Storage("Actor owner state lock poisoned"))?;
+            if state.poisoned || state.claiming {
+                return Err(Error::Conflict(
+                    "Agent close current-Turn owner requires inspection",
+                ));
+            }
+            if !state.busy {
+                drop(state);
+                if self
+                    .store
+                    .active_turn_for_branch(&self.owner, &self.session, &self.branch)?
+                    .is_some()
+                {
+                    return Err(Error::Conflict(
+                        "Agent has an active journaled Turn without a live cancellation owner",
+                    ));
+                }
+                return Ok(None);
+            }
+            state
+                .input
+                .clone()
+                .ok_or(Error::Conflict("active Agent Turn has no admitted Input"))?
+        };
+
+        let mut hash = Sha256::new();
+        hash.update(b"aw-agent-close-current-turn-v1\0");
+        for part in [
+            self.session.as_bytes(),
+            self.branch.as_bytes(),
+            &self.epoch.get().to_be_bytes(),
+            &close_revision.to_be_bytes(),
+            &input.turn_id.to_be_bytes(),
+            input.request_id.as_bytes(),
+        ] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        let request_id = format!("ac_{:x}", hash.finalize());
+        if let Ok(existing) = self.control_fact(&request_id) {
+            if existing.admission.action != ActorControlAction::CancelTurn
+                || existing.admission.turn_id != input.turn_id
+                || existing.admission.input_request_id != input.request_id
+                || existing.admission.session_id != self.session
+                || existing.admission.branch_id != self.branch
+            {
+                return Err(Error::Denied(
+                    "Agent close Control replay identity changed semantics",
+                ));
+            }
+            return match existing.state {
+                ActorControlState::Applied | ActorControlState::Rejected => Ok(Some(existing)),
+                ActorControlState::Prepared | ActorControlState::Unknown => Err(Error::Conflict(
+                    "Agent close current-Turn cancellation is unresolved; inspect, do not replay",
+                )),
+                ActorControlState::Inspected => Err(Error::Conflict(
+                    "Agent close current-Turn cancellation was inspected and cannot be replayed",
+                )),
+            };
+        }
+
+        let sender = label(self.actor);
+        let message_id = self.store.actor_control_next_message_id(
+            &self.owner,
+            &self.session,
+            self.epoch.get(),
+            &sender,
+        )?;
+        self.control(request_id, ActorControlAction::CancelTurn, message_id)
+            .map(Some)
+    }
+
     /// Typed, strictly owner-originated synchronous Control on an already
     /// active exact Turn. Control facts are immutable audit evidence only.
     /// Prepared is durable BEFORE the Runtime mutation, Applied only after
@@ -7970,6 +8059,55 @@ mod tests {
             .jobs_cancel_turn(&changed, &canonical, 1, Some(revision))
             .is_err());
         assert_eq!(owner.controls().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_agent_close_cancels_exact_active_turn_without_model_control_grant() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let fixture = setup(Some(entered.clone()));
+        fixture
+            .owner
+            .submit(
+                &fixture.agent,
+                "host_close_source",
+                input(&fixture.owner, 1, 1, "close this exact turn"),
+            )
+            .unwrap();
+
+        let run_owner = fixture.owner.clone();
+        let mut agent = fixture.agent;
+        let task = tokio::spawn(async move {
+            run_owner
+                .run_once(&mut agent, |_| Ok(()))
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .expect("provider must enter before host close");
+
+        let control = fixture
+            .owner
+            .cancel_active_turn_for_agent_close(17)
+            .unwrap()
+            .expect("active Turn needs one host close Control");
+        assert_eq!(control.state, ActorControlState::Applied);
+        assert_eq!(control.admission.action, ActorControlAction::CancelTurn);
+        assert_eq!(control.admission.turn_id, 1);
+
+        let turn = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("host close cancellation must settle the active Turn")
+            .unwrap();
+        assert_eq!(turn.id, 1);
+        assert_eq!(turn.outcome, aw_agent_core::Outcome::Cancelled);
+        assert_eq!(fixture.owner.controls().unwrap().len(), 1);
+        assert!(fixture
+            .owner
+            .cancel_active_turn_for_agent_close(17)
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(unix)]

@@ -249,9 +249,9 @@ Applied/Unknown owner, and returns `None` only when both the live owner and dura
 active Turn. `SessionStore::agent_finish_close` is the matching terminal Store seam: it accepts only a
 previously requested `closing` Agent, rechecks under one writer transaction that no journaled Turn is
 running, advances once to `closed`, and is idempotent thereafter. It intentionally knows nothing about
-finite Jobs; the outer host must prove `JobRuntime::close_owner` first. Root/native Host still needs to
-retain the configured `JobRuntime` and orchestrate these three existing owners; that wiring is not yet
-implemented and is not claimed.
+finite Jobs; the outer host must prove `JobRuntime::close_owner` first. Root/native Host now already
+retains the exact configured `Arc<JobRuntime>` through the opt-in runtime-returning construction path;
+what remains is only the actual orchestration of these three existing owners.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
 closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
@@ -261,9 +261,9 @@ trusted Project authority. Full live `agent.close` composition, initial task dis
 binding and later staged `agent.inputs.*` remain open. Stable-child active-Turn cancellation, durable
 recipient-subscription retirement, finite-Job owner-close/quiescence, and stable-child terminal close
 composition are complete. Root/default Actor current-Turn cancellation and terminal Store seams are now
-complete too; retaining the configured root `JobRuntime` and composing Actor Control + finite work +
-terminal Store transition in native Host is still pending. History ancestry still grants none of those
-authorities.
+complete too; the configured root `JobRuntime` is retained by native Host, while composing Actor Control
++ finite work + terminal Store transition there is still pending. History ancestry still grants none of
+those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative

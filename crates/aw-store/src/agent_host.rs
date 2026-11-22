@@ -756,6 +756,65 @@ impl SessionStore {
         snapshot_in(&connection, actor, canonical_ref)
     }
 
+    /// Lower terminal-close seam for the live host.
+    ///
+    /// The caller must already have driven every non-Store factual owner
+    /// (finite Jobs, Processes, etc.) to terminal/quiescent state. This
+    /// transaction owns only the authoritative Agent/Turn boundary: it refuses
+    /// to publish `closed` while a journaled Turn is still running.
+    pub fn agent_finish_close(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+    ) -> Result<AgentSnapshot> {
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (session, branch) = key_for_ref_in(&tx, canonical_ref)?;
+        let agent = agent_owner::AgentKey::new(&session, &branch);
+        agent_owner::authorize_permission(&tx, actor, agent, AgentPermission::Control)?;
+        let (lifecycle, _) = agent_owner::lifecycle(&tx, agent)?;
+        if lifecycle == "closed" {
+            db(tx.commit())?;
+            return snapshot_in(&connection, actor, canonical_ref);
+        }
+        if lifecycle != "closing" {
+            return Err(Error::Conflict(
+                "Agent terminal close requires an existing close request",
+            ));
+        }
+        let active: bool = db(tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM branches b
+                JOIN runs r ON r.id=b.active_run
+                WHERE b.session_id=?1 AND b.id=?2
+                  AND r.session_id=?1 AND r.branch_id=?2
+                  AND r.status='running'
+             )",
+            params![session, branch],
+            |row| row.get(0),
+        ))?;
+        if active {
+            return Err(Error::Conflict("Agent still has an active journaled Turn"));
+        }
+        let before = agent_owner::revision(&tx, agent)?;
+        if !agent_owner::close(&tx, agent)? {
+            return Err(Error::Conflict("Agent terminal close did not apply"));
+        }
+        audit(
+            &tx,
+            &session,
+            actor,
+            "agent.closed",
+            serde_json::json!({
+                "branch_id":branch,
+                "rev":before.saturating_add(1),
+            }),
+        )?;
+        db(tx.commit())?;
+        snapshot_in(&connection, actor, canonical_ref)
+    }
+
     pub fn agent_access_list_ref(
         &self,
         actor: &PrincipalId,
@@ -900,6 +959,10 @@ mod tests {
             .unwrap();
         assert_eq!(access.rev, held.rev);
         assert!(access.caller_permissions.manage);
+        assert!(matches!(
+            store.agent_finish_close(&actor, &created.canonical_ref),
+            Err(Error::Conflict(_))
+        ));
 
         let closing = store
             .agent_request_close(&actor, &created.canonical_ref, Some(held.rev))
@@ -937,6 +1000,17 @@ mod tests {
             ),
             Err(Error::Conflict(_))
         ));
+        let closed = store
+            .agent_finish_close(&actor, &created.canonical_ref)
+            .unwrap();
+        assert_eq!(closed.lifecycle, AgentLifecycle::Closed);
+        assert_eq!(closed.admission, AgentAdmission::Held);
+        assert!(closed.rev > closing.rev);
+        let replay = store
+            .agent_finish_close(&actor, &created.canonical_ref)
+            .unwrap();
+        assert_eq!(replay.rev, closed.rev);
+        assert_eq!(replay.lifecycle, AgentLifecycle::Closed);
 
         let failed = store.agent_create(
             &actor,
