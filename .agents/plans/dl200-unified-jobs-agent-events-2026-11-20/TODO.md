@@ -142,8 +142,12 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       native Host retains one `RootAgentClose` that composes durable close request + pending queue retirement,
       exact pre-claim withdrawal/active-Turn Control, retained JobRuntime `close_owner`, factual Turn
       quiescence, terminal Store close and live-router retirement. Stdio exposes the same current-root owner
-      concurrently as `agent_close(ref="."|canonical, rev?)` with no authority-bearing fields. Still open
-      before the host shell is complete: live initial `task` dispatch, explicit logical Sandbox refs/`auto`
+      concurrently as `agent_close(ref="."|canonical, rev?)` with no authority-bearing fields. **Taskless
+      host-created Agent activation is now reusable too:** `HostAgentActivation` reconstructs only an
+      already-published Agent into the normal Actor/Router/JobRuntime worker, and stable + host-created
+      workers share one live-control/wake primitive. This is reconstructible post-commit runtime state,
+      not another publication path. Still open before the host shell is complete: prepared/atomic initial
+      `task` custody+dispatch, explicit logical Sandbox refs/`auto`
       policy owner, reviewed
       cross-Project redirect authority and staged `agent.inputs.*`. After that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

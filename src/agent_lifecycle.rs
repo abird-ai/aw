@@ -5,10 +5,17 @@
 //! work remains in `JobRuntime`, and live routing remains in `agent_jobs`.
 
 use crate::{actor_owner, agent_jobs, Error, PrincipalId, Result};
-use aw_agent_core::InvocationScope;
+use aw_agent_core::{
+    Agent, AgentExecutionBinding, AgentOptions, CancellationToken, InvocationScope,
+    ProviderSelection, ToolEffect,
+};
 use aw_store::{AgentLifecycle, AgentSnapshot, QueueState, SessionStore};
 use aw_store_api::SessionBackend;
-use std::sync::Arc;
+use aw_tools::execution_ref::ExecutionRef;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 
 #[derive(Clone)]
 pub struct RootAgentClose {
@@ -128,19 +135,382 @@ impl RootAgentClose {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum LiveAgentCommand {
+    Wake,
+    Close,
+}
+
+pub struct LiveAgentControl {
+    closing: AtomicBool,
+    close_queued: AtomicBool,
+    active_cancel: Mutex<Option<CancellationToken>>,
+}
+
+impl LiveAgentControl {
+    pub fn new() -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            close_queued: AtomicBool::new(false),
+            active_cancel: Mutex::new(None),
+        }
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn begin_turn(self: &Arc<Self>, token: CancellationToken) -> Result<LiveAgentTurnGuard> {
+        let mut active = self
+            .active_cancel
+            .lock()
+            .map_err(|_| Error::Storage("live Agent cancellation state poisoned"))?;
+        if active.is_some() {
+            return Err(Error::Conflict(
+                "live Agent cannot run more than one Turn at once",
+            ));
+        }
+        *active = Some(token.clone());
+        if self.is_closing() {
+            token.cancel();
+        }
+        Ok(LiveAgentTurnGuard {
+            control: self.clone(),
+        })
+    }
+
+    pub fn request_close(&self) -> Result<bool> {
+        self.closing.store(true, Ordering::Release);
+        if let Some(token) = self
+            .active_cancel
+            .lock()
+            .map_err(|_| Error::Storage("live Agent cancellation state poisoned"))?
+            .as_ref()
+        {
+            token.cancel();
+        }
+        Ok(!self.close_queued.swap(true, Ordering::AcqRel))
+    }
+
+    pub fn finish_close_attempt(&self) {
+        self.close_queued.store(false, Ordering::Release);
+    }
+}
+
+impl Default for LiveAgentControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct LiveAgentTurnGuard {
+    control: Arc<LiveAgentControl>,
+}
+
+impl Drop for LiveAgentTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.control.active_cancel.lock() {
+            *active = None;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LiveAgentWakeHandle {
+    sender: mpsc::Sender<LiveAgentCommand>,
+    control: Arc<LiveAgentControl>,
+}
+
+impl agent_jobs::LiveAgentWake for LiveAgentWakeHandle {
+    fn wake(&self) -> Result<()> {
+        if self.control.is_closing() {
+            return Err(Error::Conflict(
+                "Agent is closing and accepts no future input",
+            ));
+        }
+        self.sender
+            .send(LiveAgentCommand::Wake)
+            .map_err(|_| Error::Conflict("live Agent worker is unavailable"))
+    }
+
+    fn close(&self) -> Result<()> {
+        if self.control.request_close()? && self.sender.send(LiveAgentCommand::Close).is_err() {
+            self.control.finish_close_attempt();
+            return Err(Error::Conflict("live Agent worker is unavailable"));
+        }
+        Ok(())
+    }
+
+    fn is_closing(&self) -> bool {
+        self.control.is_closing()
+    }
+}
+
+pub fn live_agent_channel() -> (
+    LiveAgentWakeHandle,
+    mpsc::Receiver<LiveAgentCommand>,
+    Arc<LiveAgentControl>,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let control = Arc::new(LiveAgentControl::new());
+    (
+        LiveAgentWakeHandle {
+            sender,
+            control: control.clone(),
+        },
+        receiver,
+        control,
+    )
+}
+
+#[derive(Clone)]
+pub struct ActivatedHostAgent {
+    canonical_ref: String,
+    wake: LiveAgentWakeHandle,
+}
+
+impl ActivatedHostAgent {
+    pub fn canonical_ref(&self) -> &str {
+        &self.canonical_ref
+    }
+
+    pub fn close(&self) -> Result<()> {
+        agent_jobs::LiveAgentWake::close(&self.wake)
+    }
+}
+
+/// Reconstructible post-publication runtime activation for a host-created Agent.
+///
+/// This deliberately accepts only an already-published canonical Agent root.
+/// It does not construct or publish Agents and therefore cannot bypass the
+/// prepared-publication requirements for task-bearing agent.create.
+#[derive(Clone)]
+pub struct HostAgentActivation {
+    store: SessionStore,
+    actor: PrincipalId,
+    selection: ProviderSelection,
+    options: AgentOptions,
+    tools: aw_tools_adapter::LocalToolOptions,
+    router: Arc<agent_jobs::Router>,
+}
+
+impl HostAgentActivation {
+    pub fn new(
+        store: SessionStore,
+        actor: PrincipalId,
+        selection: ProviderSelection,
+        options: AgentOptions,
+        tools: aw_tools_adapter::LocalToolOptions,
+        router: Arc<agent_jobs::Router>,
+    ) -> Result<Self> {
+        if options.profile != selection.identity().account_id
+            || options.model != selection.identity().model
+        {
+            return Err(Error::Denied(
+                "host Agent options must match the trusted provider selection",
+            ));
+        }
+        Ok(Self {
+            store,
+            actor,
+            selection,
+            options,
+            tools,
+            router,
+        })
+    }
+
+    fn binding_for(&self, canonical_ref: &str) -> Result<aw_store_api::AgentBindingInfo> {
+        let parsed = ExecutionRef::parse(canonical_ref)
+            .map_err(|_| Error::Denied("invalid canonical Agent ref"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "host Agent activation requires an Agent root ref",
+            ));
+        }
+        let agent = resolved.agent_ref();
+        self.store.agent_binding_by_handles(
+            &self.actor,
+            agent.domain.as_str(),
+            agent.identity.as_str(),
+            agent.project.as_str(),
+            agent.agent.as_str(),
+        )
+    }
+
+    pub fn activate(&self, canonical_ref: &str) -> Result<ActivatedHostAgent> {
+        let binding = self.binding_for(canonical_ref)?;
+        let session = self.store.session(&self.actor, &binding.session_id)?;
+
+        let mut options = self.options.clone();
+        options.system_prompt = session.binding.system_prompt.clone();
+        let mut tools = self.tools.clone();
+        tools.root = session.binding.tool_root.clone();
+        tools.agent_jobs.replace(self.router.clone())?;
+        tools.allow_wake = true;
+        if self.selection.supports_tools()
+            && !tools
+                .selected_tools
+                .iter()
+                .any(|name| name == "jobs_subscribe")
+            && (tools.mode == aw_tools_adapter::ToolMode::Off || !tools.selected_tools.is_empty())
+        {
+            tools.selected_tools.push("jobs_subscribe".into());
+        }
+
+        let builder = Agent::builder_from_selection(self.selection.clone(), options);
+        let configured =
+            aw_tools_adapter::configure_with_runtime(builder, self.actor.clone(), &tools)?;
+        let job_runtime = configured.job_runtime;
+        let mut agent = configured.builder.build()?;
+        let (view, journal) =
+            self.store
+                .activate(&self.actor, &binding.session_id, &binding.branch_id)?;
+        agent.load_history(view.history, Some(Arc::new(journal)))?;
+        agent.bind_execution_owner(AgentExecutionBinding::from_trusted_host(
+            canonical_ref.to_owned(),
+            binding.session_id.clone(),
+            binding.branch_id.clone(),
+        )?)?;
+        agent.permit_host_capability(self.actor.clone(), "jobs_subscribe", &ToolEffect::Control)?;
+
+        let owner = actor_owner::Service::attach_for_agent(
+            self.store.clone(),
+            &binding.session_id,
+            &binding.branch_id,
+            &agent,
+        )?;
+        let close = Arc::new(RootAgentClose::new(
+            self.store.clone(),
+            self.actor.clone(),
+            canonical_ref.to_owned(),
+            owner.clone(),
+            job_runtime,
+            self.router.clone(),
+        )?);
+        let (wake, receiver, control) = live_agent_channel();
+        let registered_wake: Arc<dyn agent_jobs::LiveAgentWake> = Arc::new(wake.clone());
+        self.router.register_live_owner_with_wake(
+            canonical_ref,
+            owner.clone(),
+            Some(registered_wake),
+            agent.tool_binding_authority(),
+        )?;
+
+        let canonical = canonical_ref.to_owned();
+        let router = self.router.clone();
+        let selection = self.selection.clone();
+        let agent_handle = binding.agent_handle;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let spawn = std::thread::Builder::new()
+            .name(format!(
+                "aw-host-agent-{}",
+                agent_handle.chars().rev().take(8).collect::<String>()
+            ))
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .max_blocking_threads(4)
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                        let _ = router.clear_live_owner(&canonical);
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(())).is_err() {
+                    let _ = router.clear_live_owner(&canonical);
+                    return;
+                }
+                loop {
+                    match receiver.recv() {
+                        Ok(LiveAgentCommand::Wake) => {
+                            if control.is_closing() {
+                                continue;
+                            }
+                            if !matches!(owner.admit_next_queued(&agent), Ok(Some(_))) {
+                                continue;
+                            }
+                            let token = CancellationToken::new();
+                            let guard = match control.begin_turn(token.clone()) {
+                                Ok(guard) => guard,
+                                Err(_) => continue,
+                            };
+                            let _ = runtime.block_on(owner.run_once_selected_with_cancel(
+                                &mut agent,
+                                &selection,
+                                token,
+                                |_| Ok(()),
+                            ));
+                            drop(guard);
+                            let _ = runtime.block_on(
+                                aw_tools_adapter::agent_jobs::AgentJobRouter::deliver_source_events(
+                                    router.as_ref(),
+                                    &canonical,
+                                ),
+                            );
+                        }
+                        Ok(LiveAgentCommand::Close) => {
+                            let result = runtime.block_on(close.close(None));
+                            if result.is_ok() {
+                                break;
+                            }
+                            control.finish_close_attempt();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        if let Err(error) = spawn {
+            let _ = self.router.clear_live_owner(canonical_ref);
+            return Err(Error::Io(error));
+        }
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(ActivatedHostAgent {
+                canonical_ref: canonical_ref.to_owned(),
+                wake,
+            }),
+            Ok(Err(detail)) => Err(Error::StorageDetail(detail)),
+            Err(_) => Err(Error::Storage(
+                "host Agent worker ended before runtime readiness",
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Agent, AgentExecutionBinding, AgentOptions};
+    use crate::{AccountDescriptor, Agent, AgentExecutionBinding, AgentOptions};
     use aw_agent_core::{
         provider::{CompletionFuture, DeltaSink, Provider},
         Message,
     };
-    use aw_store::SessionBinding as StoredSessionBinding;
+    use aw_store::{
+        AgentCreateContext, AgentCreateRequest, SessionBinding as StoredSessionBinding,
+    };
     use std::path::PathBuf;
 
     struct BlockingProvider {
         entered: Arc<tokio::sync::Notify>,
+    }
+
+    struct UnusedProvider;
+
+    impl Provider for UnusedProvider {
+        fn stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _model: &'a str,
+            _sink: &'a mut DeltaSink<'_>,
+        ) -> CompletionFuture<'a> {
+            Box::pin(async move { Err(Error::Denied("unused provider must not run")) })
+        }
     }
 
     impl Provider for BlockingProvider {
@@ -279,5 +649,96 @@ mod tests {
         let replay = close.close(None).await.unwrap();
         assert_eq!(replay.lifecycle, AgentLifecycle::Closed);
         assert_eq!(replay.rev, closed.rev);
+    }
+
+    #[tokio::test]
+    async fn taskless_host_agent_activation_reconstructs_live_worker_and_closes_factually() {
+        let actor = PrincipalId::new("internal:fixture:host-activation").unwrap();
+        let store = SessionStore::in_memory().unwrap();
+        let binding = StoredSessionBinding {
+            working_directory: std::env::temp_dir(),
+            tool_root: std::env::temp_dir(),
+            system_prompt: "system".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "model".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let (root, root_branch) = store.create(&actor, "root", binding.clone()).unwrap();
+        let root_binding = store
+            .agent_binding(&actor, &root.id, &root_branch.id)
+            .unwrap();
+        let root_ref = format!(
+            "/d:{}/i:{}/p:{}/a:{}",
+            root_binding.domain_handle,
+            root_binding.identity_handle,
+            root_binding.project_handle,
+            root_binding.agent_handle
+        );
+        let project_ref = format!(
+            "/d:{}/i:{}/p:{}",
+            root_binding.domain_handle, root_binding.identity_handle, root_binding.project_handle
+        );
+        let child_owner =
+            aw_store::stable_user_principal(&store.current_user(&actor).unwrap().user_id).unwrap();
+        let created = store
+            .agent_create(
+                &actor,
+                &AgentCreateContext {
+                    current_project_ref: project_ref,
+                    current_agent_ref: Some(root_ref),
+                    binding,
+                },
+                AgentCreateRequest {
+                    title: Some("activated child".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let seed = Agent::builder(
+            Arc::new(UnusedProvider),
+            AgentOptions::new("fixture", "model"),
+        )
+        .account(
+            AccountDescriptor::personal("fixture", child_owner.clone(), "local", ["model".into()]),
+            child_owner.clone(),
+            "local",
+        )
+        .build()
+        .unwrap();
+        let selection = seed
+            .provider_accounts()
+            .select(&child_owner, "fixture", "model")
+            .unwrap();
+        let router =
+            Arc::new(agent_jobs::Router::new(store.clone(), child_owner.clone(), 8).unwrap());
+        let activation = HostAgentActivation::new(
+            store.clone(),
+            child_owner.clone(),
+            selection,
+            AgentOptions::new("fixture", "model"),
+            aw_tools_adapter::LocalToolOptions::new(
+                std::env::temp_dir(),
+                aw_tools_adapter::ToolMode::Off,
+            ),
+            router,
+        )
+        .unwrap();
+        let live = activation.activate(&created.canonical_ref).unwrap();
+        assert_eq!(live.canonical_ref(), created.canonical_ref);
+        live.close().unwrap();
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = store.agent_get(&actor, &created.canonical_ref).unwrap();
+                if snapshot.lifecycle == AgentLifecycle::Closed {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("activated host Agent close must reach authoritative terminal state");
+        assert_eq!(closed.admission, aw_store::AgentAdmission::Held);
     }
 }

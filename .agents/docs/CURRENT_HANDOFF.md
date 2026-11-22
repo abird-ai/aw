@@ -255,8 +255,20 @@ transport-neutral `RootAgentClose` composes the existing owners in order: durabl
 queue retirement, exact current-Turn cancel/withdrawal, finite-work close, factual Turn quiescence,
 terminal Store close, then live-router retirement. It owns no second lifecycle state.
 
-This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
-closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
+Taskless host-created Agents now have the missing reconstructible live-runtime activation path without
+changing publication semantics. `HostAgentActivation` accepts only an already-published canonical Agent
+root, derives the authoritative child Session owner/binding/history, rebuilds the exact trusted provider
+selection + tool envelope, registers the normal Actor owner/Router wake, and starts one long-lived worker
+for future queued Turns. Activation returns a bounded `ActivatedHostAgent` handle and is post-publication
+cache/runtime state only; it cannot construct an Agent or bypass Store authority. The wake/close/current-
+Turn cancellation primitive is now shared with stable model-created Agents through one reusable
+`LiveAgentControl` / `LiveAgentWakeHandle` / `live_agent_channel` implementation rather than parallel
+copies.
+
+This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation continues to
+fail closed before publication because the sealed spec requires the optional initial task to enter child
+input/runtime custody atomically with the public Agent commit; post-publication activation is not used as
+a shortcut around that invariant. `sandbox=auto` currently
 means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
 that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
 trusted Project authority. Current-root `agent.close` composition is now complete: native Host retains
@@ -302,7 +314,10 @@ it as Cancelled. The host-shell regression proves terminal close is rejected bef
 advances `closing -> closed` once, and replays idempotently. A single root lifecycle regression now drives
 a blocked tool-capable root Turn through `RootAgentClose`, including retained JobRuntime closure and
 revision-stable replay. The existing headless strict-frame regression remains green with the new live
-`agent_close` capability.
+`agent_close` capability. A focused host-activation regression now creates a taskless Agent through the
+real Store constructor, derives its canonical destination owner, reconstructs the live runtime, and
+closes it through the normal wake/worker path to authoritative `closed`; both existing stable-Agent close
+regressions remain green after sharing the live-control primitive.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

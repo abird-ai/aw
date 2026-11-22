@@ -1,6 +1,8 @@
 use aw::{
-    config::Settings, Agent, AgentOptions, CancellationToken, Error, LocalToolConcurrency,
-    LocalToolLimits, LocalToolOptions, Result, ToolMode,
+    agent_lifecycle::{live_agent_channel, LiveAgentCommand, LiveAgentControl},
+    config::Settings,
+    Agent, AgentOptions, CancellationToken, Error, LocalToolConcurrency, LocalToolLimits,
+    LocalToolOptions, Result, ToolMode,
 };
 use aw_agent_core::{
     AgentExecutionBinding, AuxiliaryInput, AuxiliaryKind, ExecutionOwnershipLease,
@@ -43,7 +45,7 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -1641,114 +1643,6 @@ impl DelegateAgentPort for PolicyDelegatePort {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum LiveAgentCommand {
-    Wake,
-    Close,
-}
-
-#[derive(Clone)]
-struct LiveAgentWakeHandle {
-    sender: mpsc::Sender<LiveAgentCommand>,
-    control: Arc<LiveAgentControl>,
-}
-
-struct LiveAgentControl {
-    closing: AtomicBool,
-    close_queued: AtomicBool,
-    active_cancel: Mutex<Option<CancellationToken>>,
-}
-
-impl LiveAgentControl {
-    fn new() -> Self {
-        Self {
-            closing: AtomicBool::new(false),
-            close_queued: AtomicBool::new(false),
-            active_cancel: Mutex::new(None),
-        }
-    }
-
-    fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::Acquire)
-    }
-
-    fn begin_turn(self: &Arc<Self>, cancellation: CancellationToken) -> Result<LiveAgentTurnGuard> {
-        let mut active = self
-            .active_cancel
-            .lock()
-            .map_err(|_| Error::Storage("stable Agent cancellation state poisoned"))?;
-        if active.is_some() {
-            return Err(Error::Conflict(
-                "stable Agent cannot run more than one Turn at once",
-            ));
-        }
-        *active = Some(cancellation.clone());
-        if self.is_closing() {
-            cancellation.cancel();
-        }
-        Ok(LiveAgentTurnGuard {
-            control: self.clone(),
-        })
-    }
-
-    fn request_close(&self) -> Result<bool> {
-        self.closing.store(true, Ordering::Release);
-        if let Some(cancellation) = self
-            .active_cancel
-            .lock()
-            .map_err(|_| Error::Storage("stable Agent cancellation state poisoned"))?
-            .as_ref()
-        {
-            cancellation.cancel();
-        }
-        Ok(!self.close_queued.swap(true, Ordering::AcqRel))
-    }
-
-    fn finish_close_attempt(&self) {
-        self.close_queued.store(false, Ordering::Release);
-    }
-
-    fn finish_turn(&self) {
-        if let Ok(mut active) = self.active_cancel.lock() {
-            *active = None;
-        }
-    }
-}
-
-struct LiveAgentTurnGuard {
-    control: Arc<LiveAgentControl>,
-}
-
-impl Drop for LiveAgentTurnGuard {
-    fn drop(&mut self) {
-        self.control.finish_turn();
-    }
-}
-impl aw::agent_jobs::LiveAgentWake for LiveAgentWakeHandle {
-    fn wake(&self) -> Result<()> {
-        if self.control.is_closing() {
-            return Err(Error::Conflict(
-                "Agent is closing and accepts no future input",
-            ));
-        }
-        self.sender
-            .send(LiveAgentCommand::Wake)
-            .map_err(|_| Error::Conflict("live Agent worker is unavailable"))
-    }
-
-    fn close(&self) -> Result<()> {
-        if self.control.request_close()? && self.sender.send(LiveAgentCommand::Close).is_err() {
-            self.control.finish_close_attempt();
-            return Err(Error::Conflict("live Agent worker is unavailable"));
-        }
-        Ok(())
-    }
-
-    fn is_closing(&self) -> bool {
-        self.control.is_closing()
-    }
-}
-
 struct ActiveBackground {
     counter: Arc<Inner>,
 }
@@ -3112,12 +3006,8 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             &prepared.agent,
         )?;
         let router = self.agent_jobs_router()?;
-        let (sender, receiver) = mpsc::channel();
-        let control = Arc::new(LiveAgentControl::new());
-        let wake: Arc<dyn aw::agent_jobs::LiveAgentWake> = Arc::new(LiveAgentWakeHandle {
-            sender,
-            control: control.clone(),
-        });
+        let (wake_handle, receiver, control) = live_agent_channel();
+        let wake: Arc<dyn aw::agent_jobs::LiveAgentWake> = Arc::new(wake_handle);
         let canonical_ref = binding.canonical_ref().to_owned();
         router.register_live_owner_with_wake(
             &canonical_ref,
@@ -3747,7 +3637,7 @@ mod tests {
     use std::{
         path::PathBuf,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Mutex,
         },
         time::Duration,
