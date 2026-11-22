@@ -174,8 +174,16 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       the existing Store owner, then signal their existing live close controller; host-created and delegated
       runtimes retain their separate factual settlement owners. Already-closed replay is authorized and
       idempotent; a post-request controller race remains inspectable `closing` rather than fake success.
-      Still open in Phase 1: reviewed cross-Project redirect authority, staged `agent.inputs.*`, provenance
-      propagation and only consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
+      **Cross-Project host `agent.create` redirect is now implemented for the native/public trust model:**
+      destination `i:` must equal the authenticated stable user, active destination Domain membership and
+      current Workspace writer are revalidated before preparation and final publication, history redirect
+      additionally requires source `share` plus `derive`, and the shared lower history constructor validates
+      the destination owner/audience disclosure closure. Redirected create requires an explicit open Sandbox
+      in the destination Project; `auto` fails until Phase-3 materialization can truthfully create/derive one.
+      Task-bearing redirected create reuses the existing Project+Sandbox fingerprinted Prepared receipt and
+      stable-principal activation path. Raw `project=` never impersonates another principal. Still open in
+      Phase 1: staged `agent.inputs.*`, provenance propagation and only consumer-required projections.
+      Public fresh/derived `sandbox.create` remains Phase-3 work
       with SourceDriver/checkpoint semantics. After that
       propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

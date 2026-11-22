@@ -873,6 +873,30 @@ pub(crate) fn preflight_canonical_history_source_in(
     resolve_canonical_history_source_in(connection, actor, reference).map(|_| ())
 }
 
+pub(crate) fn authorize_canonical_history_share_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    reference: &str,
+) -> Result<()> {
+    let parsed = ExecutionRef::parse(reference)
+        .map_err(|_| Error::Denied("invalid exact-history source ref"))?;
+    if !parsed.is_canonical() {
+        return Err(Error::Denied("history source ref must be canonical"));
+    }
+    let resolved = parsed
+        .resolve(None, None)
+        .map_err(|_| Error::Denied("invalid canonical history source ref"))?;
+    let agent_ref = resolved.agent_ref().canonical();
+    let (session, branch) = agent_owner::key_for_ref(connection, &agent_ref)?;
+    agent_owner::authorize_permission(
+        connection,
+        actor,
+        agent_owner::AgentKey::new(&session, &branch),
+        agent_owner::AgentPermission::Share,
+    )
+    .map(|_| ())
+}
+
 fn manifest_authority_roots(
     connection: &Connection,
     manifest: &str,
@@ -1302,33 +1326,26 @@ fn attach_resolved_history_to_destination_in(
     access: AgentHistoryForkAccess,
 ) -> Result<()> {
     let source_agent = agent_owner::AgentKey::new(&source.session_id, &source.branch_id);
-    let (owner_kind, owner_handle, source_workspace): (String, String, Option<String>) =
-        db(connection.query_row(
-            "SELECT a.owner_kind,a.owner_handle,s.workspace_id
-             FROM agent_state_current a JOIN sessions s ON s.id=a.session_id
-             WHERE a.session_id=?1 AND a.branch_id=?2",
-            params![source.session_id, source.branch_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ))?;
+    let (owner_kind, _owner_handle): (String, String) = db(connection.query_row(
+        "SELECT owner_kind,owner_handle
+         FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+        params![source.session_id, source.branch_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
     if owner_kind != "user" {
         return Err(Error::Denied(
             "exact-history constructor currently requires a user-owned source Project",
         ));
     }
-    let source_workspace = source_workspace.ok_or(Error::Storage(
-        "source Agent is missing its authoritative Project binding",
+    let (destination_owner_kind, destination_owner): (String, String) = db(connection.query_row(
+        "SELECT owner_kind,owner_handle
+             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+        params![destination_session, destination_branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     ))?;
-    let (destination_owner, destination_workspace): (Option<String>, Option<String>) =
-        db(connection.query_row(
-            "SELECT owner_user_id,workspace_id FROM sessions WHERE id=?1",
-            [destination_session],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ))?;
-    if destination_owner.as_deref() != Some(owner_handle.as_str())
-        || destination_workspace.as_deref() != Some(source_workspace.as_str())
-    {
+    if destination_owner_kind != "user" {
         return Err(Error::Denied(
-            "exact-history destination must keep the source Project owner and Project",
+            "exact-history destination currently requires a user-owned Project",
         ));
     }
 
@@ -1336,7 +1353,7 @@ fn attach_resolved_history_to_destination_in(
         AgentHistoryForkAccess::Private => Vec::new(),
         AgentHistoryForkAccess::Inherit => direct_acl_rows(connection, source_agent)?,
     };
-    let mut audience = BTreeSet::from([("user".to_owned(), owner_handle)]);
+    let mut audience = BTreeSet::from([("user".to_owned(), destination_owner)]);
     for (kind, handle, permissions) in &inherited_acl {
         if permissions.view {
             audience.insert((kind.clone(), handle.clone()));
@@ -1488,6 +1505,59 @@ pub(crate) fn create_agent_from_history_ref_in(
     )
 }
 
+fn create_agent_from_resolved_history_with_ids_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source: &ResolvedHistorySource,
+    title: &str,
+    binding: &SessionBinding,
+    access: AgentHistoryForkAccess,
+    destination_owner: &PrincipalId,
+    destination_workspace: &str,
+    ids: resources::SessionCandidateIds,
+) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+    let (source_owner, source_workspace): (String, Option<String>) = db(connection.query_row(
+        "SELECT owner_user_id,workspace_id FROM sessions WHERE id=?1",
+        [&source.session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    let source_workspace = source_workspace.ok_or(Error::Storage(
+        "source Agent is missing its authoritative Project binding",
+    ))?;
+    let destination_user = user_for_principal(connection, destination_owner)?.ok_or(
+        Error::Denied("destination Agent owner identity is inactive"),
+    )?;
+    if source_owner != destination_user || source_workspace != destination_workspace {
+        agent_owner::authorize_permission(
+            connection,
+            actor,
+            agent_owner::AgentKey::new(&source.session_id, &source.branch_id),
+            agent_owner::AgentPermission::Share,
+        )?;
+    }
+    let (destination_session, destination_branch) = resources::create_in_workspace_with_ids_tx(
+        connection,
+        destination_owner,
+        title,
+        binding,
+        destination_workspace,
+        None,
+        ids,
+    )?;
+    attach_resolved_history_to_destination_in(
+        connection,
+        actor,
+        source,
+        &destination_session.id,
+        &destination_branch.id,
+        access,
+    )?;
+    Ok((
+        session_in(connection, &destination_session.id)?,
+        branch_in(connection, &destination_session.id, &destination_branch.id)?,
+    ))
+}
+
 pub(crate) fn create_agent_from_history_ref_with_ids_in(
     connection: &Connection,
     actor: &PrincipalId,
@@ -1517,34 +1587,75 @@ pub(crate) fn create_agent_from_history_ref_with_ids_in(
         "source Agent is missing its authoritative Project binding",
     ))?;
     let destination_owner = stable_user_principal(&owner_handle)?;
-    let (destination_session, destination_branch) = resources::create_in_workspace_with_ids_tx(
-        connection,
-        &destination_owner,
-        title,
-        binding,
-        &workspace,
-        None,
-        ids,
-    )?;
-    attach_resolved_history_to_destination_in(
+    create_agent_from_resolved_history_with_ids_in(
         connection,
         actor,
         &source,
-        &destination_session.id,
-        &destination_branch.id,
+        title,
+        binding,
         access,
-    )?;
-    Ok((
-        session_in(connection, &destination_session.id)?,
-        branch_in(connection, &destination_session.id, &destination_branch.id)?,
-    ))
+        &destination_owner,
+        &workspace,
+        ids,
+    )
+}
+
+pub(crate) fn create_agent_from_history_ref_in_project(
+    connection: &Connection,
+    actor: &PrincipalId,
+    canonical_source: &str,
+    title: &str,
+    binding: &SessionBinding,
+    access: AgentHistoryForkAccess,
+    destination_owner: &PrincipalId,
+    destination_workspace: &str,
+) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+    create_agent_from_history_ref_with_ids_in_project(
+        connection,
+        actor,
+        canonical_source,
+        title,
+        binding,
+        access,
+        destination_owner,
+        destination_workspace,
+        resources::mint_session_candidate_ids()?,
+    )
+}
+
+pub(crate) fn create_agent_from_history_ref_with_ids_in_project(
+    connection: &Connection,
+    actor: &PrincipalId,
+    canonical_source: &str,
+    title: &str,
+    binding: &SessionBinding,
+    access: AgentHistoryForkAccess,
+    destination_owner: &PrincipalId,
+    destination_workspace: &str,
+    ids: resources::SessionCandidateIds,
+) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+    crate::label(title, 160)?;
+    crate::validate_binding(binding)?;
+    let source = resolve_canonical_history_source_in(connection, actor, canonical_source)?;
+    create_agent_from_resolved_history_with_ids_in(
+        connection,
+        actor,
+        &source,
+        title,
+        binding,
+        access,
+        destination_owner,
+        destination_workspace,
+        ids,
+    )
 }
 
 impl SessionStore {
     /// Trusted lower constructor for a structurally shared exact-history Agent.
     /// History ancestry is independent from execution/Sandbox ancestry: callers
-    /// supply the destination binding explicitly. The destination remains in the
-    /// source Project and uses that Project's current user owner in this cut.
+    /// supply the destination binding explicitly. This convenience API preserves
+    /// the source Project/owner default; host redirect uses the same lower core
+    /// with an explicit authorized destination.
     pub fn create_agent_from_history_ref(
         &self,
         actor: &PrincipalId,

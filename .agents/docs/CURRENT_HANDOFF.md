@@ -361,13 +361,31 @@ Host-created workers replay through `RootAgentClose`; delegated workers use thei
 after the durable request surfaces explicit conflict and leaves inspectable `closing` state rather than
 fabricating terminal success. Already-closed replay still reauthorizes `control` and is idempotent.
 
+Cross-Project host `agent.create` redirect is now implemented for the current native/public trust model.
+The destination Project is reauthorized before preparation claim, at preparation commit, and at final
+publication. Its `i:` principal must be the authenticated caller's canonical stable user (raw `project=`
+can never impersonate another principal), that user must have active destination Domain membership, and
+the destination Workspace must have the current writer. Fresh and exact-history construction use the same
+existing Agent publication owners. Redirected history requires source `share` in addition to `derive`;
+the lower destination-aware history core rechecks that invariant in the final transaction and validates
+the destination owner plus inherited/custom audience against the existing disclosure manifest closure.
+Same-Project model/history constructors retain their old source-Project default unchanged.
+
+Because truthful Sandbox materialization is intentionally Phase 3, any destination Project different from
+the current host Project requires an **explicit open Sandbox in that destination Project**. `sandbox=auto`
+redirect fails with conflict rather than pretending the current Sandbox is portable or creating another
+logical ID over the same mutable environment. The existing task-bearing Prepared receipt already
+fingerprints Project + Sandbox, so redirected task create/replay needs no second replay owner. Native host
+activation continues under the same stable user principal and therefore needs no identity rewrite.
+
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
-`agent.close`, stable-child close, native/public current-Project `agent.create`, atomic initial-task
+`agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
 custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding, and
-native Sandbox list/get/close are complete. Remaining Phase-1 work is reviewed cross-Project redirect
-authority, staged `agent.inputs.*`, provenance propagation/final consumer-required projections, and any
-remaining non-current host operations beyond close. Public `sandbox.create`/derived Sandbox
-materialization stays in Phase 3 where the sealed SourceDriver/checkpoint preparation semantics belong.
+native Sandbox list/get/close are complete. Remaining Phase-1 work is staged `agent.inputs.*`, provenance
+propagation/final consumer-required projections, and any remaining non-current host operations beyond
+close. Public `sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed
+SourceDriver/checkpoint preparation semantics belong. Trusted delegation into another principal's Project
+also remains a separate future host-policy capability; it is not smuggled through the raw Project field.
 History ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
@@ -383,8 +401,12 @@ distinct, `/s:0` is seeded for the first Project layout, bound Sandbox close con
 fresh Sandbox closes/idempotently replays. The exact-history owner regression remains green after the
 generic constructor started auto-binding Sandboxes, and Actor admission remains green. The consolidated
 host shell regression now additionally proves trusted `auto` shares the current Sandbox, an explicit
-same-Project/same-layout Sandbox binds exactly, and an incompatible layout is rejected before Agent
-publication. Task-bearing atomic publication/live dispatch remains green. `cargo check -p aw-store -p
+same-Project/same-layout Sandbox binds exactly, an incompatible layout is rejected before Agent
+publication, cross-Project `auto` fails closed, and fresh + exact-history redirects land in a second real
+Workspace only with an explicit destination Sandbox. The existing host-activation regression is now itself
+task-bearing cross-Project end-to-end, proving Prepared custody/publication, stable-principal provider
+selection, live activation, exact replay and later non-current close across that boundary. The unchanged
+model exact-history regression remains source-Project-local. `cargo check -p aw-store -p
 aw-cli --tests`, strict all-target Clippy and repository fmt are green for this cut. A broader historical
 Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
 fixtures remain outside this focused Agent/Sandbox cut.

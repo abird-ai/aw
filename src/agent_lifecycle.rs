@@ -868,6 +868,20 @@ mod tests {
             root_binding.project_handle,
             root_binding.agent_handle
         );
+        let redirected_workspace = store
+            .create_workspace(
+                &actor,
+                Some(&root_binding.domain_handle),
+                "activation-redirected",
+            )
+            .unwrap();
+        let redirected_project = format!(
+            "/d:{}/i:{}/p:{}",
+            root_binding.domain_handle, root_binding.identity_handle, redirected_workspace.id
+        );
+        let redirected_sandbox = store
+            .sandbox_create_fresh(&actor, &redirected_project, &binding)
+            .unwrap();
         let child_owner =
             aw_store::stable_user_principal(&store.current_user(&actor).unwrap().user_id).unwrap();
 
@@ -913,14 +927,23 @@ mod tests {
         )
         .unwrap();
         let request = AgentCreateRequest {
+            project: Some(redirected_project.clone()),
             title: Some("activated child".into()),
             task: Some("perform the initial task".into()),
+            sandbox: aw_store::AgentSandboxSelection::Existing(
+                redirected_sandbox.canonical_ref.clone(),
+            ),
             ..Default::default()
         };
         let created = creator
             .create("host-activation-task-1", request.clone())
             .unwrap();
 
+        assert_eq!(created.project_ref, redirected_project);
+        assert_eq!(
+            created.sandbox_ref.as_deref(),
+            Some(redirected_sandbox.canonical_ref.as_str())
+        );
         assert!(router.has_live_owner(&created.canonical_ref).unwrap());
 
         let settled = tokio::time::timeout(std::time::Duration::from_secs(3), async {

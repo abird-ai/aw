@@ -542,6 +542,37 @@ fn validate_project_exists(connection: &Connection, project: &ProjectRef) -> Res
     Ok(())
 }
 
+fn authorize_project_create(
+    connection: &Connection,
+    actor: &PrincipalId,
+    project: &ProjectRef,
+) -> Result<()> {
+    validate_project_exists(connection, project)?;
+    let actor_user = crate::user_for_principal(connection, actor)?.ok_or(Error::Denied(
+        "Agent destination Project authority unavailable",
+    ))?;
+    if actor_user != project.identity {
+        return Err(Error::Denied(
+            "Agent destination Project principal must be the authenticated stable user",
+        ));
+    }
+    let member: bool = db(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM domain_memberships
+             WHERE domain_id=?1 AND user_id=?2 AND status='active'
+         )",
+        params![project.domain, actor_user],
+        |row| row.get(0),
+    ))?;
+    if !member {
+        return Err(Error::Denied(
+            "Agent destination Project requires active Domain membership",
+        ));
+    }
+    workspace_writer::require_workspace_writer(connection, &project.project)?;
+    Ok(())
+}
+
 fn parent_if_visible(
     connection: &Connection,
     actor: &PrincipalId,
@@ -807,11 +838,12 @@ impl SessionStore {
     }
 
     /// Phase-1 host constructor cut. It supports fresh or exact-history Agent
-    /// creation with trusted sandbox=auto binding, source/current Project
-    /// defaulting and private/inherited/custom access. Optional initial task
-    /// custody is prepared before publication and the ordinary Pending queue
-    /// fact is committed atomically with the Agent. Explicit logical Sandbox
-    /// refs remain fail-closed until their owner is composed by the host shell.
+    /// creation with source/current Project defaulting, reviewed same-user
+    /// cross-Project redirect, private/inherited/custom access, and immutable
+    /// Sandbox selection. Optional initial task custody is prepared before
+    /// publication and the ordinary Pending queue fact commits atomically with
+    /// the Agent. Cross-Project redirect requires an explicit destination
+    /// Sandbox until Phase-3 materialization can implement truthful auto.
     pub fn agent_create(
         &self,
         actor: &PrincipalId,
@@ -843,15 +875,13 @@ impl SessionStore {
                 .unwrap_or_else(|| current_project.clone())
         };
 
-        if let Some(source_project) = &source_project {
-            if &selected_project != source_project {
-                return Err(Error::Denied(
-                    "cross-Project history construction requires reviewed redirect authority",
-                ));
-            }
-        } else if selected_project != current_project {
-            return Err(Error::Denied(
-                "fresh Agent destination must match the trusted current Project",
+        let redirected_from_source = source_project
+            .as_ref()
+            .is_some_and(|source_project| source_project != &selected_project);
+        let redirected_from_current = selected_project != current_project;
+        if redirected_from_current && matches!(request.sandbox, AgentSandboxSelection::Auto) {
+            return Err(Error::Conflict(
+                "cross-Project Agent creation requires an explicit destination Sandbox until Sandbox materialization is available",
             ));
         }
         let requested_sandbox = match &request.sandbox {
@@ -908,13 +938,20 @@ impl SessionStore {
 
             let (parent_session, parent_branch) = {
                 let connection = self.connection()?;
-                validate_project_exists(&connection, &selected_project)?;
+                authorize_project_create(&connection, actor, &selected_project)?;
                 if let Some((canonical_source, _, _)) = source.as_ref() {
                     history_owner::preflight_canonical_history_source_in(
                         &connection,
                         actor,
                         canonical_source,
                     )?;
+                    if redirected_from_source {
+                        history_owner::authorize_canonical_history_share_in(
+                            &connection,
+                            actor,
+                            canonical_source,
+                        )?;
+                    }
                 }
                 crate::sandbox_owner::preflight_initial_selection(
                     &connection,
@@ -979,13 +1016,20 @@ impl SessionStore {
             {
                 let mut connection = self.connection()?;
                 let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-                validate_project_exists(&tx, &selected_project)?;
+                authorize_project_create(&tx, actor, &selected_project)?;
                 if let Some((canonical_source, _, _)) = source.as_ref() {
                     history_owner::preflight_canonical_history_source_in(
                         &tx,
                         actor,
                         canonical_source,
                     )?;
+                    if redirected_from_source {
+                        history_owner::authorize_canonical_history_share_in(
+                            &tx,
+                            actor,
+                            canonical_source,
+                        )?;
+                    }
                 }
                 crate::sandbox_owner::preflight_initial_selection(
                     &tx,
@@ -1087,7 +1131,7 @@ impl SessionStore {
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))
             .map_err(&reject_precommit)?;
         let publication = (|| -> Result<String> {
-            validate_project_exists(&tx, &selected_project)?;
+            authorize_project_create(&tx, actor, &selected_project)?;
             let candidate_ids = prepared_task.as_ref().map(|(_, _, preparation, _)| {
                 resources::SessionCandidateIds {
                     session: preparation.candidate_session_id.clone(),
@@ -1110,24 +1154,29 @@ impl SessionStore {
                             ))
                         }
                     };
+                    let destination_owner = stable_user_principal(&selected_project.identity)?;
                     if let Some(ids) = candidate_ids {
-                        history_owner::create_agent_from_history_ref_with_ids_in(
+                        history_owner::create_agent_from_history_ref_with_ids_in_project(
                             &tx,
                             actor,
                             canonical_source,
                             title,
                             &context.binding,
                             fork_access,
+                            &destination_owner,
+                            &selected_project.project,
                             ids,
                         )?
                     } else {
-                        history_owner::create_agent_from_history_ref_in(
+                        history_owner::create_agent_from_history_ref_in_project(
                             &tx,
                             actor,
                             canonical_source,
                             title,
                             &context.binding,
                             fork_access,
+                            &destination_owner,
+                            &selected_project.project,
                         )?
                     }
                 } else {
@@ -1583,6 +1632,68 @@ mod tests {
             ),
             Err(Error::Conflict(_))
         ));
+
+        let redirected_workspace = store
+            .create_workspace(&actor, Some(&root_binding.domain_handle), "redirected")
+            .unwrap();
+        let redirected_project = format!(
+            "/d:{}/i:{}/p:{}",
+            root_binding.domain_handle, root_binding.identity_handle, redirected_workspace.id
+        );
+        assert!(matches!(
+            store.agent_create(
+                &actor,
+                &context,
+                AgentCreateRequest {
+                    project: Some(redirected_project.clone()),
+                    title: Some("redirect auto unavailable".into()),
+                    ..Default::default()
+                },
+            ),
+            Err(Error::Conflict(_))
+        ));
+        let redirected_sandbox = store
+            .sandbox_create_fresh(&actor, &redirected_project, &binding())
+            .unwrap();
+        let redirected = store
+            .agent_create(
+                &actor,
+                &context,
+                AgentCreateRequest {
+                    project: Some(redirected_project.clone()),
+                    title: Some("redirected fresh".into()),
+                    sandbox: AgentSandboxSelection::Existing(
+                        redirected_sandbox.canonical_ref.clone(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(redirected.project_ref, redirected_project);
+        assert_eq!(
+            redirected.sandbox_ref.as_deref(),
+            Some(redirected_sandbox.canonical_ref.as_str())
+        );
+        let redirected_history = store
+            .agent_create(
+                &actor,
+                &context,
+                AgentCreateRequest {
+                    from: Some(root_ref.clone()),
+                    project: Some(redirected_project.clone()),
+                    title: Some("redirected history".into()),
+                    sandbox: AgentSandboxSelection::Existing(
+                        redirected_sandbox.canonical_ref.clone(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(redirected_history.project_ref, redirected_project);
+        assert_eq!(
+            redirected_history.sandbox_ref.as_deref(),
+            Some(redirected_sandbox.canonical_ref.as_str())
+        );
 
         let (_, subscription) = store
             .replace_agent_job_subscription(
