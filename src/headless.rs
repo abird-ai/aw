@@ -59,6 +59,13 @@ pub trait AgentCreatePort: Send + Sync {
     fn apply(&self, request_id: &str, params: Value) -> Result<Value>;
 }
 
+/// Concurrent current-Project Sandbox read/lifecycle surface. Physical
+/// materialization and Sandbox creation remain unavailable until the
+/// SourceDriver/checkpoint owner can satisfy prepared-publication semantics.
+pub trait SandboxPort: Send + Sync {
+    fn apply(&self, method: &str, params: Value) -> Result<Value>;
+}
+
 pub trait Driver {
     /// Must execute using aw's existing, exactly selected Agent/journal.
     fn prompt(
@@ -117,6 +124,9 @@ pub trait Driver {
         None
     }
     fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
+        None
+    }
+    fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
         None
     }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
@@ -334,6 +344,9 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "actor_query" | "actor_op" => Some(&["operation"]),
         "agent_create" => Some(&["from", "project", "title", "task", "access", "sandbox"]),
         "agent_close" => Some(&["ref", "rev"]),
+        "sandbox_list" => Some(&["project", "limit", "cursor"]),
+        "sandbox_get" => Some(&["ref", "include"]),
+        "sandbox_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
             "message_id",
@@ -444,6 +457,7 @@ fn stdin_reader<R: Read + Send + 'static>(
     live_control: Option<Arc<dyn LiveControlPort>>,
     agent_create: Option<Arc<dyn AgentCreatePort>>,
     agent_close: Option<Arc<dyn AgentClosePort>>,
+    sandbox: Option<Arc<dyn SandboxPort>>,
 ) {
     let mut reader = BufReader::new(input);
     loop {
@@ -556,6 +570,18 @@ fn stdin_reader<R: Read + Send + 'static>(
                     parsed =
                         Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
                 }
+            } else if matches!(
+                request.method.as_str(),
+                "sandbox_list" | "sandbox_get" | "sandbox_close"
+            ) {
+                if let Some(port) = &sandbox {
+                    let outcome = (|| -> Result<Value> {
+                        validate_method_params(&request.method, &request.params)?;
+                        port.apply(&request.method, request.params.clone())
+                    })();
+                    parsed =
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
+                }
             }
         }
         if tx.send(parsed).is_err() {
@@ -588,6 +614,10 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "actor_notice_read":driver.actor_available(),
             "agent_create":driver.agent_create_port().is_some(),
             "agent_close":driver.agent_close_port().is_some(),
+            "sandbox_list":driver.sandbox_port().is_some(),
+            "sandbox_get":driver.sandbox_port().is_some(),
+            "sandbox_create":false,
+            "sandbox_close":driver.sandbox_port().is_some(),
         },
         "profile":initial.profile,"model":initial.model,
         "warning":"client MUST inspect durable state after transport loss; never replay an uncertain prompt"
@@ -598,8 +628,17 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let live_port = driver.live_control_port();
     let agent_create = driver.agent_create_port();
     let agent_close = driver.agent_close_port();
+    let sandbox = driver.sandbox_port();
     let read = thread::spawn(move || {
-        stdin_reader(reader, tx, guard, live_port, agent_create, agent_close)
+        stdin_reader(
+            reader,
+            tx,
+            guard,
+            live_port,
+            agent_create,
+            agent_close,
+            sandbox,
+        )
     });
     let mut seen = BTreeSet::<String>::new();
     while let Ok(message) = rx.recv() {
@@ -1130,6 +1169,17 @@ mod aw_p6_9c_protocol_tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeSandboxPort {
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+    impl SandboxPort for FakeSandboxPort {
+        fn apply(&self, method: &str, params: Value) -> Result<Value> {
+            self.calls.lock().unwrap().push((method.to_owned(), params));
+            Ok(json!({"items":[],"next_cursor":null}))
+        }
+    }
+
     struct BoundFake {
         query_calls: usize,
         mutation_calls: usize,
@@ -1137,6 +1187,7 @@ mod aw_p6_9c_protocol_tests {
         step_calls: usize,
         prompts: usize,
         create: Arc<FakeAgentCreatePort>,
+        sandbox: Arc<FakeSandboxPort>,
     }
     impl Driver for BoundFake {
         fn actor_available(&self) -> bool {
@@ -1144,6 +1195,9 @@ mod aw_p6_9c_protocol_tests {
         }
         fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
             Some(self.create.clone())
+        }
+        fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
+            Some(self.sandbox.clone())
         }
         fn actor_query(&mut self, operation: Value) -> Result<Value> {
             self.query_calls += 1;
@@ -1205,9 +1259,12 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"step","method":"actor_step","params":{}}"#,
             r#"{"v":1,"id":"create","method":"agent_create","params":{"title":"child","task":"work","access":"private","sandbox":"auto"}}"#,
             r#"{"v":1,"id":"create-provider","method":"agent_create","params":{"title":"child","provider":"evil"}}"#,
+            r#"{"v":1,"id":"sandboxes","method":"sandbox_list","params":{"limit":8}}"#,
+            r#"{"v":1,"id":"sandbox-layout","method":"sandbox_get","params":{"ref":"/d:d/i:i/p:p/s:0","layout":"raw"}}"#,
             r#"{"v":1,"id":"danger","method":"trusted_bash","params":{"command":"echo no"}}"#,
         ].join("\n")+"\n";
         let create = Arc::new(FakeAgentCreatePort::default());
+        let sandbox = Arc::new(FakeSandboxPort::default());
         let mut fake = BoundFake {
             query_calls: 0,
             mutation_calls: 0,
@@ -1215,6 +1272,7 @@ mod aw_p6_9c_protocol_tests {
             step_calls: 0,
             prompts: 0,
             create: create.clone(),
+            sandbox: sandbox.clone(),
         };
         let mut bytes = Vec::new();
         serve_stdio(&mut fake, Cursor::new(frames), &mut bytes, false).unwrap();
@@ -1225,6 +1283,10 @@ mod aw_p6_9c_protocol_tests {
             .collect();
         assert_eq!(rows[0]["data"]["capabilities"]["actor_query"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_create"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["sandbox_list"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["sandbox_get"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], false);
+        assert_eq!(rows[0]["data"]["capabilities"]["sandbox_close"], true);
         assert_eq!(fake.query_calls, 1);
         assert_eq!(fake.mutation_calls, 1);
         assert_eq!(fake.enqueue_calls, 1);
@@ -1234,6 +1296,10 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(create_calls.len(), 1);
         assert_eq!(create_calls[0].0, "create");
         assert_eq!(create_calls[0].1["task"], "work");
+        let sandbox_calls = sandbox.calls.lock().unwrap();
+        assert_eq!(sandbox_calls.len(), 1);
+        assert_eq!(sandbox_calls[0].0, "sandbox_list");
+        assert_eq!(sandbox_calls[0].1["limit"], 8);
         assert!(rows
             .iter()
             .any(|r| r["id"] == "raw" && r["data"]["code"] == "invalid_parameters"));
@@ -1243,6 +1309,9 @@ mod aw_p6_9c_protocol_tests {
         assert!(rows
             .iter()
             .any(|r| r["id"] == "create-provider" && r["data"]["code"] == "protocol"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "sandbox-layout" && r["data"]["code"] == "protocol"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "send" && r["data"]["code"] == "duplicate_request_id"));

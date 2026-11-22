@@ -3385,6 +3385,7 @@ struct Host {
     agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
     agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::RootAgentClose>>,
     agent_create_owner: Option<std::sync::Arc<StdioAgentCreatePort>>,
+    sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
     context_compaction_policy: aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -3422,6 +3423,158 @@ struct StdioAgentCreatePort {
     account_selector: Option<String>,
     tools: aw::LocalToolOptions,
     router: std::sync::Arc<aw::agent_jobs::Router>,
+}
+
+struct StdioSandboxPort {
+    store: SessionStore,
+    caller: aw::PrincipalId,
+    current_project_ref: String,
+}
+
+fn sandbox_snapshot_value(
+    snapshot: &aw_store::SandboxSnapshot,
+    include_sources: bool,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "ref":snapshot.canonical_ref,
+        "project":snapshot.project_ref,
+        "rev":snapshot.rev,
+        "lifecycle":snapshot.lifecycle,
+        "parent":snapshot.parent_sandbox_ref,
+    });
+    if include_sources {
+        value
+            .as_object_mut()
+            .expect("Sandbox snapshot JSON object")
+            .insert("sources".into(), serde_json::json!([]));
+    }
+    value
+}
+
+impl StdioSandboxPort {
+    fn project<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str> {
+        let project = requested.unwrap_or(&self.current_project_ref);
+        if project != self.current_project_ref {
+            return Err(Error::Denied(
+                "cross-Project Sandbox access requires reviewed Project redirect authority",
+            ));
+        }
+        Ok(project)
+    }
+
+    fn require_current_project(&self, snapshot: &aw_store::SandboxSnapshot) -> Result<()> {
+        if snapshot.project_ref != self.current_project_ref {
+            return Err(Error::Denied(
+                "Sandbox belongs to another Project; cross-Project access is unavailable",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl aw::headless::SandboxPort for StdioSandboxPort {
+    fn apply(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        match method {
+            "sandbox_list" => {
+                let project = params
+                    .get("project")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or(Error::Protocol("sandbox_list project must be a string"))
+                    })
+                    .transpose()?;
+                let project = self.project(project)?;
+                let limit = params
+                    .get("limit")
+                    .map(|value| {
+                        value.as_u64().ok_or(Error::Protocol(
+                            "sandbox_list limit must be a positive integer",
+                        ))
+                    })
+                    .transpose()?
+                    .unwrap_or(64);
+                let limit = usize::try_from(limit)
+                    .map_err(|_| Error::Limit("invalid Sandbox list limit"))?;
+                let cursor = params
+                    .get("cursor")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or(Error::Protocol("sandbox_list cursor must be a string"))
+                    })
+                    .transpose()?;
+                let items = self
+                    .store
+                    .sandbox_list(&self.caller, project, cursor, limit)?;
+                let next_cursor = (items.len() == limit)
+                    .then(|| items.last().map(|item| item.canonical_ref.clone()))
+                    .flatten();
+                Ok(serde_json::json!({
+                    "project":project,
+                    "items":items.iter()
+                        .map(|item| sandbox_snapshot_value(item, false))
+                        .collect::<Vec<_>>(),
+                    "next_cursor":next_cursor,
+                }))
+            }
+            "sandbox_get" => {
+                let reference = params
+                    .get("ref")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Protocol("sandbox_get ref must be a string"))?;
+                let include_sources = match params.get("include") {
+                    None => false,
+                    Some(value) => {
+                        let include = value
+                            .as_array()
+                            .ok_or(Error::Protocol("sandbox_get include must be an array"))?;
+                        let mut sources = false;
+                        for item in include {
+                            match item.as_str() {
+                                Some("sources") if !sources => sources = true,
+                                Some("sources") => {
+                                    return Err(Error::Protocol(
+                                        "sandbox_get include contains duplicate sources",
+                                    ))
+                                }
+                                _ => {
+                                    return Err(Error::Protocol(
+                                        "sandbox_get include supports only sources",
+                                    ))
+                                }
+                            }
+                        }
+                        sources
+                    }
+                };
+                let snapshot = self.store.sandbox_get(&self.caller, reference)?;
+                self.require_current_project(&snapshot)?;
+                Ok(sandbox_snapshot_value(&snapshot, include_sources))
+            }
+            "sandbox_close" => {
+                let reference = params
+                    .get("ref")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Protocol("sandbox_close ref must be a string"))?;
+                let expected_rev = params
+                    .get("rev")
+                    .map(|value| {
+                        value.as_u64().ok_or(Error::Protocol(
+                            "sandbox_close rev must be a nonnegative integer",
+                        ))
+                    })
+                    .transpose()?;
+                let current = self.store.sandbox_get(&self.caller, reference)?;
+                self.require_current_project(&current)?;
+                let closed = self
+                    .store
+                    .sandbox_close(&self.caller, reference, expected_rev)?;
+                Ok(sandbox_snapshot_value(&closed, false))
+            }
+            _ => Err(Error::Protocol("unsupported Sandbox host operation")),
+        }
+    }
 }
 
 fn agent_create_optional_string(params: &serde_json::Value, field: &str) -> Result<Option<String>> {
@@ -3910,6 +4063,7 @@ impl Host {
         self.agent_job_runtime = None;
         self.agent_close_owner = None;
         self.agent_create_owner = None;
+        self.sandbox_owner = None;
         self.persistent = None;
         #[cfg(feature = "jsonl")]
         {
@@ -3998,6 +4152,7 @@ impl Host {
             agent_job_runtime: None,
             agent_close_owner: None,
             agent_create_owner: None,
+            sandbox_owner: None,
             pre_dispatch_retries: 0,
             context_compaction_policy: aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -4450,6 +4605,7 @@ impl Host {
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
             self.agent_create_owner = None;
+            self.sandbox_owner = None;
             if let Some(service) = stable_agent_service.as_ref() {
                 service.bind_agent_jobs_router(router.clone())?;
                 let agent_tool = service.agent_tool();
@@ -4522,6 +4678,17 @@ impl Host {
                     owner.clone(),
                     agent.tool_binding_authority(),
                 )?;
+                let current_project_ref = canonical
+                    .rsplit_once("/a:")
+                    .map(|(project, _)| project.to_owned())
+                    .ok_or(Error::Storage(
+                        "canonical Agent ref is missing its Agent segment",
+                    ))?;
+                self.sandbox_owner = Some(Arc::new(StdioSandboxPort {
+                    store: persistent.store.clone(),
+                    caller: persistent.actor.clone(),
+                    current_project_ref,
+                }));
                 self.agent_create_owner = Some(Arc::new(StdioAgentCreatePort {
                     store: persistent.store.clone(),
                     caller: persistent.actor.clone(),
@@ -4550,6 +4717,7 @@ impl Host {
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
             self.agent_create_owner = None;
+            self.sandbox_owner = None;
             self.tools.agent_jobs.clear()?;
             self.tools.operation_router.clear()?;
             self.tools
@@ -5559,6 +5727,11 @@ impl aw::headless::Driver for Host {
         self.agent_create_owner
             .as_ref()
             .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::AgentCreatePort>)
+    }
+    fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
+        self.sandbox_owner
+            .as_ref()
+            .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::SandboxPort>)
     }
     fn agent_close_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentClosePort>> {
         self.agent_close_owner.as_ref().map(|owner| {

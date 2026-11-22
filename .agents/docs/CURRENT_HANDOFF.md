@@ -333,12 +333,31 @@ and has the exact trusted execution layout. The choice is written inside the Age
 without an Agent rev bump and there is still no `agent.sandbox.set`/rebind path. History ancestry never
 selects or grants a Sandbox. Binding the Sandbox grants no new tool/source/network/device authority.
 
+Native/stdio Sandbox observation/lifecycle is now exposed through one current-Project-bound
+`SandboxPort`. `sandbox_list(project?,limit?,cursor?)`, `sandbox_get(ref,include?)` and
+`sandbox_close(ref,rev?)` run on the concurrent reader lane like Agent lifecycle operations. The port
+accepts no layout/mount/network/device/provider authority fields, defaults list to the trusted current
+Project, refuses cross-Project refs, and projects only public logical Sandbox identity/rev/lifecycle/
+parent data. `include=["sources"]` truthfully returns an empty bounded source list until Phase 3 installs
+SourceBindings. Pagination remains a bounded non-authority continuation over the Store's exact Project-
+bound list order; no Phase-4 cursor framework was pulled forward merely for this surface.
+
+`sandbox_create` is intentionally advertised unavailable. A tempting resource-row-local replay receipt
+was reviewed and rejected before commit: real fresh/derived Sandbox creation requires filesystem/source
+materialization, so the sealed Prepared claim must exist **before** that external effect and cannot live
+only on a not-yet-public Sandbox row. Exposing the current lower `sandbox_create_fresh` would also falsely
+promise an isolated mutable environment while SandboxDriver/SourceDriver realization does not exist.
+Public create therefore remains Phase-3 work using the shared Prepared + SourceDriver/checkpoint path;
+we did not add temporary v42 schema/replay machinery that would immediately become wrong.
+
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current-root `agent.close`,
 stable-child close, native/public current-Project `agent.create`, atomic initial-task custody/publication,
-post-commit live dispatch, and the lower logical Sandbox owner/auto+explicit binding policy are complete.
-The broader shell still needs stdio/host exposure of `sandbox.list/get/create/close`, reviewed cross-Project
-redirect authority, later staged `agent.inputs.*`, and broader host routing for non-current Agent refs.
-History ancestry still grants none of those authorities.
+post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding, and native Sandbox
+list/get/close are complete. Remaining Phase-1 work is reviewed cross-Project redirect authority, later
+staged `agent.inputs.*`, provenance propagation/final consumer-required projections, and broader host
+routing for non-current Agent refs. Public `sandbox.create`/derived Sandbox materialization stays in Phase
+3 where the sealed SourceDriver/checkpoint preparation semantics belong. History ancestry still grants
+none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -386,7 +405,10 @@ stable principal. The strict headless frame regression now advertises `agent_cre
 for a valid sealed frame, and rejects an extra `provider` field before the port. The exact-history fork
 regression remains green after adding pre-minted candidate IDs, and the older in-memory host-shell
 regression still fails task-bearing create before any half-publication because it has no persistent
-SecretStore. Root-close and both stable-Agent close regressions remain green.
+SecretStore. The strict headless regression now also advertises Sandbox list/get/close, explicitly reports
+Sandbox create unavailable, dispatches one valid bounded Sandbox list request, and rejects an extra raw
+layout field before the port. The focused v40->v41 Sandbox lifecycle regression remains green alongside
+host task create and root close. Root-close and both stable-Agent close regressions remain green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

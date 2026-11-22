@@ -162,9 +162,16 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       current Agent's immutable Sandbox, explicit refs must be open + exact destination Project + exact
       trusted layout, and no Agent rebind verb exists. Store `sandbox_get/list/create_fresh/close` primitives
       are present; SourceBindings/SandboxGrant/driver realization remain deferred and frozen 017 is untouched.
-      Still open before the host shell is complete: stdio/host `sandbox.list/get/create/close` exposure,
-      derived `sandbox.create(from=...)` once SourceDriver/checkpoint semantics exist, reviewed cross-Project
-      redirect authority, broader non-current Agent close routing, and staged `agent.inputs.*`. After that
+      **Native/stdio Sandbox list/get/close is now exposed for the trusted current Project** through one
+      concurrent `SandboxPort`; it accepts no raw layout/mount/provider authority, supports bounded list
+      continuation + logical snapshot reads, and refuses cross-Project refs. `include=["sources"]` is empty
+      until SourceBindings exist. `sandbox_create` is deliberately advertised unavailable: a reviewed
+      row-local replay shortcut was rejected because true fresh/derived Sandbox materialization needs the
+      sealed Prepared claim before external SourceDriver/filesystem effects, and the current lower logical
+      helper must not falsely promise isolation. Still open in Phase 1: reviewed cross-Project redirect
+      authority, broader non-current Agent close routing, staged `agent.inputs.*`, provenance propagation
+      and only consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
+      with SourceDriver/checkpoint semantics. After that
       propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.
