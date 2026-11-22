@@ -350,14 +350,25 @@ promise an isolated mutable environment while SandboxDriver/SourceDriver realiza
 Public create therefore remains Phase-3 work using the shared Prepared + SourceDriver/checkpoint path;
 we did not add temporary v42 schema/replay machinery that would immediately become wrong.
 
-This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current-root `agent.close`,
-stable-child close, native/public current-Project `agent.create`, atomic initial-task custody/publication,
-post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding, and native Sandbox
-list/get/close are complete. Remaining Phase-1 work is reviewed cross-Project redirect authority, later
-staged `agent.inputs.*`, provenance propagation/final consumer-required projections, and broader host
-routing for non-current Agent refs. Public `sandbox.create`/derived Sandbox materialization stays in Phase
-3 where the sealed SourceDriver/checkpoint preparation semantics belong. History ancestry still grants
-none of those authorities.
+Host `agent.close` now routes non-current live Agents as well as the current root without adding another
+lifecycle owner. One `HostAgentClose` keeps the retained `RootAgentClose` for `.`/the exact current root;
+other canonical Agent roots first pass a read-only Store `control` + optional-revision preflight (so live
+runtime topology is never disclosed to a view-only caller), then require an existing shared-Router live
+close controller. The final Store `agent_request_close` transaction revalidates authority/revision and
+atomically publishes `closing/held` + recipient retirement before the existing live worker is signalled.
+Host-created workers replay through `RootAgentClose`; delegated workers use their existing factual
+`settle_agent_job` path. The host router does not classify or duplicate those runtimes. A controller race
+after the durable request surfaces explicit conflict and leaves inspectable `closing` state rather than
+fabricating terminal success. Already-closed replay still reauthorizes `control` and is idempotent.
+
+This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
+`agent.close`, stable-child close, native/public current-Project `agent.create`, atomic initial-task
+custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding, and
+native Sandbox list/get/close are complete. Remaining Phase-1 work is reviewed cross-Project redirect
+authority, staged `agent.inputs.*`, provenance propagation/final consumer-required projections, and any
+remaining non-current host operations beyond close. Public `sandbox.create`/derived Sandbox
+materialization stays in Phase 3 where the sealed SourceDriver/checkpoint preparation semantics belong.
+History ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -377,9 +388,12 @@ publication. Task-bearing atomic publication/live dispatch remains green. `cargo
 aw-cli --tests`, strict all-target Clippy and repository fmt are green for this cut. A broader historical
 Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
 fixtures remain outside this focused Agent/Sandbox cut.
-The stable-Agent close regression now additionally covers a provider attempt that never completes on
-its own: close preempts the active Turn and reaches factual cancelled child settlement within the test
-bound, while the existing create/continue/idle-close regression remains green. Existing event-source
+The host-created Agent activation regression now also closes that non-current child through
+`HostAgentClose`: the call returns authoritative `closing/held`, the existing worker reaches factual
+`closed`, and a later close replay returns the same terminal revision. Root close remains independently
+green, and the stable delegated-Agent blocking-provider close regression still proves preemptive active
+Turn cancellation/factual child settlement, so both live-owner implementations remain covered without a
+second test harness. Existing event-source
 coverage now proves receiver retirement clears both root+exact-Turn rules and pending deliveries while
 bumping the source Agent once; the host-shell regression proves close invokes retirement atomically.
 A real finite shell-Job regression proves `JobRuntime::close_owner` cancels through JobManager, waits for

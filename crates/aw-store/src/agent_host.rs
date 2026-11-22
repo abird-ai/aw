@@ -1300,6 +1300,27 @@ impl SessionStore {
         snapshot_in(&connection, actor, canonical_ref)
     }
 
+    /// Read-only host close preflight. This prevents live-runtime topology from
+    /// becoming observable to a caller that lacks Agent control, while the
+    /// later request transaction still revalidates the same authority/revision
+    /// at the actual lifecycle linearization point.
+    pub fn agent_close_preflight(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        expected_rev: Option<u64>,
+    ) -> Result<AgentSnapshot> {
+        let connection = self.connection()?;
+        let (session, branch) = key_for_ref_in(&connection, canonical_ref)?;
+        let agent = agent_owner::AgentKey::new(&session, &branch);
+        agent_owner::authorize_permission(&connection, actor, agent, AgentPermission::Control)?;
+        let revision = agent_owner::revision(&connection, agent)?;
+        if expected_rev.is_some_and(|expected| expected != revision) {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+        snapshot_in(&connection, actor, canonical_ref)
+    }
+
     /// Lower close lifecycle seam for the live host. This atomically fences
     /// future admission and records the close request, but deliberately does not
     /// fabricate runtime cancellation/settlement; the outer live host must pair

@@ -244,6 +244,26 @@ impl Router {
         wake.close()
     }
 
+    pub fn has_live_close_controller(&self, canonical_agent_ref: &str) -> Result<bool> {
+        let parsed = ExecutionRef::parse(canonical_agent_ref)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "live Agent close lookup needs an Agent root ref",
+            ));
+        }
+        let canonical = resolved.agent_ref().canonical();
+        Ok(self
+            .owners
+            .lock()
+            .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?
+            .get(&canonical)
+            .is_some_and(|live| live.wake.is_some()))
+    }
+
     pub fn register_live_owner(
         &self,
         canonical_agent_ref: &str,

@@ -168,9 +168,14 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       until SourceBindings exist. `sandbox_create` is deliberately advertised unavailable: a reviewed
       row-local replay shortcut was rejected because true fresh/derived Sandbox materialization needs the
       sealed Prepared claim before external SourceDriver/filesystem effects, and the current lower logical
-      helper must not falsely promise isolation. Still open in Phase 1: reviewed cross-Project redirect
-      authority, broader non-current Agent close routing, staged `agent.inputs.*`, provenance propagation
-      and only consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
+      helper must not falsely promise isolation. **Host non-current Agent close routing is now complete:**
+      one `HostAgentClose` preserves full root composition for `.` while other canonical live Agents pass
+      Agent-control/revision preflight before Router topology lookup, atomically enter `closing/held` through
+      the existing Store owner, then signal their existing live close controller; host-created and delegated
+      runtimes retain their separate factual settlement owners. Already-closed replay is authorized and
+      idempotent; a post-request controller race remains inspectable `closing` rather than fake success.
+      Still open in Phase 1: reviewed cross-Project redirect authority, staged `agent.inputs.*`, provenance
+      propagation and only consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
       with SourceDriver/checkpoint semantics. After that
       propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

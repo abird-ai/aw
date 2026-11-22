@@ -3383,7 +3383,7 @@ struct Host {
     actor_owner: Option<aw::actor_owner::Service>,
     agent_jobs_owner: Option<aw::actor_owner::Service>,
     agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
-    agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::RootAgentClose>>,
+    agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentClose>>,
     agent_create_owner: Option<std::sync::Arc<StdioAgentCreatePort>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
@@ -3410,7 +3410,7 @@ struct Host {
 }
 
 struct StdioAgentClosePort {
-    inner: std::sync::Arc<aw::agent_lifecycle::RootAgentClose>,
+    inner: std::sync::Arc<aw::agent_lifecycle::HostAgentClose>,
 }
 
 struct StdioAgentCreatePort {
@@ -3719,16 +3719,11 @@ impl aw::headless::AgentCreatePort for StdioAgentCreatePort {
 
 impl aw::headless::AgentClosePort for StdioAgentClosePort {
     fn apply(&self, reference: &str, expected_rev: Option<u64>) -> Result<serde_json::Value> {
-        if reference != "." && reference != self.inner.canonical_ref() {
-            return Err(Error::Denied(
-                "stdio Agent close is bound to the current root Agent",
-            ));
-        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(2)
             .build()?;
-        let closed = runtime.block_on(self.inner.close(expected_rev))?;
+        let closed = runtime.block_on(self.inner.close(reference, expected_rev))?;
         Ok(serde_json::json!({
             "ref":closed.canonical_ref,
             "rev":closed.rev,
@@ -4700,12 +4695,18 @@ impl Host {
                     tools: self.tools.clone(),
                     router: router.clone(),
                 }));
-                self.agent_close_owner = Some(Arc::new(aw::agent_lifecycle::RootAgentClose::new(
+                let root_close = Arc::new(aw::agent_lifecycle::RootAgentClose::new(
                     persistent.store.clone(),
                     persistent.actor.clone(),
                     canonical,
                     owner.clone(),
                     self.agent_job_runtime.clone(),
+                    router.clone(),
+                )?);
+                self.agent_close_owner = Some(Arc::new(aw::agent_lifecycle::HostAgentClose::new(
+                    persistent.store.clone(),
+                    persistent.actor.clone(),
+                    root_close,
                     router.clone(),
                 )?));
                 self.agent_jobs_owner = Some(owner);

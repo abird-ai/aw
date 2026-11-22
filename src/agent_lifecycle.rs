@@ -138,6 +138,98 @@ impl RootAgentClose {
     }
 }
 
+#[derive(Clone)]
+pub struct HostAgentClose {
+    store: SessionStore,
+    actor: PrincipalId,
+    root: Arc<RootAgentClose>,
+    router: Arc<agent_jobs::Router>,
+}
+
+impl HostAgentClose {
+    pub fn new(
+        store: SessionStore,
+        actor: PrincipalId,
+        root: Arc<RootAgentClose>,
+        router: Arc<agent_jobs::Router>,
+    ) -> Result<Self> {
+        if root.actor != actor {
+            return Err(Error::Denied(
+                "host Agent close principal differs from root lifecycle owner",
+            ));
+        }
+        Ok(Self {
+            store,
+            actor,
+            root,
+            router,
+        })
+    }
+
+    pub fn root_ref(&self) -> &str {
+        self.root.canonical_ref()
+    }
+
+    fn canonical_ref(&self, reference: &str) -> Result<String> {
+        if reference == "." {
+            return Ok(self.root.canonical_ref().to_owned());
+        }
+        let parsed =
+            ExecutionRef::parse(reference).map_err(|_| Error::Denied("invalid Agent close ref"))?;
+        if !parsed.is_canonical() {
+            return Err(Error::Denied(
+                "non-current Agent close requires a canonical Agent ref",
+            ));
+        }
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid Agent close ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied("Agent close requires an Agent root ref"));
+        }
+        Ok(resolved.agent_ref().canonical())
+    }
+
+    pub async fn close(&self, reference: &str, expected_rev: Option<u64>) -> Result<AgentSnapshot> {
+        let canonical = self.canonical_ref(reference)?;
+        if canonical == self.root.canonical_ref() {
+            return self.root.close(expected_rev).await;
+        }
+
+        let current = self
+            .store
+            .agent_close_preflight(&self.actor, &canonical, expected_rev)?;
+        if current.lifecycle == AgentLifecycle::Closed {
+            return Ok(current);
+        }
+        if !self.router.has_live_close_controller(&canonical)? {
+            return Err(Error::Conflict(
+                "non-current Agent has no live close controller",
+            ));
+        }
+
+        let closing = self
+            .store
+            .agent_request_close(&self.actor, &canonical, expected_rev)?;
+        match self.router.request_live_close(&canonical) {
+            Ok(()) => Ok(closing),
+            Err(error) => {
+                let observed = self.store.agent_get(&self.actor, &canonical)?;
+                if observed.lifecycle == AgentLifecycle::Closed {
+                    Ok(observed)
+                } else {
+                    Err(match error {
+                        Error::Conflict(_) | Error::Denied(_) => Error::Conflict(
+                            "Agent close was requested, but its live close controller became unavailable",
+                        ),
+                        error => error,
+                    })
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum LiveAgentCommand {
     Wake,
@@ -814,7 +906,7 @@ mod tests {
         let creator = HostAgentCreator::new(
             store.clone(),
             actor.clone(),
-            root_ref,
+            root_ref.clone(),
             binding,
             "local",
             activation,
@@ -848,7 +940,71 @@ mod tests {
         let replay = creator.create("host-activation-task-1", request).unwrap();
         assert_eq!(replay.canonical_ref, created.canonical_ref);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        router.request_live_close(&created.canonical_ref).unwrap();
+
+        let root_provider = Arc::new(CompletingProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut root_agent =
+            Agent::builder(root_provider, AgentOptions::new("root-fixture", "model"))
+                .account(
+                    AccountDescriptor::personal(
+                        "root-fixture",
+                        actor.clone(),
+                        "local",
+                        ["model".into()],
+                    ),
+                    actor.clone(),
+                    "local",
+                )
+                .build()
+                .unwrap();
+        let (root_view, root_journal) = store.activate(&actor, &root.id, &root_branch.id).unwrap();
+        root_agent
+            .load_history(root_view.history, Some(Arc::new(root_journal)))
+            .unwrap();
+        root_agent
+            .bind_execution_owner(
+                AgentExecutionBinding::from_trusted_host(
+                    root_ref.clone(),
+                    root.id.clone(),
+                    root_branch.id.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let root_owner = actor_owner::Service::attach_for_agent(
+            store.clone(),
+            &root.id,
+            &root_branch.id,
+            &root_agent,
+        )
+        .unwrap();
+        router
+            .register_live_owner(
+                &root_ref,
+                root_owner.clone(),
+                root_agent.tool_binding_authority(),
+            )
+            .unwrap();
+        let root_close = Arc::new(
+            RootAgentClose::new(
+                store.clone(),
+                actor.clone(),
+                root_ref,
+                root_owner,
+                None,
+                router.clone(),
+            )
+            .unwrap(),
+        );
+        let host_close =
+            HostAgentClose::new(store.clone(), actor.clone(), root_close, router.clone()).unwrap();
+        let closing = host_close
+            .close(&created.canonical_ref, Some(settled.rev))
+            .await
+            .unwrap();
+        assert_eq!(closing.lifecycle, AgentLifecycle::Closing);
+        assert_eq!(closing.admission, aw_store::AgentAdmission::Held);
 
         let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -862,6 +1018,12 @@ mod tests {
         .await
         .expect("activated host Agent close must reach authoritative terminal state");
         assert_eq!(closed.admission, aw_store::AgentAdmission::Held);
+        let close_replay = host_close
+            .close(&created.canonical_ref, None)
+            .await
+            .unwrap();
+        assert_eq!(close_replay.lifecycle, AgentLifecycle::Closed);
+        assert_eq!(close_replay.rev, closed.rev);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(state_dir);
     }
