@@ -1650,11 +1650,77 @@ enum LiveAgentCommand {
 #[derive(Clone)]
 struct LiveAgentWakeHandle {
     sender: mpsc::Sender<LiveAgentCommand>,
-    closing: Arc<AtomicBool>,
+    control: Arc<LiveAgentControl>,
+}
+
+struct LiveAgentControl {
+    closing: AtomicBool,
+    active_cancel: Mutex<Option<CancellationToken>>,
+}
+
+impl LiveAgentControl {
+    fn new() -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            active_cancel: Mutex::new(None),
+        }
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    fn begin_turn(self: &Arc<Self>, cancellation: CancellationToken) -> Result<LiveAgentTurnGuard> {
+        let mut active = self
+            .active_cancel
+            .lock()
+            .map_err(|_| Error::Storage("stable Agent cancellation state poisoned"))?;
+        if active.is_some() {
+            return Err(Error::Conflict(
+                "stable Agent cannot run more than one Turn at once",
+            ));
+        }
+        *active = Some(cancellation.clone());
+        if self.is_closing() {
+            cancellation.cancel();
+        }
+        Ok(LiveAgentTurnGuard {
+            control: self.clone(),
+        })
+    }
+
+    fn request_close(&self) -> Result<bool> {
+        let first = !self.closing.swap(true, Ordering::AcqRel);
+        if let Some(cancellation) = self
+            .active_cancel
+            .lock()
+            .map_err(|_| Error::Storage("stable Agent cancellation state poisoned"))?
+            .as_ref()
+        {
+            cancellation.cancel();
+        }
+        Ok(first)
+    }
+
+    fn finish_turn(&self) {
+        if let Ok(mut active) = self.active_cancel.lock() {
+            *active = None;
+        }
+    }
+}
+
+struct LiveAgentTurnGuard {
+    control: Arc<LiveAgentControl>,
+}
+
+impl Drop for LiveAgentTurnGuard {
+    fn drop(&mut self) {
+        self.control.finish_turn();
+    }
 }
 impl aw::agent_jobs::LiveAgentWake for LiveAgentWakeHandle {
     fn wake(&self) -> Result<()> {
-        if self.closing.load(Ordering::Acquire) {
+        if self.control.is_closing() {
             return Err(Error::Conflict(
                 "Agent is closing and accepts no future input",
             ));
@@ -1665,14 +1731,16 @@ impl aw::agent_jobs::LiveAgentWake for LiveAgentWakeHandle {
     }
 
     fn close(&self) -> Result<()> {
-        self.closing.store(true, Ordering::Release);
-        self.sender
-            .send(LiveAgentCommand::Close)
-            .map_err(|_| Error::Conflict("live Agent worker is unavailable"))
+        if self.control.request_close()? {
+            self.sender
+                .send(LiveAgentCommand::Close)
+                .map_err(|_| Error::Conflict("live Agent worker is unavailable"))?;
+        }
+        Ok(())
     }
 
     fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::Acquire)
+        self.control.is_closing()
     }
 }
 
@@ -1702,7 +1770,7 @@ struct StableAgentRuntime {
     canonical_ref: String,
     owner: aw::actor_owner::Service,
     receiver: mpsc::Receiver<LiveAgentCommand>,
-    closing: Arc<AtomicBool>,
+    control: Arc<LiveAgentControl>,
 }
 
 impl Service {
@@ -2161,7 +2229,9 @@ impl Service {
             .resolve(None, None)
             .map_err(|_| Error::Denied("invalid bound current Agent ref"))?;
         if !current.suffix().is_empty() {
-            return Err(Error::Denied("current execution owner is not an Agent root"));
+            return Err(Error::Denied(
+                "current execution owner is not an Agent root",
+            ));
         }
         let parent = self
             .inner
@@ -3032,10 +3102,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         )?;
         let router = self.agent_jobs_router()?;
         let (sender, receiver) = mpsc::channel();
-        let closing = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(LiveAgentControl::new());
         let wake: Arc<dyn aw::agent_jobs::LiveAgentWake> = Arc::new(LiveAgentWakeHandle {
             sender,
-            closing: closing.clone(),
+            control: control.clone(),
         });
         let canonical_ref = binding.canonical_ref().to_owned();
         router.register_live_owner_with_wake(
@@ -3049,7 +3119,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             canonical_ref,
             owner,
             receiver,
-            closing,
+            control,
         })
     }
 
@@ -3097,11 +3167,14 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
     async fn run_one_stable_queued_turn(
         prepared: &mut Prepared,
         owner: &aw::actor_owner::Service,
+        control: &Arc<LiveAgentControl>,
     ) -> Result<bool> {
         if owner.admit_next_queued(&prepared.agent)?.is_none() {
             return Ok(false);
         }
-        let _ = Self::run_stable_claimed_turn(prepared, owner, CancellationToken::new()).await?;
+        let cancellation = CancellationToken::new();
+        let _active = control.begin_turn(cancellation.clone())?;
+        let _ = Self::run_stable_claimed_turn(prepared, owner, cancellation).await?;
         Ok(true)
     }
 
@@ -3111,7 +3184,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         runtime: &StableAgentRuntime,
         reason: &str,
     ) -> Result<()> {
-        runtime.closing.store(true, Ordering::Release);
+        runtime.control.request_close()?;
         let (_principal, session, branch, _site, _epoch) = runtime.owner.bound_peer_scope();
         for fact in runtime.owner.queue_list()? {
             if fact.state != QueueState::Pending {
@@ -3195,7 +3268,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             loop {
                 match runtime_state.receiver.recv() {
                     Ok(LiveAgentCommand::Wake) => {
-                        if runtime_state.closing.load(Ordering::Acquire) {
+                        if runtime_state.control.is_closing() {
                             continue;
                         }
                         // Exactly one accepted queue item per wake. More queued
@@ -3204,6 +3277,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                         let _ = runtime.block_on(Self::run_one_stable_queued_turn(
                             &mut prepared,
                             &runtime_state.owner,
+                            &runtime_state.control,
                         ));
                         runtime.block_on(Self::deliver_stable_agent_events(
                             runtime_state.router.as_ref(),
@@ -3281,8 +3355,23 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 Self::fail_stable_worker_creation(&inner, &prepared, &runtime_state, &detail);
                 return;
             }
+            let first_cancel = prepared
+                .agent
+                .execution_scope()
+                .map(|scope| scope.cancellation())
+                .unwrap_or_default();
+            let _active = match runtime_state.control.begin_turn(first_cancel.clone()) {
+                Ok(active) => active,
+                Err(error) => {
+                    let detail = format!("cannot arm stable Agent cancellation: {error}");
+                    let _ = ready_tx.send(Err(detail.clone()));
+                    Self::fail_stable_worker_creation(&inner, &prepared, &runtime_state, &detail);
+                    return;
+                }
+            };
             // The handoff caller cannot return before this exact durable Input
-            // admission exists. Paid inference may begin only afterwards.
+            // admission and cancellation owner exist. Paid inference may begin
+            // only afterwards.
             if ready_tx.send(Ok(())).is_err() {
                 Self::fail_stable_worker_creation(
                     &inner,
@@ -3292,16 +3381,12 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 );
                 return;
             }
-            let first_cancel = prepared
-                .agent
-                .execution_scope()
-                .map(|scope| scope.cancellation())
-                .unwrap_or_default();
             let first = runtime.block_on(Self::run_stable_claimed_turn(
                 &mut prepared,
                 &runtime_state.owner,
                 first_cancel,
             ));
+            drop(_active);
             Self::finish_scoped_initial_turn(&mut prepared, &first);
             runtime.block_on(Self::deliver_stable_agent_events(
                 runtime_state.router.as_ref(),
@@ -3311,12 +3396,13 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             loop {
                 match runtime_state.receiver.recv() {
                     Ok(LiveAgentCommand::Wake) => {
-                        if runtime_state.closing.load(Ordering::Acquire) {
+                        if runtime_state.control.is_closing() {
                             continue;
                         }
                         let _ = runtime.block_on(Self::run_one_stable_queued_turn(
                             &mut prepared,
                             &runtime_state.owner,
+                            &runtime_state.control,
                         ));
                         runtime.block_on(Self::deliver_stable_agent_events(
                             runtime_state.router.as_ref(),
@@ -3494,11 +3580,8 @@ impl Tool for AgentConstructor {
                 .as_deref()
                 .map(|reference| self.service.resolve_agent_history_from(&ctx, reference))
                 .transpose()?;
-            let fingerprint = Service::agent_constructor_fingerprint(
-                &ctx,
-                &args,
-                canonical_from.as_deref(),
-            )?;
+            let fingerprint =
+                Service::agent_constructor_fingerprint(&ctx, &args, canonical_from.as_deref())?;
             if let Some(replay) =
                 self.service
                     .replay_agent_constructor(&ctx, &args, &fingerprint)?
@@ -3563,12 +3646,12 @@ impl Tool for AgentConstructor {
                 return Err(error);
             }
 
-            let first = Service::run_stable_claimed_turn(
-                &mut prepared,
-                &runtime_state.owner,
-                ctx.cancellation,
-            )
-            .await;
+            let first = {
+                let cancellation = ctx.cancellation;
+                let _active = runtime_state.control.begin_turn(cancellation.clone())?;
+                Service::run_stable_claimed_turn(&mut prepared, &runtime_state.owner, cancellation)
+                    .await
+            };
             Service::finish_scoped_initial_turn(&mut prepared, &first);
             Service::deliver_stable_agent_events(
                 runtime_state.router.as_ref(),
@@ -3630,8 +3713,8 @@ mod tests {
     use aw::config;
     use aw_agent_core::{
         AccountDescriptor, CompletionFuture, CompletionMeta, DeltaSink, InvocationScope,
-        JournalEntry, Outcome, PrincipalId, Provider, ToolCall, ToolContext, ToolEffect, ToolRecord,
-        ToolStatus, Turn, TurnJournal, TurnStart, Usage,
+        JournalEntry, Outcome, PrincipalId, Provider, ToolCall, ToolContext, ToolEffect,
+        ToolRecord, ToolStatus, Turn, TurnJournal, TurnStart, Usage,
     };
     use aw_agent_core::{Message, ModelFuture, ModelReply, Role};
     #[cfg(feature = "workspace")]
@@ -6383,11 +6466,7 @@ mod tests {
             .find(|binding| binding.session_id == child.child_session_id)
             .expect("forked Agent binding");
         let child_view = store
-            .read_agent_branch_view(
-                &actor,
-                &child_binding.session_id,
-                &child_binding.branch_id,
-            )
+            .read_agent_branch_view(&actor, &child_binding.session_id, &child_binding.branch_id)
             .unwrap();
         assert_eq!(child_view.history.turns.len(), 2);
         assert_eq!(child_view.history.turns[0].id, 1);
@@ -6853,6 +6932,202 @@ mod tests {
         );
         assert_eq!(closed_root.model_attempts_started, 3);
         assert_eq!(closed_root.model_attempts_finished, 3);
+    }
+
+    #[tokio::test]
+    async fn stable_agent_close_cancels_an_active_turn_before_worker_settlement() {
+        struct BlockingProvider {
+            started: Arc<AtomicBool>,
+        }
+        impl Provider for BlockingProvider {
+            fn stream<'a>(
+                &'a self,
+                messages: &'a [Message],
+                model: &'a str,
+                _sink: &'a mut DeltaSink<'_>,
+            ) -> CompletionFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(model, "fixture-model");
+                    assert!(messages
+                        .iter()
+                        .any(|message| message.content == "blocking task"));
+                    self.started.store(true, Ordering::SeqCst);
+                    std::future::pending::<Result<CompletionMeta>>().await
+                })
+            }
+        }
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "aw-stable-agent-close-{}-{}",
+            std::process::id(),
+            unix_micros()
+        ));
+        aw_platform::ensure_private_dir(&state_dir).unwrap();
+        let actor = PrincipalId::new("local:stable-agent-close").unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let accounts = ProviderAccounts::new("local").unwrap();
+        accounts
+            .register(
+                AccountDescriptor::personal(
+                    "fixture-account",
+                    actor.clone(),
+                    "local",
+                    ["fixture-model".into()],
+                ),
+                Arc::new(BlockingProvider {
+                    started: started.clone(),
+                }),
+            )
+            .unwrap();
+        let identity = accounts
+            .select(&actor, "fixture-account", "fixture-model")
+            .unwrap()
+            .identity()
+            .clone();
+
+        let store = SessionStore::open(&state_dir).unwrap();
+        let (parent, branch) = store.create(&actor, "Parent", binding()).unwrap();
+        let (_, handle) = store.activate(&actor, &parent.id, &branch.id).unwrap();
+        handle
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "parent secret text".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        let parent_binding = store.agent_binding(&actor, &parent.id, &branch.id).unwrap();
+        let parent_owner = AgentExecutionBinding::from_trusted_host(
+            format!(
+                "/d:{}/i:{}/p:{}/a:{}",
+                parent_binding.domain_handle,
+                parent_binding.identity_handle,
+                parent_binding.project_handle,
+                parent_binding.agent_handle,
+            ),
+            parent_binding.session_id,
+            parent_binding.branch_id,
+        )
+        .unwrap();
+
+        let service = Service::new(
+            store.clone(),
+            accounts,
+            settings(),
+            ServiceConfig::new(
+                ToolMode::Off,
+                BudgetConfig::default(),
+                PathBuf::from("/tmp"),
+                None,
+            ),
+        )
+        .unwrap();
+        let router = Arc::new(
+            aw::agent_jobs::Router::new(
+                store.clone(),
+                actor.clone(),
+                LocalToolLimits::default().jobs.max_retained_jobs,
+            )
+            .unwrap(),
+        );
+        service.bind_agent_jobs_router(router.clone()).unwrap();
+        let output = service
+            .agent_tool()
+            .execute(
+                ToolContext {
+                    actor: actor.clone(),
+                    turn_id: 1,
+                    call_id: "create-blocking-stable-agent".into(),
+                    source: aw_agent_core::ToolSource::trusted_host(),
+                    effect: ToolEffect::Process,
+                    execution_site: "local".into(),
+                    cancellation: CancellationToken::new(),
+                    result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+                    identity: identity.clone(),
+                    scope: Some(InvocationScope {
+                        session_id: parent.id.clone(),
+                        branch_id: branch.id.clone(),
+                    }),
+                    execution_owner: Some(parent_owner.clone()),
+                    execution_scope: None,
+                    live_step_gate: None,
+                },
+                &json!({
+                    "task":"blocking task",
+                    "title":"Blocking child",
+                    "background":true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let canonical = output
+            .content
+            .split_whitespace()
+            .next()
+            .expect("background Agent receipt")
+            .to_owned();
+        let child_session = store
+            .subagents_for_parent(&actor, &parent.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("blocking child relation")
+            .child_session_id;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocking provider must start");
+
+        let close = aw_tools_adapter::agent_jobs::AgentJobRouter::cancel(
+            router.as_ref(),
+            &ToolContext {
+                actor: actor.clone(),
+                turn_id: 1,
+                call_id: "close-active-stable-agent".into(),
+                source: aw_agent_core::ToolSource::trusted_host(),
+                effect: ToolEffect::Control,
+                execution_site: "local".into(),
+                cancellation: CancellationToken::new(),
+                result_budget_bytes: aw_agent_core::tool::MAX_TOOL_RESULT_BYTES,
+                identity,
+                scope: Some(InvocationScope {
+                    session_id: parent.id,
+                    branch_id: branch.id,
+                }),
+                execution_owner: Some(parent_owner),
+                execution_scope: None,
+                live_step_gate: None,
+            },
+            aw_tools_adapter::agent_jobs::AgentJobCancel {
+                reference: canonical,
+                revision: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(close.content.contains(" agent closing "));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let relation = store
+                    .subagent_for_child_session(&actor, &child_session)
+                    .unwrap()
+                    .unwrap();
+                if relation.state != "running" {
+                    assert_eq!(relation.state, "cancelled");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("close must cancel the active Turn rather than wait for provider completion");
     }
 
     #[tokio::test]

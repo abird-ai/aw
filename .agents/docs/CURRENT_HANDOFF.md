@@ -201,16 +201,27 @@ The Agent admission state is now a real execution gate, not presentation-only st
 before allocating a future Input fact, then retains the existing model-pause gate. Holding admission
 therefore lets the current Turn settle while refusing future Turn admission. Close-request atomically
 moves lifecycle to `closing`/admission to `held`; `agent.admission` cannot reopen a closing/closed
-Agent. The currently exposed `agent_request_close` is deliberately only the **lower host seam**: full
-SPEC `agent.close` still requires the live host to compose factual active-Turn/owned-work cancellation,
-recipient-subscription retirement and eventual `closed` transition without fabricating certainty.
+Agent. The currently exposed `agent_request_close` is deliberately only the **lower host seam**.
+The existing stable-Agent runtime close primitive is now stronger and reusable: one shared
+`LiveAgentControl` owns the close bit plus the currently active `CancellationToken`; every stable Turn
+registers that token only for its execution interval, and close cancels it before queue/worker
+settlement. Background construction arms cancellation before the constructor handoff can return, so a
+close racing the first paid Turn cannot fall into the old wait-for-provider-completion gap. Repeated
+close uses the same level-triggered close state and does not enqueue duplicate close commands. There is
+still no second runtime/control owner or background cancellation task.
+
+Full SPEC `agent.close` remains incomplete until the live host composes this preemptive stable-Agent
+primitive with root-host active-Turn control where applicable, recipient-subscription retirement, and
+eventual `closed` transition without fabricating certainty.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
 closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
 means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
 that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
-trusted Project authority. Full live `agent.close`, initial task dispatch, explicit Sandbox binding and
-later staged `agent.inputs.*` remain open. History ancestry still grants none of those authorities.
+trusted Project authority. Full live `agent.close` composition, initial task dispatch, explicit Sandbox binding and later staged
+`agent.inputs.*` remain open. The stable-child active-Turn cancellation sub-primitive is complete;
+recipient subscription retirement/root-host composition are still pending. History ancestry still
+grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -230,6 +241,9 @@ failures are older remote-start/remote-view migration fixtures that downgrade an
 schema to v34/v35 without removing later v38+ tables, then re-run initialization and collide with those
 still-existing tables. They reproduce individually and are outside this Agent-owned cut; they are not
 claimed green or repaired here. The required focused Agent/history/admission regressions remain green.
+The stable-Agent close regression now additionally covers a provider attempt that never completes on
+its own: close preempts the active Turn and reaches factual cancelled child settlement within the test
+bound, while the existing create/continue/idle-close regression remains green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

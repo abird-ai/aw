@@ -117,10 +117,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       seam compose `agent_state_current`; fresh/exact-history create keeps trusted current Project +
       execution binding outside caller/model fields and installs private/inherit/custom access inside
       the same immediate existing-constructor transaction. Real Actor future-Input admission now checks
-      Agent lifecycle/admission before the legacy pause gate. Still open before this host shell is
-      complete: live initial `task` dispatch, explicit logical Sandbox refs/`auto` policy owner,
-      reviewed cross-Project redirect authority, factual full `agent.close` runtime/subscription
-      retirement + terminal closure, then staged `agent.inputs.*`. After that propagate provenance
+      Agent lifecycle/admission before the legacy pause gate. **Stable-Agent active close is now
+      preemptive:** one shared close/cancellation primitive tracks only the current Turn token; close
+      cancels that token before worker settlement, background construction arms it before handoff, and
+      repeated close does not enqueue duplicate close commands. One real blocking-provider regression
+      proves the child reaches factual cancelled settlement instead of waiting forever. Still open
+      before the host shell is complete: live initial `task` dispatch, explicit logical Sandbox
+      refs/`auto` policy owner, reviewed cross-Project redirect authority, recipient-subscription/root-
+      host composition for full `agent.close` + terminal closure, then staged `agent.inputs.*`. After
+      that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
