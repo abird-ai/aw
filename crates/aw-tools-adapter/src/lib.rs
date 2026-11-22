@@ -968,6 +968,23 @@ pub fn configure(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<AgentBuilder> {
+    Ok(configure_inner(builder, actor, options, None)?.builder)
+}
+
+pub struct ConfiguredLocalTools {
+    pub builder: AgentBuilder,
+    pub job_runtime: Option<Arc<job_runtime::JobRuntime>>,
+}
+
+/// Host-facing variant of `configure` that returns the exact finite-work
+/// runtime installed into the Agent builder. No second runtime is constructed:
+/// lifecycle owners can retain this handle to fence/cancel/wait on the same
+/// Job namespace used by the model-facing tools.
+pub fn configure_with_runtime(
+    builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+) -> Result<ConfiguredLocalTools> {
     configure_inner(builder, actor, options, None)
 }
 
@@ -981,17 +998,20 @@ pub fn configure_with_toolset(
 ) -> Result<AgentBuilder> {
     let mut configured = options.clone();
     configured.limits = options.limits.with_toolset(toolset);
-    configure_inner(builder, actor, &configured, Some(toolset))
+    Ok(configure_inner(builder, actor, &configured, Some(toolset))?.builder)
 }
 fn configure_inner(
     mut builder: AgentBuilder,
     actor: PrincipalId,
     options: &LocalToolOptions,
     catalog: Option<&aw_tools::toolset::Toolset>,
-) -> Result<AgentBuilder> {
+) -> Result<ConfiguredLocalTools> {
     if options.mode == ToolMode::Off {
         if options.selected_tools.is_empty() {
-            return Ok(builder);
+            return Ok(ConfiguredLocalTools {
+                builder,
+                job_runtime: None,
+            });
         }
         let agent_subscribe_only = options.selected_tools.len() == 1
             && options.selected_tools[0] == "jobs_subscribe"
@@ -1299,7 +1319,10 @@ fn configure_inner(
             "selected tool is unavailable under the current tool mode",
         ));
     }
-    Ok(builder.tool_policy(policy))
+    Ok(ConfiguredLocalTools {
+        builder: builder.tool_policy(policy),
+        job_runtime,
+    })
 }
 pub fn validate_root(path: &Path) -> Result<PathBuf> {
     let path = path.canonicalize()?;

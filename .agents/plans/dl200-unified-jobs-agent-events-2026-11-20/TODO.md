@@ -126,10 +126,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       from existing source books, drops pending deliveries + durable wake admission, bumps each affected
       source Agent once, and delegated close evicts its cached wake admission before signalling the
       worker. Replay repairs retirement idempotently. The transitional implementation intentionally uses
-      a cold close-path scan rather than prebuilding Phase-2 indexing. Still open before the host shell
-      is complete: live initial `task` dispatch, explicit logical Sandbox refs/`auto` policy owner,
-      reviewed cross-Project redirect authority, root-host runtime/cache composition + terminal closure
-      for full `agent.close`, then staged `agent.inputs.*`. After that propagate provenance
+      a cold close-path scan rather than prebuilding Phase-2 indexing. **Finite Job close ownership is
+      now reusable too:** the canonical per-Agent `JobRuntime` can be retained by the host via
+      `configure_with_runtime`; `close_owner` fences new finite work, cancels through the existing
+      JobHost/JobManager + exact runner tokens, waits for quiescence, and refuses terminal success while
+      JobManager still reports ambiguous/in-flight/live-writer state. No parallel Job lifecycle or index
+      was added. Still open before the host shell is complete: compose that owner with stable/root close
+      while preserving retriable `closing` on uncertainty, root active-Turn control, final terminal
+      closure, live initial `task` dispatch, explicit logical Sandbox refs/`auto` policy owner, reviewed
+      cross-Project redirect authority, then staged `agent.inputs.*`. After that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first

@@ -69,6 +69,7 @@ struct State {
     generation: u64,
     scope: LiveScope,
     host: Arc<JobHost>,
+    closing: bool,
     runners: HashMap<String, CancellationToken>,
     control_replays: HashMap<[u8; 32], ControlReplayEntry>,
 }
@@ -155,6 +156,7 @@ pub struct JobRuntime {
     allow_wake: bool,
     max_graph_nodes: usize,
     state: Mutex<State>,
+    runner_change: tokio::sync::Notify,
 }
 impl JobRuntime {
     pub fn new(
@@ -256,9 +258,11 @@ impl JobRuntime {
                 generation: 1,
                 scope,
                 host,
+                closing: false,
                 runners: HashMap::new(),
                 control_replays: HashMap::new(),
             }),
+            runner_change: tokio::sync::Notify::new(),
         }))
     }
 
@@ -628,11 +632,104 @@ impl JobRuntime {
         Ok((state.generation, state.host.clone()))
     }
 
+    fn current_host_for_admission(&self, ctx: &ToolContext) -> Result<(u64, Arc<JobHost>)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Protocol("Job runtime state poisoned"))?;
+        if !state.scope.matches_context(ctx.scope.as_ref()) {
+            return Err(Error::Denied(
+                "Job runtime is bound to another live Session; finish scope replacement first",
+            ));
+        }
+        if state.closing {
+            return Err(Error::Denied("Agent finite-work admission is closing"));
+        }
+        state.host.bind_execution_owner(ctx)?;
+        Ok((state.generation, state.host.clone()))
+    }
+
     fn runner_finished(&self, generation: u64, id: &str) {
         if let Ok(mut state) = self.state.lock() {
             if state.generation == generation {
                 state.runners.remove(id);
+                self.runner_change.notify_waiters();
             }
+        }
+    }
+
+    /// Host lifecycle close for the exact Agent-owned finite-work namespace.
+    /// JobManager remains the factual lifecycle owner; this only fences future
+    /// admission, requests ordinary cancellation for every live runner, signals
+    /// those exact runner tokens, and waits until the manager proves quiescence.
+    pub async fn close_owner(&self, scope: Option<&InvocationScope>) -> Result<()> {
+        let (generation, host, runners) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Protocol("Job runtime state poisoned"))?;
+            if !state.scope.matches_context(scope) {
+                return Err(Error::Denied(
+                    "finite-work close targets another Agent Session",
+                ));
+            }
+            state.closing = true;
+            (
+                state.generation,
+                state.host.clone(),
+                state
+                    .runners
+                    .iter()
+                    .map(|(id, token)| (id.clone(), token.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let mut first_error = None;
+        for (id, token) in runners {
+            if let Err(error) = host.cancel(&id) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            token.cancel();
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        loop {
+            let notified = self.runner_change.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let runners_empty = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| Error::Protocol("Job runtime state poisoned"))?;
+                if state.generation != generation
+                    || !Arc::ptr_eq(&state.host, &host)
+                    || !state.scope.matches_context(scope)
+                {
+                    return Err(Error::Denied(
+                        "finite-work owner changed during Agent close",
+                    ));
+                }
+                state.runners.is_empty()
+            };
+            if runners_empty {
+                if host
+                    .manager()
+                    .has_nonterminal_jobs()
+                    .map_err(|_| Error::Protocol("cannot inspect Agent finite-work settlement"))?
+                {
+                    return Err(Error::Conflict(
+                        "Agent finite-work state remains unresolved after cancellation",
+                    ));
+                }
+                return Ok(());
+            }
+            notified.await;
         }
     }
 
@@ -713,7 +810,7 @@ impl JobRuntime {
         ops: &Value,
         expose: bool,
     ) -> Result<StartedJob> {
-        let (generation, host) = self.current_host(ctx)?;
+        let (generation, host) = self.current_host_for_admission(ctx)?;
         let prepared = host.prepare(ctx, ops)?;
         let token = CancellationToken::new();
         let id = {
@@ -724,6 +821,7 @@ impl JobRuntime {
             if state.generation != generation
                 || !Arc::ptr_eq(&state.host, &host)
                 || !state.scope.matches_context(ctx.scope.as_ref())
+                || state.closing
             {
                 return Err(Error::Denied("Job Session changed during Graph preflight"));
             }
@@ -750,7 +848,7 @@ impl JobRuntime {
         wake: InitialWake,
     ) -> Result<StartedJob> {
         self.revalidate_initial_wake(ctx, &wake)?;
-        let (generation, host) = self.current_host(ctx)?;
+        let (generation, host) = self.current_host_for_admission(ctx)?;
         let prepared = host.prepare(ctx, ops)?;
         let reservation = host.reserve_graph_admission(ctx, expose)?;
         let token = CancellationToken::new();
@@ -762,6 +860,7 @@ impl JobRuntime {
             if state.generation != generation
                 || !Arc::ptr_eq(&state.host, &host)
                 || !state.scope.matches_context(ctx.scope.as_ref())
+                || state.closing
             {
                 drop(state);
                 let _ = host.release_graph_admission(&reservation);
@@ -806,7 +905,7 @@ impl JobRuntime {
         if ctx.scope.is_some() {
             return self.start_graph(ctx, ops, expose).map(StartDecision::New);
         }
-        let (generation, host) = self.current_host(ctx)?;
+        let (generation, host) = self.current_host_for_admission(ctx)?;
         let prepared = host.prepare(ctx, ops)?;
         let namespace = format!(
             "job-create:{}:{}",
@@ -825,6 +924,7 @@ impl JobRuntime {
             if state.generation != generation
                 || !Arc::ptr_eq(&state.host, &host)
                 || !state.scope.matches_context(ctx.scope.as_ref())
+                || state.closing
             {
                 return Err(Error::Denied("Job Session changed during Graph preflight"));
             }
@@ -846,7 +946,10 @@ impl JobRuntime {
                         .state
                         .lock()
                         .map_err(|_| Error::Protocol("Job runtime state poisoned"))?;
-                    if state.generation != generation || !Arc::ptr_eq(&state.host, &host) {
+                    if state.generation != generation
+                        || !Arc::ptr_eq(&state.host, &host)
+                        || state.closing
+                    {
                         let _ = host.revoke(&id);
                         return Err(Error::Denied("Job Session changed during replay admission"));
                     }
@@ -874,7 +977,7 @@ impl JobRuntime {
                 .map(StartDecision::New);
         }
 
-        let (generation, host) = self.current_host(ctx)?;
+        let (generation, host) = self.current_host_for_admission(ctx)?;
         let prepared = host.prepare(ctx, ops)?;
         let namespace = format!(
             "job-create:{}:{}",
@@ -912,6 +1015,7 @@ impl JobRuntime {
                     if state.generation != generation
                         || !Arc::ptr_eq(&state.host, &host)
                         || !state.scope.matches_context(ctx.scope.as_ref())
+                        || state.closing
                     {
                         let _ = host.revoke(&id);
                         return Err(Error::Denied(
@@ -965,7 +1069,7 @@ impl JobRuntime {
             };
         }
 
-        let (generation, host) = self.current_host(ctx)?;
+        let (generation, host) = self.current_host_for_admission(ctx)?;
         let draft = host.prepare(ctx, ops)?;
         let reservation = host.reserve_graph_admission(ctx, expose)?;
         let request = match host.graph_preseal_request(reservation.id(), ops, &draft) {
@@ -1024,6 +1128,7 @@ impl JobRuntime {
             if state.generation != generation
                 || !Arc::ptr_eq(&state.host, &host)
                 || !state.scope.matches_context(ctx.scope.as_ref())
+                || state.closing
             {
                 drop(state);
                 let _ = router.abandon_preseal(reservation.id());
@@ -1124,7 +1229,7 @@ impl JobRuntime {
         ctx: &ToolContext,
         source_id: &str,
     ) -> Result<(crate::job_host::AdmissionDecision, Option<StartedJob>)> {
-        let (generation, host) = self.current_host(ctx)?;
+        let (generation, host) = self.current_host_for_admission(ctx)?;
         let decision = host.restart(ctx, source_id)?;
         let id = match &decision {
             crate::job_host::AdmissionDecision::New(id) => id.clone(),
@@ -1136,7 +1241,7 @@ impl JobRuntime {
                 .state
                 .lock()
                 .map_err(|_| Error::Protocol("Job runtime state poisoned"))?;
-            if state.generation != generation || !Arc::ptr_eq(&state.host, &host) {
+            if state.generation != generation || !Arc::ptr_eq(&state.host, &host) || state.closing {
                 let _ = host.revoke(&id);
                 return Err(Error::Denied(
                     "Job Session changed during restart admission",
@@ -1239,6 +1344,7 @@ impl InvocationScopeLifecycle for JobRuntime {
             .ok_or(Error::Limit("Job runtime scope generations exhausted"))?;
         state.scope = scope;
         state.host = host;
+        state.closing = false;
         state.runners.clear();
         state.control_replays.clear();
         Ok(())
@@ -2093,6 +2199,51 @@ mod tests {
             snapshot.lifecycle,
             aw_tools::filesystem::job::Lifecycle::Terminal
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_close_cancels_live_finite_work_waits_for_quiescence_and_fences_admission() {
+        let (root, _agent, runtime, mut ctx) = shell_runtime_fixture();
+        ctx.call_id = "owner-close".into();
+        let started = runtime
+            .start_graph(
+                &ctx,
+                &serde_json::json!({"ops":[["bash",{
+                    "command":"while :; do :; done",
+                    "timeout_secs":10
+                }]]}),
+                true,
+            )
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            runtime.close_owner(ctx.scope.as_ref()),
+        )
+        .await
+        .expect("owner close must wait only for factual Job settlement")
+        .unwrap();
+        let snapshot = started.task.await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.stop_reason,
+            Some(aw_tools::filesystem::job::StopReason::Cancelled)
+        );
+        assert_eq!(
+            snapshot.lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        );
+        assert!(!started.host.manager().has_nonterminal_jobs().unwrap());
+        assert!(matches!(
+            runtime.start_graph(
+                &ctx,
+                &serde_json::json!({"ops":[["read",{"path":"a.txt"}]]}),
+                true,
+            ),
+            Err(Error::Denied(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

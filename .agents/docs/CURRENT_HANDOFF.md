@@ -219,18 +219,31 @@ a cold close-path scan over the transitional JSON books rather than a new schema
 would immediately replace. Delegated/model close performs the same retirement (including replay repair)
 and evicts matching in-memory wake admissions before signalling the live worker.
 
-Full SPEC `agent.close` remains incomplete until the live host composes these durable/preemptive
-primitives with root-host active-Turn control where applicable and eventual `closed` transition without
-fabricating certainty.
+Finite Job ownership now has the missing reusable lifecycle seam too, without moving Job facts out of
+`JobManager`. `JobRuntime::close_owner` fences new finite-work admission for one exact Agent Session,
+requests ordinary factual cancellation through the existing `JobHost`/`JobManager` for every live
+runner, signals those exact runner tokens, waits for runner quiescence, and returns success only when
+`JobManager::has_nonterminal_jobs()` proves there is no journal ambiguity, in-flight transition or live
+writer. Unresolved work returns conflict rather than manufacturing terminality. Tool configuration now
+has a host-facing `configure_with_runtime` variant that returns the **same Arc<JobRuntime>** installed
+into the Agent builder, so root/stable lifecycle composition can retain the real finite-work owner
+without constructing a parallel runtime. The old `configure`/`configure_with_toolset` APIs and the
+ToolMode::Off zero-runtime fast path are unchanged for existing callers.
+
+Full SPEC `agent.close` remains incomplete until the live host composes these durable/preemptive owners
+with root-host active-Turn control and the final stable/root `closing -> closed` transition. That next
+composition must preserve a retriable/inspectable `closing` state when finite work is unresolved rather
+than dropping the live owner.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
 closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
 means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
 that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
 trusted Project authority. Full live `agent.close` composition, initial task dispatch, explicit Sandbox
-binding and later staged `agent.inputs.*` remain open. Stable-child active-Turn cancellation and durable
-recipient-subscription retirement are complete; root-host runtime/cache composition and terminal closure
-are still pending. History ancestry still grants none of those authorities.
+binding and later staged `agent.inputs.*` remain open. Stable-child active-Turn cancellation, durable
+recipient-subscription retirement, and the shared finite-Job owner-close/quiescence primitive are
+complete; root/stable host composition of that primitive plus terminal closure is still pending. History
+ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -255,6 +268,10 @@ its own: close preempts the active Turn and reaches factual cancelled child sett
 bound, while the existing create/continue/idle-close regression remains green. Existing event-source
 coverage now proves receiver retirement clears both root+exact-Turn rules and pending deliveries while
 bumping the source Agent once; the host-shell regression proves close invokes retirement atomically.
+A real finite shell-Job regression now proves `JobRuntime::close_owner` cancels through JobManager,
+waits for terminal/quiescent output ownership, then rejects new finite-work admission; the existing scope
+replacement runner-cancellation regression remains green. Adapter check + strict all-target Clippy are
+green for that owner cut.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017
