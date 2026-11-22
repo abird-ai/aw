@@ -30,6 +30,8 @@ use zeroize::Zeroizing;
 pub mod actor_owner;
 #[cfg(feature = "durable")]
 pub mod agent_jobs;
+#[cfg(feature = "durable")]
+pub mod agent_lifecycle;
 #[cfg(all(feature = "durable", feature = "pipelines", feature = "routing"))]
 pub mod approval_ui;
 pub mod context;

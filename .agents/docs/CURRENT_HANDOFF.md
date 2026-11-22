@@ -249,21 +249,24 @@ Applied/Unknown owner, and returns `None` only when both the live owner and dura
 active Turn. `SessionStore::agent_finish_close` is the matching terminal Store seam: it accepts only a
 previously requested `closing` Agent, rechecks under one writer transaction that no journaled Turn is
 running, advances once to `closed`, and is idempotent thereafter. It intentionally knows nothing about
-finite Jobs; the outer host must prove `JobRuntime::close_owner` first. Root/native Host now already
-retains the exact configured `Arc<JobRuntime>` through the opt-in runtime-returning construction path;
-what remains is only the actual orchestration of these three existing owners.
+finite Jobs; the outer host must prove `JobRuntime::close_owner` first. Root/native Host now retains the
+exact configured `Arc<JobRuntime>` through the opt-in runtime-returning construction path and one
+transport-neutral `RootAgentClose` composes the existing owners in order: durable close request + pending
+queue retirement, exact current-Turn cancel/withdrawal, finite-work close, factual Turn quiescence,
+terminal Store close, then live-router retirement. It owns no second lifecycle state.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
 closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
 means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
 that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
-trusted Project authority. Full live `agent.close` composition, initial task dispatch, explicit Sandbox
-binding and later staged `agent.inputs.*` remain open. Stable-child active-Turn cancellation, durable
-recipient-subscription retirement, finite-Job owner-close/quiescence, and stable-child terminal close
-composition are complete. Root/default Actor current-Turn cancellation and terminal Store seams are now
-complete too; the configured root `JobRuntime` is retained by native Host, while composing Actor Control
-+ finite work + terminal Store transition there is still pending. History ancestry still grants none of
-those authorities.
+trusted Project authority. Current-root `agent.close` composition is now complete: native Host retains
+the composed close owner and stdio exposes a concurrent `agent_close` live port accepting only `ref` (the
+current `.` or its exact canonical root) plus optional `rev`; it cannot select Project/Sandbox/provider or
+execution authority. Stable-child active-Turn cancellation, durable recipient-subscription retirement,
+finite-Job owner-close/quiescence, stable-child terminal close and current-root terminal close are all
+complete. The broader §28 shell still needs live initial task dispatch, explicit Sandbox ownership,
+reviewed cross-Project redirect authority, later staged `agent.inputs.*`, and any future host routing for
+non-current Agent refs. History ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -293,10 +296,13 @@ terminal/quiescent output ownership, then rejects new finite-work admission. The
 blocking-provider close and create/continue/close regressions remain green after stable close was wired to
 that exact runtime handle, proving the composition did not regress active-Turn preemption or normal
 terminal settlement. The existing scope-replacement runner-cancellation regression remains green. A new
-Actor-owner regression proves trusted host close cancels a genuinely running provider Turn without any
-model `jobs_cancel` grant and settles it as Cancelled; the host-shell regression now also proves terminal
-close is rejected before a close request, advances `closing -> closed` once, and replays idempotently.
-Root JobRuntime retention/orchestration is still open; no root-close completion is claimed yet.
+Actor-owner regression proves trusted host close both withdraws an accepted pre-claim Input as durable
+`Rejected` and cancels a genuinely running provider Turn without any model `jobs_cancel` grant, settling
+it as Cancelled. The host-shell regression proves terminal close is rejected before a close request,
+advances `closing -> closed` once, and replays idempotently. A single root lifecycle regression now drives
+a blocked tool-capable root Turn through `RootAgentClose`, including retained JobRuntime closure and
+revision-stable replay. The existing headless strict-frame regression remains green with the new live
+`agent_close` capability.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

@@ -45,6 +45,13 @@ pub trait LiveControlPort: Send + Sync {
     fn apply(&self, operation: Value) -> Result<Value>;
 }
 
+/// Concurrent owner-bound Agent lifecycle port. The transport supplies only
+/// the target ref/revision; Project, provider, Sandbox and execution authority
+/// remain fixed by the already-bound host.
+pub trait AgentClosePort: Send + Sync {
+    fn apply(&self, reference: &str, expected_rev: Option<u64>) -> Result<Value>;
+}
+
 pub trait Driver {
     /// Must execute using aw's existing, exactly selected Agent/journal.
     fn prompt(
@@ -97,6 +104,9 @@ pub trait Driver {
         false
     }
     fn live_control_port(&self) -> Option<Arc<dyn LiveControlPort>> {
+        None
+    }
+    fn agent_close_port(&self) -> Option<Arc<dyn AgentClosePort>> {
         None
     }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
@@ -312,6 +322,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "set_model" => Some(&["model"]),
         "set_effort" => Some(&["effort"]),
         "actor_query" | "actor_op" => Some(&["operation"]),
+        "agent_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
             "message_id",
@@ -382,7 +393,7 @@ fn bounded_history(turns: &[Turn], limit: usize) -> Value {
 
 enum Inbound {
     Request(Request, bool),
-    LiveControl(Request, std::result::Result<Value, &'static str>),
+    LiveResult(Request, std::result::Result<Value, &'static str>),
     Invalid,
 }
 fn read_bounded_line<R: BufRead>(input: &mut R) -> io::Result<Option<(Vec<u8>, bool)>> {
@@ -420,6 +431,7 @@ fn stdin_reader<R: Read + Send + 'static>(
     tx: mpsc::SyncSender<Inbound>,
     active: Arc<Mutex<Option<(String, CancellationToken)>>>,
     live_control: Option<Arc<dyn LiveControlPort>>,
+    agent_close: Option<Arc<dyn AgentClosePort>>,
 ) {
     let mut reader = BufReader::new(input);
     loop {
@@ -486,7 +498,42 @@ fn stdin_reader<R: Read + Send + 'static>(
                         Ok(fact)
                     })();
                     parsed =
-                        Inbound::LiveControl(request.clone(), outcome.map_err(|e| error_code(&e)));
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
+                }
+            } else if request.method == "agent_close" {
+                if let Some(port) = &agent_close {
+                    let outcome = (|| -> Result<Value> {
+                        validate_method_params(&request.method, &request.params)?;
+                        let reference = request
+                            .params
+                            .get("ref")
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .ok_or(Error::Protocol("agent_close ref must be a string"))
+                            })
+                            .transpose()?
+                            .unwrap_or(".");
+                        if reference.is_empty()
+                            || reference.len() > 2048
+                            || !reference.is_ascii()
+                            || reference.chars().any(char::is_control)
+                        {
+                            return Err(Error::Protocol("invalid agent_close ref"));
+                        }
+                        let expected_rev = request
+                            .params
+                            .get("rev")
+                            .map(|value| {
+                                value.as_u64().ok_or(Error::Protocol(
+                                    "agent_close rev must be a nonnegative integer",
+                                ))
+                            })
+                            .transpose()?;
+                        port.apply(reference, expected_rev)
+                    })();
+                    parsed =
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
                 }
             }
         }
@@ -518,6 +565,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "actor_enqueue":driver.actor_available(),
             "actor_step":driver.actor_available(),
             "actor_notice_read":driver.actor_available(),
+            "agent_close":driver.agent_close_port().is_some(),
         },
         "profile":initial.profile,"model":initial.model,
         "warning":"client MUST inspect durable state after transport loss; never replay an uncertain prompt"
@@ -526,7 +574,8 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let (tx, rx) = mpsc::sync_channel(MAX_INPUT_QUEUE);
     let guard = active.clone();
     let live_port = driver.live_control_port();
-    let read = thread::spawn(move || stdin_reader(reader, tx, guard, live_port));
+    let agent_close = driver.agent_close_port();
+    let read = thread::spawn(move || stdin_reader(reader, tx, guard, live_port, agent_close));
     let mut seen = BTreeSet::<String>::new();
     while let Ok(message) = rx.recv() {
         let (request, abort_requested, live_result) = match message {
@@ -539,7 +588,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
                 continue;
             }
             Inbound::Request(r, requested) => (r, requested, None),
-            Inbound::LiveControl(r, result) => (r, false, Some(result)),
+            Inbound::LiveResult(r, result) => (r, false, Some(result)),
         };
         let id = request.id.as_str();
         if !seen.insert(request.id.clone()) {

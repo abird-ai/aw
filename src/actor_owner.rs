@@ -199,6 +199,7 @@ impl WriterEpochFence for DurableFence {
 #[derive(Default)]
 struct State {
     input: Option<ActorInputAdmission>,
+    input_sender: Option<ActorKey>,
     busy: bool,
     poisoned: bool,
     claiming: bool,
@@ -237,9 +238,11 @@ pub struct Service {
     site: String,
     controller: AgentSessionController,
     state: Arc<Mutex<State>>,
+    change: Arc<tokio::sync::Notify>,
 }
 struct RunGuard {
     state: Arc<Mutex<State>>,
+    change: Arc<tokio::sync::Notify>,
     finished: bool,
 }
 impl RunGuard {
@@ -250,6 +253,9 @@ impl RunGuard {
             .map_err(|_| Error::Storage("Actor owner state lock poisoned"))?;
         state.busy = false;
         state.input = None;
+        state.input_sender = None;
+        drop(state);
+        self.change.notify_waiters();
         self.finished = true;
         Ok(())
     }
@@ -261,6 +267,7 @@ impl Drop for RunGuard {
                 state.poisoned = true;
                 state.busy = false;
             }
+            self.change.notify_waiters();
         }
     }
 }
@@ -325,6 +332,7 @@ impl Service {
         });
         let controller = AgentSessionController::new(runtime, owner.clone(), actor, Some(epoch))?
             .with_writer_fence(fence)?;
+        let change = Arc::new(tokio::sync::Notify::new());
         Ok(Self {
             store,
             owner,
@@ -335,6 +343,7 @@ impl Service {
             site,
             controller,
             state: Arc::new(Mutex::new(State::default())),
+            change,
         })
     }
 
@@ -933,6 +942,7 @@ impl Service {
         participant: Option<ParticipantInputAdmission>,
     ) -> Result<ActorInputFact> {
         let request_id = request_id.into();
+        let input_sender = message.from;
         if !from_queue && request_id.starts_with("qi_") {
             return Err(Error::Denied(
                 "queue-derived Input IDs are reserved for owning Runtime",
@@ -1012,6 +1022,7 @@ impl Service {
                 // The in-memory queue now contains the message. Until this
                 // immutable acceptance ACK commits, it MUST NOT dispatch.
                 state.input = Some(admission.clone());
+                state.input_sender = Some(input_sender);
                 match self.store.actor_input_transition(
                     &self.owner,
                     &admission,
@@ -1021,6 +1032,7 @@ impl Service {
                     Ok(fact) => Ok(fact),
                     Err(error) => {
                         state.poisoned = true;
+                        self.change.notify_waiters();
                         Err(error)
                     }
                 }
@@ -2837,7 +2849,7 @@ impl Service {
             return Err(Error::Denied("invalid Agent close revision"));
         }
         let input = {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .map_err(|_| Error::Storage("Actor owner state lock poisoned"))?;
@@ -2847,6 +2859,53 @@ impl Service {
                 ));
             }
             if !state.busy {
+                if let Some(input) = state.input.clone() {
+                    let sender = state.input_sender.ok_or(Error::Conflict(
+                        "accepted Agent Input has no retained Runtime sender",
+                    ))?;
+                    let removed = match self.controller.delete_pending(sender, input.message_id) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            state.poisoned = true;
+                            self.change.notify_waiters();
+                            return Err(error);
+                        }
+                    };
+                    let exact = removed.kind == Kind::Input
+                        && removed.from == sender
+                        && removed.to == self.actor
+                        && removed.id == input.message_id
+                        && removed.source_sequence == input.message_id
+                        && matches!(removed.turn, TurnTarget::Exact(turn) if turn == input.turn_id)
+                        && format!("{:x}", Sha256::digest(removed.payload.as_bytes()))
+                            == input.payload_sha256;
+                    if !exact {
+                        state.poisoned = true;
+                        self.change.notify_waiters();
+                        return Err(Error::Conflict(
+                            "withdrawn Agent Input differs from durable acceptance",
+                        ));
+                    }
+                    match self.store.actor_input_transition(
+                        &self.owner,
+                        &input,
+                        InputAdmissionState::Accepted,
+                        InputAdmissionState::Rejected,
+                    ) {
+                        Ok(_) => {
+                            state.input = None;
+                            state.input_sender = None;
+                            drop(state);
+                            self.change.notify_waiters();
+                            return Ok(None);
+                        }
+                        Err(error) => {
+                            state.poisoned = true;
+                            self.change.notify_waiters();
+                            return Err(error);
+                        }
+                    }
+                }
                 drop(state);
                 if self
                     .store
@@ -2910,6 +2969,42 @@ impl Service {
         )?;
         self.control(request_id, ActorControlAction::CancelTurn, message_id)
             .map(Some)
+    }
+
+    /// Wait for this exact live owner to have no accepted or active Turn.
+    /// Poisoned/claiming state remains uncertain and must be inspected rather
+    /// than being treated as quiescent.
+    pub async fn wait_turn_quiescent(&self) -> Result<()> {
+        loop {
+            let notified = self.change.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| Error::Storage("Actor owner state lock poisoned"))?;
+                if state.poisoned || state.claiming {
+                    return Err(Error::Conflict(
+                        "Agent Turn owner requires inspection before close",
+                    ));
+                }
+                if !state.busy && state.input.is_none() {
+                    drop(state);
+                    if self
+                        .store
+                        .active_turn_for_branch(&self.owner, &self.session, &self.branch)?
+                        .is_some()
+                    {
+                        return Err(Error::Conflict(
+                            "Agent journal still reports an active Turn after live quiescence",
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
     }
 
     /// Typed, strictly owner-originated synchronous Control on an already
@@ -3122,6 +3217,7 @@ impl Service {
 
         let mut guard = RunGuard {
             state: self.state.clone(),
+            change: self.change.clone(),
             finished: false,
         };
         let proof = |message: &ActorMessage, turn: u64| -> Result<()> {
@@ -8063,6 +8159,26 @@ mod tests {
 
     #[tokio::test]
     async fn host_agent_close_cancels_exact_active_turn_without_model_control_grant() {
+        let pending = setup(None);
+        pending
+            .owner
+            .submit(
+                &pending.agent,
+                "host_close_preclaim",
+                input(&pending.owner, 1, 1, "never dispatch this"),
+            )
+            .unwrap();
+        assert!(pending
+            .owner
+            .cancel_active_turn_for_agent_close(16)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            pending.owner.fact("host_close_preclaim").unwrap().state,
+            InputAdmissionState::Rejected
+        );
+        pending.owner.wait_turn_quiescent().await.unwrap();
+
         let entered = Arc::new(tokio::sync::Notify::new());
         let fixture = setup(Some(entered.clone()));
         fixture

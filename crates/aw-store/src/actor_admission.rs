@@ -437,6 +437,7 @@ impl SessionStore {
                     InputAdmissionState::Accepted,
                     InputAdmissionState::Dispatching
                 )
+                | (InputAdmissionState::Accepted, InputAdmissionState::Rejected)
                 | (InputAdmissionState::Accepted, InputAdmissionState::Unknown)
                 | (
                     InputAdmissionState::Dispatching,

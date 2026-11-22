@@ -4,11 +4,11 @@ mod attach;
 mod awnet;
 #[cfg(all(feature = "device", target_os = "linux"))]
 mod device;
-mod resources_cli;
 mod resource_cli_args;
-mod skill_package;
+mod resources_cli;
 #[cfg(feature = "routing")]
 mod routing_runtime;
+mod skill_package;
 #[cfg(all(feature = "team", target_os = "linux"))]
 mod team;
 // Opt-in host-only Actor/child services. 9C gates authenticated stdio
@@ -19,6 +19,8 @@ mod subagents;
 mod tui;
 #[cfg(feature = "workspace")]
 mod workspace;
+#[cfg(feature = "jsonl")]
+use aw::sessions::JsonlPersistentSession;
 use aw::{
     config::{self, Profile, ProviderKind, Settings},
     context::ExecutionContext,
@@ -27,11 +29,9 @@ use aw::{
     terminal::{self, Input},
     Agent, AgentEvent, Error, Result,
 };
-#[cfg(feature = "jsonl")]
-use aw::sessions::JsonlPersistentSession;
+use aw_store::{SessionInfo, SessionStore};
 #[cfg(feature = "jsonl")]
 use aw_store_api::SessionBackend;
-use aw_store::{SessionInfo, SessionStore};
 use clap::{Parser, Subcommand};
 use std::{
     collections::BTreeMap,
@@ -430,19 +430,19 @@ pub(crate) struct TargetCliArgs {
     context_compact_mode: String,
     /// Preserve this many complete most-recent active Turns on checkpoint.
     #[arg(long="context-keep-recent",default_value_t=16,value_parser=clap::value_parser!(u32).range(1..=64),help_heading="Context & compaction")]
-    context_keep_recent:u32,
+    context_keep_recent: u32,
     /// Suggest or initiate compaction when this number of active Turns is reached.
     #[arg(long="context-trigger-turns",default_value_t=64,value_parser=clap::value_parser!(u32).range(2..=256),help_heading="Context & compaction")]
-    context_trigger_turns:u32,
+    context_trigger_turns: u32,
     /// Proven current model context window byte limit, absent by default.
     #[arg(long="context-known-window-bytes",value_parser=clap::value_parser!(u64).range(1024..=268435456),help_heading="Context & compaction")]
-    context_known_window_bytes:Option<u64>,
+    context_known_window_bytes: Option<u64>,
     /// Permit a separately journaled paid automatic summary attempt.
-    #[arg(long="context-auto-spend",help_heading="Context & compaction")]
-    context_auto_spend:bool,
+    #[arg(long = "context-auto-spend", help_heading = "Context & compaction")]
+    context_auto_spend: bool,
     /// Explicitly summarize and checkpoint current JSONL Session once, then exit.
-    #[arg(long="context-compact-now",help_heading="Context & compaction")]
-    context_compact_now:bool,
+    #[arg(long = "context-compact-now", help_heading = "Context & compaction")]
+    context_compact_now: bool,
 }
 impl Default for TargetCliArgs {
     fn default() -> Self {
@@ -460,12 +460,12 @@ impl Default for TargetCliArgs {
             branch: "main".into(),
             title: None,
             allow_context_transfer: false,
-            context_compact_mode:"ask".into(),
-            context_keep_recent:16,
-            context_trigger_turns:64,
-            context_known_window_bytes:None,
-            context_auto_spend:false,
-            context_compact_now:false,
+            context_compact_mode: "ask".into(),
+            context_keep_recent: 16,
+            context_trigger_turns: 64,
+            context_known_window_bytes: None,
+            context_auto_spend: false,
+            context_compact_now: false,
         }
     }
 }
@@ -749,7 +749,10 @@ struct RootRunCliArgs {
           help_heading="Interface & output")]
     output: aw::headless::Output,
     /// Log only event types/frame lengths to stderr, never raw payload/credentials.
-    #[arg(long="diagnostics-protocol",help_heading="Diagnostics & validation")]
+    #[arg(
+        long = "diagnostics-protocol",
+        help_heading = "Diagnostics & validation"
+    )]
     diagnostics_protocol: bool,
     /// Compatibility spelling for the canonical `aw web` command.
     #[arg(long)]
@@ -858,43 +861,52 @@ enum PipelineInvocation {
         request_id: String,
         input: String,
     },
-    Resume { run_id: String },
+    Resume {
+        run_id: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
 struct RpcCommandCliArgs {
     /// Launch strictly versioned JSONL stdin/stdout; no TCP listener.
-    #[arg(long="stdio")]
+    #[arg(long = "stdio")]
     rpc_stdio: bool,
     /// Opt in to owner-bound Actor query/queue operations for one existing
     /// local SQLite Session. Requires --session-id ID and tools disabled;
     /// never grants commands by a client-supplied ActorKey.
-    #[arg(long="actor-owner", requires="rpc_stdio")]
+    #[arg(long = "actor-owner", requires = "rpc_stdio")]
     rpc_actor_owner: bool,
     /// Explicit signed AwNet MachineLink Actor owner, never an HTTP/RPC server.
-    #[cfg(all(feature="net",target_os="linux"))]
-    #[arg(long="actor-peer", conflicts_with="rpc_stdio")]
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    #[arg(long = "actor-peer", conflicts_with = "rpc_stdio")]
     rpc_actor_peer: Option<String>,
-    #[cfg(all(feature="net",target_os="linux"))]
-    #[arg(long="actor-room", requires="rpc_actor_peer")]
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    #[arg(long = "actor-room", requires = "rpc_actor_peer")]
     rpc_actor_room: Option<String>,
-    #[cfg(all(feature="net",target_os="linux"))]
-    #[arg(long="actor-rendezvous", requires="rpc_actor_peer")]
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    #[arg(long = "actor-rendezvous", requires = "rpc_actor_peer")]
     rpc_actor_rendezvous: Option<SocketAddr>,
-    #[cfg(all(feature="net",target_os="linux"))]
-    #[arg(long="actor-grant", requires="rpc_actor_peer", default_value="actor-query")]
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    #[arg(
+        long = "actor-grant",
+        requires = "rpc_actor_peer",
+        default_value = "actor-query"
+    )]
     rpc_actor_grants: Vec<String>,
-    #[cfg(all(feature="net",target_os="linux"))]
-    #[arg(long="actor-lease", default_value_t=60)]
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    #[arg(long = "actor-lease", default_value_t = 60)]
     rpc_actor_lease: u64,
-    #[cfg(all(feature="net",target_os="linux"))]
-    #[arg(long="actor-listen",default_value="0.0.0.0:0")]
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    #[arg(long = "actor-listen", default_value = "0.0.0.0:0")]
     rpc_actor_listen: SocketAddr,
-    #[cfg(all(feature="net",target_os="linux"))]
-    #[arg(long="actor-timeout",default_value_t=30)]
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    #[arg(long = "actor-timeout", default_value_t = 30)]
     rpc_actor_timeout: u64,
     /// Sanitized stdio event metadata only (never raw wire).
-    #[arg(long="diagnostics-protocol",help_heading="Diagnostics & validation")]
+    #[arg(
+        long = "diagnostics-protocol",
+        help_heading = "Diagnostics & validation"
+    )]
     diagnostics_protocol: bool,
     #[command(flatten)]
     provider: ProviderCliArgs,
@@ -930,16 +942,16 @@ struct WebCommandCliArgs {
     web_options: WebCliArgs,
 }
 
-#[cfg(all(feature="net",target_os="linux"))]
-#[derive(Clone,Debug)]
+#[cfg(all(feature = "net", target_os = "linux"))]
+#[derive(Clone, Debug)]
 struct ActorRemoteCliOptions {
-    peer:String,
-    room:String,
-    rendezvous:SocketAddr,
-    grants:Vec<String>,
-    lease:u64,
-    listen:SocketAddr,
-    timeout:u64,
+    peer: String,
+    room: String,
+    rendezvous: SocketAddr,
+    grants: Vec<String>,
+    lease: u64,
+    listen: SocketAddr,
+    timeout: u64,
 }
 
 #[derive(Debug)]
@@ -949,7 +961,7 @@ pub(crate) struct RunArgs {
     output: aw::headless::Output,
     rpc_stdio: bool,
     rpc_actor_owner: bool,
-    #[cfg(all(feature="net",target_os="linux"))]
+    #[cfg(all(feature = "net", target_os = "linux"))]
     rpc_actor_remote: Option<ActorRemoteCliOptions>,
     diagnostics_protocol: bool,
     web: bool,
@@ -1044,8 +1056,8 @@ pub(crate) struct RunArgs {
     import: Option<PathBuf>,
     backup: Option<PathBuf>,
     allow_context_transfer: bool,
-    context_compaction_policy:aw_agent_core::CompactionPolicy,
-    context_compact_now:bool,
+    context_compaction_policy: aw_agent_core::CompactionPolicy,
+    context_compact_now: bool,
     #[cfg(feature = "routing")]
     route: Option<String>,
     #[cfg(feature = "routing")]
@@ -1082,7 +1094,7 @@ impl RunArgs {
             output: aw::headless::Output::Text,
             rpc_stdio: false,
             rpc_actor_owner: false,
-            #[cfg(all(feature="net",target_os="linux"))]
+            #[cfg(all(feature = "net", target_os = "linux"))]
             rpc_actor_remote: None,
             diagnostics_protocol: false,
             web,
@@ -1133,13 +1145,19 @@ impl RunArgs {
             } else {
                 tools.tools_parallel_limit.min(8)
             },
-            parallel_reads: if tools.tools_parallel == "off" { 1 } else {
-                tools.tools_parallel_read_limit.unwrap_or(tools.tools_parallel_limit)
+            parallel_reads: if tools.tools_parallel == "off" {
+                1
+            } else {
+                tools
+                    .tools_parallel_read_limit
+                    .unwrap_or(tools.tools_parallel_limit)
                     .min(tools.tools_parallel_limit)
             },
             parallel_bash: tools.tools_parallel == "model",
-            parallel_bash_limit: tools.tools_parallel_bash_limit
-                .unwrap_or(tools.tools_parallel_limit).min(tools.tools_parallel_limit),
+            parallel_bash_limit: tools
+                .tools_parallel_bash_limit
+                .unwrap_or(tools.tools_parallel_limit)
+                .min(tools.tools_parallel_limit),
             mcp: tools.mcp,
             extensions: tools.extensions,
             tool_root: tools.tool_root,
@@ -1185,19 +1203,19 @@ impl RunArgs {
             import: management.import,
             backup: management.backup,
             allow_context_transfer: target.allow_context_transfer,
-            context_compaction_policy:aw_agent_core::CompactionPolicy {
-                mode:match target.context_compact_mode.as_str(){
-                    "off"=>aw_agent_core::CompactionMode::Off,
-                    "auto"=>aw_agent_core::CompactionMode::Auto,
-                    _=>aw_agent_core::CompactionMode::Ask,
+            context_compaction_policy: aw_agent_core::CompactionPolicy {
+                mode: match target.context_compact_mode.as_str() {
+                    "off" => aw_agent_core::CompactionMode::Off,
+                    "auto" => aw_agent_core::CompactionMode::Auto,
+                    _ => aw_agent_core::CompactionMode::Ask,
                 },
-                keep_recent:target.context_keep_recent as usize,
-                trigger_turns:target.context_trigger_turns as usize,
-                known_context_window:target.context_known_window_bytes.map(|n|n as usize),
-                allow_paid_auto:target.context_auto_spend,
+                keep_recent: target.context_keep_recent as usize,
+                trigger_turns: target.context_trigger_turns as usize,
+                known_context_window: target.context_known_window_bytes.map(|n| n as usize),
+                allow_paid_auto: target.context_auto_spend,
                 ..aw_agent_core::CompactionPolicy::default()
             },
-            context_compact_now:target.context_compact_now,
+            context_compact_now: target.context_compact_now,
             #[cfg(feature = "routing")]
             route: None,
             #[cfg(feature = "routing")]
@@ -1288,7 +1306,9 @@ impl PipelineResumeCliArgs {
             false,
             false,
         );
-        run.pipeline = Some(PipelineInvocation::Resume { run_id: self.run_id });
+        run.pipeline = Some(PipelineInvocation::Resume {
+            run_id: self.run_id,
+        });
         run
     }
 }
@@ -1297,9 +1317,18 @@ impl PipelineResumeCliArgs {
 impl ScheduleRunDueCliArgs {
     fn into_run(self, run_id: String) -> RunArgs {
         let mut run = RunArgs::compose(
-            Vec::new(), true, false, self.provider, self.tools, self.target,
-            WebCliArgs::default(), OwnerCliArgs::default(), ManagementCliArgs::default(),
-            None, false, false,
+            Vec::new(),
+            true,
+            false,
+            self.provider,
+            self.tools,
+            self.target,
+            WebCliArgs::default(),
+            OwnerCliArgs::default(),
+            ManagementCliArgs::default(),
+            None,
+            false,
+            false,
         );
         run.pipeline = Some(PipelineInvocation::Resume { run_id });
         run
@@ -1479,53 +1508,80 @@ fn management(
 }
 fn run_top_command(command: TopCommand) -> Result<u8> {
     match command {
-        TopCommand::Cli { action } =>
-            cli_taxonomy::run(action, cli_taxonomy::command_tree::<Cli>()),
+        TopCommand::Cli { action } => {
+            cli_taxonomy::run(action, cli_taxonomy::command_tree::<Cli>())
+        }
         TopCommand::Rpc { args } => {
-            #[cfg(all(feature="net",target_os="linux"))]
-            let remote=args.rpc_actor_peer.is_some();
-            #[cfg(not(all(feature="net",target_os="linux")))]
-            let remote=false;
-            if args.rpc_stdio==remote || args.rpc_actor_owner && !args.rpc_stdio {
+            #[cfg(all(feature = "net", target_os = "linux"))]
+            let remote = args.rpc_actor_peer.is_some();
+            #[cfg(not(all(feature = "net", target_os = "linux")))]
+            let remote = false;
+            if args.rpc_stdio == remote || args.rpc_actor_owner && !args.rpc_stdio {
                 return Err(Error::Denied("choose exactly one of --agent-stdio or an explicitly configured --agent-actor-peer"));
             }
-            let mut run=RunArgs::compose(
-                Vec::new(),false,false,args.provider,args.tools,args.target,
-                WebCliArgs::default(),OwnerCliArgs::default(),
-                ManagementCliArgs::default(),None,false,false,
+            let mut run = RunArgs::compose(
+                Vec::new(),
+                false,
+                false,
+                args.provider,
+                args.tools,
+                args.target,
+                WebCliArgs::default(),
+                OwnerCliArgs::default(),
+                ManagementCliArgs::default(),
+                None,
+                false,
+                false,
             );
-            run.rpc_stdio=args.rpc_stdio;
-            run.rpc_actor_owner=args.rpc_actor_owner || remote;
-            #[cfg(all(feature="net",target_os="linux"))]
-            if let Some(peer)=args.rpc_actor_peer {
-                let room=args.rpc_actor_room.ok_or(Error::Denied("signed Actor peer requires exact rendezvous room"))?;
-                let rendezvous=args.rpc_actor_rendezvous.ok_or(Error::Denied("signed Actor peer requires exact rendezvous address"))?;
-                run.rpc_actor_remote=Some(ActorRemoteCliOptions {
-                    peer, room, rendezvous, grants:args.rpc_actor_grants,
-                    lease:args.rpc_actor_lease, listen:args.rpc_actor_listen,
-                    timeout:args.rpc_actor_timeout,
+            run.rpc_stdio = args.rpc_stdio;
+            run.rpc_actor_owner = args.rpc_actor_owner || remote;
+            #[cfg(all(feature = "net", target_os = "linux"))]
+            if let Some(peer) = args.rpc_actor_peer {
+                let room = args.rpc_actor_room.ok_or(Error::Denied(
+                    "signed Actor peer requires exact rendezvous room",
+                ))?;
+                let rendezvous = args.rpc_actor_rendezvous.ok_or(Error::Denied(
+                    "signed Actor peer requires exact rendezvous address",
+                ))?;
+                run.rpc_actor_remote = Some(ActorRemoteCliOptions {
+                    peer,
+                    room,
+                    rendezvous,
+                    grants: args.rpc_actor_grants,
+                    lease: args.rpc_actor_lease,
+                    listen: args.rpc_actor_listen,
+                    timeout: args.rpc_actor_timeout,
                 });
             }
-            run.diagnostics_protocol=args.diagnostics_protocol;
+            run.diagnostics_protocol = args.diagnostics_protocol;
             run_agent(run)
         }
         TopCommand::Workspace { command } => match command {
             #[cfg(all(feature = "workspace", unix))]
-            Some(resources_cli::WorkspaceCommand::Attach { invite }) => workspace::native_dock::attach(&invite),
+            Some(resources_cli::WorkspaceCommand::Attach { invite }) => {
+                workspace::native_dock::attach(&invite)
+            }
             #[cfg(all(feature = "workspace", unix))]
             Some(resources_cli::WorkspaceCommand::Persistent { command }) => {
                 use resources_cli::PersistentTerminalCommand as Persistent;
                 match command {
                     #[cfg(target_os = "linux")]
-                    Persistent::Adopt { directory } => workspace::native_dock::serve_adoption(&directory),
+                    Persistent::Adopt { directory } => {
+                        workspace::native_dock::serve_adoption(&directory)
+                    }
                     #[cfg(target_os = "linux")]
-                    Persistent::Inspect { directory } => workspace::native_dock::inspect_migration(&directory),
-                    Persistent::Start { root, shell } =>
-                        workspace::native_dock::start_persistent(&root, &shell),
-                    Persistent::Stop { invite } =>
-                        workspace::native_dock::stop_persistent(&invite),
-                    Persistent::Serve { root, shell, directory } =>
-                        workspace::native_dock::serve_persistent(&root, &shell, &directory),
+                    Persistent::Inspect { directory } => {
+                        workspace::native_dock::inspect_migration(&directory)
+                    }
+                    Persistent::Start { root, shell } => {
+                        workspace::native_dock::start_persistent(&root, &shell)
+                    }
+                    Persistent::Stop { invite } => workspace::native_dock::stop_persistent(&invite),
+                    Persistent::Serve {
+                        root,
+                        shell,
+                        directory,
+                    } => workspace::native_dock::serve_persistent(&root, &shell, &directory),
                 }
             }
             Some(resources_cli::WorkspaceCommand::Open { name, args }) => {
@@ -1556,8 +1612,16 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             }
         },
         TopCommand::Model { command } => model_cli::run(command),
-        TopCommand::Mcp { options, action, json } => mcp_cli::inspect(options, action, json),
-        TopCommand::Extension { options, action, json } => extension_cli::inspect(options, action, json),
+        TopCommand::Mcp {
+            options,
+            action,
+            json,
+        } => mcp_cli::inspect(options, action, json),
+        TopCommand::Extension {
+            options,
+            action,
+            json,
+        } => extension_cli::inspect(options, action, json),
         TopCommand::Skill { command } => resources_cli::skill(command),
         TopCommand::Session { command } => match command {
             resources_cli::SessionCommand::Open { session, run } => {
@@ -1616,16 +1680,21 @@ fn run() -> Result<u8> {
 }
 
 fn run_agent(args: RunArgs) -> Result<u8> {
-    if (args.rpc_stdio || args.output==aw::headless::Output::Jsonl)
-        && (args.web || args.agent_mode || args.open_workspace_ui
+    if (args.rpc_stdio || args.output == aw::headless::Output::Jsonl)
+        && (args.web
+            || args.agent_mode
+            || args.open_workspace_ui
             || args.app_mode != AppModeArg::Agent)
     {
-        return Err(Error::Denied("headless output supports only the local Agent execution owner"));
+        return Err(Error::Denied(
+            "headless output supports only the local Agent execution owner",
+        ));
     }
     let wants_workspace = args.open_workspace_ui || args.app_mode == AppModeArg::Workspace;
     if wants_workspace && args.tui_mode_override.is_some() {
         return Err(Error::Config(
-            "--tui-mode applies only to --ui-mode=agent; Workspace owns its own presentation".into(),
+            "--tui-mode applies only to --ui-mode=agent; Workspace owns its own presentation"
+                .into(),
         ));
     }
     let wants_owner = args.agent_mode;
@@ -1634,10 +1703,14 @@ fn run_agent(args: RunArgs) -> Result<u8> {
     let wants_web = args.web || (wants_owner && args.serve_web);
     let wants_host = wants_owner || wants_web;
     if wants_host && !args.mcp.is_empty() {
-        return Err(Error::Denied("R5 MCP connections require native single-user Agent mode; not web/owner"));
+        return Err(Error::Denied(
+            "R5 MCP connections require native single-user Agent mode; not web/owner",
+        ));
     }
     if wants_host && !args.extensions.is_empty() {
-        return Err(Error::Denied("process extensions require native single-user Agent mode; not web/owner"));
+        return Err(Error::Denied(
+            "process extensions require native single-user Agent mode; not web/owner",
+        ));
     }
     let local_single_web = wants_web && !wants_owner;
     if !args.device_links.is_empty()
@@ -1847,7 +1920,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         }
     }
     if let Some(message) = args.resources.action(
-        args.config.as_deref(), args.directory.as_deref().unwrap_or(Path::new(".")),
+        args.config.as_deref(),
+        args.directory.as_deref().unwrap_or(Path::new(".")),
     )? {
         println!("{message}");
         return Ok(0);
@@ -2049,16 +2123,28 @@ fn run_agent(args: RunArgs) -> Result<u8> {
     }
     profile.allow_insecure_http |= args.allow_insecure_http;
     profile.validate()?;
-    let selected_project_skills = args.skills.iter()
-        .filter(|spec| spec.source().is_none()
-            && !file_config.skills.contains_key(spec.name())
-            && project.as_ref().is_some_and(|p|p.skills.contains_key(spec.name())))
+    let selected_project_skills = args
+        .skills
+        .iter()
+        .filter(|spec| {
+            spec.source().is_none()
+                && !file_config.skills.contains_key(spec.name())
+                && project
+                    .as_ref()
+                    .is_some_and(|p| p.skills.contains_key(spec.name()))
+        })
         .collect::<Vec<_>>();
-    let file_skills = args.skills.iter()
-        .filter(|spec| !selected_project_skills.iter().any(|p|p.name()==spec.name()))
-        .cloned().collect::<Vec<_>>();
+    let file_skills = args
+        .skills
+        .iter()
+        .filter(|spec| {
+            !selected_project_skills
+                .iter()
+                .any(|p| p.name() == spec.name())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let loaded_skills = skills::load(&file_skills, &file_config.skills)?;
-
 
     let should_onboard = profile.model.is_none()
         && !wants_host
@@ -2070,9 +2156,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         && io::stdin().is_terminal()
         && io::stdout().is_terminal();
     if should_onboard {
-        let mut discover_models = |profile: &Profile| {
-            runtime()?.block_on(aw::discovery::discover_models(profile))
-        };
+        let mut discover_models =
+            |profile: &Profile| runtime()?.block_on(aw::discovery::discover_models(profile));
         match tui::onboarding::run_with_discovery(&file_config, &mut discover_models)? {
             tui::onboarding::OnboardingOutcome::Save(update) => {
                 let (saved_name, saved_profile) = persist_profile_update(
@@ -2091,10 +2176,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                 {
                     // Stable OAuth host identity is created/read under the
                     // shared config mutation lock before authorization begins.
-                    let host_id = ensure_chatgpt_host_id(
-                        args.config.as_deref(),
-                        &mut file_config,
-                    )?;
+                    let host_id = ensure_chatgpt_host_id(args.config.as_deref(), &mut file_config)?;
                     if let Some(update) = chatgpt_plan_profile_update(
                         SessionStore::open(directory.as_deref().ok_or(Error::Denied(
                             "Sign in with ChatGPT requires durable local state for SecretStore custody",
@@ -2126,19 +2208,30 @@ fn run_agent(args: RunArgs) -> Result<u8> {
     }
 
     let (mut system, system_prompt_origin) = if let Some(system) = args.system.clone() {
-        (system, tui::agent_resources::SystemPromptOrigin::CommandLine)
+        (
+            system,
+            tui::agent_resources::SystemPromptOrigin::CommandLine,
+        )
     } else if let Some(saved_prompt) = saved.as_ref().map(|s| s.binding.system_prompt.clone()) {
-        (saved_prompt, tui::agent_resources::SystemPromptOrigin::SavedSession)
+        (
+            saved_prompt,
+            tui::agent_resources::SystemPromptOrigin::SavedSession,
+        )
     } else if let Some(configured) = file_config.system_prompt.clone() {
         (configured, tui::agent_resources::SystemPromptOrigin::Config)
     } else {
         (
-            if args.tools == aw::ToolMode::Off { SYSTEM.into() } else { TOOL_SYSTEM.into() },
+            if args.tools == aw::ToolMode::Off {
+                SYSTEM.into()
+            } else {
+                TOOL_SYSTEM.into()
+            },
             tui::agent_resources::SystemPromptOrigin::BuiltIn,
         )
     };
     let mut loaded_resources = tui::agent_resources::LoadedResourceSummary::with_system_prompt(
-        system_prompt_origin, system.len(),
+        system_prompt_origin,
+        system.len(),
     );
     for file in &args.instructions {
         let data = read_bounded(file, config::MAX_PROMPT_BYTES)?;
@@ -2155,7 +2248,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
     for skill in &loaded_skills {
         loaded_resources.add_skill(skill.name(), skill.source(), skill.bytes());
     }
-    if saved.is_some() && project.is_none()
+    if saved.is_some()
+        && project.is_none()
         && system.contains("Owner-approved project instructions from ")
     {
         return Err(Error::Denied(
@@ -2167,7 +2261,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         project.system_append(&mut addition, config::MAX_PROMPT_BYTES)?;
         for source in &project.instructions {
             loaded_resources.add_instruction_file(
-                format!("approved project:{}", source.path), source.content.len(),
+                format!("approved project:{}", source.path),
+                source.content.len(),
             );
         }
         for spec in &selected_project_skills {
@@ -2177,7 +2272,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                 spec.name(), text,
             ));
             loaded_resources.add_skill(
-                spec.name(), format!("approved project:{}", project.skills[spec.name()].path),
+                spec.name(),
+                format!("approved project:{}", project.skills[spec.name()].path),
                 text.len(),
             );
         }
@@ -2192,7 +2288,9 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             }
         } else {
             if system.len().saturating_add(addition.len()) > config::MAX_PROMPT_BYTES {
-                return Err(Error::Limit("project resources exceed combined instructions budget"));
+                return Err(Error::Limit(
+                    "project resources exceed combined instructions budget",
+                ));
             }
             system.push_str(&addition);
         }
@@ -2252,7 +2350,11 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         ));
     }
     #[cfg(feature = "web")]
-    let local_web_store = if local_single_web { store.clone() } else { None };
+    let local_web_store = if local_single_web {
+        store.clone()
+    } else {
+        None
+    };
     let mut persistent = None;
     if let Some(s) = store.take() {
         // Local single-user web is a configuration/control surface even before
@@ -2361,7 +2463,9 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     }
                 }
                 #[cfg(feature = "surfaces")]
-                let remote_workspace_router: Option<Arc<dyn aw::web::RemoteWorkspaceTargetRouter>> = {
+                let remote_workspace_router: Option<
+                    Arc<dyn aw::web::RemoteWorkspaceTargetRouter>,
+                > = {
                     #[cfg(feature = "net")]
                     {
                         if args.web_remote_targets.is_empty() {
@@ -2432,8 +2536,16 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                     domain_selector: args.domain.clone(),
                     workspace_selector: args.workspace.clone(),
                     resources: aw::web::ResourceSummary {
-                        context: loaded_resources.context().iter().map(|resource| resource.label()).collect(),
-                        skills: loaded_resources.skills().iter().map(|resource| resource.label()).collect(),
+                        context: loaded_resources
+                            .context()
+                            .iter()
+                            .map(|resource| resource.label())
+                            .collect(),
+                        skills: loaded_resources
+                            .skills()
+                            .iter()
+                            .map(|resource| resource.label())
+                            .collect(),
                     },
                     #[cfg(feature = "surfaces")]
                     remote_workspace_router,
@@ -2779,10 +2891,10 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         args.workspace.clone(),
         args.account.clone(),
     );
-    if let (Some(project),Some(name))=(&host.project,&host.resources.theme) {
-        let theme=project.theme(name)?;
-        host.ui.theme=theme.base;
-        host.ui.theme_accent=theme.accent;
+    if let (Some(project), Some(name)) = (&host.project, &host.resources.theme) {
+        let theme = project.theme(name)?;
+        host.ui.theme = theme.base;
+        host.ui.theme_accent = theme.accent;
         host.ui.validate()?;
     }
     host.pre_dispatch_retries = args.pre_dispatch_retries;
@@ -2823,8 +2935,8 @@ fn run_agent(args: RunArgs) -> Result<u8> {
                 "explicit --context-compact-now requires --session-id ID or --session-resume; it never creates a new Session",
             ));
         }
-        host.ensure(false,"Explicit JSONL compaction")?;
-        let through=aw::headless::Driver::compact(&mut host)?;
+        host.ensure(false, "Explicit JSONL compaction")?;
+        let through = aw::headless::Driver::compact(&mut host)?;
         println!("Active context compacted through turn {through}; original JSONL log retained.");
         return Ok(0);
     }
@@ -2840,54 +2952,105 @@ fn run_agent(args: RunArgs) -> Result<u8> {
     if let Some(invocation) = args.pipeline.clone() {
         return run_pipeline_invocation(&mut host, invocation);
     }
-    #[cfg(all(feature="net",target_os="linux"))]
-    if let Some(ActorRemoteCliOptions{peer,room,rendezvous,grants,lease,listen,timeout})=args.rpc_actor_remote.clone() {
-        if args.rpc_stdio || !args.rpc_actor_owner || args.session.is_none() || args.resume
-            || args.no_state || args.store_backend!=resources_cli::SessionStoreBackendArg::Sqlite
-            || args.tools!=aw::ToolMode::Off || args.subagents || !args.mcp.is_empty()
-            || !args.extensions.is_empty() || args.web || args.agent_mode {
-            return Err(Error::Denied("remote Actor owner needs exact SQLite Session and tools disabled"));
-        }
-        let allowed=grants.iter().map(|v|crate::awnet::MachineCapability::parse(v))
-            .collect::<Result<std::collections::BTreeSet<_>>>()?;
-        let state_dir=host.state_dir.clone().ok_or(Error::Denied("private state directory unavailable"))?;
-        host.ensure(false,"Remote Actor Session bound")?;
-        host.attach_rpc_actor_owner()?;
-        let owner=host.actor_owner.take().ok_or(Error::Denied("Actor binding unavailable"))?;
-        let agent=host.agent.take().ok_or(Error::Denied("original Agent unavailable"))?;
-        let store=host.persistent.as_ref().ok_or(Error::Denied("SQLite Session unavailable"))?.store.clone();
-        let opts=crate::awnet::MachineLinkServeOptions{
-            route:crate::awnet::PunchOptions{
-                peer_node_id:peer,room,rendezvous,listen,stun:vec![],
-                timeout:Duration::from_secs(timeout),
-            },allowed,lease:Duration::from_secs(lease),
-        };
-        let served=crate::awnet::serve_actor_remote(store,&state_dir,opts,owner,agent)?;
-        print_json(&served)?;
-        return Ok(0);
-    }
-    if args.rpc_stdio {
-        if args.rpc_actor_owner && (args.no_state
+    #[cfg(all(feature = "net", target_os = "linux"))]
+    if let Some(ActorRemoteCliOptions {
+        peer,
+        room,
+        rendezvous,
+        grants,
+        lease,
+        listen,
+        timeout,
+    }) = args.rpc_actor_remote.clone()
+    {
+        if args.rpc_stdio
+            || !args.rpc_actor_owner
             || args.session.is_none()
             || args.resume
+            || args.no_state
             || args.store_backend != resources_cli::SessionStoreBackendArg::Sqlite
             || args.tools != aw::ToolMode::Off
             || args.subagents
             || !args.mcp.is_empty()
-            || !args.extensions.is_empty())
+            || !args.extensions.is_empty()
+            || args.web
+            || args.agent_mode
+        {
+            return Err(Error::Denied(
+                "remote Actor owner needs exact SQLite Session and tools disabled",
+            ));
+        }
+        let allowed = grants
+            .iter()
+            .map(|v| crate::awnet::MachineCapability::parse(v))
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        let state_dir = host
+            .state_dir
+            .clone()
+            .ok_or(Error::Denied("private state directory unavailable"))?;
+        host.ensure(false, "Remote Actor Session bound")?;
+        host.attach_rpc_actor_owner()?;
+        let owner = host
+            .actor_owner
+            .take()
+            .ok_or(Error::Denied("Actor binding unavailable"))?;
+        let agent = host
+            .agent
+            .take()
+            .ok_or(Error::Denied("original Agent unavailable"))?;
+        let store = host
+            .persistent
+            .as_ref()
+            .ok_or(Error::Denied("SQLite Session unavailable"))?
+            .store
+            .clone();
+        let opts = crate::awnet::MachineLinkServeOptions {
+            route: crate::awnet::PunchOptions {
+                peer_node_id: peer,
+                room,
+                rendezvous,
+                listen,
+                stun: vec![],
+                timeout: Duration::from_secs(timeout),
+            },
+            allowed,
+            lease: Duration::from_secs(lease),
+        };
+        let served = crate::awnet::serve_actor_remote(store, &state_dir, opts, owner, agent)?;
+        print_json(&served)?;
+        return Ok(0);
+    }
+    if args.rpc_stdio {
+        if args.rpc_actor_owner
+            && (args.no_state
+                || args.session.is_none()
+                || args.resume
+                || args.store_backend != resources_cli::SessionStoreBackendArg::Sqlite
+                || args.tools != aw::ToolMode::Off
+                || args.subagents
+                || !args.mcp.is_empty()
+                || !args.extensions.is_empty())
         {
             return Err(Error::Denied("--agent-actor-owner requires an exact --session-id ID, local SQLite, tools off, and no MCP/subagents/extensions"));
         }
         if args.no_state && (args.session.is_some() || args.resume) {
-            return Err(Error::Denied("memory-only RPC cannot resume durable Sessions"));
+            return Err(Error::Denied(
+                "memory-only RPC cannot resume durable Sessions",
+            ));
         }
         if args.session.is_some() || args.resume {
-            host.ensure(false,"RPC bound Session")?;
+            host.ensure(false, "RPC bound Session")?;
         }
         if args.rpc_actor_owner {
             host.attach_rpc_actor_owner()?;
         }
-        return aw::headless::serve_stdio(&mut host,io::stdin(),io::stdout(),args.diagnostics_protocol).map(|()|0);
+        return aw::headless::serve_stdio(
+            &mut host,
+            io::stdin(),
+            io::stdout(),
+            args.diagnostics_protocol,
+        )
+        .map(|()| 0);
     }
     let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     let mut initial = if args.prompt.is_empty() {
@@ -2922,13 +3085,19 @@ fn run_agent(args: RunArgs) -> Result<u8> {
         }
         initial = Some(input);
     }
-    if args.print || !tty || args.output==aw::headless::Output::Jsonl {
-        let prompt = initial
-            .ok_or_else(|| Error::Config("--output-print/--output-format requires a prompt or piped stdin".into()))?;
+    if args.print || !tty || args.output == aw::headless::Output::Jsonl {
+        let prompt = initial.ok_or_else(|| {
+            Error::Config("--output-print/--output-format requires a prompt or piped stdin".into())
+        })?;
         // Machine-readable mode must report even provider/Session preflight
         // failures as a versioned error line, never a human-only stderr error.
-        if args.output==aw::headless::Output::Jsonl {
-            return aw::headless::emit_print(&mut host,prompt,io::stdout(),args.diagnostics_protocol);
+        if args.output == aw::headless::Output::Jsonl {
+            return aw::headless::emit_print(
+                &mut host,
+                prompt,
+                io::stdout(),
+                args.diagnostics_protocol,
+            );
         }
         host.ensure(false, &prompt)?;
         host.describe()?;
@@ -2943,16 +3112,30 @@ fn run_schedule_due(args: ScheduleRunDueCliArgs) -> Result<u8> {
     if args.target.no_state {
         return Err(Error::Denied("schedule run-due requires durable state"));
     }
-    if !matches!(args.target.store_backend, resources_cli::SessionStoreBackendArg::Sqlite) {
-        return Err(Error::Denied("Phase 67 schedules require the SQLite authority backend"));
+    if !matches!(
+        args.target.store_backend,
+        resources_cli::SessionStoreBackendArg::Sqlite
+    ) {
+        return Err(Error::Denied(
+            "Phase 67 schedules require the SQLite authority backend",
+        ));
     }
     if args.target.session.is_some() || args.target.resume {
         return Err(Error::Config("Phase 67 schedules are user-scoped; --session-id/--session-resume are not valid for run-due".into()));
     }
-    let directory = args.target.directory.clone().unwrap_or(std::env::current_dir()?);
+    let directory = args
+        .target
+        .directory
+        .clone()
+        .unwrap_or(std::env::current_dir()?);
     let context = ExecutionContext::capture(&directory)?;
     let actor = sessions::actor(&context, false)?;
-    let state = args.target.state_dir.clone().map(Ok).unwrap_or_else(sessions::default_directory)?;
+    let state = args
+        .target
+        .state_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(sessions::default_directory)?;
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| Error::Storage("system clock precedes Unix epoch"))?
@@ -2994,15 +3177,29 @@ fn run_pipeline_invocation(host: &mut Host, invocation: PipelineInvocation) -> R
     host.state_dir.as_deref().ok_or(Error::Denied(
         "pipeline execution requires durable SQLite state",
     ))?;
-    if !matches!(host.store_backend, resources_cli::SessionStoreBackendArg::Sqlite) {
-        return Err(Error::Denied("Phase 39 pipelines require the SQLite authority backend"));
+    if !matches!(
+        host.store_backend,
+        resources_cli::SessionStoreBackendArg::Sqlite
+    ) {
+        return Err(Error::Denied(
+            "Phase 39 pipelines require the SQLite authority backend",
+        ));
     }
     let mut store = host.sqlite_store()?;
     let actor = sessions::actor(&host.context, false)?;
     let mut run = match invocation {
-        PipelineInvocation::Start { pipeline, revision, binding, request_id, input } => {
+        PipelineInvocation::Start {
+            pipeline,
+            revision,
+            binding,
+            request_id,
+            input,
+        } => {
             let (session, branch) = match host.persistent.as_ref() {
-                Some(saved) => (Some(saved.handle.session_id()), Some(saved.handle.branch()?.id)),
+                Some(saved) => (
+                    Some(saved.handle.session_id()),
+                    Some(saved.handle.branch()?.id),
+                ),
                 None => (None, None),
             };
             store.pipeline_admit_manual(
@@ -3038,22 +3235,39 @@ fn run_pipeline_invocation(host: &mut Host, invocation: PipelineInvocation) -> R
     loop {
         match store.pipeline_next(&actor, &run.id)? {
             aw_store::PipelineDirective::Completed { run: completed } => {
-                print_json(&serde_json::json!({"run":completed,"steps":store.pipeline_steps(&actor,&run.id)?}))?;
+                print_json(
+                    &serde_json::json!({"run":completed,"steps":store.pipeline_steps(&actor,&run.id)?}),
+                )?;
                 return Ok(0);
             }
             aw_store::PipelineDirective::Failed { run: failed } => {
-                print_json(&serde_json::json!({"run":failed,"steps":store.pipeline_steps(&actor,&run.id)?}))?;
+                print_json(
+                    &serde_json::json!({"run":failed,"steps":store.pipeline_steps(&actor,&run.id)?}),
+                )?;
                 return Ok(1);
             }
-            aw_store::PipelineDirective::Approval { run: waiting, approval } => {
-                print_json(&serde_json::json!({"run":waiting,"approval":approval,"steps":store.pipeline_steps(&actor,&run.id)?}))?;
+            aw_store::PipelineDirective::Approval {
+                run: waiting,
+                approval,
+            } => {
+                print_json(
+                    &serde_json::json!({"run":waiting,"approval":approval,"steps":store.pipeline_steps(&actor,&run.id)?}),
+                )?;
                 return Ok(0);
             }
-            aw_store::PipelineDirective::UnknownExternal { run: unknown, attempt } => {
+            aw_store::PipelineDirective::UnknownExternal {
+                run: unknown,
+                attempt,
+            } => {
                 print_json(&serde_json::json!({"run":unknown,"unknown_external_effect":attempt}))?;
                 return Ok(2);
             }
-            aw_store::PipelineDirective::Agent { run: current, attempt, role, input } => {
+            aw_store::PipelineDirective::Agent {
+                run: current,
+                attempt,
+                role,
+                input,
+            } => {
                 if host.persistent.is_none() {
                     drop(store);
                     if let Err(error) = host.ensure(false, &input) {
@@ -3076,12 +3290,9 @@ fn run_pipeline_invocation(host: &mut Host, invocation: PipelineInvocation) -> R
                 } else {
                     host.ensure(false, &input)?;
                 }
-                let saved = host
-                    .persistent
-                    .as_ref()
-                    .ok_or(Error::Storage(
-                        "durable pipeline agent is missing its Session",
-                    ))?;
+                let saved = host.persistent.as_ref().ok_or(Error::Storage(
+                    "durable pipeline agent is missing its Session",
+                ))?;
                 let execution_session = saved.handle.session_id().to_owned();
                 let execution_branch = saved.handle.branch()?.id;
                 store.pipeline_note_agent_target(
@@ -3091,14 +3302,11 @@ fn run_pipeline_invocation(host: &mut Host, invocation: PipelineInvocation) -> R
                     &execution_session,
                     &execution_branch,
                 )?;
-                let result = host.prompt_with(
-                    input,
-                    aw::CancellationToken::new(),
-                    |_| Ok(()),
-                );
+                let result = host.prompt_with(input, aw::CancellationToken::new(), |_| Ok(()));
                 match result {
                     Ok(turn) => {
-                        let usage = aw::conversation::usage_for(std::slice::from_ref(&turn), &actor);
+                        let usage =
+                            aw::conversation::usage_for(std::slice::from_ref(&turn), &actor);
                         let receipt = aw_store::PipelineAgentReceipt {
                             turn_id: turn.id,
                             outcome: format!("{:?}", turn.outcome).to_ascii_lowercase(),
@@ -3175,8 +3383,9 @@ struct Host {
     actor_owner: Option<aw::actor_owner::Service>,
     agent_jobs_owner: Option<aw::actor_owner::Service>,
     agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
+    agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::RootAgentClose>>,
     pre_dispatch_retries: u8,
-    context_compaction_policy:aw_agent_core::CompactionPolicy,
+    context_compaction_policy: aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
     resources: resource_cli_args::ResourcesArgs,
     resource_config_path: Option<PathBuf>,
@@ -3197,6 +3406,32 @@ struct Host {
     #[cfg(feature = "workspace")]
     workspace_git_contexts: Option<workspace::git::Contexts>,
 }
+
+struct StdioAgentClosePort {
+    inner: std::sync::Arc<aw::agent_lifecycle::RootAgentClose>,
+}
+
+impl aw::headless::AgentClosePort for StdioAgentClosePort {
+    fn apply(&self, reference: &str, expected_rev: Option<u64>) -> Result<serde_json::Value> {
+        if reference != "." && reference != self.inner.canonical_ref() {
+            return Err(Error::Denied(
+                "stdio Agent close is bound to the current root Agent",
+            ));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()?;
+        let closed = runtime.block_on(self.inner.close(expected_rev))?;
+        Ok(serde_json::json!({
+            "ref":closed.canonical_ref,
+            "rev":closed.rev,
+            "lifecycle":closed.lifecycle,
+            "admission":closed.admission,
+        }))
+    }
+}
+
 impl Host {
     /// Build a fresh Runtime/Actor Envelope from the *verified* current
     /// Unix-local owning SQLite Session and selected Agent. A raw RPC frame
@@ -3208,7 +3443,10 @@ impl Host {
             actor::{ActorState, RuntimeKey},
             envelope::{Access, Budget, EnvelopeSpec, Network},
         };
-        use std::{num::NonZeroU64, sync::{Arc, Mutex}};
+        use std::{
+            num::NonZeroU64,
+            sync::{Arc, Mutex},
+        };
 
         if self.actor_owner.is_some() {
             return Err(Error::Conflict("Actor RPC owner already attached"));
@@ -3219,74 +3457,117 @@ impl Host {
             || !self.mcp.is_empty()
             || !self.extensions.is_empty()
         {
-            return Err(Error::Denied("Actor RPC binds only one explicit SQLite tool-free local Agent"));
+            return Err(Error::Denied(
+                "Actor RPC binds only one explicit SQLite tool-free local Agent",
+            ));
         }
         let persistent = self.persistent.as_ref().ok_or(Error::Denied(
             "Actor RPC requires an already-selected durable Session; it must never create one",
         ))?;
-        let agent = self.agent.as_ref().ok_or(Error::Denied("Actor RPC requires the original Agent"))?;
-        if !agent.is_journaled() || !agent.tool_specs().is_empty()
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or(Error::Denied("Actor RPC requires the original Agent"))?;
+        if !agent.is_journaled()
+            || !agent.tool_specs().is_empty()
             || agent.default_identity()?.actor != persistent.actor
-            || agent.journal_scope()?.as_ref().map(|s| s.session_id.as_str())
+            || agent
+                .journal_scope()?
+                .as_ref()
+                .map(|s| s.session_id.as_str())
                 != Some(persistent.handle.session_id())
         {
-            return Err(Error::Denied("Actor RPC cannot bind a non-journaled or tool-enabled Agent"));
+            return Err(Error::Denied(
+                "Actor RPC cannot bind a non-journaled or tool-enabled Agent",
+            ));
         }
         let session_id = persistent.handle.session_id();
         let branch_id = persistent.handle.branch()?.id;
         let session_info = persistent.store.session(&persistent.actor, session_id)?;
-        let writer = persistent.store.workspace_writer(&persistent.actor, None, &session_info.workspace_id)?;
-        let epoch = NonZeroU64::new(writer.writer_epoch).ok_or(Error::Denied("Actor RPC writer epoch absent"))?;
-        persistent.store.actor_input_writer_fence(&persistent.actor, session_id, epoch.get())?;
+        let writer = persistent.store.workspace_writer(
+            &persistent.actor,
+            None,
+            &session_info.workspace_id,
+        )?;
+        let epoch = NonZeroU64::new(writer.writer_epoch)
+            .ok_or(Error::Denied("Actor RPC writer epoch absent"))?;
+        persistent
+            .store
+            .actor_input_writer_fence(&persistent.actor, session_id, epoch.get())?;
         if writer.state != "active" {
             return Err(Error::Denied("Actor RPC selected writer is not active"));
         }
         // Independent Unix-local Runtime incarnation IDs. Never reuse an
         // old actor generation or derive one from the untrusted RPC request.
-        let mut nonce=[0u8;16];
-        getrandom::fill(&mut nonce).map_err(|_|Error::Storage("Actor Runtime nonce unavailable"))?;
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|_| Error::Storage("Actor Runtime nonce unavailable"))?;
         let runtime_key = RuntimeKey {
-            id: NonZeroU64::new(u64::from_le_bytes(nonce[..8].try_into().map_err(|_|Error::Storage("Runtime nonce malformed"))?))
-                .ok_or(Error::Storage("Actor Runtime ID zero; retry explicit attachment"))?,
-            generation: NonZeroU64::new(u64::from_le_bytes(nonce[8..].try_into().map_err(|_|Error::Storage("Runtime generation malformed"))?))
-                .ok_or(Error::Storage("Actor Runtime generation zero; retry explicit attachment"))?,
+            id: NonZeroU64::new(u64::from_le_bytes(
+                nonce[..8]
+                    .try_into()
+                    .map_err(|_| Error::Storage("Runtime nonce malformed"))?,
+            ))
+            .ok_or(Error::Storage(
+                "Actor Runtime ID zero; retry explicit attachment",
+            ))?,
+            generation: NonZeroU64::new(u64::from_le_bytes(
+                nonce[8..]
+                    .try_into()
+                    .map_err(|_| Error::Storage("Runtime generation malformed"))?,
+            ))
+            .ok_or(Error::Storage(
+                "Actor Runtime generation zero; retry explicit attachment",
+            ))?,
         };
-        let site=agent.tool_execution_site().to_owned();
-        let mut owner_runtime=HostRuntime::new(persistent.actor.clone(),site.clone(),runtime_key,8,32)?;
-        let actor=owner_runtime.bind_agent(
+        let site = agent.tool_execution_site().to_owned();
+        let mut owner_runtime =
+            HostRuntime::new(persistent.actor.clone(), site.clone(), runtime_key, 8, 32)?;
+        let actor = owner_runtime.bind_agent(
             &persistent.actor,
-            SessionBinding::from_trusted_host(session_id,Some(epoch))?,
+            SessionBinding::from_trusted_host(session_id, Some(epoch))?,
             None,
             EnvelopeSpec {
-                actor:persistent.actor.as_str().into(),
+                actor: persistent.actor.as_str().into(),
                 site,
-                revision:1,
-                access:Access::ReadOnly,
-                network:Network::Deny,
-                process:false,tty:false,microphone:false,speaker:false,
-                budget:Budget {
-                    max_model_rounds:32,max_tool_calls:128,max_children:0,
-                    max_depth:0,max_output_bytes:1024*1024,
+                revision: 1,
+                access: Access::ReadOnly,
+                network: Network::Deny,
+                process: false,
+                tty: false,
+                microphone: false,
+                speaker: false,
+                budget: Budget {
+                    max_model_rounds: 32,
+                    max_tool_calls: 128,
+                    max_children: 0,
+                    max_depth: 0,
+                    max_output_bytes: 1024 * 1024,
                 },
-                grants:vec![],
+                grants: vec![],
             },
             "rpc-session",
         )?;
-        owner_runtime.record_state(&persistent.actor,actor,Some(epoch),ActorState::Running)?;
-        let owner=aw::actor_owner::Service::new(
-            persistent.store.clone(), Arc::new(Mutex::new(owner_runtime)),
-            persistent.actor.clone(),actor,epoch,
-            session_id.to_owned(),branch_id,
+        owner_runtime.record_state(&persistent.actor, actor, Some(epoch), ActorState::Running)?;
+        let owner = aw::actor_owner::Service::new(
+            persistent.store.clone(),
+            Arc::new(Mutex::new(owner_runtime)),
+            persistent.actor.clone(),
+            actor,
+            epoch,
+            session_id.to_owned(),
+            branch_id,
         )?;
         owner.verify_rpc_agent(agent)?;
-        self.actor_owner=Some(owner);
+        self.actor_owner = Some(owner);
         Ok(())
     }
 
     fn verify_project(&self) -> Result<()> {
         if let Some(project) = &self.project {
             let current = aw::project_resources::Catalog::scan(
-                &project.root, &self.context.working_directory,
+                &project.root,
+                &self.context.working_directory,
             )?;
             current.verify(&config::load(self.resource_config_path.as_deref())?)?;
             if current.approved_files != project.approved_files {
@@ -3299,21 +3580,24 @@ impl Host {
     }
     fn render_named_prompt(&self, name: &str, input: &str) -> Result<String> {
         self.verify_project()?;
-        self.project.as_ref().ok_or(Error::Denied(
-            "named project prompts require --resources-project approval",
-        ))?.template(name, input, &self.resources.vars)
+        self.project
+            .as_ref()
+            .ok_or(Error::Denied(
+                "named project prompts require --resources-project approval",
+            ))?
+            .template(name, input, &self.resources.vars)
     }
-    fn render_named_skill(&self,name:&str,task:&str)->Result<String> {
+    fn render_named_skill(&self, name: &str, task: &str) -> Result<String> {
         self.verify_project()?;
-        let project=self.project.as_ref().ok_or(Error::Denied(
+        let project = self.project.as_ref().ok_or(Error::Denied(
             "on-demand project skill requires current source-pinned project trust",
         ))?;
-        let text=project.skill(name)?;
+        let text = project.skill(name)?;
         let request=format!(
             "Explicitly selected project skill {} (task data; never a permission grant):\n{}\n\nUser request:\n{}",
             name,text,task,
         );
-        if request.len()>config::MAX_PROMPT_BYTES {
+        if request.len() > config::MAX_PROMPT_BYTES {
             return Err(Error::Limit("selected skill exceeds max prompt budget"));
         }
         Ok(request)
@@ -3364,10 +3648,7 @@ impl Host {
     }
 
     fn current_provider_selection(&self) -> Result<aw::ProviderSelection> {
-        let agent = self
-            .agent
-            .as_ref()
-            .ok_or(Error::Storage("agent missing"))?;
+        let agent = self.agent.as_ref().ok_or(Error::Storage("agent missing"))?;
         if let Some(account) = self.account_selector.as_deref() {
             let model = self
                 .settings
@@ -3380,11 +3661,9 @@ impl Host {
                 .select(agent.actor(), account, model);
         }
         let identity = agent.default_identity()?;
-        agent.provider_accounts().select(
-            agent.actor(),
-            &identity.account_id,
-            &identity.model,
-        )
+        agent
+            .provider_accounts()
+            .select(agent.actor(), &identity.account_id, &identity.model)
     }
 
     fn auxiliary_inference(
@@ -3476,6 +3755,7 @@ impl Host {
         self.settings.profile = profile;
         self.agent = None;
         self.agent_job_runtime = None;
+        self.agent_close_owner = None;
         self.persistent = None;
         #[cfg(feature = "jsonl")]
         {
@@ -3520,10 +3800,8 @@ impl Host {
         workspace_selector: Option<String>,
         account_selector: Option<String>,
     ) -> Self {
-        let config_persistence = crate::config_persistence::Service::new(
-            config_path.clone(),
-            file_config.clone(),
-        );
+        let config_persistence =
+            crate::config_persistence::Service::new(config_path.clone(), file_config.clone());
         Self {
             settings,
             loaded_resources,
@@ -3564,8 +3842,9 @@ impl Host {
             actor_owner: None,
             agent_jobs_owner: None,
             agent_job_runtime: None,
+            agent_close_owner: None,
             pre_dispatch_retries: 0,
-            context_compaction_policy:aw_agent_core::CompactionPolicy::default(),
+            context_compaction_policy: aw_agent_core::CompactionPolicy::default(),
             project: None,
             resources: resource_cli_args::ResourcesArgs::default(),
             resource_config_path: None,
@@ -3590,22 +3869,24 @@ impl Host {
 
     fn loaded_resource_summary(&self) -> tui::agent_resources::LoadedResourceSummary {
         self.loaded_resources.with_context_blocks(
-            self.agent.as_ref().map(Agent::context_blocks).unwrap_or(&[]),
+            self.agent
+                .as_ref()
+                .map(Agent::context_blocks)
+                .unwrap_or(&[]),
         )
     }
 
     fn has_persistence(&self) -> bool {
-        self.persistent.is_some()
-            || {
-                #[cfg(feature = "jsonl")]
-                {
-                    self.jsonl_persistent.is_some()
-                }
-                #[cfg(not(feature = "jsonl"))]
-                {
-                    false
-                }
+        self.persistent.is_some() || {
+            #[cfg(feature = "jsonl")]
+            {
+                self.jsonl_persistent.is_some()
             }
+            #[cfg(not(feature = "jsonl"))]
+            {
+                false
+            }
+        }
     }
 
     fn current_session_label(&self) -> Result<Option<(String, String)>> {
@@ -3648,7 +3929,10 @@ impl Host {
                 binding.session_id() == p.session_id() && binding.branch_id() == branch
             })
         });
-        if self.agent.as_ref().is_some_and(|agent| agent.execution_binding().is_none())
+        if self
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.execution_binding().is_none())
             || same_binding
         {
             if let Some(agent) = &mut self.agent {
@@ -3687,17 +3971,29 @@ impl Host {
 
     #[cfg(feature = "jsonl")]
     fn compact_jsonl(&mut self) -> Result<u64> {
-        let cursor=self.jsonl_stored()?.cursor.clone();
-        let agent=self.agent.as_mut().ok_or(Error::Storage("Agent not loaded for compaction"))?;
-        if self.runtime.is_none() { self.runtime=Some(runtime()?); }
-        self.runtime.as_ref().ok_or(Error::Storage("no summary runtime"))?.block_on(
-            aw::jsonl_compaction::compact(agent,&cursor,&self.context_compaction_policy)
-        )
+        let cursor = self.jsonl_stored()?.cursor.clone();
+        let agent = self
+            .agent
+            .as_mut()
+            .ok_or(Error::Storage("Agent not loaded for compaction"))?;
+        if self.runtime.is_none() {
+            self.runtime = Some(runtime()?);
+        }
+        self.runtime
+            .as_ref()
+            .ok_or(Error::Storage("no summary runtime"))?
+            .block_on(aw::jsonl_compaction::compact(
+                agent,
+                &cursor,
+                &self.context_compaction_policy,
+            ))
     }
     #[cfg(feature = "jsonl")]
-    fn maybe_compact_jsonl(&mut self)->Result<()> {
-        let Some(p)=self.jsonl_persistent.as_ref() else {return Ok(())};
-        let history=p.view()?.history;
+    fn maybe_compact_jsonl(&mut self) -> Result<()> {
+        let Some(p) = self.jsonl_persistent.as_ref() else {
+            return Ok(());
+        };
+        let history = p.view()?.history;
         match self.context_compaction_policy.decision(&history)? {
             aw_agent_core::CompactionDecision::AutoAllowed => {
                 let through=self.compact_jsonl()?;
@@ -3716,7 +4012,8 @@ impl Host {
     fn jsonl_stored(&self) -> Result<&JsonlPersistentSession> {
         self.jsonl_persistent.as_ref().ok_or_else(|| {
             Error::Config(
-                "no active saved JSONL session; send a prompt or restart with --session-id ID".into(),
+                "no active saved JSONL session; send a prompt or restart with --session-id ID"
+                    .into(),
             )
         })
     }
@@ -3796,14 +4093,18 @@ impl Host {
             if self.runtime.is_none() {
                 self.runtime = Some(runtime()?);
             }
-            self.runtime.as_ref().ok_or(Error::Storage("missing MCP runtime"))?
+            self.runtime
+                .as_ref()
+                .ok_or(Error::Storage("missing MCP runtime"))?
                 .block_on(aw_mcp::attach(&mut agent, &self.mcp))?;
         }
         if !self.extensions.is_empty() {
             if self.runtime.is_none() {
                 self.runtime = Some(runtime()?);
             }
-            self.runtime.as_ref().ok_or(Error::Storage("missing extension runtime"))?
+            self.runtime
+                .as_ref()
+                .ok_or(Error::Storage("missing extension runtime"))?
                 .block_on(aw_extensions::attach(&mut agent, &self.extensions))?;
         }
         if !self.has_persistence() {
@@ -3821,7 +4122,8 @@ impl Host {
 
                 match self.store_backend {
                     resources_cli::SessionStoreBackendArg::Sqlite => {
-                        let store = Self::storage_step(self.sqlite_store(), "opening Session store")?;
+                        let store =
+                            Self::storage_step(self.sqlite_store(), "opening Session store")?;
                         if let Some(selector) = self.workspace_selector.as_deref() {
                             let d = match self.domain_selector.as_deref() {
                                 Some(v) => Some(store.domain(agent.actor(), v)?.id),
@@ -3991,15 +4293,14 @@ impl Host {
                 self.tools.limits.jobs.max_retained_jobs,
             )?);
             self.agent_jobs_owner = None;
+            self.agent_close_owner = None;
             if let Some(service) = stable_agent_service.as_ref() {
                 service.bind_agent_jobs_router(router.clone())?;
                 let agent_tool = service.agent_tool();
-                agent.register_host_tool(
-                    aw_tools_adapter::operation_router::routed_host_tool(
-                        agent_tool.clone(),
-                        self.tools.operation_router.clone(),
-                    )?,
-                )?;
+                agent.register_host_tool(aw_tools_adapter::operation_router::routed_host_tool(
+                    agent_tool.clone(),
+                    self.tools.operation_router.clone(),
+                )?)?;
                 self.tools
                     .graph_host_tools
                     .install(aw_tools::OperationId::Agent, agent_tool)?;
@@ -4031,10 +4332,9 @@ impl Host {
                         "remote execution-site binding differs from ToolPolicy site",
                     ));
                 }
-                let runtime = self
-                    .runtime
-                    .as_ref()
-                    .ok_or(Error::Storage("missing MCP runtime for remote execution site"))?;
+                let runtime = self.runtime.as_ref().ok_or(Error::Storage(
+                    "missing MCP runtime for remote execution site",
+                ))?;
                 let bridge = runtime.block_on(aw_mcp::connect_remote_bridge(&binding.endpoint))?;
                 operation_router = Some(
                     operation_router
@@ -4056,7 +4356,9 @@ impl Host {
                 )?;
                 let canonical = agent
                     .execution_binding()
-                    .ok_or(Error::Storage("Agent execution binding missing after persistence load"))?
+                    .ok_or(Error::Storage(
+                        "Agent execution binding missing after persistence load",
+                    ))?
                     .canonical_ref()
                     .to_owned();
                 router.register_live_owner(
@@ -4064,6 +4366,14 @@ impl Host {
                     owner.clone(),
                     agent.tool_binding_authority(),
                 )?;
+                self.agent_close_owner = Some(Arc::new(aw::agent_lifecycle::RootAgentClose::new(
+                    persistent.store.clone(),
+                    persistent.actor.clone(),
+                    canonical,
+                    owner.clone(),
+                    self.agent_job_runtime.clone(),
+                    router.clone(),
+                )?));
                 self.agent_jobs_owner = Some(owner);
             }
             self.tools.agent_jobs.replace(router)?;
@@ -4071,6 +4381,7 @@ impl Host {
             // Never leave a router/owner for a previously active SQLite Agent
             // when the rebuilt host is memory-only or uses another backend.
             self.agent_jobs_owner = None;
+            self.agent_close_owner = None;
             self.tools.agent_jobs.clear()?;
             self.tools.operation_router.clear()?;
             self.tools
@@ -4142,10 +4453,9 @@ impl Host {
         let retry_selected = if let Some(identity) = retry_identity.as_ref() {
             #[cfg(feature = "routing")]
             if let Some(route_operation) = retry_routing_operation.as_deref() {
-                let persistent = self
-                    .persistent
-                    .as_ref()
-                    .ok_or(Error::Denied("routed retry requires a saved SQLite session"))?;
+                let persistent = self.persistent.as_ref().ok_or(Error::Denied(
+                    "routed retry requires a saved SQLite session",
+                ))?;
                 Some(routing_runtime::select_routed_retry(
                     &*agent,
                     persistent,
@@ -4289,11 +4599,8 @@ impl Host {
             }
         }
         if let Ok(turn) = &result {
-            let stats = tui::performance::PerformanceStats::from_turn(
-                turn,
-                started.elapsed(),
-                first_delta,
-            );
+            let stats =
+                tui::performance::PerformanceStats::from_turn(turn, started.elapsed(), first_delta);
             self.session_performance.record(&stats);
             self.last_performance = Some(stats);
         }
@@ -4306,7 +4613,10 @@ impl Host {
                 binding.session_id() == p.handle.session_id() && binding.branch_id() == branch
             })
         });
-        if self.agent.as_ref().is_some_and(|agent| agent.execution_binding().is_none())
+        if self
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.execution_binding().is_none())
             || same_binding
         {
             if let Some(agent) = &mut self.agent {
@@ -4505,9 +4815,9 @@ impl Host {
             .ok_or(Error::Storage("runtime missing"))?;
         runtime.block_on(aw::context_flow::execute(
             self.agent.as_mut().ok_or(Error::Storage("agent missing"))?,
-            self.persistent
-                .as_mut()
-                .ok_or(Error::Denied("context flow requires the SQLite context-flow capability"))?,
+            self.persistent.as_mut().ok_or(Error::Denied(
+                "context flow requires the SQLite context-flow capability",
+            ))?,
             command,
             cancel,
         ))
@@ -4534,9 +4844,7 @@ impl Host {
                 #[cfg(feature = "jsonl")]
                 {
                     if branch != "main" {
-                        return Err(Error::Denied(
-                            "JSONL uses one main branch per Session file",
-                        ));
+                        return Err(Error::Denied("JSONL uses one main branch per Session file"));
                     }
                     let persistent = if let Some(current) = &self.jsonl_persistent {
                         current.open_session(id, "main")?
@@ -4627,43 +4935,48 @@ impl Host {
 
     fn command(&mut self, line: &str) -> Result<bool> {
         let (raw_verb, rest) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
-        let canonical = crate::tui::commands::canonical_slash_name(
-            raw_verb.trim_start_matches('/'),
-        )
-        .map(|name| format!("/{name}"));
+        let canonical =
+            crate::tui::commands::canonical_slash_name(raw_verb.trim_start_matches('/'))
+                .map(|name| format!("/{name}"));
         let verb = canonical.as_deref().unwrap_or(raw_verb);
         let rest = rest.trim();
         match verb {
             "/prompt" | "/skill" => {
                 self.verify_project()?;
-                if let Some(project)=&self.project {
-                    let values=if verb=="/prompt" {
+                if let Some(project) = &self.project {
+                    let values = if verb == "/prompt" {
                         project.templates.keys().collect::<Vec<_>>()
                     } else {
                         project.skills.keys().collect::<Vec<_>>()
                     };
-                    eprintln!("Approved {verb} resources: {}",values.iter().map(|name|
-                        terminal::safe_text(name)).collect::<Vec<_>>().join(", "));
+                    eprintln!(
+                        "Approved {verb} resources: {}",
+                        values
+                            .iter()
+                            .map(|name| terminal::safe_text(name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 } else {
                     eprintln!("No source-pinned project selected; use --resources-project.");
                 }
             }
             _ if verb.starts_with("/skill:") => {
-                let name=&verb["/skill:".len()..];
-                let prompt=self.render_named_skill(name,rest)?;
-                let prior=self.resources.template.take();
-                let result=self.prompt(prompt);
-                self.resources.template=prior;
+                let name = &verb["/skill:".len()..];
+                let prompt = self.render_named_skill(name, rest)?;
+                let prior = self.resources.template.take();
+                let result = self.prompt(prompt);
+                self.resources.template = prior;
                 result?;
             }
             _ if verb.starts_with("/prompt:") => {
-                let name=&verb["/prompt:".len()..];
-                let prompt=self.render_named_prompt(name,rest)?;
+                let name = &verb["/prompt:".len()..];
+                let prompt = self.render_named_prompt(name, rest)?;
                 // The named template is a whole user message, not a second
                 // interpolation of the default --resources-template.
-                let previous=self.resources.template.take();
-                let result=self.prompt(prompt);
-                self.resources.template=previous;
+                let previous = self.resources.template.take();
+                let result = self.prompt(prompt);
+                self.resources.template = previous;
                 result?;
             }
             "/status" => self.describe()?,
@@ -4695,28 +5008,32 @@ impl Host {
                         },
                         self.project.as_ref().map_or_else(
                             || "none".into(),
-                            |p|p.themes.keys().cloned().collect::<Vec<_>>().join(", ")
+                            |p| p.themes.keys().cloned().collect::<Vec<_>>().join(", ")
                         ),
                     );
                 } else {
-                    let (theme,accent) = match rest {
-                        "auto" | "system" => (config::ThemeMode::System,None),
-                        "dark" => (config::ThemeMode::Dark,None),
-                        "light" => (config::ThemeMode::Light,None),
+                    let (theme, accent) = match rest {
+                        "auto" | "system" => (config::ThemeMode::System, None),
+                        "dark" => (config::ThemeMode::Dark, None),
+                        "light" => (config::ThemeMode::Light, None),
                         name => {
                             self.verify_project()?;
-                            let selected=self.project.as_ref().ok_or(Error::Denied(
-                                "named theme requires approved --resources-project",
-                            ))?.theme(name)?;
-                            (selected.base,selected.accent)
+                            let selected = self
+                                .project
+                                .as_ref()
+                                .ok_or(Error::Denied(
+                                    "named theme requires approved --resources-project",
+                                ))?
+                                .theme(name)?;
+                            (selected.base, selected.accent)
                         }
                     };
-                    let mut ui=self.ui.clone();
-                    ui.theme=theme;
-                    ui.theme_accent=accent;
+                    let mut ui = self.ui.clone();
+                    ui.theme = theme;
+                    ui.theme_accent = accent;
                     ui.validate()?;
                     self.apply_ui(ui)?;
-                    eprintln!("Theme: {}",terminal::safe_text(rest));
+                    eprintln!("Theme: {}", terminal::safe_text(rest));
                 }
             }
             "/title-generate" => {
@@ -4960,8 +5277,7 @@ impl Host {
                             return Err(Error::Config("/export PATH".into()));
                         }
                         let p = self.jsonl_stored()?;
-                        let document =
-                            p.store.export_document(&p.actor, p.session_id(), "main")?;
+                        let document = p.store.export_document(&p.actor, p.session_id(), "main")?;
                         let bytes =
                             aw_session_format::encode(aw_session_format::Format::Aw, &document)?;
                         let path = Path::new(rest);
@@ -5071,197 +5387,300 @@ impl aw::headless::Driver for Host {
             std::sync::Arc::new(owner.clone()) as std::sync::Arc<dyn aw::headless::LiveControlPort>
         })
     }
+    fn agent_close_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentClosePort>> {
+        self.agent_close_owner.as_ref().map(|owner| {
+            std::sync::Arc::new(StdioAgentClosePort {
+                inner: owner.clone(),
+            }) as std::sync::Arc<dyn aw::headless::AgentClosePort>
+        })
+    }
     fn actor_query(&mut self, operation: serde_json::Value) -> Result<serde_json::Value> {
         use aw::actor_owner::{ActorOperation, ActorOperationResult};
-        let op=ActorOperation::from_rpc_value(operation)?;
-        if !matches!(op, ActorOperation::QueryInput {..} | ActorOperation::QueryControl {..}
-            | ActorOperation::ListControls | ActorOperation::QueryQueue {..}
-            | ActorOperation::ListQueue | ActorOperation::QueryNotice {..}
-            | ActorOperation::ListNotices)
-        {
+        let op = ActorOperation::from_rpc_value(operation)?;
+        if !matches!(
+            op,
+            ActorOperation::QueryInput { .. }
+                | ActorOperation::QueryControl { .. }
+                | ActorOperation::ListControls
+                | ActorOperation::QueryQueue { .. }
+                | ActorOperation::ListQueue
+                | ActorOperation::QueryNotice { .. }
+                | ActorOperation::ListNotices
+        ) {
             return Err(Error::Denied("Actor query may not alter state"));
         }
-        let result=self.actor_owner.as_ref().ok_or(Error::Denied("Actor owner not attached"))?
+        let result = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("Actor owner not attached"))?
             .operate_bound(op)?;
-        let value=match result {
-            ActorOperationResult::Input{fact}=>serde_json::json!({
+        let value = match result {
+            ActorOperationResult::Input { fact } => serde_json::json!({
                 "kind":"input","request_id":fact.admission.request_id,
                 "state":fact.state,"turn_id":fact.admission.turn_id,
                 "note":fact.note,
             }),
-            ActorOperationResult::Control{fact}=>serde_json::json!({
+            ActorOperationResult::Control { fact } => serde_json::json!({
                 "kind":"control","request_id":fact.admission.request_id,
                 "state":fact.state,"action":fact.admission.action,
                 "turn_id":fact.admission.turn_id,"note":fact.note,
             }),
-            ActorOperationResult::Controls{facts}=>serde_json::json!({
+            ActorOperationResult::Controls { facts } => serde_json::json!({
                 "kind":"controls","facts":facts.iter().map(|fact|serde_json::json!({
                     "request_id":fact.admission.request_id,"state":fact.state,
                     "action":fact.admission.action,"turn_id":fact.admission.turn_id,
                     "note":fact.note,
                 })).collect::<Vec<_>>()
             }),
-            ActorOperationResult::Queue{fact}=>serde_json::json!({"kind":"queue","fact":fact}),
-            ActorOperationResult::Queued{facts}=>serde_json::json!({"kind":"queued","facts":facts}),
-            ActorOperationResult::Notice{fact}=>serde_json::json!({"kind":"notice","fact":fact}),
-            ActorOperationResult::Notices{facts}=>serde_json::json!({"kind":"notices","facts":facts}),
+            ActorOperationResult::Queue { fact } => serde_json::json!({"kind":"queue","fact":fact}),
+            ActorOperationResult::Queued { facts } => {
+                serde_json::json!({"kind":"queued","facts":facts})
+            }
+            ActorOperationResult::Notice { fact } => {
+                serde_json::json!({"kind":"notice","fact":fact})
+            }
+            ActorOperationResult::Notices { facts } => {
+                serde_json::json!({"kind":"notices","facts":facts})
+            }
         };
         Ok(value)
     }
     fn actor_op(&mut self, operation: serde_json::Value) -> Result<serde_json::Value> {
         use aw::actor_owner::{ActorOperation, ActorOperationResult};
-        let op=ActorOperation::from_rpc_value(operation)?;
-        if !matches!(op,
-            ActorOperation::InspectInput{..} | ActorOperation::InspectControl{..}
-            | ActorOperation::DeleteQueue{..} | ActorOperation::InspectQueue{..}
-            | ActorOperation::AckNotice{..} | ActorOperation::InspectNotice{..})
-        {
-            return Err(Error::Denied("Actor op is restricted to inspected or revision-fenced owner dispositions"));
+        let op = ActorOperation::from_rpc_value(operation)?;
+        if !matches!(
+            op,
+            ActorOperation::InspectInput { .. }
+                | ActorOperation::InspectControl { .. }
+                | ActorOperation::DeleteQueue { .. }
+                | ActorOperation::InspectQueue { .. }
+                | ActorOperation::AckNotice { .. }
+                | ActorOperation::InspectNotice { .. }
+        ) {
+            return Err(Error::Denied(
+                "Actor op is restricted to inspected or revision-fenced owner dispositions",
+            ));
         }
-        let result=self.actor_owner.as_ref().ok_or(Error::Denied("Actor owner not attached"))?
+        let result = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("Actor owner not attached"))?
             .operate_bound(op)?;
         // Do not permit a request for a full admission/control fact to leak
         // private SHA, process identity, ciphertext refs, or origin headers.
         match result {
-            ActorOperationResult::Input{fact}=>Ok(serde_json::json!({
+            ActorOperationResult::Input { fact } => Ok(serde_json::json!({
                 "kind":"input","request_id":fact.admission.request_id,
                 "state":fact.state,"turn_id":fact.admission.turn_id,"note":fact.note,
             })),
-            ActorOperationResult::Control{fact}=>Ok(serde_json::json!({
+            ActorOperationResult::Control { fact } => Ok(serde_json::json!({
                 "kind":"control","request_id":fact.admission.request_id,
                 "state":fact.state,"action":fact.admission.action,
                 "turn_id":fact.admission.turn_id,"note":fact.note,
             })),
-            ActorOperationResult::Queue{fact}=>Ok(serde_json::json!({"kind":"queue","fact":fact})),
-            ActorOperationResult::Notice{fact}=>Ok(serde_json::json!({"kind":"notice","fact":fact})),
-            _=>Err(Error::Denied("Actor mutation returned an unexpected result class")),
+            ActorOperationResult::Queue { fact } => {
+                Ok(serde_json::json!({"kind":"queue","fact":fact}))
+            }
+            ActorOperationResult::Notice { fact } => {
+                Ok(serde_json::json!({"kind":"notice","fact":fact}))
+            }
+            _ => Err(Error::Denied(
+                "Actor mutation returned an unexpected result class",
+            )),
         }
     }
-    fn actor_enqueue(&mut self, p:&serde_json::Value) -> Result<serde_json::Value> {
+    fn actor_enqueue(&mut self, p: &serde_json::Value) -> Result<serde_json::Value> {
         use aw_store::QueueTarget;
-        let object=p.as_object().ok_or(Error::Protocol("Actor enqueue params must be object"))?;
-        let req=object.get("request_id").and_then(serde_json::Value::as_str)
+        let object = p
+            .as_object()
+            .ok_or(Error::Protocol("Actor enqueue params must be object"))?;
+        let req = object
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
             .ok_or(Error::Protocol("Actor enqueue needs durable request_id"))?;
-        let seq=object.get("message_id").and_then(serde_json::Value::as_u64)
-            .ok_or(Error::Protocol("Actor enqueue needs positive source sequence"))?;
-        let text=object.get("text").and_then(serde_json::Value::as_str)
+        let seq = object
+            .get("message_id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(Error::Protocol(
+                "Actor enqueue needs positive source sequence",
+            ))?;
+        let text = object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
             .ok_or(Error::Protocol("Actor enqueue requires text"))?;
-        let priority=object.get("priority").map_or(Some(0),serde_json::Value::as_i64)
-            .and_then(|n|i8::try_from(n).ok())
+        let priority = object
+            .get("priority")
+            .map_or(Some(0), serde_json::Value::as_i64)
+            .and_then(|n| i8::try_from(n).ok())
             .ok_or(Error::Protocol("Actor enqueue invalid priority"))?;
-        let target=match object.get("target_turn") {
-            None=>QueueTarget::Auto,
-            Some(v)=>QueueTarget::Exact(v.as_u64().filter(|n|*n>0)
-                .ok_or(Error::Protocol("Actor exact Turn invalid"))?),
+        let target = match object.get("target_turn") {
+            None => QueueTarget::Auto,
+            Some(v) => QueueTarget::Exact(
+                v.as_u64()
+                    .filter(|n| *n > 0)
+                    .ok_or(Error::Protocol("Actor exact Turn invalid"))?,
+            ),
         };
-        let owner=self.actor_owner.as_ref().ok_or(Error::Denied("Actor owner not attached"))?;
-        let agent=self.agent.as_ref().ok_or(Error::Denied("original Agent not selected"))?;
-        let fact=owner.enqueue_bound_text(agent,req,seq,target,priority,text)?;
+        let owner = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("Actor owner not attached"))?;
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or(Error::Denied("original Agent not selected"))?;
+        let fact = owner.enqueue_bound_text(agent, req, seq, target, priority, text)?;
         Ok(serde_json::json!({"kind":"queue","fact":fact}))
     }
-    fn actor_notice_read(&mut self, request_id:&str) -> Result<serde_json::Value> {
-        let owner=self.actor_owner.as_ref().ok_or(Error::Denied("Actor owner not attached"))?;
-        let text=owner.notice_private(request_id)?;
+    fn actor_notice_read(&mut self, request_id: &str) -> Result<serde_json::Value> {
+        let owner = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("Actor owner not attached"))?;
+        let text = owner.notice_private(request_id)?;
         // Explicitly opted-in owning local stdio consumer; this payload is
         // intentionally returned as private data, never on Query/metadata.
-        Ok(serde_json::json!({"kind":"notice_private","request_id":request_id,"text":text.as_str()}))
+        Ok(
+            serde_json::json!({"kind":"notice_private","request_id":request_id,"text":text.as_str()}),
+        )
     }
     fn actor_step(
         &mut self,
-        cancel:aw::CancellationToken,
-        emit:&mut (dyn FnMut(&AgentEvent)->Result<()> + Send),
+        cancel: aw::CancellationToken,
+        emit: &mut (dyn FnMut(&AgentEvent) -> Result<()> + Send),
     ) -> Result<Option<aw::conversation::Turn>> {
-        let owner=self.actor_owner.as_ref().ok_or(Error::Denied("Actor owner not attached"))?;
-        let agent=self.agent.as_mut().ok_or(Error::Denied("original Agent not selected"))?;
+        let owner = self
+            .actor_owner
+            .as_ref()
+            .ok_or(Error::Denied("Actor owner not attached"))?;
+        let agent = self
+            .agent
+            .as_mut()
+            .ok_or(Error::Denied("original Agent not selected"))?;
         if owner.admit_next_queued(agent)?.is_none() {
             return Ok(None);
         }
-        if self.runtime.is_none(){self.runtime=Some(runtime()?);}
-        let tokio=self.runtime.as_ref().ok_or(Error::Storage("Agent runtime unavailable"))?;
-        let canonical=agent.execution_binding().map(|binding|binding.canonical_ref().to_owned());
-        let result=tokio.block_on(async {
+        if self.runtime.is_none() {
+            self.runtime = Some(runtime()?);
+        }
+        let tokio = self
+            .runtime
+            .as_ref()
+            .ok_or(Error::Storage("Agent runtime unavailable"))?;
+        let canonical = agent
+            .execution_binding()
+            .map(|binding| binding.canonical_ref().to_owned());
+        let result = tokio.block_on(async {
             tokio::select! {
                 biased;
                 _=cancel.cancelled()=>Err(Error::Cancelled),
                 result=owner.run_once(agent, |event| emit(event))=>result,
             }
         });
-        if let Some(canonical)=canonical.as_deref() {
-            let _=tokio.block_on(self.tools.agent_jobs.deliver_source_events(canonical));
+        if let Some(canonical) = canonical.as_deref() {
+            let _ = tokio.block_on(self.tools.agent_jobs.deliver_source_events(canonical));
         }
         result
     }
     fn prompt(
-        &mut self,text:String,cancel:aw::CancellationToken,
-        emit:&mut (dyn FnMut(&AgentEvent)->Result<()> + Send),
-    )->Result<aw::conversation::Turn> {
+        &mut self,
+        text: String,
+        cancel: aw::CancellationToken,
+        emit: &mut (dyn FnMut(&AgentEvent) -> Result<()> + Send),
+    ) -> Result<aw::conversation::Turn> {
         if self.actor_owner.is_some() {
-            return Err(Error::Denied("Actor RPC accepts only the original queue-to-Agent path; raw prompt disabled"));
+            return Err(Error::Denied(
+                "Actor RPC accepts only the original queue-to-Agent path; raw prompt disabled",
+            ));
         }
-        self.ensure(false,&text)?;
-        self.prompt_with(text,cancel,emit)
+        self.ensure(false, &text)?;
+        self.prompt_with(text, cancel, emit)
     }
-    fn state(&self)->aw::headless::State {
-        let state=self.agent.as_ref().map(Agent::history_state);
-        let session=self.persistent.as_ref().map(|s|s.handle.session_id().to_owned());
-        #[cfg(feature="jsonl")]
-        let session=session.or_else(||self.jsonl_persistent.as_ref()
-            .map(|s|s.session_id().to_owned()));
-        aw::headless::State{
-            profile:self.settings.profile_name.clone(),
-            model:self.settings.profile.model.clone(),
+    fn state(&self) -> aw::headless::State {
+        let state = self.agent.as_ref().map(Agent::history_state);
+        let session = self
+            .persistent
+            .as_ref()
+            .map(|s| s.handle.session_id().to_owned());
+        #[cfg(feature = "jsonl")]
+        let session = session.or_else(|| {
+            self.jsonl_persistent
+                .as_ref()
+                .map(|s| s.session_id().to_owned())
+        });
+        aw::headless::State {
+            profile: self.settings.profile_name.clone(),
+            model: self.settings.profile.model.clone(),
             session,
-            next_turn:state.as_ref().map_or(1,|s|s.next_turn_id),
-            turn_count:state.as_ref().map_or(0,|s|s.turns.len()),
-            needs_reconciliation:self.agent.as_ref().is_some_and(Agent::needs_reconciliation),
-            tool_names:self.agent.as_ref().map_or_else(Vec::new,|a|a.tool_specs()
-                .into_iter().map(|tool|tool.name).collect()),
+            next_turn: state.as_ref().map_or(1, |s| s.next_turn_id),
+            turn_count: state.as_ref().map_or(0, |s| s.turns.len()),
+            needs_reconciliation: self.agent.as_ref().is_some_and(Agent::needs_reconciliation),
+            tool_names: self.agent.as_ref().map_or_else(Vec::new, |a| {
+                a.tool_specs().into_iter().map(|tool| tool.name).collect()
+            }),
         }
     }
-    fn turns(&self)->&[aw::conversation::Turn] {
-        self.agent.as_ref().map_or(&[],Agent::turns)
+    fn turns(&self) -> &[aw::conversation::Turn] {
+        self.agent.as_ref().map_or(&[], Agent::turns)
     }
-    fn can_template(&self)->bool {self.project.is_some()}
-    fn template(&self,name:&str,input:&str,vars:&[String])->Result<String> {
+    fn can_template(&self) -> bool {
+        self.project.is_some()
+    }
+    fn template(&self, name: &str, input: &str, vars: &[String]) -> Result<String> {
         self.verify_project()?;
-        self.project.as_ref().ok_or(Error::Denied(
-            "explicit named project template needs current source approval",
-        ))?.template(name,input,vars)
+        self.project
+            .as_ref()
+            .ok_or(Error::Denied(
+                "explicit named project template needs current source approval",
+            ))?
+            .template(name, input, vars)
     }
     fn prompt_prepared(
-        &mut self,text:String,cancel:aw::CancellationToken,
-        emit:&mut (dyn FnMut(&AgentEvent)->Result<()> + Send),
-    )->Result<aw::conversation::Turn> {
-        let before=self.resources.template.take();
-        let result=<Self as aw::headless::Driver>::prompt(self,text,cancel,emit);
-        self.resources.template=before;
+        &mut self,
+        text: String,
+        cancel: aw::CancellationToken,
+        emit: &mut (dyn FnMut(&AgentEvent) -> Result<()> + Send),
+    ) -> Result<aw::conversation::Turn> {
+        let before = self.resources.template.take();
+        let result = <Self as aw::headless::Driver>::prompt(self, text, cancel, emit);
+        self.resources.template = before;
         result
     }
-    fn can_sessions(&self)->bool {
-        self.actor_owner.is_none() && self.store_backend==resources_cli::SessionStoreBackendArg::Jsonl
-            && self.state_dir.is_some() && self.settings.profile.model.is_some()
+    fn can_sessions(&self) -> bool {
+        self.actor_owner.is_none()
+            && self.store_backend == resources_cli::SessionStoreBackendArg::Jsonl
+            && self.state_dir.is_some()
+            && self.settings.profile.model.is_some()
     }
-    fn new_session(&mut self)->Result<String> {
+    fn new_session(&mut self) -> Result<String> {
         if !<Self as aw::headless::Driver>::can_sessions(self) {
-            return Err(Error::Denied("new Session requires configured local JSONL Agent"));
+            return Err(Error::Denied(
+                "new Session requires configured local JSONL Agent",
+            ));
         }
         if self.agent.as_ref().is_some_and(Agent::needs_reconciliation) {
-            return Err(Error::Denied("inspect unresolved effects before creating a new Session"));
+            return Err(Error::Denied(
+                "inspect unresolved effects before creating a new Session",
+            ));
         }
-        #[cfg(feature="jsonl")]
+        #[cfg(feature = "jsonl")]
         {
             // The lightweight backend has no cross-Session root coordinator:
             // inspect siblings explicitly before creating an overlapping
             // owner/root Session. An unknown prior tool effect blocks creation.
-            let state_dir=self.state_dir.as_deref()
-                .ok_or(Error::Denied("new JSONL Session requires private state directory"))?;
-            let store=self.jsonl_store.clone()
-                .map(Ok).unwrap_or_else(||sessions::jsonl_store(state_dir))?;
-            let actor=sessions::actor(&self.context,false)?;
-            let root=self.tools.root.canonicalize()?;
+            let state_dir = self.state_dir.as_deref().ok_or(Error::Denied(
+                "new JSONL Session requires private state directory",
+            ))?;
+            let store = self
+                .jsonl_store
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| sessions::jsonl_store(state_dir))?;
+            let actor = sessions::actor(&self.context, false)?;
+            let root = self.tools.root.canonicalize()?;
             for entry in store.list(&actor)? {
                 if entry.binding.tool_root == root {
-                    let history=store.open(&actor,&entry.id,"main")?.view()?.history;
+                    let history = store.open(&actor, &entry.id, "main")?.view()?.history;
                     if history.needs_reconciliation {
                         return Err(Error::Denied(
                             "a sibling Session at the same tool root has unknown effects; inspect before creating another",
@@ -5269,69 +5688,100 @@ impl aw::headless::Driver for Host {
                     }
                 }
             }
-            if let Some(current)=&self.jsonl_persistent {
-                let next=current.new_session("New Agent")?;
-                let id=next.session_id().to_owned();
+            if let Some(current) = &self.jsonl_persistent {
+                let next = current.new_session("New Agent")?;
+                let id = next.session_id().to_owned();
                 self.replace_jsonl(next)?;
                 return Ok(id);
             }
-            self.ensure(false,"RPC new Session")?;
+            self.ensure(false, "RPC new Session")?;
             Ok(self.jsonl_stored()?.session_id().to_owned())
         }
-        #[cfg(not(feature="jsonl"))]
-        {Err(Error::Denied("no JSONL backend"))}
+        #[cfg(not(feature = "jsonl"))]
+        {
+            Err(Error::Denied("no JSONL backend"))
+        }
     }
-    fn open_session(&mut self,id:&str)->Result<()> {
+    fn open_session(&mut self, id: &str) -> Result<()> {
         if !<Self as aw::headless::Driver>::can_sessions(self) {
-            return Err(Error::Denied("Session switch requires a configured local JSONL Agent"));
+            return Err(Error::Denied(
+                "Session switch requires a configured local JSONL Agent",
+            ));
         }
         if self.agent.as_ref().is_some_and(Agent::needs_reconciliation) {
-            return Err(Error::Denied("inspect unresolved effects before Session switch"));
+            return Err(Error::Denied(
+                "inspect unresolved effects before Session switch",
+            ));
         }
-        self.resume_session(id,"main")?;
-        self.ensure(false,"RPC selected Session")
+        self.resume_session(id, "main")?;
+        self.ensure(false, "RPC selected Session")
     }
-    fn can_compact(&self)->bool {
-        if self.actor_owner.is_some(){return false;}
-        #[cfg(feature="jsonl")]
-        {self.jsonl_persistent.is_some() && self.agent.is_some()}
-        #[cfg(not(feature="jsonl"))]
-        {false}
-    }
-    fn compact(&mut self)->Result<u64> {
-        #[cfg(feature="jsonl")]
+    fn can_compact(&self) -> bool {
+        if self.actor_owner.is_some() {
+            return false;
+        }
+        #[cfg(feature = "jsonl")]
         {
-            if self.store_backend!=resources_cli::SessionStoreBackendArg::Jsonl {
-                return Err(Error::Denied("headless compact needs JSONL; SQLite uses ContextFlow"));
+            self.jsonl_persistent.is_some() && self.agent.is_some()
+        }
+        #[cfg(not(feature = "jsonl"))]
+        {
+            false
+        }
+    }
+    fn compact(&mut self) -> Result<u64> {
+        #[cfg(feature = "jsonl")]
+        {
+            if self.store_backend != resources_cli::SessionStoreBackendArg::Jsonl {
+                return Err(Error::Denied(
+                    "headless compact needs JSONL; SQLite uses ContextFlow",
+                ));
             }
             self.compact_jsonl()
         }
-        #[cfg(not(feature="jsonl"))]
-        {Err(Error::Denied("JSONL compaction unavailable in this build"))}
+        #[cfg(not(feature = "jsonl"))]
+        {
+            Err(Error::Denied("JSONL compaction unavailable in this build"))
+        }
     }
-    fn set_model(&mut self,model:&str)->Result<()> {
-        if self.actor_owner.is_some(){return Err(Error::Denied("Actor owner is bound to a fixed provider"));}
+    fn set_model(&mut self, model: &str) -> Result<()> {
+        if self.actor_owner.is_some() {
+            return Err(Error::Denied("Actor owner is bound to a fixed provider"));
+        }
         // The original Host::ensure creates a durable Session when state_dir
         // is present, even when has_persistence() is false right now. Only
         // true --no-state RPC is permitted to change profile/model choices.
-        if self.state_dir.is_some() || self.has_persistence(){
-            return Err(Error::Denied("RPC cannot rebind a durable Session to a different model"));
+        if self.state_dir.is_some() || self.has_persistence() {
+            return Err(Error::Denied(
+                "RPC cannot rebind a durable Session to a different model",
+            ));
         }
         config::validate_model(model)?;
-        if !self.settings.profile.effective_models().contains(model){
-            return Err(Error::Denied("new RPC model is not in the selected profile allowlist"));
+        if !self.settings.profile.effective_models().contains(model) {
+            return Err(Error::Denied(
+                "new RPC model is not in the selected profile allowlist",
+            ));
         }
-        self.ensure(false,"RPC model selection")?;
-        self.agent.as_mut().ok_or(Error::Denied("no configured Agent"))?.set_model(model)?;
-        self.settings.profile.model=Some(model.into());
+        self.ensure(false, "RPC model selection")?;
+        self.agent
+            .as_mut()
+            .ok_or(Error::Denied("no configured Agent"))?
+            .set_model(model)?;
+        self.settings.profile.model = Some(model.into());
         Ok(())
     }
-    fn set_effort(&mut self,effort:&str)->Result<()> {
-        if self.actor_owner.is_some(){return Err(Error::Denied("Actor owner is bound to its existing model settings"));}
-        if self.state_dir.is_some() || self.has_persistence(){
-            return Err(Error::Denied("RPC reasoning change on a durable Session is unavailable"));
+    fn set_effort(&mut self, effort: &str) -> Result<()> {
+        if self.actor_owner.is_some() {
+            return Err(Error::Denied(
+                "Actor owner is bound to its existing model settings",
+            ));
         }
-        let parsed=config::ReasoningEffort::parse(effort)
+        if self.state_dir.is_some() || self.has_persistence() {
+            return Err(Error::Denied(
+                "RPC reasoning change on a durable Session is unavailable",
+            ));
+        }
+        let parsed = config::ReasoningEffort::parse(effort)
             .ok_or(Error::Config("unsupported reasoning effort".into()))?;
         self.set_reasoning_effort(parsed)
     }
@@ -5489,13 +5939,9 @@ fn configure_provider_interactively(
     host: &mut Host,
     profiles: &mut BTreeMap<String, Profile>,
 ) -> Result<bool> {
-    let mut discover_models = |profile: &Profile| {
-                            runtime()?.block_on(aw::discovery::discover_models(profile))
-                        };
-                        match tui::onboarding::run_with_discovery(
-                            &host.file_config,
-                            &mut discover_models,
-                        )? {
+    let mut discover_models =
+        |profile: &Profile| runtime()?.block_on(aw::discovery::discover_models(profile));
+    match tui::onboarding::run_with_discovery(&host.file_config, &mut discover_models)? {
         tui::onboarding::OnboardingOutcome::Save(update) => {
             host.apply_profile_update(profiles, update)?;
             Ok(true)
@@ -5506,10 +5952,8 @@ fn configure_provider_interactively(
             #[cfg(feature = "oidc")]
             {
                 let actor = sessions::actor(&host.context, false)?;
-                let host_id = ensure_chatgpt_host_id(
-                    host.config_path.as_deref(),
-                    &mut host.file_config,
-                )?;
+                let host_id =
+                    ensure_chatgpt_host_id(host.config_path.as_deref(), &mut host.file_config)?;
                 if let Some(update) = chatgpt_plan_profile_update(
                     host.sqlite_store()?,
                     &actor,
@@ -5556,7 +6000,10 @@ fn sync_agent_presenter(
     presenter: &mut Option<tui::inline::AgentPresenter>,
     mode: config::TuiMode,
 ) -> Result<()> {
-    if presenter.as_ref().is_some_and(|current| current.mode() == mode) {
+    if presenter
+        .as_ref()
+        .is_some_and(|current| current.mode() == mode)
+    {
         return Ok(());
     }
     *presenter = None;
@@ -5573,14 +6020,26 @@ fn interactive(
 ) -> Result<u8> {
     // Restore bounded input recall from this exact authorized Session.
     // No secondary unmanaged plaintext history database is created.
-    let mut history = host.agent.as_ref().map(|agent|
-        agent.turns().iter().filter(|t|!t.prompt.is_empty())
-            .rev().take(128).map(|t|t.prompt.clone()).collect::<Vec<_>>()
-    ).unwrap_or_default();
+    let mut history = host
+        .agent
+        .as_ref()
+        .map(|agent| {
+            agent
+                .turns()
+                .iter()
+                .filter(|t| !t.prompt.is_empty())
+                .rev()
+                .take(128)
+                .map(|t| t.prompt.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     history.reverse();
     let mut next = initial;
     if host.has_persistence() {
-        eprintln!("Resumed saved conversation. /status for details · /tui fullscreen for full screen.");
+        eprintln!(
+            "Resumed saved conversation. /status for details · /tui fullscreen for full screen."
+        );
     }
     if host.tools.mode == aw::ToolMode::Trusted {
         eprintln!("WARNING: bash has your OS permissions; this is not a sandbox.");
@@ -5643,7 +6102,10 @@ fn interactive(
                     .as_mut()
                     .ok_or(Error::Storage("Agent presenter missing"))?
                     .read_prompt(
-                        tui::inline::prompt_editor(std::mem::take(&mut draft), preserved_editor.take())?,
+                        tui::inline::prompt_editor(
+                            std::mem::take(&mut draft),
+                            preserved_editor.take(),
+                        )?,
                         &history,
                         context,
                         &turns,
@@ -5657,8 +6119,14 @@ fn interactive(
                         host.flush_config()?;
                         return Ok(0);
                     }
-                    tui::inline::ReadOutcome::PaletteCommand { command, draft: original, ui } => {
-                        if ui != current_ui { host.apply_ui(ui)?; }
+                    tui::inline::ReadOutcome::PaletteCommand {
+                        command,
+                        draft: original,
+                        ui,
+                    } => {
+                        if ui != current_ui {
+                            host.apply_ui(ui)?;
+                        }
                         draft = original.text().to_owned();
                         preserved_editor = Some(original);
                         palette_command = true;
@@ -5701,26 +6169,60 @@ fn interactive(
             continue;
         }
         remember_interactive_input(&mut history, &line);
-        if let Some(request)=tui::commands::tui_request(&line) {
-            let request=match request { Ok(request)=>request,Err(usage)=>{eprintln!("aw: {usage}");if !palette_command { draft=line; }continue;} };
-            let target=match request {
-                tui::commands::TuiRequest::Show=>{
-                    eprintln!("TUI: {} · {}",match host.ui.tui_mode { config::TuiMode::Scrollback=>"scrollback",config::TuiMode::Inline=>"inline",config::TuiMode::Fullscreen=>"fullscreen" },tui::commands::TUI_USAGE);
+        if let Some(request) = tui::commands::tui_request(&line) {
+            let request = match request {
+                Ok(request) => request,
+                Err(usage) => {
+                    eprintln!("aw: {usage}");
+                    if !palette_command {
+                        draft = line;
+                    }
                     continue;
                 }
-                tui::commands::TuiRequest::Switch(target)=>target,
             };
-            if let Some(mode)=target.agent_mode() { let mut ui=host.ui.clone();ui.tui_mode=mode;host.apply_ui(ui)?;continue; }
-            presenter=None;
+            let target = match request {
+                tui::commands::TuiRequest::Show => {
+                    eprintln!(
+                        "TUI: {} · {}",
+                        match host.ui.tui_mode {
+                            config::TuiMode::Scrollback => "scrollback",
+                            config::TuiMode::Inline => "inline",
+                            config::TuiMode::Fullscreen => "fullscreen",
+                        },
+                        tui::commands::TUI_USAGE
+                    );
+                    continue;
+                }
+                tui::commands::TuiRequest::Switch(target) => target,
+            };
+            if let Some(mode) = target.agent_mode() {
+                let mut ui = host.ui.clone();
+                ui.tui_mode = mode;
+                host.apply_ui(ui)?;
+                continue;
+            }
+            presenter = None;
             #[cfg(feature = "workspace")]
             {
-                let returned=run_workspace_with_provider_setup(host,&mut profiles,None,std::mem::take(&mut draft))?;
-                host=returned.host;draft=returned.draft;
-                if returned.quit { host.flush_config()?;return Ok(0); }
+                let returned = run_workspace_with_provider_setup(
+                    host,
+                    &mut profiles,
+                    None,
+                    std::mem::take(&mut draft),
+                )?;
+                host = returned.host;
+                draft = returned.draft;
+                if returned.quit {
+                    host.flush_config()?;
+                    return Ok(0);
+                }
                 continue;
             }
             #[cfg(not(feature = "workspace"))]
-            { eprintln!("Workspace support disabled in this build.");continue; }
+            {
+                eprintln!("Workspace support disabled in this build.");
+                continue;
+            }
         }
         if line.trim_start().starts_with('/') && !line.trim_start().starts_with("//") {
             // Typed slash/status commands may intentionally print JSON or
@@ -5733,7 +6235,9 @@ fn interactive(
                 Ok(false) => {}
                 Err(e) => {
                     eprintln!("aw: {}", terminal::safe_text(&e.to_string()));
-                    if !palette_command { draft = line.clone(); }
+                    if !palette_command {
+                        draft = line.clone();
+                    }
                     continue;
                 }
             }
@@ -5749,8 +6253,7 @@ fn interactive(
                 let result = match host.store_backend {
                     resources_cli::SessionStoreBackendArg::Sqlite => {
                         if let Some(p) = &host.persistent {
-                            p.new_session("New agent")
-                                .and_then(|new| host.replace(new))
+                            p.new_session("New agent").and_then(|new| host.replace(new))
                         } else if let Some(a) = &mut host.agent {
                             a.reset()
                         } else {
@@ -5832,7 +6335,9 @@ fn interactive(
                 });
                 if let Err(e) = res {
                     eprintln!("aw: {e}");
-                    if !palette_command { draft = line.clone(); }
+                    if !palette_command {
+                        draft = line.clone();
+                    }
                 }
                 continue;
             }
@@ -5862,7 +6367,9 @@ fn interactive(
                     eprintln!("Next prompt creates a new session; old context is not disclosed to the new endpoint.");
                 } else {
                     eprintln!("Unknown current profile.");
-                    if !palette_command { draft = line.clone(); }
+                    if !palette_command {
+                        draft = line.clone();
+                    }
                 }
                 continue;
             }
@@ -5941,7 +6448,9 @@ fn interactive(
                 eprintln!(
                     "Unknown command; type / to search commands, or // to send a leading slash."
                 );
-                if !palette_command { draft = line.clone(); }
+                if !palette_command {
+                    draft = line.clone();
+                }
                 continue;
             }
             Input::Prompt(p) => p.to_owned(),
@@ -5953,11 +6462,15 @@ fn interactive(
             } else {
                 eprintln!("{message}");
             }
-            if !palette_command { draft = line.clone(); }
+            if !palette_command {
+                draft = line.clone();
+            }
             continue;
         }
         if host.settings.profile.model.is_none() {
-            if !palette_command { draft = line.clone(); }
+            if !palette_command {
+                draft = line.clone();
+            }
             presenter = None;
             if configure_provider_interactively(&mut host, &mut profiles)? {
                 history.clear();
@@ -5971,7 +6484,9 @@ fn interactive(
             } else {
                 eprintln!("{message}");
             }
-            if !palette_command { draft = line.clone(); }
+            if !palette_command {
+                draft = line.clone();
+            }
             continue;
         }
         let cwd = host.context.working_directory.display().to_string();
@@ -6062,7 +6577,10 @@ mod phase54_cli_tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Cli {
-        let owned = args.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+        let owned = args
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
         std::thread::Builder::new()
             .name("phase54-cli-parse".into())
             .stack_size(16 * 1024 * 1024)
@@ -6258,17 +6776,23 @@ mod phase54_cli_tests {
     }
 }
 
-
 #[cfg(test)]
 #[test]
 fn r14_original_command_tree_inventory() {
     if std::env::var_os("AW_R14_INVENTORY").is_some() {
         use clap::CommandFactory;
-        std::thread::Builder::new().stack_size(32*1024*1024)
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
-                let original=cli_taxonomy::schema(Cli::command());
-                println!("R14_INVENTORY_JSON={}",serde_json::to_string(&original).unwrap());
-            }).unwrap().join().unwrap();
+                let original = cli_taxonomy::schema(Cli::command());
+                println!(
+                    "R14_INVENTORY_JSON={}",
+                    serde_json::to_string(&original).unwrap()
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 
@@ -6276,7 +6800,10 @@ fn r14_original_command_tree_inventory() {
 #[test]
 fn native_workspace_attach_is_a_distinct_typed_command_not_a_new_agent() {
     let cli = cli_taxonomy::parse::<Cli>([
-        "aw", "workspace", "attach", "/tmp/synthetic-native-owner/invite",
+        "aw",
+        "workspace",
+        "attach",
+        "/tmp/synthetic-native-owner/invite",
     ]);
     match cli.command {
         Some(TopCommand::Workspace {
@@ -6291,61 +6818,103 @@ fn native_workspace_attach_is_a_distinct_typed_command_not_a_new_agent() {
 fn persistent_terminal_cli_is_typed_and_explicit() {
     use resources_cli::PersistentTerminalCommand as Persistent;
     let args = [
-        ["aw", "workspace", "persistent", "start", "/tmp/synthetic-root", "/bin/bash"],
-        ["aw", "workspace", "persistent", "serve", "/tmp/synthetic-root", "/bin/bash"],
+        [
+            "aw",
+            "workspace",
+            "persistent",
+            "start",
+            "/tmp/synthetic-root",
+            "/bin/bash",
+        ],
+        [
+            "aw",
+            "workspace",
+            "persistent",
+            "serve",
+            "/tmp/synthetic-root",
+            "/bin/bash",
+        ],
     ];
     for input in args {
         let mut words = input.to_vec();
-        if words[3] == "serve" { words.push("/tmp/synthetic-owner"); }
+        if words[3] == "serve" {
+            words.push("/tmp/synthetic-owner");
+        }
         let parsed = cli_taxonomy::parse::<Cli>(words);
         match parsed.command {
             Some(TopCommand::Workspace {
                 command: Some(resources_cli::WorkspaceCommand::Persistent { command }),
             }) => match command {
-                Persistent::Start { root, shell } if root == std::path::Path::new("/tmp/synthetic-root")
-                    && shell == std::path::Path::new("/bin/bash") => {}
-                Persistent::Serve { root, shell, directory }
+                Persistent::Start { root, shell }
                     if root == std::path::Path::new("/tmp/synthetic-root")
-                        && shell == std::path::Path::new("/bin/bash")
-                        && directory == std::path::Path::new("/tmp/synthetic-owner") => {}
+                        && shell == std::path::Path::new("/bin/bash") => {}
+                Persistent::Serve {
+                    root,
+                    shell,
+                    directory,
+                } if root == std::path::Path::new("/tmp/synthetic-root")
+                    && shell == std::path::Path::new("/bin/bash")
+                    && directory == std::path::Path::new("/tmp/synthetic-owner") => {}
                 _ => panic!("persistent owner CLI must carry explicit root/shell/endpoint"),
             },
             _ => panic!("persistent owner CLI must not activate an Agent"),
         }
     }
     let parsed = cli_taxonomy::parse::<Cli>([
-        "aw", "workspace", "persistent", "stop", "/tmp/synthetic-owner/invite",
+        "aw",
+        "workspace",
+        "persistent",
+        "stop",
+        "/tmp/synthetic-owner/invite",
     ]);
-    assert!(matches!(parsed.command, Some(TopCommand::Workspace {
-        command: Some(resources_cli::WorkspaceCommand::Persistent {
-            command: Persistent::Stop { .. },
-        }),
-    })));
+    assert!(matches!(
+        parsed.command,
+        Some(TopCommand::Workspace {
+            command: Some(resources_cli::WorkspaceCommand::Persistent {
+                command: Persistent::Stop { .. },
+            }),
+        })
+    ));
 }
 
 #[cfg(test)]
 #[test]
 fn r14_full_cli_parses_and_exports_from_small_outer_stack() {
-    let output=std::thread::Builder::new().stack_size(1024*1024)
-        .spawn(||{
-            let cli=cli_taxonomy::parse::<Cli>([
-                "aw", "--state-memory-only", "--provider-profile","llama",
-                "--model-id","mock", "--output-print","Hello",
+    let output = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let cli = cli_taxonomy::parse::<Cli>([
+                "aw",
+                "--state-memory-only",
+                "--provider-profile",
+                "llama",
+                "--model-id",
+                "mock",
+                "--output-print",
+                "Hello",
             ]);
             assert!(cli.command.is_none());
             assert!(cli.run.print);
-            let cmd=cli_taxonomy::command_tree::<Cli>();
-            let schema=cli_taxonomy::schema(cmd);
+            let cmd = cli_taxonomy::command_tree::<Cli>();
+            let schema = cli_taxonomy::schema(cmd);
             if cfg!(feature = "full") {
                 if cfg!(target_os = "linux") {
-                    assert_eq!(schema.counts.flags,1719);
-                    assert_eq!(schema.counts.command_paths,244 + 7 * usize::from(cfg!(all(feature = "workspace", unix))));
+                    assert_eq!(schema.counts.flags, 1719);
+                    assert_eq!(
+                        schema.counts.command_paths,
+                        244 + 7 * usize::from(cfg!(all(feature = "workspace", unix)))
+                    );
                 } else {
-                    assert_eq!(schema.counts.flags,1670);
-                    assert_eq!(schema.counts.command_paths,235 + 5 * usize::from(cfg!(all(feature = "workspace", unix))));
+                    assert_eq!(schema.counts.flags, 1670);
+                    assert_eq!(
+                        schema.counts.command_paths,
+                        235 + 5 * usize::from(cfg!(all(feature = "workspace", unix)))
+                    );
                 }
             }
         })
         .expect("spawn small outer proof thread");
-    output.join().expect("R14 full CLI parser/schema must work on smaller OS thread stacks");
+    output
+        .join()
+        .expect("R14 full CLI parser/schema must work on smaller OS thread stacks");
 }
