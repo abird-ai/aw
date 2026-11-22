@@ -4,14 +4,15 @@
 //! stays in ActorQueue/AuthoritySteer after the later Send boundary.
 
 use crate::{
-    actor_queue, agent_owner, db, durability, now, session_in, Error, PrincipalId, Result,
-    SecretStore, SessionStore,
+    actor_queue, agent_owner, db, durability, now, principal_is_session_owner, session_in,
+    workspace_writer, Error, PrincipalId, Result, SecretStore, SessionStore,
 };
 use getrandom::fill;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use zeroize::Zeroizing;
 
 const MAX_ITEMS: usize = 256;
 const ORDER_STEP: i64 = 1024;
@@ -96,7 +97,7 @@ pub struct AgentInputPlanSnapshot {
     pub items: Vec<AgentInputPlanItem>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct StoredItem {
     id: String,
     intent: AgentInputIntent,
@@ -107,6 +108,92 @@ struct StoredItem {
     payload_sha256: String,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutationState {
+    Prepared,
+    Applied,
+    Rejected,
+    Unknown,
+}
+
+impl MutationState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "applied" => Ok(Self::Applied),
+            "rejected" => Ok(Self::Rejected),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(Error::Storage("invalid staged Agent input replay state")),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MutationReceipt {
+    actor_user: String,
+    request_id: String,
+    operation: String,
+    fingerprint: String,
+    session: String,
+    branch: String,
+    state: MutationState,
+    resulting_inputs_rev: Option<u64>,
+    result_json: String,
+}
+
+pub struct AgentInputSendControl {
+    pub request_id: String,
+    pub turn: u64,
+    pub boundary: aw_agent_core::AuthorityBoundaryKind,
+    text: Zeroizing<String>,
+}
+
+impl AgentInputSendControl {
+    pub fn text(&self) -> &str {
+        self.text.as_str()
+    }
+}
+
+pub struct PreparedAgentInputSend {
+    canonical_ref: String,
+    session: String,
+    branch: String,
+    actor_user: String,
+    request_id: String,
+    fingerprint: String,
+    expected_rev: u64,
+    selected: Vec<StoredItem>,
+    control: Option<AgentInputSendControl>,
+    runtime_owner: Option<PrincipalId>,
+    recipient_site: Option<String>,
+    writer_epoch: Option<u64>,
+    prepared_control: Option<crate::AuthoritySteerFact>,
+}
+
+impl PreparedAgentInputSend {
+    pub fn canonical_ref(&self) -> &str {
+        &self.canonical_ref
+    }
+
+    pub fn control(&self) -> Option<&AgentInputSendControl> {
+        self.control.as_ref()
+    }
+}
+
+pub enum AgentInputSendStart {
+    Replay(AgentInputPlanSnapshot),
+    Prepared(Box<PreparedAgentInputSend>),
 }
 
 fn table_exists(connection: &Connection) -> Result<bool> {
@@ -149,6 +236,163 @@ fn validate_text(text: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_request_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-:".contains(&byte))
+    {
+        return Err(Error::Denied(
+            "invalid staged Agent input mutation identity",
+        ));
+    }
+    Ok(())
+}
+
+fn mutation_fingerprint(
+    operation: &str,
+    canonical_ref: &str,
+    semantic: serde_json::Value,
+) -> Result<String> {
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "version":1,
+        "operation":operation,
+        "agent":canonical_ref,
+        "semantic":semantic,
+    }))
+    .map_err(|_| Error::Storage("cannot encode staged Agent input mutation fingerprint"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"aw-agent-input-mutation-v1\0");
+    hash.update(encoded);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn receipt_in(
+    connection: &Connection,
+    actor_user: &str,
+    request_id: &str,
+) -> Result<Option<MutationReceipt>> {
+    let row: Option<(String, String, String, String, String, String, Option<u64>, String)> = db(
+        connection
+            .query_row(
+                "SELECT operation,fingerprint,session_id,branch_id,state,\n                        actor_user_id,resulting_inputs_rev,result_json\n                 FROM agent_input_mutation_replay\n                 WHERE actor_user_id=?1 AND request_id=?2",
+                params![actor_user, request_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional(),
+    )?;
+    row.map(
+        |(operation, fingerprint, session, branch, state, stored_actor, rev, result_json)| {
+            Ok(MutationReceipt {
+                actor_user: stored_actor,
+                request_id: request_id.to_owned(),
+                operation,
+                fingerprint,
+                session,
+                branch,
+                state: MutationState::parse(&state)?,
+                resulting_inputs_rev: rev,
+                result_json,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn validate_replay(
+    receipt: &MutationReceipt,
+    operation: &str,
+    fingerprint: &str,
+    session: &str,
+    branch: &str,
+) -> Result<()> {
+    if receipt.operation != operation
+        || receipt.fingerprint != fingerprint
+        || receipt.session != session
+        || receipt.branch != branch
+    {
+        return Err(Error::Conflict(
+            "staged Agent input request identity was reused with changed semantics",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_receipt_in(
+    connection: &Connection,
+    receipt: &MutationReceipt,
+    note: Option<&str>,
+) -> Result<()> {
+    let when = now();
+    db(connection.execute(
+        "INSERT INTO agent_input_mutation_replay(\n             actor_user_id,request_id,operation,fingerprint,session_id,branch_id,state,\n             resulting_inputs_rev,result_json,note,created_at,updated_at\n         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+        params![
+            receipt.actor_user,
+            receipt.request_id,
+            receipt.operation,
+            receipt.fingerprint,
+            receipt.session,
+            receipt.branch,
+            receipt.state.as_str(),
+            receipt.resulting_inputs_rev,
+            receipt.result_json,
+            note,
+            when
+        ],
+    ))?;
+    Ok(())
+}
+
+fn transition_receipt_in(
+    connection: &Connection,
+    expected: &MutationReceipt,
+    state: MutationState,
+    resulting_inputs_rev: Option<u64>,
+    result_json: &str,
+    note: Option<&str>,
+) -> Result<MutationReceipt> {
+    let changed = db(connection.execute(
+        "UPDATE agent_input_mutation_replay\n         SET state=?1,resulting_inputs_rev=?2,result_json=?3,note=?4,updated_at=?5\n         WHERE actor_user_id=?6 AND request_id=?7 AND operation=?8 AND fingerprint=?9\n           AND session_id=?10 AND branch_id=?11 AND state=?12",
+        params![
+            state.as_str(),
+            resulting_inputs_rev,
+            result_json,
+            note,
+            now(),
+            expected.actor_user,
+            expected.request_id,
+            expected.operation,
+            expected.fingerprint,
+            expected.session,
+            expected.branch,
+            expected.state.as_str()
+        ],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Conflict(
+            "staged Agent input mutation receipt changed concurrently",
+        ));
+    }
+    Ok(MutationReceipt {
+        state,
+        resulting_inputs_rev,
+        result_json: result_json.to_owned(),
+        ..expected.clone()
+    })
 }
 
 fn mint_id() -> Result<String> {
@@ -323,6 +567,94 @@ fn require_item_permission(
         )?;
     }
     Ok(())
+}
+
+fn require_send_permission(
+    connection: &Connection,
+    actor: &PrincipalId,
+    agent: agent_owner::AgentKey<'_>,
+    actor_user: &str,
+    item: &StoredItem,
+) -> Result<()> {
+    let permission = match item.intent {
+        AgentInputIntent::Followup { .. } => agent_owner::AgentPermission::Submit,
+        AgentInputIntent::Steer { .. } | AgentInputIntent::Interrupt { .. } => {
+            agent_owner::AgentPermission::Control
+        }
+    };
+    agent_owner::authorize_permission(connection, actor, agent, permission)?;
+    if item.creator != actor_user {
+        agent_owner::authorize_permission(
+            connection,
+            actor,
+            agent,
+            agent_owner::AgentPermission::Manage,
+        )?;
+    }
+    Ok(())
+}
+
+fn selected_items(items: &[StoredItem], ids: Option<&[String]>) -> Result<Vec<StoredItem>> {
+    let Some(ids) = ids else {
+        if items.is_empty() {
+            return Err(Error::Denied("Agent input Send selected no staged items"));
+        }
+        return Ok(items.to_vec());
+    };
+    if ids.is_empty() || ids.len() > MAX_ITEMS {
+        return Err(Error::Limit("invalid staged Agent input Send count"));
+    }
+    let wanted = ids.iter().collect::<BTreeSet<_>>();
+    if wanted.len() != ids.len() {
+        return Err(Error::Denied("duplicate staged Agent input Send id"));
+    }
+    let selected = items
+        .iter()
+        .filter(|item| wanted.contains(&item.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.len() != wanted.len() {
+        return Err(Error::Denied("staged Agent input Send item does not exist"));
+    }
+    Ok(selected)
+}
+
+fn runtime_request_id(request_id: &str, canonical_ref: &str, input_id: &str, kind: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-agent-input-runtime-v1\0");
+    for part in [
+        request_id.as_bytes(),
+        canonical_ref.as_bytes(),
+        input_id.as_bytes(),
+        kind.as_bytes(),
+    ] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    format!("hi_{:x}", hash.finalize())
+}
+
+fn sender_token(actor_user: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-agent-input-host-sender-v1\0");
+    hash.update(actor_user.as_bytes());
+    format!("host:{:x}", hash.finalize())
+}
+
+fn send_result_json(selected: &[StoredItem]) -> Result<String> {
+    let items = selected
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "id":item.id,
+                "intent":item.intent,
+                "creator":item.creator,
+                "last_editor":item.last_editor,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({"sent":items}))
+        .map_err(|_| Error::Storage("cannot encode staged Agent input Send result"))
 }
 
 fn next_rev(connection: &Connection, session: &str, branch: &str, current: u64) -> Result<u64> {
@@ -764,6 +1096,487 @@ impl SessionStore {
             let _ = self.discard_prepared_queue_custody(prepared);
         }
         self.agent_inputs_list(actor, canonical_ref)
+    }
+
+    pub fn agent_inputs_prepare_send(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        request_id: &str,
+        ids: Option<&[String]>,
+        expected_rev: u64,
+    ) -> Result<AgentInputSendStart> {
+        validate_request_id(request_id)?;
+        let actor_user = self.current_user(actor)?.user_id;
+        let semantic_ids = ids.map(|ids| {
+            let mut normalized = ids.to_vec();
+            normalized.sort();
+            normalized
+        });
+        let fingerprint = mutation_fingerprint(
+            "send",
+            canonical_ref,
+            serde_json::json!({"ids":semantic_ids,"rev":expected_rev}),
+        )?;
+
+        let prepared = {
+            let connection = self.connection()?;
+            let (session, branch, _) = agent_key(
+                &connection,
+                actor,
+                canonical_ref,
+                agent_owner::AgentPermission::View,
+            )?;
+            if let Some(receipt) = receipt_in(&connection, &actor_user, request_id)? {
+                validate_replay(&receipt, "send", &fingerprint, &session, &branch)?;
+                return match receipt.state {
+                    MutationState::Applied => {
+                        drop(connection);
+                        Ok(AgentInputSendStart::Replay(
+                            self.agent_inputs_list(actor, canonical_ref)?,
+                        ))
+                    }
+                    MutationState::Prepared | MutationState::Unknown | MutationState::Rejected => {
+                        Err(Error::Conflict(
+                            "Agent input Send request is non-retryable; inspect its mutation receipt",
+                        ))
+                    }
+                };
+            }
+            require_open(&connection, &session, &branch)?;
+            let current = plan_rev(&connection, &session, &branch)?;
+            require_rev(current, Some(expected_rev))?;
+            let items = load_items(&connection, &session, &branch)?;
+            let selected = selected_items(&items, ids)?;
+            let agent = agent_owner::AgentKey::new(&session, &branch);
+            let mut control_index = None;
+            for (index, item) in selected.iter().enumerate() {
+                require_send_permission(&connection, actor, agent, &actor_user, item)?;
+                validate_intent(&connection, &session, &branch, &item.intent)?;
+                if !matches!(item.intent, AgentInputIntent::Followup { .. })
+                    && control_index.replace(index).is_some()
+                {
+                    return Err(Error::Conflict(
+                        "one Agent input Send may contain at most one steer or interrupt",
+                    ));
+                }
+            }
+            (session, branch, selected, control_index)
+        };
+
+        let vault = self.local_secret_store()?;
+        let mut control = None;
+        for (index, item) in prepared.2.iter().enumerate() {
+            let bytes = vault.get(&item.payload_ref)?;
+            if format!("{:x}", Sha256::digest(bytes.as_slice())) != item.payload_sha256 {
+                return Err(Error::Storage(
+                    "staged Agent input payload digest no longer matches",
+                ));
+            }
+            if prepared.3 == Some(index) {
+                let text = String::from_utf8(bytes.to_vec())
+                    .map_err(|_| Error::Storage("staged Agent input payload is not UTF-8"))?;
+                let (turn, boundary, kind) = match item.intent {
+                    AgentInputIntent::Steer { turn } => {
+                        (turn, aw_agent_core::AuthorityBoundaryKind::Steer, "steer")
+                    }
+                    AgentInputIntent::Interrupt { turn } => (
+                        turn,
+                        aw_agent_core::AuthorityBoundaryKind::Interrupt,
+                        "interrupt",
+                    ),
+                    AgentInputIntent::Followup { .. } => unreachable!("selected control index"),
+                };
+                control = Some(AgentInputSendControl {
+                    request_id: runtime_request_id(request_id, canonical_ref, &item.id, kind),
+                    turn,
+                    boundary,
+                    text: Zeroizing::new(text),
+                });
+            }
+        }
+
+        Ok(AgentInputSendStart::Prepared(Box::new(
+            PreparedAgentInputSend {
+                canonical_ref: canonical_ref.to_owned(),
+                session: prepared.0,
+                branch: prepared.1,
+                actor_user,
+                request_id: request_id.to_owned(),
+                fingerprint,
+                expected_rev,
+                selected: prepared.2,
+                control,
+                runtime_owner: None,
+                recipient_site: None,
+                writer_epoch: None,
+                prepared_control: None,
+            },
+        )))
+    }
+
+    pub fn agent_inputs_bind_send_runtime(
+        &self,
+        actor: &PrincipalId,
+        mut prepared: PreparedAgentInputSend,
+        runtime_owner: PrincipalId,
+        recipient_site: &str,
+        writer_epoch: u64,
+    ) -> Result<PreparedAgentInputSend> {
+        if recipient_site.is_empty()
+            || recipient_site.len() > 128
+            || !recipient_site.is_ascii()
+            || recipient_site.chars().any(char::is_control)
+            || writer_epoch == 0
+        {
+            return Err(Error::Denied("invalid live Agent input owner binding"));
+        }
+        {
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let (session, branch, _) = agent_key(
+                &tx,
+                actor,
+                &prepared.canonical_ref,
+                agent_owner::AgentPermission::View,
+            )?;
+            if session != prepared.session || branch != prepared.branch {
+                return Err(Error::Conflict(
+                    "Agent input Send target changed before live binding",
+                ));
+            }
+            require_open(&tx, &session, &branch)?;
+            require_rev(
+                plan_rev(&tx, &session, &branch)?,
+                Some(prepared.expected_rev),
+            )?;
+            if !principal_is_session_owner(&tx, &session, &runtime_owner)? {
+                return Err(Error::Denied(
+                    "live Agent input owner differs from durable Session owner",
+                ));
+            }
+            workspace_writer::verify_writer_epoch_for_session(&tx, &session, writer_epoch)?;
+            let current = load_items(&tx, &session, &branch)?;
+            let ids = prepared
+                .selected
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            if selected_items(&current, Some(&ids))? != prepared.selected {
+                return Err(Error::Conflict(
+                    "staged Agent input selection changed before live binding",
+                ));
+            }
+            if prepared.control.is_some() {
+                if receipt_in(&tx, &prepared.actor_user, &prepared.request_id)?.is_some() {
+                    return Err(Error::Conflict(
+                        "Agent input Send mutation identity was claimed concurrently",
+                    ));
+                }
+                insert_receipt_in(
+                    &tx,
+                    &MutationReceipt {
+                        actor_user: prepared.actor_user.clone(),
+                        request_id: prepared.request_id.clone(),
+                        operation: "send".into(),
+                        fingerprint: prepared.fingerprint.clone(),
+                        session: session.clone(),
+                        branch: branch.clone(),
+                        state: MutationState::Prepared,
+                        resulting_inputs_rev: None,
+                        result_json: send_result_json(&prepared.selected)?,
+                    },
+                    None,
+                )?;
+            }
+            db(tx.commit())?;
+        }
+
+        prepared.runtime_owner = Some(runtime_owner.clone());
+        prepared.recipient_site = Some(recipient_site.to_owned());
+        prepared.writer_epoch = Some(writer_epoch);
+        if let Some(control) = &prepared.control {
+            let result = self.authority_steer_prepare(
+                &runtime_owner,
+                crate::AuthoritySteerRequest {
+                    request_id: control.request_id.clone(),
+                    session_id: prepared.session.clone(),
+                    branch_id: prepared.branch.clone(),
+                    writer_epoch,
+                    turn_id: control.turn,
+                    canonical_target: format!("{}/t:{}", prepared.canonical_ref, control.turn),
+                    participant: None,
+                },
+                control.text(),
+            );
+            match result {
+                Ok(fact) => prepared.prepared_control = Some(fact),
+                Err(error) => {
+                    let note = error.to_string().chars().take(1024).collect::<String>();
+                    let mut connection = self.connection()?;
+                    let tx =
+                        db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+                    let receipt = receipt_in(&tx, &prepared.actor_user, &prepared.request_id)?
+                        .ok_or(Error::Storage(
+                            "Agent input Send mutation receipt disappeared",
+                        ))?;
+                    validate_replay(
+                        &receipt,
+                        "send",
+                        &prepared.fingerprint,
+                        &prepared.session,
+                        &prepared.branch,
+                    )?;
+                    let _ = transition_receipt_in(
+                        &tx,
+                        &receipt,
+                        MutationState::Rejected,
+                        None,
+                        &receipt.result_json,
+                        Some(&note),
+                    )?;
+                    db(tx.commit())?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(prepared)
+    }
+
+    pub fn agent_inputs_commit_send(
+        &self,
+        actor: &PrincipalId,
+        prepared: &PreparedAgentInputSend,
+        control_segment: Option<&aw_agent_core::AuthoritySegment>,
+    ) -> Result<AgentInputPlanSnapshot> {
+        let runtime_owner = prepared.runtime_owner.as_ref().ok_or(Error::Conflict(
+            "Agent input Send lacks live runtime owner binding",
+        ))?;
+        let recipient_site = prepared.recipient_site.as_deref().ok_or(Error::Conflict(
+            "Agent input Send lacks live recipient site",
+        ))?;
+        let writer_epoch = prepared
+            .writer_epoch
+            .ok_or(Error::Conflict("Agent input Send lacks live writer epoch"))?;
+        if prepared.control.is_some() != control_segment.is_some()
+            || prepared.control.is_some() != prepared.prepared_control.is_some()
+        {
+            return Err(Error::Conflict(
+                "Agent input Send control preparation is incomplete",
+            ));
+        }
+
+        let control_staged_custody = prepared.control.as_ref().and_then(|control| {
+            prepared
+                .selected
+                .iter()
+                .find(|item| {
+                    matches!(
+                        (&item.intent, control.boundary),
+                        (
+                            AgentInputIntent::Steer { turn },
+                            aw_agent_core::AuthorityBoundaryKind::Steer
+                        ) if *turn == control.turn
+                    ) || matches!(
+                        (&item.intent, control.boundary),
+                        (
+                            AgentInputIntent::Interrupt { turn },
+                            aw_agent_core::AuthorityBoundaryKind::Interrupt
+                        ) if *turn == control.turn
+                    )
+                })
+                .map(|item| actor_queue::PreparedQueueCustody {
+                    payload_ref: item.payload_ref.clone(),
+                    payload_sha256: item.payload_sha256.clone(),
+                })
+        });
+
+        {
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let (session, branch, _) = agent_key(
+                &tx,
+                actor,
+                &prepared.canonical_ref,
+                agent_owner::AgentPermission::View,
+            )?;
+            if session != prepared.session || branch != prepared.branch {
+                return Err(Error::Conflict(
+                    "Agent input Send target changed before publication",
+                ));
+            }
+            require_open(&tx, &session, &branch)?;
+            let current_rev = plan_rev(&tx, &session, &branch)?;
+            require_rev(current_rev, Some(prepared.expected_rev))?;
+            if !principal_is_session_owner(&tx, &session, runtime_owner)? {
+                return Err(Error::Denied(
+                    "live Agent input owner differs from durable Session owner",
+                ));
+            }
+            workspace_writer::verify_writer_epoch_for_session(&tx, &session, writer_epoch)?;
+            let current = load_items(&tx, &session, &branch)?;
+            let ids = prepared
+                .selected
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            let selected = selected_items(&current, Some(&ids))?;
+            if selected != prepared.selected {
+                return Err(Error::Conflict(
+                    "staged Agent input selection changed before Send publication",
+                ));
+            }
+            let agent = agent_owner::AgentKey::new(&session, &branch);
+            for item in &selected {
+                require_send_permission(&tx, actor, agent, &prepared.actor_user, item)?;
+                validate_intent(&tx, &session, &branch, &item.intent)?;
+            }
+
+            if let (Some(fact), Some(segment)) =
+                (prepared.prepared_control.as_ref(), control_segment)
+            {
+                let receipt = receipt_in(&tx, &prepared.actor_user, &prepared.request_id)?.ok_or(
+                    Error::Storage("Agent input Send mutation receipt disappeared"),
+                )?;
+                validate_replay(&receipt, "send", &prepared.fingerprint, &session, &branch)?;
+                if receipt.state != MutationState::Prepared {
+                    return Err(Error::Conflict(
+                        "Agent input Send mutation receipt is not Prepared",
+                    ));
+                }
+                self.authority_steer_accept_in(&tx, runtime_owner, fact, segment)?;
+            } else if receipt_in(&tx, &prepared.actor_user, &prepared.request_id)?.is_some() {
+                return Err(Error::Conflict(
+                    "follow-up Agent input Send mutation identity was claimed concurrently",
+                ));
+            }
+
+            let sender = sender_token(&prepared.actor_user);
+            let mut message_id = actor_queue::next_message_id_in(&tx, &session, &sender)?;
+            for item in &selected {
+                if !matches!(item.intent, AgentInputIntent::Followup { .. }) {
+                    continue;
+                }
+                actor_queue::publish_prepared_queue_in(
+                    &tx,
+                    runtime_owner,
+                    crate::ActorQueueRequest {
+                        request_id: runtime_request_id(
+                            &prepared.request_id,
+                            &prepared.canonical_ref,
+                            &item.id,
+                            "followup",
+                        ),
+                        session_id: session.clone(),
+                        branch_id: branch.clone(),
+                        recipient_site: recipient_site.to_owned(),
+                        sender: sender.clone(),
+                        message_id,
+                        writer_epoch,
+                        target: crate::QueueTarget::Auto,
+                        priority: 0,
+                    },
+                    &actor_queue::PreparedQueueCustody {
+                        payload_ref: item.payload_ref.clone(),
+                        payload_sha256: item.payload_sha256.clone(),
+                    },
+                )?;
+                message_id = message_id
+                    .checked_add(1)
+                    .ok_or(Error::Limit("Actor queue sender sequence exhausted"))?;
+            }
+
+            for item in &selected {
+                db(tx.execute(
+                    "DELETE FROM agent_input_plan_items
+                     WHERE session_id=?1 AND branch_id=?2 AND input_id=?3",
+                    params![session, branch, item.id],
+                ))?;
+            }
+            let next = next_rev(&tx, &session, &branch, current_rev)?;
+            agent_owner::changed(&tx, agent)?;
+            publish_changed(&tx, actor, &session, &branch, next)?;
+            let result_json = send_result_json(&selected)?;
+            if let Some(receipt) = receipt_in(&tx, &prepared.actor_user, &prepared.request_id)? {
+                let _ = transition_receipt_in(
+                    &tx,
+                    &receipt,
+                    MutationState::Applied,
+                    Some(next),
+                    &result_json,
+                    None,
+                )?;
+            } else {
+                insert_receipt_in(
+                    &tx,
+                    &MutationReceipt {
+                        actor_user: prepared.actor_user.clone(),
+                        request_id: prepared.request_id.clone(),
+                        operation: "send".into(),
+                        fingerprint: prepared.fingerprint.clone(),
+                        session: session.clone(),
+                        branch: branch.clone(),
+                        state: MutationState::Applied,
+                        resulting_inputs_rev: Some(next),
+                        result_json,
+                    },
+                    None,
+                )?;
+            }
+            db(tx.commit())?;
+        }
+
+        if let Some(custody) = control_staged_custody {
+            let _ = self.discard_prepared_queue_custody(&custody);
+        }
+        self.agent_inputs_list(actor, &prepared.canonical_ref)
+    }
+
+    pub fn agent_inputs_abort_send(
+        &self,
+        prepared: &PreparedAgentInputSend,
+        uncertain: bool,
+        note: &str,
+    ) -> Result<()> {
+        let Some(fact) = prepared.prepared_control.as_ref() else {
+            return Ok(());
+        };
+        if note.trim().is_empty() {
+            return Err(Error::Denied("Agent input Send abort note is empty"));
+        }
+        let runtime_owner = prepared.runtime_owner.as_ref().ok_or(Error::Conflict(
+            "Agent input Send abort lacks runtime owner",
+        ))?;
+        let bounded = note.chars().take(1024).collect::<String>();
+        let authority = if uncertain {
+            self.authority_steer_mark_unknown(runtime_owner, fact, &bounded)
+        } else {
+            self.authority_steer_reject_prepared(runtime_owner, fact, &bounded)
+        };
+        let state = if uncertain || authority.is_err() {
+            MutationState::Unknown
+        } else {
+            MutationState::Rejected
+        };
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let receipt = receipt_in(&tx, &prepared.actor_user, &prepared.request_id)?.ok_or(
+            Error::Storage("Agent input Send mutation receipt disappeared"),
+        )?;
+        validate_replay(
+            &receipt,
+            "send",
+            &prepared.fingerprint,
+            &prepared.session,
+            &prepared.branch,
+        )?;
+        if receipt.state == MutationState::Prepared {
+            let result_json = receipt.result_json.clone();
+            let _ =
+                transition_receipt_in(&tx, &receipt, state, None, &result_json, Some(&bounded))?;
+        }
+        db(tx.commit())?;
+        Ok(())
     }
 }
 

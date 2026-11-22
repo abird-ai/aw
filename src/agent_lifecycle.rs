@@ -230,6 +230,148 @@ impl HostAgentClose {
     }
 }
 
+#[derive(Clone)]
+pub struct HostAgentInputs {
+    store: SessionStore,
+    actor: PrincipalId,
+    current_agent_ref: String,
+    router: Arc<agent_jobs::Router>,
+}
+
+impl HostAgentInputs {
+    pub fn new(
+        store: SessionStore,
+        actor: PrincipalId,
+        current_agent_ref: impl Into<String>,
+        router: Arc<agent_jobs::Router>,
+    ) -> Result<Self> {
+        let current_agent_ref = current_agent_ref.into();
+        let current = store.agent_get(&actor, &current_agent_ref)?;
+        if current.canonical_ref != current_agent_ref {
+            return Err(Error::Denied(
+                "host Agent input owner requires the exact current Agent ref",
+            ));
+        }
+        Ok(Self {
+            store,
+            actor,
+            current_agent_ref,
+            router,
+        })
+    }
+
+    fn canonical_ref(&self, reference: &str) -> Result<String> {
+        if reference == "." {
+            return Ok(self.current_agent_ref.clone());
+        }
+        let parsed =
+            ExecutionRef::parse(reference).map_err(|_| Error::Denied("invalid Agent input ref"))?;
+        if !parsed.is_canonical() {
+            return Err(Error::Denied(
+                "non-current Agent input operations require a canonical Agent ref",
+            ));
+        }
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid Agent input ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "Agent input operations require an Agent root ref",
+            ));
+        }
+        Ok(resolved.agent_ref().canonical())
+    }
+
+    pub fn send(
+        &self,
+        request_id: &str,
+        reference: &str,
+        ids: Option<&[String]>,
+        expected_rev: u64,
+    ) -> Result<aw_store::AgentInputPlanSnapshot> {
+        let canonical = self.canonical_ref(reference)?;
+        let prepared = match self.store.agent_inputs_prepare_send(
+            &self.actor,
+            &canonical,
+            request_id,
+            ids,
+            expected_rev,
+        )? {
+            aw_store::AgentInputSendStart::Replay(snapshot) => return Ok(snapshot),
+            aw_store::AgentInputSendStart::Prepared(prepared) => *prepared,
+        };
+
+        // Store authorization above intentionally precedes live-topology lookup.
+        let live = self.router.host_live_owner(&canonical)?;
+        let (owner, _session, _branch, site, epoch) = live.bound_peer_scope();
+        let owner = owner.clone();
+        let site = site.to_owned();
+        let bound = self.store.agent_inputs_bind_send_runtime(
+            &self.actor,
+            prepared,
+            owner,
+            &site,
+            epoch,
+        )?;
+
+        let segment = if let Some(control) = bound.control() {
+            match live.stage_host_authority_update(
+                control.turn,
+                &control.request_id,
+                control.boundary,
+                control.text(),
+            ) {
+                Ok(segment) => Some(segment),
+                Err(error) => {
+                    let _ = self.store.agent_inputs_abort_send(
+                        &bound,
+                        false,
+                        &format!("live Runtime rejected staged Send control: {error}"),
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        match self
+            .store
+            .agent_inputs_commit_send(&self.actor, &bound, segment.as_ref())
+        {
+            Ok(snapshot) => {
+                let _ = self.router.wake_live_if_supported(&canonical);
+                Ok(snapshot)
+            }
+            Err(error) => {
+                if let (Some(control), Some(segment)) = (bound.control(), segment.as_ref()) {
+                    let withdrawn = live.withdraw_host_authority_update(
+                        control.turn,
+                        &control.request_id,
+                        segment.fingerprint,
+                    );
+                    let uncertain = withdrawn.is_err();
+                    let _ = self.store.agent_inputs_abort_send(
+                        &bound,
+                        uncertain,
+                        if uncertain {
+                            "Send publication failed and live control withdrawal was uncertain"
+                        } else {
+                            "Send publication failed; live control was withdrawn"
+                        },
+                    );
+                    if uncertain {
+                        return Err(Error::Conflict(
+                            "Agent input Send outcome is unknown; inspect before retry",
+                        ));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum LiveAgentCommand {
     Wake,
@@ -667,7 +809,9 @@ mod tests {
         provider::{CompletionFuture, DeltaSink, Provider},
         CompletionMeta, Message, Usage,
     };
-    use aw_store::{AgentCreateRequest, SessionBinding as StoredSessionBinding};
+    use aw_store::{
+        AgentCreateRequest, AgentInputAdd, AgentInputIntent, SessionBinding as StoredSessionBinding,
+    };
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
@@ -964,6 +1108,61 @@ mod tests {
         assert_eq!(replay.canonical_ref, created.canonical_ref);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+        let staged = store
+            .agent_inputs_add(
+                &actor,
+                &created.canonical_ref,
+                &[AgentInputAdd {
+                    text: "perform the follow-up".into(),
+                    intent: AgentInputIntent::Followup { after: Some(1) },
+                    before: None,
+                    after: None,
+                }],
+                None,
+            )
+            .unwrap();
+        let agent_rev_before_send = store.agent_get(&actor, &created.canonical_ref).unwrap().rev;
+        let host_inputs = HostAgentInputs::new(
+            store.clone(),
+            actor.clone(),
+            root_ref.clone(),
+            router.clone(),
+        )
+        .unwrap();
+        let sent = host_inputs
+            .send(
+                "host-input-send-1",
+                &created.canonical_ref,
+                None,
+                staged.inputs_rev,
+            )
+            .unwrap();
+        assert!(sent.items.is_empty());
+        assert_eq!(sent.inputs_rev, staged.inputs_rev + 1);
+
+        let followup_settled = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = store.agent_get(&actor, &created.canonical_ref).unwrap();
+                if calls.load(Ordering::SeqCst) == 2 && snapshot.active_turn.is_none() {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sent staged follow-up must enter the existing queue and execute once");
+        assert!(followup_settled.rev > agent_rev_before_send);
+        let send_replay = host_inputs
+            .send(
+                "host-input-send-1",
+                &created.canonical_ref,
+                None,
+                staged.inputs_rev,
+            )
+            .unwrap();
+        assert_eq!(send_replay.inputs_rev, sent.inputs_rev);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
         let root_provider = Arc::new(CompletingProvider {
             calls: Arc::new(AtomicUsize::new(0)),
         });
@@ -1023,7 +1222,7 @@ mod tests {
         let host_close =
             HostAgentClose::new(store.clone(), actor.clone(), root_close, router.clone()).unwrap();
         let closing = host_close
-            .close(&created.canonical_ref, Some(settled.rev))
+            .close(&created.canonical_ref, Some(followup_settled.rev))
             .await
             .unwrap();
         assert_eq!(closing.lifecycle, AgentLifecycle::Closing);
@@ -1047,7 +1246,7 @@ mod tests {
             .unwrap();
         assert_eq!(close_replay.lifecycle, AgentLifecycle::Closed);
         assert_eq!(close_replay.rev, closed.rev);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(state_dir);
     }
 }

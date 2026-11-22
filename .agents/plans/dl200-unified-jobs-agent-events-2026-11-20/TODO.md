@@ -186,10 +186,17 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       SecretStore text, sparse ordered drafts with transactional rebalance, immutable creator/source +
       last-editor provenance, followup/contribute vs steer|interrupt/control permissions, manage for other
       users' drafts, exact Turn validation, close freeze, and one `agent.changed aspect=inputs` fact per
-      successful mutation without Agent-rev churn. Lower `list/add/edit/delete/reorder` are complete but are
-      intentionally not exposed yet. Still open in Phase 1: atomic `agent.inputs.send` into the existing
-      queue/control owners followed by exposing all five host methods together, provenance propagation and
-      only consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
+      successful mutation without Agent-rev churn. **Atomic staged Send is now internally complete:** v43
+      adds one stable-user/request replay owner; `HostAgentInputs` authorizes the complete set before Router
+      lookup; any number of followups plus at most one Runtime-pending steer/interrupt are supported; control
+      uses existing Prepared AuthoritySteer + live staging + transactional accept/withdraw/Unknown semantics;
+      followups publish through existing prepared ActorQueue custody; the final transaction removes every
+      selected draft, advances `inputs_rev` and Agent `rev` exactly once, emits the input-change fact and
+      records Applied replay. Same-request followup Send replay is proven not to duplicate execution, and
+      existing steer/interrupt segmented-custody regressions remain green. Lower `list/add/edit/delete/reorder`
+      are still intentionally not exposed. Still open in Phase 1: thread add/edit/delete through the shared
+      v43 replay owner, expose all five host methods together, then provenance propagation and only
+      consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
       with SourceDriver/checkpoint semantics. After that
       propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

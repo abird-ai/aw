@@ -521,6 +521,20 @@ pub(crate) fn publish_prepared_queue_in(
     Ok(fact)
 }
 
+pub(crate) fn next_message_id_in(
+    connection: &rusqlite::Connection,
+    session: &str,
+    sender: &str,
+) -> Result<u64> {
+    if !token(session, 128) || !token(sender, 128) {
+        return Err(Error::Denied("invalid Actor queue sender sequence scope"));
+    }
+    let all = events(connection, session)?;
+    max_sequence(connection, session, sender, &all)?
+        .checked_add(1)
+        .ok_or(Error::Limit("Actor queue sender sequence exhausted"))
+}
+
 impl SessionStore {
     pub(crate) fn write_prepared_queue_custody(
         &self,

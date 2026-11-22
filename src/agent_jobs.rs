@@ -227,6 +227,38 @@ impl Router {
             .contains_key(&resolved.agent_ref().canonical()))
     }
 
+    pub fn host_live_owner(&self, canonical_agent_ref: &str) -> Result<actor_owner::Service> {
+        let parsed = ExecutionRef::parse(canonical_agent_ref)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "live Agent owner lookup needs an Agent root ref",
+            ));
+        }
+        Ok(self.live_owner(&resolved.agent_ref().canonical())?.owner)
+    }
+
+    pub fn wake_live_if_supported(&self, canonical_agent_ref: &str) -> Result<()> {
+        let parsed = ExecutionRef::parse(canonical_agent_ref)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "live Agent wake lookup needs an Agent root ref",
+            ));
+        }
+        let live = self.live_owner(&resolved.agent_ref().canonical())?;
+        if let Some(wake) = live.wake {
+            wake.wake()?;
+        }
+        Ok(())
+    }
+
     pub fn request_live_close(&self, canonical_agent_ref: &str) -> Result<()> {
         let parsed = ExecutionRef::parse(canonical_agent_ref)
             .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;

@@ -96,6 +96,7 @@ pub use agent_host::{
 };
 pub use agent_input_plan::{
     AgentInputAdd, AgentInputEdit, AgentInputIntent, AgentInputPlanItem, AgentInputPlanSnapshot,
+    AgentInputSendControl, AgentInputSendStart, PreparedAgentInputSend,
 };
 pub use agent_job_events::AgentJobWakeAdmission;
 pub use agent_owner::{
@@ -257,8 +258,10 @@ pub const DOMAIN_PRINCIPALS_SCHEMA: &str = include_str!("../migrations/039_domai
 pub const HISTORY_OWNER_SCHEMA: &str = include_str!("../migrations/040_history_owner.sql");
 pub const SANDBOX_OWNER_SCHEMA: &str = include_str!("../migrations/041_sandbox_owner.sql");
 pub const AGENT_INPUT_PLAN_SCHEMA: &str = include_str!("../migrations/042_agent_input_plan.sql");
+pub const AGENT_INPUT_REPLAY_SCHEMA: &str =
+    include_str!("../migrations/043_agent_input_replay.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 42;
+const LATEST_SCHEMA_VERSION: i64 = 43;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2829,6 +2832,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 41 {
         migrate_agent_input_plan(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 42 {
+        migrate_agent_input_replay(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -3207,6 +3214,52 @@ fn migrate_agent_input_plan(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 42))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_agent_input_replay(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='agent-input-replay',generation=generation+1,
+             target_epoch=43,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(AGENT_INPUT_REPLAY_SCHEMA))?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Agent input replay migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='43' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=43,activation_epoch=43,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=43,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 43))?;
     db(tx.commit())?;
     Ok(())
 }

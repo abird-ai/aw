@@ -915,6 +915,42 @@ impl Service {
         }
     }
 
+    /// Host composition seam for an already-authorized staged input Send.
+    /// This owns no policy decision or durable receipt; the staged-input owner
+    /// must prepare durable custody first and later accept the returned segment
+    /// in its final publication transaction.
+    pub fn stage_host_authority_update(
+        &self,
+        turn_id: u64,
+        request_id: &str,
+        boundary: aw_agent_core::AuthorityBoundaryKind,
+        text: &str,
+    ) -> Result<aw_agent_core::AuthoritySegment> {
+        self.verify_rpc_state()?;
+        match boundary {
+            aw_agent_core::AuthorityBoundaryKind::Steer => self
+                .controller
+                .admit_authority_steer(turn_id, request_id, text),
+            aw_agent_core::AuthorityBoundaryKind::Interrupt => self
+                .controller
+                .admit_authority_interrupt(turn_id, request_id, text),
+            aw_agent_core::AuthorityBoundaryKind::Input => Err(Error::Denied(
+                "host authority update must be steer or interrupt",
+            )),
+        }
+    }
+
+    pub fn withdraw_host_authority_update(
+        &self,
+        turn_id: u64,
+        request_id: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<()> {
+        self.verify_rpc_state()?;
+        self.controller
+            .discard_authority_steer(turn_id, request_id, fingerprint)
+    }
+
     pub fn submit(
         &self,
         agent: &Agent,

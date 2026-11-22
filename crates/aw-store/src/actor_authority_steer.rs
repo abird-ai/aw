@@ -157,6 +157,53 @@ fn audit_fact(
     )
 }
 
+fn accept_in(
+    connection: &rusqlite::Connection,
+    owner: &PrincipalId,
+    prepared: &AuthoritySteerFact,
+    segment: &aw_agent_core::AuthoritySegment,
+) -> Result<AuthoritySteerFact> {
+    segment.validate()?;
+    if prepared.state != AuthoritySteerState::Prepared
+        || prepared.segment_ordinal.is_some()
+        || prepared.segment_fingerprint.is_some()
+    {
+        return Err(Error::Conflict(
+            "AuthoritySteer accept requires exact Prepared fact",
+        ));
+    }
+    if let Some(participant) = &prepared.request.participant {
+        let expected = participant.authority_segment_evidence()?;
+        if segment.evidence.as_ref() != Some(&expected) {
+            return Err(Error::Denied(
+                "staged AuthoritySegment differs from admitted participant Control evidence",
+            ));
+        }
+    }
+    writer(
+        connection,
+        owner,
+        &prepared.request.session_id,
+        prepared.request.writer_epoch,
+    )?;
+    let all = events(connection, &prepared.request.session_id)?;
+    let current = latest(&all, &prepared.request.request_id)
+        .ok_or(Error::Denied("AuthoritySteer fact disappeared"))?;
+    if current != prepared {
+        return Err(Error::Conflict("AuthoritySteer fact changed before accept"));
+    }
+    let mut next = prepared.clone();
+    next.state = AuthoritySteerState::Accepted;
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .ok_or(Error::Limit("AuthoritySteer revision exhausted"))?;
+    next.segment_ordinal = Some(segment.ordinal);
+    next.segment_fingerprint = Some(segment.fingerprint);
+    audit_fact(connection, owner, &next)?;
+    Ok(next)
+}
+
 impl SessionStore {
     pub fn authority_steer_prepare(
         &self,
@@ -280,48 +327,21 @@ impl SessionStore {
         prepared: &AuthoritySteerFact,
         segment: &aw_agent_core::AuthoritySegment,
     ) -> Result<AuthoritySteerFact> {
-        segment.validate()?;
-        if prepared.state != AuthoritySteerState::Prepared
-            || prepared.segment_ordinal.is_some()
-            || prepared.segment_fingerprint.is_some()
-        {
-            return Err(Error::Conflict(
-                "AuthoritySteer accept requires exact Prepared fact",
-            ));
-        }
-        if let Some(participant) = &prepared.request.participant {
-            let expected = participant.authority_segment_evidence()?;
-            if segment.evidence.as_ref() != Some(&expected) {
-                return Err(Error::Denied(
-                    "staged AuthoritySegment differs from admitted participant Control evidence",
-                ));
-            }
-        }
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        writer(
-            &tx,
-            owner,
-            &prepared.request.session_id,
-            prepared.request.writer_epoch,
-        )?;
-        let all = events(&tx, &prepared.request.session_id)?;
-        let current = latest(&all, &prepared.request.request_id)
-            .ok_or(Error::Denied("AuthoritySteer fact disappeared"))?;
-        if current != prepared {
-            return Err(Error::Conflict("AuthoritySteer fact changed before accept"));
-        }
-        let mut next = prepared.clone();
-        next.state = AuthoritySteerState::Accepted;
-        next.revision = next
-            .revision
-            .checked_add(1)
-            .ok_or(Error::Limit("AuthoritySteer revision exhausted"))?;
-        next.segment_ordinal = Some(segment.ordinal);
-        next.segment_fingerprint = Some(segment.fingerprint);
-        audit_fact(&tx, owner, &next)?;
+        let next = accept_in(&tx, owner, prepared, segment)?;
         db(tx.commit())?;
         Ok(next)
+    }
+
+    pub(crate) fn authority_steer_accept_in(
+        &self,
+        connection: &rusqlite::Connection,
+        owner: &PrincipalId,
+        prepared: &AuthoritySteerFact,
+        segment: &aw_agent_core::AuthoritySegment,
+    ) -> Result<AuthoritySteerFact> {
+        accept_in(connection, owner, prepared, segment)
     }
 
     pub fn authority_steer_reject_prepared(

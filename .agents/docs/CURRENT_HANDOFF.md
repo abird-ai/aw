@@ -395,18 +395,45 @@ emit immutable `agent.changed {aspect:"inputs", inputs_rev}` in the same transac
 **not** advance Agent `rev`. Once Agent lifecycle leaves `open`, list remains readable while draft mutation
 freezes. Payload text is never written into audit/commit-log rows.
 
-This staged owner is intentionally **not exposed on the host wire yet**. `agent.inputs.send` is the
-irreversible/effectful half: selected followups must transfer atomically into existing ActorQueue custody,
-while steer/interrupt must enter the existing authority-control owner and live Runtime without partial
-Send or silent Turn retargeting. That is the next coherent cut; all five public methods will be exposed
-together only after Send is correct rather than publishing a partial API.
+Schema **v43** adds one compact durable replay owner for staged-input mutations, keyed by authenticated
+stable user + host request ID with operation/fingerprint/target/state/result revision and bounded non-secret
+result metadata only. It is deliberately one table for add/edit/delete/send, not per-method ledgers. The
+atomic Send path now consumes it; add/edit/delete will be threaded through the same owner immediately
+before wire exposure.
+
+Atomic staged **Send is now complete internally** through one transport-neutral `HostAgentInputs`
+coordinator. Store first authorizes and fingerprints the complete selected set before any Router topology
+lookup. Followups require `submit`; steer/interrupt require `control`; other users' drafts additionally
+require `manage`; lifecycle/input-plan revision and exact Turn targets are rechecked. The existing Runtime
+allows one pending same-Turn authority update, so one Send may contain any number of followups plus at most
+one steer/interrupt; a selection with multiple controls conflicts atomically and leaves every draft staged.
+
+For a control item, the v43 mutation receipt enters `Prepared` before the existing `AuthoritySteer`
+preparation; the already-live `actor_owner::Service` stages the exact pending segment but owns no policy or
+new durable state. The final SQLite transaction revalidates the whole plan, accepts that exact control
+segment through the existing authority owner, publishes every selected followup through existing
+`ActorQueue` prepared custody, removes all selected drafts, advances `inputs_rev` once, advances Agent
+`rev` once, emits `agent.changed {aspect:"inputs"}`, and transitions the replay receipt to Applied. A
+precommit failure withdraws the exact live segment and rejects the Prepared control; uncertain withdrawal
+marks both owners Unknown and forbids blind retry. Followup-only Send needs no external Prepared phase and
+publishes its Applied replay receipt in the same final transaction. Existing staged SecretStore custody is
+transferred directly to ActorQueue for followups; only a control draft's original staged blob is retired
+after commit because AuthoritySteer owns its own prepared encrypted copy.
+
+The host-created Agent regression now proves staged followup -> atomic Send -> existing queue wake -> one
+second Turn, Agent-rev advancement, and exact same-request Send replay with no duplicate execution. Existing
+same-Turn steer and interrupt custody/AuthoritySegment regressions remain green after factoring the
+crate-private transactional accept helper. The public five-method `agent.inputs.*` wire is still withheld
+on purpose: add/edit/delete must first consume the same v43 replay owner so the complete surface is durable
+before it is advertised.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
 `agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
 custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding,
-native Sandbox list/get/close, and the lower v42 staged input-plan owner are complete. Remaining Phase-1
-work is atomic staged-input Send + five-method host exposure, provenance propagation/final
-consumer-required projections, and any remaining non-current host operations beyond close. Public
+native Sandbox list/get/close, the v42 staged input-plan owner, and internal atomic v43 Send composition
+are complete. Remaining Phase-1 work is threading add/edit/delete through the shared replay owner and then
+exposing all five `agent.inputs.*` host methods together, followed by provenance propagation/final
+consumer-required projections and any remaining non-current host operations beyond close. Public
 `sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed SourceDriver/checkpoint
 preparation semantics belong. Trusted delegation into another principal's Project also remains a separate
 future host-policy capability; it is not smuggled through the raw Project field. History ancestry still
@@ -434,8 +461,12 @@ model exact-history regression remains source-Project-local. The focused **v41 -
 regression is green over a real persistent Store: migration seeding, encrypted blind append, CAS relative
 insert, stale rejection, exact-Turn control-intent rejection without an active Turn, edit+reorder, delete,
 separate `inputs_rev`, unchanged Agent `rev`, close freeze, no plaintext audit leakage, and exactly one
-input-change fact per successful transaction. `cargo check -p aw-store -p aw-cli --tests`, strict
-all-target Clippy and repository fmt are green for this cut. A broader historical
+input-change fact per successful transaction. The host-activation regression now additionally sends a
+staged followup through `HostAgentInputs`, observes exactly one second provider Turn, proves Send advances
+Agent rev, and replays the same host request without another runtime Input. Existing
+`jobs_send_same_turn_steer_is_custodied_segmented_and_applied_once` and interrupt counterpart remain green
+after the transactional AuthoritySteer accept refactor. `cargo check -p aw-store -p aw-cli --tests`,
+strict all-target Clippy and repository fmt are green for this cut. A broader historical
 Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
 fixtures remain outside this focused Agent/Sandbox cut.
 The host-created Agent activation regression now also closes that non-current child through
