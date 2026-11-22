@@ -183,28 +183,53 @@ and the equivalent absolute ref replay the same committed child. Requests with n
 retain the pre-feature fingerprint JSON shape byte-for-byte, preserving previously committed Agent
 constructor replay across upgrade. Policy/operation delegates continue to pass no history source.
 
-This checkpoint does **not** claim the complete external host `agent.create` request shell from §28.3.
-The Store now provides its canonical Agent/settled-Turn history adapter, and the model `agent(from=...)`
-surface is wired. Still open are trusted host request/defaulting for alternate Project selection,
-custom access arrays, Sandbox `auto|ref`, optional initial task admission, and the remaining public
-Agent list/get/edit/close/admission shell. Those must compose this constructor rather than introduce a
-second publication path.
+The first external host Agent **state-shell** cut is now live locally over the existing owners; it does
+not create another Agent/Session/Project/Sandbox owner or publication path. `agent_host` provides
+project-scoped row-authorized `agent.list`, authoritative `agent.get`, title-only `agent.edit`,
+`agent.admission`, canonical-ref `agent.access.list/set` adapters, and the lower close-request seam.
+The host create request keeps trusted context separate from caller fields: the host supplies the
+current Project/current Agent and already-resolved execution `SessionBinding`; `from` resolves to the
+existing canonical Agent/settled-Turn history owner; Project defaults to source/current; and
+`private|inherit|custom` access is installed inside the **same immediate construction transaction**.
+The history constructor was factored only into an in-transaction helper so both its existing public
+adapter and the host shell use the same source-resolution, disclosure, destination creation and
+history-attachment path. Custom initial ACL rows use the existing disclosure-expansion owner before
+publication rather than publishing private and widening afterward.
 
-Phase 1 is still **underway**, not complete. Next coherent work is the external host Agent lifecycle/
-creation shell over the existing owners, then provenance propagation for newly committed
-Event/Tool/Process facts, reachability/flatten acceleration, minimal authoritative snapshots, and
-rebuilding Agent lookup/exposure from `agent_state_current`. Add StoreScope cursor/projection-head
-helpers only when one of those real consumers needs them; do not prebuild Phase-2/4 engines.
+The Agent admission state is now a real execution gate, not presentation-only state:
+`actor_input_prepare` checks authoritative Agent lifecycle/admission under the same writer transaction
+before allocating a future Input fact, then retains the existing model-pause gate. Holding admission
+therefore lets the current Turn settle while refusing future Turn admission. Close-request atomically
+moves lifecycle to `closing`/admission to `held`; `agent.admission` cannot reopen a closing/closed
+Agent. The currently exposed `agent_request_close` is deliberately only the **lower host seam**: full
+SPEC `agent.close` still requires the live host to compose factual active-Turn/owned-work cancellation,
+recipient-subscription retirement and eventual `closed` transition without fabricating certainty.
+
+This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
+closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
+means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
+that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
+trusted Project authority. Full live `agent.close`, initial task dispatch, explicit Sandbox binding and
+later staged `agent.inputs.*` remain open. History ancestry still grants none of those authorities.
+
+Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
+provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
+snapshots only where a real consumer needs them, and normalization/rebuild of Agent exposure from
+`agent_state_current`; add reachability/flatten acceleration only if a consumer proves it necessary.
+Do not prebuild Phase-2/4 engines.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
-backfill are green; group access/wake/history fencing remains green. The exact-history Store regression
-now additionally proves active `t:2` rejection, canonical local `t:1` selection after later Turn
-settlement, and `t:1` selection through an already-forked Agent's inherited HistoryBase chain. The
-model constructor regression proves `agent(from=".")` sees committed parent Turn 1 but not active
-parent Turn 2, starts its child work at Turn 2, and replays unchanged when the same call uses the
-equivalent absolute Agent ref. The pre-existing no-`from` stable-Agent replay regression remains green,
-proving fingerprint backward compatibility. Strict all-target/all-feature `aw-store` + `aw-cli`
-Clippy, all-feature checks, fmt and diff checks are green.
+backfill remain green; group access/wake/history fencing remains green. The exact-history owner suite is
+**4/4** after the constructor factoring, Actor admission is **2/2**, and the consolidated host shell
+regression proves fresh create/list/get projection, title CAS, access snapshot, admission hold,
+close-request fencing, non-reopen after closing, and fail-closed initial-task creation without a
+half-published Agent. The existing model `agent(from=...)`/no-`from` replay evidence remains the prior
+published evidence. `cargo check -p aw-store`, strict all-target `aw-store` Clippy and repository fmt are
+green for this cut. A broader `cargo test -p aw-store --lib` sweep reached **222/225**; the three
+failures are older remote-start/remote-view migration fixtures that downgrade an already-current test
+schema to v34/v35 without removing later v38+ tables, then re-run initialization and collide with those
+still-existing tables. They reproduce individually and are outside this Agent-owned cut; they are not
+claimed green or repaired here. The required focused Agent/history/admission regressions remain green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

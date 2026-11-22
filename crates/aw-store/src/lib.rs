@@ -14,6 +14,7 @@ mod actor_custody;
 mod actor_notice;
 mod actor_peer;
 mod actor_queue;
+mod agent_host;
 mod agent_job_events;
 mod agent_owner;
 mod archive;
@@ -86,6 +87,10 @@ pub use actor_queue::{
     model_queue_disposition_id, model_queue_request_id, queued_input_request_id, ActorQueueFact,
     ActorQueueRequest, ActorQueueView, ClaimedQueueInput, ModelQueueDispositionKind,
     ModelQueueDispositionRequest, QueueClaim, QueueState, QueueTarget,
+};
+pub use agent_host::{
+    AgentAdmission, AgentCreateAccess, AgentCreateAccessGrant, AgentCreateContext,
+    AgentCreateRequest, AgentLifecycle, AgentSandboxSelection, AgentSnapshot,
 };
 pub use agent_job_events::AgentJobWakeAdmission;
 pub use agent_owner::{

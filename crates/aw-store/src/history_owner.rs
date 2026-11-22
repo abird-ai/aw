@@ -1461,6 +1461,56 @@ pub(crate) fn attach_canonical_history_to_existing_agent_in(
     )
 }
 
+pub(crate) fn create_agent_from_history_ref_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    canonical_source: &str,
+    title: &str,
+    binding: &SessionBinding,
+    access: AgentHistoryForkAccess,
+) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+    crate::label(title, 160)?;
+    crate::validate_binding(binding)?;
+    let source = resolve_canonical_history_source_in(connection, actor, canonical_source)?;
+    let (owner_kind, owner_handle, workspace): (String, String, Option<String>) = db(connection
+        .query_row(
+            "SELECT a.owner_kind,a.owner_handle,s.workspace_id
+             FROM agent_state_current a JOIN sessions s ON s.id=a.session_id
+             WHERE a.session_id=?1 AND a.branch_id=?2",
+            params![source.session_id, source.branch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ))?;
+    if owner_kind != "user" {
+        return Err(Error::Denied(
+            "exact-history constructor currently requires a user-owned source Project",
+        ));
+    }
+    let workspace = workspace.ok_or(Error::Storage(
+        "source Agent is missing its authoritative Project binding",
+    ))?;
+    let destination_owner = stable_user_principal(&owner_handle)?;
+    let (destination_session, destination_branch) = resources::create_in_workspace_tx(
+        connection,
+        &destination_owner,
+        title,
+        binding,
+        &workspace,
+        None,
+    )?;
+    attach_resolved_history_to_destination_in(
+        connection,
+        actor,
+        &source,
+        &destination_session.id,
+        &destination_branch.id,
+        access,
+    )?;
+    Ok((
+        session_in(connection, &destination_session.id)?,
+        branch_in(connection, &destination_session.id, &destination_branch.id)?,
+    ))
+}
+
 impl SessionStore {
     /// Trusted lower constructor for a structurally shared exact-history Agent.
     /// History ancestry is independent from execution/Sandbox ancestry: callers
@@ -1474,49 +1524,17 @@ impl SessionStore {
         binding: SessionBinding,
         access: AgentHistoryForkAccess,
     ) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
-        crate::label(title, 160)?;
-        crate::validate_binding(&binding)?;
         let mut connection = self.connection()?;
         let tx =
             db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
-        let source = resolve_canonical_history_source_in(&tx, actor, canonical_source)?;
-        let (owner_kind, owner_handle, workspace): (String, String, Option<String>) = db(tx
-            .query_row(
-                "SELECT a.owner_kind,a.owner_handle,s.workspace_id
-                 FROM agent_state_current a JOIN sessions s ON s.id=a.session_id
-                 WHERE a.session_id=?1 AND a.branch_id=?2",
-                params![source.session_id, source.branch_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ))?;
-        if owner_kind != "user" {
-            return Err(Error::Denied(
-                "exact-history constructor currently requires a user-owned source Project",
-            ));
-        }
-        let workspace = workspace.ok_or(Error::Storage(
-            "source Agent is missing its authoritative Project binding",
-        ))?;
-        let destination_owner = stable_user_principal(&owner_handle)?;
-        let (destination_session, destination_branch) = resources::create_in_workspace_tx(
-            &tx,
-            &destination_owner,
-            title,
-            &binding,
-            &workspace,
-            None,
-        )?;
-        attach_resolved_history_to_destination_in(
+        let result = create_agent_from_history_ref_in(
             &tx,
             actor,
-            &source,
-            &destination_session.id,
-            &destination_branch.id,
+            canonical_source,
+            title,
+            &binding,
             access,
         )?;
-        let result = (
-            session_in(&tx, &destination_session.id)?,
-            branch_in(&tx, &destination_session.id, &destination_branch.id)?,
-        );
         db(tx.commit())?;
         Ok(result)
     }

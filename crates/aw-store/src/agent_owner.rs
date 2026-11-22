@@ -483,6 +483,23 @@ pub(crate) fn changed(connection: &Connection, agent: AgentKey<'_>) -> Result<()
     Ok(())
 }
 
+pub(crate) fn require_future_admission(connection: &Connection, agent: AgentKey<'_>) -> Result<()> {
+    validate(agent)?;
+    let (lifecycle, admission): (String, String) = db(connection.query_row(
+        "SELECT lifecycle,admission FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![agent.session, agent.branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    if lifecycle != "open" {
+        return Err(Error::Denied("Agent is closing or closed"));
+    }
+    if admission != "open" {
+        return Err(Error::Denied("Agent admission is held"));
+    }
+    Ok(())
+}
+
 pub(crate) fn request_close(connection: &Connection, agent: AgentKey<'_>) -> Result<bool> {
     validate(agent)?;
     let changed = db(connection.execute(
@@ -815,6 +832,58 @@ pub(crate) fn acl_permissions(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn initialize_acl(
+    connection: &Connection,
+    agent: AgentKey<'_>,
+    principal_kind: &str,
+    principal_handle: &str,
+    permissions: AgentPermissions,
+    granted_by_handle: &str,
+) -> Result<()> {
+    validate(agent)?;
+    let permissions = permissions.validate()?;
+    if permissions.is_empty() {
+        return Ok(());
+    }
+    if !matches!(principal_kind, "user" | "group") {
+        return Err(Error::Denied("invalid Agent ACL principal kind"));
+    }
+    let (rev, acl_rev): (u64, u64) = db(connection.query_row(
+        "SELECT rev,acl_rev FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![agent.session, agent.branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    if rev != 1 || acl_rev != 1 {
+        return Err(Error::Conflict(
+            "initial Agent access can only be installed during construction",
+        ));
+    }
+    db(connection.execute(
+        "INSERT INTO agent_acl_current(
+             session_id,branch_id,principal_kind,principal_handle,
+             can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
+             grant_rev,granted_by_handle,updated_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12,?13)",
+        params![
+            agent.session,
+            agent.branch,
+            principal_kind,
+            principal_handle,
+            i64::from(permissions.view),
+            i64::from(permissions.contribute),
+            i64::from(permissions.submit),
+            i64::from(permissions.control),
+            i64::from(permissions.derive),
+            i64::from(permissions.share),
+            i64::from(permissions.manage),
+            granted_by_handle,
+            now(),
+        ],
+    ))?;
+    Ok(())
+}
+
 pub(crate) fn set_acl(
     connection: &Connection,
     agent: AgentKey<'_>,
@@ -968,6 +1037,49 @@ pub(crate) fn lifecycle(connection: &Connection, agent: AgentKey<'_>) -> Result<
         params![agent.session, agent.branch],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ))
+}
+
+pub(crate) fn set_admission(
+    connection: &Connection,
+    agent: AgentKey<'_>,
+    expected_rev: Option<u64>,
+    state: &str,
+) -> Result<(u64, bool)> {
+    validate(agent)?;
+    if !matches!(state, "open" | "held") {
+        return Err(Error::Denied("invalid Agent admission state"));
+    }
+    let (lifecycle, admission, rev): (String, String, u64) = db(connection.query_row(
+        "SELECT lifecycle,admission,rev FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2",
+        params![agent.session, agent.branch],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ))?;
+    if expected_rev.is_some_and(|expected| expected != rev) {
+        return Err(Error::Conflict("stale Agent revision"));
+    }
+    if lifecycle != "open" {
+        return Err(Error::Conflict(
+            "Agent admission cannot change after close begins",
+        ));
+    }
+    if admission == state {
+        return Ok((rev, false));
+    }
+    let changed = db(connection.execute(
+        "UPDATE agent_state_current
+         SET admission=?1,rev=rev+1,updated_at=?2
+         WHERE session_id=?3 AND branch_id=?4 AND lifecycle='open' AND rev=?5
+           AND rev<9223372036854775807",
+        params![state, now(), agent.session, agent.branch, rev],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Conflict("Agent admission changed concurrently"));
+    }
+    let next = rev
+        .checked_add(1)
+        .ok_or(Error::Limit("Agent revision exhausted"))?;
+    Ok((next, true))
 }
 
 pub(crate) fn delegated_child_branch(

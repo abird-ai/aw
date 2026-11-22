@@ -112,10 +112,17 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       identity, and attaches history inside the existing durable child-allocation transaction before
       publication. `from="."` and equivalent absolute refs replay identically; no-`from` fingerprint
       shape stays backward-compatible. Focused Store/model/no-from replay tests and strict Clippy are
-      green. The full external host §28.3 `agent.create` shell (trusted Project/custom access/Sandbox/
-      optional task defaults) remains open and must compose this path. Then propagate manifests through
-      new Event/Tool/Process facts, add reachability/flatten acceleration as consumers require, minimal
-      snapshots and rebuild Agent exposure from owner state.
+      green. **First external host Agent state-shell cut landed locally:** project-scoped row-authorized
+      list/get, title edit, admission, canonical access list/set adapters and the lower close-request
+      seam compose `agent_state_current`; fresh/exact-history create keeps trusted current Project +
+      execution binding outside caller/model fields and installs private/inherit/custom access inside
+      the same immediate existing-constructor transaction. Real Actor future-Input admission now checks
+      Agent lifecycle/admission before the legacy pause gate. Still open before this host shell is
+      complete: live initial `task` dispatch, explicit logical Sandbox refs/`auto` policy owner,
+      reviewed cross-Project redirect authority, factual full `agent.close` runtime/subscription
+      retirement + terminal closure, then staged `agent.inputs.*`. After that propagate provenance
+      through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
+      and defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

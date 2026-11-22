@@ -297,6 +297,10 @@ impl SessionStore {
         // UNDER THE SAME SQLite writer transaction before allocating an
         // Input Prepared fact. A model cannot interrupt its own paid Turn;
         // this only blocks another Turn after the current one.
+        crate::agent_owner::require_future_admission(
+            &tx,
+            crate::agent_owner::AgentKey::new(&admission.session_id, &admission.branch_id),
+        )?;
         crate::model_agent_pause::require_future_admission(
             &tx,
             &admission.session_id,
