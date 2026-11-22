@@ -1,10 +1,10 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md).
+[AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-R6-NEXT-AGENT-2026-11-21.md](AW-DL200-R6-NEXT-AGENT-2026-11-21.md).
+[AW-DL200-R6-NEXT-AGENT-2026-11-22.md](AW-DL200-R6-NEXT-AGENT-2026-11-22.md).
 
 Normative R6 design:
 - [README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md)
@@ -12,7 +12,7 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Current authoritative snapshot — 2026-11-21
+## Current authoritative snapshot — 2026-11-22
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
 complete and published. Dotlink is repinned to the published corrective AW revision and the ordinary
@@ -22,6 +22,7 @@ and Windows-native qualification, so Phase 1 is now underway.**
 Current published refs:
 
 ```text
+AW current Phase-1 main         0f3f3ebbfaa12e66c1aeb0f5c2a27faf53e84e2e
 AW R6/Phase-0 publication       20a63a4d4547cc20b2a154787823125b82f5e385
 dotlink R6 consumer publication 85ceccc1088e201c98c994a46a68834440eeab32
 release/0.17                    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
@@ -33,47 +34,27 @@ Pinned qualification is green: ordinary all-target/all-feature build, shell **86
 spawn refusal, strict Clippy, fmt and diff-check. Real Bubblewrap worker-retirement and
 Windows-native qualification remain explicitly deferred evidence, not claimed green.
 
-Phase 1 foundation is underway. One private `StoreScope` loads the existing
-`store_meta.store_id` + nonzero `restore_generation`; transparent `StorePos(u64)` carries internal
-`commit_log.seq` ordering through commit insertion -> Job exposure projection; public/persisted
-compatibility remains `u64`. Coordination loads identity+generation in one SQLite statement. Exact
-Agent-ref lookup uses the existing `job_exposure_current` primary-key projection for both `a:0` and
-non-root Agents, followed by the existing current authorization/binding recheck; it no longer scans
-Sessions/branches to discover a canonical Agent.
+Phase 1 has advanced well beyond the initial StoreScope cut. One private `StoreScope` still reuses
+existing `store_id + restore_generation`, and transparent `StorePos(u64)` carries store-local
+`commit_log.seq` ordering without becoming a global clock. Schema v38 makes
+`agent_state_current + agent_acl_current` authoritative for Agent envelope/ACL state; schema v39 adds
+the Domain principal/group owner; schema v40 adds immutable HistorySpan/Base/Grant + the persistent
+DisclosureManifest DAG. Agent-facing Jobs/wake/history authority now uses the full Agent ACL owner,
+not Session participation.
 
-Schema **v38** now performs the exclusive Agent-owner cutover. In one existing BEGIN-IMMEDIATE /
-migration-lease transaction it creates `agent_state_current` + `agent_acl_current`, seeds every
-published exact Agent binding from the already-complete v37 exposure index plus authoritative legacy
-Session/User state, verifies complete branch/exposure/owner cardinality + foreign keys, and only then
-publishes schema/activation epoch 38. Rollback leaves v37 ownership intact; there is no online
-dual-write/catch-up period.
+`agent_state_current` owns frozen canonical handles/backing Session+branch, owner, title, Agent-local
+`rev`/`acl_rev`, lifecycle/admission, immutable delegation parent lineage and history/Sandbox
+pointers. Migration seeded the initial rev from the exact legacy `MAX(audit.seq)+1` bridge; after
+activation only Agent-owned mutations advance it. Turn admission/result/attachment, accepted Input,
+Applied Actor Control, direct child/close/recovery and exact title/ACL mutations use that owner.
+Reads, Process output, cursor reads and group-membership churn do not manufacture Agent rev.
 
-`agent_state_current` is now authoritative for frozen canonical handles/backing Session+branch,
-owner, title, Agent-local `rev`/`acl_rev`, `open|closing|closed` lifecycle, `open|held` admission and
-immutable delegation parent lineage. Migration seeds each Agent rev from the exact old
-`MAX(audit.seq)+1` bridge, then revisions become branch-local. Existing Session participation seeds
-only the five direct permissions it already proves; migrated nonowners receive **no invented
-`derive/share`**. Owner authority is implicit in the Agent row. New Agent/branch constructors write
-the owner row in their existing transaction; the v37 exposure projector deliberately retains the
-legacy namespace derivation only as creation/rebuild machinery.
-
-The previous mutation seam is now real owner persistence: Turn admission/result/attachment,
-`Prepared -> Accepted` Input custody, Applied Actor Control, changed subscriptions, direct child
-attachment, stable close/terminal settlement and recovery advance the exact Agent owner. Recovery
-still deduplicates arbitrary changed `(session, branch)` keys only in its cold path; if subagent
-restart recovery closes an Agent in that transaction, the generic Turn-recovery bump is suppressed
-so one logical recovery transaction does not double-advance it. Close moves `open -> closing/held ->
-closed/held`; Session-only subagent runtime bookkeeping remains distinct.
-
-Agent-facing Jobs access now uses direct Agent ACL rather than Session participation. Durable wake
-receipts reuse their existing two generation fields as direct-grant revision + Agent `acl_rev`;
-Agent history cursors bind to the same access evidence. Mixed Agent/finite-Job exposure SQL filters
-by the Agent owner/ACL and rechecks exact current ACL before disclosure. A narrow exact-branch
-`set_agent_collaboration_access` bridge supports the five already-shipped collaboration permissions,
-CAS-advancing `acl_rev + rev` together and reusing the existing disclosure-dependency grant check;
-it deliberately cannot rewrite/grant future `derive/share`. Exact Agent title CAS likewise advances
-only that Agent. Legacy `set_title(session)` and Session participation remain backing compatibility
-state and no longer define Agent revision or AgentJobs access.
+Agent access is now the full seven-permission allow-only model
+`view/contribute/submit/control/derive/share/manage`, with owner rights UNION direct user grant UNION
+matching active group grants. Group/security changes fence the opaque `access_generation` without
+Agent-rev fanout. Wake receipts and history cursors bind to that generation; mixed exposure remains a
+candidate projection followed by current authoritative access recheck. Legacy Session title and
+participation are backing compatibility only, not Agent revision/access truth.
 
 Schema **v39** now owns the Domain principal namespace and v1 groups. `domain_principals` enforces
 one `(domain, handle)` namespace across user/group kinds; existing stable `usr_*` handles are
@@ -124,7 +105,7 @@ node-content/provenance digests; `history_bases` structurally compose inherited 
 complete local branch tail and retain total/next Turn coordinates. Re-sealing a branch now skips any
 same-branch base layers before choosing the inherited parent, so repeated seals/compactions replace
 rather than duplicate that local tail. `history_grants` + normalized disclosed-principal rows are now
-actively used by ACL audience expansion; public exact-history fork construction remains the next cut.
+actively used by ACL audience expansion and exact-history Agent/settled-Turn fork construction.
 
 `DisclosureManifest` is represented as a persistent content-addressed bounded-fanout DAG rather
 than flattened JSON: immutable authority roots, leaf entries and branch child links use SHA-256

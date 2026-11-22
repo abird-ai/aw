@@ -158,8 +158,10 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       Phase 0 + 0B are published and Phase 1 is underway.
 - [x] `IMPLEMENTATION.md` updated for R6; implementation remains separately promoted on
       2026-11-21 and proceeds under sealed R6.
-- [x] R6 comprehensive handoff + copy-ready next-agent prompt created under `.agents/docs/`
-      and wired as the canonical entrypoint from AW/dotlink CURRENT_HANDOFF.
+- [x] R6 comprehensive handoff + copy-ready next-agent prompt created under `.agents/docs/`.
+- [x] 2026-11-22 handoff refresh records the full Phase-1 implementation ledger through
+      `0f3f3eb` (`Wire Agent from refs`), current cross-repo refs, validation, exact pending work and
+      copy-ready onboarding prompt; AW `CURRENT_HANDOFF` + DL-200 README point to the refreshed docs.
 - [x] Phase 0 shared convergence corrective published after the v0.17.7 worker-retirement finding;
       historical v0.17.6 evidence remains provenance for unchanged semantics, while the stable Spawn
       Facility/launch-gate correction is live in AW `20a63a4` and consumed by dotlink `85ceccc`.

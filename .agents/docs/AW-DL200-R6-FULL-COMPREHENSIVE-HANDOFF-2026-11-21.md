@@ -1,5 +1,7 @@
 # AW + dotlink + DL-200 R6 full comprehensive handoff — 2026-11-21
 
+> **Superseded for current onboarding by** [AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md). This file remains historical provenance.
+
 Prepared: 2026-11-21, after the local shared-Process consumer cut + Phase-0B closure
 Owner: @pvl
 Machine/source authority: **L5 only**
