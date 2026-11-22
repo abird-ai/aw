@@ -146,9 +146,14 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       host-created Agent activation is now reusable too:** `HostAgentActivation` reconstructs only an
       already-published Agent into the normal Actor/Router/JobRuntime worker, and stable + host-created
       workers share one live-control/wake primitive. This is reconstructible post-commit runtime state,
-      not another publication path. Still open before the host shell is complete: prepared/atomic initial
-      `task` custody+dispatch, explicit logical Sandbox refs/`auto`
-      policy owner, reviewed
+      not another publication path. **Prepared/atomic initial `task` custody + dispatch is now complete as
+      a lower host primitive:** candidate Agent IDs + an audit-backed preparation receipt are claimed before
+      encrypted SecretStore custody; one final Store transaction publishes Agent + ordinary Pending queue
+      + Applied receipt; exact Applied replay returns the same Agent and uncertain outcomes never auto-retry;
+      activation wakes the normal queue owner only after worker readiness. Still open before the host shell
+      is complete: native/public `agent.create` coordination with legitimate provider selection for the
+      destination `i:` owner (personal accounts are owner-only; never forge the caller identity), explicit
+      logical Sandbox refs/`auto` policy owner, reviewed
       cross-Project redirect authority and staged `agent.inputs.*`. After that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.

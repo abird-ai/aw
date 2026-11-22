@@ -206,6 +206,33 @@ pub struct ActorQueueFact {
     pub claim: Option<QueueClaim>,
     pub note: Option<String>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedQueueCustody {
+    pub(crate) payload_ref: String,
+    pub(crate) payload_sha256: String,
+}
+
+pub(crate) fn mint_prepared_queue_custody(
+    session: &str,
+    request_id: &str,
+    payload: &str,
+) -> Result<PreparedQueueCustody> {
+    if !token(session, 128)
+        || !token(request_id, 128)
+        || payload.is_empty()
+        || payload.len() > MAX_BODY
+        || payload.contains('\0')
+    {
+        return Err(Error::Limit(
+            "prepared Actor queued text must contain 1..65536 safe bytes",
+        ));
+    }
+    Ok(PreparedQueueCustody {
+        payload_ref: random_secret_ref(session, request_id)?,
+        payload_sha256: hash_payload(payload.as_bytes()),
+    })
+}
 /// Deliberately reduced data-only projection for an authenticated host
 /// query/transport. Never reveal encrypted-item lookup refs, plaintext,
 /// unkeyed payload hashes or process-incarnation markers over ActorOperation.
@@ -431,7 +458,108 @@ fn safe_to_claim(c: &rusqlite::Connection, session: &str, branch: &str) -> Resul
     }
     Ok(current.next_turn)
 }
+
+pub(crate) fn publish_prepared_queue_in(
+    connection: &rusqlite::Connection,
+    owner: &PrincipalId,
+    request: ActorQueueRequest,
+    prepared: &PreparedQueueCustody,
+) -> Result<ActorQueueFact> {
+    request.validate()?;
+    if prepared.payload_ref.len() != 68
+        || !prepared.payload_ref.starts_with("sec_")
+        || !prepared.payload_ref[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || prepared.payload_sha256.len() != 64
+        || !prepared
+            .payload_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::Denied("invalid prepared queue custody evidence"));
+    }
+    writer(connection, owner, &request.session_id, request.writer_epoch)?;
+    branch_in(connection, &request.session_id, &request.branch_id)?;
+    let all = events(connection, &request.session_id)?;
+    if all
+        .iter()
+        .any(|item| item.request.request_id == request.request_id)
+        || collision(connection, &request.session_id, &request.request_id)?
+    {
+        return Err(Error::Conflict("Actor request ID already used"));
+    }
+    let current = latest(&all);
+    if current
+        .values()
+        .filter(|fact| {
+            same_recipient(fact, &request.branch_id, &request.recipient_site)
+                && matches!(fact.state, QueueState::Pending | QueueState::Claimed)
+        })
+        .count()
+        >= MAX_PENDING_PER_RECIPIENT
+    {
+        return Err(Error::Limit("Actor pending queue capacity reached"));
+    }
+    reserve_audit(&all, 1, future_facts(&all) + 3)?;
+    let last_sequence = max_sequence(connection, &request.session_id, &request.sender, &all)?;
+    if request.message_id <= last_sequence {
+        return Err(Error::Denied(
+            "Actor queued source sequence is stale or duplicated",
+        ));
+    }
+    let fact = ActorQueueFact {
+        request,
+        state: QueueState::Pending,
+        revision: 1,
+        payload_sha256: prepared.payload_sha256.clone(),
+        payload_ref: prepared.payload_ref.clone(),
+        claim: None,
+        note: None,
+    };
+    audit_fact(connection, owner, &fact)?;
+    Ok(fact)
+}
+
 impl SessionStore {
+    pub(crate) fn write_prepared_queue_custody(
+        &self,
+        prepared: &PreparedQueueCustody,
+        payload: &str,
+    ) -> Result<()> {
+        if payload.is_empty()
+            || payload.len() > MAX_BODY
+            || payload.contains('\0')
+            || hash_payload(payload.as_bytes()) != prepared.payload_sha256
+        {
+            return Err(Error::Denied(
+                "prepared queue payload differs from its immutable digest",
+            ));
+        }
+        self.local_secret_store()?
+            .put(&prepared.payload_ref, payload.as_bytes())
+    }
+
+    pub(crate) fn verify_prepared_queue_custody(
+        &self,
+        prepared: &PreparedQueueCustody,
+    ) -> Result<()> {
+        let bytes = self.local_secret_store()?.get(&prepared.payload_ref)?;
+        if hash_payload(bytes.as_slice()) != prepared.payload_sha256 {
+            return Err(Error::Denied(
+                "prepared queue custody digest no longer matches",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard_prepared_queue_custody(
+        &self,
+        prepared: &PreparedQueueCustody,
+    ) -> Result<()> {
+        self.local_secret_store()?.delete(&prepared.payload_ref)
+    }
+
     /// Persist encrypted custody BEFORE an immutable Pending fact. Only an
     /// existing on-disk private owner store is supported; minimal/stateless
     /// and in-memory stores cannot claim restart durability.

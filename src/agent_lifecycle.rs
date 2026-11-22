@@ -471,10 +471,13 @@ impl HostAgentActivation {
             return Err(Error::Io(error));
         }
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(ActivatedHostAgent {
-                canonical_ref: canonical_ref.to_owned(),
-                wake,
-            }),
+            Ok(Ok(())) => {
+                agent_jobs::LiveAgentWake::wake(&wake)?;
+                Ok(ActivatedHostAgent {
+                    canonical_ref: canonical_ref.to_owned(),
+                    wake,
+                })
+            }
             Ok(Err(detail)) => Err(Error::StorageDetail(detail)),
             Err(_) => Err(Error::Storage(
                 "host Agent worker ended before runtime readiness",
@@ -489,27 +492,45 @@ mod tests {
     use crate::{AccountDescriptor, Agent, AgentExecutionBinding, AgentOptions};
     use aw_agent_core::{
         provider::{CompletionFuture, DeltaSink, Provider},
-        Message,
+        CompletionMeta, Message, Usage,
     };
     use aw_store::{
         AgentCreateContext, AgentCreateRequest, SessionBinding as StoredSessionBinding,
     };
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     struct BlockingProvider {
         entered: Arc<tokio::sync::Notify>,
     }
 
-    struct UnusedProvider;
+    struct CompletingProvider {
+        calls: Arc<AtomicUsize>,
+    }
 
-    impl Provider for UnusedProvider {
+    impl Provider for CompletingProvider {
         fn stream<'a>(
             &'a self,
-            _messages: &'a [Message],
+            messages: &'a [Message],
             _model: &'a str,
-            _sink: &'a mut DeltaSink<'_>,
+            sink: &'a mut DeltaSink<'_>,
         ) -> CompletionFuture<'a> {
-            Box::pin(async move { Err(Error::Denied("unused provider must not run")) })
+            Box::pin(async move {
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content == "perform the initial task"));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                sink("initial task complete")?;
+                Ok(CompletionMeta {
+                    finish_reason: "stop".into(),
+                    usage: Usage {
+                        input_tokens: Some(3),
+                        output_tokens: Some(2),
+                    },
+                })
+            })
         }
     }
 
@@ -652,12 +673,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taskless_host_agent_activation_reconstructs_live_worker_and_closes_factually() {
+    async fn task_bearing_host_create_activates_and_dispatches_committed_initial_input_once() {
         let actor = PrincipalId::new("internal:fixture:host-activation").unwrap();
-        let store = SessionStore::in_memory().unwrap();
+        let state_dir = crate::test_support::temp_dir("host-task-activation");
+        aw_platform::ensure_private_dir(&state_dir).unwrap();
+        let store = SessionStore::open(&state_dir).unwrap();
         let binding = StoredSessionBinding {
-            working_directory: std::env::temp_dir(),
-            tool_root: std::env::temp_dir(),
+            working_directory: state_dir.clone(),
+            tool_root: state_dir.clone(),
             system_prompt: "system".into(),
             profile_hint: "fixture".into(),
             model_hint: "model".into(),
@@ -687,16 +710,22 @@ mod tests {
                     current_project_ref: project_ref,
                     current_agent_ref: Some(root_ref),
                     binding,
+                    request_id: Some("host-activation-task-1".into()),
+                    execution_site: "local".into(),
                 },
                 AgentCreateRequest {
                     title: Some("activated child".into()),
+                    task: Some("perform the initial task".into()),
                     ..Default::default()
                 },
             )
             .unwrap();
 
+        let calls = Arc::new(AtomicUsize::new(0));
         let seed = Agent::builder(
-            Arc::new(UnusedProvider),
+            Arc::new(CompletingProvider {
+                calls: calls.clone(),
+            }),
             AgentOptions::new("fixture", "model"),
         )
         .account(
@@ -718,7 +747,7 @@ mod tests {
             selection,
             AgentOptions::new("fixture", "model"),
             aw_tools_adapter::LocalToolOptions::new(
-                std::env::temp_dir(),
+                state_dir.clone(),
                 aw_tools_adapter::ToolMode::Off,
             ),
             router,
@@ -726,6 +755,21 @@ mod tests {
         .unwrap();
         let live = activation.activate(&created.canonical_ref).unwrap();
         assert_eq!(live.canonical_ref(), created.canonical_ref);
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = store.agent_get(&actor, &created.canonical_ref).unwrap();
+                if snapshot.history_head != created.history_head && snapshot.active_turn.is_none() {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("activated host Agent must dispatch its committed initial task");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(settled.lifecycle, AgentLifecycle::Open);
+
         live.close().unwrap();
 
         let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -740,5 +784,7 @@ mod tests {
         .await
         .expect("activated host Agent close must reach authoritative terminal state");
         assert_eq!(closed.admission, aw_store::AgentAdmission::Held);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }

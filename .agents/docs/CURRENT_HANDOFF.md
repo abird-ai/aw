@@ -265,10 +265,32 @@ Turn cancellation primitive is now shared with stable model-created Agents throu
 `LiveAgentControl` / `LiveAgentWakeHandle` / `live_agent_channel` implementation rather than parallel
 copies.
 
-This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation continues to
-fail closed before publication because the sealed spec requires the optional initial task to enter child
-input/runtime custody atomically with the public Agent commit; post-publication activation is not used as
-a shortcut around that invariant. `sandbox=auto` currently
+Task-bearing host construction now satisfies the sealed publication invariant rather than queueing after
+publication. The host constructor pre-mints exact child Session/root/branch IDs, durably claims a compact
+`agent.create.preparation` receipt on the bound current Agent, then writes the initial task into the
+existing encrypted SecretStore queue custody under an opaque operation-owned ref. The receipt contains
+only normalized semantic fingerprint, candidate IDs, task digest, queue ID and opaque custody ref—never
+task plaintext. The final single `BEGIN IMMEDIATE` publication transaction revalidates Project/history/
+ACL authority, creates/forks the Agent using those candidate IDs, appends the ordinary Pending Actor queue
+fact, emits `agent.created`, and transitions the same preparation receipt `Prepared -> Applied` with the
+canonical Agent ref. That commit is the only public linearization point. Definitive precommit failure
+cleans the unique custody blob and consumes the receipt as `Rejected`; uncertain custody/publication keeps
+exact recovery identity as `Unknown` and never automatically retries. Exact Applied replay returns the
+same Agent; changed semantics under the same request ID are denied. No constructor table, second replay
+ledger or public `preparing` Agent lifecycle was added.
+
+`HostAgentActivation` now performs one ordinary wake only after its worker reports ready. Therefore an
+atomically published initial Pending task (or another restart-recoverable Pending input) is claimed by the
+normal queue/Actor owner after publication; Claimed/Accepted ambiguity is still non-replayable. A focused
+end-to-end regression proves task-bearing Store create -> activation -> exactly one provider Turn ->
+authoritative history advance -> normal close.
+
+This checkpoint still does **not** claim the complete §28.3/§28 host shell. The native/public host
+`agent.create` transport/coordinator is not yet wired because provider selection must be legitimate for
+the destination Project's canonical `i:` principal. Personal `AccountDescriptor`s are owner-only, so the
+host must not forge/rewrite the caller's `InvocationIdentity` or silently lend personal credentials to a
+different destination owner. That provider-account authority seam is the next create-path item.
+`sandbox=auto` currently
 means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
 that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
 trusted Project authority. Current-root `agent.close` composition is now complete: native Host retains
@@ -276,9 +298,11 @@ the composed close owner and stdio exposes a concurrent `agent_close` live port 
 current `.` or its exact canonical root) plus optional `rev`; it cannot select Project/Sandbox/provider or
 execution authority. Stable-child active-Turn cancellation, durable recipient-subscription retirement,
 finite-Job owner-close/quiescence, stable-child terminal close and current-root terminal close are all
-complete. The broader §28 shell still needs live initial task dispatch, explicit Sandbox ownership,
-reviewed cross-Project redirect authority, later staged `agent.inputs.*`, and any future host routing for
-non-current Agent refs. History ancestry still grants none of those authorities.
+complete. Atomic initial-task custody/publication plus post-commit live dispatch are now complete as
+reusable lower primitives too. The broader §28 shell still needs the native/public host create coordinator
+with legitimate destination-owner provider selection, explicit Sandbox ownership, reviewed cross-Project
+redirect authority, later staged `agent.inputs.*`, and any future host routing for non-current Agent refs.
+History ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -314,10 +338,15 @@ it as Cancelled. The host-shell regression proves terminal close is rejected bef
 advances `closing -> closed` once, and replays idempotently. A single root lifecycle regression now drives
 a blocked tool-capable root Turn through `RootAgentClose`, including retained JobRuntime closure and
 revision-stable replay. The existing headless strict-frame regression remains green with the new live
-`agent_close` capability. A focused host-activation regression now creates a taskless Agent through the
-real Store constructor, derives its canonical destination owner, reconstructs the live runtime, and
-closes it through the normal wake/worker path to authoritative `closed`; both existing stable-Agent close
-regressions remain green after sharing the live-control primitive.
+`agent_close` capability. The host-activation regression now uses a persistent, task-bearing real Store
+constructor: it publishes encrypted initial Pending custody atomically with the Agent, derives the
+canonical destination owner, reconstructs the live runtime, auto-wakes the normal queue owner, executes
+exactly one provider Turn, observes authoritative history advance, then closes through the ordinary
+wake/worker path. The Store-side regression separately proves no plaintext in queue audit, exact Applied
+create replay returns the same Agent, and changed semantics under the same request identity are rejected.
+The exact-history fork regression remains green after adding pre-minted candidate IDs, and the older
+in-memory host-shell regression still fails task-bearing create before any half-publication because it
+has no persistent SecretStore. Root-close remains green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

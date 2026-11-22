@@ -5,17 +5,20 @@
 //! separate from model-visible constructor arguments.
 
 use crate::{
-    agent_owner, audit, db, history_owner, principal_groups, resources, stable_user_principal,
-    user_for_principal, AgentAccessSnapshot, AgentHistoryForkAccess, AgentPermission,
-    AgentPermissions, Error, PrincipalId, Result, SessionBinding, SessionStore,
+    actor_queue, agent_owner, audit, db, history_owner, principal_groups, resources,
+    stable_user_principal, user_for_principal, workspace_writer, ActorQueueRequest,
+    AgentAccessSnapshot, AgentHistoryForkAccess, AgentPermission, AgentPermissions, Error,
+    PrincipalId, QueueTarget, Result, SessionBinding, SessionStore,
 };
 use aw_tools::execution_ref::{AgentRef, ExecutionRef, ExecutionSegment};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
 const MAX_AGENT_LIST: usize = 256;
 const MAX_INITIAL_ACCESS: usize = 512;
+const AGENT_CREATE_PREPARATION_ACTION: &str = "agent.create.preparation";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,6 +137,38 @@ pub struct AgentCreateContext {
     pub current_project_ref: String,
     pub current_agent_ref: Option<String>,
     pub binding: SessionBinding,
+    /// Stable authenticated host/RPC request identity. Required only for
+    /// task-bearing construction because it owns prepared external custody.
+    pub request_id: Option<String>,
+    /// Trusted logical execution site selected by the host. Never accepted
+    /// from model-visible Agent constructor arguments.
+    pub execution_site: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentCreatePreparationState {
+    Prepared,
+    Applied,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentCreatePreparation {
+    request_id: String,
+    fingerprint: String,
+    state: AgentCreatePreparationState,
+    parent_branch_id: String,
+    candidate_session_id: String,
+    candidate_root_id: String,
+    candidate_branch_id: String,
+    queue_request_id: String,
+    payload_ref: String,
+    payload_sha256: String,
+    result_ref: Option<String>,
+    note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,6 +284,229 @@ fn canonical_history_source(
             project: agent.project.as_str().to_owned(),
         },
     ))
+}
+
+fn validate_host_request_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-:".contains(&byte))
+    {
+        return Err(Error::Denied("invalid host Agent create request identity"));
+    }
+    Ok(())
+}
+
+fn validate_execution_site(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+    {
+        return Err(Error::Denied("invalid trusted Agent execution site"));
+    }
+    Ok(())
+}
+
+fn agent_create_fingerprint(
+    context: &AgentCreateContext,
+    request: &AgentCreateRequest,
+    canonical_source: Option<&str>,
+    project: &ProjectRef,
+    title: &str,
+) -> Result<String> {
+    let task_sha256 = request
+        .task
+        .as_deref()
+        .map(|task| format!("{:x}", Sha256::digest(task.as_bytes())));
+    let semantic = serde_json::json!({
+        "version":1,
+        "current_agent":context.current_agent_ref,
+        "from":canonical_source,
+        "project":project.canonical(),
+        "title":title,
+        "task_sha256":task_sha256,
+        "access":request.access,
+        "sandbox":request.sandbox,
+        "binding":context.binding,
+        "execution_site":context.execution_site,
+    });
+    let encoded = serde_json::to_vec(&semantic)
+        .map_err(|_| Error::Storage("cannot encode Agent create fingerprint"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"aw-host-agent-create-v1\0");
+    hash.update(encoded);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn initial_task_request_id(host_request_id: &str, session_id: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-host-agent-create-initial-task-v1\0");
+    for part in [host_request_id.as_bytes(), session_id.as_bytes()] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    format!("hq_{:x}", hash.finalize())
+}
+
+fn agent_create_preparation_in(
+    connection: &Connection,
+    parent_session: &str,
+    parent_branch: &str,
+    request_id: &str,
+) -> Result<Option<AgentCreatePreparation>> {
+    let encoded: Option<String> = db(connection
+        .query_row(
+            "SELECT data_json FROM audit
+             WHERE session_id=?1 AND action=?2
+               AND json_extract(data_json,'$.request_id')=?3
+               AND json_extract(data_json,'$.parent_branch_id')=?4
+             ORDER BY seq DESC LIMIT 1",
+            params![
+                parent_session,
+                AGENT_CREATE_PREPARATION_ACTION,
+                request_id,
+                parent_branch
+            ],
+            |row| row.get(0),
+        )
+        .optional())?;
+    encoded
+        .map(|value| crate::decode::<AgentCreatePreparation>(&value))
+        .transpose()
+}
+
+fn append_agent_create_preparation(
+    connection: &Connection,
+    actor: &PrincipalId,
+    parent_session: &str,
+    preparation: &AgentCreatePreparation,
+) -> Result<()> {
+    audit(
+        connection,
+        parent_session,
+        actor,
+        AGENT_CREATE_PREPARATION_ACTION,
+        serde_json::to_value(preparation)
+            .map_err(|_| Error::Storage("cannot encode Agent create preparation"))?,
+    )
+}
+
+fn transition_agent_create_preparation(
+    connection: &Connection,
+    actor: &PrincipalId,
+    parent_session: &str,
+    parent_branch: &str,
+    expected: &AgentCreatePreparation,
+    state: AgentCreatePreparationState,
+    result_ref: Option<String>,
+    note: Option<String>,
+) -> Result<AgentCreatePreparation> {
+    let current = agent_create_preparation_in(
+        connection,
+        parent_session,
+        parent_branch,
+        &expected.request_id,
+    )?
+    .ok_or(Error::Storage(
+        "Agent create preparation receipt disappeared",
+    ))?;
+    if &current != expected {
+        return Err(Error::Conflict(
+            "Agent create preparation receipt changed; inspect before retry",
+        ));
+    }
+    let next = AgentCreatePreparation {
+        state,
+        result_ref,
+        note,
+        ..expected.clone()
+    };
+    append_agent_create_preparation(connection, actor, parent_session, &next)?;
+    Ok(next)
+}
+
+fn persist_agent_create_preparation_transition(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    parent_session: &str,
+    parent_branch: &str,
+    expected: &AgentCreatePreparation,
+    state: AgentCreatePreparationState,
+    note: Option<String>,
+) -> Result<AgentCreatePreparation> {
+    let mut connection = store.connection()?;
+    let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let next = transition_agent_create_preparation(
+        &tx,
+        actor,
+        parent_session,
+        parent_branch,
+        expected,
+        state,
+        None,
+        note,
+    )?;
+    db(tx.commit())?;
+    Ok(next)
+}
+
+fn reject_prepared_agent_create(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    parent_session: &str,
+    parent_branch: &str,
+    preparation: &AgentCreatePreparation,
+    custody: &actor_queue::PreparedQueueCustody,
+    error: Error,
+) -> Error {
+    let note = error.to_string().chars().take(2048).collect::<String>();
+    if store.discard_prepared_queue_custody(custody).is_ok()
+        && persist_agent_create_preparation_transition(
+            store,
+            actor,
+            parent_session,
+            parent_branch,
+            preparation,
+            AgentCreatePreparationState::Rejected,
+            Some(note.clone()),
+        )
+        .is_ok()
+    {
+        return error;
+    }
+    let _ = persist_agent_create_preparation_transition(
+        store,
+        actor,
+        parent_session,
+        parent_branch,
+        preparation,
+        AgentCreatePreparationState::Unknown,
+        Some(note),
+    );
+    Error::Conflict("Agent create preparation outcome requires inspection")
+}
+
+fn mark_agent_create_preparation_unknown(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    parent_session: &str,
+    parent_branch: &str,
+    preparation: &AgentCreatePreparation,
+    error: &Error,
+) -> Error {
+    let note = error.to_string().chars().take(2048).collect::<String>();
+    let _ = persist_agent_create_preparation_transition(
+        store,
+        actor,
+        parent_session,
+        parent_branch,
+        preparation,
+        AgentCreatePreparationState::Unknown,
+        Some(note),
+    );
+    Error::Conflict("Agent create publication outcome requires inspection")
 }
 
 fn validate_project_exists(connection: &Connection, project: &ProjectRef) -> Result<()> {
@@ -544,11 +802,12 @@ impl SessionStore {
         Ok(out)
     }
 
-    /// Phase-1 host constructor cut. It supports fresh or exact-history dormant
-    /// Agent creation with trusted sandbox=auto binding, source/current Project
-    /// defaulting and private/inherited/custom access. Initial task admission and
-    /// explicit logical Sandbox refs remain fail-closed until their runtime owner
-    /// is composed by the outer host shell.
+    /// Phase-1 host constructor cut. It supports fresh or exact-history Agent
+    /// creation with trusted sandbox=auto binding, source/current Project
+    /// defaulting and private/inherited/custom access. Optional initial task
+    /// custody is prepared before publication and the ordinary Pending queue
+    /// fact is committed atomically with the Agent. Explicit logical Sandbox
+    /// refs remain fail-closed until their owner is composed by the host shell.
     pub fn agent_create(
         &self,
         actor: &PrincipalId,
@@ -556,18 +815,12 @@ impl SessionStore {
         request: AgentCreateRequest,
     ) -> Result<AgentSnapshot> {
         crate::validate_binding(&context.binding)?;
+        validate_execution_site(&context.execution_site)?;
         let current_project = parse_project_ref(&context.current_project_ref)?;
-        if request
-            .task
-            .as_deref()
-            .is_some_and(|task| task.trim().is_empty() || task.contains('\0'))
-        {
+        if request.task.as_deref().is_some_and(|task| {
+            task.trim().is_empty() || task.len() > 64 * 1024 || task.contains('\0')
+        }) {
             return Err(Error::Denied("invalid initial Agent task"));
-        }
-        if request.task.is_some() {
-            return Err(Error::Denied(
-                "initial Agent task requires the live host runtime admission shell",
-            ));
         }
         if let AgentSandboxSelection::Existing(_) = request.sandbox {
             return Err(Error::Denied(
@@ -602,73 +855,374 @@ impl SessionStore {
                 "fresh Agent destination must match the trusted current Project",
             ));
         }
-
-        let mut connection = self.connection()?;
-        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        validate_project_exists(&tx, &selected_project)?;
-        let (session, branch) = if let Some((canonical_source, source_is_agent, _)) = source {
-            let fork_access = match &request.access {
-                AgentCreateAccess::Private | AgentCreateAccess::Custom(_) => {
-                    AgentHistoryForkAccess::Private
-                }
-                AgentCreateAccess::Inherit if source_is_agent => AgentHistoryForkAccess::Inherit,
-                AgentCreateAccess::Inherit => {
-                    return Err(Error::Denied(
-                        "access=inherit requires an Agent history source, not a Turn",
-                    ))
-                }
-            };
-            history_owner::create_agent_from_history_ref_in(
-                &tx,
-                actor,
-                &canonical_source,
-                title,
-                &context.binding,
-                fork_access,
-            )?
-        } else {
-            if matches!(request.access, AgentCreateAccess::Inherit) {
-                return Err(Error::Denied(
-                    "access=inherit requires an Agent history source",
-                ));
-            }
-            let owner = stable_user_principal(&selected_project.identity)?;
-            resources::create_in_workspace_tx(
-                &tx,
-                &owner,
-                title,
-                &context.binding,
-                &selected_project.project,
-                None,
-            )?
-        };
-
+        if matches!(request.access, AgentCreateAccess::Inherit)
+            && !source
+                .as_ref()
+                .is_some_and(|(_, source_is_agent, _)| *source_is_agent)
+        {
+            return Err(Error::Denied(
+                "access=inherit requires an Agent history source",
+            ));
+        }
         if let AgentCreateAccess::Custom(grants) = &request.access {
-            install_initial_custom_access(&tx, actor, &session.id, &branch.id, grants)?;
+            if grants.len() > MAX_INITIAL_ACCESS {
+                return Err(Error::Limit("initial Agent access list exceeds bound"));
+            }
+            let mut principals = BTreeSet::new();
+            for grant in grants {
+                if grant.permissions.validate()?.is_empty() {
+                    return Err(Error::Denied(
+                        "initial Agent access grants cannot be empty; omit the principal instead",
+                    ));
+                }
+                if !principals.insert(grant.principal.as_str()) {
+                    return Err(Error::Denied("duplicate principal in initial Agent access"));
+                }
+            }
         }
 
-        let canonical = db(tx.query_row(
-            "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
-                    '/p:' || project_handle || '/a:' || agent_handle
-             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
-            params![session.id, branch.id],
-            |row| row.get::<_, String>(0),
-        ))?;
-        audit(
-            &tx,
-            &session.id,
-            actor,
-            "agent.created",
-            serde_json::json!({
-                "branch_id":branch.id,
-                "ref":canonical,
-                "from":request.from,
-                "project":selected_project.canonical(),
-                "access":request.access,
-                "sandbox":"auto",
-            }),
-        )?;
-        db(tx.commit())?;
+        let prepared_task = if let Some(task) = request.task.as_deref() {
+            if self.directory().is_none() {
+                return Err(Error::Denied(
+                    "task-bearing Agent creation requires persistent SecretStore custody",
+                ));
+            }
+            let request_id = context.request_id.as_deref().ok_or(Error::Denied(
+                "task-bearing Agent creation requires a stable host request identity",
+            ))?;
+            validate_host_request_id(request_id)?;
+            let current_agent = canonical_current_agent(context)?.ok_or(Error::Denied(
+                "task-bearing Agent creation requires a bound current Agent",
+            ))?;
+            let parent_ref = current_agent.canonical();
+            let fingerprint = agent_create_fingerprint(
+                context,
+                &request,
+                source.as_ref().map(|(canonical, _, _)| canonical.as_str()),
+                &selected_project,
+                title,
+            )?;
+
+            let (parent_session, parent_branch) = {
+                let connection = self.connection()?;
+                validate_project_exists(&connection, &selected_project)?;
+                if let Some((canonical_source, _, _)) = source.as_ref() {
+                    history_owner::preflight_canonical_history_source_in(
+                        &connection,
+                        actor,
+                        canonical_source,
+                    )?;
+                }
+                let (session, branch) = key_for_ref_in(&connection, &parent_ref)?;
+                agent_owner::authorize_permission(
+                    &connection,
+                    actor,
+                    agent_owner::AgentKey::new(&session, &branch),
+                    AgentPermission::View,
+                )?;
+                if let Some(existing) =
+                    agent_create_preparation_in(&connection, &session, &branch, request_id)?
+                {
+                    if existing.fingerprint != fingerprint {
+                        return Err(Error::Denied(
+                            "Agent create request identity was reused with changed semantics",
+                        ));
+                    }
+                    return match existing.state {
+                        AgentCreatePreparationState::Applied => {
+                            let canonical = existing.result_ref.ok_or(Error::Storage(
+                                "applied Agent create receipt lost its result ref",
+                            ))?;
+                            snapshot_in(&connection, actor, &canonical)
+                        }
+                        AgentCreatePreparationState::Prepared
+                        | AgentCreatePreparationState::Unknown
+                        | AgentCreatePreparationState::Rejected => Err(Error::Conflict(
+                            "Agent create request is non-retryable; inspect its prepared receipt",
+                        )),
+                    };
+                }
+                (session, branch)
+            };
+
+            let ids = resources::mint_session_candidate_ids()?;
+            let queue_request_id = initial_task_request_id(request_id, &ids.session);
+            let custody =
+                actor_queue::mint_prepared_queue_custody(&ids.session, &queue_request_id, task)?;
+            let preparation = AgentCreatePreparation {
+                request_id: request_id.to_owned(),
+                fingerprint,
+                state: AgentCreatePreparationState::Prepared,
+                parent_branch_id: parent_branch.clone(),
+                candidate_session_id: ids.session,
+                candidate_root_id: ids.root,
+                candidate_branch_id: ids.branch,
+                queue_request_id,
+                payload_ref: custody.payload_ref.clone(),
+                payload_sha256: custody.payload_sha256.clone(),
+                result_ref: None,
+                note: None,
+            };
+
+            {
+                let mut connection = self.connection()?;
+                let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+                validate_project_exists(&tx, &selected_project)?;
+                if let Some((canonical_source, _, _)) = source.as_ref() {
+                    history_owner::preflight_canonical_history_source_in(
+                        &tx,
+                        actor,
+                        canonical_source,
+                    )?;
+                }
+                let (session, branch) = key_for_ref_in(&tx, &parent_ref)?;
+                if session != parent_session || branch != parent_branch {
+                    return Err(Error::Conflict(
+                        "current Agent identity changed before create preparation",
+                    ));
+                }
+                agent_owner::authorize_permission(
+                    &tx,
+                    actor,
+                    agent_owner::AgentKey::new(&session, &branch),
+                    AgentPermission::View,
+                )?;
+                if agent_create_preparation_in(&tx, &session, &branch, request_id)?.is_some() {
+                    return Err(Error::Conflict(
+                        "Agent create request identity was claimed concurrently",
+                    ));
+                }
+                append_agent_create_preparation(&tx, actor, &session, &preparation)?;
+                db(tx.commit())?;
+            }
+
+            if let Err(error) = self.write_prepared_queue_custody(&custody, task) {
+                let note = error.to_string().chars().take(2048).collect::<String>();
+                if self.discard_prepared_queue_custody(&custody).is_ok() {
+                    let _ = persist_agent_create_preparation_transition(
+                        self,
+                        actor,
+                        &parent_session,
+                        &parent_branch,
+                        &preparation,
+                        AgentCreatePreparationState::Rejected,
+                        Some(note),
+                    );
+                    return Err(error);
+                }
+                let _ = persist_agent_create_preparation_transition(
+                    self,
+                    actor,
+                    &parent_session,
+                    &parent_branch,
+                    &preparation,
+                    AgentCreatePreparationState::Unknown,
+                    Some(note),
+                );
+                return Err(Error::Conflict(
+                    "Agent create task custody outcome requires inspection",
+                ));
+            }
+            if let Err(error) = self.verify_prepared_queue_custody(&custody) {
+                let note = error.to_string().chars().take(2048).collect::<String>();
+                let state = if self.discard_prepared_queue_custody(&custody).is_ok() {
+                    AgentCreatePreparationState::Rejected
+                } else {
+                    AgentCreatePreparationState::Unknown
+                };
+                let _ = persist_agent_create_preparation_transition(
+                    self,
+                    actor,
+                    &parent_session,
+                    &parent_branch,
+                    &preparation,
+                    state,
+                    Some(note),
+                );
+                return Err(error);
+            }
+            Some((parent_session, parent_branch, preparation, custody))
+        } else {
+            None
+        };
+
+        let reject_precommit = |error: Error| -> Error {
+            if let Some((parent_session, parent_branch, preparation, custody)) = &prepared_task {
+                reject_prepared_agent_create(
+                    self,
+                    actor,
+                    parent_session,
+                    parent_branch,
+                    preparation,
+                    custody,
+                    error,
+                )
+            } else {
+                error
+            }
+        };
+
+        let mut connection = self.connection().map_err(&reject_precommit)?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))
+            .map_err(&reject_precommit)?;
+        let publication = (|| -> Result<String> {
+            validate_project_exists(&tx, &selected_project)?;
+            let candidate_ids = prepared_task.as_ref().map(|(_, _, preparation, _)| {
+                resources::SessionCandidateIds {
+                    session: preparation.candidate_session_id.clone(),
+                    root: preparation.candidate_root_id.clone(),
+                    branch: preparation.candidate_branch_id.clone(),
+                }
+            });
+            let (session, branch) =
+                if let Some((canonical_source, source_is_agent, _)) = source.as_ref() {
+                    let fork_access = match &request.access {
+                        AgentCreateAccess::Private | AgentCreateAccess::Custom(_) => {
+                            AgentHistoryForkAccess::Private
+                        }
+                        AgentCreateAccess::Inherit if *source_is_agent => {
+                            AgentHistoryForkAccess::Inherit
+                        }
+                        AgentCreateAccess::Inherit => {
+                            return Err(Error::Denied(
+                                "access=inherit requires an Agent history source, not a Turn",
+                            ))
+                        }
+                    };
+                    if let Some(ids) = candidate_ids {
+                        history_owner::create_agent_from_history_ref_with_ids_in(
+                            &tx,
+                            actor,
+                            canonical_source,
+                            title,
+                            &context.binding,
+                            fork_access,
+                            ids,
+                        )?
+                    } else {
+                        history_owner::create_agent_from_history_ref_in(
+                            &tx,
+                            actor,
+                            canonical_source,
+                            title,
+                            &context.binding,
+                            fork_access,
+                        )?
+                    }
+                } else {
+                    let owner = stable_user_principal(&selected_project.identity)?;
+                    if let Some(ids) = candidate_ids {
+                        resources::create_in_workspace_with_ids_tx(
+                            &tx,
+                            &owner,
+                            title,
+                            &context.binding,
+                            &selected_project.project,
+                            None,
+                            ids,
+                        )?
+                    } else {
+                        resources::create_in_workspace_tx(
+                            &tx,
+                            &owner,
+                            title,
+                            &context.binding,
+                            &selected_project.project,
+                            None,
+                        )?
+                    }
+                };
+
+            if let AgentCreateAccess::Custom(grants) = &request.access {
+                install_initial_custom_access(&tx, actor, &session.id, &branch.id, grants)?;
+            }
+
+            if let Some((_, _, preparation, custody)) = &prepared_task {
+                if session.id != preparation.candidate_session_id
+                    || branch.id != preparation.candidate_branch_id
+                {
+                    return Err(Error::Conflict(
+                        "published Agent identity differs from prepared candidate",
+                    ));
+                }
+                let owner = stable_user_principal(&selected_project.identity)?;
+                let writer =
+                    workspace_writer::require_workspace_writer_for_session(&tx, &session.id)?;
+                actor_queue::publish_prepared_queue_in(
+                    &tx,
+                    &owner,
+                    ActorQueueRequest {
+                        request_id: preparation.queue_request_id.clone(),
+                        session_id: session.id.clone(),
+                        branch_id: branch.id.clone(),
+                        recipient_site: context.execution_site.clone(),
+                        sender: "host:create".into(),
+                        message_id: 1,
+                        writer_epoch: writer.writer_epoch,
+                        target: QueueTarget::Auto,
+                        priority: 0,
+                    },
+                    custody,
+                )?;
+            }
+
+            let canonical = db(tx.query_row(
+                "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
+                        '/p:' || project_handle || '/a:' || agent_handle
+                 FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+                params![session.id, branch.id],
+                |row| row.get::<_, String>(0),
+            ))?;
+            audit(
+                &tx,
+                &session.id,
+                actor,
+                "agent.created",
+                serde_json::json!({
+                    "branch_id":branch.id,
+                    "ref":canonical,
+                    "from":request.from,
+                    "project":selected_project.canonical(),
+                    "access":request.access,
+                    "sandbox":"auto",
+                    "initial_task":prepared_task.as_ref().map(|(_,_,preparation,_)| preparation.queue_request_id.as_str()),
+                }),
+            )?;
+            if let Some((parent_session, parent_branch, preparation, _)) = &prepared_task {
+                transition_agent_create_preparation(
+                    &tx,
+                    actor,
+                    parent_session,
+                    parent_branch,
+                    preparation,
+                    AgentCreatePreparationState::Applied,
+                    Some(canonical.clone()),
+                    None,
+                )?;
+            }
+            Ok(canonical)
+        })();
+
+        let canonical = match publication {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                drop(tx);
+                return Err(reject_precommit(error));
+            }
+        };
+        if let Err(error) = db(tx.commit()) {
+            if let Some((parent_session, parent_branch, preparation, _)) = &prepared_task {
+                return Err(mark_agent_create_preparation_unknown(
+                    self,
+                    actor,
+                    parent_session,
+                    parent_branch,
+                    preparation,
+                    &error,
+                ));
+            }
+            return Err(error);
+        }
         snapshot_in(&connection, actor, &canonical)
     }
 
@@ -856,9 +1410,34 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SecretStore;
     use aw_store_api::SessionBackend;
     use aw_tools::job_event::{EventRule, EventRuleSet, JobEventKind, JobWakeMode};
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct PrivateTemp(PathBuf);
+
+    impl PrivateTemp {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "aw-agent-create-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            aw_platform::ensure_private_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for PrivateTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn binding() -> SessionBinding {
         SessionBinding {
@@ -891,6 +1470,8 @@ mod tests {
             current_project_ref: project_ref.clone(),
             current_agent_ref: Some(root_ref.clone()),
             binding: binding(),
+            request_id: None,
+            execution_site: "local".into(),
         };
 
         let created = store
@@ -1026,5 +1607,89 @@ mod tests {
         assert!(!after
             .iter()
             .any(|candidate| candidate.title == "must not publish"));
+    }
+
+    #[test]
+    fn task_bearing_create_publishes_pending_input_atomically_and_replays_exactly() {
+        let temp = PrivateTemp::new();
+        let store = SessionStore::open(&temp.0).unwrap();
+        let actor = PrincipalId::new("internal:fixture:host-task-create").unwrap();
+        let (root, branch) = store.create(&actor, "root", binding()).unwrap();
+        let root_binding = store.agent_binding(&actor, &root.id, &branch.id).unwrap();
+        let root_ref = canonical_agent_ref(
+            &root_binding.domain_handle,
+            &root_binding.identity_handle,
+            &root_binding.project_handle,
+            &root_binding.agent_handle,
+        );
+        let project_ref = format!(
+            "/d:{}/i:{}/p:{}",
+            root_binding.domain_handle, root_binding.identity_handle, root_binding.project_handle
+        );
+        let context = AgentCreateContext {
+            current_project_ref: project_ref.clone(),
+            current_agent_ref: Some(root_ref.clone()),
+            binding: binding(),
+            request_id: Some("host-task-create-1".into()),
+            execution_site: "local".into(),
+        };
+        let request = AgentCreateRequest {
+            title: Some("task child".into()),
+            task: Some("perform the initial task".into()),
+            ..Default::default()
+        };
+
+        let created = store
+            .agent_create(&actor, &context, request.clone())
+            .unwrap();
+        let connection = store.connection().unwrap();
+        let (child_session, child_branch) =
+            key_for_ref_in(&connection, &created.canonical_ref).unwrap();
+        let queue = actor_queue::events(&connection, &child_session).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].state, crate::QueueState::Pending);
+        assert_eq!(queue[0].request.branch_id, child_branch);
+        assert_eq!(queue[0].request.recipient_site, "local");
+        assert!(queue[0].request.request_id.starts_with("hq_"));
+        let encoded = serde_json::to_string(&queue[0]).unwrap();
+        assert!(!encoded.contains("perform the initial task"));
+        let secret = store
+            .local_secret_store()
+            .unwrap()
+            .get(&queue[0].payload_ref)
+            .unwrap();
+        assert_eq!(secret.as_slice(), b"perform the initial task");
+
+        let preparation =
+            agent_create_preparation_in(&connection, &root.id, &branch.id, "host-task-create-1")
+                .unwrap()
+                .unwrap();
+        assert_eq!(preparation.state, AgentCreatePreparationState::Applied);
+        assert_eq!(
+            preparation.result_ref.as_deref(),
+            Some(created.canonical_ref.as_str())
+        );
+        drop(connection);
+
+        let replay = store
+            .agent_create(&actor, &context, request.clone())
+            .unwrap();
+        assert_eq!(replay.canonical_ref, created.canonical_ref);
+        assert_eq!(replay.rev, created.rev);
+        let listed = store.agent_list(&actor, &project_ref, None, 16).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|candidate| candidate.title == "task child")
+                .count(),
+            1
+        );
+
+        let mut changed = request;
+        changed.task = Some("changed task".into());
+        assert!(matches!(
+            store.agent_create(&actor, &context, changed),
+            Err(Error::Denied(_))
+        ));
     }
 }

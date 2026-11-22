@@ -2906,6 +2906,21 @@ impl SessionStore {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionCandidateIds {
+    pub(crate) session: String,
+    pub(crate) root: String,
+    pub(crate) branch: String,
+}
+
+pub(crate) fn mint_session_candidate_ids() -> Result<SessionCandidateIds> {
+    Ok(SessionCandidateIds {
+        session: id("s")?,
+        root: id("n")?,
+        branch: id("b")?,
+    })
+}
+
 pub(crate) fn create_in_workspace_tx(
     c: &Connection,
     owner: &PrincipalId,
@@ -2914,15 +2929,37 @@ pub(crate) fn create_in_workspace_tx(
     workspace: &str,
     target: Option<SessionExecutionTarget>,
 ) -> Result<(SessionInfo, BranchInfo)> {
+    create_in_workspace_with_ids_tx(
+        c,
+        owner,
+        title,
+        b,
+        workspace,
+        target,
+        mint_session_candidate_ids()?,
+    )
+}
+
+pub(crate) fn create_in_workspace_with_ids_tx(
+    c: &Connection,
+    owner: &PrincipalId,
+    title: &str,
+    b: &SessionBinding,
+    workspace: &str,
+    target: Option<SessionExecutionTarget>,
+    ids: SessionCandidateIds,
+) -> Result<(SessionInfo, BranchInfo)> {
     let user = ensure_user_for_principal(c, owner)?;
     let allowed:Option<(String,String)>=db(c.query_row("SELECT w.domain_id,w.kind FROM workspaces w JOIN domain_memberships dm ON dm.domain_id=w.domain_id WHERE w.workspace_id=?1 AND w.archived_at IS NULL AND dm.user_id=?2 AND dm.status='active'",params![workspace,user],|r|Ok((r.get(0)?,r.get(1)?))).optional())?;
     let Some((workspace_domain, workspace_kind)) = allowed else {
         return Err(Error::Denied("workspace unavailable or not permitted"));
     };
     let _writer = crate::workspace_writer::require_workspace_writer(c, workspace)?;
-    let session = id("s")?;
-    let root = id("n")?;
-    let branch = id("b")?;
+    let SessionCandidateIds {
+        session,
+        root,
+        branch,
+    } = ids;
     let created = now();
     db(c.execute("INSERT INTO sessions(id,owner,title,binding_json,root_key,root_node,created_at,updated_at,owner_user_id,workspace_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,?8,?9)",params![session,owner.as_str(),title,json(b)?,key(b)?,root,created,user,workspace]))?;
     insert_node(

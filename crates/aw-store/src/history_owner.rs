@@ -865,6 +865,14 @@ fn resolve_canonical_history_source_in(
     })
 }
 
+pub(crate) fn preflight_canonical_history_source_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    reference: &str,
+) -> Result<()> {
+    resolve_canonical_history_source_in(connection, actor, reference).map(|_| ())
+}
+
 fn manifest_authority_roots(
     connection: &Connection,
     manifest: &str,
@@ -1469,6 +1477,26 @@ pub(crate) fn create_agent_from_history_ref_in(
     binding: &SessionBinding,
     access: AgentHistoryForkAccess,
 ) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+    create_agent_from_history_ref_with_ids_in(
+        connection,
+        actor,
+        canonical_source,
+        title,
+        binding,
+        access,
+        resources::mint_session_candidate_ids()?,
+    )
+}
+
+pub(crate) fn create_agent_from_history_ref_with_ids_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    canonical_source: &str,
+    title: &str,
+    binding: &SessionBinding,
+    access: AgentHistoryForkAccess,
+    ids: resources::SessionCandidateIds,
+) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
     crate::label(title, 160)?;
     crate::validate_binding(binding)?;
     let source = resolve_canonical_history_source_in(connection, actor, canonical_source)?;
@@ -1489,13 +1517,14 @@ pub(crate) fn create_agent_from_history_ref_in(
         "source Agent is missing its authoritative Project binding",
     ))?;
     let destination_owner = stable_user_principal(&owner_handle)?;
-    let (destination_session, destination_branch) = resources::create_in_workspace_tx(
+    let (destination_session, destination_branch) = resources::create_in_workspace_with_ids_tx(
         connection,
         &destination_owner,
         title,
         binding,
         &workspace,
         None,
+        ids,
     )?;
     attach_resolved_history_to_destination_in(
         connection,
