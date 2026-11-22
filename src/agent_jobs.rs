@@ -237,10 +237,19 @@ impl Router {
             .lock()
             .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?
             .remove(canonical_agent_ref);
+        self.retire_wake_recipient(canonical_agent_ref)?;
         self.revision_watchers
             .lock()
             .map_err(|_| Error::Storage("Agent revision watcher registry poisoned"))?
             .remove(canonical_agent_ref);
+        Ok(())
+    }
+
+    fn retire_wake_recipient(&self, canonical_agent_ref: &str) -> Result<()> {
+        self.wake_admissions
+            .lock()
+            .map_err(|_| Error::Storage("Agent wake admission registry poisoned"))?
+            .retain(|_, admission| admission.recipient_ref != canonical_agent_ref);
         Ok(())
     }
 
@@ -1939,6 +1948,7 @@ impl AgentJobRouter for Router {
                         &binding.branch_id,
                         &request_id,
                     )?;
+                    self.retire_wake_recipient(&canonical)?;
                     let live = self.live_owner(&canonical)?;
                     let wake = live.wake.as_ref().ok_or(Error::Denied(
                         "delegated Agent has no live close controller",

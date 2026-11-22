@@ -14,6 +14,7 @@ use aw_tools::job_event::{
     EventRuleSet, JobEventDelivery, JobEventKind, SourceEventBook, SubscriptionUpdate,
 };
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentJobWakeAdmission {
@@ -191,6 +192,78 @@ fn save(
         ],
     ))?;
     Ok(())
+}
+
+pub(crate) fn retire_recipient_in(c: &rusqlite::Connection, recipient_ref: &str) -> Result<usize> {
+    let mut query = db(c.prepare(
+        "SELECT source_ref,session_id,branch_id,event_book_json,pending_deliveries_json
+         FROM agent_job_event_sources ORDER BY source_ref",
+    ))?;
+    let rows = db(query.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    }))?;
+    let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    drop(query);
+
+    let mut affected_agents = BTreeSet::new();
+    let mut changed_sources = 0usize;
+    for (source, session, branch, encoded_book, encoded_pending) in rows {
+        let mut book: SourceEventBook = serde_json::from_str(&encoded_book)
+            .map_err(|_| Error::Storage("cannot decode Agent Job event source state"))?;
+        book.validate().map_err(Error::Storage)?;
+        let mut pending: Vec<JobEventDelivery> = serde_json::from_str(&encoded_pending)
+            .map_err(|_| Error::Storage("cannot decode pending Agent Job events"))?;
+        for delivery in &pending {
+            delivery.validate().map_err(Error::Storage)?;
+            if delivery.source_ref != source {
+                return Err(Error::Storage(
+                    "pending Agent Job event belongs to another source",
+                ));
+            }
+        }
+
+        let retired = book
+            .retire_recipient(recipient_ref)
+            .map_err(Error::Storage)?;
+        let before_pending = pending.len();
+        pending.retain(|delivery| delivery.recipient_ref != recipient_ref);
+        if !retired.changed && pending.len() == before_pending {
+            continue;
+        }
+
+        let book = serde_json::to_string(&book)
+            .map_err(|_| Error::Storage("cannot encode Agent Job event source state"))?;
+        let pending = serde_json::to_string(&pending)
+            .map_err(|_| Error::Storage("cannot encode pending Agent Job events"))?;
+        let changed = db(c.execute(
+            "UPDATE agent_job_event_sources
+             SET event_book_json=?1,pending_deliveries_json=?2,updated_at=?3
+             WHERE source_ref=?4",
+            params![book, pending, now(), source],
+        ))?;
+        if changed != 1 {
+            return Err(Error::Storage(
+                "Agent Job event source disappeared during recipient retirement",
+            ));
+        }
+        affected_agents.insert((session, branch));
+        changed_sources += 1;
+    }
+
+    db(c.execute(
+        "DELETE FROM agent_job_wake_admissions WHERE recipient_ref=?1",
+        [recipient_ref],
+    ))?;
+    for (session, branch) in affected_agents {
+        agent_owner::changed(c, agent_owner::AgentKey::new(&session, &branch))?;
+    }
+    Ok(changed_sources)
 }
 
 fn agent_is_settled(c: &rusqlite::Connection, session: &str) -> Result<bool> {
@@ -804,5 +877,41 @@ mod tests {
                 .len(),
             2
         );
+
+        let before_retire = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        let mut connection = store.connection().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(retire_recipient_in(&tx, recipient).unwrap(), 2);
+        tx.commit().unwrap();
+        drop(connection);
+        assert!(store
+            .pending_agent_job_events(&actor, &session.id, &branch.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .agent_public_revision(&actor, &session.id, &branch.id)
+                .unwrap(),
+            before_retire + 1,
+            "retiring one receiver across root+Turn sources advances the source Agent once"
+        );
+        let (_, already_retired) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &session.id,
+                &branch.id,
+                None,
+                None,
+                recipient,
+                authority,
+                EventRuleSet::default(),
+                8,
+            )
+            .unwrap();
+        assert!(!already_retired.changed);
     }
 }

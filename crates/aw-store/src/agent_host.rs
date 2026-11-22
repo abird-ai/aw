@@ -739,6 +739,7 @@ impl SessionStore {
         }
         let (lifecycle, _) = agent_owner::lifecycle(&tx, agent)?;
         agent_owner::request_close(&tx, agent)?;
+        crate::agent_job_events::retire_recipient_in(&tx, canonical_ref)?;
         if lifecycle == "open" {
             audit(
                 &tx,
@@ -797,6 +798,7 @@ impl SessionStore {
 mod tests {
     use super::*;
     use aw_store_api::SessionBackend;
+    use aw_tools::job_event::{EventRule, EventRuleSet, JobEventKind, JobWakeMode};
     use std::path::PathBuf;
 
     fn binding() -> SessionBinding {
@@ -847,6 +849,25 @@ mod tests {
         assert_eq!(created.admission, AgentAdmission::Open);
         assert_ne!(created.canonical_ref, root_ref);
 
+        let (_, subscription) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &root.id,
+                &branch.id,
+                None,
+                None,
+                &created.canonical_ref,
+                "jwa_host_close_fixture",
+                EventRuleSet::new([EventRule::new(JobEventKind::Settled, JobWakeMode::Queue)])
+                    .unwrap(),
+                8,
+            )
+            .unwrap();
+        assert!(subscription.active);
+        let source_rev_before_close = store
+            .agent_public_revision(&actor, &root.id, &branch.id)
+            .unwrap();
+
         let listed = store.agent_list(&actor, &project_ref, None, 16).unwrap();
         assert!(listed
             .iter()
@@ -886,6 +907,27 @@ mod tests {
         assert_eq!(closing.lifecycle, AgentLifecycle::Closing);
         assert_eq!(closing.admission, AgentAdmission::Held);
         assert!(closing.rev > held.rev);
+        let (_, retired) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &root.id,
+                &branch.id,
+                None,
+                None,
+                &created.canonical_ref,
+                "jwa_host_close_fixture",
+                EventRuleSet::default(),
+                8,
+            )
+            .unwrap();
+        assert!(!retired.changed);
+        assert_eq!(
+            store
+                .agent_public_revision(&actor, &root.id, &branch.id)
+                .unwrap(),
+            source_rev_before_close + 1,
+            "recipient close retires the inbound source rule exactly once"
+        );
         assert!(matches!(
             store.agent_admission(
                 &actor,

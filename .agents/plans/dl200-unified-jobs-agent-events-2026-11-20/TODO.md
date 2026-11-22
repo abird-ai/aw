@@ -121,11 +121,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       preemptive:** one shared close/cancellation primitive tracks only the current Turn token; close
       cancels that token before worker settlement, background construction arms it before handoff, and
       repeated close does not enqueue duplicate close commands. One real blocking-provider regression
-      proves the child reaches factual cancelled settlement instead of waiting forever. Still open
-      before the host shell is complete: live initial `task` dispatch, explicit logical Sandbox
-      refs/`auto` policy owner, reviewed cross-Project redirect authority, recipient-subscription/root-
-      host composition for full `agent.close` + terminal closure, then staged `agent.inputs.*`. After
-      that propagate provenance
+      proves the child reaches factual cancelled settlement instead of waiting forever. **Durable
+      receiver retirement is also complete without a new Event schema:** close removes the receiver
+      from existing source books, drops pending deliveries + durable wake admission, bumps each affected
+      source Agent once, and delegated close evicts its cached wake admission before signalling the
+      worker. Replay repairs retirement idempotently. The transitional implementation intentionally uses
+      a cold close-path scan rather than prebuilding Phase-2 indexing. Still open before the host shell
+      is complete: live initial `task` dispatch, explicit logical Sandbox refs/`auto` policy owner,
+      reviewed cross-Project redirect authority, root-host runtime/cache composition + terminal closure
+      for full `agent.close`, then staged `agent.inputs.*`. After that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first

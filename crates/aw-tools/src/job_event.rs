@@ -249,6 +249,35 @@ impl SourceEventBook {
         })
     }
 
+    /// Remove one recipient without requiring its old opaque admission token.
+    /// This is the receiver-lifecycle counterpart to source-owned replacement:
+    /// closing a receiver may revoke all inbound wake rules even though those
+    /// rules were originally installed by many independent sources.
+    pub fn retire_recipient(
+        &mut self,
+        recipient_ref: &str,
+    ) -> Result<SubscriptionUpdate, &'static str> {
+        if recipient_ref.is_empty()
+            || recipient_ref.len() > 2048
+            || !recipient_ref.is_ascii()
+            || recipient_ref.chars().any(char::is_control)
+        {
+            return Err("invalid Job event recipient admission");
+        }
+        let Some(authority_ref) = self
+            .subscriptions
+            .get(recipient_ref)
+            .map(|subscription| subscription.recipient_authority_ref.clone())
+        else {
+            return Ok(SubscriptionUpdate {
+                generation: self.next_generation,
+                changed: false,
+                active: false,
+            });
+        };
+        self.replace(recipient_ref, &authority_ref, EventRuleSet::default())
+    }
+
     /// Commit one factual source checkpoint. All events in the slice share one
     /// event_rev so the receiver can coalesce result+settled when their effective
     /// modes agree.
@@ -397,5 +426,25 @@ mod tests {
             .commit("/d:0/i:0/p:0/a:0/t:1/j:job", &[JobEventKind::Settled],)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn source_event_book_can_retire_a_receiver_without_its_admission_token() {
+        let mut book = SourceEventBook::default();
+        let recipient = "/d:0/i:0/p:0/a:1";
+        let first = book
+            .replace(
+                recipient,
+                "jwa_fixture",
+                EventRuleSet::new([EventRule::new(JobEventKind::Settled, JobWakeMode::Queue)])
+                    .unwrap(),
+            )
+            .unwrap();
+        let retired = book.retire_recipient(recipient).unwrap();
+        assert!(retired.changed);
+        assert!(!retired.active);
+        assert!(retired.generation > first.generation);
+        assert_eq!(book.generation_for(recipient), None);
+        assert!(!book.retire_recipient(recipient).unwrap().changed);
     }
 }

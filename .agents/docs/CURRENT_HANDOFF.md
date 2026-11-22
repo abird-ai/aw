@@ -210,18 +210,27 @@ close racing the first paid Turn cannot fall into the old wait-for-provider-comp
 close uses the same level-triggered close state and does not enqueue duplicate close commands. There is
 still no second runtime/control owner or background cancellation task.
 
-Full SPEC `agent.close` remains incomplete until the live host composes this preemptive stable-Agent
-primitive with root-host active-Turn control where applicable, recipient-subscription retirement, and
-eventual `closed` transition without fabricating certainty.
+Recipient subscription retirement is now also owned by the close transaction without introducing the
+Phase-2 Event engine. `SourceEventBook::retire_recipient` removes one receiver without needing the old
+opaque admission token; the Store close seam applies it across the existing legacy source books, drops
+already-pending deliveries to that receiver, deletes its durable wake admission, and advances each
+affected source Agent revision **once** even when both root and Turn sources changed. This is deliberately
+a cold close-path scan over the transitional JSON books rather than a new schema/index that Phase 2
+would immediately replace. Delegated/model close performs the same retirement (including replay repair)
+and evicts matching in-memory wake admissions before signalling the live worker.
+
+Full SPEC `agent.close` remains incomplete until the live host composes these durable/preemptive
+primitives with root-host active-Turn control where applicable and eventual `closed` transition without
+fabricating certainty.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
 closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
 means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
 that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
-trusted Project authority. Full live `agent.close` composition, initial task dispatch, explicit Sandbox binding and later staged
-`agent.inputs.*` remain open. The stable-child active-Turn cancellation sub-primitive is complete;
-recipient subscription retirement/root-host composition are still pending. History ancestry still
-grants none of those authorities.
+trusted Project authority. Full live `agent.close` composition, initial task dispatch, explicit Sandbox
+binding and later staged `agent.inputs.*` remain open. Stable-child active-Turn cancellation and durable
+recipient-subscription retirement are complete; root-host runtime/cache composition and terminal closure
+are still pending. History ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -243,7 +252,9 @@ still-existing tables. They reproduce individually and are outside this Agent-ow
 claimed green or repaired here. The required focused Agent/history/admission regressions remain green.
 The stable-Agent close regression now additionally covers a provider attempt that never completes on
 its own: close preempts the active Turn and reaches factual cancelled child settlement within the test
-bound, while the existing create/continue/idle-close regression remains green.
+bound, while the existing create/continue/idle-close regression remains green. Existing event-source
+coverage now proves receiver retirement clears both root+exact-Turn rules and pending deliveries while
+bumping the source Agent once; the host-shell regression proves close invokes retirement atomically.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

@@ -2916,6 +2916,10 @@ impl SessionStore {
         if relation.identity.actor != *actor {
             return Err(Error::Denied("Agent close belongs to another actor"));
         }
+        let child_ref = crate::agent_owner::canonical_ref(
+            &tx,
+            crate::agent_owner::AgentKey::new(child_session, &child_branch.id),
+        )?;
         let existing: bool = db(tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM audit
@@ -2926,6 +2930,7 @@ impl SessionStore {
             |row| row.get(0),
         ))?;
         if existing {
+            crate::agent_job_events::retire_recipient_in(&tx, &child_ref)?;
             db(tx.commit())?;
             return Ok(());
         }
@@ -2948,6 +2953,7 @@ impl SessionStore {
             &tx,
             crate::agent_owner::AgentKey::new(child_session, &child_branch.id),
         )?;
+        crate::agent_job_events::retire_recipient_in(&tx, &child_ref)?;
         db(tx.commit())?;
         Ok(())
     }

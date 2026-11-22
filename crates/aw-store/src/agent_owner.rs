@@ -212,7 +212,7 @@ fn agent_handle(canonical_ref: &str) -> Result<&str> {
     Ok(handle)
 }
 
-fn canonical_ref(connection: &Connection, agent: AgentKey<'_>) -> Result<String> {
+pub(crate) fn canonical_ref(connection: &Connection, agent: AgentKey<'_>) -> Result<String> {
     validate(agent)?;
     db(connection.query_row(
         "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
