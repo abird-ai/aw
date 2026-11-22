@@ -241,10 +241,17 @@ for inspection/reconciliation, and no terminal fact is fabricated. Close signall
 do not enqueue duplicates, while a failed attempt clears that bit so a later authenticated close can
 retry after reconciliation. This does not add lifecycle authority; `closing` remains durable Store state.
 
-Full SPEC `agent.close` therefore now has complete stable-child terminal composition. Root/default Agent
-host composition remains open because its active Turn cancellation token is owned by `Host::prompt_with`,
-not the stable worker; that root path must retain/reuse the same `JobRuntime` and only mark `closed` after
-its current Turn plus finite work are factually terminal.
+Full SPEC `agent.close` therefore now has complete stable-child terminal composition. Root/default
+close now also has its two missing lower factual seams. `actor_owner::Service::cancel_active_turn_for_agent_close`
+is a trusted-host lifecycle operation, not a model Tool: it binds replay identity to the durable Agent
+close revision plus exact admitted Turn/Input, reuses the existing Actor Control Prepared ->
+Applied/Unknown owner, and returns `None` only when both the live owner and durable branch prove no
+active Turn. `SessionStore::agent_finish_close` is the matching terminal Store seam: it accepts only a
+previously requested `closing` Agent, rechecks under one writer transaction that no journaled Turn is
+running, advances once to `closed`, and is idempotent thereafter. It intentionally knows nothing about
+finite Jobs; the outer host must prove `JobRuntime::close_owner` first. Root/native Host still needs to
+retain the configured `JobRuntime` and orchestrate these three existing owners; that wiring is not yet
+implemented and is not claimed.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
 closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
@@ -253,8 +260,10 @@ that later Sandbox owner does not exist yet. Cross-Project redirect also fails c
 trusted Project authority. Full live `agent.close` composition, initial task dispatch, explicit Sandbox
 binding and later staged `agent.inputs.*` remain open. Stable-child active-Turn cancellation, durable
 recipient-subscription retirement, finite-Job owner-close/quiescence, and stable-child terminal close
-composition are complete; root/default host composition is still pending. History ancestry still grants
-none of those authorities.
+composition are complete. Root/default Actor current-Turn cancellation and terminal Store seams are now
+complete too; retaining the configured root `JobRuntime` and composing Actor Control + finite work +
+terminal Store transition in native Host is still pending. History ancestry still grants none of those
+authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -283,7 +292,11 @@ A real finite shell-Job regression proves `JobRuntime::close_owner` cancels thro
 terminal/quiescent output ownership, then rejects new finite-work admission. The existing stable-Agent
 blocking-provider close and create/continue/close regressions remain green after stable close was wired to
 that exact runtime handle, proving the composition did not regress active-Turn preemption or normal
-terminal settlement. The existing scope-replacement runner-cancellation regression remains green.
+terminal settlement. The existing scope-replacement runner-cancellation regression remains green. A new
+Actor-owner regression proves trusted host close cancels a genuinely running provider Turn without any
+model `jobs_cancel` grant and settles it as Cancelled; the host-shell regression now also proves terminal
+close is rejected before a close request, advances `closing -> closed` once, and replays idempotently.
+Root JobRuntime retention/orchestration is still open; no root-close completion is claimed yet.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

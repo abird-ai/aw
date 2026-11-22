@@ -3174,6 +3174,7 @@ struct Host {
     agent: Option<Agent>,
     actor_owner: Option<aw::actor_owner::Service>,
     agent_jobs_owner: Option<aw::actor_owner::Service>,
+    agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
     pre_dispatch_retries: u8,
     context_compaction_policy:aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -3474,6 +3475,7 @@ impl Host {
         self.settings.profile_name = name;
         self.settings.profile = profile;
         self.agent = None;
+        self.agent_job_runtime = None;
         self.persistent = None;
         #[cfg(feature = "jsonl")]
         {
@@ -3561,6 +3563,7 @@ impl Host {
             agent: None,
             actor_owner: None,
             agent_jobs_owner: None,
+            agent_job_runtime: None,
             pre_dispatch_retries: 0,
             context_compaction_policy:aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -3757,7 +3760,7 @@ impl Host {
         if self.agent.is_some() {
             return Ok(());
         }
-        let mut agent = if self.settings.profile.oauth_connector.is_some() {
+        let configured = if self.settings.profile.oauth_connector.is_some() {
             #[cfg(feature = "oidc")]
             {
                 if web {
@@ -3769,7 +3772,7 @@ impl Host {
                     "Sign in with ChatGPT requires durable local state for SecretStore custody",
                 ))?;
                 let store = Self::storage_step(self.sqlite_store(), "opening OAuth durable store")?;
-                aw::configured_oauth_execution(
+                aw::configured_oauth_execution_with_runtime(
                     &self.settings,
                     &self.context,
                     &self.tools,
@@ -3784,8 +3787,10 @@ impl Host {
                 ));
             }
         } else {
-            aw::configured_execution(&self.settings, &self.context, &self.tools, web)?
+            aw::configured_execution_with_runtime(&self.settings, &self.context, &self.tools, web)?
         };
+        self.agent_job_runtime = configured.job_runtime.clone();
+        let mut agent = configured.agent;
         agent.set_pre_dispatch_retries(self.pre_dispatch_retries)?;
         if !self.mcp.is_empty() {
             if self.runtime.is_none() {

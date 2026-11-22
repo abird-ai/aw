@@ -636,6 +636,16 @@ impl<'a> LocalHost<'a> {
     /// Consumes the one-shot local host, moving its actor into the adapter.
     /// No extra PrincipalId allocation or clone in the default bootstrap.
     pub fn configure(self, builder: AgentBuilder) -> Result<AgentBuilder> {
+        Ok(self.configure_with_runtime(builder)?.builder)
+    }
+
+    /// Same host composition as `configure`, while returning the exact finite
+    /// Job runtime installed into the Agent builder for lifecycle owners that
+    /// must later cancel/quiesce Agent-owned work. No second runtime is built.
+    pub fn configure_with_runtime(
+        self,
+        builder: AgentBuilder,
+    ) -> Result<aw_tools_adapter::ConfiguredLocalTools> {
         if self.effective.strategy() != Strategy::Local
             || !self.effective.routes().contains(Strategy::Local)
         {
@@ -671,7 +681,11 @@ impl<'a> LocalHost<'a> {
         if let Some(ceiling) = self.effective.max_model_rounds() {
             policy.max_model_rounds = policy.max_model_rounds.min(ceiling);
         }
-        aw_tools_adapter::configure(builder.tool_policy(policy), self.actor, self.tools)
+        aw_tools_adapter::configure_with_runtime(
+            builder.tool_policy(policy),
+            self.actor,
+            self.tools,
+        )
     }
 }
 

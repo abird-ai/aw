@@ -279,6 +279,25 @@ pub fn configured_oauth_execution(
     store: SessionStore,
     web_owner: bool,
 ) -> Result<Agent> {
+    Ok(
+        configured_oauth_execution_with_runtime(settings, _ctx, tool_options, store, web_owner)?
+            .agent,
+    )
+}
+
+pub struct ConfiguredExecution {
+    pub agent: Agent,
+    pub job_runtime: Option<Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
+}
+
+#[cfg(feature = "oidc")]
+pub fn configured_oauth_execution_with_runtime(
+    settings: &config::Settings,
+    _ctx: &context::ExecutionContext,
+    tool_options: &LocalToolOptions,
+    store: SessionStore,
+    web_owner: bool,
+) -> Result<ConfiguredExecution> {
     let connector_id = settings
         .profile
         .oauth_connector
@@ -322,7 +341,12 @@ pub fn configured_oauth_execution(
         settings.profile.effective_models(),
     );
     let builder = Agent::builder(provider, options).account(account, actor.clone(), "local");
-    aw_host::configure_local(builder, actor, tool_options)?.build()
+    let configured =
+        aw_host::LocalHost::new(actor, tool_options).configure_with_runtime(builder)?;
+    Ok(ConfiguredExecution {
+        agent: configured.builder.build()?,
+        job_runtime: configured.job_runtime,
+    })
 }
 
 /// Register one explicitly selected durable server/shared provider account into
@@ -448,6 +472,15 @@ pub fn configured_execution(
     tool_options: &LocalToolOptions,
     web_owner: bool,
 ) -> Result<Agent> {
+    Ok(configured_execution_with_runtime(settings, _ctx, tool_options, web_owner)?.agent)
+}
+
+pub fn configured_execution_with_runtime(
+    settings: &config::Settings,
+    _ctx: &context::ExecutionContext,
+    tool_options: &LocalToolOptions,
+    web_owner: bool,
+) -> Result<ConfiguredExecution> {
     use std::collections::BTreeSet;
     let mut builder = configured_agent_builder(settings)?;
     let actor = if web_owner {
@@ -481,7 +514,12 @@ pub fn configured_execution(
         )
     };
     builder = builder.account(account, actor.clone(), "local");
-    aw_host::configure_local(builder, actor, tool_options)?.build()
+    let configured =
+        aw_host::LocalHost::new(actor, tool_options).configure_with_runtime(builder)?;
+    Ok(ConfiguredExecution {
+        agent: configured.builder.build()?,
+        job_runtime: configured.job_runtime,
+    })
 }
 
 /// Register or replace one same-user OAuth-backed ChatGPT plan profile in the

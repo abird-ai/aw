@@ -134,10 +134,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       was added. **Stable-child terminal composition is now complete:** preparation retains the exact
       configured JobRuntime; close awaits finite-work quiescence before the existing atomic child/Agent
       settlement, keeps the live worker in durable `closing` on unresolved work, and permits one later
-      close retry without duplicate in-flight close commands. Still open before the host shell is
-      complete: root/default active-Turn + finite-work composition and terminal closure, live initial
-      `task` dispatch, explicit logical Sandbox refs/`auto` policy owner, reviewed cross-Project redirect
-      authority, then staged `agent.inputs.*`. After that propagate provenance
+      close retry without duplicate in-flight close commands. **Root/default lower close seams are now
+      complete without a new lifecycle owner:** trusted host close can cancel the exact active Actor Turn
+      through the existing durable Actor Control owner keyed by close revision, and the Store can publish
+      `closed` only from `closing` after rechecking that no journaled Turn is active. The Store terminal
+      seam deliberately does not inspect finite Jobs. Still open before the host shell is complete: retain
+      the configured root JobRuntime in native Host and compose Actor Control + `close_owner` + terminal
+      Store transition for root/default close, then live initial `task` dispatch, explicit logical Sandbox
+      refs/`auto` policy owner, reviewed
+      cross-Project redirect authority and staged `agent.inputs.*`. After that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
