@@ -1655,6 +1655,7 @@ struct LiveAgentWakeHandle {
 
 struct LiveAgentControl {
     closing: AtomicBool,
+    close_queued: AtomicBool,
     active_cancel: Mutex<Option<CancellationToken>>,
 }
 
@@ -1662,6 +1663,7 @@ impl LiveAgentControl {
     fn new() -> Self {
         Self {
             closing: AtomicBool::new(false),
+            close_queued: AtomicBool::new(false),
             active_cancel: Mutex::new(None),
         }
     }
@@ -1690,7 +1692,7 @@ impl LiveAgentControl {
     }
 
     fn request_close(&self) -> Result<bool> {
-        let first = !self.closing.swap(true, Ordering::AcqRel);
+        self.closing.store(true, Ordering::Release);
         if let Some(cancellation) = self
             .active_cancel
             .lock()
@@ -1699,7 +1701,11 @@ impl LiveAgentControl {
         {
             cancellation.cancel();
         }
-        Ok(first)
+        Ok(!self.close_queued.swap(true, Ordering::AcqRel))
+    }
+
+    fn finish_close_attempt(&self) {
+        self.close_queued.store(false, Ordering::Release);
     }
 
     fn finish_turn(&self) {
@@ -1731,10 +1737,9 @@ impl aw::agent_jobs::LiveAgentWake for LiveAgentWakeHandle {
     }
 
     fn close(&self) -> Result<()> {
-        if self.control.request_close()? {
-            self.sender
-                .send(LiveAgentCommand::Close)
-                .map_err(|_| Error::Conflict("live Agent worker is unavailable"))?;
+        if self.control.request_close()? && self.sender.send(LiveAgentCommand::Close).is_err() {
+            self.control.finish_close_attempt();
+            return Err(Error::Conflict("live Agent worker is unavailable"));
         }
         Ok(())
     }
@@ -1763,6 +1768,7 @@ struct Prepared {
     task: String,
     actor_lease: Option<crate::child_actors::ChildLease>,
     execution_lease: Option<ExecutionOwnershipLease>,
+    job_runtime: Option<Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
 }
 
 struct StableAgentRuntime {
@@ -2801,8 +2807,9 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 .fail_admitted_subagent(&resource_owner, &info.id, &bounded);
             return Err(error);
         }
-        let setup = (|| -> Result<Agent> {
+        let setup = (|| -> Result<(Agent, Option<Arc<aw_tools_adapter::job_runtime::JobRuntime>>)> {
             let mut builder = Agent::builder_from_selection(selected.clone(), options);
+            let mut job_runtime = None;
             let stable_agent = !attach_legacy_child_actor;
             let visible_subscribe = stable_agent && selected.supports_tools();
             if child_tool_mode != ToolMode::Off || visible_subscribe {
@@ -2831,7 +2838,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 if child_tool_mode != ToolMode::Off {
                     child_tools.private_state_dir = Some(inner.state_dir.clone());
                 }
-                builder = aw_tools_adapter::configure(builder, ctx.actor.clone(), &child_tools)?;
+                let configured =
+                    aw_tools_adapter::configure_with_runtime(builder, ctx.actor.clone(), &child_tools)?;
+                builder = configured.builder;
+                job_runtime = configured.job_runtime;
             }
             let mut agent = builder.build()?;
             if let Some(scope) = execution_scope.as_ref() {
@@ -2889,10 +2899,10 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                 execution.session_id,
                 execution.branch_id,
             )?)?;
-            Ok(agent)
+            Ok((agent, job_runtime))
         })();
-        let agent = match setup {
-            Ok(agent) => agent,
+        let (agent, job_runtime) = match setup {
+            Ok(prepared) => prepared,
             Err(error) => {
                 let detail = error.to_string();
                 let bounded = detail.chars().take(2048).collect::<String>();
@@ -2952,6 +2962,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
             task: args.task,
             actor_lease,
             execution_lease,
+            job_runtime,
         })
     }
 
@@ -3178,7 +3189,7 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
         Ok(true)
     }
 
-    fn close_stable_agent(
+    async fn close_stable_agent(
         inner: &Arc<Inner>,
         prepared: &Prepared,
         runtime: &StableAgentRuntime,
@@ -3206,6 +3217,14 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                     &request_id,
                 );
             }
+        }
+        if let Some(job_runtime) = &prepared.job_runtime {
+            job_runtime
+                .close_owner(Some(&aw_agent_core::InvocationScope {
+                    session_id: session.to_owned(),
+                    branch_id: branch.to_owned(),
+                }))
+                .await?;
         }
         inner.store.settle_agent_job(
             &prepared.resource_owner,
@@ -3285,17 +3304,20 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                         ));
                     }
                     Ok(LiveAgentCommand::Close) => {
-                        let _ = Self::close_stable_agent(
+                        let closed = runtime.block_on(Self::close_stable_agent(
                             &inner,
                             &prepared,
                             &runtime_state,
                             "Agent closed by jobs_cancel",
-                        );
+                        ));
                         runtime.block_on(Self::deliver_stable_agent_events(
                             runtime_state.router.as_ref(),
                             &runtime_state.canonical_ref,
                         ));
-                        break;
+                        if closed.is_ok() {
+                            break;
+                        }
+                        runtime_state.control.finish_close_attempt();
                     }
                     Err(_) => {
                         Self::fail_stable_worker_creation(
@@ -3410,17 +3432,20 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                         ));
                     }
                     Ok(LiveAgentCommand::Close) => {
-                        let _ = Self::close_stable_agent(
+                        let closed = runtime.block_on(Self::close_stable_agent(
                             &inner,
                             &prepared,
                             &runtime_state,
                             "Agent closed by jobs_cancel",
-                        );
+                        ));
                         runtime.block_on(Self::deliver_stable_agent_events(
                             runtime_state.router.as_ref(),
                             &runtime_state.canonical_ref,
                         ));
-                        break;
+                        if closed.is_ok() {
+                            break;
+                        }
+                        runtime_state.control.finish_close_attempt();
                     }
                     Err(_) => {
                         Self::fail_stable_worker_creation(

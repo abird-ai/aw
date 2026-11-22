@@ -230,10 +230,21 @@ into the Agent builder, so root/stable lifecycle composition can retain the real
 without constructing a parallel runtime. The old `configure`/`configure_with_toolset` APIs and the
 ToolMode::Off zero-runtime fast path are unchanged for existing callers.
 
-Full SPEC `agent.close` remains incomplete until the live host composes these durable/preemptive owners
-with root-host active-Turn control and the final stable/root `closing -> closed` transition. That next
-composition must preserve a retriable/inspectable `closing` state when finite work is unresolved rather
-than dropping the live owner.
+Stable-Agent close now composes that exact finite-work owner before terminal settlement. Child tool
+configuration uses `configure_with_runtime`; the resulting `Prepared` retains the same `Arc<JobRuntime>`
+already installed into the Agent builder. Once the active Turn has been cancelled/settled and queued
+future Inputs are deleted, stable close awaits `JobRuntime::close_owner`; only a proven-quiescent result
+may proceed to the existing atomic `settle_agent_job` / Agent `closed` transition and live-owner removal.
+If finite work remains unresolved, the Agent stays `closing`, its worker/router owner remains available
+for inspection/reconciliation, and no terminal fact is fabricated. Close signalling now has one tiny
+`close_queued` bit solely to serialize close attempts: duplicate requests while one attempt is in flight
+do not enqueue duplicates, while a failed attempt clears that bit so a later authenticated close can
+retry after reconciliation. This does not add lifecycle authority; `closing` remains durable Store state.
+
+Full SPEC `agent.close` therefore now has complete stable-child terminal composition. Root/default Agent
+host composition remains open because its active Turn cancellation token is owned by `Host::prompt_with`,
+not the stable worker; that root path must retain/reuse the same `JobRuntime` and only mark `closed` after
+its current Turn plus finite work are factually terminal.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. `task` creation fails
 closed before publication until the live runtime admission path is composed. `sandbox=auto` currently
@@ -241,9 +252,9 @@ means the trusted host supplied execution binding; an explicit logical Sandbox r
 that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
 trusted Project authority. Full live `agent.close` composition, initial task dispatch, explicit Sandbox
 binding and later staged `agent.inputs.*` remain open. Stable-child active-Turn cancellation, durable
-recipient-subscription retirement, and the shared finite-Job owner-close/quiescence primitive are
-complete; root/stable host composition of that primitive plus terminal closure is still pending. History
-ancestry still grants none of those authorities.
+recipient-subscription retirement, finite-Job owner-close/quiescence, and stable-child terminal close
+composition are complete; root/default host composition is still pending. History ancestry still grants
+none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -268,10 +279,11 @@ its own: close preempts the active Turn and reaches factual cancelled child sett
 bound, while the existing create/continue/idle-close regression remains green. Existing event-source
 coverage now proves receiver retirement clears both root+exact-Turn rules and pending deliveries while
 bumping the source Agent once; the host-shell regression proves close invokes retirement atomically.
-A real finite shell-Job regression now proves `JobRuntime::close_owner` cancels through JobManager,
-waits for terminal/quiescent output ownership, then rejects new finite-work admission; the existing scope
-replacement runner-cancellation regression remains green. Adapter check + strict all-target Clippy are
-green for that owner cut.
+A real finite shell-Job regression proves `JobRuntime::close_owner` cancels through JobManager, waits for
+terminal/quiescent output ownership, then rejects new finite-work admission. The existing stable-Agent
+blocking-provider close and create/continue/close regressions remain green after stable close was wired to
+that exact runtime handle, proving the composition did not regress active-Turn preemption or normal
+terminal settlement. The existing scope-replacement runner-cancellation regression remains green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

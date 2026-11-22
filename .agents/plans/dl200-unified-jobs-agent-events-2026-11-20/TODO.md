@@ -131,10 +131,13 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       `configure_with_runtime`; `close_owner` fences new finite work, cancels through the existing
       JobHost/JobManager + exact runner tokens, waits for quiescence, and refuses terminal success while
       JobManager still reports ambiguous/in-flight/live-writer state. No parallel Job lifecycle or index
-      was added. Still open before the host shell is complete: compose that owner with stable/root close
-      while preserving retriable `closing` on uncertainty, root active-Turn control, final terminal
-      closure, live initial `task` dispatch, explicit logical Sandbox refs/`auto` policy owner, reviewed
-      cross-Project redirect authority, then staged `agent.inputs.*`. After that propagate provenance
+      was added. **Stable-child terminal composition is now complete:** preparation retains the exact
+      configured JobRuntime; close awaits finite-work quiescence before the existing atomic child/Agent
+      settlement, keeps the live worker in durable `closing` on unresolved work, and permits one later
+      close retry without duplicate in-flight close commands. Still open before the host shell is
+      complete: root/default active-Turn + finite-work composition and terminal closure, live initial
+      `task` dispatch, explicit logical Sandbox refs/`auto` policy owner, reviewed cross-Project redirect
+      authority, then staged `agent.inputs.*`. After that propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
