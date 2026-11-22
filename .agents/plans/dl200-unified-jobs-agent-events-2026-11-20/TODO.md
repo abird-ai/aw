@@ -181,9 +181,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       the destination owner/audience disclosure closure. Redirected create requires an explicit open Sandbox
       in the destination Project; `auto` fails until Phase-3 materialization can truthfully create/derive one.
       Task-bearing redirected create reuses the existing Project+Sandbox fingerprinted Prepared receipt and
-      stable-principal activation path. Raw `project=` never impersonates another principal. Still open in
-      Phase 1: staged `agent.inputs.*`, provenance propagation and only consumer-required projections.
-      Public fresh/derived `sandbox.create` remains Phase-3 work
+      stable-principal activation path. Raw `project=` never impersonates another principal. **The v42
+      staged input-plan owner is now implemented:** one per-Agent `inputs_rev`, opaque `q:` IDs, encrypted
+      SecretStore text, sparse ordered drafts with transactional rebalance, immutable creator/source +
+      last-editor provenance, followup/contribute vs steer|interrupt/control permissions, manage for other
+      users' drafts, exact Turn validation, close freeze, and one `agent.changed aspect=inputs` fact per
+      successful mutation without Agent-rev churn. Lower `list/add/edit/delete/reorder` are complete but are
+      intentionally not exposed yet. Still open in Phase 1: atomic `agent.inputs.send` into the existing
+      queue/control owners followed by exposing all five host methods together, provenance propagation and
+      only consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
       with SourceDriver/checkpoint semantics. After that
       propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

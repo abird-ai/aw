@@ -15,6 +15,7 @@ mod actor_notice;
 mod actor_peer;
 mod actor_queue;
 mod agent_host;
+mod agent_input_plan;
 mod agent_job_events;
 mod agent_owner;
 mod archive;
@@ -92,6 +93,9 @@ pub use actor_queue::{
 pub use agent_host::{
     AgentAdmission, AgentCreateAccess, AgentCreateAccessGrant, AgentCreateContext,
     AgentCreateRequest, AgentLifecycle, AgentSandboxSelection, AgentSnapshot,
+};
+pub use agent_input_plan::{
+    AgentInputAdd, AgentInputEdit, AgentInputIntent, AgentInputPlanItem, AgentInputPlanSnapshot,
 };
 pub use agent_job_events::AgentJobWakeAdmission;
 pub use agent_owner::{
@@ -252,8 +256,9 @@ pub const AGENT_OWNER_SCHEMA: &str = include_str!("../migrations/038_agent_owner
 pub const DOMAIN_PRINCIPALS_SCHEMA: &str = include_str!("../migrations/039_domain_principals.sql");
 pub const HISTORY_OWNER_SCHEMA: &str = include_str!("../migrations/040_history_owner.sql");
 pub const SANDBOX_OWNER_SCHEMA: &str = include_str!("../migrations/041_sandbox_owner.sql");
+pub const AGENT_INPUT_PLAN_SCHEMA: &str = include_str!("../migrations/042_agent_input_plan.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 41;
+const LATEST_SCHEMA_VERSION: i64 = 42;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2820,6 +2825,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 40 {
         migrate_sandbox_owner(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 41 {
+        migrate_agent_input_plan(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));
@@ -3137,6 +3146,67 @@ fn migrate_sandbox_owner(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 41))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_agent_input_plan(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='agent-input-plan',generation=generation+1,
+             target_epoch=42,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(AGENT_INPUT_PLAN_SCHEMA))?;
+    let agents: u64 = db(
+        tx.query_row("SELECT count(*) FROM agent_state_current", [], |row| {
+            row.get(0)
+        }),
+    )?;
+    let plans: u64 = db(
+        tx.query_row("SELECT count(*) FROM agent_input_plans", [], |row| {
+            row.get(0)
+        }),
+    )?;
+    if agents != plans {
+        return Err(Error::Storage(
+            "Agent input-plan migration did not seed every authoritative Agent",
+        ));
+    }
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Agent input-plan migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='42' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=42,activation_epoch=42,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=42,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 42))?;
     db(tx.commit())?;
     Ok(())
 }

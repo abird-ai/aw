@@ -378,15 +378,39 @@ logical ID over the same mutable environment. The existing task-bearing Prepared
 fingerprints Project + Sandbox, so redirected task create/replay needs no second replay owner. Native host
 activation continues under the same stable user principal and therefore needs no identity rewrite.
 
+Schema **v42** now installs the mutable host-staged Agent input-plan owner without reusing runtime
+`ActorQueue` facts as drafts. Every authoritative Agent has one `agent_input_plans` row with independent
+`inputs_rev`; staged items use opaque `q:` IDs, bounded sparse integer ordering, immutable creator/source
+provenance, mutable last-editor metadata, exact followup/steer/interrupt Turn intent and encrypted
+SecretStore payload custody. There is no per-item revision or second history/journal owner. New Agents are
+seeded through the generic Agent constructor only when v42 exists; the v41->v42 migration seeds all
+existing Agents at `inputs_rev=1`.
+
+The lower staged owner currently implements `list/add/edit/delete/reorder`. `view` reads the plan;
+followups require `contribute`; steer/interrupt drafts require `control`; editing/deleting another stable
+user's draft additionally requires `manage`. Blind append may omit `inputs_rev`, while relative insertion,
+edit and delete use the one plan CAS. Steer/interrupt intent must name the exact current active Turn;
+followup `after` must name an already-known Turn. Successful mutations advance `inputs_rev` exactly once,
+emit immutable `agent.changed {aspect:"inputs", inputs_rev}` in the same transaction, and deliberately do
+**not** advance Agent `rev`. Once Agent lifecycle leaves `open`, list remains readable while draft mutation
+freezes. Payload text is never written into audit/commit-log rows.
+
+This staged owner is intentionally **not exposed on the host wire yet**. `agent.inputs.send` is the
+irreversible/effectful half: selected followups must transfer atomically into existing ActorQueue custody,
+while steer/interrupt must enter the existing authority-control owner and live Runtime without partial
+Send or silent Turn retargeting. That is the next coherent cut; all five public methods will be exposed
+together only after Send is correct rather than publishing a partial API.
+
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
 `agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
-custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding, and
-native Sandbox list/get/close are complete. Remaining Phase-1 work is staged `agent.inputs.*`, provenance
-propagation/final consumer-required projections, and any remaining non-current host operations beyond
-close. Public `sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed
-SourceDriver/checkpoint preparation semantics belong. Trusted delegation into another principal's Project
-also remains a separate future host-policy capability; it is not smuggled through the raw Project field.
-History ancestry still grants none of those authorities.
+custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding,
+native Sandbox list/get/close, and the lower v42 staged input-plan owner are complete. Remaining Phase-1
+work is atomic staged-input Send + five-method host exposure, provenance propagation/final
+consumer-required projections, and any remaining non-current host operations beyond close. Public
+`sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed SourceDriver/checkpoint
+preparation semantics belong. Trusted delegation into another principal's Project also remains a separate
+future host-policy capability; it is not smuggled through the raw Project field. History ancestry still
+grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -406,8 +430,12 @@ publication, cross-Project `auto` fails closed, and fresh + exact-history redire
 Workspace only with an explicit destination Sandbox. The existing host-activation regression is now itself
 task-bearing cross-Project end-to-end, proving Prepared custody/publication, stable-principal provider
 selection, live activation, exact replay and later non-current close across that boundary. The unchanged
-model exact-history regression remains source-Project-local. `cargo check -p aw-store -p
-aw-cli --tests`, strict all-target Clippy and repository fmt are green for this cut. A broader historical
+model exact-history regression remains source-Project-local. The focused **v41 -> v42** staged-plan
+regression is green over a real persistent Store: migration seeding, encrypted blind append, CAS relative
+insert, stale rejection, exact-Turn control-intent rejection without an active Turn, edit+reorder, delete,
+separate `inputs_rev`, unchanged Agent `rev`, close freeze, no plaintext audit leakage, and exactly one
+input-change fact per successful transaction. `cargo check -p aw-store -p aw-cli --tests`, strict
+all-target Clippy and repository fmt are green for this cut. A broader historical
 Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
 fixtures remain outside this focused Agent/Sandbox cut.
 The host-created Agent activation regression now also closes that non-current child through

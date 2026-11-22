@@ -418,6 +418,11 @@ pub(crate) fn created(
     if inserted == 1 {
         seed_acl_for_agent(connection, agent)?;
         crate::sandbox_owner::bind_auto_if_available(connection, agent.session, agent.branch)?;
+        crate::agent_input_plan::ensure_for_agent_if_available(
+            connection,
+            agent.session,
+            agent.branch,
+        )?;
         return Ok(());
     }
 
@@ -469,6 +474,11 @@ pub(crate) fn created(
         )),
     }?;
     crate::sandbox_owner::bind_auto_if_available(connection, agent.session, agent.branch)?;
+    crate::agent_input_plan::ensure_for_agent_if_available(
+        connection,
+        agent.session,
+        agent.branch,
+    )?;
     Ok(())
 }
 
