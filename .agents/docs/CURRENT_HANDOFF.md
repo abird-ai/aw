@@ -397,9 +397,11 @@ freezes. Payload text is never written into audit/commit-log rows.
 
 Schema **v43** adds one compact durable replay owner for staged-input mutations, keyed by authenticated
 stable user + host request ID with operation/fingerprint/target/state/result revision and bounded non-secret
-result metadata only. It is deliberately one table for add/edit/delete/send, not per-method ledgers. The
-atomic Send path now consumes it; add/edit/delete will be threaded through the same owner immediately
-before wire exposure.
+result metadata only. It is deliberately one table for add/edit/delete/send, not per-method ledgers.
+`add/edit/delete/send` now all consume that same owner: exact request replay is checked before new
+SecretStore custody, same identity with changed semantics conflicts, and fresh pure draft mutations commit
+the mutation + Applied replay receipt in one transaction. Only Send uses Prepared/Rejected/Unknown because
+it crosses the live Runtime boundary.
 
 Atomic staged **Send is now complete internally** through one transport-neutral `HostAgentInputs`
 coordinator. Store first authorizes and fingerprints the complete selected set before any Router topology
@@ -420,20 +422,31 @@ publishes its Applied replay receipt in the same final transaction. Existing sta
 transferred directly to ActorQueue for followups; only a control draft's original staged blob is retired
 after commit because AuthoritySteer owns its own prepared encrypted copy.
 
-The host-created Agent regression now proves staged followup -> atomic Send -> existing queue wake -> one
+The public/native host now exposes all five staged-input methods together through one concurrent
+`AgentInputsPort`: `agent_inputs_list`, `agent_inputs_add`, `agent_inputs_edit`, `agent_inputs_delete`, and
+`agent_inputs_send`. The RPC frame ID is the sole durable mutation identity for add/edit/delete/send; there
+is no request-id field in method JSON. Strict top-level field whitelists reject provider/model/Sandbox/tool
+or other authority-bearing extras before dispatch. Item/intent bodies reuse the typed Store structs with
+unknown-field denial, refs default to `.`, non-current targets require canonical Agent refs, edit/delete/send
+require a positive observed `inputs_rev`, and omitted Send IDs mean all staged items. The operations run on
+the concurrent reader lane so exact active-Turn steer/interrupt can be submitted while the provider Turn is
+in flight; only Send consults Router/live Runtime.
+
+The host-created Agent regression proves staged followup -> atomic Send -> existing queue wake -> one
 second Turn, Agent-rev advancement, and exact same-request Send replay with no duplicate execution. Existing
 same-Turn steer and interrupt custody/AuthoritySegment regressions remain green after factoring the
-crate-private transactional accept helper. The public five-method `agent.inputs.*` wire is still withheld
-on purpose: add/edit/delete must first consume the same v43 replay owner so the complete surface is durable
-before it is advertised.
+crate-private transactional accept helper. The consolidated v43 Store regression now also proves durable
+add/edit/delete replay is a no-op and changed semantics under the same host request identity conflict.
+The strict headless regression advertises all five capabilities together, dispatches a valid list once and
+rejects an authority-bearing extra field before the port.
 
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
 `agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
 custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding,
-native Sandbox list/get/close, the v42 staged input-plan owner, and internal atomic v43 Send composition
-are complete. Remaining Phase-1 work is threading add/edit/delete through the shared replay owner and then
-exposing all five `agent.inputs.*` host methods together, followed by provenance propagation/final
-consumer-required projections and any remaining non-current host operations beyond close. Public
+native Sandbox list/get/close, the v42 staged input-plan owner, atomic v43 Send composition, durable
+add/edit/delete replay and all five native `agent.inputs.*` host methods are complete. Remaining Phase-1
+work is provenance propagation/final consumer-required projections and any remaining non-current host
+operations beyond close. Public
 `sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed SourceDriver/checkpoint
 preparation semantics belong. Trusted delegation into another principal's Project also remains a separate
 future host-policy capability; it is not smuggled through the raw Project field. History ancestry still
@@ -457,7 +470,7 @@ publication, cross-Project `auto` fails closed, and fresh + exact-history redire
 Workspace only with an explicit destination Sandbox. The existing host-activation regression is now itself
 task-bearing cross-Project end-to-end, proving Prepared custody/publication, stable-principal provider
 selection, live activation, exact replay and later non-current close across that boundary. The unchanged
-model exact-history regression remains source-Project-local. The focused **v41 -> v42** staged-plan
+model exact-history regression remains source-Project-local. The focused **v41 -> v42 -> v43** staged-plan
 regression is green over a real persistent Store: migration seeding, encrypted blind append, CAS relative
 insert, stale rejection, exact-Turn control-intent rejection without an active Turn, edit+reorder, delete,
 separate `inputs_rev`, unchanged Agent `rev`, close freeze, no plaintext audit leakage, and exactly one

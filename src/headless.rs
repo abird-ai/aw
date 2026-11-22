@@ -59,6 +59,13 @@ pub trait AgentCreatePort: Send + Sync {
     fn apply(&self, request_id: &str, params: Value) -> Result<Value>;
 }
 
+/// Concurrent host staged-input surface. The transport request ID is the
+/// durable mutation identity for add/edit/delete/send; list remains a pure
+/// snapshot read.
+pub trait AgentInputsPort: Send + Sync {
+    fn apply(&self, request_id: &str, method: &str, params: Value) -> Result<Value>;
+}
+
 /// Concurrent current-Project Sandbox read/lifecycle surface. Physical
 /// materialization and Sandbox creation remain unavailable until the
 /// SourceDriver/checkpoint owner can satisfy prepared-publication semantics.
@@ -124,6 +131,9 @@ pub trait Driver {
         None
     }
     fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
+        None
+    }
+    fn agent_inputs_port(&self) -> Option<Arc<dyn AgentInputsPort>> {
         None
     }
     fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
@@ -344,6 +354,11 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "actor_query" | "actor_op" => Some(&["operation"]),
         "agent_create" => Some(&["from", "project", "title", "task", "access", "sandbox"]),
         "agent_close" => Some(&["ref", "rev"]),
+        "agent_inputs_list" => Some(&["ref"]),
+        "agent_inputs_add" => Some(&["ref", "items", "rev"]),
+        "agent_inputs_edit" => Some(&["ref", "id", "text", "intent", "before", "after", "rev"]),
+        "agent_inputs_delete" => Some(&["ref", "ids", "rev"]),
+        "agent_inputs_send" => Some(&["ref", "ids", "rev"]),
         "sandbox_list" => Some(&["project", "limit", "cursor"]),
         "sandbox_get" => Some(&["ref", "include"]),
         "sandbox_close" => Some(&["ref", "rev"]),
@@ -450,14 +465,20 @@ fn read_bounded_line<R: BufRead>(input: &mut R) -> io::Result<Option<(Vec<u8>, b
         }
     }
 }
+#[derive(Default)]
+struct ReaderPorts {
+    live_control: Option<Arc<dyn LiveControlPort>>,
+    agent_create: Option<Arc<dyn AgentCreatePort>>,
+    agent_close: Option<Arc<dyn AgentClosePort>>,
+    agent_inputs: Option<Arc<dyn AgentInputsPort>>,
+    sandbox: Option<Arc<dyn SandboxPort>>,
+}
+
 fn stdin_reader<R: Read + Send + 'static>(
     input: R,
     tx: mpsc::SyncSender<Inbound>,
     active: Arc<Mutex<Option<(String, CancellationToken)>>>,
-    live_control: Option<Arc<dyn LiveControlPort>>,
-    agent_create: Option<Arc<dyn AgentCreatePort>>,
-    agent_close: Option<Arc<dyn AgentClosePort>>,
-    sandbox: Option<Arc<dyn SandboxPort>>,
+    ports: ReaderPorts,
 ) {
     let mut reader = BufReader::new(input);
     loop {
@@ -503,7 +524,7 @@ fn stdin_reader<R: Read + Send + 'static>(
                     .and_then(Value::as_str)
                     == Some("control")
             {
-                if let Some(port) = &live_control {
+                if let Some(port) = &ports.live_control {
                     let outcome = (|| -> Result<Value> {
                         validate_method_params(&request.method, &request.params)?;
                         let operation = request
@@ -527,7 +548,7 @@ fn stdin_reader<R: Read + Send + 'static>(
                         Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
                 }
             } else if request.method == "agent_create" {
-                if let Some(port) = &agent_create {
+                if let Some(port) = &ports.agent_create {
                     let outcome = (|| -> Result<Value> {
                         validate_method_params(&request.method, &request.params)?;
                         port.apply(&request.id, request.params.clone())
@@ -536,7 +557,7 @@ fn stdin_reader<R: Read + Send + 'static>(
                         Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
                 }
             } else if request.method == "agent_close" {
-                if let Some(port) = &agent_close {
+                if let Some(port) = &ports.agent_close {
                     let outcome = (|| -> Result<Value> {
                         validate_method_params(&request.method, &request.params)?;
                         let reference = request
@@ -572,9 +593,25 @@ fn stdin_reader<R: Read + Send + 'static>(
                 }
             } else if matches!(
                 request.method.as_str(),
+                "agent_inputs_list"
+                    | "agent_inputs_add"
+                    | "agent_inputs_edit"
+                    | "agent_inputs_delete"
+                    | "agent_inputs_send"
+            ) {
+                if let Some(port) = &ports.agent_inputs {
+                    let outcome = (|| -> Result<Value> {
+                        validate_method_params(&request.method, &request.params)?;
+                        port.apply(&request.id, &request.method, request.params.clone())
+                    })();
+                    parsed =
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
+                }
+            } else if matches!(
+                request.method.as_str(),
                 "sandbox_list" | "sandbox_get" | "sandbox_close"
             ) {
-                if let Some(port) = &sandbox {
+                if let Some(port) = &ports.sandbox {
                     let outcome = (|| -> Result<Value> {
                         validate_method_params(&request.method, &request.params)?;
                         port.apply(&request.method, request.params.clone())
@@ -614,6 +651,11 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "actor_notice_read":driver.actor_available(),
             "agent_create":driver.agent_create_port().is_some(),
             "agent_close":driver.agent_close_port().is_some(),
+            "agent_inputs_list":driver.agent_inputs_port().is_some(),
+            "agent_inputs_add":driver.agent_inputs_port().is_some(),
+            "agent_inputs_edit":driver.agent_inputs_port().is_some(),
+            "agent_inputs_delete":driver.agent_inputs_port().is_some(),
+            "agent_inputs_send":driver.agent_inputs_port().is_some(),
             "sandbox_list":driver.sandbox_port().is_some(),
             "sandbox_get":driver.sandbox_port().is_some(),
             "sandbox_create":false,
@@ -625,21 +667,14 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let active = Arc::new(Mutex::new(None::<(String, CancellationToken)>));
     let (tx, rx) = mpsc::sync_channel(MAX_INPUT_QUEUE);
     let guard = active.clone();
-    let live_port = driver.live_control_port();
-    let agent_create = driver.agent_create_port();
-    let agent_close = driver.agent_close_port();
-    let sandbox = driver.sandbox_port();
-    let read = thread::spawn(move || {
-        stdin_reader(
-            reader,
-            tx,
-            guard,
-            live_port,
-            agent_create,
-            agent_close,
-            sandbox,
-        )
-    });
+    let ports = ReaderPorts {
+        live_control: driver.live_control_port(),
+        agent_create: driver.agent_create_port(),
+        agent_close: driver.agent_close_port(),
+        agent_inputs: driver.agent_inputs_port(),
+        sandbox: driver.sandbox_port(),
+    };
+    let read = thread::spawn(move || stdin_reader(reader, tx, guard, ports));
     let mut seen = BTreeSet::<String>::new();
     while let Ok(message) = rx.recv() {
         let (request, abort_requested, live_result) = match message {
@@ -1170,6 +1205,20 @@ mod aw_p6_9c_protocol_tests {
     }
 
     #[derive(Default)]
+    struct FakeAgentInputsPort {
+        calls: Mutex<Vec<(String, String, Value)>>,
+    }
+    impl AgentInputsPort for FakeAgentInputsPort {
+        fn apply(&self, request_id: &str, method: &str, params: Value) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request_id.to_owned(), method.to_owned(), params));
+            Ok(json!({"agent_ref":"/d:d/i:i/p:p/a:a","inputs_rev":1,"items":[]}))
+        }
+    }
+
+    #[derive(Default)]
     struct FakeSandboxPort {
         calls: Mutex<Vec<(String, Value)>>,
     }
@@ -1187,6 +1236,7 @@ mod aw_p6_9c_protocol_tests {
         step_calls: usize,
         prompts: usize,
         create: Arc<FakeAgentCreatePort>,
+        inputs: Arc<FakeAgentInputsPort>,
         sandbox: Arc<FakeSandboxPort>,
     }
     impl Driver for BoundFake {
@@ -1195,6 +1245,9 @@ mod aw_p6_9c_protocol_tests {
         }
         fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
             Some(self.create.clone())
+        }
+        fn agent_inputs_port(&self) -> Option<Arc<dyn AgentInputsPort>> {
+            Some(self.inputs.clone())
         }
         fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
             Some(self.sandbox.clone())
@@ -1259,11 +1312,14 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"step","method":"actor_step","params":{}}"#,
             r#"{"v":1,"id":"create","method":"agent_create","params":{"title":"child","task":"work","access":"private","sandbox":"auto"}}"#,
             r#"{"v":1,"id":"create-provider","method":"agent_create","params":{"title":"child","provider":"evil"}}"#,
+            r#"{"v":1,"id":"inputs-list","method":"agent_inputs_list","params":{"ref":"."}}"#,
+            r#"{"v":1,"id":"inputs-raw","method":"agent_inputs_add","params":{"items":[],"provider":"evil"}}"#,
             r#"{"v":1,"id":"sandboxes","method":"sandbox_list","params":{"limit":8}}"#,
             r#"{"v":1,"id":"sandbox-layout","method":"sandbox_get","params":{"ref":"/d:d/i:i/p:p/s:0","layout":"raw"}}"#,
             r#"{"v":1,"id":"danger","method":"trusted_bash","params":{"command":"echo no"}}"#,
         ].join("\n")+"\n";
         let create = Arc::new(FakeAgentCreatePort::default());
+        let inputs = Arc::new(FakeAgentInputsPort::default());
         let sandbox = Arc::new(FakeSandboxPort::default());
         let mut fake = BoundFake {
             query_calls: 0,
@@ -1272,6 +1328,7 @@ mod aw_p6_9c_protocol_tests {
             step_calls: 0,
             prompts: 0,
             create: create.clone(),
+            inputs: inputs.clone(),
             sandbox: sandbox.clone(),
         };
         let mut bytes = Vec::new();
@@ -1283,6 +1340,11 @@ mod aw_p6_9c_protocol_tests {
             .collect();
         assert_eq!(rows[0]["data"]["capabilities"]["actor_query"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_create"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_list"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_add"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_edit"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_delete"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_send"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_list"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_get"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], false);
@@ -1296,6 +1358,10 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(create_calls.len(), 1);
         assert_eq!(create_calls[0].0, "create");
         assert_eq!(create_calls[0].1["task"], "work");
+        let input_calls = inputs.calls.lock().unwrap();
+        assert_eq!(input_calls.len(), 1);
+        assert_eq!(input_calls[0].0, "inputs-list");
+        assert_eq!(input_calls[0].1, "agent_inputs_list");
         let sandbox_calls = sandbox.calls.lock().unwrap();
         assert_eq!(sandbox_calls.len(), 1);
         assert_eq!(sandbox_calls[0].0, "sandbox_list");
@@ -1309,6 +1375,9 @@ mod aw_p6_9c_protocol_tests {
         assert!(rows
             .iter()
             .any(|r| r["id"] == "create-provider" && r["data"]["code"] == "protocol"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "inputs-raw" && r["data"]["code"] == "protocol"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "sandbox-layout" && r["data"]["code"] == "protocol"));

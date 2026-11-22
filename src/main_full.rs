@@ -3385,6 +3385,7 @@ struct Host {
     agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
     agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentClose>>,
     agent_create_owner: Option<std::sync::Arc<StdioAgentCreatePort>>,
+    agent_inputs_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
     context_compaction_policy: aw_agent_core::CompactionPolicy,
@@ -3423,6 +3424,10 @@ struct StdioAgentCreatePort {
     account_selector: Option<String>,
     tools: aw::LocalToolOptions,
     router: std::sync::Arc<aw::agent_jobs::Router>,
+}
+
+struct StdioAgentInputsPort {
+    inner: std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>,
 }
 
 struct StdioSandboxPort {
@@ -3714,6 +3719,154 @@ impl aw::headless::AgentCreatePort for StdioAgentCreatePort {
             "project":created.project_ref,
             "title":created.title,
         }))
+    }
+}
+
+fn agent_inputs_ref(params: &serde_json::Value) -> Result<&str> {
+    let reference = params
+        .get("ref")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(Error::Protocol("agent input ref must be a string"))
+        })
+        .transpose()?
+        .unwrap_or(".");
+    if reference.is_empty()
+        || reference.len() > 2048
+        || !reference.is_ascii()
+        || reference.chars().any(char::is_control)
+    {
+        return Err(Error::Protocol("invalid agent input ref"));
+    }
+    Ok(reference)
+}
+
+fn agent_inputs_rev(params: &serde_json::Value, required: bool) -> Result<Option<u64>> {
+    let value = params
+        .get("rev")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|revision| *revision > 0)
+                .ok_or(Error::Protocol(
+                    "agent input rev must be a positive integer",
+                ))
+        })
+        .transpose()?;
+    if required && value.is_none() {
+        return Err(Error::Protocol("agent input rev is required"));
+    }
+    Ok(value)
+}
+
+fn agent_inputs_ids(params: &serde_json::Value, required: bool) -> Result<Option<Vec<String>>> {
+    let Some(value) = params.get("ids") else {
+        return if required {
+            Err(Error::Protocol("agent input ids are required"))
+        } else {
+            Ok(None)
+        };
+    };
+    let array = value
+        .as_array()
+        .ok_or(Error::Protocol("agent input ids must be an array"))?;
+    let mut ids = Vec::with_capacity(array.len());
+    for value in array {
+        let id = value
+            .as_str()
+            .ok_or(Error::Protocol("agent input id must be a string"))?;
+        if !id.starts_with("q:")
+            || id.len() > 128
+            || !id.is_ascii()
+            || id.chars().any(char::is_control)
+        {
+            return Err(Error::Protocol("invalid staged Agent input id"));
+        }
+        ids.push(id.to_owned());
+    }
+    Ok(Some(ids))
+}
+
+impl aw::headless::AgentInputsPort for StdioAgentInputsPort {
+    fn apply(
+        &self,
+        request_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let reference = agent_inputs_ref(&params)?;
+        let snapshot = match method {
+            "agent_inputs_list" => self.inner.list(reference)?,
+            "agent_inputs_add" => {
+                let items = params
+                    .get("items")
+                    .cloned()
+                    .ok_or(Error::Protocol("agent_inputs_add items are required"))
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<aw_store::AgentInputAdd>>(value).map_err(
+                            |_| Error::Protocol("agent_inputs_add items have invalid shape"),
+                        )
+                    })?;
+                self.inner.add(
+                    request_id,
+                    reference,
+                    &items,
+                    agent_inputs_rev(&params, false)?,
+                )?
+            }
+            "agent_inputs_edit" => {
+                let id = params
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Protocol("agent_inputs_edit id is required"))?;
+                if !id.starts_with("q:")
+                    || id.len() > 128
+                    || !id.is_ascii()
+                    || id.chars().any(char::is_control)
+                {
+                    return Err(Error::Protocol("invalid staged Agent input id"));
+                }
+                let mut edit = serde_json::Map::new();
+                for field in ["text", "intent", "before", "after"] {
+                    if let Some(value) = params.get(field) {
+                        edit.insert(field.into(), value.clone());
+                    }
+                }
+                let edit = serde_json::from_value::<aw_store::AgentInputEdit>(
+                    serde_json::Value::Object(edit),
+                )
+                .map_err(|_| Error::Protocol("agent_inputs_edit fields have invalid shape"))?;
+                self.inner.edit(
+                    request_id,
+                    reference,
+                    id,
+                    edit,
+                    agent_inputs_rev(&params, true)?.expect("required input rev"),
+                )?
+            }
+            "agent_inputs_delete" => {
+                let ids = agent_inputs_ids(&params, true)?.expect("required input ids");
+                self.inner.delete(
+                    request_id,
+                    reference,
+                    &ids,
+                    agent_inputs_rev(&params, true)?.expect("required input rev"),
+                )?
+            }
+            "agent_inputs_send" => {
+                let ids = agent_inputs_ids(&params, false)?;
+                self.inner.send(
+                    request_id,
+                    reference,
+                    ids.as_deref(),
+                    agent_inputs_rev(&params, true)?.expect("required input rev"),
+                )?
+            }
+            _ => return Err(Error::Protocol("unsupported Agent input host operation")),
+        };
+        serde_json::to_value(snapshot)
+            .map_err(|_| Error::Storage("cannot encode Agent input plan snapshot"))
     }
 }
 
@@ -4058,6 +4211,7 @@ impl Host {
         self.agent_job_runtime = None;
         self.agent_close_owner = None;
         self.agent_create_owner = None;
+        self.agent_inputs_owner = None;
         self.sandbox_owner = None;
         self.persistent = None;
         #[cfg(feature = "jsonl")]
@@ -4147,6 +4301,7 @@ impl Host {
             agent_job_runtime: None,
             agent_close_owner: None,
             agent_create_owner: None,
+            agent_inputs_owner: None,
             sandbox_owner: None,
             pre_dispatch_retries: 0,
             context_compaction_policy: aw_agent_core::CompactionPolicy::default(),
@@ -4600,6 +4755,7 @@ impl Host {
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
             self.agent_create_owner = None;
+            self.agent_inputs_owner = None;
             self.sandbox_owner = None;
             if let Some(service) = stable_agent_service.as_ref() {
                 service.bind_agent_jobs_router(router.clone())?;
@@ -4695,6 +4851,13 @@ impl Host {
                     tools: self.tools.clone(),
                     router: router.clone(),
                 }));
+                self.agent_inputs_owner =
+                    Some(Arc::new(aw::agent_lifecycle::HostAgentInputs::new(
+                        persistent.store.clone(),
+                        persistent.actor.clone(),
+                        canonical.clone(),
+                        router.clone(),
+                    )?));
                 let root_close = Arc::new(aw::agent_lifecycle::RootAgentClose::new(
                     persistent.store.clone(),
                     persistent.actor.clone(),
@@ -4718,6 +4881,7 @@ impl Host {
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
             self.agent_create_owner = None;
+            self.agent_inputs_owner = None;
             self.sandbox_owner = None;
             self.tools.agent_jobs.clear()?;
             self.tools.operation_router.clear()?;
@@ -5728,6 +5892,13 @@ impl aw::headless::Driver for Host {
         self.agent_create_owner
             .as_ref()
             .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::AgentCreatePort>)
+    }
+    fn agent_inputs_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentInputsPort>> {
+        self.agent_inputs_owner.as_ref().map(|owner| {
+            std::sync::Arc::new(StdioAgentInputsPort {
+                inner: owner.clone(),
+            }) as std::sync::Arc<dyn aw::headless::AgentInputsPort>
+        })
     }
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner

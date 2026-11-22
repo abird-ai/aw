@@ -282,6 +282,54 @@ impl HostAgentInputs {
         Ok(resolved.agent_ref().canonical())
     }
 
+    pub fn list(&self, reference: &str) -> Result<aw_store::AgentInputPlanSnapshot> {
+        let canonical = self.canonical_ref(reference)?;
+        self.store.agent_inputs_list(&self.actor, &canonical)
+    }
+
+    pub fn add(
+        &self,
+        request_id: &str,
+        reference: &str,
+        items: &[aw_store::AgentInputAdd],
+        expected_rev: Option<u64>,
+    ) -> Result<aw_store::AgentInputPlanSnapshot> {
+        let canonical = self.canonical_ref(reference)?;
+        self.store
+            .agent_inputs_add_host(&self.actor, &canonical, request_id, items, expected_rev)
+    }
+
+    pub fn edit(
+        &self,
+        request_id: &str,
+        reference: &str,
+        id: &str,
+        edit: aw_store::AgentInputEdit,
+        expected_rev: u64,
+    ) -> Result<aw_store::AgentInputPlanSnapshot> {
+        let canonical = self.canonical_ref(reference)?;
+        self.store.agent_inputs_edit_host(
+            &self.actor,
+            &canonical,
+            request_id,
+            id,
+            edit,
+            expected_rev,
+        )
+    }
+
+    pub fn delete(
+        &self,
+        request_id: &str,
+        reference: &str,
+        ids: &[String],
+        expected_rev: u64,
+    ) -> Result<aw_store::AgentInputPlanSnapshot> {
+        let canonical = self.canonical_ref(reference)?;
+        self.store
+            .agent_inputs_delete_host(&self.actor, &canonical, request_id, ids, expected_rev)
+    }
+
     pub fn send(
         &self,
         request_id: &str,

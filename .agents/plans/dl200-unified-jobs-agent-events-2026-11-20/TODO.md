@@ -193,10 +193,13 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       followups publish through existing prepared ActorQueue custody; the final transaction removes every
       selected draft, advances `inputs_rev` and Agent `rev` exactly once, emits the input-change fact and
       records Applied replay. Same-request followup Send replay is proven not to duplicate execution, and
-      existing steer/interrupt segmented-custody regressions remain green. Lower `list/add/edit/delete/reorder`
-      are still intentionally not exposed. Still open in Phase 1: thread add/edit/delete through the shared
-      v43 replay owner, expose all five host methods together, then provenance propagation and only
-      consumer-required projections. Public fresh/derived `sandbox.create` remains Phase-3 work
+      existing steer/interrupt segmented-custody regressions remain green. **All five native host input
+      methods are now exposed together** through one `AgentInputsPort`; add/edit/delete share the same v43
+      stable-user/request replay owner, exact replays perform no new SecretStore write or revision bump, and
+      changed semantics under the same request ID conflict. RPC frame ID is the mutation identity, strict
+      field whitelists block authority-bearing extras, and only Send touches Router/live Runtime. Still open
+      in Phase 1: provenance propagation and only consumer-required projections. Public fresh/derived
+      `sandbox.create` remains Phase-3 work
       with SourceDriver/checkpoint semantics. After that
       propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,

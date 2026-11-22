@@ -332,6 +332,22 @@ fn validate_replay(
     Ok(())
 }
 
+fn replay_state_in(
+    connection: &Connection,
+    actor_user: &str,
+    request_id: &str,
+    operation: &str,
+    fingerprint: &str,
+    session: &str,
+    branch: &str,
+) -> Result<Option<MutationState>> {
+    let Some(receipt) = receipt_in(connection, actor_user, request_id)? else {
+        return Ok(None);
+    };
+    validate_replay(&receipt, operation, fingerprint, session, branch)?;
+    Ok(Some(receipt.state))
+}
+
 fn insert_receipt_in(
     connection: &Connection,
     receipt: &MutationReceipt,
@@ -820,10 +836,79 @@ impl SessionStore {
         additions: &[AgentInputAdd],
         expected_rev: Option<u64>,
     ) -> Result<AgentInputPlanSnapshot> {
+        self.agent_inputs_add_inner(actor, canonical_ref, additions, expected_rev, None)
+    }
+
+    pub fn agent_inputs_add_host(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        request_id: &str,
+        additions: &[AgentInputAdd],
+        expected_rev: Option<u64>,
+    ) -> Result<AgentInputPlanSnapshot> {
+        validate_request_id(request_id)?;
+        self.agent_inputs_add_inner(
+            actor,
+            canonical_ref,
+            additions,
+            expected_rev,
+            Some(request_id),
+        )
+    }
+
+    fn agent_inputs_add_inner(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        additions: &[AgentInputAdd],
+        expected_rev: Option<u64>,
+        request_id: Option<&str>,
+    ) -> Result<AgentInputPlanSnapshot> {
         if additions.is_empty() || additions.len() > MAX_ITEMS {
             return Err(Error::Limit("invalid staged Agent input add count"));
         }
         let actor_user = self.current_user(actor)?.user_id;
+        let fingerprint = request_id
+            .map(|_| {
+                mutation_fingerprint(
+                    "add",
+                    canonical_ref,
+                    serde_json::json!({"items":additions,"rev":expected_rev}),
+                )
+            })
+            .transpose()?;
+        if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+            let connection = self.connection()?;
+            let (session, branch, _) = agent_key(
+                &connection,
+                actor,
+                canonical_ref,
+                agent_owner::AgentPermission::View,
+            )?;
+            if let Some(state) = replay_state_in(
+                &connection,
+                &actor_user,
+                request_id,
+                "add",
+                fingerprint,
+                &session,
+                &branch,
+            )? {
+                return match state {
+                    MutationState::Applied => {
+                        drop(connection);
+                        self.agent_inputs_list(actor, canonical_ref)
+                    }
+                    MutationState::Prepared | MutationState::Unknown | MutationState::Rejected => {
+                        Err(Error::Conflict(
+                            "staged Agent input add request is non-retryable; inspect its mutation receipt",
+                        ))
+                    }
+                };
+            }
+        }
+
         let mut custody = Vec::with_capacity(additions.len());
         let mut ids = Vec::with_capacity(additions.len());
         for addition in additions {
@@ -834,6 +919,7 @@ impl SessionStore {
             ids.push(id);
             custody.push(prepared);
         }
+
         let result = (|| {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
@@ -844,6 +930,23 @@ impl SessionStore {
                 agent_owner::AgentPermission::View,
             )?;
             require_open(&tx, &session, &branch)?;
+            if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+                if replay_state_in(
+                    &tx,
+                    &actor_user,
+                    request_id,
+                    "add",
+                    fingerprint,
+                    &session,
+                    &branch,
+                )?
+                .is_some()
+                {
+                    return Err(Error::Conflict(
+                        "staged Agent input add request was claimed concurrently",
+                    ));
+                }
+            }
             let current = plan_rev(&tx, &session, &branch)?;
             require_rev(current, expected_rev)?;
             let existing = load_items(&tx, &session, &branch)?;
@@ -893,6 +996,26 @@ impl SessionStore {
             }
             let next = next_rev(&tx, &session, &branch, current)?;
             publish_changed(&tx, actor, &session, &branch, next)?;
+            if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+                let result_json =
+                    serde_json::to_string(&serde_json::json!({"ids":ids,"inputs_rev":next}))
+                        .map_err(|_| Error::Storage("cannot encode staged input add result"))?;
+                insert_receipt_in(
+                    &tx,
+                    &MutationReceipt {
+                        actor_user: actor_user.clone(),
+                        request_id: request_id.to_owned(),
+                        operation: "add".into(),
+                        fingerprint: fingerprint.to_owned(),
+                        session: session.clone(),
+                        branch: branch.clone(),
+                        state: MutationState::Applied,
+                        resulting_inputs_rev: Some(next),
+                        result_json,
+                    },
+                    None,
+                )?;
+            }
             db(tx.commit())?;
             Ok(())
         })();
@@ -913,6 +1036,38 @@ impl SessionStore {
         edit: AgentInputEdit,
         expected_rev: u64,
     ) -> Result<AgentInputPlanSnapshot> {
+        self.agent_inputs_edit_inner(actor, canonical_ref, id, edit, expected_rev, None)
+    }
+
+    pub fn agent_inputs_edit_host(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        request_id: &str,
+        id: &str,
+        edit: AgentInputEdit,
+        expected_rev: u64,
+    ) -> Result<AgentInputPlanSnapshot> {
+        validate_request_id(request_id)?;
+        self.agent_inputs_edit_inner(
+            actor,
+            canonical_ref,
+            id,
+            edit,
+            expected_rev,
+            Some(request_id),
+        )
+    }
+
+    fn agent_inputs_edit_inner(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        id: &str,
+        edit: AgentInputEdit,
+        expected_rev: u64,
+        request_id: Option<&str>,
+    ) -> Result<AgentInputPlanSnapshot> {
         if edit.text.is_none()
             && edit.intent.is_none()
             && edit.before.is_none()
@@ -929,6 +1084,46 @@ impl SessionStore {
             return Err(Error::Denied("staged input cannot move relative to itself"));
         }
         let actor_user = self.current_user(actor)?.user_id;
+        let fingerprint = request_id
+            .map(|_| {
+                mutation_fingerprint(
+                    "edit",
+                    canonical_ref,
+                    serde_json::json!({"id":id,"edit":edit,"rev":expected_rev}),
+                )
+            })
+            .transpose()?;
+        if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+            let connection = self.connection()?;
+            let (session, branch, _) = agent_key(
+                &connection,
+                actor,
+                canonical_ref,
+                agent_owner::AgentPermission::View,
+            )?;
+            if let Some(state) = replay_state_in(
+                &connection,
+                &actor_user,
+                request_id,
+                "edit",
+                fingerprint,
+                &session,
+                &branch,
+            )? {
+                return match state {
+                    MutationState::Applied => {
+                        drop(connection);
+                        self.agent_inputs_list(actor, canonical_ref)
+                    }
+                    MutationState::Prepared | MutationState::Unknown | MutationState::Rejected => {
+                        Err(Error::Conflict(
+                            "staged Agent input edit request is non-retryable; inspect its mutation receipt",
+                        ))
+                    }
+                };
+            }
+        }
+
         let prepared = edit
             .text
             .as_deref()
@@ -950,6 +1145,23 @@ impl SessionStore {
                 agent_owner::AgentPermission::View,
             )?;
             require_open(&tx, &session, &branch)?;
+            if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+                if replay_state_in(
+                    &tx,
+                    &actor_user,
+                    request_id,
+                    "edit",
+                    fingerprint,
+                    &session,
+                    &branch,
+                )?
+                .is_some()
+                {
+                    return Err(Error::Conflict(
+                        "staged Agent input edit request was claimed concurrently",
+                    ));
+                }
+            }
             let current = plan_rev(&tx, &session, &branch)?;
             require_rev(current, Some(expected_rev))?;
             let items = load_items(&tx, &session, &branch)?;
@@ -1004,6 +1216,26 @@ impl SessionStore {
             ))?;
             let next = next_rev(&tx, &session, &branch, current)?;
             publish_changed(&tx, actor, &session, &branch, next)?;
+            if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+                let result_json =
+                    serde_json::to_string(&serde_json::json!({"id":id,"inputs_rev":next}))
+                        .map_err(|_| Error::Storage("cannot encode staged input edit result"))?;
+                insert_receipt_in(
+                    &tx,
+                    &MutationReceipt {
+                        actor_user: actor_user.clone(),
+                        request_id: request_id.to_owned(),
+                        operation: "edit".into(),
+                        fingerprint: fingerprint.to_owned(),
+                        session: session.clone(),
+                        branch: branch.clone(),
+                        state: MutationState::Applied,
+                        resulting_inputs_rev: Some(next),
+                        result_json,
+                    },
+                    None,
+                )?;
+            }
             if prepared.is_some() {
                 old_custody = Some(actor_queue::PreparedQueueCustody {
                     payload_ref: old.payload_ref,
@@ -1036,6 +1268,29 @@ impl SessionStore {
         ids: &[String],
         expected_rev: u64,
     ) -> Result<AgentInputPlanSnapshot> {
+        self.agent_inputs_delete_inner(actor, canonical_ref, ids, expected_rev, None)
+    }
+
+    pub fn agent_inputs_delete_host(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        request_id: &str,
+        ids: &[String],
+        expected_rev: u64,
+    ) -> Result<AgentInputPlanSnapshot> {
+        validate_request_id(request_id)?;
+        self.agent_inputs_delete_inner(actor, canonical_ref, ids, expected_rev, Some(request_id))
+    }
+
+    fn agent_inputs_delete_inner(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+        ids: &[String],
+        expected_rev: u64,
+        request_id: Option<&str>,
+    ) -> Result<AgentInputPlanSnapshot> {
         if ids.is_empty() || ids.len() > MAX_ITEMS {
             return Err(Error::Limit("invalid staged Agent input delete count"));
         }
@@ -1044,6 +1299,48 @@ impl SessionStore {
             return Err(Error::Denied("duplicate staged Agent input id"));
         }
         let actor_user = self.current_user(actor)?.user_id;
+        let fingerprint = request_id
+            .map(|_| {
+                let mut normalized = ids.to_vec();
+                normalized.sort();
+                mutation_fingerprint(
+                    "delete",
+                    canonical_ref,
+                    serde_json::json!({"ids":normalized,"rev":expected_rev}),
+                )
+            })
+            .transpose()?;
+        if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+            let connection = self.connection()?;
+            let (session, branch, _) = agent_key(
+                &connection,
+                actor,
+                canonical_ref,
+                agent_owner::AgentPermission::View,
+            )?;
+            if let Some(state) = replay_state_in(
+                &connection,
+                &actor_user,
+                request_id,
+                "delete",
+                fingerprint,
+                &session,
+                &branch,
+            )? {
+                return match state {
+                    MutationState::Applied => {
+                        drop(connection);
+                        self.agent_inputs_list(actor, canonical_ref)
+                    }
+                    MutationState::Prepared | MutationState::Unknown | MutationState::Rejected => {
+                        Err(Error::Conflict(
+                            "staged Agent input delete request is non-retryable; inspect its mutation receipt",
+                        ))
+                    }
+                };
+            }
+        }
+
         let mut removed = Vec::new();
         {
             let mut connection = self.connection()?;
@@ -1055,6 +1352,23 @@ impl SessionStore {
                 agent_owner::AgentPermission::View,
             )?;
             require_open(&tx, &session, &branch)?;
+            if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+                if replay_state_in(
+                    &tx,
+                    &actor_user,
+                    request_id,
+                    "delete",
+                    fingerprint,
+                    &session,
+                    &branch,
+                )?
+                .is_some()
+                {
+                    return Err(Error::Conflict(
+                        "staged Agent input delete request was claimed concurrently",
+                    ));
+                }
+            }
             let current = plan_rev(&tx, &session, &branch)?;
             require_rev(current, Some(expected_rev))?;
             let items = load_items(&tx, &session, &branch)?;
@@ -1090,6 +1404,26 @@ impl SessionStore {
             }
             let next = next_rev(&tx, &session, &branch, current)?;
             publish_changed(&tx, actor, &session, &branch, next)?;
+            if let (Some(request_id), Some(fingerprint)) = (request_id, fingerprint.as_deref()) {
+                let result_json =
+                    serde_json::to_string(&serde_json::json!({"ids":ids,"inputs_rev":next}))
+                        .map_err(|_| Error::Storage("cannot encode staged input delete result"))?;
+                insert_receipt_in(
+                    &tx,
+                    &MutationReceipt {
+                        actor_user: actor_user.clone(),
+                        request_id: request_id.to_owned(),
+                        operation: "delete".into(),
+                        fingerprint: fingerprint.to_owned(),
+                        session: session.clone(),
+                        branch: branch.clone(),
+                        state: MutationState::Applied,
+                        resulting_inputs_rev: Some(next),
+                        result_json,
+                    },
+                    None,
+                )?;
+            }
             db(tx.commit())?;
         }
         for prepared in &removed {
@@ -1622,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn v42_staged_input_plan_is_revisioned_encrypted_ordered_and_frozen_on_close() {
+    fn v43_staged_input_plan_is_revisioned_encrypted_replay_safe_and_frozen_on_close() {
         let temp = PrivateTemp::new();
         let store = SessionStore::open(&temp.0).unwrap();
         let actor = PrincipalId::new("internal:fixture:input-plan").unwrap();
@@ -1641,7 +1975,8 @@ mod tests {
             let mut connection = store.connection().unwrap();
             connection
                 .execute_batch(
-                    "DROP TABLE agent_input_plan_items;
+                    "DROP TABLE agent_input_mutation_replay;
+                     DROP TABLE agent_input_plan_items;
                      DROP TABLE agent_input_plans;
                      UPDATE store_meta SET value='41' WHERE key='schema_epoch';
                      UPDATE schema_meta
@@ -1661,6 +1996,13 @@ mod tests {
                     .unwrap(),
                 42
             );
+            crate::migrate_agent_input_replay(&mut connection).unwrap();
+            assert_eq!(
+                connection
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                43
+            );
         }
 
         let initial_agent_rev = store.agent_get(&actor, &canonical).unwrap().rev;
@@ -1668,19 +2010,38 @@ mod tests {
         assert_eq!(empty.inputs_rev, 1);
         assert!(empty.items.is_empty());
 
+        let first_item = AgentInputAdd {
+            text: "first".into(),
+            intent: AgentInputIntent::Followup { after: None },
+            before: None,
+            after: None,
+        };
         let first = store
-            .agent_inputs_add(
+            .agent_inputs_add_host(
                 &actor,
                 &canonical,
-                &[AgentInputAdd {
-                    text: "first".into(),
-                    intent: AgentInputIntent::Followup { after: None },
-                    before: None,
-                    after: None,
-                }],
+                "input-add-1",
+                std::slice::from_ref(&first_item),
                 None,
             )
             .unwrap();
+        let first_replay = store
+            .agent_inputs_add_host(
+                &actor,
+                &canonical,
+                "input-add-1",
+                std::slice::from_ref(&first_item),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first_replay.inputs_rev, first.inputs_rev);
+        assert_eq!(first_replay.items.len(), 1);
+        let mut changed_first = first_item.clone();
+        changed_first.text = "changed replay".into();
+        assert!(matches!(
+            store.agent_inputs_add_host(&actor, &canonical, "input-add-1", &[changed_first], None,),
+            Err(Error::Conflict(_))
+        ));
         assert_eq!(first.inputs_rev, 2);
         assert_eq!(first.items.len(), 1);
         assert!(first.items[0].id.starts_with("q:"));
@@ -1740,20 +2101,33 @@ mod tests {
             Err(Error::Conflict(_))
         ));
 
+        let edit = AgentInputEdit {
+            text: Some("first edited".into()),
+            intent: None,
+            before: Some(second_id.clone()),
+            after: None,
+        };
         let edited = store
-            .agent_inputs_edit(
+            .agent_inputs_edit_host(
                 &actor,
                 &canonical,
+                "input-edit-1",
                 &first_id,
-                AgentInputEdit {
-                    text: Some("first edited".into()),
-                    intent: None,
-                    before: Some(second_id.clone()),
-                    after: None,
-                },
+                edit.clone(),
                 second.inputs_rev,
             )
             .unwrap();
+        let edited_replay = store
+            .agent_inputs_edit_host(
+                &actor,
+                &canonical,
+                "input-edit-1",
+                &first_id,
+                edit,
+                second.inputs_rev,
+            )
+            .unwrap();
+        assert_eq!(edited_replay.inputs_rev, edited.inputs_rev);
         assert_eq!(edited.inputs_rev, 4);
         assert_eq!(
             edited
@@ -1765,13 +2139,24 @@ mod tests {
         );
 
         let deleted = store
-            .agent_inputs_delete(
+            .agent_inputs_delete_host(
                 &actor,
                 &canonical,
+                "input-delete-1",
                 std::slice::from_ref(&second_id),
                 edited.inputs_rev,
             )
             .unwrap();
+        let deleted_replay = store
+            .agent_inputs_delete_host(
+                &actor,
+                &canonical,
+                "input-delete-1",
+                std::slice::from_ref(&second_id),
+                edited.inputs_rev,
+            )
+            .unwrap();
+        assert_eq!(deleted_replay.inputs_rev, deleted.inputs_rev);
         assert_eq!(deleted.inputs_rev, 5);
         assert_eq!(deleted.items.len(), 1);
         assert_eq!(deleted.items[0].id, first_id);
