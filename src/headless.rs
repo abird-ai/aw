@@ -52,6 +52,13 @@ pub trait AgentClosePort: Send + Sync {
     fn apply(&self, reference: &str, expected_rev: Option<u64>) -> Result<Value>;
 }
 
+/// Concurrent owner-bound Agent constructor. The transport supplies only the
+/// sealed host API fields plus its authenticated request identity; provider,
+/// model, execution site and durable current-Agent context remain host-owned.
+pub trait AgentCreatePort: Send + Sync {
+    fn apply(&self, request_id: &str, params: Value) -> Result<Value>;
+}
+
 pub trait Driver {
     /// Must execute using aw's existing, exactly selected Agent/journal.
     fn prompt(
@@ -107,6 +114,9 @@ pub trait Driver {
         None
     }
     fn agent_close_port(&self) -> Option<Arc<dyn AgentClosePort>> {
+        None
+    }
+    fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
         None
     }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
@@ -322,6 +332,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "set_model" => Some(&["model"]),
         "set_effort" => Some(&["effort"]),
         "actor_query" | "actor_op" => Some(&["operation"]),
+        "agent_create" => Some(&["from", "project", "title", "task", "access", "sandbox"]),
         "agent_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
@@ -431,6 +442,7 @@ fn stdin_reader<R: Read + Send + 'static>(
     tx: mpsc::SyncSender<Inbound>,
     active: Arc<Mutex<Option<(String, CancellationToken)>>>,
     live_control: Option<Arc<dyn LiveControlPort>>,
+    agent_create: Option<Arc<dyn AgentCreatePort>>,
     agent_close: Option<Arc<dyn AgentClosePort>>,
 ) {
     let mut reader = BufReader::new(input);
@@ -500,6 +512,15 @@ fn stdin_reader<R: Read + Send + 'static>(
                     parsed =
                         Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
                 }
+            } else if request.method == "agent_create" {
+                if let Some(port) = &agent_create {
+                    let outcome = (|| -> Result<Value> {
+                        validate_method_params(&request.method, &request.params)?;
+                        port.apply(&request.id, request.params.clone())
+                    })();
+                    parsed =
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
+                }
             } else if request.method == "agent_close" {
                 if let Some(port) = &agent_close {
                     let outcome = (|| -> Result<Value> {
@@ -565,6 +586,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "actor_enqueue":driver.actor_available(),
             "actor_step":driver.actor_available(),
             "actor_notice_read":driver.actor_available(),
+            "agent_create":driver.agent_create_port().is_some(),
             "agent_close":driver.agent_close_port().is_some(),
         },
         "profile":initial.profile,"model":initial.model,
@@ -574,8 +596,11 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let (tx, rx) = mpsc::sync_channel(MAX_INPUT_QUEUE);
     let guard = active.clone();
     let live_port = driver.live_control_port();
+    let agent_create = driver.agent_create_port();
     let agent_close = driver.agent_close_port();
-    let read = thread::spawn(move || stdin_reader(reader, tx, guard, live_port, agent_close));
+    let read = thread::spawn(move || {
+        stdin_reader(reader, tx, guard, live_port, agent_create, agent_close)
+    });
     let mut seen = BTreeSet::<String>::new();
     while let Ok(message) = rx.recv() {
         let (request, abort_requested, live_result) = match message {
@@ -1091,16 +1116,34 @@ mod aw_p6_9c_protocol_tests {
     use super::*;
     use std::io::Cursor;
 
+    #[derive(Default)]
+    struct FakeAgentCreatePort {
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+    impl AgentCreatePort for FakeAgentCreatePort {
+        fn apply(&self, request_id: &str, params: Value) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request_id.to_owned(), params));
+            Ok(json!({"ref":"/d:0/i:0/p:0/a:created","state":"open"}))
+        }
+    }
+
     struct BoundFake {
         query_calls: usize,
         mutation_calls: usize,
         enqueue_calls: usize,
         step_calls: usize,
         prompts: usize,
+        create: Arc<FakeAgentCreatePort>,
     }
     impl Driver for BoundFake {
         fn actor_available(&self) -> bool {
             true
+        }
+        fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
+            Some(self.create.clone())
         }
         fn actor_query(&mut self, operation: Value) -> Result<Value> {
             self.query_calls += 1;
@@ -1160,14 +1203,18 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"grant","method":"actor_enqueue","params":{"request_id":"evil","message_id":3,"text":"never accepted","grant":"tool:process"}}"#,
             r#"{"v":1,"id":"read","method":"actor_notice_read","params":{"request_id":"notice_1"}}"#,
             r#"{"v":1,"id":"step","method":"actor_step","params":{}}"#,
+            r#"{"v":1,"id":"create","method":"agent_create","params":{"title":"child","task":"work","access":"private","sandbox":"auto"}}"#,
+            r#"{"v":1,"id":"create-provider","method":"agent_create","params":{"title":"child","provider":"evil"}}"#,
             r#"{"v":1,"id":"danger","method":"trusted_bash","params":{"command":"echo no"}}"#,
         ].join("\n")+"\n";
+        let create = Arc::new(FakeAgentCreatePort::default());
         let mut fake = BoundFake {
             query_calls: 0,
             mutation_calls: 0,
             enqueue_calls: 0,
             step_calls: 0,
             prompts: 0,
+            create: create.clone(),
         };
         let mut bytes = Vec::new();
         serve_stdio(&mut fake, Cursor::new(frames), &mut bytes, false).unwrap();
@@ -1177,17 +1224,25 @@ mod aw_p6_9c_protocol_tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(rows[0]["data"]["capabilities"]["actor_query"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_create"], true);
         assert_eq!(fake.query_calls, 1);
         assert_eq!(fake.mutation_calls, 1);
         assert_eq!(fake.enqueue_calls, 1);
         assert_eq!(fake.step_calls, 1);
         assert_eq!(fake.prompts, 0);
+        let create_calls = create.calls.lock().unwrap();
+        assert_eq!(create_calls.len(), 1);
+        assert_eq!(create_calls[0].0, "create");
+        assert_eq!(create_calls[0].1["task"], "work");
         assert!(rows
             .iter()
             .any(|r| r["id"] == "raw" && r["data"]["code"] == "invalid_parameters"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "grant" && r["data"]["code"] == "invalid_parameters"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "create-provider" && r["data"]["code"] == "protocol"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "send" && r["data"]["code"] == "duplicate_request_id"));

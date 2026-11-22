@@ -3384,6 +3384,7 @@ struct Host {
     agent_jobs_owner: Option<aw::actor_owner::Service>,
     agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
     agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::RootAgentClose>>,
+    agent_create_owner: Option<std::sync::Arc<StdioAgentCreatePort>>,
     pre_dispatch_retries: u8,
     context_compaction_policy: aw_agent_core::CompactionPolicy,
     project: Option<aw::project_resources::Catalog>,
@@ -3409,6 +3410,158 @@ struct Host {
 
 struct StdioAgentClosePort {
     inner: std::sync::Arc<aw::agent_lifecycle::RootAgentClose>,
+}
+
+struct StdioAgentCreatePort {
+    store: SessionStore,
+    caller: aw::PrincipalId,
+    current_agent_ref: String,
+    binding: aw_store::SessionBinding,
+    execution_site: String,
+    settings: aw::config::Settings,
+    account_selector: Option<String>,
+    tools: aw::LocalToolOptions,
+    router: std::sync::Arc<aw::agent_jobs::Router>,
+}
+
+fn agent_create_optional_string(params: &serde_json::Value, field: &str) -> Result<Option<String>> {
+    params
+        .get(field)
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or(Error::Protocol(
+                "agent_create string field has invalid type",
+            ))
+        })
+        .transpose()
+}
+
+fn agent_create_access(value: Option<&serde_json::Value>) -> Result<aw_store::AgentCreateAccess> {
+    let Some(value) = value else {
+        return Ok(aw_store::AgentCreateAccess::Private);
+    };
+    if let Some(mode) = value.as_str() {
+        return match mode {
+            "private" => Ok(aw_store::AgentCreateAccess::Private),
+            "inherit" => Ok(aw_store::AgentCreateAccess::Inherit),
+            _ => Err(Error::Protocol(
+                "agent_create access must be private, inherit, or a grant array",
+            )),
+        };
+    }
+    let grants = value.as_array().ok_or(Error::Protocol(
+        "agent_create access must be private, inherit, or a grant array",
+    ))?;
+    let mut out = Vec::with_capacity(grants.len());
+    for grant in grants {
+        let object = grant.as_object().ok_or(Error::Protocol(
+            "agent_create access grant must be an object",
+        ))?;
+        if object.len() != 2
+            || !object.contains_key("principal")
+            || !object.contains_key("permissions")
+        {
+            return Err(Error::Protocol(
+                "agent_create access grant accepts only principal and permissions",
+            ));
+        }
+        let principal = object["principal"]
+            .as_str()
+            .ok_or(Error::Protocol(
+                "agent_create grant principal must be a string",
+            ))?
+            .to_owned();
+        let permissions = object["permissions"].as_array().ok_or(Error::Protocol(
+            "agent_create grant permissions must be an array",
+        ))?;
+        let mut parsed = aw_store::AgentPermissions::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for permission in permissions {
+            let permission = permission
+                .as_str()
+                .ok_or(Error::Protocol("agent_create permission must be a string"))?;
+            if !seen.insert(permission) {
+                return Err(Error::Protocol("duplicate agent_create permission"));
+            }
+            match permission {
+                "view" => parsed.view = true,
+                "contribute" => parsed.contribute = true,
+                "submit" => parsed.submit = true,
+                "control" => parsed.control = true,
+                "derive" => parsed.derive = true,
+                "share" => parsed.share = true,
+                "manage" => parsed.manage = true,
+                _ => return Err(Error::Protocol("unknown agent_create permission")),
+            }
+        }
+        out.push(aw_store::AgentCreateAccessGrant {
+            principal,
+            permissions: parsed,
+        });
+    }
+    Ok(aw_store::AgentCreateAccess::Custom(out))
+}
+
+fn parse_agent_create_request(params: &serde_json::Value) -> Result<aw_store::AgentCreateRequest> {
+    let sandbox = match params.get("sandbox") {
+        None => aw_store::AgentSandboxSelection::Auto,
+        Some(value) => {
+            let reference = value
+                .as_str()
+                .ok_or(Error::Protocol("agent_create sandbox must be a string"))?;
+            if reference == "auto" {
+                aw_store::AgentSandboxSelection::Auto
+            } else {
+                aw_store::AgentSandboxSelection::Existing(reference.to_owned())
+            }
+        }
+    };
+    Ok(aw_store::AgentCreateRequest {
+        from: agent_create_optional_string(params, "from")?,
+        project: agent_create_optional_string(params, "project")?,
+        title: agent_create_optional_string(params, "title")?,
+        task: agent_create_optional_string(params, "task")?,
+        access: agent_create_access(params.get("access"))?,
+        sandbox,
+    })
+}
+
+impl aw::headless::AgentCreatePort for StdioAgentCreatePort {
+    fn apply(&self, request_id: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let stable_user = self.store.current_user(&self.caller)?;
+        let child_actor = aw_store::stable_user_principal(&stable_user.user_id)?;
+        let configured = aw::configured_provider_selection_for_actor(
+            &self.settings,
+            child_actor.clone(),
+            self.store.clone(),
+            self.account_selector.as_deref(),
+        )?;
+        let child_router = std::sync::Arc::new(self.router.for_actor(child_actor.clone()));
+        let activation = aw::agent_lifecycle::HostAgentActivation::new(
+            self.store.clone(),
+            child_actor,
+            configured.selection,
+            configured.options,
+            self.tools.clone(),
+            child_router,
+        )?;
+        let creator = aw::agent_lifecycle::HostAgentCreator::new(
+            self.store.clone(),
+            self.caller.clone(),
+            self.current_agent_ref.clone(),
+            self.binding.clone(),
+            self.execution_site.clone(),
+            activation,
+        )?;
+        let created = creator.create(request_id, parse_agent_create_request(&params)?)?;
+        Ok(serde_json::json!({
+            "ref":created.canonical_ref,
+            "rev":created.rev,
+            "lifecycle":created.lifecycle,
+            "admission":created.admission,
+            "project":created.project_ref,
+            "title":created.title,
+        }))
+    }
 }
 
 impl aw::headless::AgentClosePort for StdioAgentClosePort {
@@ -3756,6 +3909,7 @@ impl Host {
         self.agent = None;
         self.agent_job_runtime = None;
         self.agent_close_owner = None;
+        self.agent_create_owner = None;
         self.persistent = None;
         #[cfg(feature = "jsonl")]
         {
@@ -3843,6 +3997,7 @@ impl Host {
             agent_jobs_owner: None,
             agent_job_runtime: None,
             agent_close_owner: None,
+            agent_create_owner: None,
             pre_dispatch_retries: 0,
             context_compaction_policy: aw_agent_core::CompactionPolicy::default(),
             project: None,
@@ -4294,6 +4449,7 @@ impl Host {
             )?);
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
+            self.agent_create_owner = None;
             if let Some(service) = stable_agent_service.as_ref() {
                 service.bind_agent_jobs_router(router.clone())?;
                 let agent_tool = service.agent_tool();
@@ -4366,6 +4522,17 @@ impl Host {
                     owner.clone(),
                     agent.tool_binding_authority(),
                 )?;
+                self.agent_create_owner = Some(Arc::new(StdioAgentCreatePort {
+                    store: persistent.store.clone(),
+                    caller: persistent.actor.clone(),
+                    current_agent_ref: canonical.clone(),
+                    binding: persistent.binding.clone(),
+                    execution_site: self.tools.execution_site.clone(),
+                    settings: self.settings.clone(),
+                    account_selector: self.account_selector.clone(),
+                    tools: self.tools.clone(),
+                    router: router.clone(),
+                }));
                 self.agent_close_owner = Some(Arc::new(aw::agent_lifecycle::RootAgentClose::new(
                     persistent.store.clone(),
                     persistent.actor.clone(),
@@ -4382,6 +4549,7 @@ impl Host {
             // when the rebuilt host is memory-only or uses another backend.
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
+            self.agent_create_owner = None;
             self.tools.agent_jobs.clear()?;
             self.tools.operation_router.clear()?;
             self.tools
@@ -5386,6 +5554,11 @@ impl aw::headless::Driver for Host {
         self.actor_owner.as_ref().map(|owner| {
             std::sync::Arc::new(owner.clone()) as std::sync::Arc<dyn aw::headless::LiveControlPort>
         })
+    }
+    fn agent_create_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentCreatePort>> {
+        self.agent_create_owner
+            .as_ref()
+            .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::AgentCreatePort>)
     }
     fn agent_close_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentClosePort>> {
         self.agent_close_owner.as_ref().map(|owner| {

@@ -292,6 +292,175 @@ pub struct ConfiguredExecution {
     pub job_runtime: Option<Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
 }
 
+#[derive(Clone)]
+pub struct ConfiguredProviderSelection {
+    pub selection: ProviderSelection,
+    pub options: AgentOptions,
+}
+
+fn configured_agent_options(settings: &config::Settings) -> Result<AgentOptions> {
+    let model = settings
+        .profile
+        .model
+        .clone()
+        .ok_or_else(|| Error::Config("model missing".into()))?;
+    let mut options = AgentOptions::new(settings.profile_name.clone(), model);
+    options.system_prompt = settings.system_prompt.clone();
+    options.request_timeout = settings.request_timeout;
+    options.max_output_bytes = settings.max_output_bytes;
+    Ok(options)
+}
+
+fn local_provider_account(
+    settings: &config::Settings,
+    actor: &PrincipalId,
+) -> Result<(AccountDescriptor, Arc<dyn Provider>)> {
+    let provider: Arc<dyn Provider> = Arc::new(provider::LazyHttpProvider::new(
+        settings.profile.clone(),
+        settings.idle_timeout,
+    )?);
+    Ok((
+        AccountDescriptor::personal(
+            settings.profile_name.clone(),
+            actor.clone(),
+            "local",
+            settings.profile.effective_models(),
+        ),
+        provider,
+    ))
+}
+
+#[cfg(feature = "oidc")]
+fn oauth_provider_account(
+    settings: &config::Settings,
+    actor: &PrincipalId,
+    store: SessionStore,
+) -> Result<(AccountDescriptor, Arc<dyn Provider>)> {
+    let connector_id = settings
+        .profile
+        .oauth_connector
+        .clone()
+        .ok_or_else(|| Error::Config("OAuth-backed profile has no connector".into()))?;
+    if settings.profile.kind != config::ProviderKind::OpenaiResponses {
+        return Err(Error::Config(
+            "OAuth-backed ChatGPT profile must use openai-responses".into(),
+        ));
+    }
+    let connector = store.oauth_connector_for_owner(actor, &connector_id)?;
+    if connector.status != "active" {
+        return Err(Error::Denied("selected ChatGPT connection is not active"));
+    }
+    let provider: Arc<dyn Provider> = Arc::new(OAuthStoreHttpProvider {
+        profile: settings.profile.clone(),
+        idle_timeout: settings.idle_timeout,
+        store,
+        actor: actor.clone(),
+        connector_id,
+        refresh_lock: tokio::sync::Mutex::new(()),
+    });
+    Ok((
+        AccountDescriptor::personal(
+            settings.profile_name.clone(),
+            actor.clone(),
+            "local",
+            settings.profile.effective_models(),
+        ),
+        provider,
+    ))
+}
+
+#[cfg(feature = "durable")]
+fn persisted_server_provider_account(
+    settings: &config::Settings,
+    actor: &PrincipalId,
+    store: SessionStore,
+    account_id: &str,
+) -> Result<(AccountDescriptor, Arc<dyn Provider>)> {
+    let model = settings
+        .profile
+        .model
+        .as_deref()
+        .ok_or_else(|| Error::Config("model missing".into()))?;
+    let info = store.provider_account_for_use(
+        actor,
+        account_id,
+        model,
+        &settings.profile.base_url,
+        "local",
+    )?;
+    let version = info.secret_version.ok_or(Error::Denied(
+        "selected server provider account has no active credential version",
+    ))?;
+    let expected_kind = match settings.profile.kind {
+        config::ProviderKind::Openai | config::ProviderKind::OpenaiResponses => "openai",
+        config::ProviderKind::Ollama => "ollama",
+        config::ProviderKind::Anthropic => "anthropic",
+        config::ProviderKind::Gemini => "gemini",
+    };
+    if info.provider_kind != expected_kind {
+        return Err(Error::Denied(
+            "selected provider account kind does not match the selected profile",
+        ));
+    }
+    let provider: Arc<dyn Provider> = Arc::new(SecretStoreHttpProvider {
+        profile: settings.profile.clone(),
+        idle_timeout: settings.idle_timeout,
+        store,
+        actor: actor.clone(),
+        account_id: info.id.clone(),
+        expected_version: version,
+    });
+    Ok((
+        AccountDescriptor {
+            id: info.id,
+            owner: AccountOwner::Server(info.account_owner),
+            payer: BillingOwner::Shared(info.payer),
+            credential_custody: CredentialCustody::Server(info.executor_id.clone()),
+            credential_version: Some(version),
+            inference_executor: info.executor_id,
+            allowed_models: info.allowed_models,
+            grants: std::collections::BTreeSet::from([actor.clone()]),
+            shared_with_all_authenticated: false,
+        },
+        provider,
+    ))
+}
+
+/// Build one trusted provider selection for an already-authenticated Agent
+/// principal. The actor is never taken from model/RPC data. Personal accounts
+/// remain owner-only; server accounts retain their persisted grant checks.
+#[cfg(feature = "durable")]
+pub fn configured_provider_selection_for_actor(
+    settings: &config::Settings,
+    actor: PrincipalId,
+    store: SessionStore,
+    account_selector: Option<&str>,
+) -> Result<ConfiguredProviderSelection> {
+    let mut options = configured_agent_options(settings)?;
+    let (account, provider) = if let Some(account_id) = account_selector {
+        persisted_server_provider_account(settings, &actor, store, account_id)?
+    } else if settings.profile.oauth_connector.is_some() {
+        #[cfg(feature = "oidc")]
+        {
+            oauth_provider_account(settings, &actor, store)?
+        }
+        #[cfg(not(feature = "oidc"))]
+        {
+            return Err(Error::Config(
+                "this build disabled Sign in with ChatGPT support".into(),
+            ));
+        }
+    } else {
+        local_provider_account(settings, &actor)?
+    };
+    let selected_account = account.id.clone();
+    options.profile = selected_account.clone();
+    let accounts = ProviderAccounts::new("local")?;
+    accounts.register(account, provider)?;
+    let selection = accounts.select(&actor, &selected_account, &options.model)?;
+    Ok(ConfiguredProviderSelection { selection, options })
+}
+
 #[cfg(feature = "oidc")]
 pub fn configured_oauth_execution_with_runtime(
     settings: &config::Settings,
@@ -364,54 +533,9 @@ pub fn register_persisted_server_account(
     if !store.provider_account_registered(account_id)? {
         return Ok(false);
     }
-    let model = settings
-        .profile
-        .model
-        .as_deref()
-        .ok_or_else(|| Error::Config("model missing".into()))?;
-    let info = store.provider_account_for_use(
-        agent.actor(),
-        account_id,
-        model,
-        &settings.profile.base_url,
-        "local",
-    )?;
-    let version = info.secret_version.ok_or(Error::Denied(
-        "selected server provider account has no active credential version",
-    ))?;
-    let expected_kind = match settings.profile.kind {
-        config::ProviderKind::Openai | config::ProviderKind::OpenaiResponses => "openai",
-        config::ProviderKind::Ollama => "ollama",
-        config::ProviderKind::Anthropic => "anthropic",
-        config::ProviderKind::Gemini => "gemini",
-    };
-    if info.provider_kind != expected_kind {
-        return Err(Error::Denied(
-            "selected provider account kind does not match the selected profile",
-        ));
-    }
-    let provider: Arc<dyn Provider> = Arc::new(SecretStoreHttpProvider {
-        profile: settings.profile.clone(),
-        idle_timeout: settings.idle_timeout,
-        store,
-        actor: agent.actor().clone(),
-        account_id: info.id.clone(),
-        expected_version: version,
-    });
-    agent.register_provider_account(
-        AccountDescriptor {
-            id: info.id,
-            owner: AccountOwner::Server(info.account_owner),
-            payer: BillingOwner::Shared(info.payer),
-            credential_custody: CredentialCustody::Server(info.executor_id.clone()),
-            credential_version: Some(version),
-            inference_executor: info.executor_id,
-            allowed_models: info.allowed_models,
-            grants: std::collections::BTreeSet::from([agent.actor().clone()]),
-            shared_with_all_authenticated: false,
-        },
-        provider,
-    )?;
+    let (account, provider) =
+        persisted_server_provider_account(settings, agent.actor(), store, account_id)?;
+    agent.register_provider_account(account, provider)?;
     Ok(true)
 }
 
@@ -655,5 +779,39 @@ mod execution_policy_tests {
             }
         );
         assert!(agent.tool_specs().is_empty());
+    }
+
+    #[cfg(feature = "durable")]
+    #[test]
+    fn configured_child_provider_selection_keeps_canonical_stable_user_ownership() {
+        let mut profile = config::builtins().remove("openai").unwrap();
+        profile.model = Some("fixture-model".into());
+        let settings = config::Settings {
+            profile_name: "fixture-account".into(),
+            profile,
+            system_prompt: "fixture".into(),
+            request_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(5),
+            max_output_bytes: config::MAX_OUTPUT_BYTES,
+        };
+        let actor = PrincipalId::new("user:usr_fixture").unwrap();
+        let selected = configured_provider_selection_for_actor(
+            &settings,
+            actor.clone(),
+            SessionStore::in_memory().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.selection.identity().actor, actor);
+        assert_eq!(
+            selected.selection.identity().account_owner,
+            AccountOwner::User(actor.clone())
+        );
+        assert_eq!(
+            selected.selection.identity().payer,
+            BillingOwner::User(actor)
+        );
+        assert_eq!(selected.options.profile, "fixture-account");
+        assert_eq!(selected.options.model, "fixture-model");
     }
 }

@@ -285,24 +285,38 @@ normal queue/Actor owner after publication; Claimed/Accepted ambiguity is still 
 end-to-end regression proves task-bearing Store create -> activation -> exactly one provider Turn ->
 authoritative history advance -> normal close.
 
-This checkpoint still does **not** claim the complete §28.3/§28 host shell. The native/public host
-`agent.create` transport/coordinator is not yet wired because provider selection must be legitimate for
-the destination Project's canonical `i:` principal. Personal `AccountDescriptor`s are owner-only, so the
-host must not forge/rewrite the caller's `InvocationIdentity` or silently lend personal credentials to a
-different destination owner. That provider-account authority seam is the next create-path item.
-`sandbox=auto` currently
-means the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because
-that later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed
-trusted Project authority. Current-root `agent.close` composition is now complete: native Host retains
-the composed close owner and stdio exposes a concurrent `agent_close` live port accepting only `ref` (the
-current `.` or its exact canonical root) plus optional `rev`; it cannot select Project/Sandbox/provider or
-execution authority. Stable-child active-Turn cancellation, durable recipient-subscription retirement,
-finite-Job owner-close/quiescence, stable-child terminal close and current-root terminal close are all
-complete. Atomic initial-task custody/publication plus post-commit live dispatch are now complete as
-reusable lower primitives too. The broader §28 shell still needs the native/public host create coordinator
-with legitimate destination-owner provider selection, explicit Sandbox ownership, reviewed cross-Project
-redirect authority, later staged `agent.inputs.*`, and any future host routing for non-current Agent refs.
-History ancestry still grants none of those authorities.
+Native/public `agent.create` composition is now complete for the current Phase-1 destination policy.
+`configured_provider_selection_for_actor` rebuilds the trusted current profile under the destination
+Project's canonical stable-user principal instead of rewriting the caller's selected identity. Local and
+OAuth profiles therefore create a fresh owner-only personal `AccountDescriptor` whose actor/owner/payer is
+that stable principal; OAuth connector lookup reuses the Store's same-stable-user ownership proof. An
+explicit persisted server account still passes its existing Store grant/version/provider-kind checks and
+is selected for the stable child actor. The RPC cannot supply provider/model/account/execution fields.
+
+The Agent Router now supports exact-actor facades over one structurally shared live-owner/wake/revision
+registry through `Router::for_actor`. The local root alias and canonical stable child principal therefore
+address the same Agent graph without copying live state or weakening exact ToolContext actor checks.
+`HostAgentActivation` first performs an authorized binding lookup plus a cheap `has_live_owner` replay
+fast path, then uses atomic register-if-absent as the race fence; exact create replay never replaces or
+spawns a second worker. `HostAgentCreator` owns only composition: Store create/replay with the stable host
+request ID, then idempotent activation.
+
+Native Host retains one lazy `StdioAgentCreatePort` alongside the existing close owner. Stdio now exposes
+`agent_create` concurrently with a running root Turn and accepts exactly the sealed fields `from`,
+`project`, `title`, `task`, `access`, and `sandbox`; the authenticated RPC frame ID is the durable create
+request identity. Provider/model/credential/execution authority is captured from trusted Host state only.
+Explicit `--account` has the same precedence as root prompt dispatch; otherwise current local/OAuth
+profile policy is used. A frame containing an authority-bearing extra field such as `provider` is rejected
+before the create port executes.
+
+This checkpoint still does **not** claim the complete §28.3/§28 host shell. `sandbox=auto` currently means
+the trusted host supplied execution binding; an explicit logical Sandbox ref fails closed because that
+later Sandbox owner does not exist yet. Cross-Project redirect also fails closed pending reviewed trusted
+Project authority. Current-root `agent.close`, stable-child close, native/public current-Project
+`agent.create`, atomic initial-task custody/publication, and post-commit live dispatch are complete. The
+broader §28 shell still needs explicit Sandbox ownership/`auto` policy, reviewed cross-Project redirect
+authority, later staged `agent.inputs.*`, and broader host routing for non-current Agent refs. History
+ancestry still grants none of those authorities.
 
 Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
 provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
@@ -338,15 +352,19 @@ it as Cancelled. The host-shell regression proves terminal close is rejected bef
 advances `closing -> closed` once, and replays idempotently. A single root lifecycle regression now drives
 a blocked tool-capable root Turn through `RootAgentClose`, including retained JobRuntime closure and
 revision-stable replay. The existing headless strict-frame regression remains green with the new live
-`agent_close` capability. The host-activation regression now uses a persistent, task-bearing real Store
-constructor: it publishes encrypted initial Pending custody atomically with the Agent, derives the
-canonical destination owner, reconstructs the live runtime, auto-wakes the normal queue owner, executes
-exactly one provider Turn, observes authoritative history advance, then closes through the ordinary
-wake/worker path. The Store-side regression separately proves no plaintext in queue audit, exact Applied
-create replay returns the same Agent, and changed semantics under the same request identity are rejected.
-The exact-history fork regression remains green after adding pre-minted candidate IDs, and the older
-in-memory host-shell regression still fails task-bearing create before any half-publication because it
-has no persistent SecretStore. Root-close remains green.
+`agent_close` capability. The host-activation regression now drives the reusable `HostAgentCreator` over
+a root Router carrying the local alias and a child `Router::for_actor` facade carrying the canonical
+stable principal. It publishes encrypted initial Pending custody atomically with the Agent, executes
+exactly one provider Turn, observes authoritative history advance, exact-replays the same create request
+without a second provider call/worker, then closes through the shared live registry. The Store-side
+regression separately proves no plaintext in queue audit, exact Applied create replay returns the same
+Agent, and changed semantics under the same request identity are rejected. A focused provider regression
+proves child selection keeps `InvocationIdentity.actor`, personal account owner and payer on the canonical
+stable principal. The strict headless frame regression now advertises `agent_create`, invokes the port once
+for a valid sealed frame, and rejects an extra `provider` field before the port. The exact-history fork
+regression remains green after adding pre-minted candidate IDs, and the older in-memory host-shell
+regression still fails task-bearing create before any half-publication because it has no persistent
+SecretStore. Root-close and both stable-Agent close regressions remain green.
 
 The user authorized this publication/repin/proceed sequence. Do not tag/release/deploy without a
 separate explicit request. Use dotlink---l5 only; never touch `.agents/plans/ux/**`; 017

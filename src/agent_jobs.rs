@@ -192,6 +192,58 @@ impl Router {
         })
     }
 
+    /// Exact-actor facade over the same live Agent registry/cursors. This is
+    /// the identity-preserving way for one authenticated stable-user alias and
+    /// its current host alias to address the same Agent graph without copying
+    /// live owners or weakening exact ToolContext actor checks.
+    pub fn for_actor(&self, actor: PrincipalId) -> Self {
+        Self {
+            store: self.store.clone(),
+            actor,
+            cursor_key: self.cursor_key,
+            exposure_generation: self.exposure_generation.clone(),
+            finite_capacity: self.finite_capacity,
+            owners: self.owners.clone(),
+            wake_admissions: self.wake_admissions.clone(),
+            revision_watchers: self.revision_watchers.clone(),
+        }
+    }
+
+    pub fn has_live_owner(&self, canonical_agent_ref: &str) -> Result<bool> {
+        let parsed = ExecutionRef::parse(canonical_agent_ref)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "live Agent owner lookup needs an Agent root ref",
+            ));
+        }
+        Ok(self
+            .owners
+            .lock()
+            .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?
+            .contains_key(&resolved.agent_ref().canonical()))
+    }
+
+    pub fn request_live_close(&self, canonical_agent_ref: &str) -> Result<()> {
+        let parsed = ExecutionRef::parse(canonical_agent_ref)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied("live close requires an Agent root ref"));
+        }
+        let canonical = resolved.agent_ref().canonical();
+        let live = self.live_owner(&canonical)?;
+        let wake = live.wake.ok_or(Error::Denied(
+            "Agent has no live close controller; use its host lifecycle owner",
+        ))?;
+        wake.close()
+    }
+
     pub fn register_live_owner(
         &self,
         canonical_agent_ref: &str,
@@ -230,6 +282,46 @@ impl Router {
                 },
             );
         Ok(())
+    }
+
+    /// Reconstructible host/runtime activation may race exact replay. Install
+    /// one live owner only when the canonical Agent root has no current owner;
+    /// callers that lose this race must reuse the already-live runtime rather
+    /// than replace it and spawn a duplicate worker.
+    pub fn register_live_owner_with_wake_if_absent(
+        &self,
+        canonical_agent_ref: &str,
+        owner: actor_owner::Service,
+        wake: Option<Arc<dyn LiveAgentWake>>,
+        wake_authority: ToolBindingAuthority,
+    ) -> Result<bool> {
+        let parsed = ExecutionRef::parse(canonical_agent_ref)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        let resolved = parsed
+            .resolve(None, None)
+            .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;
+        if !resolved.suffix().is_empty() {
+            return Err(Error::Denied(
+                "live Agent owner registration needs an Agent root ref",
+            ));
+        }
+        let canonical = resolved.agent_ref().canonical();
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?;
+        if owners.contains_key(&canonical) {
+            return Ok(false);
+        }
+        owners.insert(
+            canonical,
+            LiveOwner {
+                owner,
+                wake,
+                wake_authority,
+            },
+        );
+        Ok(true)
     }
 
     pub fn clear_live_owner(&self, canonical_agent_ref: &str) -> Result<()> {

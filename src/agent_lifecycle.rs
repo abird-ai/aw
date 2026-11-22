@@ -9,7 +9,10 @@ use aw_agent_core::{
     Agent, AgentExecutionBinding, AgentOptions, CancellationToken, InvocationScope,
     ProviderSelection, ToolEffect,
 };
-use aw_store::{AgentLifecycle, AgentSnapshot, QueueState, SessionStore};
+use aw_store::{
+    AgentCreateContext, AgentCreateRequest, AgentLifecycle, AgentSnapshot, QueueState,
+    SessionBinding, SessionStore,
+};
 use aw_store_api::SessionBackend;
 use aw_tools::execution_ref::ExecutionRef;
 use std::sync::{
@@ -341,8 +344,13 @@ impl HostAgentActivation {
         )
     }
 
-    pub fn activate(&self, canonical_ref: &str) -> Result<ActivatedHostAgent> {
+    /// Returns Some only when this call installed the live runtime. Exact
+    /// create replay returns None when the canonical Agent is already live.
+    pub fn activate(&self, canonical_ref: &str) -> Result<Option<ActivatedHostAgent>> {
         let binding = self.binding_for(canonical_ref)?;
+        if self.router.has_live_owner(canonical_ref)? {
+            return Ok(None);
+        }
         let session = self.store.session(&self.actor, &binding.session_id)?;
 
         let mut options = self.options.clone();
@@ -393,12 +401,14 @@ impl HostAgentActivation {
         )?);
         let (wake, receiver, control) = live_agent_channel();
         let registered_wake: Arc<dyn agent_jobs::LiveAgentWake> = Arc::new(wake.clone());
-        self.router.register_live_owner_with_wake(
+        if !self.router.register_live_owner_with_wake_if_absent(
             canonical_ref,
             owner.clone(),
             Some(registered_wake),
             agent.tool_binding_authority(),
-        )?;
+        )? {
+            return Ok(None);
+        }
 
         let canonical = canonical_ref.to_owned();
         let router = self.router.clone();
@@ -473,16 +483,81 @@ impl HostAgentActivation {
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 agent_jobs::LiveAgentWake::wake(&wake)?;
-                Ok(ActivatedHostAgent {
+                Ok(Some(ActivatedHostAgent {
                     canonical_ref: canonical_ref.to_owned(),
                     wake,
-                })
+                }))
             }
             Ok(Err(detail)) => Err(Error::StorageDetail(detail)),
             Err(_) => Err(Error::Storage(
                 "host Agent worker ended before runtime readiness",
             )),
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct HostAgentCreator {
+    store: SessionStore,
+    caller: PrincipalId,
+    current_agent_ref: String,
+    current_project_ref: String,
+    binding: SessionBinding,
+    execution_site: String,
+    activation: HostAgentActivation,
+}
+
+impl HostAgentCreator {
+    pub fn new(
+        store: SessionStore,
+        caller: PrincipalId,
+        current_agent_ref: impl Into<String>,
+        binding: SessionBinding,
+        execution_site: impl Into<String>,
+        activation: HostAgentActivation,
+    ) -> Result<Self> {
+        let current_agent_ref = current_agent_ref.into();
+        let current = store.agent_get(&caller, &current_agent_ref)?;
+        let stable_user = store.current_user(&caller)?;
+        let canonical_owner = aw_store::stable_user_principal(&stable_user.user_id)?;
+        if activation.actor != canonical_owner {
+            return Err(Error::Denied(
+                "host Agent activation principal is not the caller's canonical stable user",
+            ));
+        }
+        let execution_site = execution_site.into();
+        if execution_site.is_empty()
+            || execution_site.len() > 128
+            || !execution_site.is_ascii()
+            || execution_site.chars().any(char::is_control)
+        {
+            return Err(Error::Denied("invalid trusted Agent execution site"));
+        }
+        Ok(Self {
+            store,
+            caller,
+            current_agent_ref,
+            current_project_ref: current.project_ref,
+            binding,
+            execution_site,
+            activation,
+        })
+    }
+
+    pub fn create(&self, request_id: &str, request: AgentCreateRequest) -> Result<AgentSnapshot> {
+        let snapshot = self.store.agent_create(
+            &self.caller,
+            &AgentCreateContext {
+                current_project_ref: self.current_project_ref.clone(),
+                current_agent_ref: Some(self.current_agent_ref.clone()),
+                binding: self.binding.clone(),
+                request_id: Some(request_id.to_owned()),
+                execution_site: self.execution_site.clone(),
+            },
+            request,
+        )?;
+        let _ = self.activation.activate(&snapshot.canonical_ref)?;
+        Ok(snapshot)
     }
 }
 
@@ -494,9 +569,7 @@ mod tests {
         provider::{CompletionFuture, DeltaSink, Provider},
         CompletionMeta, Message, Usage,
     };
-    use aw_store::{
-        AgentCreateContext, AgentCreateRequest, SessionBinding as StoredSessionBinding,
-    };
+    use aw_store::{AgentCreateRequest, SessionBinding as StoredSessionBinding};
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
@@ -697,29 +770,8 @@ mod tests {
             root_binding.project_handle,
             root_binding.agent_handle
         );
-        let project_ref = format!(
-            "/d:{}/i:{}/p:{}",
-            root_binding.domain_handle, root_binding.identity_handle, root_binding.project_handle
-        );
         let child_owner =
             aw_store::stable_user_principal(&store.current_user(&actor).unwrap().user_id).unwrap();
-        let created = store
-            .agent_create(
-                &actor,
-                &AgentCreateContext {
-                    current_project_ref: project_ref,
-                    current_agent_ref: Some(root_ref),
-                    binding,
-                    request_id: Some("host-activation-task-1".into()),
-                    execution_site: "local".into(),
-                },
-                AgentCreateRequest {
-                    title: Some("activated child".into()),
-                    task: Some("perform the initial task".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let seed = Agent::builder(
@@ -739,8 +791,8 @@ mod tests {
             .provider_accounts()
             .select(&child_owner, "fixture", "model")
             .unwrap();
-        let router =
-            Arc::new(agent_jobs::Router::new(store.clone(), child_owner.clone(), 8).unwrap());
+        let router = Arc::new(agent_jobs::Router::new(store.clone(), actor.clone(), 8).unwrap());
+        let child_router = Arc::new(router.for_actor(child_owner.clone()));
         let activation = HostAgentActivation::new(
             store.clone(),
             child_owner.clone(),
@@ -750,11 +802,28 @@ mod tests {
                 state_dir.clone(),
                 aw_tools_adapter::ToolMode::Off,
             ),
-            router,
+            child_router,
         )
         .unwrap();
-        let live = activation.activate(&created.canonical_ref).unwrap();
-        assert_eq!(live.canonical_ref(), created.canonical_ref);
+        let creator = HostAgentCreator::new(
+            store.clone(),
+            actor.clone(),
+            root_ref,
+            binding,
+            "local",
+            activation,
+        )
+        .unwrap();
+        let request = AgentCreateRequest {
+            title: Some("activated child".into()),
+            task: Some("perform the initial task".into()),
+            ..Default::default()
+        };
+        let created = creator
+            .create("host-activation-task-1", request.clone())
+            .unwrap();
+
+        assert!(router.has_live_owner(&created.canonical_ref).unwrap());
 
         let settled = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -770,7 +839,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(settled.lifecycle, AgentLifecycle::Open);
 
-        live.close().unwrap();
+        let replay = creator.create("host-activation-task-1", request).unwrap();
+        assert_eq!(replay.canonical_ref, created.canonical_ref);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        router.request_live_close(&created.canonical_ref).unwrap();
 
         let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {

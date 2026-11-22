@@ -150,11 +150,15 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       a lower host primitive:** candidate Agent IDs + an audit-backed preparation receipt are claimed before
       encrypted SecretStore custody; one final Store transaction publishes Agent + ordinary Pending queue
       + Applied receipt; exact Applied replay returns the same Agent and uncertain outcomes never auto-retry;
-      activation wakes the normal queue owner only after worker readiness. Still open before the host shell
-      is complete: native/public `agent.create` coordination with legitimate provider selection for the
-      destination `i:` owner (personal accounts are owner-only; never forge the caller identity), explicit
-      logical Sandbox refs/`auto` policy owner, reviewed
-      cross-Project redirect authority and staged `agent.inputs.*`. After that propagate provenance
+      activation wakes the normal queue owner only after worker readiness. **Native/public current-Project
+      `agent.create` is now composed too:** trusted provider selection is rebuilt for the destination
+      canonical stable-user principal (personal/OAuth stay owner-only; persisted server accounts retain
+      current Store grants), `Router::for_actor` gives root/local and child/stable principals exact-actor
+      facades over one shared live registry, exact replay uses live-owner fast-path + insert-if-absent, and
+      stdio exposes only the sealed create fields with RPC id as durable request identity. Still open before
+      the host shell is complete: explicit logical Sandbox refs/`auto` policy owner, reviewed cross-Project
+      redirect authority, broader non-current Agent close routing, and staged `agent.inputs.*`. After that
+      propagate provenance
       through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
       and defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
