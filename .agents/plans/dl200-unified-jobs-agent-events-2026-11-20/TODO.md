@@ -269,10 +269,20 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       progress, and scope/placement changes stale the cursor. The existing attached-Turn regression now
       proves owner read-once semantics plus revoke->private-skip->regrant non-retroactivity and
       v44→v45→v46 migration. EventScan is production-reachable and its dead-code allowance is gone.
-      **Next:** add event wake + wait_ms around this exact-Agent single-attempt read without polling/another
-      worker, then extend placement only through an existing owner that can prove authorized broad selectors
-      wholly store-local. Durable subscriptions/Handlers/EventInput, EventTypeRegistry, protected-manifest
-      authority and explicit v36 delivery_cutover_rev remain later Phase-2 slices.
+      **Exact-Agent wait/wake landed locally:** `SessionStore::events_read` composes
+      `wait_ms=0..30000` around the same single-attempt cursor read using one process-local Tokio watch
+      generation. Registration happens before the first durable recheck; committed Agent/Turn Event
+      producers signal only after transaction commit; wakes re-run the same bounded source-first scanner;
+      timeout performs one final durable recheck, so trusted-local commits from another process remain
+      correct without polling/new IPC even though their wake latency may reach the deadline. The existing
+      attached-Turn regression proves the reader is pending before publication, commit wakes it to the
+      three Events, and a drained 1ms wait returns empty. No Event worker/per-Agent waiter registry was
+      added; Tokio `time` is the only runtime feature addition.
+      **Next:** extend placement only through existing Domain/Workspace owners that can prove the caller's
+      authorized broad selector is wholly served by this Event store. Keep broad selectors fail-closed and
+      never invent a global topology generation or merged cross-store cursor. Durable subscriptions/
+      Handlers/EventInput, EventTypeRegistry, protected-manifest authority and explicit v36
+      delivery_cutover_rev remain later Phase-2 slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

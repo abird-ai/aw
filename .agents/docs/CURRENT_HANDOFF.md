@@ -614,27 +614,38 @@ loss returns `CursorExpired`. Public Event projection revalidates immutable mark
 agreement and actor/Turn/causal bounds.
 
 This removes the scanner's temporary non-test dead-code allowance: EventScan and its projection snapshot
-are now production-reachable through a real consumer. It does **not** claim full section-26.2 completion
-yet: `events_read_page` is the bounded single-attempt Store primitive; `wait_ms`/wake composition and
-authority-scoped broad-selector placement remain pending. No durable subscription, Handler, EventInput,
-EventTypeRegistry or v36 delivery cutover is implemented. `delivery_cutover_rev` remains NULL and legacy
-pending delivery/ACK ownership is unchanged. The Event cursor is the first implementation of the sealed
-opaque cursor envelope; extract shared cursor-binding mechanics when the second real cursor consumer lands
-rather than pre-building a generic unused cursor framework.
+are production-reachable through a real consumer. Exact-Agent section-26.2 waiting is now also implemented:
+`SessionStore::events_read` wraps the single-attempt `events_read_page` with bounded `wait_ms=0..30000`
+using one process-local `tokio::watch` generation. The receiver registers **before** the first durable read,
+then follows register→recheck→await-change until one absolute deadline; every wake re-enters the same
+authorized cursor read, so there is no polling loop or Event worker. Current Agent/Turn Event producers
+signal only **after** their authoritative transaction commits. A timeout performs one final durable read,
+covering deadline races and trusted-local commits from another process/Store instance that cannot share the
+ephemeral watch. Thus cross-process wake latency may reach the caller's requested deadline, but correctness
+and no-loss semantics remain entirely projection/cursor-owned rather than requiring new IPC.
+
+The wake is deliberately store-local and coarse: any committed local Event may wake exact-Agent readers,
+which then cheaply prove pattern/source relevance through EventScan. This avoids a per-Agent waiter
+registry/worker until profiling shows a real need. The Tokio `time` feature is the only runtime addition;
+no background task is created. Subagent terminal Agent Events use the same post-commit wake path. No durable
+subscription, Handler, EventInput, EventTypeRegistry or v36 delivery cutover is implemented.
+`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged. The Event
+cursor remains the first implementation of the sealed opaque cursor envelope; extract shared cursor-binding
+mechanics only when the second real cursor consumer lands.
 
 Current focused Phase-2 evidence: Event-subject/pattern **2/2**; EventScan
 source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing attached-Turn
-coexistence regression **1/1** now also covers v46 end-to-end: owner `Now` cursor reads exactly the three
-new root/Turn Events once, repeat is empty, observer cursor created with `view` privately skips all three
-after revocation, and regrant cannot reveal them retroactively. The same regression performs
-v44→v45→v46 migration and preserves immutable commit-log cardinality/source next revision. Current-schema
-`aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad `aw-store --lib`
-result remains **226 green / 4 historical stale-downgrade reds** and was not repeated for this focused cut.
+coexistence regression **1/1** covers v46 end-to-end plus waiting: an owner read is demonstrably pending
+before publication, the committed Turn wakes it to exactly the three root/Turn Events, a drained cursor with
+a 1ms wait returns empty after the deadline recheck, observer revoke→private-skip→regrant remains
+non-retroactive, and v44→v45→v46 migration still preserves immutable commit-log cardinality/source next
+revision. Current-schema `aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad
+`aw-store --lib` result remains **226 green / 4 historical stale-downgrade reds** and was not repeated.
 
-**Next Phase-2 slice:** finish exact-Agent section-26.2 observation by composing Event wake +
-`wait_ms` around this single-attempt primitive without polling or another worker, then decide the smallest
-existing placement-owner extension needed for broader selectors. Keep broad selectors fail-closed until
-one-store completeness can actually be proven; do not fabricate a global topology generation.
+**Next Phase-2 slice:** inspect the existing Domain/Workspace placement owners and add only the smallest
+authority-scoped proof needed to admit broader selectors wholly served by this Event store. Keep broad
+selectors fail-closed until one-store completeness is actually provable; do not fabricate a global topology
+generation, per-user Event index or cross-store merged cursor.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

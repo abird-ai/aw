@@ -75,11 +75,54 @@ struct CursorRow {
 }
 
 impl SessionStore {
+    /// Wait for one authorized Event page without polling.
+    ///
+    /// The process-local watch is only a wake accelerator. The durable cursor and
+    /// Event projection are re-read after registration and once more at timeout,
+    /// so missed/external-process wakes cannot become durable loss.
+    pub async fn events_read(
+        &self,
+        actor: &PrincipalId,
+        subject: &str,
+        after: EventReadAfter,
+        limit: usize,
+        wait_ms: u64,
+    ) -> Result<EventReadOutcome> {
+        if wait_ms > 30_000 {
+            return Err(Error::Limit("Event read wait_ms must be 0..30000"));
+        }
+        if wait_ms == 0 {
+            return self.events_read_page(actor, subject, after, limit);
+        }
+
+        let mut wake = self.event_wake_receiver();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let mut after = after;
+        loop {
+            let outcome = self.events_read_page(actor, subject, after.clone(), limit)?;
+            let EventReadOutcome::Page(page) = outcome else {
+                return Ok(outcome);
+            };
+            if !page.events.is_empty() {
+                return Ok(EventReadOutcome::Page(page));
+            }
+            after = EventReadAfter::Cursor(page.cursor.clone());
+
+            match tokio::time::timeout_at(deadline, wake.changed()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) | Err(_) => {
+                    // Final durable recheck covers timeout races and Event commits
+                    // made through another trusted-local process.
+                    return self.events_read_page(actor, subject, after, limit);
+                }
+            }
+        }
+    }
+
     /// Read one bounded Event page for a selector wholly contained by one exact Agent.
     ///
-    /// Higher host/SDK layers may add wait/wake behavior around this single-attempt
-    /// primitive. Broad Project/Domain selectors remain rejected until the placement
-    /// owner can prove one-store completeness for the caller.
+    /// Broad Project/Domain selectors remain rejected until the placement owner
+    /// can prove one-store completeness for the caller.
     pub fn events_read_page(
         &self,
         actor: &PrincipalId,

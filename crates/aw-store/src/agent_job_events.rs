@@ -870,6 +870,28 @@ mod tests {
             }
             other => panic!("unexpected owner Event cursor outcome: {other:?}"),
         };
+        let owner_wait = {
+            let store = store.clone();
+            let actor = actor.clone();
+            let read_pattern = read_pattern.clone();
+            let cursor = owner_cursor.clone();
+            tokio::spawn(async move {
+                store
+                    .events_read(
+                        &actor,
+                        &read_pattern,
+                        crate::EventReadAfter::Cursor(cursor),
+                        16,
+                        5_000,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !owner_wait.is_finished(),
+            "empty Event wait must remain pending before publication"
+        );
 
         let observer = PrincipalId::new("internal:fixture:event-observer").unwrap();
         let observer_ref = {
@@ -1010,17 +1032,9 @@ mod tests {
             assert!(projected.iter().all(|event| event.5 == 1));
         }
 
-        let owner_page = match store
-            .events_read_page(
-                &actor,
-                &read_pattern,
-                crate::EventReadAfter::Cursor(owner_cursor.clone()),
-                16,
-            )
-            .unwrap()
-        {
+        let owner_page = match owner_wait.await.unwrap().unwrap() {
             crate::EventReadOutcome::Page(page) => page,
-            other => panic!("unexpected owner Event read outcome: {other:?}"),
+            other => panic!("unexpected owner Event wait outcome: {other:?}"),
         };
         assert_eq!(owner_page.cursor, owner_cursor);
         assert_eq!(owner_page.events.len(), 3);
@@ -1048,16 +1062,18 @@ mod tests {
             ]
         );
         let owner_empty = match store
-            .events_read_page(
+            .events_read(
                 &actor,
                 &read_pattern,
                 crate::EventReadAfter::Cursor(owner_page.cursor.clone()),
                 16,
+                1,
             )
+            .await
             .unwrap()
         {
             crate::EventReadOutcome::Page(page) => page,
-            other => panic!("unexpected repeated owner Event read outcome: {other:?}"),
+            other => panic!("unexpected timed owner Event read outcome: {other:?}"),
         };
         assert!(owner_empty.events.is_empty());
 

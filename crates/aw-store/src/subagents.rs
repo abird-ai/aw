@@ -3240,6 +3240,9 @@ impl SessionStore {
             crate::agent_owner::AgentKey::new(&info.child_session_id, &owned_branch),
         )?;
         db(tx.commit())?;
+        if child_branch.is_some() {
+            self.signal_event_wake();
+        }
         row(&c, id)
     }
 

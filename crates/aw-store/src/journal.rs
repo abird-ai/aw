@@ -1134,13 +1134,16 @@ impl SessionHandle {
         };
         phase34_after_result_commit_crash_hook();
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        attach_settled_run(&tx, &run)?;
+        let attached = attach_settled_run(&tx, &run)?;
         let next = branch_in(&tx, &self.session, &cursor.id)?;
         crate::agent_owner::changed(
             &tx,
             crate::agent_owner::AgentKey::new(&self.session, &cursor.id),
         )?;
         db(tx.commit())?;
+        if attached {
+            self.store.signal_event_wake();
+        }
         *cursor = next;
         Ok(())
     }

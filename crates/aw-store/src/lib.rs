@@ -305,6 +305,9 @@ pub(crate) struct Inner {
     mode: StoreMode,
     heartbeat_stop: Option<mpsc::Sender<()>>,
     heartbeat_thread: Option<thread::JoinHandle<()>>,
+    /// Ephemeral local wake accelerator for committed DL-200 Events.
+    /// Durable truth and missed-wake recovery remain in the Event projection.
+    event_wake: tokio::sync::watch::Sender<u64>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -1174,6 +1177,7 @@ impl SessionStore {
                 mode: StoreMode::OwnerLock,
                 heartbeat_stop: None,
                 heartbeat_thread: None,
+                event_wake: tokio::sync::watch::channel(0).0,
             }),
         };
         out.recover()?;
@@ -1240,6 +1244,7 @@ impl SessionStore {
                 mode: StoreMode::TrustedLocalDirect,
                 heartbeat_stop: Some(heartbeat_stop),
                 heartbeat_thread: Some(heartbeat_thread),
+                event_wake: tokio::sync::watch::channel(0).0,
             }),
         };
         out.recover()?;
@@ -1260,6 +1265,7 @@ impl SessionStore {
                 mode: StoreMode::InMemory,
                 heartbeat_stop: None,
                 heartbeat_thread: None,
+                event_wake: tokio::sync::watch::channel(0).0,
             }),
         })
     }
@@ -1283,6 +1289,7 @@ impl SessionStore {
                 mode: StoreMode::TrustedLocalDirect,
                 heartbeat_stop: None,
                 heartbeat_thread: None,
+                event_wake: tokio::sync::watch::channel(0).0,
             }),
         })
     }
@@ -1298,6 +1305,17 @@ impl SessionStore {
     pub(crate) fn trusted_local_direct(&self) -> bool {
         self.inner.mode == StoreMode::TrustedLocalDirect
     }
+
+    pub(crate) fn event_wake_receiver(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.event_wake.subscribe()
+    }
+
+    pub(crate) fn signal_event_wake(&self) {
+        self.inner
+            .event_wake
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     fn coordination_connection(&self) -> Result<MutexGuard<'_, Connection>> {
         let process = self.process_identity()?;
         let conn = self
