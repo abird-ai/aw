@@ -6,6 +6,7 @@
 use crate::{
     agent_owner, db,
     event_authority::{self, EventEnvelope, EventSourceEvidence},
+    event_causal,
     event_placement::{self, EventSelectorPlacement},
     event_scan::{EventAuthorization, EventCandidate},
     event_subscription::{self, StoredSubscription},
@@ -121,14 +122,31 @@ pub(crate) fn admit_subscription_candidate(
         return Ok(EventInputAdmission::AuthorizationUnavailable);
     }
 
-    let envelope = match event_authority::candidate_authority(candidate)? {
-        EventAuthorization::Allow(envelope) => envelope,
-        EventAuthorization::Deny => return Ok(EventInputAdmission::ProvenDenied),
-        EventAuthorization::Unknown => return Ok(EventInputAdmission::AuthorizationUnavailable),
-    };
+    let envelope = event_authority::candidate_envelope(candidate)?;
     if envelope != *preliminary_envelope {
         return Ok(EventInputAdmission::AuthorizationUnavailable);
     }
+    let audience = match crate::history_owner::authorize_event_delivery(
+        connection,
+        &creator,
+        &source_agent_ref,
+        &current.recipient_ref,
+        envelope.disclosure_manifest.as_deref(),
+    )? {
+        crate::history_owner::DisclosureAuthorization::Allow { audience } => audience,
+        crate::history_owner::DisclosureAuthorization::Deny => {
+            return Ok(EventInputAdmission::ProvenDenied)
+        }
+        crate::history_owner::DisclosureAuthorization::Unknown => {
+            return Ok(EventInputAdmission::AuthorizationUnavailable)
+        }
+    };
+
+    let retained_manifest = crate::history_owner::event_input_manifest(
+        connection,
+        &source_agent_ref,
+        envelope.disclosure_manifest.as_deref(),
+    )?;
 
     let delivery_id = delivery_id(
         &current.recipient_ref,
@@ -196,6 +214,15 @@ pub(crate) fn admit_subscription_candidate(
     if budget_changed != 1 {
         return Err(Error::Conflict("Event causal budget changed concurrently"));
     }
+    if next_count == MAX_CAUSAL_DELIVERIES {
+        event_causal::record_exhausted_attention(
+            connection,
+            &causal_root,
+            "delivery_limit",
+            &creator,
+            &recipient_session,
+        )?;
+    }
 
     let data_json = envelope.data.as_ref().map(json).transpose()?;
     db(connection.execute(
@@ -204,9 +231,9 @@ pub(crate) fn admit_subscription_candidate(
              subscription_subject,subscription_generation,event_id,event_position,
              source_ref,source_agent_ref,subject,event_rev,source_actor,source_turn,
              causal_root,causal_hop,data_json,created_by,source_access_generation,
-             recipient_access_generation,created_at
+             recipient_access_generation,created_at,disclosure_manifest
          ) VALUES(
-             ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21
+             ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22
          )",
         params![
             delivery_id,
@@ -230,8 +257,22 @@ pub(crate) fn admit_subscription_candidate(
             source_access.access_generation.as_slice(),
             recipient_access.access_generation.as_slice(),
             now(),
+            retained_manifest,
         ],
     ))?;
+    for (ordinal, (principal_kind, principal_handle)) in audience.iter().enumerate() {
+        db(connection.execute(
+            "INSERT INTO agent_event_input_audience(
+                 delivery_id,ordinal,principal_kind,principal_handle
+             ) VALUES(?1,?2,?3,?4)",
+            params![
+                delivery_id,
+                ordinal as u64,
+                principal_kind,
+                principal_handle
+            ],
+        ))?;
+    }
     agent_owner::changed(connection, recipient)?;
     Ok(EventInputAdmission::Accepted { delivery_id })
 }

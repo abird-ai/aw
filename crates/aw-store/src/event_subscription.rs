@@ -55,6 +55,9 @@ pub struct EventSubscriptionView {
 pub struct EventSubscriptionDeliveryRun {
     pub accepted: usize,
     pub deduplicated: usize,
+    /// Newly accepted or replay-deduplicated immutable EventInputs ready for
+    /// host scheduling. IDs are stable across replay.
+    pub ready_inputs: Vec<String>,
     pub skipped: usize,
     pub blocked: bool,
     pub lagged: bool,
@@ -458,7 +461,9 @@ impl SessionStore {
                         &mut authority_cache,
                     )
                 },
-                |candidate, _source_evidence| event_authority::candidate_authority(candidate),
+                |candidate, _source_evidence| {
+                    event_authority::candidate_envelope(candidate).map(EventAuthorization::Allow)
+                },
             )?;
             match result {
                 EventScanResult::Candidate {
@@ -478,13 +483,15 @@ impl SessionStore {
                         &source_evidence,
                         &candidate_evidence,
                     )? {
-                        event_input::EventInputAdmission::Accepted { .. } => {
+                        event_input::EventInputAdmission::Accepted { delivery_id } => {
                             run.accepted += 1;
+                            run.ready_inputs.push(delivery_id);
                             terminal += 1;
                             position = event.position;
                         }
-                        event_input::EventInputAdmission::Deduplicated { .. } => {
+                        event_input::EventInputAdmission::Deduplicated { delivery_id } => {
                             run.deduplicated += 1;
+                            run.ready_inputs.push(delivery_id);
                             terminal += 1;
                             position = event.position;
                         }

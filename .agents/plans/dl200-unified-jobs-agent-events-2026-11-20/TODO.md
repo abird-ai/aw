@@ -318,11 +318,27 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Existing combined Event coverage proves 3 real EventInputs to a separate recipient, 3 self-suppressed
       skips to the source Agent, drained replay no-op, 3 fresh causal roots at count1, all prior privacy/state
       contracts, and v44→v45→v46→v47→v48→v49 migration under strict all-target Clippy/check.
-      **Next:** finish protected Event disclosure + causal propagation: real DisclosureManifest/provider and
-      recipient-audience reauthorization, EventInput→Turn causal scope, descendant Event root/hop inheritance
-      and one bounded durable host-visible exhaustion attention fact. Then land the final one-leaf
-      EventTypeRegistry staging owner before custom/model publication. Handler remains the third EventScan
-      consumer; wider selector placement and explicit v36 delivery_cutover_rev remain subsequent slices.
+      **v50 disclosure + causal execution closure landed locally:** accepted EventInputs now retain the
+      existing v40 manifest DAG plus a concrete `agent_source` authority root and immutable normalized
+      recipient audience. Reader authorization rechecks the current reader; delivery snapshots the recipient
+      Agent's current owner/view ACL audience and requires source `share` when that audience broadens beyond
+      source viewers. Agent-source and legacy-session roots reauthorize through existing owners; exact active
+      materialized policy can authorize an individual reader, while whole-recipient provider/materialized
+      expansion remains Unknown until a principal-level provider fence exists. History sealing unions
+      EventInput manifests from causal prompt ancestry, retaining source/share dependencies across forks.
+      `event_subscription_deliver` returns stable ready input IDs; host-only
+      `SessionHandle::bind_event_input` binds one to the normal begin transaction, which records exact
+      delivery/root/parent-hop on the run. Descendant system Events inherit the root and increment hop once;
+      parent hop16 suppresses hop17 while still reserving source revision. Count256 or hop exhaustion emits
+      exactly one non-deliverable host-visible attention commit fact. Combined coverage proves retained
+      source-manifest denial after revocation, EventInput→real Turn binding, descendant root/hop 0→1 with
+      publication-time max-hop projection, retry inheritance without reusing the EventInput ID, all prior
+      Event semantics and v44→…→v50 migration; focused history disclosure tests + strict Clippy/check are
+      green.
+      **Next:** land the final one-leaf EventTypeRegistry staged owner and use it for bounded custom host/model
+      `#name` publication without later owner/identity replacement. Then add EventHandler as EventScan's
+      third consumer with separate at-least-once receipt/ack. Wider selector placement and explicit v36
+      delivery_cutover_rev remain subsequent slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

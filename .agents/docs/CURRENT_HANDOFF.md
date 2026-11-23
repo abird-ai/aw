@@ -20,10 +20,11 @@ Normative R6 design:
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
 complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
-exact-Project wildcard placement, v48 durable subscription state, and v49 replay-safe typed EventInput
-subscription delivery are now implemented locally. Protected-manifest audience closure, inherited causal
-execution propagation, wider Principal/Domain selectors, Handler delivery and the v36 delivery cutover
-remain later Phase-2 work.
+exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery
+and v50 disclosure/causal execution closure are now implemented locally. Materialized/provider audience
+expansion remains Unknown until its provider-held principal fence exists; wider Principal/Domain selectors,
+EventTypeRegistry/custom publication, Handler delivery and the v36 delivery cutover remain later Phase-2
+work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -714,32 +715,63 @@ and stops retention pinning. Scan advancement and all accepted EventInputs for t
 `BEGIN IMMEDIATE` transaction. The scheduler status exposes accepted/deduplicated/skipped/blocked/lagged
 to trusted Rust callers; its Store position remains crate-private and is not an Events RPC field.
 
-This cut deliberately does **not** claim protected-content delivery closure yet. Current locally emitted
-result/settled Events are metadata-only source-policy facts and can deliver through the source/recipient
-checks above. Any Event carrying a DisclosureManifest blocks with unchanged scan until the real
-manifest/provider + recipient-audience authorizer exists. Causal delivery counting is now durable and
-replay-safe, but EventInput→Turn causal execution scope, descendant Event root/hop inheritance and the
-one host-visible exhaustion attention fact remain pending; v49 does not claim those propagation surfaces.
-No Handler, EventTypeRegistry, custom/model Event publication or v36 delivery cutover is implemented.
-`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+Schema **v50** closes the AW-owned protected-disclosure and causal-execution path without adding another
+grant service or ambient causal context. `agent_event_inputs` now stores the retained disclosure manifest
+and a normalized immutable audience side table. The retained manifest is the existing v40 content-addressed
+DAG: each EventInput unions an `agent_source` authority root for the concrete source Agent with the Event's
+transitive DisclosureManifest. The history sealer walks EventInput-originated prompt ancestry and unions
+those same manifests, so cross-Agent delivery cannot discard source/share dependencies before later
+history/fork audience expansion.
 
-Current focused Phase-2 evidence: Event-subject/pattern **2/2**; EventScan
-source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing attached-Turn
-coexistence regression **1/1** now covers v49 without a new fixture harness. A separate recipient
-subscription accepts exactly the three real root/Turn Events as typed EventInputs and advances recipient
-Agent rev three times; the source Agent's own broad subscription proves self-delivery suppression by
-advancing across the same three with zero EventInputs; a drained second sweep creates nothing; three fresh
-Event IDs become three causal roots with count=1; all prior read/wait/Project/privacy/subscription-state
-checks remain green; and v44→v45→v46→v47→v48→v49 migration remains history-preserving. Current-schema
-`aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad `aw-store --lib`
-result remains **226 green / 4 historical stale-downgrade reds** and was not repeated.
+Reader and delivery authorization are intentionally distinct but share the same manifest graph. A reader
+reauthorizes its own current principal against every root. EventInput admission snapshots the recipient
+Agent's current owner + direct view ACL audience; if that audience is broader than the source Agent's current
+audience the creating principal must currently hold source `share`. `agent_source` and
+`legacy_session` roots are fully reauthorized with existing Agent/context owners. A current exact
+materialized-policy root can authorize an individual reader through the existing federation/materialization
+authority, but delivery to an entire recipient audience remains **Unknown** while AW lacks a principal-level
+provider/materialized share fence; revoked/missing policy is proven denial. Unknown keeps subscription scan
+at the candidate. No Event-specific grant database was added.
 
-**Next Phase-2 slice:** finish the remaining EventInput disclosure/causal closure before adding more
-surfaces: compose the real DisclosureManifest/provider + recipient-audience authorizer for protected
-Events, carry EventInput causal root into admitted Turn execution, inherit/advance that root on descendant
-Event publication, and emit the bounded host-visible exhaustion attention fact. Keep Unknown fail-closed
-with unchanged progress. After that, land the final one-leaf EventTypeRegistry staging owner before custom
-host/model publication; Handler remains the third EventScan consumer and v36 delivery cutover stays later.
+Causal scope also remains adjacent to existing owners. `event_subscription_deliver` now returns stable
+ready EventInput IDs. `SessionHandle::bind_event_input` is a host-only one-shot next-admission hint, parallel
+to the existing web/retry/route bindings. The normal `begin_sync` transaction verifies that exact immutable
+EventInput belongs to the same Agent and is unbound, then records its delivery ID, causal root and parent
+Event hop directly on the factual run. There is no TurnStart-wide API churn and no task-local/global causal
+state. System Event emission derives descendant scope from the exact run: fresh work stays hop 0/rootless;
+EventInput-derived work retains the root and increments Event hop exactly once, updating the causal
+projection when that descendant Event is authored. Same-context provider retries copy root/parent-hop from
+the prior run of the same logical operation while leaving the EventInput delivery ID unique to its original
+admission. A parent Event at hop 16 reserves the source-local revision but suppresses a would-be hop-17
+DL-200 Event, preserving source revision alignment while stopping the causal chain.
+
+The causal owner now records exactly one non-deliverable host-visible `event.causal_exhausted` commit fact
+per root, keyed by the existing causal root. It fires when the 256th EventInput is accepted or when a
+hop-16 Turn attempts another Event generation. The attention fact is deliberately **not** a DL-200 Event,
+so it cannot reset or recursively escape the exhausted budget. Accepted EventInputs/audience rows and causal
+attention facts are database-immutable; the small causal-root row remains the replay-safe current safety
+projection.
+
+Current locally emitted result/settled Events remain metadata-only, but the protected Event path is now
+real for retained/future envelopes carrying DisclosureManifest. The existing combined Event regression
+proves a delivered EventInput has a 64-byte effective retained manifest and immutable audience, source owner
+authorization succeeds, and after source-view revocation the same retained source manifest denies the
+observer. The same accepted EventInput is bound to the recipient's actual next journaled Turn; the run
+records the exact input/root/parent-hop, and its three real descendant Agent/Turn Events all retain the root
+with hop **0→1**. All prior read/wait/Project/privacy/subscription checks remain green, as do the existing
+history disclosure-grant and manifest-fanout regressions. Migration now exercises
+v44→v45→v46→v47→v48→v49→v50. Current-schema `aw-tools + aw-store` all-target check, strict Clippy, fmt and
+focused diff-check are green. The prior broad `aw-store --lib` result remains
+**226 green / 4 historical stale-downgrade reds** and was not repeated.
+
+No EventTypeRegistry, custom/model Event publication, EventHandler consumer or v36 delivery cutover is
+implemented. `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+
+**Next Phase-2 slice:** land the final one-leaf EventTypeRegistry through the sealed private staged
+publication mechanics, then use that exact registry for bounded custom host/model `#name` publication
+without replacing its identity later during ExtensionRegistry composition. After custom publication is
+real, add EventHandler as EventScan's third consumer with its separate at-least-once receipt/ack owner.
+Keep wider selector placement and explicit v36 `delivery_cutover_rev` cutover as later slices.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

@@ -10,7 +10,7 @@ use crate::{
     SessionBinding, SessionStore,
 };
 use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +43,13 @@ pub struct TurnFactProvenance {
     pub original_turn: u64,
     pub actor: PrincipalId,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DisclosureAuthorization {
+    Allow { audience: Vec<(String, String)> },
+    Deny,
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,7 +358,57 @@ fn dependency_manifest(connection: &Connection, head: &str) -> Result<String> {
         }
     }
 
-    manifest_from_entries(connection, &entries)
+    let mut manifest = manifest_from_entries(connection, &entries)?;
+    let mut query = db(connection.prepare(
+        "WITH RECURSIVE ancestry(id,parent_id) AS (
+             SELECT id,parent_id FROM nodes WHERE id=?1
+             UNION ALL
+             SELECT n.id,n.parent_id FROM nodes n
+             JOIN ancestry a ON a.parent_id=n.id
+         )
+         SELECT DISTINCT i.disclosure_manifest
+         FROM ancestry a
+         JOIN runs r ON r.prompt_node=a.id
+         JOIN agent_event_inputs i ON i.delivery_id=r.event_input_delivery_id
+         WHERE i.disclosure_manifest IS NOT NULL
+         ORDER BY i.disclosure_manifest
+         LIMIT ?2",
+    ))?;
+    let rows = db(
+        query.query_map(params![head, (MAX_MANIFEST_INPUTS + 1) as i64], |row| {
+            row.get::<_, String>(0)
+        }),
+    )?;
+    let inherited = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    if inherited.len() > MAX_MANIFEST_INPUTS {
+        return Err(Error::Limit(
+            "EventInput disclosure manifest bound exceeded",
+        ));
+    }
+    for inherited in inherited {
+        manifest = union_manifests(connection, &manifest, &inherited)?;
+    }
+    Ok(manifest)
+}
+
+pub(crate) fn event_input_manifest(
+    connection: &Connection,
+    source_agent_ref: &str,
+    event_manifest: Option<&str>,
+) -> Result<String> {
+    let evidence = json(&serde_json::json!({"source_agent_ref":source_agent_ref}))?;
+    let root = authority_root(connection, "agent_source", source_agent_ref, &evidence)?;
+    let source_manifest = manifest_from_entries(
+        connection,
+        &BTreeSet::from([ManifestEntry {
+            kind: "authority_root",
+            reference: root,
+        }]),
+    )?;
+    match event_manifest {
+        Some(manifest) => union_manifests(connection, &source_manifest, manifest),
+        None => Ok(source_manifest),
+    }
 }
 
 fn base_row(connection: &Connection, base_id: &str) -> Result<HistoryBaseRef> {
@@ -1099,30 +1156,11 @@ fn grant_covers(
     ))
 }
 
-fn current_disclosed_principals(
+fn current_agent_audience(
     connection: &Connection,
     agent: agent_owner::AgentKey<'_>,
-    current_grant: Option<&str>,
 ) -> Result<BTreeSet<(String, String)>> {
     let mut principals = BTreeSet::new();
-    if let Some(grant) = current_grant {
-        let mut query = db(connection.prepare(
-            "SELECT principal_kind,principal_handle FROM history_grant_principals
-             WHERE grant_id=?1 ORDER BY ordinal LIMIT ?2",
-        ))?;
-        let rows = db(
-            query.query_map(params![grant, (MAX_MANIFEST_INPUTS + 1) as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }),
-        )?;
-        let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
-        if rows.len() > MAX_MANIFEST_INPUTS {
-            return Err(Error::Limit("HistoryGrant principal bound exceeded"));
-        }
-        principals.extend(rows);
-        return Ok(principals);
-    }
-
     let (owner_kind, owner_handle): (String, String) = db(connection.query_row(
         "SELECT owner_kind,owner_handle FROM agent_state_current
          WHERE session_id=?1 AND branch_id=?2",
@@ -1149,6 +1187,55 @@ fn current_disclosed_principals(
     }
     principals.extend(rows);
     Ok(principals)
+}
+
+fn current_disclosed_principals(
+    connection: &Connection,
+    agent: agent_owner::AgentKey<'_>,
+    current_grant: Option<&str>,
+) -> Result<BTreeSet<(String, String)>> {
+    if let Some(grant) = current_grant {
+        let mut principals = BTreeSet::new();
+        let mut query = db(connection.prepare(
+            "SELECT principal_kind,principal_handle FROM history_grant_principals
+             WHERE grant_id=?1 ORDER BY ordinal LIMIT ?2",
+        ))?;
+        let rows = db(
+            query.query_map(params![grant, (MAX_MANIFEST_INPUTS + 1) as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }),
+        )?;
+        let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        if rows.len() > MAX_MANIFEST_INPUTS {
+            return Err(Error::Limit("HistoryGrant principal bound exceeded"));
+        }
+        principals.extend(rows);
+        return Ok(principals);
+    }
+    current_agent_audience(connection, agent)
+}
+
+fn validate_agent_source_expansion(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source_agent_ref: &str,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<()> {
+    let (source_session, source_branch) = agent_owner::key_for_ref(connection, source_agent_ref)?;
+    let source_agent = agent_owner::AgentKey::new(&source_session, &source_branch);
+    if current_agent_audience(connection, source_agent)?
+        .contains(&(principal_kind.to_owned(), principal_handle.to_owned()))
+    {
+        return Ok(());
+    }
+    agent_owner::authorize_permission(
+        connection,
+        actor,
+        source_agent,
+        agent_owner::AgentPermission::Share,
+    )
+    .map(|_| ())
 }
 
 fn validate_legacy_session_expansion(
@@ -1188,6 +1275,13 @@ fn validate_manifest_expansion(
 ) -> Result<()> {
     for (_root, kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)? {
         match kind.as_str() {
+            "agent_source" => validate_agent_source_expansion(
+                connection,
+                actor,
+                &stable_key,
+                principal_kind,
+                principal_handle,
+            )?,
             "legacy_session" => validate_legacy_session_expansion(
                 connection,
                 actor,
@@ -1208,6 +1302,208 @@ fn validate_manifest_expansion(
         }
     }
     Ok(())
+}
+
+fn materialized_policy_state(
+    connection: &Connection,
+    stable_key: &str,
+) -> Result<Option<(String, String, u64)>> {
+    let Some((policy_id, expected_revision)) = stable_key.rsplit_once('@') else {
+        return Err(Error::Storage(
+            "materialized disclosure authority root has invalid stable key",
+        ));
+    };
+    let expected_revision = expected_revision
+        .parse::<u64>()
+        .map_err(|_| Error::Storage("materialized disclosure policy revision is invalid"))?;
+    db(connection
+        .query_row(
+            "SELECT status,federation_id,revision
+             FROM semantic_materialization_policies WHERE policy_id=?1",
+            [policy_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
+        )
+        .optional())
+    .map(|row| row.filter(|(_, _, revision)| *revision == expected_revision))
+}
+
+fn classify_disclosure_check(result: Result<()>) -> Result<Option<DisclosureAuthorization>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(Error::Denied(_)) => Ok(Some(DisclosureAuthorization::Deny)),
+        Err(Error::Conflict(_)) => Ok(Some(DisclosureAuthorization::Unknown)),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn authorize_event_manifest_reader(
+    connection: &Connection,
+    actor: &PrincipalId,
+    manifest: &str,
+) -> Result<DisclosureAuthorization> {
+    let Some(user) = user_for_principal(connection, actor)? else {
+        return Ok(DisclosureAuthorization::Deny);
+    };
+    for (_root, kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)? {
+        match kind.as_str() {
+            "agent_source" => match agent_owner::key_for_ref_optional(connection, &stable_key)? {
+                Some((session, branch)) => match agent_owner::authorize_permission(
+                    connection,
+                    actor,
+                    agent_owner::AgentKey::new(&session, &branch),
+                    agent_owner::AgentPermission::View,
+                ) {
+                    Ok(_) => {}
+                    Err(Error::Denied(_)) => return Ok(DisclosureAuthorization::Deny),
+                    Err(Error::Conflict(_)) => return Ok(DisclosureAuthorization::Unknown),
+                    Err(error) => return Err(error),
+                },
+                None => return Ok(DisclosureAuthorization::Unknown),
+            },
+            "legacy_session" => {
+                if let Some(decision) =
+                    classify_disclosure_check(validate_legacy_session_expansion(
+                        connection,
+                        actor,
+                        &stable_key,
+                        "user",
+                        &user,
+                    ))?
+                {
+                    return Ok(decision);
+                }
+            }
+            "materialized_policy" => {
+                let Some((status, federation, _revision)) =
+                    materialized_policy_state(connection, &stable_key)?
+                else {
+                    return Ok(DisclosureAuthorization::Deny);
+                };
+                if status != "active" {
+                    return Ok(DisclosureAuthorization::Deny);
+                }
+                match crate::durability::semantic_materialization_authority(
+                    connection,
+                    actor,
+                    &federation,
+                    false,
+                    true,
+                ) {
+                    Ok(_) => {}
+                    Err(Error::Denied(_)) => return Ok(DisclosureAuthorization::Deny),
+                    Err(Error::Conflict(_)) => return Ok(DisclosureAuthorization::Unknown),
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => return Ok(DisclosureAuthorization::Unknown),
+        }
+    }
+    Ok(DisclosureAuthorization::Allow {
+        audience: vec![("user".to_owned(), user)],
+    })
+}
+
+pub(crate) fn authorize_event_delivery(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source_agent_ref: &str,
+    recipient_agent_ref: &str,
+    manifest: Option<&str>,
+) -> Result<DisclosureAuthorization> {
+    let Some((source_session, source_branch)) =
+        agent_owner::key_for_ref_optional(connection, source_agent_ref)?
+    else {
+        return Ok(DisclosureAuthorization::Unknown);
+    };
+    let Some((recipient_session, recipient_branch)) =
+        agent_owner::key_for_ref_optional(connection, recipient_agent_ref)?
+    else {
+        return Ok(DisclosureAuthorization::Deny);
+    };
+    let source_agent = agent_owner::AgentKey::new(&source_session, &source_branch);
+    let recipient_agent = agent_owner::AgentKey::new(&recipient_session, &recipient_branch);
+    let source_audience = current_agent_audience(connection, source_agent)?;
+    let recipient_audience = current_agent_audience(connection, recipient_agent)?;
+
+    if recipient_audience
+        .iter()
+        .any(|principal| !source_audience.contains(principal))
+    {
+        match agent_owner::authorize_permission(
+            connection,
+            actor,
+            source_agent,
+            agent_owner::AgentPermission::Share,
+        ) {
+            Ok(_) => {}
+            Err(Error::Denied(_)) => return Ok(DisclosureAuthorization::Deny),
+            Err(Error::Conflict(_)) => return Ok(DisclosureAuthorization::Unknown),
+            Err(error) => return Err(error),
+        }
+    }
+
+    if let Some(manifest) = manifest {
+        for (_root, kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)?
+        {
+            match kind.as_str() {
+                "agent_source" => {
+                    for (principal_kind, principal_handle) in &recipient_audience {
+                        if let Some(decision) =
+                            classify_disclosure_check(validate_agent_source_expansion(
+                                connection,
+                                actor,
+                                &stable_key,
+                                principal_kind,
+                                principal_handle,
+                            ))?
+                        {
+                            return Ok(decision);
+                        }
+                    }
+                }
+                "legacy_session" => {
+                    for (principal_kind, principal_handle) in &recipient_audience {
+                        if let Some(decision) =
+                            classify_disclosure_check(validate_legacy_session_expansion(
+                                connection,
+                                actor,
+                                &stable_key,
+                                principal_kind,
+                                principal_handle,
+                            ))?
+                        {
+                            return Ok(decision);
+                        }
+                    }
+                }
+                "materialized_policy" => {
+                    let Some((status, _federation, _revision)) =
+                        materialized_policy_state(connection, &stable_key)?
+                    else {
+                        return Ok(DisclosureAuthorization::Deny);
+                    };
+                    if status != "active" {
+                        return Ok(DisclosureAuthorization::Deny);
+                    }
+                    // Current AW owns the exact materialization policy, but it has
+                    // no principal-level provider/share fence for a recipient
+                    // Agent's whole audience. Keep this retryable and pinned.
+                    return Ok(DisclosureAuthorization::Unknown);
+                }
+                _ => return Ok(DisclosureAuthorization::Unknown),
+            }
+        }
+    }
+
+    Ok(DisclosureAuthorization::Allow {
+        audience: recipient_audience.into_iter().collect(),
+    })
 }
 
 fn validate_fork_manifest_for_principal(
@@ -1238,6 +1534,13 @@ fn validate_fork_manifest_for_principal(
 
     for (root, kind, stable_key, _evidence) in manifest_authority_roots(connection, new_manifest)? {
         match kind.as_str() {
+            "agent_source" => validate_agent_source_expansion(
+                connection,
+                actor,
+                &stable_key,
+                principal_kind,
+                principal_handle,
+            )?,
             // Explicitly revocable/materialized source policy is stronger than
             // immutable prior disclosure and must be revalidated on every new
             // destination. No principal-level source-share contract exists yet.

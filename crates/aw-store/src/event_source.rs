@@ -4,7 +4,10 @@
 //! one monotonic Event revision per concrete source transition and writes bounded
 //! immutable Event envelopes into the existing commit_log transaction.
 
-use crate::{db, durability, event_authority, event_projection, now, Error, PrincipalId, Result};
+use crate::{
+    db, durability, event_authority, event_causal, event_projection, now, Error, PrincipalId,
+    Result,
+};
 use aw_tools::{event_subject::EventSubject, job_event::SourceEventBook};
 use rusqlite::{params, Connection};
 use sha2::{Digest as _, Sha256};
@@ -112,23 +115,43 @@ pub(crate) fn emit_system_events(
     }
 
     let event_rev = reserve_revision(connection, source_ref, expected_revision)?;
+    let causal = event_causal::descendant_event_scope(connection, source_ref, turn, actor)?;
+    if matches!(causal, event_causal::DescendantEventScope::Exhausted { .. }) {
+        return Ok(Some(event_rev));
+    }
+    if let event_causal::DescendantEventScope::Inherited { root, event_hop } = &causal {
+        event_causal::observe_event_hop(connection, root, *event_hop)?;
+    }
     let txid = durability::tx_id()?;
     let entity_id = format!("{:x}", Sha256::digest(source_ref.as_bytes()));
     for event in events {
         let subject = EventSubject::from_resource_ref(source_ref, event.name)
             .map_err(|_| Error::Storage("invalid authoritative Event subject"))?;
+        let (causal_root, causal_hop) = match &causal {
+            event_causal::DescendantEventScope::Fresh => (None, 0),
+            event_causal::DescendantEventScope::Inherited { root, event_hop } => {
+                (Some(root.as_str()), *event_hop)
+            }
+            event_causal::DescendantEventScope::Exhausted { .. } => unreachable!(),
+        };
         let mut envelope = serde_json::json!({
             "version": event_projection::EVENT_MARKER_VERSION,
             "subject": subject.as_str(),
             "event_rev": event_rev,
             "actor": actor.as_str(),
-            "causal_hop": 0
+            "causal_hop": causal_hop
         });
         let object = envelope
             .as_object_mut()
             .expect("Event envelope fixture is always an object");
         if let Some(turn) = turn {
             object.insert("turn".into(), serde_json::Value::from(turn));
+        }
+        if let Some(root) = causal_root {
+            object.insert(
+                "causal_root".into(),
+                serde_json::Value::String(root.to_owned()),
+            );
         }
         if let Some(data) = event.data {
             object.insert("data".into(), data.clone());

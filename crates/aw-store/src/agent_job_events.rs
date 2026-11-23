@@ -1280,6 +1280,138 @@ mod tests {
             "drained delivery must preserve private progress"
         );
 
+        assert_eq!(delivered.ready_inputs.len(), 3);
+        let bound_input = delivered.ready_inputs[0].clone();
+        let (bound_root, bound_manifest) = {
+            let connection = store.connection().unwrap();
+            let (event_id, causal_root, hop, manifest): (String, String, u64, String) = connection
+                .query_row(
+                    "SELECT event_id,causal_root,causal_hop,disclosure_manifest
+                     FROM agent_event_inputs WHERE delivery_id=?1",
+                    [&bound_input],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(event_id, causal_root);
+            assert_eq!(hop, 0);
+            assert_eq!(manifest.len(), 64);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM agent_event_input_audience
+                         WHERE delivery_id=?1",
+                        [&bound_input],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+            assert!(matches!(
+                crate::history_owner::authorize_event_manifest_reader(
+                    &connection,
+                    &actor,
+                    &manifest,
+                )
+                .unwrap(),
+                crate::history_owner::DisclosureAuthorization::Allow { .. }
+            ));
+            (causal_root, manifest)
+        };
+        let (_, target_journal) = store
+            .activate(&actor, &event_target.id, &event_target_branch.id)
+            .unwrap();
+        target_journal
+            .bind_event_input(bound_input.clone())
+            .unwrap();
+        target_journal
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "event input turn".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        target_journal
+            .finish(Turn {
+                id: 1,
+                prompt: "event input turn".into(),
+                answer: "causal done".into(),
+                model: identity.model.clone(),
+                profile: identity.account_id.clone(),
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(actor.clone()),
+                tool_records: Vec::new(),
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            let (delivery, run_root, parent_hop): (String, String, u64) = connection
+                .query_row(
+                    "SELECT event_input_delivery_id,event_causal_root,event_causal_parent_hop
+                     FROM runs
+                     WHERE session_id=?1 AND branch_id=?2 AND turn_id=1",
+                    params![&event_target.id, &event_target_branch.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(delivery, bound_input);
+            assert_eq!(run_root, bound_root);
+            assert_eq!(parent_hop, 0);
+
+            let target_turn_ref = format!("{event_target_ref}/t:1");
+            let mut query = connection
+                .prepare(
+                    "SELECT c.payload_json
+                     FROM event_projection_index p
+                     JOIN commit_log c ON c.seq=p.commit_position
+                     WHERE p.source_ref IN (?1,?2)
+                     ORDER BY p.commit_position",
+                )
+                .unwrap();
+            let payloads = query
+                .query_map(params![&event_target_ref, &target_turn_ref], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(payloads.len(), 3);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT max_event_hop FROM event_causal_roots_current WHERE root_id=?1",
+                        [&bound_root],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "causal safety projection tracks descendant Event generation"
+            );
+            for encoded in payloads {
+                let payload: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                let marker = payload
+                    .get(crate::event_projection::EVENT_MARKER)
+                    .and_then(serde_json::Value::as_object)
+                    .unwrap();
+                assert_eq!(
+                    marker
+                        .get("causal_root")
+                        .and_then(serde_json::Value::as_str),
+                    Some(bound_root.as_str())
+                );
+                assert_eq!(
+                    marker.get("causal_hop").and_then(serde_json::Value::as_u64),
+                    Some(1)
+                );
+            }
+        }
+
         let disabled_subscription = store
             .events_subscribe(&actor, &project_pattern, &root, false)
             .unwrap();
@@ -1329,6 +1461,19 @@ mod tests {
                 revision,
             )
             .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            assert_eq!(
+                crate::history_owner::authorize_event_manifest_reader(
+                    &connection,
+                    &observer,
+                    &bound_manifest,
+                )
+                .unwrap(),
+                crate::history_owner::DisclosureAuthorization::Deny,
+                "retained EventInput history must keep the source Agent disclosure dependency"
+            );
+        }
         let hidden_page = match store
             .events_read_page(
                 &observer,
@@ -1438,7 +1583,13 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE agent_event_inputs;
+                "DROP TABLE agent_event_input_audience;
+                 DROP TABLE event_causal_attention;
+                 DROP INDEX runs_event_input_delivery;
+                 ALTER TABLE runs DROP COLUMN event_input_delivery_id;
+                 ALTER TABLE runs DROP COLUMN event_causal_root;
+                 ALTER TABLE runs DROP COLUMN event_causal_parent_hop;
+                 DROP TABLE agent_event_inputs;
                  DROP TABLE event_causal_roots_current;
                  DROP TABLE event_subscriptions_current;
                  DROP TABLE event_read_cursors_current;
@@ -1458,11 +1609,12 @@ mod tests {
         crate::migrate_event_read_placement(&mut connection).unwrap();
         crate::migrate_event_subscriptions(&mut connection).unwrap();
         crate::migrate_event_inputs(&mut connection).unwrap();
+        crate::migrate_event_disclosure_causal(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            49
+            50
         );
         for source in [&root, &turn_ref] {
             assert_eq!(

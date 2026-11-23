@@ -15,6 +15,7 @@ pub struct SessionHandle {
     session: String,
     cursor: Arc<Mutex<BranchInfo>>,
     pending_web_receipt: Arc<Mutex<Option<u64>>>,
+    pending_event_input: Arc<Mutex<Option<String>>>,
     pending_retry_operation: Arc<Mutex<Option<String>>>,
     pending_retry_policy: Arc<Mutex<Option<crate::RetryPolicy>>>,
     #[cfg(feature = "routing")]
@@ -160,6 +161,7 @@ impl SessionHandle {
             session,
             cursor: Arc::new(Mutex::new(branch)),
             pending_web_receipt: Arc::new(Mutex::new(None)),
+            pending_event_input: Arc::new(Mutex::new(None)),
             pending_retry_operation: Arc::new(Mutex::new(None)),
             pending_retry_policy: Arc::new(Mutex::new(None)),
             #[cfg(feature = "routing")]
@@ -184,6 +186,51 @@ impl SessionHandle {
     pub fn store(&self) -> SessionStore {
         self.store.clone()
     }
+    /// Host-only causal binding from one immutable accepted EventInput to the
+    /// next Turn admission. Binding is ephemeral; the EventInput remains durable
+    /// until begin_sync atomically records it on the exact run.
+    pub fn bind_event_input(&self, delivery_id: impl Into<String>) -> Result<()> {
+        let delivery_id = delivery_id.into();
+        if delivery_id.len() != 68
+            || !delivery_id.starts_with("edi_")
+            || !delivery_id[4..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Denied("invalid EventInput delivery identity"));
+        }
+        let branch = self.branch()?;
+        let connection = self.store.connection()?;
+        crate::event_causal::event_input_scope_for_turn(
+            &connection,
+            &delivery_id,
+            &self.session,
+            &branch.id,
+        )?;
+        let mut slot = self
+            .pending_event_input
+            .lock()
+            .map_err(|_| Error::Storage("EventInput binding poisoned"))?;
+        if slot.is_some() {
+            return Err(Error::Conflict(
+                "an EventInput is already awaiting Turn admission",
+            ));
+        }
+        *slot = Some(delivery_id);
+        Ok(())
+    }
+
+    pub fn clear_event_input(&self, delivery_id: &str) -> Result<()> {
+        let mut slot = self
+            .pending_event_input
+            .lock()
+            .map_err(|_| Error::Storage("EventInput binding poisoned"))?;
+        if slot.as_deref() == Some(delivery_id) {
+            *slot = None;
+        }
+        Ok(())
+    }
+
     /// Host-only: select retry semantics for the next newly admitted logical operation.
     /// The policy is persisted by begin_sync before any provider call can occur.
     pub fn configure_next_retry(&self, policy: crate::RetryPolicy) -> Result<()> {
@@ -295,6 +342,11 @@ impl SessionHandle {
             .lock()
             .map_err(|_| Error::Storage("request binding unavailable"))?
             .take();
+        let event_input = self
+            .pending_event_input
+            .lock()
+            .map_err(|_| Error::Storage("EventInput binding unavailable"))?
+            .take();
         let retry_of = self
             .pending_retry_operation
             .lock()
@@ -313,6 +365,11 @@ impl SessionHandle {
             .take();
         #[cfg(not(feature = "routing"))]
         let routing_operation: Option<String> = None;
+        if event_input.is_some() && (receipt.is_some() || retry_of.is_some()) {
+            return Err(Error::Denied(
+                "EventInput Turn admission cannot also claim a web receipt or retry lineage",
+            ));
+        }
         if start.prompt.trim().is_empty()
             || start.prompt.len() > aw_agent_core::limits::MAX_PROMPT_BYTES
         {
@@ -372,6 +429,17 @@ impl SessionHandle {
                 "review imported history and explicitly acknowledge before execution",
             ));
         }
+        let mut event_causal = event_input
+            .as_deref()
+            .map(|delivery_id| {
+                crate::event_causal::event_input_scope_for_turn(
+                    &tx,
+                    delivery_id,
+                    &self.session,
+                    &b.id,
+                )
+            })
+            .transpose()?;
         let physical_root = key(&s.binding)?;
         let child_run_key = crate::subagents::model_only_child_run_key(
             &tx,
@@ -415,6 +483,32 @@ impl SessionHandle {
                 return Err(Error::Conflict("same-context retry must target the original pinned head; fork from it or create a new operation"));
             }
             let old_identity: aw_agent_core::InvocationIdentity = decode(&identity)?;
+            let prior_causal: Option<(Option<String>, Option<u64>)> = db(tx
+                .query_row(
+                    "SELECT event_causal_root,event_causal_parent_hop
+                     FROM runs
+                     WHERE operation_id=?1
+                     ORDER BY attempt_no DESC LIMIT 1",
+                    [&existing],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional())?;
+            if let Some((root, parent_hop)) = prior_causal {
+                match (root, parent_hop) {
+                    (Some(root), Some(parent_event_hop)) => {
+                        event_causal = Some(crate::event_causal::CausalScope {
+                            root,
+                            parent_event_hop,
+                        });
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(Error::Storage(
+                            "retry run causal root/hop columns are inconsistent",
+                        ))
+                    }
+                }
+            }
             if !same_retry_destination(&old_identity, &start.identity) {
                 return Err(Error::Denied(
                     "same-context retry must keep the original account/model/payer/custody/executor selection",
@@ -480,7 +574,37 @@ impl SessionHandle {
         if attempt_no > policy.max_attempts.max(1) {
             return Err(Error::Conflict("retry policy exhausted before dispatch"));
         }
-        db(tx.execute("INSERT INTO runs(id,session_id,branch_id,turn_id,prompt_node,identity_json,root_key,status,started_at,operation_id,attempt_no,produced_from_head,produced_from_revision,attach_status,produced_from_writer_epoch,owner_process_id,owner_store_generation) VALUES(?1,?2,?3,?4,?5,?6,?7,'running',?8,?9,?10,?11,?12,'pending',?13,?14,?15)",params![run,self.session,b.id,start.turn_id,node,json(&start.identity)?,root,now(),operation,attempt_no,b.head,b.revision,writer.writer_epoch,process.as_ref().map(|p|p.process_id.as_str()),process.as_ref().map(|p|p.store_generation)]))?;
+        db(tx.execute(
+            "INSERT INTO runs(
+                 id,session_id,branch_id,turn_id,prompt_node,identity_json,root_key,status,
+                 started_at,operation_id,attempt_no,produced_from_head,produced_from_revision,
+                 attach_status,produced_from_writer_epoch,owner_process_id,owner_store_generation,
+                 event_input_delivery_id,event_causal_root,event_causal_parent_hop
+             ) VALUES(
+                 ?1,?2,?3,?4,?5,?6,?7,'running',?8,?9,?10,?11,?12,'pending',?13,?14,?15,
+                 ?16,?17,?18
+             )",
+            params![
+                run,
+                self.session,
+                b.id,
+                start.turn_id,
+                node,
+                json(&start.identity)?,
+                root,
+                now(),
+                operation,
+                attempt_no,
+                b.head,
+                b.revision,
+                writer.writer_epoch,
+                process.as_ref().map(|p| p.process_id.as_str()),
+                process.as_ref().map(|p| p.store_generation),
+                event_input.as_deref(),
+                event_causal.as_ref().map(|scope| scope.root.as_str()),
+                event_causal.as_ref().map(|scope| scope.parent_event_hop),
+            ],
+        ))?;
         db(tx.execute("INSERT INTO llm_attempts(id,operation_id,attempt_no,run_id,dispatch_state,started_at) VALUES(?1,?2,?3,?4,'admitted',?5)",params![id("att")?,operation,attempt_no,run,now()]))?;
         db(tx.execute(
             "UPDATE llm_operations SET prompt_node=?1,state='running',settled_at=NULL WHERE id=?2",

@@ -30,6 +30,7 @@ pub(crate) struct EventEnvelope {
     pub(crate) turn: Option<u64>,
     pub(crate) causal_root: Option<String>,
     pub(crate) causal_hop: u64,
+    pub(crate) disclosure_manifest: Option<String>,
 }
 
 pub(crate) fn authorize_agent_ref(
@@ -122,9 +123,7 @@ pub(crate) fn source_visibility(
     })
 }
 
-pub(crate) fn candidate_authority(
-    candidate: &EventCandidate,
-) -> Result<EventAuthorization<EventEnvelope>> {
+pub(crate) fn candidate_envelope(candidate: &EventCandidate) -> Result<EventEnvelope> {
     let concrete = aw_tools::event_subject::EventSubject::parse(&candidate.subject)
         .map_err(|_| Error::Storage("Event projection subject is not canonical"))?;
     if concrete.source_ref() != candidate.source.reference {
@@ -147,8 +146,16 @@ pub(crate) fn candidate_authority(
             "DL-200 Event envelope disagrees with its projection",
         ));
     }
-    if marker.get("disclosure_manifest").is_some() {
-        return Ok(EventAuthorization::Unknown);
+    let disclosure_manifest = marker
+        .get("disclosure_manifest")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if disclosure_manifest.as_ref().is_some_and(|manifest| {
+        manifest.len() != 64
+            || !manifest.is_ascii()
+            || !manifest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(Error::Storage("invalid DL-200 Event disclosure manifest"));
     }
     if let Some(data) = marker.get("data") {
         validate_data(data).map_err(|_| Error::Storage("invalid retained DL-200 Event data"))?;
@@ -190,13 +197,32 @@ pub(crate) fn candidate_authority(
     }) {
         return Err(Error::Storage("invalid DL-200 Event causal root"));
     }
-    Ok(EventAuthorization::Allow(EventEnvelope {
+    Ok(EventEnvelope {
         data: marker.get("data").cloned(),
         actor,
         turn,
         causal_root,
         causal_hop,
-    }))
+        disclosure_manifest,
+    })
+}
+
+pub(crate) fn candidate_authority(
+    connection: &Connection,
+    actor: &PrincipalId,
+    candidate: &EventCandidate,
+) -> Result<EventAuthorization<EventEnvelope>> {
+    let envelope = candidate_envelope(candidate)?;
+    let Some(manifest) = envelope.disclosure_manifest.as_deref() else {
+        return Ok(EventAuthorization::Allow(envelope));
+    };
+    match crate::history_owner::authorize_event_manifest_reader(connection, actor, manifest)? {
+        crate::history_owner::DisclosureAuthorization::Allow { .. } => {
+            Ok(EventAuthorization::Allow(envelope))
+        }
+        crate::history_owner::DisclosureAuthorization::Deny => Ok(EventAuthorization::Deny),
+        crate::history_owner::DisclosureAuthorization::Unknown => Ok(EventAuthorization::Unknown),
+    }
 }
 
 pub(crate) fn validate_data(data: &serde_json::Value) -> Result<()> {

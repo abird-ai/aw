@@ -287,7 +287,9 @@ fn read_cursor_page(
                     &mut authority_cache,
                 )
             },
-            |candidate, _source_evidence| event_authority::candidate_authority(candidate),
+            |candidate, _source_evidence| {
+                event_authority::candidate_authority(&tx, actor, candidate)
+            },
         )?;
         match result {
             EventScanResult::Candidate {
