@@ -209,11 +209,16 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       the hot exposure projection remains unchanged. `JobHost` projects the same value from immutable
       TaskIdentity for bounded finite list/get/ack/send/cancel receipts; raw `jobs_read` bytes and
       `ProcessTerminal` remain untouched. `ModelProcessFact` freezes canonical Agent/Turn/actor at Prepared
-      and reduced close/terminate receipts expose it without private Process metadata. Still open in Phase 1:
-      only consumer-required Agent exposure/index normalization/rebuild and any exact remaining non-current
-      host operation required by the sealed surface. Event provenance/cutover remains Phase 2. Public
-      fresh/derived `sandbox.create` remains Phase-3 work with SourceDriver/checkpoint semantics; defer
-      reachability/flatten acceleration until a real consumer requires it.
+      and reduced close/terminate receipts expose it without private Process metadata.
+      **Agent exposure/index normalization is now complete:** `agent_state_current` remains authoritative;
+      owner-locked Store open compares the rebuildable mixed exposure projection and, only on mismatch,
+      replaces Agent rows from authoritative state while recovering immutable original positions from
+      `session.created`/`branch.created` commit evidence. No synthetic events/revs/clocks are created, finite
+      Job rows are preserved, and exact projections are a zero-write no-op. Still open in Phase 1: expose the
+      already-existing Store `agent.list/get/edit/admission/access.list/access.set` operations through one
+      dedicated native `AgentStatePort`; then re-audit the sealed host surface. Event provenance/cutover
+      remains Phase 2. Public fresh/derived `sandbox.create` remains Phase-3 work with SourceDriver/checkpoint
+      semantics; defer reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

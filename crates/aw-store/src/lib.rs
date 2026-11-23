@@ -2836,6 +2836,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     if current == 42 {
         migrate_agent_input_replay(c)?;
     }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current >= 38 {
+        job_exposure::normalize_agent_exposures(c)?;
+    }
     let check: String = db(c.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if check != "ok" {
         return Err(Error::Storage("SQLite integrity check failed"));

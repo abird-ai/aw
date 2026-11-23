@@ -483,26 +483,37 @@ reduced model-facing close-stdin/terminate receipts expose only that canonical A
 alongside their existing safe fact/handle/state fields; PID/program/argv/env/output/private Session IDs stay
 out of the receipt.
 
+The Phase-1 Agent exposure/index boundary is now normalized to the authoritative owner. `agent_state_current`
+already has the exact project/list indexes needed for `agent.list`; `job_exposure_current` remains the
+separate rebuildable mixed Agent/finite-Job lookup/list projection. Owner-locked `SessionStore::open()` now
+performs a cheap exact comparison after schema activation. When Agent exposure rows are missing/stale it
+rebuilds **only** those rows from `agent_state_current`, deriving each original publication position from
+its immutable `session.created`/`branch.created` commit evidence. It emits no synthetic event/audit, never
+changes Agent rev/lifecycle/title/lineage, and leaves finite Job rows untouched. Trusted-local direct mode
+still never migrates/repairs. The old `repair_missing_agent_exposures` path is explicitly pre-v38 migration
+compatibility only.
+
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
 `agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
 custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding,
 native Sandbox list/get/close, the v42 staged input-plan owner, atomic v43 Send composition, durable
 add/edit/delete replay, all five native `agent.inputs.*` host methods, committed Turn/Tool/model attribution,
-and finite Process/Job-facing provenance are complete. Remaining Phase-1 work is only final
-consumer-required projections/exposure normalization and any exact remaining non-current host operations
-required by the sealed surface. Event-source provenance/cutover remains Phase 2 rather than being pulled
-forward. Public
+finite Process/Job-facing provenance, and authoritative Agent exposure/index normalization are complete.
+The remaining concrete Phase-1 host gap found by this audit is dedicated native RPC exposure for the
+already-implemented Store operations `agent.list`, `agent.get`, `agent.edit`, `agent.admission`,
+`agent.access.list` and `agent.access.set`; today the dedicated headless ports cover create/close/inputs but
+not those six operations. Event-source provenance/cutover remains Phase 2 rather than being pulled forward.
+Public
 `sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed SourceDriver/checkpoint
 preparation semantics belong. Trusted delegation into another principal's Project also remains a separate
 future host-policy capability; it is not smuggled through the raw Project field. History ancestry still
 grants none of those authorities.
 
-Phase 1 is therefore still **underway**, but provenance propagation for the owners intentionally in this
-phase is now complete. The next slice is a fresh review of the **consumer-required Agent exposure/index
-normalization/rebuild boundary** and any exact remaining non-current host operation from the sealed spec;
-if the existing indexed exposure owner already satisfies those consumers, document/qualify it rather than
-adding machinery. Event provenance/delivery cutover stays Phase 2; do not prebuild Phase-2/4 engines or add
-reachability/flatten acceleration until a consumer proves it necessary.
+Phase 1 is therefore still **underway**, but provenance and the consumer-required Agent exposure/index
+normalization are now complete. The next coherent slice is one thin concurrent **`AgentStatePort`** over the
+existing authoritative Store methods for `agent.list/get/edit/admission/access.list/access.set`, with strict
+sealed parameter parsing and no second state/replay owner. After that, re-audit the sealed host surface; do
+not pull Phase-2 Events, Phase-3 Vault/Sandbox materialization or Phase-4 high-water/tree traversal forward.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
 backfill remain green; group access/wake/history fencing remains green. The focused **v40 -> v41**
@@ -534,8 +545,12 @@ the existing contextless explicit-owner Job regression proves adapter provenance
 bound Agent + immutable TaskIdentity; the bounded receipt regression proves canonical attribution is never
 silently truncated; and the existing Process close-stdin + terminate regressions prove durable
 `ModelProcessFact` and reduced model receipts agree on canonical Agent/Turn/actor while retaining the
-existing no-PID/program/env disclosure boundary. `cargo check -p aw-store -p aw-tools-adapter -p aw-cli
---tests`, strict all-target Clippy and repository fmt are green for this cut. A broader historical
+existing no-PID/program/env disclosure boundary. The authoritative Agent-exposure rebuild regression now
+also deletes every Agent projection row after real title/admission mutations and a published finite Job,
+rebuilds from `agent_state_current`, proves both Agent snapshots/revisions and original publication positions
+are unchanged, proves the finite row survives, proves commit-log cardinality is unchanged, and proves a
+second normalization pass is a no-op. `cargo check -p aw-store --tests`, strict aw-store all-target Clippy
+and repository fmt are green for this cut. A broader historical
 Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
 fixtures remain outside this focused Agent/Sandbox cut.
 The host-created Agent activation regression now also closes that non-current child through
