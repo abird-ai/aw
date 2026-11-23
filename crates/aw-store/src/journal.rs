@@ -1925,6 +1925,8 @@ fn persist_finish_in(c: &Connection, run: &str, mut turn: Turn, recovered: bool)
         params![now(), session],
     ))?;
     let txid = crate::durability::tx_id()?;
+    let agent_ref =
+        crate::agent_owner::canonical_ref(c, crate::agent_owner::AgentKey::new(&session, &branch))?;
     // Once the provider outcome/unknown state is durably represented in the
     // operation ledger, the process-coordination lease no longer owns replay
     // safety. Releasing it here never turns an unknown call into a retry; retry
@@ -1937,7 +1939,17 @@ fn persist_finish_in(c: &Connection, run: &str, mut turn: Turn, recovered: bool)
         "llm_operation",
         &operation,
         Some(&who.actor),
-        serde_json::json!({"session_id":session,"branch_id":branch,"run_id":run,"attempt_no":attempt_no,"outcome":status,"dispatch_unknown":unknown>0,"attach_status":"pending"}),
+        serde_json::json!({
+            "agent_ref":agent_ref,
+            "turn":turn.id,
+            "session_id":session,
+            "branch_id":branch,
+            "run_id":run,
+            "attempt_no":attempt_no,
+            "outcome":status,
+            "dispatch_unknown":unknown>0,
+            "attach_status":"pending"
+        }),
     )?;
     Ok(())
 }

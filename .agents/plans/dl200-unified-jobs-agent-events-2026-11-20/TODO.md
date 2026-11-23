@@ -197,13 +197,16 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       methods are now exposed together** through one `AgentInputsPort`; add/edit/delete share the same v43
       stable-user/request replay owner, exact replays perform no new SecretStore write or revision bump, and
       changed semantics under the same request ID conflict. RPC frame ID is the mutation identity, strict
-      field whitelists block authority-bearing extras, and only Send touches Router/live Runtime. Still open
-      in Phase 1: provenance propagation and only consumer-required projections. Public fresh/derived
-      `sandbox.create` remains Phase-3 work
-      with SourceDriver/checkpoint semantics. After that
-      propagate provenance
-      through new Event/Tool/Process/model facts, add only consumer-required snapshots/exposure rebuild,
-      and defer reachability/flatten acceleration until a real consumer requires it.
+      field whitelists block authority-bearing extras, and only Send touches Router/live Runtime.
+      **Committed Turn/Tool/model provenance is now projected from the existing v40 history owner:** one
+      batched `TurnFactProvenance` preserves original canonical Agent/Turn/actor/timestamp through exact
+      forks, `jobs_read` explicit history records carry it, default result reads remain unchanged, and
+      `llm.attempt_settled` commit evidence now names canonical Agent + Turn while retaining internal
+      Session/branch locators. No new provenance schema or hot Tool/Invocation fields were added. Still open
+      in Phase 1: finite Process/Job-facing provenance plus only consumer-required projections/exposure
+      normalization. Event provenance/cutover remains Phase 2. Public fresh/derived `sandbox.create`
+      remains Phase-3 work with SourceDriver/checkpoint semantics; defer reachability/flatten acceleration
+      until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

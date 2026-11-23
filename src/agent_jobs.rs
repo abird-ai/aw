@@ -9,7 +9,7 @@ use aw_agent_core::{
     tool::{ToolBindingAuthority, ToolBindingSnapshot, ToolCapabilitySnapshot},
     Outcome, PrincipalId, ToolContext, ToolEffect, ToolOutput, ToolSource, ToolStatus,
 };
-use aw_store::{QueueState, SessionStore};
+use aw_store::{QueueState, SessionStore, TurnFactProvenance};
 use aw_store_api::{AgentBindingInfo, SessionBackend, SessionView};
 use aw_tools::{
     execution_ref::{AgentRef, ExecutionRef, ExecutionSegment},
@@ -25,7 +25,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -855,12 +855,22 @@ impl Router {
         }
     }
 
-    fn message_records(turn: &aw_agent_core::Turn) -> Vec<Value> {
+    fn provenance(
+        provenance: &BTreeMap<u64, TurnFactProvenance>,
+        turn: u64,
+    ) -> Result<&TurnFactProvenance> {
+        provenance
+            .get(&turn)
+            .ok_or(Error::Storage("committed Turn provenance disappeared"))
+    }
+
+    fn message_records(turn: &aw_agent_core::Turn, provenance: &TurnFactProvenance) -> Vec<Value> {
         let mut records = vec![json!({
             "turn": turn.id,
             "kind": "message",
             "role": "user",
             "content": turn.prompt,
+            "provenance": provenance,
         })];
         if !turn.answer.is_empty() {
             records.push(json!({
@@ -868,6 +878,7 @@ impl Router {
                 "kind": "message",
                 "role": "assistant",
                 "content": turn.answer,
+                "provenance": provenance,
             }));
         }
         records
@@ -875,6 +886,7 @@ impl Router {
 
     fn tool_call_records(
         turn: &aw_agent_core::Turn,
+        provenance: &TurnFactProvenance,
         tools: Option<&[String]>,
         exclude: bool,
     ) -> Vec<Value> {
@@ -896,6 +908,7 @@ impl Router {
                     "id": record.call.id,
                     "tool": record.call.name,
                     "status": Self::tool_status(&record.status),
+                    "provenance": provenance,
                     // Arguments are intentionally omitted until current resource
                     // disclosure can be revalidated independently.
                     "arguments_redacted": true,
@@ -907,6 +920,7 @@ impl Router {
     fn history_records(
         &self,
         target: &Target,
+        caller: &PrincipalId,
         request: &AgentJobRead,
         view: &SessionView,
     ) -> Result<Vec<Value>> {
@@ -944,14 +958,38 @@ impl Router {
             })]);
         }
 
+        let binding = match target {
+            Target::Agent { binding, .. } | Target::Turn { binding, .. } => binding,
+        };
+        let turn_ids = turns.iter().map(|turn| turn.id).collect::<Vec<_>>();
+        let provenance = self.store.agent_turn_provenance(
+            caller,
+            &binding.session_id,
+            &binding.branch_id,
+            &turn_ids,
+        )?;
+
         if selected_view == Some("messages") {
-            return Ok(turns.into_iter().flat_map(Self::message_records).collect());
+            let mut records = Vec::new();
+            for turn in turns {
+                records.extend(Self::message_records(
+                    turn,
+                    Self::provenance(&provenance, turn.id)?,
+                ));
+            }
+            return Ok(records);
         }
         if selected_view == Some("tool_calls") {
-            return Ok(turns
-                .into_iter()
-                .flat_map(|turn| Self::tool_call_records(turn, None, false))
-                .collect());
+            let mut records = Vec::new();
+            for turn in turns {
+                records.extend(Self::tool_call_records(
+                    turn,
+                    Self::provenance(&provenance, turn.id)?,
+                    None,
+                    false,
+                ));
+            }
+            return Ok(records);
         }
 
         let Some(filter) = request.filter.as_ref() else {
@@ -960,13 +998,15 @@ impl Router {
         if filter == "none" {
             let mut records = Vec::new();
             for turn in turns {
-                records.extend(Self::message_records(turn));
-                records.extend(Self::tool_call_records(turn, None, false));
+                let provenance = Self::provenance(&provenance, turn.id)?;
+                records.extend(Self::message_records(turn, provenance));
+                records.extend(Self::tool_call_records(turn, provenance, None, false));
                 if !turn.answer.is_empty() {
                     records.push(json!({
                         "turn": turn.id,
                         "kind": "result",
                         "content": turn.answer,
+                        "provenance": provenance,
                     }));
                 }
             }
@@ -1003,19 +1043,26 @@ impl Router {
 
         let mut records = Vec::new();
         for turn in turns {
+            let provenance = Self::provenance(&provenance, turn.id)?;
             if messages != exclude {
-                records.extend(Self::message_records(turn));
+                records.extend(Self::message_records(turn, provenance));
             }
             if tool_calls {
-                records.extend(Self::tool_call_records(turn, tools.as_deref(), exclude));
+                records.extend(Self::tool_call_records(
+                    turn,
+                    provenance,
+                    tools.as_deref(),
+                    exclude,
+                ));
             } else if exclude {
-                records.extend(Self::tool_call_records(turn, None, false));
+                records.extend(Self::tool_call_records(turn, provenance, None, false));
             }
             if result != exclude && !turn.answer.is_empty() {
                 records.push(json!({
                     "turn": turn.id,
                     "kind": "result",
                     "content": turn.answer,
+                    "provenance": provenance,
                 }));
             }
         }
@@ -1052,7 +1099,7 @@ impl Router {
             Target::Agent { binding, .. } | Target::Turn { binding, .. } => binding,
         };
         let disclosure = self.disclosure_fingerprint(&ctx.actor, binding)?;
-        let records = self.history_records(target, request, &view)?;
+        let records = self.history_records(target, &ctx.actor, request, &view)?;
 
         // Natural/latest result is one value, not a history page.
         if request
@@ -2780,6 +2827,17 @@ mod tests {
         let mut lines = first_page.content.lines();
         let first_record = lines.next().expect("one history record");
         assert!(first_record.contains(r#""kind":"message""#));
+        let first_record: Value = serde_json::from_str(first_record).unwrap();
+        assert_eq!(
+            first_record["provenance"]["original_agent"],
+            Router::canonical(&binding)
+        );
+        assert_eq!(first_record["provenance"]["original_turn"], 1);
+        assert_eq!(
+            first_record["provenance"]["actor"],
+            serde_json::Value::String(actor.as_str().to_owned())
+        );
+        assert!(first_record["provenance"]["created_at"].as_i64().is_some());
         let marker = lines.next().expect("history continuation marker");
         let cursor = marker
             .strip_prefix("more cursor=")

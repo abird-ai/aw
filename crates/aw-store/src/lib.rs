@@ -134,7 +134,7 @@ pub use durability::{
 };
 pub use extension_secret::{SecretSettingScope, SecretSettingState, SecretSettingView};
 use fs2::FileExt;
-pub use history_owner::AgentHistoryForkAccess;
+pub use history_owner::{AgentHistoryForkAccess, TurnFactProvenance};
 pub use identity_continuity::*;
 pub use job_exposure::{FiniteExposure, FiniteExposureState};
 pub use journal::SessionHandle;

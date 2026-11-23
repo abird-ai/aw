@@ -13,7 +13,7 @@ use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MANIFEST_FANOUT: usize = 64;
 const MAX_MANIFEST_INPUTS: usize = 16_384;
@@ -34,6 +34,15 @@ pub(crate) struct HistoryBaseRef {
 pub enum AgentHistoryForkAccess {
     Private,
     Inherit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnFactProvenance {
+    pub original_agent: String,
+    pub original_turn: u64,
+    pub actor: PrincipalId,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,7 +397,7 @@ fn inherited_parent_for_seal(
     Ok(None)
 }
 
-fn inherited_projected_nodes(connection: &Connection, base_id: &str) -> Result<Vec<crate::Node>> {
+fn inherited_span_chain(connection: &Connection, base_id: &str) -> Result<Vec<String>> {
     let mut chain = Vec::new();
     let mut cursor = Some(base_id.to_owned());
     while let Some(base) = cursor {
@@ -406,33 +415,46 @@ fn inherited_projected_nodes(connection: &Connection, base_id: &str) -> Result<V
         cursor = parent;
     }
     chain.reverse();
+    Ok(chain)
+}
 
+fn verified_span_nodes(connection: &Connection, span: &str) -> Result<(String, Vec<crate::Node>)> {
+    let (source_agent, backing_session): (String, String) = db(connection.query_row(
+        "SELECT source_agent_ref,backing_session_id FROM history_spans WHERE span_id=?1",
+        [span],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    let mut query = db(connection.prepare(
+        "SELECT node_id,node_digest FROM history_span_nodes
+         WHERE span_id=?1 ORDER BY ordinal LIMIT ?2",
+    ))?;
+    let rows = db(query.query_map(
+        params![span, (crate::MAX_SESSION_NODES + 1) as i64],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ))?;
+    let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    if rows.len() > crate::MAX_SESSION_NODES {
+        return Err(Error::Limit("HistorySpan exceeds projection bound"));
+    }
+    let mut nodes = Vec::with_capacity(rows.len());
+    for (node_id, expected_digest) in rows {
+        let actual_digest = raw_node_digest(connection, &backing_session, &node_id)?;
+        if actual_digest != expected_digest {
+            return Err(Error::Storage("HistorySpan backing node digest changed"));
+        }
+        nodes.push(crate::node_in(connection, &backing_session, &node_id)?);
+    }
+    Ok((source_agent, nodes))
+}
+
+fn inherited_projected_nodes(connection: &Connection, base_id: &str) -> Result<Vec<crate::Node>> {
     let mut nodes = Vec::new();
-    for span in chain {
-        let backing_session: String = db(connection.query_row(
-            "SELECT backing_session_id FROM history_spans WHERE span_id=?1",
-            [&span],
-            |row| row.get(0),
-        ))?;
-        let mut query = db(connection.prepare(
-            "SELECT node_id,node_digest FROM history_span_nodes
-             WHERE span_id=?1 ORDER BY ordinal LIMIT ?2",
-        ))?;
-        let rows = db(query.query_map(
-            params![span, (crate::MAX_SESSION_NODES + 1) as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        ))?;
-        let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
-        if nodes.len().saturating_add(rows.len()) > crate::MAX_SESSION_NODES {
+    for span in inherited_span_chain(connection, base_id)? {
+        let (_, span_nodes) = verified_span_nodes(connection, &span)?;
+        if nodes.len().saturating_add(span_nodes.len()) > crate::MAX_SESSION_NODES {
             return Err(Error::Limit("inherited history exceeds projection bound"));
         }
-        for (node_id, expected_digest) in rows {
-            let actual_digest = raw_node_digest(connection, &backing_session, &node_id)?;
-            if actual_digest != expected_digest {
-                return Err(Error::Storage("HistorySpan backing node digest changed"));
-            }
-            nodes.push(crate::node_in(connection, &backing_session, &node_id)?);
-        }
+        nodes.extend(span_nodes);
     }
     Ok(nodes)
 }
@@ -460,6 +482,101 @@ pub(crate) fn effective_history(
     }
     nodes.extend(local);
     context::history_from_projected_nodes(connection, session, nodes, session.next_turn)
+}
+
+fn collect_turn_provenance(
+    out: &mut BTreeMap<u64, TurnFactProvenance>,
+    wanted: &BTreeSet<u64>,
+    original_agent: &str,
+    nodes: impl IntoIterator<Item = crate::Node>,
+) -> Result<()> {
+    for node in nodes {
+        if node.kind != "turn" {
+            continue;
+        }
+        let Some(turn) = node.payload.get("id").and_then(serde_json::Value::as_u64) else {
+            return Err(Error::Storage("committed Turn node is missing its Turn ID"));
+        };
+        if !wanted.contains(&turn) {
+            continue;
+        }
+        let provenance = TurnFactProvenance {
+            original_agent: original_agent.to_owned(),
+            original_turn: turn,
+            actor: node.actor,
+            created_at: node.created_at,
+        };
+        if let Some(existing) = out.get(&turn) {
+            if existing != &provenance {
+                return Err(Error::Storage(
+                    "committed Turn has conflicting immutable provenance",
+                ));
+            }
+        } else {
+            out.insert(turn, provenance);
+        }
+    }
+    Ok(())
+}
+
+impl SessionStore {
+    /// Batch immutable attribution for already-committed Turns. This is a
+    /// projection over the v40 HistoryBase/span chain plus the current local
+    /// branch; it owns no authority and performs no lazy sealing/write.
+    pub fn agent_turn_provenance(
+        &self,
+        actor: &PrincipalId,
+        session_id: &str,
+        branch_id: &str,
+        turn_ids: &[u64],
+    ) -> Result<BTreeMap<u64, TurnFactProvenance>> {
+        if turn_ids.len() > crate::MAX_SESSION_NODES {
+            return Err(Error::Limit(
+                "Turn provenance request exceeds history bound",
+            ));
+        }
+        let wanted = turn_ids.iter().copied().collect::<BTreeSet<_>>();
+        if wanted.iter().any(|turn| *turn == 0) {
+            return Err(Error::Denied("Turn provenance requires positive Turn IDs"));
+        }
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let connection = self.connection()?;
+        let branch = branch_in(&connection, session_id, branch_id)?;
+        let agent = agent_owner::AgentKey::new(session_id, &branch.id);
+        agent_owner::authorize_permission(
+            &connection,
+            actor,
+            agent,
+            agent_owner::AgentPermission::View,
+        )?;
+        let current_agent = agent_owner::canonical_ref(&connection, agent)?;
+        let base_id: Option<String> = db(connection.query_row(
+            "SELECT history_base_id FROM agent_state_current
+             WHERE session_id=?1 AND branch_id=?2",
+            params![session_id, branch_id],
+            |row| row.get(0),
+        ))?;
+
+        let mut out = BTreeMap::new();
+        if let Some(base_id) = base_id {
+            for span in inherited_span_chain(&connection, &base_id)? {
+                let (source_agent, nodes) = verified_span_nodes(&connection, &span)?;
+                collect_turn_provenance(&mut out, &wanted, &source_agent, nodes)?;
+            }
+        }
+        let local = context::projected(&connection, session_id, &branch.head)?;
+        collect_turn_provenance(&mut out, &wanted, &current_agent, local)?;
+
+        if out.len() != wanted.len() {
+            return Err(Error::Storage(
+                "committed Agent history is missing immutable Turn provenance",
+            ));
+        }
+        Ok(out)
+    }
 }
 
 fn projected_node_digests(
@@ -1982,6 +2099,22 @@ mod tests {
             })
             .await
             .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            let payload: String = connection
+                .query_row(
+                    "SELECT payload_json FROM commit_log
+                     WHERE kind='llm.attempt_settled'
+                       AND json_extract(payload_json,'$.session_id')=?1
+                     ORDER BY seq DESC LIMIT 1",
+                    [&source.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["agent_ref"], source_ref);
+            assert_eq!(payload["turn"], 1);
+        }
 
         let (inherited, inherited_branch) = store
             .create_agent_from_agent_history(
@@ -2005,6 +2138,20 @@ mod tests {
         assert_eq!(inherited_view.history.turns[0].id, 1);
         assert_eq!(inherited_view.history.turns[0].answer, "seed answer");
         assert_eq!(inherited_view.history.next_turn_id, 2);
+        let source_provenance = store
+            .agent_turn_provenance(&owner, &source.id, &source_branch.id, &[1])
+            .unwrap()
+            .remove(&1)
+            .expect("source Turn provenance");
+        let inherited_provenance = store
+            .agent_turn_provenance(&owner, &inherited.id, &inherited_branch.id, &[1])
+            .unwrap()
+            .remove(&1)
+            .expect("inherited Turn provenance");
+        assert_eq!(source_provenance, inherited_provenance);
+        assert_eq!(source_provenance.original_agent, source_ref);
+        assert_eq!(source_provenance.original_turn, 1);
+        assert_eq!(source_provenance.actor, owner);
         let (activated_view, _) = store
             .activate(&owner, &inherited.id, &inherited_branch.id)
             .unwrap();
@@ -2049,6 +2196,12 @@ mod tests {
             .unwrap();
         assert_eq!(reforked_turn_view.history.turns.len(), 1);
         assert_eq!(reforked_turn_view.history.turns[0].id, 1);
+        let reforked_provenance = store
+            .agent_turn_provenance(&owner, &reforked_turn.id, &reforked_turn_branch.id, &[1])
+            .unwrap()
+            .remove(&1)
+            .expect("reforked Turn provenance");
+        assert_eq!(reforked_provenance, source_provenance);
         {
             let connection = store.connection().unwrap();
             let local_nodes: u64 = connection

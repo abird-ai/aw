@@ -440,23 +440,44 @@ add/edit/delete replay is a no-op and changed semantics under the same host requ
 The strict headless regression advertises all five capabilities together, dispatches a valid list once and
 rejects an authority-bearing extra field before the port.
 
+Committed history provenance now has one authoritative projection rather than copied fields on every hot
+record. `TurnFactProvenance {original_agent, original_turn, actor, created_at}` is reconstructed in batches
+from the existing v40 structural history owner: inherited spans reuse their immutable `source_agent_ref` +
+verified backing nodes, while current local continuation uses the authoritative current Agent ref + branch
+ancestry. The inherited-span verifier is shared with effective-history projection, so provenance reads do
+not create a second history walker, table or lazy-seal write. Conflicting duplicate Turn attribution fails
+closed.
+
+Explicit `jobs_read` history records now attach that same provenance envelope to message, assistant result
+and redacted tool-call records. Natural/latest result reads return before the provenance lookup and preserve
+the old plain-content path, so model/default ergonomics and prefix/cache semantics do not change. Tool and
+model invocation structs themselves remain untouched: their factual lineage stays inside the immutable
+TurnJournal and inherits the Turn envelope. Exact source/fork/refork tests prove inherited Turn provenance
+remains byte-for-byte original rather than being re-authored under the destination Agent.
+
+New model-settlement commit evidence (`llm.attempt_settled`) now also carries canonical `agent_ref` + exact
+`turn` alongside retained internal Session/branch/run locators. The commit actor remains the real initiating
+`InvocationIdentity.actor`. Session IDs stay valid private audit locators but are no longer the only public
+provenance referent.
+
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
 `agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
 custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding,
 native Sandbox list/get/close, the v42 staged input-plan owner, atomic v43 Send composition, durable
-add/edit/delete replay and all five native `agent.inputs.*` host methods are complete. Remaining Phase-1
-work is provenance propagation/final consumer-required projections and any remaining non-current host
-operations beyond close. Public
+add/edit/delete replay, all five native `agent.inputs.*` host methods, and committed Turn/Tool/model
+attribution are complete. Remaining Phase-1 work is finite Process/Job-facing provenance, final
+consumer-required projections/exposure normalization, and any remaining non-current host operations beyond
+close. Event-source provenance/cutover remains Phase 2 rather than being pulled forward. Public
 `sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed SourceDriver/checkpoint
 preparation semantics belong. Trusted delegation into another principal's Project also remains a separate
 future host-policy capability; it is not smuggled through the raw Project field. History ancestry still
 grants none of those authorities.
 
-Phase 1 is therefore still **underway**, not complete. Finish that live host composition, then return to
-provenance propagation for newly committed Event/Tool/Process/model facts, minimal authoritative
-snapshots only where a real consumer needs them, and normalization/rebuild of Agent exposure from
-`agent_state_current`; add reachability/flatten acceleration only if a consumer proves it necessary.
-Do not prebuild Phase-2/4 engines.
+Phase 1 is therefore still **underway**, not complete. The next provenance slice is finite Process/Job
+receipts/exposure that still need canonical original-Agent/Turn attribution, followed only by projections a
+real consumer actually requires and any necessary normalization/rebuild of Agent exposure from
+`agent_state_current`. Event provenance/delivery cutover stays Phase 2; do not prebuild Phase-2/4 engines
+or add reachability/flatten acceleration until a consumer proves it necessary.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
 backfill remain green; group access/wake/history fencing remains green. The focused **v40 -> v41**
@@ -478,8 +499,12 @@ input-change fact per successful transaction. The host-activation regression now
 staged followup through `HostAgentInputs`, observes exactly one second provider Turn, proves Send advances
 Agent rev, and replays the same host request without another runtime Input. Existing
 `jobs_send_same_turn_steer_is_custodied_segmented_and_applied_once` and interrupt counterpart remain green
-after the transactional AuthoritySteer accept refactor. `cargo check -p aw-store -p aw-cli --tests`,
-strict all-target Clippy and repository fmt are green for this cut. A broader historical
+after the transactional AuthoritySteer accept refactor. The exact-history fork regression now additionally
+proves source -> fork -> refork Turn provenance preserves the original canonical Agent, Turn, actor and
+timestamp without copied nodes, and verifies `llm.attempt_settled` stores canonical Agent/Turn attribution.
+The paged Agent-history regression proves explicit `jobs_read` message records expose that provenance while
+the default/latest result path remains unchanged. `cargo check -p aw-store -p aw-cli --tests`, strict
+all-target Clippy and repository fmt are green for this cut. A broader historical
 Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
 fixtures remain outside this focused Agent/Sandbox cut.
 The host-created Agent activation regression now also closes that non-current child through
