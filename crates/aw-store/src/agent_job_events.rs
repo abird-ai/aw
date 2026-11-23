@@ -863,6 +863,79 @@ mod tests {
             .expect("Agent Event subject has final Agent token")
             .0;
         let project_pattern = format!("{project_subject_prefix}.a:*.>");
+        let subscription = store
+            .events_subscribe(&actor, &project_pattern, &root, true)
+            .unwrap();
+        assert!(subscription.enabled);
+        assert!(subscription.changed);
+        assert_eq!(subscription.generation, Some(1));
+        assert_eq!(
+            subscription.state,
+            Some(crate::EventSubscriptionState::Active)
+        );
+        let subscription_floor = {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT baseline_position,scan_position,created_at,updated_at
+                     FROM event_subscriptions_current
+                     WHERE recipient_ref=?1 AND subject=?2",
+                    params![&root, &project_pattern],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(subscription_floor.0, subscription_floor.1);
+        let unchanged_subscription = store
+            .events_subscribe(&actor, &project_pattern, &root, true)
+            .unwrap();
+        assert!(!unchanged_subscription.changed);
+        assert_eq!(unchanged_subscription.generation, Some(1));
+        let unchanged_floor = {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT baseline_position,scan_position,created_at,updated_at
+                     FROM event_subscriptions_current
+                     WHERE recipient_ref=?1 AND subject=?2",
+                    params![&root, &project_pattern],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            unchanged_floor, subscription_floor,
+            "active enabled=true must be a zero-write no-op"
+        );
+        let listed_subscriptions = store
+            .events_subscriptions_list(&actor, &root, None, 16)
+            .unwrap();
+        assert_eq!(listed_subscriptions.len(), 1);
+        assert_eq!(listed_subscriptions[0].subject, project_pattern);
+        assert_eq!(listed_subscriptions[0].generation, 1);
+        assert_eq!(
+            listed_subscriptions[0].state,
+            crate::EventSubscriptionState::Active
+        );
+        let public_subscription = serde_json::to_string(&listed_subscriptions[0]).unwrap();
+        assert!(!public_subscription.contains("baseline"));
+        assert!(!public_subscription.contains("scan_position"));
+        assert!(!public_subscription.contains("placement_token"));
+
         let owner_project_cursor = match store
             .events_read_page(&actor, &project_pattern, crate::EventReadAfter::Now, 16)
             .unwrap()
@@ -1119,6 +1192,42 @@ mod tests {
         };
         assert!(owner_empty.events.is_empty());
 
+        let disabled_subscription = store
+            .events_subscribe(&actor, &project_pattern, &root, false)
+            .unwrap();
+        assert!(!disabled_subscription.enabled);
+        assert!(disabled_subscription.changed);
+        assert_eq!(disabled_subscription.generation, Some(1));
+        let reenabled_subscription = store
+            .events_subscribe(&actor, &project_pattern, &root, true)
+            .unwrap();
+        assert!(reenabled_subscription.enabled);
+        assert!(reenabled_subscription.changed);
+        assert_eq!(reenabled_subscription.generation, Some(2));
+        let rebaseline = {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT generation,baseline_position,scan_position,state
+                     FROM event_subscriptions_current
+                     WHERE recipient_ref=?1 AND subject=?2",
+                    params![&root, &project_pattern],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, u64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(rebaseline.0, 2);
+        assert_eq!(rebaseline.1, rebaseline.2);
+        assert!(rebaseline.1 > subscription_floor.0);
+        assert_eq!(rebaseline.3, "active");
+
         let revision = store
             .agent_public_revision(&actor, &session.id, &branch.id)
             .unwrap();
@@ -1222,13 +1331,27 @@ mod tests {
             .unwrap();
         assert!(!already_retired.changed);
 
+        let closing = store.agent_request_close(&actor, &root, None).unwrap();
+        assert_eq!(closing.lifecycle, crate::AgentLifecycle::Closing);
+        let close_disabled = store
+            .events_subscribe(&actor, &project_pattern, &root, false)
+            .unwrap();
+        assert!(!close_disabled.enabled);
+        assert!(!close_disabled.changed);
+        assert_eq!(close_disabled.generation, Some(2));
+        assert!(store
+            .events_subscriptions_list(&actor, &root, None, 16)
+            .unwrap()
+            .is_empty());
+
         let mut connection = store.connection().unwrap();
         let commit_count: u64 = connection
             .query_row("SELECT count(*) FROM commit_log", [], |row| row.get(0))
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE event_read_cursors_current;
+                "DROP TABLE event_subscriptions_current;
+                 DROP TABLE event_read_cursors_current;
                  DROP TABLE event_sources_current;
                  UPDATE store_meta SET value='44' WHERE key='schema_epoch';
                  UPDATE schema_meta
@@ -1243,11 +1366,12 @@ mod tests {
         crate::migrate_event_sources(&mut connection).unwrap();
         crate::migrate_event_read_cursors(&mut connection).unwrap();
         crate::migrate_event_read_placement(&mut connection).unwrap();
+        crate::migrate_event_subscriptions(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            47
+            48
         );
         for source in [&root, &turn_ref] {
             assert_eq!(

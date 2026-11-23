@@ -2954,6 +2954,7 @@ impl SessionStore {
             crate::agent_owner::AgentKey::new(child_session, &child_branch.id),
         )?;
         crate::agent_job_events::retire_recipient_in(&tx, &child_ref)?;
+        crate::event_subscription::disable_recipient_in(&tx, &child_ref)?;
         db(tx.commit())?;
         Ok(())
     }
@@ -3110,10 +3111,10 @@ impl SessionStore {
             &info.child_session_id,
             crate::agent_owner::AgentKey::new(&info.parent_session_id, &info.parent_branch_id),
         )?;
-        crate::agent_owner::close(
-            &tx,
-            crate::agent_owner::AgentKey::new(&info.child_session_id, &child_branch),
-        )?;
+        let child_key = crate::agent_owner::AgentKey::new(&info.child_session_id, &child_branch);
+        let child_ref = crate::agent_owner::canonical_ref(&tx, child_key)?;
+        crate::agent_owner::close(&tx, child_key)?;
+        crate::event_subscription::disable_recipient_in(&tx, &child_ref)?;
         db(tx.commit())?;
         row(&c, id)
     }
@@ -3235,10 +3236,10 @@ impl SessionStore {
             },
             Ok,
         )?;
-        crate::agent_owner::close(
-            &tx,
-            crate::agent_owner::AgentKey::new(&info.child_session_id, &owned_branch),
-        )?;
+        let child_key = crate::agent_owner::AgentKey::new(&info.child_session_id, &owned_branch);
+        let child_ref = crate::agent_owner::canonical_ref(&tx, child_key)?;
+        crate::agent_owner::close(&tx, child_key)?;
+        crate::event_subscription::disable_recipient_in(&tx, &child_ref)?;
         db(tx.commit())?;
         if child_branch.is_some() {
             self.signal_event_wake();
@@ -3344,10 +3345,10 @@ impl SessionStore {
                 &child_session,
                 crate::agent_owner::AgentKey::new(&parent_session, &parent_branch),
             )?;
-            crate::agent_owner::close(
-                c,
-                crate::agent_owner::AgentKey::new(&child_session, &child_branch),
-            )?;
+            let child_key = crate::agent_owner::AgentKey::new(&child_session, &child_branch);
+            let child_ref = crate::agent_owner::canonical_ref(c, child_key)?;
+            crate::agent_owner::close(c, child_key)?;
+            crate::event_subscription::disable_recipient_in(c, &child_ref)?;
         }
         Ok(())
     }

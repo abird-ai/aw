@@ -1393,6 +1393,7 @@ impl SessionStore {
         let (lifecycle, _) = agent_owner::lifecycle(&tx, agent)?;
         agent_owner::request_close(&tx, agent)?;
         crate::agent_job_events::retire_recipient_in(&tx, canonical_ref)?;
+        crate::event_subscription::disable_recipient_in(&tx, canonical_ref)?;
         if lifecycle == "open" {
             audit(
                 &tx,

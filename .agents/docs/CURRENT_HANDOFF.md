@@ -19,9 +19,10 @@ Normative R6 design:
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
 complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
-one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, and the first
-v47 exact-Project wildcard placement are now implemented locally. Wider Principal/Domain selectors,
-subscription/Handler delivery and the v36 delivery cutover remain later Phase-2 work.
+one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
+exact-Project wildcard placement, and the v48 durable subscription state owner are now implemented locally.
+EventInput/subscription delivery, wider Principal/Domain selectors, Handler delivery and the v36 delivery
+cutover remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -38,10 +39,13 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 The local Phase-1 implementation line remains unpublished. Its signed completion checkpoint is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 started at signed local
 checkpoint `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`), followed by
-`7e54a9d248a3b9536e95a62ba1fa1886673fe346` (`Add private Event scan`) and
-`9958b7e80b8aca8c25218b1b96893048f51e29b0` (`Own source Event revisions`). This checkpoint adds the
-first real v46 EventScan consumer and exact-Agent opaque read cursor. The local `origin/main` tracking ref
-is stale and is not publication truth.
+`7e54a9d248a3b9536e95a62ba1fa1886673fe346` (`Add private Event scan`),
+`9958b7e80b8aca8c25218b1b96893048f51e29b0` (`Own source Event revisions`),
+`57d3940d1c50d912e6a39058faee2fa7022f6485` (`Add exact Agent Event reads`),
+`639cebdb86ba729ff992bac4767efab0495f7a54` (`Wake exact Agent Event reads`) and
+`1c777dcf95b7269016d77d53ce884eb8ed187911` (`Broaden Event reads to exact Projects`). This checkpoint
+adds the v48 durable Event subscription owner. The local `origin/main` tracking ref is stale and is not
+publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -648,24 +652,55 @@ Missing current Agent ownership is indeterminate/AuthorizationUnavailable, never
 proven deny. A Project cursor becomes stale if its Workspace is archived/moved away from local hosting or its
 Domain is no longer active; ordinary Agent ACL changes remain visibility changes, not placement staleness.
 
-No durable subscription, Handler, EventInput, EventTypeRegistry or v36 delivery cutover is implemented.
-`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged. The Event
-cursor remains the first implementation of the sealed opaque cursor envelope; extract shared cursor-binding
-mechanics only when the second real cursor consumer lands.
+The second real selector consumer justified one small extraction: `event_placement` now owns the shared
+exact-Agent/exact-Project same-Store placement parse, admission, snapshot, stale/unknown classification and
+placement token. `events.read` still owns its cursor/privacy/source authorization mechanics; the new
+subscription owner reuses only placement affinity rather than duplicating it.
+
+Schema **v48** adds `event_subscriptions_current`. The durable key is exact recipient Agent + normalized
+absolute subject. Each row stores StoreScope + placement affinity, monotonic generation, private
+baseline/scan positions, creating principal + host authority provenance, recipient control/manage evidence,
+and state `active|lagged|disabled`. The shared immutable Event log remains the only backlog: there is no
+per-subscriber Event/message table. `disabled` is a private tombstone so disable→re-enable must mint a
+strictly newer generation and old in-flight admission evidence can never become valid again.
+
+`SessionStore::events_subscribe` implements the sealed idempotent state transitions. Current recipient
+`control` or `manage` is required; enable additionally requires recipient lifecycle `open` and current
+selector admission through the shared same-Store placement owner. First enable commits baseline=scan at the
+current safe Event projection tail in the same `BEGIN IMMEDIATE` transaction. Repeating `enabled=true`
+for a current active row is a zero-write no-op preserving generation, baseline, scan and timestamps.
+Disabled/lagged rows—or an active row whose stored StoreScope/placement affinity is stale—re-enable with
+generation+1 and a fresh future-only baseline. Disable changes active/lagged to the disabled tombstone while
+preserving generation; absent/already-disabled disable is unchanged. Generation exhaustion fails closed.
+
+Recipient close is transactionally fenced across every current Agent close path: explicit host close,
+delegated close request, direct subagent terminal close and restart recovery all disable live Event
+subscriptions in the same Store transaction that changes recipient lifecycle. Management-only
+`events_subscriptions_list` follows the existing canonical-key `after` paging style and exposes only
+subject/generation/live state/creator/authority metadata; baseline, scan, StoreScope and placement tokens
+never leave the owner. Disabled tombstones are omitted. The `lagged` owner state and explicit rebaseline
+semantics exist now, but active→lagged is intentionally **not** manufactured by list/open-time mutation; the
+future subscription scanner will set it when it actually proves retention or placement failure.
+
+No EventInput admission, subscription scanner/delivery, Handler, EventTypeRegistry or v36 delivery cutover
+is implemented yet. Therefore an allowed matching Event cannot be advanced as “delivered” by v48 state
+alone. `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
 
 Current focused Phase-2 evidence: Event-subject/pattern **2/2**; EventScan
 source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing attached-Turn
-coexistence regression **1/1** now covers v47 as well: exact-Agent waiting still returns the three durable
-root/Turn Events, exact-Project `a:*` reads the same three through the shared scanner, an ACL-only observer
-is denied the broad Project cursor, revoke→private-skip→regrant remains non-retroactive on the exact-Agent
-cursor, and v44→v45→v46→v47 migration preserves immutable commit-log cardinality/source next revision.
-Current-schema `aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad
-`aw-store --lib` result remains **226 green / 4 historical stale-downgrade reds** and was not repeated.
+coexistence regression **1/1** now covers v48 subscription ownership in addition to read/wait/Project
+placement: first subscription baseline=scan, repeated active enable leaves positions/timestamps unchanged,
+disable preserves generation 1, re-enable mints generation 2 at the post-Event tail, management inspection
+exposes no private progress fields, recipient close has already disabled the row, and
+v44→v45→v46→v47→v48 migration preserves immutable Event history/source revision. Current-schema
+`aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad `aw-store --lib`
+result remains **226 green / 4 historical stale-downgrade reds** and was not repeated.
 
-**Next Phase-2 slice:** begin the sealed durable Agent Event-subscription owner on the same supported
-same-store placement scopes, with generation/baseline/scan/lag semantics and no copied backlog. Keep wider
-Principal/Domain selectors fail-closed until an existing placement owner can prove them complete; do not
-invent a topology service or merged cross-store cursor.
+**Next Phase-2 slice:** implement the replay-safe typed EventInput admission transaction plus deterministic
+delivery identity/causal-budget owner, then attach the durable subscription as EventScan's second consumer.
+Only that input-owner transaction may accept/dedupe/proven-deny a candidate and advance subscription scan;
+Unknown holds progress, retention/placement failure marks the row lagged, and self-delivery is suppressed.
+Keep protected-manifest delivery fail-closed until its real authority closure exists.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

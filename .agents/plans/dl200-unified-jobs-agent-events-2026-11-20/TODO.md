@@ -290,11 +290,24 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Existing attached-Turn coverage now proves exact-Project `a:*` returns the same three Events,
       ACL-only observer broad admission is denied, exact-Agent wait/revocation semantics remain intact, and
       v44→v45→v46→v47 migration is green under strict all-target Clippy/check.
-      **Next:** implement the durable Event subscription owner over the same supported same-store placement
-      scopes: generation + baseline + private scan position + active/disabled/lagged state, with repeated
-      active `enabled=true` preserving backlog and no copied Event queue. Keep wider selector placement,
-      EventInput/Handler delivery, EventTypeRegistry, protected-manifest authority and explicit v36
-      delivery_cutover_rev as subsequent Phase-2 slices.
+      **v48 durable subscription state owner landed locally:** the second selector consumer extracts one
+      shared private `event_placement` primitive for exact-Agent/exact-Project same-Store affinity. One
+      subscription row is keyed by recipient Agent + normalized subject and stores StoreScope/placement,
+      monotonic generation, private baseline+scan, creator/host authority provenance, recipient management
+      evidence and active|lagged|disabled state; backlog remains only the shared immutable Event log.
+      Enable requires open recipient + current control/manage + selector placement admission. First enable
+      baselines at the safe Event tail; repeated current active enable is a zero-write no-op; disabled,
+      lagged or stale-affinity re-enable increments generation and rebaselines; disable tombstones without
+      changing generation. Every Agent close path disables live rows in the same lifecycle transaction.
+      Management-only bounded inspection exposes no baseline/scan/StoreScope/token. The existing attached-
+      Turn regression proves baseline/scan equality, active replay timestamp/position stability,
+      disable→generation-2 rebaseline, close fencing, private inspection, and
+      v44→v45→v46→v47→v48 migration under strict all-target Clippy/check.
+      **Next:** add the replay-safe typed EventInput admission + deterministic delivery identity/causal
+      budget, then make durable subscription the second EventScan consumer. Accepted/deduped/proven-denied
+      results may advance scan; Unknown must hold; proven retention/placement failure marks lagged;
+      self-delivery is suppressed. Keep protected-manifest delivery fail-closed until the real authority
+      closure exists, and leave Handler/EventTypeRegistry/v36 delivery_cutover_rev for subsequent slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

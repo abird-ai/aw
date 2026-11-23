@@ -35,10 +35,12 @@ mod composite_staging;
 pub mod context;
 mod coordination;
 pub mod durability;
+mod event_placement;
 mod event_projection;
 mod event_read;
 mod event_scan;
 mod event_source;
+mod event_subscription;
 mod extension_secret;
 mod history_owner;
 mod identity_continuity;
@@ -137,6 +139,9 @@ pub use durability::{
     SemanticMaterializedFact, SemanticSyncApply, SemanticSyncBatch,
 };
 pub use event_read::{EventReadAfter, EventReadEvent, EventReadOutcome, EventReadPage};
+pub use event_subscription::{
+    EventSubscriptionState, EventSubscriptionUpdate, EventSubscriptionView,
+};
 pub use extension_secret::{SecretSettingScope, SecretSettingState, SecretSettingView};
 use fs2::FileExt;
 pub use history_owner::{AgentHistoryForkAccess, TurnFactProvenance};
@@ -270,8 +275,10 @@ pub const EVENT_SOURCE_SCHEMA: &str = include_str!("../migrations/045_event_sour
 pub const EVENT_READ_CURSOR_SCHEMA: &str = include_str!("../migrations/046_event_read_cursors.sql");
 pub const EVENT_READ_PLACEMENT_SCHEMA: &str =
     include_str!("../migrations/047_event_read_placement.sql");
+pub const EVENT_SUBSCRIPTION_SCHEMA: &str =
+    include_str!("../migrations/048_event_subscriptions.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 47;
+const LATEST_SCHEMA_VERSION: i64 = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2881,6 +2888,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
         migrate_event_read_placement(c)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 47 {
+        migrate_event_subscriptions(c)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {
         job_exposure::normalize_agent_exposures(c)?;
     }
@@ -3358,6 +3369,52 @@ fn migrate_event_projection(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 44))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_event_subscriptions(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='event-subscriptions',generation=generation+1,
+             target_epoch=48,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(EVENT_SUBSCRIPTION_SCHEMA))?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Event subscription migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='48' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=48,activation_epoch=48,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=48,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 48))?;
     db(tx.commit())?;
     Ok(())
 }
