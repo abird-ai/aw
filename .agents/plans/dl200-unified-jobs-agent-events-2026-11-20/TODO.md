@@ -248,10 +248,21 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       blocked/end outcomes small. Focused pattern 2/2, scanner 1/1 and projection 1/1 are green with strict
       current-schema all-target Clippy/check. The private scanner has a narrow temporary non-test dead-code
       allowance until its first real consumer lands; do not publish a fake API to remove it.
-      **Next:** add real source-local event_rev + transaction-coupled Event emission and exact source/deeper
-      authority composition, then attach the first real Event consumer to this same scanner and remove the
-      temporary reachability allowance. events.read/subscription/Handler, EventTypeRegistry and v36 delivery
-      cutover remain later Phase-2 slices.
+      **v45 source-local Event authorship landed locally:** one generic `event_sources_current` owns
+      exact source ref + first-unissued event_rev + nullable future delivery cutover. Migration seeds every
+      legacy SourceEventBook at its exact next revision without rewriting Event history. New legacy source
+      books align from the generic counter, and Agent/Turn result/settled transitions dual-write real
+      immutable DL-200 envelopes in the same authoritative transaction while legacy delivery ownership
+      remains unchanged. One transition reserves one revision; Turn result+settled share it; legacy and
+      generic revisions must match exactly or the transaction aborts. System envelopes retain canonical
+      subject, factual actor/Turn provenance and source-only disclosure for these metadata facts. Focused
+      legacy 4/4 + subject 2/2 + scanner 1/1 + projection 1/1 + attached-Turn coexistence/migration 1/1 are
+      green with strict current-schema all-target Clippy/check.
+      **Next:** compose exact current Agent/Turn source visibility into EventScan and attach the first real
+      Event consumer, removing the temporary scanner dead-code allowance. Add deeper manifest/provider
+      evidence only for Event types that genuinely carry protected dependencies; do not create a generic
+      manifest authority service. events.read/subscription/Handler, EventTypeRegistry and the explicit v36
+      delivery_cutover_rev transition remain later Phase-2 slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

@@ -38,6 +38,7 @@ pub mod durability;
 mod event_projection;
 #[cfg_attr(not(test), allow(dead_code))]
 mod event_scan;
+mod event_source;
 mod extension_secret;
 mod history_owner;
 mod identity_continuity;
@@ -264,8 +265,9 @@ pub const AGENT_INPUT_PLAN_SCHEMA: &str = include_str!("../migrations/042_agent_
 pub const AGENT_INPUT_REPLAY_SCHEMA: &str =
     include_str!("../migrations/043_agent_input_replay.sql");
 pub const EVENT_PROJECTION_SCHEMA: &str = include_str!("../migrations/044_event_projection.sql");
+pub const EVENT_SOURCE_SCHEMA: &str = include_str!("../migrations/045_event_sources.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 44;
+const LATEST_SCHEMA_VERSION: i64 = 45;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2845,6 +2847,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
         migrate_event_projection(c)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 44 {
+        migrate_event_sources(c)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {
         job_exposure::normalize_agent_exposures(c)?;
     }
@@ -3322,6 +3328,53 @@ fn migrate_event_projection(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 44))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_event_sources(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='event-sources',generation=generation+1,
+             target_epoch=45,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(EVENT_SOURCE_SCHEMA))?;
+    event_source::seed_legacy_sources(&tx)?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Event source migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='45' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=45,activation_epoch=45,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=45,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 45))?;
     db(tx.commit())?;
     Ok(())
 }

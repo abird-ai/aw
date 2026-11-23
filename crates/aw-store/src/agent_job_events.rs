@@ -288,8 +288,10 @@ fn initial_state(
         .map(|turn| turn_is_attached(c, &binding.session_id, &binding.branch_id, turn))
         .transpose()?
         .unwrap_or(false);
+    let source = source_ref(binding, turn);
+    let next_event_rev = crate::event_source::next_event_revision(c, &source)?;
     Ok(SourceState {
-        book: SourceEventBook::default(),
+        book: SourceEventBook::from_next_event_revision(next_event_rev).map_err(Error::Storage)?,
         last_result_turn: match turn {
             Some(turn) if turn_settled => turn,
             Some(_) => 0,
@@ -313,36 +315,60 @@ fn commit_source(
     actor: &PrincipalId,
 ) -> Result<()> {
     let source = source_ref(binding, turn);
-    let Some(mut state) = row(c, &source)? else {
-        return Ok(());
+    let mut state = row(c, &source)?;
+    if let Some(state) = state.as_mut() {
+        if let Some(result_turn) = result_turn {
+            if result_turn <= state.last_result_turn {
+                return Ok(());
+            }
+            state.last_result_turn = result_turn;
+        }
+        if settle {
+            if state.settled {
+                return Ok(());
+            }
+            state.settled = true;
+        }
+    }
+
+    let legacy_revision = if let Some(state) = state.as_mut() {
+        let deliveries = state.book.commit(&source, events).map_err(Error::Storage)?;
+        let revision = state.book.current_event_revision();
+        state.pending.extend(deliveries);
+        Some(revision)
+    } else {
+        None
     };
-    if let Some(result_turn) = result_turn {
-        if result_turn <= state.last_result_turn {
-            return Ok(());
-        }
-        state.last_result_turn = result_turn;
-    }
-    if settle {
-        if state.settled {
-            return Ok(());
-        }
-        state.settled = true;
-    }
-    let deliveries = state.book.commit(&source, events).map_err(Error::Storage)?;
-    state.pending.extend(deliveries);
-    save(c, binding, turn, &state)?;
-    audit(
+    let system_events = events
+        .iter()
+        .map(|event| crate::event_source::SystemEvent::new(event.as_str()))
+        .collect::<Vec<_>>();
+    let event_revision = crate::event_source::emit_system_events(
         c,
-        &binding.session_id,
+        &source,
         actor,
-        "agent.job.event",
-        serde_json::json!({
-            "source_ref": source,
-            "turn_id": turn,
-            "result_turn": result_turn,
-            "events": events.iter().map(|event| event.as_str()).collect::<Vec<_>>(),
-        }),
-    )
+        result_turn.or(turn),
+        &system_events,
+        legacy_revision,
+    )?;
+
+    if let Some(state) = state {
+        save(c, binding, turn, &state)?;
+        audit(
+            c,
+            &binding.session_id,
+            actor,
+            "agent.job.event",
+            serde_json::json!({
+                "source_ref": source,
+                "turn_id": turn,
+                "result_turn": result_turn,
+                "event_rev": event_revision,
+                "events": events.iter().map(|event| event.as_str()).collect::<Vec<_>>(),
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn commit_turn_settled_in(
@@ -350,6 +376,7 @@ pub(crate) fn commit_turn_settled_in(
     session: &str,
     branch: &str,
     turn: u64,
+    actor: &PrincipalId,
 ) -> Result<()> {
     let owner = session_in(c, session)?.owner;
     let binding = agent_binding_in(c, &owner, session, branch)?;
@@ -360,7 +387,7 @@ pub(crate) fn commit_turn_settled_in(
         &[JobEventKind::Result],
         Some(turn),
         false,
-        &owner,
+        actor,
     )?;
     commit_source(
         c,
@@ -369,7 +396,7 @@ pub(crate) fn commit_turn_settled_in(
         &[JobEventKind::Result, JobEventKind::Settled],
         Some(turn),
         true,
-        &owner,
+        actor,
     )
 }
 
@@ -867,6 +894,64 @@ mod tests {
             .iter()
             .any(|delivery| delivery.event == JobEventKind::Settled));
 
+        {
+            let connection = store.connection().unwrap();
+            for source in [&root, &turn_ref] {
+                assert_eq!(
+                    crate::event_source::next_event_revision(&connection, source).unwrap(),
+                    2,
+                    "legacy and DL-200 source revisions must stay aligned"
+                );
+            }
+            let mut query = connection
+                .prepare(
+                    "SELECT p.source_ref,p.subject,p.event_rev,p.event_id,
+                            json_extract(c.payload_json,'$._aw_dl200_event.actor'),
+                            json_extract(c.payload_json,'$._aw_dl200_event.turn')
+                     FROM event_projection_index p
+                     JOIN commit_log c ON c.seq=p.commit_position
+                     WHERE p.source_ref IN (?1,?2)
+                     ORDER BY p.commit_position",
+                )
+                .unwrap();
+            let projected = query
+                .query_map(params![&root, &turn_ref], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(projected.len(), 3);
+            let root_subject =
+                aw_tools::event_subject::EventSubject::from_resource_ref(&root, "result")
+                    .unwrap()
+                    .into_string();
+            assert_eq!(
+                projected
+                    .iter()
+                    .filter(|event| event.0 == root)
+                    .map(|event| (event.1.clone(), event.2))
+                    .collect::<Vec<_>>(),
+                vec![(root_subject, 1)]
+            );
+            let turn_projected = projected
+                .iter()
+                .filter(|event| event.0 == turn_ref)
+                .collect::<Vec<_>>();
+            assert_eq!(turn_projected.len(), 2);
+            assert!(turn_projected.iter().all(|event| event.2 == 1));
+            assert!(turn_projected.iter().all(|event| !event.3.is_empty()));
+            assert!(projected.iter().all(|event| event.4 == actor.as_str()));
+            assert!(projected.iter().all(|event| event.5 == 1));
+        }
+
         store
             .ack_agent_job_event(&actor, &session.id, &branch.id, root_result)
             .unwrap();
@@ -913,5 +998,45 @@ mod tests {
             )
             .unwrap();
         assert!(!already_retired.changed);
+
+        let mut connection = store.connection().unwrap();
+        let commit_count: u64 = connection
+            .query_row("SELECT count(*) FROM commit_log", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE event_sources_current;
+                 UPDATE store_meta SET value='44' WHERE key='schema_epoch';
+                 UPDATE schema_meta
+                    SET schema_epoch=44,activation_epoch=44,migration_phase='ready'
+                    WHERE singleton=1;
+                 UPDATE migration_lease
+                    SET holder_client_id=NULL,current_epoch=44,target_epoch=NULL,lease_expires_at=NULL
+                    WHERE singleton=1;
+                 PRAGMA user_version=44;",
+            )
+            .unwrap();
+        crate::migrate_event_sources(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            45
+        );
+        for source in [&root, &turn_ref] {
+            assert_eq!(
+                crate::event_source::next_event_revision(&connection, source).unwrap(),
+                2,
+                "v44 -> v45 migration must recover the first unissued source revision"
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM commit_log", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            commit_count,
+            "source-state migration must not rewrite immutable Event history"
+        );
     }
 }

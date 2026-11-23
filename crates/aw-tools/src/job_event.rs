@@ -158,6 +158,30 @@ pub struct SourceEventBook {
 }
 
 impl SourceEventBook {
+    /// First source-local Event revision that has not yet been committed.
+    pub fn next_event_revision(&self) -> Result<u64, &'static str> {
+        self.next_event_rev
+            .checked_add(1)
+            .ok_or("Job event revision exhausted")
+    }
+
+    /// Transitional constructor used while DL-200 and the legacy Job-only
+    /// delivery owner share the same source-local revision sequence.
+    pub fn from_next_event_revision(next_event_revision: u64) -> Result<Self, &'static str> {
+        let current = next_event_revision
+            .checked_sub(1)
+            .ok_or("invalid next Job event revision")?;
+        Ok(Self {
+            next_generation: 0,
+            next_event_rev: current,
+            subscriptions: std::collections::BTreeMap::new(),
+        })
+    }
+
+    pub fn current_event_revision(&self) -> u64 {
+        self.next_event_rev
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.subscriptions.values().any(|subscription| {
             let canonical = EventRuleSet::new(subscription.rules.as_slice().iter().copied());

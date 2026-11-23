@@ -12,8 +12,8 @@ use crate::{
 };
 use aw_tools::event_subject::EventSubject;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-const EVENT_MARKER: &str = "_aw_dl200_event";
-const EVENT_MARKER_VERSION: u64 = 1;
+pub(crate) const EVENT_MARKER: &str = "_aw_dl200_event";
+pub(crate) const EVENT_MARKER_VERSION: u64 = 1;
 const STORE_SCHEMA_VERSION: i64 = 44;
 
 #[derive(Clone, Copy)]

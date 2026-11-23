@@ -18,8 +18,8 @@ Normative R6 design:
 ## Current authoritative snapshot — 2026-11-23
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
-complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection
-foundation and the one private EventScan boundary are now implemented locally; real Event emission,
+complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
+one private EventScan, and v45 source-local Event revision/emission owner are now implemented locally.
 events.read/subscription/Handler consumers and the v36 delivery cutover remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
@@ -36,9 +36,10 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 
 The local Phase-1 implementation line remains unpublished. Its signed completion checkpoint is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 started at signed local
-checkpoint `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`); this checkpoint
-adds the private EventScan boundary on top. The local `origin/main` tracking ref is stale and is not
-publication truth.
+checkpoint `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`), followed by
+`7e54a9d248a3b9536e95a62ba1fa1886673fe346` (`Add private Event scan`). This checkpoint adds the v45
+source-local Event owner and first real Agent/Turn system envelopes. The local `origin/main` tracking ref
+is stale and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -560,18 +561,41 @@ consumer to carry `()` for purely local proofs or an owned provider fence/receip
 global authority service or allocation on skip/blocked/end outcomes. Only the already-large visible
 candidate is boxed so the result enum stays small.
 
-No cursor, public `events.read`, subscription, Handler, EventInput, EventTypeRegistry, source-local
-`event_rev` owner or v36 delivery cutover is implemented yet. The scanner/snapshot seam therefore has a
-narrow temporary non-test dead-code allowance until the first real consumer lands; do not make it public
-merely to silence reachability. **Next Phase-2 slice:** establish real source-local Event revision/emission
-and exact source/deeper authority composition, then attach the first real consumer to this scanner and
-remove that temporary allowance.
+Schema **v45** now splits source-local Event revision ownership out of the legacy v36 Job-only
+book without cutting delivery over yet. `event_sources_current` owns exactly the concrete `source_ref`,
+the first unissued `next_event_rev`, and a nullable future `delivery_cutover_rev`. The v44→v45 migration
+parses every legacy `SourceEventBook`, validates its canonical source ref and seeds the generic next
+revision; it does not rewrite commit-log/Event history or claim a cutover. New legacy subscriptions created
+after v45 initialize their book from that same generic next revision, so coexistence cannot silently fork
+the revision sequence.
 
-Current focused Phase-2 evidence: Event-subject/pattern regressions **2/2**, EventScan source-first/
-bounded/Unknown/stale/evidence regression **1/1**, and v44 projection/watermark/rebuild/restore-scope
-regression **1/1** are green. Current-schema `aw-tools + aw-store` all-target check and strict Clippy are
-green. The prior broad `aw-store --lib` result remains **226 green / 4 historical stale-downgrade reds**;
-it was not repeated for this scanner-only cut, and those unrelated fixtures were not modified.
+The first authoritative source family now emits real DL-200 system Events. Attached Turns emit Agent-root
+`result` plus exact-Turn `result + settled`; Agent terminal settlement emits root `settled`. One source
+transition reserves exactly one revision in the existing authoritative transaction, and multiple names from
+that transition share it. If a legacy source book exists, its committed revision is passed as an exact
+expected value; any divergence aborts the transaction. Sources with no legacy subscription still emit DL-200
+Events. The immutable `commit_log` row remains Event truth/id; its bounded marker carries canonical
+subject, source-local revision, factual actor/Turn provenance and causal_hop=0, and v44 projects it in the
+same transaction. System emission rejects custom `#` names, duplicate names, autocommit use, oversized/
+deep/non-object Event data, and revision exhaustion. Metadata-only result/settled Events deliberately attach
+no DisclosureManifest: section 26.5 permits source-policy-only system facts, and the existing history
+manifest code has no generic current-viewer authorizer that should be repurposed into a second policy owner.
+
+No cursor, public `events.read`, subscription, Handler, EventInput, EventTypeRegistry or v36 delivery
+cutover is implemented yet. `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership
+is unchanged. The scanner/snapshot seam therefore still has its narrow temporary non-test dead-code
+allowance until the first real consumer lands. **Next Phase-2 slice:** compose the exact current Agent/Turn
+source-visibility adapter (and deeper evidence only where a real Event carries it), attach the first real
+Event consumer to the existing EventScan, then remove that temporary reachability allowance. Do not invent
+a generic DisclosureManifest authority service merely to satisfy the scanner.
+
+Current focused Phase-2 evidence: legacy Job-event pure tests **4/4**; Event-subject/pattern **2/2**;
+EventScan source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing
+attached-Turn legacy regression **1/1** now additionally proves generic root/Turn next-revision alignment,
+three real projected envelopes at exact revision 1, stable commit-log Event IDs, actor/Turn provenance, and
+v44→v45 reseeding to next revision 2 without changing commit-log cardinality. Current-schema
+`aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad `aw-store --lib`
+result remains **226 green / 4 historical stale-downgrade reds** and was not repeated for this focused cut.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless
