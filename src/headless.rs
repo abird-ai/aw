@@ -59,6 +59,12 @@ pub trait AgentCreatePort: Send + Sync {
     fn apply(&self, request_id: &str, params: Value) -> Result<Value>;
 }
 
+/// Concurrent authenticated Agent state projection/mutation surface. Durable
+/// Agent state, ACLs and revision semantics remain owned by SessionStore.
+pub trait AgentStatePort: Send + Sync {
+    fn apply(&self, method: &str, params: Value) -> Result<Value>;
+}
+
 /// Concurrent host staged-input surface. The transport request ID is the
 /// durable mutation identity for add/edit/delete/send; list remains a pure
 /// snapshot read.
@@ -131,6 +137,9 @@ pub trait Driver {
         None
     }
     fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
+        None
+    }
+    fn agent_state_port(&self) -> Option<Arc<dyn AgentStatePort>> {
         None
     }
     fn agent_inputs_port(&self) -> Option<Arc<dyn AgentInputsPort>> {
@@ -354,6 +363,12 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "actor_query" | "actor_op" => Some(&["operation"]),
         "agent_create" => Some(&["from", "project", "title", "task", "access", "sandbox"]),
         "agent_close" => Some(&["ref", "rev"]),
+        "agent_list" => Some(&["project", "limit", "cursor"]),
+        "agent_get" => Some(&["ref", "include"]),
+        "agent_edit" => Some(&["ref", "title", "rev"]),
+        "agent_admission" => Some(&["ref", "state", "rev"]),
+        "agent_access_list" => Some(&["ref"]),
+        "agent_access_set" => Some(&["ref", "principal", "permissions", "rev"]),
         "agent_inputs_list" => Some(&["ref"]),
         "agent_inputs_add" => Some(&["ref", "items", "rev"]),
         "agent_inputs_edit" => Some(&["ref", "id", "text", "intent", "before", "after", "rev"]),
@@ -470,6 +485,7 @@ struct ReaderPorts {
     live_control: Option<Arc<dyn LiveControlPort>>,
     agent_create: Option<Arc<dyn AgentCreatePort>>,
     agent_close: Option<Arc<dyn AgentClosePort>>,
+    agent_state: Option<Arc<dyn AgentStatePort>>,
     agent_inputs: Option<Arc<dyn AgentInputsPort>>,
     sandbox: Option<Arc<dyn SandboxPort>>,
 }
@@ -593,6 +609,23 @@ fn stdin_reader<R: Read + Send + 'static>(
                 }
             } else if matches!(
                 request.method.as_str(),
+                "agent_list"
+                    | "agent_get"
+                    | "agent_edit"
+                    | "agent_admission"
+                    | "agent_access_list"
+                    | "agent_access_set"
+            ) {
+                if let Some(port) = &ports.agent_state {
+                    let outcome = (|| -> Result<Value> {
+                        validate_method_params(&request.method, &request.params)?;
+                        port.apply(&request.method, request.params.clone())
+                    })();
+                    parsed =
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
+                }
+            } else if matches!(
+                request.method.as_str(),
                 "agent_inputs_list"
                     | "agent_inputs_add"
                     | "agent_inputs_edit"
@@ -651,6 +684,12 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "actor_notice_read":driver.actor_available(),
             "agent_create":driver.agent_create_port().is_some(),
             "agent_close":driver.agent_close_port().is_some(),
+            "agent_list":driver.agent_state_port().is_some(),
+            "agent_get":driver.agent_state_port().is_some(),
+            "agent_edit":driver.agent_state_port().is_some(),
+            "agent_admission":driver.agent_state_port().is_some(),
+            "agent_access_list":driver.agent_state_port().is_some(),
+            "agent_access_set":driver.agent_state_port().is_some(),
             "agent_inputs_list":driver.agent_inputs_port().is_some(),
             "agent_inputs_add":driver.agent_inputs_port().is_some(),
             "agent_inputs_edit":driver.agent_inputs_port().is_some(),
@@ -671,6 +710,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
         live_control: driver.live_control_port(),
         agent_create: driver.agent_create_port(),
         agent_close: driver.agent_close_port(),
+        agent_state: driver.agent_state_port(),
         agent_inputs: driver.agent_inputs_port(),
         sandbox: driver.sandbox_port(),
     };
@@ -1205,6 +1245,17 @@ mod aw_p6_9c_protocol_tests {
     }
 
     #[derive(Default)]
+    struct FakeAgentStatePort {
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+    impl AgentStatePort for FakeAgentStatePort {
+        fn apply(&self, method: &str, params: Value) -> Result<Value> {
+            self.calls.lock().unwrap().push((method.to_owned(), params));
+            Ok(json!({"ref":"/d:d/i:i/p:p/a:a","rev":1}))
+        }
+    }
+
+    #[derive(Default)]
     struct FakeAgentInputsPort {
         calls: Mutex<Vec<(String, String, Value)>>,
     }
@@ -1236,6 +1287,7 @@ mod aw_p6_9c_protocol_tests {
         step_calls: usize,
         prompts: usize,
         create: Arc<FakeAgentCreatePort>,
+        state: Arc<FakeAgentStatePort>,
         inputs: Arc<FakeAgentInputsPort>,
         sandbox: Arc<FakeSandboxPort>,
     }
@@ -1245,6 +1297,9 @@ mod aw_p6_9c_protocol_tests {
         }
         fn agent_create_port(&self) -> Option<Arc<dyn AgentCreatePort>> {
             Some(self.create.clone())
+        }
+        fn agent_state_port(&self) -> Option<Arc<dyn AgentStatePort>> {
+            Some(self.state.clone())
         }
         fn agent_inputs_port(&self) -> Option<Arc<dyn AgentInputsPort>> {
             Some(self.inputs.clone())
@@ -1312,6 +1367,15 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"step","method":"actor_step","params":{}}"#,
             r#"{"v":1,"id":"create","method":"agent_create","params":{"title":"child","task":"work","access":"private","sandbox":"auto"}}"#,
             r#"{"v":1,"id":"create-provider","method":"agent_create","params":{"title":"child","provider":"evil"}}"#,
+            r#"{"v":1,"id":"agents","method":"agent_list","params":{"limit":8}}"#,
+            r#"{"v":1,"id":"agent-get","method":"agent_get","params":{"ref":"."}}"#,
+            r#"{"v":1,"id":"agent-edit","method":"agent_edit","params":{"ref":".","title":"renamed","rev":1}}"#,
+            r#"{"v":1,"id":"agent-admission","method":"agent_admission","params":{"ref":".","state":"held","rev":1}}"#,
+            r#"{"v":1,"id":"agent-access","method":"agent_access_list","params":{"ref":"."}}"#,
+            r#"{"v":1,"id":"agent-grant","method":"agent_access_set","params":{"ref":".","principal":"/d:d/i:other","permissions":["view"],"rev":1}}"#,
+            r#"{"v":1,"id":"agent-provider","method":"agent_get","params":{"ref":".","provider":"evil"}}"#,
+            r#"{"v":1,"id":"agent-sandbox","method":"agent_edit","params":{"ref":".","title":"x","rev":1,"sandbox":"/d:d/i:i/p:p/s:0"}}"#,
+            r#"{"v":1,"id":"agent-owner","method":"agent_access_set","params":{"ref":".","principal":"/d:d/i:other","permissions":["view"],"rev":1,"owner":"/d:d/i:evil"}}"#,
             r#"{"v":1,"id":"inputs-list","method":"agent_inputs_list","params":{"ref":"."}}"#,
             r#"{"v":1,"id":"inputs-raw","method":"agent_inputs_add","params":{"items":[],"provider":"evil"}}"#,
             r#"{"v":1,"id":"sandboxes","method":"sandbox_list","params":{"limit":8}}"#,
@@ -1319,6 +1383,7 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"danger","method":"trusted_bash","params":{"command":"echo no"}}"#,
         ].join("\n")+"\n";
         let create = Arc::new(FakeAgentCreatePort::default());
+        let state = Arc::new(FakeAgentStatePort::default());
         let inputs = Arc::new(FakeAgentInputsPort::default());
         let sandbox = Arc::new(FakeSandboxPort::default());
         let mut fake = BoundFake {
@@ -1328,6 +1393,7 @@ mod aw_p6_9c_protocol_tests {
             step_calls: 0,
             prompts: 0,
             create: create.clone(),
+            state: state.clone(),
             inputs: inputs.clone(),
             sandbox: sandbox.clone(),
         };
@@ -1340,6 +1406,12 @@ mod aw_p6_9c_protocol_tests {
             .collect();
         assert_eq!(rows[0]["data"]["capabilities"]["actor_query"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_create"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_list"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_get"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_edit"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_admission"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_access_list"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_access_set"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_list"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_add"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_edit"], true);
@@ -1358,6 +1430,22 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(create_calls.len(), 1);
         assert_eq!(create_calls[0].0, "create");
         assert_eq!(create_calls[0].1["task"], "work");
+        let state_calls = state.calls.lock().unwrap();
+        assert_eq!(state_calls.len(), 6);
+        assert_eq!(
+            state_calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "agent_list",
+                "agent_get",
+                "agent_edit",
+                "agent_admission",
+                "agent_access_list",
+                "agent_access_set",
+            ]
+        );
         let input_calls = inputs.calls.lock().unwrap();
         assert_eq!(input_calls.len(), 1);
         assert_eq!(input_calls[0].0, "inputs-list");
@@ -1375,6 +1463,11 @@ mod aw_p6_9c_protocol_tests {
         assert!(rows
             .iter()
             .any(|r| r["id"] == "create-provider" && r["data"]["code"] == "protocol"));
+        for id in ["agent-provider", "agent-sandbox", "agent-owner"] {
+            assert!(rows
+                .iter()
+                .any(|r| r["id"] == id && r["data"]["code"] == "protocol"));
+        }
         assert!(rows
             .iter()
             .any(|r| r["id"] == "inputs-raw" && r["data"]["code"] == "protocol"));
@@ -1451,6 +1544,8 @@ mod aw_p6_9c_protocol_tests {
             .collect();
         assert_eq!(result.len(), 6);
         assert_eq!(result[0]["data"]["capabilities"]["actor_query"], false);
+        assert_eq!(result[0]["data"]["capabilities"]["agent_list"], false);
+        assert_eq!(result[0]["data"]["capabilities"]["agent_access_set"], false);
         for event in result.iter().skip(1) {
             assert_eq!(event["data"]["code"], "unsupported_method", "{event}");
         }

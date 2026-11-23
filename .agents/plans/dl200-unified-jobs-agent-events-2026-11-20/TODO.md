@@ -2,7 +2,7 @@
 
 Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
-Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASE 1 UNDERWAY**
+Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASE 1 COMPLETE LOCALLY / PHASE 2 NEXT**
 
 ## Committed
 
@@ -56,7 +56,7 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       than deleting the authorization identity. Unknown outcomes remain tombstones. Long-lived
       admission no longer depends on Session-lifetime audit/event scans, and live capacities remain
       explicitly scoped to active Turns/subscriptions/exposures rather than retained history.
-- [~] **Phase 1 UNDERWAY** — private `StoreScope` reuses existing `store_id` + nonzero
+- [x] **Phase 1 COMPLETE locally** — private `StoreScope` reuses existing `store_id` + nonzero
       `restore_generation`; transparent `StorePos(u64)` carries internal `commit_log.seq`; exact
       Agent lookup reuses indexed `job_exposure_current` with current-authority recheck. **v38
       owner cutover landed:** one exclusive migration transaction creates/seeds
@@ -214,12 +214,19 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       owner-locked Store open compares the rebuildable mixed exposure projection and, only on mismatch,
       replaces Agent rows from authoritative state while recovering immutable original positions from
       `session.created`/`branch.created` commit evidence. No synthetic events/revs/clocks are created, finite
-      Job rows are preserved, and exact projections are a zero-write no-op. Still open in Phase 1: expose the
-      already-existing Store `agent.list/get/edit/admission/access.list/access.set` operations through one
-      dedicated native `AgentStatePort`; then re-audit the sealed host surface. Event provenance/cutover
-      remains Phase 2. Public fresh/derived `sandbox.create` remains Phase-3 work with SourceDriver/checkpoint
-      semantics; defer reachability/flatten acceleration until a real consumer requires it.
-- [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
+      Job rows are preserved, and exact projections are a zero-write no-op. **Native Agent state RPC
+      exposure is now complete:** one concurrent `AgentStatePort` directly composes the existing Store
+      `agent.list/get/edit/admission/access.list/access.set` operations; strict headless whitelists reject
+      provider/model/Sandbox/owner or other unknown authority-bearing fields before dispatch; only `.` or
+      canonical Agent roots are accepted; list/get/access-list remain pure projections; and title/admission/
+      ACL mutations stay in their existing owners. The existing host state-shell regression now exercises a
+      real group ACL grant through `agent_access_set_ref`; the existing strict headless regression exercises
+      all six methods, capability advertisement and authority-field rejection. A fresh SPEC §28 audit found
+      no remaining Phase-1 owner/surface gap. Event provenance/cutover remains Phase 2; Vault bindings and
+      public fresh/derived `sandbox.create` remain Phase 3; View/Extension enrichment and Phase-4 Jobs
+      traversal remain in their sealed later phases. No Phase-2 source was started in this checkpoint.
+      Defer reachability/flatten acceleration until a real consumer requires it.
+- [ ] **Phase 2 NEXT** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
@@ -265,6 +272,10 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
 - [x] 2026-11-22 handoff refresh records the full Phase-1 implementation ledger through
       `0f3f3eb` (`Wire Agent from refs`), current cross-repo refs, validation, exact pending work and
       copy-ready onboarding prompt; AW `CURRENT_HANDOFF` + DL-200 README point to the refreshed docs.
+- [x] 2026-11-23 final Phase-1 native state cut exposes `agent.list/get/edit/admission/access.list/
+      access.set` through one `AgentStatePort` over the authoritative Store, extends only the existing
+      state-shell/headless regressions, and passes strict all-target Clippy. Fresh SPEC §28 audit closes
+      Phase 1 locally; Phase 2 is next and was not started in this checkpoint.
 - [x] Phase 0 shared convergence corrective published after the v0.17.7 worker-retirement finding;
       historical v0.17.6 evidence remains provenance for unchanged semantics, while the stable Spawn
       Facility/launch-gate correction is live in AW `20a63a4` and consumed by dotlink `85ceccc`.

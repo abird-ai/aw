@@ -15,22 +15,28 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Current authoritative snapshot — 2026-11-22
+## Current authoritative snapshot — 2026-11-23
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
-complete and published. Dotlink is repinned to the published corrective AW revision and the ordinary
-Git-pinned consumer gate is green. The user explicitly deferred real-Bubblewrap worker-retirement
-and Windows-native qualification, so Phase 1 is now underway.**
+complete and published. Phase 1 is now COMPLETE locally after the native Agent state-port cut and a fresh
+SPEC §28 audit. Phase 2 is the next implementation phase; no EventScan/Event cutover source was started in
+this checkpoint. Real-Bubblewrap worker-retirement and Windows-native Process qualification remain
+explicitly deferred evidence and are not claimed green.**
 
-Current published refs:
+Verified publication truth:
 
 ```text
-AW current Phase-1 main         0f3f3ebbfaa12e66c1aeb0f5c2a27faf53e84e2e
+AW remote main                  78339410710472ec51d5ff46a5c9e586b67ff30d = Own logical Sandboxes
 AW R6/Phase-0 publication       20a63a4d4547cc20b2a154787823125b82f5e385
-dotlink R6 consumer publication 85ceccc1088e201c98c994a46a68834440eeab32
+dotlink remote/main             85ceccc1088e201c98c994a46a68834440eeab32
 release/0.17                    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
 dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
+
+The local Phase-1 implementation line is unpublished. The prior implementation checkpoint is
+`03d1224ef7b2054b3856fa559dcc23ac666f341f` (`Rebuild Agent exposure from owner state`); docs-only
+handoff commits sit above it, and this checkpoint adds the final Phase-1 native Agent-state exposure.
+The local `origin/main` tracking ref is stale and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -496,27 +502,28 @@ changes Agent rev/lifecycle/title/lineage, and leaves finite Job rows untouched.
 still never migrates/repairs. The old `repair_missing_agent_exposures` path is explicitly pre-v38 migration
 compatibility only.
 
-This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
-`agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
-custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding,
-native Sandbox list/get/close, the v42 staged input-plan owner, atomic v43 Send composition, durable
-add/edit/delete replay, all five native `agent.inputs.*` host methods, committed Turn/Tool/model attribution,
-finite Process/Job-facing provenance, and authoritative Agent exposure/index normalization are complete.
-The remaining concrete Phase-1 host gap found by this audit is dedicated native RPC exposure for the
-already-implemented Store operations `agent.list`, `agent.get`, `agent.edit`, `agent.admission`,
-`agent.access.list` and `agent.access.set`; today the dedicated headless ports cover create/close/inputs but
-not those six operations. Event-source provenance/cutover remains Phase 2 rather than being pulled forward.
-Public
-`sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed SourceDriver/checkpoint
-preparation semantics belong. Trusted delegation into another principal's Project also remains a separate
-future host-policy capability; it is not smuggled through the raw Project field. History ancestry still
-grants none of those authorities.
+The final concrete Phase-1 host gap is now closed. One concurrent **`AgentStatePort`** exposes the
+already-authoritative Store operations `agent.list`, `agent.get`, `agent.edit`, `agent.admission`,
+`agent.access.list` and `agent.access.set`. The headless transport rejects unknown/authority-bearing
+fields before port dispatch; the port accepts only current `.` or canonical Agent roots, keeps list/get/
+access-list as pure Store reads, and delegates title/admission/ACL mutations directly to their existing
+owners. No Agent state table, ACL owner, replay ledger, constructor or authority field was added.
 
-Phase 1 is therefore still **underway**, but provenance and the consumer-required Agent exposure/index
-normalization are now complete. The next coherent slice is one thin concurrent **`AgentStatePort`** over the
-existing authoritative Store methods for `agent.list/get/edit/admission/access.list/access.set`, with strict
-sealed parameter parsing and no second state/replay owner. After that, re-audit the sealed host surface; do
-not pull Phase-2 Events, Phase-3 Vault/Sandbox materialization or Phase-4 high-water/tree traversal forward.
+A fresh SPEC §28 audit after this cut finds no remaining **Phase-1** owner/surface gap. Current/non-current
+`agent.close`, native/public same-user cross-Project `agent.create`, all five `agent.inputs.*` methods,
+logical Sandbox identity/binding plus native list/get/close, immutable history/provenance, finite Job/Process
+provenance and authoritative Agent exposure normalization are all present. The still-later §28 pieces remain
+in their sealed owning phases rather than being pulled forward: Vault bindings and physical/fresh Sandbox
+materialization are Phase 3; generic Event provenance/cutover is Phase 2; View/Extension enrichment and
+later Jobs traversal/high-water work remain in their planned phases. Trusted delegation into another
+principal's Project remains a separate future host-policy capability and is not smuggled through raw
+Project fields. Phase 1 is therefore **COMPLETE locally**; Phase 2 is next.
+
+Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
+also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless
+frame/capability regression exercises all six Agent-state methods plus provider/Sandbox/owner injection
+rejection before port dispatch. Both are green; repository all-target strict Clippy is green. The broader
+Phase-1 evidence remains as recorded below.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
 backfill remain green; group access/wake/history fencing remains green. The focused **v40 -> v41**

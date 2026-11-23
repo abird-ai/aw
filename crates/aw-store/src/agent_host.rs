@@ -1741,18 +1741,42 @@ mod tests {
         assert_eq!(held.admission, AgentAdmission::Held);
         assert!(held.rev > edited.rev);
 
+        let collaborator = PrincipalId::new("internal:fixture:host-agent-collaborator").unwrap();
+        let group = store
+            .create_principal_group(
+                &actor,
+                Some(&root_binding.domain_handle),
+                "Host reviewers",
+                std::slice::from_ref(&collaborator),
+            )
+            .unwrap();
+        let granted = store
+            .agent_access_set_ref(
+                &actor,
+                &created.canonical_ref,
+                &group.reference,
+                Some(AgentPermissions::VIEW_ONLY),
+                held.rev,
+            )
+            .unwrap();
+        assert!(granted.rev > held.rev);
         let access = store
             .agent_access_list_ref(&actor, &created.canonical_ref)
             .unwrap();
-        assert_eq!(access.rev, held.rev);
+        assert_eq!(access.rev, granted.rev);
         assert!(access.caller_permissions.manage);
+        assert!(access.entries.iter().any(|entry| {
+            entry.principal_ref == group.reference
+                && entry.principal_kind == "group"
+                && entry.permissions == AgentPermissions::VIEW_ONLY
+        }));
         assert!(matches!(
             store.agent_finish_close(&actor, &created.canonical_ref),
             Err(Error::Conflict(_))
         ));
 
         let closing = store
-            .agent_request_close(&actor, &created.canonical_ref, Some(held.rev))
+            .agent_request_close(&actor, &created.canonical_ref, Some(granted.rev))
             .unwrap();
         assert_eq!(closing.lifecycle, AgentLifecycle::Closing);
         assert_eq!(closing.admission, AgentAdmission::Held);

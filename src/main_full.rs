@@ -3385,6 +3385,7 @@ struct Host {
     agent_job_runtime: Option<std::sync::Arc<aw_tools_adapter::job_runtime::JobRuntime>>,
     agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentClose>>,
     agent_create_owner: Option<std::sync::Arc<StdioAgentCreatePort>>,
+    agent_state_port: Option<std::sync::Arc<StdioAgentStatePort>>,
     agent_inputs_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
@@ -3426,6 +3427,13 @@ struct StdioAgentCreatePort {
     router: std::sync::Arc<aw::agent_jobs::Router>,
 }
 
+struct StdioAgentStatePort {
+    store: SessionStore,
+    caller: aw::PrincipalId,
+    current_agent_ref: String,
+    current_project_ref: String,
+}
+
 struct StdioAgentInputsPort {
     inner: std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>,
 }
@@ -3434,6 +3442,333 @@ struct StdioSandboxPort {
     store: SessionStore,
     caller: aw::PrincipalId,
     current_project_ref: String,
+}
+
+fn agent_ref_text<'a>(
+    params: &'a serde_json::Value,
+    field: &str,
+    required: bool,
+) -> Result<Option<&'a str>> {
+    let value = params
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(Error::Protocol("Agent ref parameter must be a string"))
+        })
+        .transpose()?;
+    if required && value.is_none() {
+        return Err(Error::Protocol("required Agent ref parameter missing"));
+    }
+    if value.is_some_and(|reference| {
+        reference.is_empty()
+            || reference.len() > 2048
+            || !reference.is_ascii()
+            || reference.chars().any(char::is_control)
+    }) {
+        return Err(Error::Protocol("invalid Agent ref"));
+    }
+    Ok(value)
+}
+
+fn canonical_agent_ref(current: Option<&str>, reference: &str) -> Result<String> {
+    if reference == "." {
+        return current.map(str::to_owned).ok_or(Error::Protocol(
+            "Agent cursor must be a canonical Agent ref",
+        ));
+    }
+    let parsed = aw_tools::execution_ref::ExecutionRef::parse(reference)
+        .map_err(|_| Error::Protocol("invalid Agent ref"))?;
+    if !parsed.is_canonical() {
+        return Err(Error::Protocol(
+            "non-current Agent operations require a canonical Agent ref",
+        ));
+    }
+    let resolved = parsed
+        .resolve(None, None)
+        .map_err(|_| Error::Protocol("invalid Agent ref"))?;
+    if !resolved.suffix().is_empty() {
+        return Err(Error::Protocol(
+            "Agent operation requires an Agent root ref",
+        ));
+    }
+    Ok(resolved.agent_ref().canonical())
+}
+
+fn agent_expected_rev(params: &serde_json::Value, required: bool) -> Result<Option<u64>> {
+    let rev = params
+        .get("rev")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|revision| *revision > 0)
+                .ok_or(Error::Protocol("Agent rev must be a positive integer"))
+        })
+        .transpose()?;
+    if required && rev.is_none() {
+        return Err(Error::Protocol("Agent rev is required"));
+    }
+    Ok(rev)
+}
+
+fn parse_agent_permissions(value: &serde_json::Value) -> Result<aw_store::AgentPermissions> {
+    let values = value
+        .as_array()
+        .ok_or(Error::Protocol("Agent permissions must be an array"))?;
+    if values.is_empty() {
+        return Err(Error::Protocol(
+            "Agent permission grant must not be empty; use null to remove access",
+        ));
+    }
+    let mut permissions = aw_store::AgentPermissions::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        let permission = value
+            .as_str()
+            .ok_or(Error::Protocol("Agent permission must be a string"))?;
+        if !seen.insert(permission) {
+            return Err(Error::Protocol("duplicate Agent permission"));
+        }
+        match permission {
+            "view" => permissions.view = true,
+            "contribute" => permissions.contribute = true,
+            "submit" => permissions.submit = true,
+            "control" => permissions.control = true,
+            "derive" => permissions.derive = true,
+            "share" => permissions.share = true,
+            "manage" => permissions.manage = true,
+            _ => return Err(Error::Protocol("unknown Agent permission")),
+        }
+    }
+    Ok(permissions)
+}
+
+fn agent_permissions_value(permissions: aw_store::AgentPermissions) -> serde_json::Value {
+    let mut values = Vec::with_capacity(7);
+    if permissions.view {
+        values.push("view");
+    }
+    if permissions.contribute {
+        values.push("contribute");
+    }
+    if permissions.submit {
+        values.push("submit");
+    }
+    if permissions.control {
+        values.push("control");
+    }
+    if permissions.derive {
+        values.push("derive");
+    }
+    if permissions.share {
+        values.push("share");
+    }
+    if permissions.manage {
+        values.push("manage");
+    }
+    serde_json::json!(values)
+}
+
+fn access_generation_value(generation: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(64);
+    for byte in generation {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
+}
+
+fn agent_snapshot_value(snapshot: &aw_store::AgentSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "ref":snapshot.canonical_ref,
+        "rev":snapshot.rev,
+        "owner":snapshot.owner_ref,
+        "project":snapshot.project_ref,
+        "title":snapshot.title,
+        "caller_permissions":agent_permissions_value(snapshot.caller_permissions),
+        "access_generation":access_generation_value(&snapshot.access_generation),
+        "lifecycle":snapshot.lifecycle,
+        "admission":snapshot.admission,
+        "active_turn":snapshot.active_turn,
+        "parent":snapshot.parent_agent_ref,
+        "sandbox":snapshot.sandbox_ref,
+        "history_head":snapshot.history_head,
+        "history_content_digest":snapshot.history_content_digest,
+        "created_at":snapshot.created_at,
+        "updated_at":snapshot.updated_at,
+    })
+}
+
+fn agent_access_snapshot_value(snapshot: &aw_store::AgentAccessSnapshot) -> serde_json::Value {
+    let entries = snapshot
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "principal":entry.principal_ref,
+                "kind":entry.principal_kind,
+                "permissions":agent_permissions_value(entry.permissions),
+                "grant_revision":entry.grant_revision,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "owner":snapshot.owner_ref,
+        "entries":entries,
+        "rev":snapshot.rev,
+        "acl_rev":snapshot.acl_rev,
+        "caller_permissions":agent_permissions_value(snapshot.caller_permissions),
+        "access_generation":access_generation_value(&snapshot.access_generation),
+    })
+}
+
+impl StdioAgentStatePort {
+    fn current_or_canonical_ref(
+        &self,
+        params: &serde_json::Value,
+        required: bool,
+    ) -> Result<String> {
+        let reference = agent_ref_text(params, "ref", required)?.unwrap_or(".");
+        canonical_agent_ref(Some(&self.current_agent_ref), reference)
+    }
+}
+
+impl aw::headless::AgentStatePort for StdioAgentStatePort {
+    fn apply(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        match method {
+            "agent_list" => {
+                let project = params
+                    .get("project")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or(Error::Protocol("agent_list project must be a string"))
+                    })
+                    .transpose()?
+                    .unwrap_or(&self.current_project_ref);
+                if project.is_empty()
+                    || project.len() > 2048
+                    || !project.is_ascii()
+                    || project.chars().any(char::is_control)
+                {
+                    return Err(Error::Protocol("invalid agent_list project"));
+                }
+                let limit = params
+                    .get("limit")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .filter(|limit| *limit > 0)
+                            .ok_or(Error::Protocol(
+                                "agent_list limit must be a positive integer",
+                            ))
+                    })
+                    .transpose()?
+                    .unwrap_or(64);
+                let limit =
+                    usize::try_from(limit).map_err(|_| Error::Limit("invalid Agent list limit"))?;
+                let cursor = agent_ref_text(&params, "cursor", false)?
+                    .map(|reference| canonical_agent_ref(None, reference))
+                    .transpose()?;
+                let items =
+                    self.store
+                        .agent_list(&self.caller, project, cursor.as_deref(), limit)?;
+                let next_cursor = (items.len() == limit)
+                    .then(|| items.last().map(|item| item.canonical_ref.clone()))
+                    .flatten();
+                Ok(serde_json::json!({
+                    "project":project,
+                    "items":items.iter().map(agent_snapshot_value).collect::<Vec<_>>(),
+                    "next_cursor":next_cursor,
+                }))
+            }
+            "agent_get" => {
+                if let Some(include) = params.get("include") {
+                    let include = include
+                        .as_array()
+                        .ok_or(Error::Protocol("agent_get include must be an array"))?;
+                    if !include.is_empty() {
+                        return Err(Error::Protocol(
+                            "agent_get extension views are not available on this core state port",
+                        ));
+                    }
+                }
+                let reference = self.current_or_canonical_ref(&params, false)?;
+                let snapshot = self.store.agent_get(&self.caller, &reference)?;
+                Ok(agent_snapshot_value(&snapshot))
+            }
+            "agent_edit" => {
+                let reference = self.current_or_canonical_ref(&params, true)?;
+                let expected_rev = agent_expected_rev(&params, true)?
+                    .ok_or(Error::Protocol("agent_edit rev is required"))?;
+                let title = params
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Protocol("agent_edit title must be a string"))?;
+                let snapshot =
+                    self.store
+                        .agent_edit(&self.caller, &reference, expected_rev, title)?;
+                Ok(agent_snapshot_value(&snapshot))
+            }
+            "agent_admission" => {
+                let reference = self.current_or_canonical_ref(&params, true)?;
+                let state = match params.get("state").and_then(serde_json::Value::as_str) {
+                    Some("open") => aw_store::AgentAdmission::Open,
+                    Some("held") => aw_store::AgentAdmission::Held,
+                    _ => {
+                        return Err(Error::Protocol(
+                            "agent_admission state must be open or held",
+                        ))
+                    }
+                };
+                let expected_rev = agent_expected_rev(&params, false)?;
+                let snapshot =
+                    self.store
+                        .agent_admission(&self.caller, &reference, state, expected_rev)?;
+                Ok(agent_snapshot_value(&snapshot))
+            }
+            "agent_access_list" => {
+                let reference = self.current_or_canonical_ref(&params, false)?;
+                let snapshot = self.store.agent_access_list_ref(&self.caller, &reference)?;
+                Ok(agent_access_snapshot_value(&snapshot))
+            }
+            "agent_access_set" => {
+                let reference = self.current_or_canonical_ref(&params, true)?;
+                let principal = params
+                    .get("principal")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Protocol(
+                        "agent_access_set principal must be a string",
+                    ))?;
+                if principal.is_empty()
+                    || principal.len() > 2048
+                    || !principal.is_ascii()
+                    || principal.chars().any(char::is_control)
+                {
+                    return Err(Error::Protocol("invalid agent_access_set principal"));
+                }
+                let permissions = match params.get("permissions") {
+                    Some(value) if value.is_null() => None,
+                    Some(value) => Some(parse_agent_permissions(value)?),
+                    None => {
+                        return Err(Error::Protocol("agent_access_set permissions are required"))
+                    }
+                };
+                let expected_rev = agent_expected_rev(&params, true)?
+                    .ok_or(Error::Protocol("agent_access_set rev is required"))?;
+                let snapshot = self.store.agent_access_set_ref(
+                    &self.caller,
+                    &reference,
+                    principal,
+                    permissions,
+                    expected_rev,
+                )?;
+                Ok(agent_snapshot_value(&snapshot))
+            }
+            _ => Err(Error::Protocol("unknown Agent state RPC method")),
+        }
+    }
 }
 
 fn sandbox_snapshot_value(
@@ -3628,32 +3963,10 @@ fn agent_create_access(value: Option<&serde_json::Value>) -> Result<aw_store::Ag
                 "agent_create grant principal must be a string",
             ))?
             .to_owned();
-        let permissions = object["permissions"].as_array().ok_or(Error::Protocol(
-            "agent_create grant permissions must be an array",
-        ))?;
-        let mut parsed = aw_store::AgentPermissions::default();
-        let mut seen = std::collections::BTreeSet::new();
-        for permission in permissions {
-            let permission = permission
-                .as_str()
-                .ok_or(Error::Protocol("agent_create permission must be a string"))?;
-            if !seen.insert(permission) {
-                return Err(Error::Protocol("duplicate agent_create permission"));
-            }
-            match permission {
-                "view" => parsed.view = true,
-                "contribute" => parsed.contribute = true,
-                "submit" => parsed.submit = true,
-                "control" => parsed.control = true,
-                "derive" => parsed.derive = true,
-                "share" => parsed.share = true,
-                "manage" => parsed.manage = true,
-                _ => return Err(Error::Protocol("unknown agent_create permission")),
-            }
-        }
+        let permissions = parse_agent_permissions(&object["permissions"])?;
         out.push(aw_store::AgentCreateAccessGrant {
             principal,
-            permissions: parsed,
+            permissions,
         });
     }
     Ok(aw_store::AgentCreateAccess::Custom(out))
@@ -4211,6 +4524,7 @@ impl Host {
         self.agent_job_runtime = None;
         self.agent_close_owner = None;
         self.agent_create_owner = None;
+        self.agent_state_port = None;
         self.agent_inputs_owner = None;
         self.sandbox_owner = None;
         self.persistent = None;
@@ -4301,6 +4615,7 @@ impl Host {
             agent_job_runtime: None,
             agent_close_owner: None,
             agent_create_owner: None,
+            agent_state_port: None,
             agent_inputs_owner: None,
             sandbox_owner: None,
             pre_dispatch_retries: 0,
@@ -4755,6 +5070,7 @@ impl Host {
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
             self.agent_create_owner = None;
+            self.agent_state_port = None;
             self.agent_inputs_owner = None;
             self.sandbox_owner = None;
             if let Some(service) = stable_agent_service.as_ref() {
@@ -4835,6 +5151,12 @@ impl Host {
                     .ok_or(Error::Storage(
                         "canonical Agent ref is missing its Agent segment",
                     ))?;
+                self.agent_state_port = Some(Arc::new(StdioAgentStatePort {
+                    store: persistent.store.clone(),
+                    caller: persistent.actor.clone(),
+                    current_agent_ref: canonical.clone(),
+                    current_project_ref: current_project_ref.clone(),
+                }));
                 self.sandbox_owner = Some(Arc::new(StdioSandboxPort {
                     store: persistent.store.clone(),
                     caller: persistent.actor.clone(),
@@ -4881,6 +5203,7 @@ impl Host {
             self.agent_jobs_owner = None;
             self.agent_close_owner = None;
             self.agent_create_owner = None;
+            self.agent_state_port = None;
             self.agent_inputs_owner = None;
             self.sandbox_owner = None;
             self.tools.agent_jobs.clear()?;
@@ -5892,6 +6215,11 @@ impl aw::headless::Driver for Host {
         self.agent_create_owner
             .as_ref()
             .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::AgentCreatePort>)
+    }
+    fn agent_state_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentStatePort>> {
+        self.agent_state_port
+            .as_ref()
+            .map(|port| port.clone() as std::sync::Arc<dyn aw::headless::AgentStatePort>)
     }
     fn agent_inputs_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentInputsPort>> {
         self.agent_inputs_owner.as_ref().map(|owner| {
