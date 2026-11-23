@@ -103,7 +103,7 @@ impl SessionStore {
 
         match after {
             EventReadAfter::Now => {
-                cleanup_expired_cursors(&tx, at)?;
+                cleanup_expired_cursors(&tx, actor, at)?;
                 let Some((session, branch)) = agent_owner::key_for_ref_optional(&tx, &agent_ref)?
                 else {
                     return Err(Error::Denied(
@@ -538,10 +538,11 @@ fn placement_token(scope: &StoreScope, agent_ref: &str) -> [u8; 32] {
     hash.finalize().into()
 }
 
-fn cleanup_expired_cursors(connection: &Connection, at: i64) -> Result<()> {
+fn cleanup_expired_cursors(connection: &Connection, actor: &PrincipalId, at: i64) -> Result<()> {
     db(connection.execute(
-        "DELETE FROM event_read_cursors_current WHERE last_used_at<=?1",
-        [at.saturating_sub(CURSOR_IDLE_MICROS)],
+        "DELETE FROM event_read_cursors_current
+         WHERE principal=?1 AND last_used_at<=?2",
+        params![actor.as_str(), at.saturating_sub(CURSOR_IDLE_MICROS)],
     ))?;
     Ok(())
 }
