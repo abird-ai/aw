@@ -202,11 +202,18 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       batched `TurnFactProvenance` preserves original canonical Agent/Turn/actor/timestamp through exact
       forks, `jobs_read` explicit history records carry it, default result reads remain unchanged, and
       `llm.attempt_settled` commit evidence now names canonical Agent + Turn while retaining internal
-      Session/branch locators. No new provenance schema or hot Tool/Invocation fields were added. Still open
-      in Phase 1: finite Process/Job-facing provenance plus only consumer-required projections/exposure
-      normalization. Event provenance/cutover remains Phase 2. Public fresh/derived `sandbox.create`
-      remains Phase-3 work with SourceDriver/checkpoint semantics; defer reachability/flatten acceleration
-      until a real consumer requires it.
+      Session/branch locators. No new provenance schema or hot Tool/Invocation fields were added.
+      **Finite Process/Job provenance is now complete without a new owner:** immutable finite exposure
+      reservations carry canonical Job + original Agent/Turn + initiating actor, publish/release cannot
+      rewrite that actor, old events derive the same provenance from typed ref + original commit actor, and
+      the hot exposure projection remains unchanged. `JobHost` projects the same value from immutable
+      TaskIdentity for bounded finite list/get/ack/send/cancel receipts; raw `jobs_read` bytes and
+      `ProcessTerminal` remain untouched. `ModelProcessFact` freezes canonical Agent/Turn/actor at Prepared
+      and reduced close/terminate receipts expose it without private Process metadata. Still open in Phase 1:
+      only consumer-required Agent exposure/index normalization/rebuild and any exact remaining non-current
+      host operation required by the sealed surface. Event provenance/cutover remains Phase 2. Public
+      fresh/derived `sandbox.create` remains Phase-3 work with SourceDriver/checkpoint semantics; defer
+      reachability/flatten acceleration until a real consumer requires it.
 - [ ] **Phase 2** — one EventScan for read/subscription/Handler with source-first
       proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
       acknowledgment; reuse projection/cursor/registry mechanics.

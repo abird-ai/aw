@@ -8,8 +8,8 @@
 //! to a verified external OS effect owner. After crash, Prepared requires
 //! explicit inspection, never replay of the original paid/model Tool/OS effect.
 use crate::{
-    actor_admission, audit, branch_in, db, principal_is_session_owner, workspace_writer,
-    SessionStore,
+    actor_admission, agent_owner, audit, branch_in, db, principal_is_session_owner,
+    workspace_writer, SessionStore,
 };
 use aw_agent_core::{Error, PrincipalId, Result};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -106,9 +106,19 @@ impl ModelProcessRequest {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ModelProcessProvenance {
+    pub canonical_agent_ref: String,
+    pub original_turn: u64,
+    pub initiating_actor: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProcessFact {
     pub request: ModelProcessRequest,
     pub state: ModelProcessState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ModelProcessProvenance>,
     /// No PID, Process program, argv, root, env or output bytes in audit.
     pub owner_process_id: Option<String>,
     pub owner_store_generation: Option<u64>,
@@ -227,9 +237,19 @@ impl SessionStore {
                 "original Turn already attempted model Process effect",
             ));
         }
+        let canonical_agent_ref = agent_owner::canonical_ref(
+            &tx,
+            agent_owner::AgentKey::new(&request.session_id, &request.branch_id),
+        )?;
+        let provenance = ModelProcessProvenance {
+            canonical_agent_ref,
+            original_turn: request.turn_id,
+            initiating_actor: request.sender.clone(),
+        };
         let fact = ModelProcessFact {
             request,
             state: ModelProcessState::Prepared,
+            provenance: Some(provenance),
             owner_process_id: Some(incarnation.process_id.clone()),
             owner_store_generation: Some(incarnation.store_generation),
             note: None,

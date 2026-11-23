@@ -6620,6 +6620,18 @@ mod tests {
         let id = response["fact"].as_str().unwrap();
         let saved = f.owner.model_process_fact(id).unwrap();
         assert_eq!(saved.state, aw_store::ModelProcessState::Applied);
+        let provenance = saved
+            .provenance
+            .as_ref()
+            .expect("new model Process fact must retain canonical provenance");
+        assert_eq!(
+            provenance.canonical_agent_ref,
+            f.agent.execution_binding().unwrap().canonical_ref()
+        );
+        assert_eq!(provenance.original_turn, 1);
+        assert_eq!(response["agent"], provenance.canonical_agent_ref);
+        assert_eq!(response["turn"], provenance.original_turn);
+        assert_eq!(response["actor"], provenance.initiating_actor);
         assert_eq!(
             saved.request.action,
             aw_store::ModelProcessAction::Terminate
@@ -6893,6 +6905,18 @@ mod tests {
         assert_eq!(fact.state, aw_store::ModelProcessState::Applied);
         assert_eq!(fact.request.handle, "owned_cat");
         assert_eq!(fact.request.turn_id, 1);
+        let provenance = fact
+            .provenance
+            .as_ref()
+            .expect("new model Process fact must retain canonical provenance");
+        assert_eq!(
+            provenance.canonical_agent_ref,
+            fixture.agent.execution_binding().unwrap().canonical_ref()
+        );
+        assert_eq!(provenance.original_turn, 1);
+        assert_eq!(encoded["agent"], provenance.canonical_agent_ref);
+        assert_eq!(encoded["turn"], provenance.original_turn);
+        assert_eq!(encoded["actor"], provenance.initiating_actor);
         assert_eq!(provider_calls.load(Ordering::SeqCst),2,
             "only one original paid provider proposal plus original completion, no model/process executor");
         assert!(crate::model_process_control::install_close_stdin(

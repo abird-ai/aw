@@ -92,11 +92,17 @@ impl Tool for CloseStdinTool {
                 self.owner
                     .finish_model_process_close(&ctx, &intent, ModelProcessState::Applied)?;
             self.owner.verify_model_observation(&ctx)?;
+            let provenance = applied.provenance.as_ref().ok_or(Error::Storage(
+                "model Process receipt is missing canonical provenance",
+            ))?;
             let result = ToolOutput::text(
                 serde_json::to_string(&json!({
                     "kind":"original_process_stdin_close",
                     "handle":handle,"state":applied.state,
                     "fact":applied.request.intent_id,
+                    "agent":provenance.canonical_agent_ref,
+                    "turn":provenance.original_turn,
+                    "actor":provenance.initiating_actor,
                     "scope":"exact_original_owner",
                     "process_exit":"NOT_PROVEN",
                     "delivery":"NOT_PROVEN",
@@ -244,6 +250,9 @@ impl Tool for TerminateTool {
                 return Err(Error::Conflict("OS Process termination outcome uncertain; inspect immutable original receipt, never replay"));
             }
             self.owner.verify_model_observation(&ctx)?;
+            let provenance = fact.provenance.as_ref().ok_or(Error::Storage(
+                "model Process receipt is missing canonical provenance",
+            ))?;
             // This is a bounded direct-child wait receipt, NOT proof that
             // every OS group descendant exited or a paid provider settled.
             let output = ToolOutput::text(
@@ -251,6 +260,9 @@ impl Tool for TerminateTool {
                     "kind":"original_process_termination",
                     "handle":handle,"state":fact.state,
                     "fact":fact.request.intent_id,
+                    "agent":provenance.canonical_agent_ref,
+                    "turn":provenance.original_turn,
+                    "actor":provenance.initiating_actor,
                     "direct_child_reaped":true,
                     "process_group":"BEST_EFFORT",
                     "provider_settlement":"NOT_PROVEN",

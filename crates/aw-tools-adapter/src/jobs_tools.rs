@@ -279,6 +279,38 @@ impl JobsTool {
         .map_err(|_| Error::Protocol("cannot render typed compact Job status"))
     }
 
+    fn append_provenance_value(
+        provenance: &crate::job_host::FiniteJobProvenance,
+        budget: usize,
+        content: &mut String,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(&json!({
+            "job":provenance.canonical_job_ref,
+            "agent":provenance.original_agent_ref,
+            "turn":provenance.original_turn,
+            "actor":provenance.initiating_actor,
+        }))
+        .map_err(|_| Error::Protocol("cannot encode finite Job provenance"))?;
+        let suffix = format!(" provenance={encoded}");
+        if content.len().saturating_add(suffix.len()) > budget {
+            return Err(Error::Limit(
+                "finite Job receipt cannot fit canonical provenance",
+            ));
+        }
+        content.push_str(&suffix);
+        Ok(())
+    }
+
+    fn append_finite_provenance(
+        host: &crate::job_host::JobHost,
+        id: &str,
+        budget: usize,
+        content: &mut String,
+    ) -> Result<()> {
+        let provenance = host.finite_job_provenance(id)?;
+        Self::append_provenance_value(&provenance, budget, content)
+    }
+
     fn control_fingerprint(
         operation: &str,
         canonical_ref: &str,
@@ -1170,7 +1202,12 @@ impl Tool for JobsTool {
                                         Ok((id, None)) => match host.manager().get(&id) {
                                             Ok(snapshot) => {
                                                 let reference = host.job_ref(&id, None)?;
-                                                Some(Self::render_snapshot(&reference, &snapshot)?)
+                                                let mut row =
+                                                    Self::render_snapshot(&reference, &snapshot)?;
+                                                Self::append_finite_provenance(
+                                                    &host, &id, budget, &mut row,
+                                                )?;
+                                                Some(row)
                                             }
                                             Err(_) => None,
                                         },
@@ -1224,7 +1261,8 @@ impl Tool for JobsTool {
                     let mut rows = Vec::new();
                     for snapshot in jobs {
                         let reference = host.job_ref(&snapshot.id, None)?;
-                        let row = Self::render_snapshot(&reference, &snapshot)?;
+                        let mut row = Self::render_snapshot(&reference, &snapshot)?;
+                        Self::append_finite_provenance(&host, &snapshot.id, budget, &mut row)?;
                         let mut candidate = rows.clone();
                         candidate.push(row.clone());
                         if let Some(cursor) = &next {
@@ -1341,6 +1379,7 @@ impl Tool for JobsTool {
                         Self::render_snapshot(&reference, &snapshot)?
                     };
                     let mut content = content;
+                    Self::append_finite_provenance(&host, &id, budget, &mut content)?;
                     self.append_process_tail(
                         &ctx,
                         &host,
@@ -1563,7 +1602,7 @@ impl Tool for JobsTool {
                                     ),
                                 })
                         })?;
-                        let content = aw_tools::receipt::render_plain(
+                        let mut content = aw_tools::receipt::render_plain(
                             aw_tools::receipt::Receipt::Ack {
                                 reference: &reference,
                                 mode: aw_tools::receipt::AckMode::Finish,
@@ -1578,10 +1617,11 @@ impl Tool for JobsTool {
                             }
                             _ => Error::Protocol("cannot render typed Job ACK receipt"),
                         })?;
+                        Self::append_finite_provenance(&host, &id, budget, &mut content)?;
                         return Ok(ToolOutput::text(content));
                     };
                     let through = offset.expect("through ACK branch has an offset");
-                    let content = aw_tools::receipt::render_plain(
+                    let mut content = aw_tools::receipt::render_plain(
                         aw_tools::receipt::Receipt::Ack {
                             reference: &reference,
                             mode: aw_tools::receipt::AckMode::Through(through),
@@ -1596,6 +1636,7 @@ impl Tool for JobsTool {
                         }
                         _ => Error::Protocol("cannot render typed Job ACK receipt"),
                     })?;
+                    Self::append_finite_provenance(&host, &id, budget, &mut content)?;
                     ToolOutput::text(content)
                 }
                 JobsKind::Send => {
@@ -1742,10 +1783,15 @@ impl Tool for JobsTool {
                                         let snapshot = host.manager().get(&id).map_err(|_| {
                                             Error::Protocol("Job disappeared after jobs_send")
                                         })?;
-                                        let output = ToolOutput::text(format!(
-                                            "{canonical} rev={} ok",
-                                            snapshot.sequence
-                                        ));
+                                        let mut content =
+                                            format!("{canonical} rev={} ok", snapshot.sequence);
+                                        Self::append_finite_provenance(
+                                            &host,
+                                            &id,
+                                            budget,
+                                            &mut content,
+                                        )?;
+                                        let output = ToolOutput::text(content);
                                         Self::finish_control_output(
                                             &self.runtime,
                                             key,
@@ -1867,7 +1913,7 @@ impl Tool for JobsTool {
                                 }
                                 match self.runtime.cancel_checked(&ctx, &id, revision).await {
                                     Ok((changed, snapshot)) => {
-                                        let content = aw_tools::receipt::render_plain(
+                                        let mut content = aw_tools::receipt::render_plain(
                                             aw_tools::receipt::Receipt::Cancel {
                                                 reference: &canonical_ref,
                                                 revision: snapshot.sequence,
@@ -1885,6 +1931,12 @@ impl Tool for JobsTool {
                                                 "cannot render typed Job cancellation receipt",
                                             ),
                                         })?;
+                                        Self::append_finite_provenance(
+                                            &host,
+                                            &id,
+                                            budget,
+                                            &mut content,
+                                        )?;
                                         let output = ToolOutput::text(content);
                                         Self::finish_control_output(
                                             &self.runtime,
@@ -2209,5 +2261,25 @@ mod delivery_tests {
         assert_eq!(used, 0);
         assert_eq!(rendered, "truncated retained=0 total=100");
         assert!(JobsTool::render_output_page(&page, 0, "text", serialized(1)).is_err());
+    }
+
+    #[test]
+    fn finite_job_provenance_suffix_is_canonical_and_bounded() {
+        let provenance = crate::job_host::FiniteJobProvenance {
+            canonical_job_ref: "/d:d/i:i/p:p/a:a/t:7/j:j7".into(),
+            original_agent_ref: "/d:d/i:i/p:p/a:a".into(),
+            original_turn: 7,
+            initiating_actor: "user:bob".into(),
+        };
+        let mut content = "j:j7 settled rev=3".to_owned();
+        JobsTool::append_provenance_value(&provenance, 512, &mut content).unwrap();
+        assert!(content.contains(r#""job":"/d:d/i:i/p:p/a:a/t:7/j:j7""#));
+        assert!(content.contains(r#""agent":"/d:d/i:i/p:p/a:a""#));
+        assert!(content.contains(r#""turn":7"#));
+        assert!(content.contains(r#""actor":"user:bob""#));
+
+        let mut too_small = "j:j7 settled rev=3".to_owned();
+        assert!(JobsTool::append_provenance_value(&provenance, 24, &mut too_small).is_err());
+        assert_eq!(too_small, "j:j7 settled rev=3");
     }
 }

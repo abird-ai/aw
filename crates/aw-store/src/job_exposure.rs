@@ -45,6 +45,15 @@ pub struct FiniteExposure {
     pub writer_epoch: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FiniteExposureProvenance {
+    pub canonical_job_ref: String,
+    pub original_agent_ref: String,
+    pub original_turn: u64,
+    pub initiating_actor: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobExposureListItem {
     pub canonical_ref: String,
@@ -62,6 +71,8 @@ struct Payload {
     session_id: String,
     branch_id: String,
     writer_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<FiniteExposureProvenance>,
     #[serde(default)]
     reservation_position: Option<u64>,
 }
@@ -121,6 +132,40 @@ fn validate_ref(binding: &AgentBindingInfo, canonical_ref: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn provenance_from_ref(
+    canonical_ref: &str,
+    initiating_actor: &str,
+) -> Result<FiniteExposureProvenance> {
+    let parsed = ExecutionRef::parse(canonical_ref)
+        .map_err(|_| Error::Denied("invalid finite Job provenance ref"))?;
+    let resolved = parsed
+        .resolve(None, None)
+        .map_err(|_| Error::Denied("invalid canonical finite Job provenance ref"))?;
+    let [ExecutionSegment::Turn(turn), ExecutionSegment::Job(_)] = resolved.suffix() else {
+        return Err(Error::Denied(
+            "finite Job provenance requires exact Agent/Turn/Job ref",
+        ));
+    };
+    let original_turn = turn
+        .as_str()
+        .parse::<u64>()
+        .ok()
+        .filter(|turn| *turn > 0)
+        .ok_or(Error::Denied("finite Job provenance Turn is invalid"))?;
+    if initiating_actor.is_empty()
+        || initiating_actor.len() > 256
+        || initiating_actor.chars().any(char::is_control)
+    {
+        return Err(Error::Denied("finite Job initiating actor is invalid"));
+    }
+    Ok(FiniteExposureProvenance {
+        canonical_job_ref: canonical_ref.to_owned(),
+        original_agent_ref: resolved.agent_ref().canonical(),
+        original_turn,
+        initiating_actor: initiating_actor.to_owned(),
+    })
 }
 
 fn entity_key(generation: &str, canonical_ref: &str) -> String {
@@ -451,11 +496,45 @@ fn authoritative_binding(
     Ok(actual)
 }
 
+fn reservation_provenance(
+    c: &rusqlite::Connection,
+    generation: &str,
+    canonical_ref: &str,
+) -> Result<FiniteExposureProvenance> {
+    let key = entity_key(generation, canonical_ref);
+    let (actor, payload_json): (Option<String>, String) = db(c.query_row(
+        "SELECT actor,payload_json FROM commit_log
+         WHERE kind=?1 AND entity_type=?2 AND entity_id=?3
+         ORDER BY seq LIMIT 1",
+        params![RESERVED, ENTITY, key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    let actor = actor.ok_or(Error::Storage(
+        "finite Job exposure reservation lacks initiating actor",
+    ))?;
+    let payload: Payload = crate::decode(&payload_json)?;
+    if payload.generation != generation || payload.canonical_ref != canonical_ref {
+        return Err(Error::Storage(
+            "finite Job exposure reservation identity changed",
+        ));
+    }
+    let derived = provenance_from_ref(canonical_ref, &actor)?;
+    if let Some(stored) = payload.provenance {
+        if stored != derived {
+            return Err(Error::Storage(
+                "finite Job exposure reservation provenance changed",
+            ));
+        }
+    }
+    Ok(derived)
+}
+
 fn payload(
     binding: &AgentBindingInfo,
     generation: &str,
     canonical_ref: &str,
     writer_epoch: u64,
+    provenance: Option<FiniteExposureProvenance>,
     reservation_position: Option<u64>,
 ) -> Payload {
     Payload {
@@ -467,6 +546,7 @@ fn payload(
         session_id: binding.session_id.clone(),
         branch_id: binding.branch_id.clone(),
         writer_epoch,
+        provenance,
         reservation_position,
     }
 }
@@ -698,6 +778,12 @@ impl SessionStore {
                     "finite Job exposure identity was reused across owners",
                 ));
             }
+            let provenance = reservation_provenance(&tx, generation, canonical_ref)?;
+            if provenance.initiating_actor != actor.as_str() {
+                return Err(Error::Denied(
+                    "finite Job exposure initiating actor cannot be rewritten",
+                ));
+            }
             return match existing.state {
                 FiniteExposureState::Reserved | FiniteExposureState::Published => Ok(existing),
                 FiniteExposureState::Released => Err(Error::Conflict(
@@ -726,11 +812,13 @@ impl SessionStore {
         }
 
         let txid = durability::tx_id()?;
+        let provenance = provenance_from_ref(canonical_ref, actor.as_str())?;
         let encoded = serde_json::to_value(payload(
             &actual,
             generation,
             canonical_ref,
             writer.writer_epoch,
+            Some(provenance),
             None,
         ))
         .map_err(|_| Error::Storage("cannot encode finite Job exposure reservation"))?;
@@ -792,6 +880,12 @@ impl SessionStore {
             }
             FiniteExposureState::Reserved => {}
         }
+        let provenance = reservation_provenance(&tx, generation, canonical_ref)?;
+        if provenance.initiating_actor != actor.as_str() {
+            return Err(Error::Denied(
+                "finite Job exposure initiating actor changed before publication",
+            ));
+        }
 
         let txid = durability::tx_id()?;
         let encoded = serde_json::to_value(payload(
@@ -799,6 +893,7 @@ impl SessionStore {
             generation,
             canonical_ref,
             existing.writer_epoch,
+            Some(provenance),
             Some(existing.position),
         ))
         .map_err(|_| Error::Storage("cannot encode finite Job exposure publication"))?;
@@ -845,12 +940,19 @@ impl SessionStore {
         if existing.session_id != actual.session_id || existing.branch_id != actual.branch_id {
             return Err(Error::Denied("finite Job exposure release owner changed"));
         }
+        let provenance = reservation_provenance(&tx, generation, canonical_ref)?;
+        if provenance.initiating_actor != actor.as_str() {
+            return Err(Error::Denied(
+                "finite Job exposure initiating actor changed before release",
+            ));
+        }
         let txid = durability::tx_id()?;
         let encoded = serde_json::to_value(payload(
             &actual,
             generation,
             canonical_ref,
             existing.writer_epoch,
+            Some(provenance),
             Some(existing.position),
         ))
         .map_err(|_| Error::Storage("cannot encode finite Job exposure release"))?;

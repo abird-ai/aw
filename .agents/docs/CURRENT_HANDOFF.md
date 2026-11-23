@@ -460,24 +460,49 @@ New model-settlement commit evidence (`llm.attempt_settled`) now also carries ca
 `InvocationIdentity.actor`. Session IDs stay valid private audit locators but are no longer the only public
 provenance referent.
 
+Finite Process/Job provenance now follows the same owner-local rule rather than introducing a generic
+provenance service. Finite Job admission already owns immutable `TaskIdentity`; the adapter projects
+`FiniteJobProvenance {canonical_job_ref, original_agent_ref, original_turn, initiating_actor}` directly from
+that identity plus the bound Agent. The Store's immutable `job.exposure.reserved` commit now persists the
+same canonical provenance. Publish/release re-read that original reservation and refuse to rewrite the
+initiating actor. Older reservation events remain readable because missing provenance is conservatively
+derived from the typed canonical Agent/Turn/Job ref plus the original commit actor. The hot
+`job_exposure_current` projection gains no columns or scans.
+
+Finite public status/control receipts (`jobs_list`, `jobs_get`, `jobs_ack`, successful finite `jobs_send`
+and `jobs_cancel`) append one bounded canonical provenance envelope only after the typed factual receipt has
+been rendered. If that envelope cannot fit the existing result budget, the receipt fails rather than
+silently dropping attribution. Raw `jobs_read` stdout/stderr/result bytes remain raw bytes. `ProcessTerminal`
+and `aw-process` remain Agent-agnostic exactly as sealed; no lifecycle/runtime ownership moved upward or
+downward.
+
+The existing model-requested Process control owner now freezes
+`ModelProcessProvenance {canonical_agent_ref, original_turn, initiating_actor}` at Prepared after its exact
+active-Turn + original-Input checks. Applied/Rejected/Unknown/Inspected facts structurally retain it. The
+reduced model-facing close-stdin/terminate receipts expose only that canonical Agent/Turn/actor attribution
+alongside their existing safe fact/handle/state fields; PID/program/argv/env/output/private Session IDs stay
+out of the receipt.
+
 This checkpoint still does **not** claim the complete §28.3/§28 host shell. Current/non-current
 `agent.close`, stable-child close, native/public same-user cross-Project `agent.create`, atomic initial-task
 custody/publication, post-commit live dispatch, logical Sandbox ownership/auto+explicit Agent binding,
 native Sandbox list/get/close, the v42 staged input-plan owner, atomic v43 Send composition, durable
-add/edit/delete replay, all five native `agent.inputs.*` host methods, and committed Turn/Tool/model
-attribution are complete. Remaining Phase-1 work is finite Process/Job-facing provenance, final
-consumer-required projections/exposure normalization, and any remaining non-current host operations beyond
-close. Event-source provenance/cutover remains Phase 2 rather than being pulled forward. Public
+add/edit/delete replay, all five native `agent.inputs.*` host methods, committed Turn/Tool/model attribution,
+and finite Process/Job-facing provenance are complete. Remaining Phase-1 work is only final
+consumer-required projections/exposure normalization and any exact remaining non-current host operations
+required by the sealed surface. Event-source provenance/cutover remains Phase 2 rather than being pulled
+forward. Public
 `sandbox.create`/derived Sandbox materialization stays in Phase 3 where the sealed SourceDriver/checkpoint
 preparation semantics belong. Trusted delegation into another principal's Project also remains a separate
 future host-policy capability; it is not smuggled through the raw Project field. History ancestry still
 grants none of those authorities.
 
-Phase 1 is therefore still **underway**, not complete. The next provenance slice is finite Process/Job
-receipts/exposure that still need canonical original-Agent/Turn attribution, followed only by projections a
-real consumer actually requires and any necessary normalization/rebuild of Agent exposure from
-`agent_state_current`. Event provenance/delivery cutover stays Phase 2; do not prebuild Phase-2/4 engines
-or add reachability/flatten acceleration until a consumer proves it necessary.
+Phase 1 is therefore still **underway**, but provenance propagation for the owners intentionally in this
+phase is now complete. The next slice is a fresh review of the **consumer-required Agent exposure/index
+normalization/rebuild boundary** and any exact remaining non-current host operation from the sealed spec;
+if the existing indexed exposure owner already satisfies those consumers, document/qualify it rather than
+adding machinery. Event provenance/delivery cutover stays Phase 2; do not prebuild Phase-2/4 engines or add
+reachability/flatten acceleration until a consumer proves it necessary.
 
 Current focused evidence: populated **v37 -> v38** Agent-owner seed and **v38 -> v39** principal
 backfill remain green; group access/wake/history fencing remains green. The focused **v40 -> v41**
@@ -503,8 +528,14 @@ after the transactional AuthoritySteer accept refactor. The exact-history fork r
 proves source -> fork -> refork Turn provenance preserves the original canonical Agent, Turn, actor and
 timestamp without copied nodes, and verifies `llm.attempt_settled` stores canonical Agent/Turn attribution.
 The paged Agent-history regression proves explicit `jobs_read` message records expose that provenance while
-the default/latest result path remains unchanged. `cargo check -p aw-store -p aw-cli --tests`, strict
-all-target Clippy and repository fmt are green for this cut. A broader historical
+the default/latest result path remains unchanged. Focused finite-provenance evidence is also green: the
+mixed exposure regression proves the immutable reservation event stores canonical Job/Agent/Turn/actor;
+the existing contextless explicit-owner Job regression proves adapter provenance derives from the exact
+bound Agent + immutable TaskIdentity; the bounded receipt regression proves canonical attribution is never
+silently truncated; and the existing Process close-stdin + terminate regressions prove durable
+`ModelProcessFact` and reduced model receipts agree on canonical Agent/Turn/actor while retaining the
+existing no-PID/program/env disclosure boundary. `cargo check -p aw-store -p aw-tools-adapter -p aw-cli
+--tests`, strict all-target Clippy and repository fmt are green for this cut. A broader historical
 Store sweep is still not claimed here; the previously documented old remote-start/remote-view downgrade
 fixtures remain outside this focused Agent/Sandbox cut.
 The host-created Agent activation regression now also closes that non-current child through

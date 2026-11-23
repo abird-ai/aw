@@ -52,6 +52,14 @@ use std::{
 const NODE_WORK_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const SHELL_RESULT_BYTES: usize = 4 * 1024;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FiniteJobProvenance {
+    pub canonical_job_ref: String,
+    pub original_agent_ref: String,
+    pub original_turn: u64,
+    pub initiating_actor: String,
+}
+
 fn job_admission_error(error: JobManagerError) -> Error {
     match error {
         JobManagerError::Capacity => Error::Limit("live Job capacity exhausted"),
@@ -873,6 +881,25 @@ impl JobHost {
         }
         ResolvedExecutionRef::new(self.bound_agent_ref()?, suffix)
             .map_err(|_| Error::Protocol("cannot construct canonical Job ref"))
+    }
+
+    pub fn finite_job_provenance(&self, id: &str) -> Result<FiniteJobProvenance> {
+        let task = self
+            .manager
+            .task_binding(id)
+            .map_err(|_| Error::Denied("Job routing identity is unavailable"))?;
+        let agent = self.bound_agent_ref()?;
+        if task.session != self.session || task.branch != self.branch || task.turn_id == 0 {
+            return Err(Error::Denied(
+                "finite Job provenance differs from bound Agent task identity",
+            ));
+        }
+        Ok(FiniteJobProvenance {
+            canonical_job_ref: self.execution_ref(id, None)?.canonical(),
+            original_agent_ref: agent.canonical(),
+            original_turn: task.turn_id,
+            initiating_actor: task.actor,
+        })
     }
 
     fn resolve_flat_job_ref(&self, requested: &JobRef) -> Result<(String, Option<usize>)> {
@@ -3626,6 +3653,14 @@ mod tests {
         let prepared = host.prepare(&explicit, &arguments).unwrap();
         let id = host.admit_exposed(prepared).unwrap();
         assert_eq!(host.manager().list(0, 8).unwrap().jobs.len(), 1);
+        let provenance = host.finite_job_provenance(&id).unwrap();
+        assert_eq!(
+            provenance.canonical_job_ref,
+            host.execution_ref(&id, None).unwrap().canonical()
+        );
+        assert_eq!(provenance.original_agent_ref, "/d:0/i:0/p:0/a:0");
+        assert_eq!(provenance.original_turn, explicit.turn_id);
+        assert_eq!(provenance.initiating_actor, explicit.actor.as_str());
         assert_eq!(
             host.execution_ref(&id, None)
                 .unwrap()

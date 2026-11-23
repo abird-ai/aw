@@ -142,8 +142,8 @@ pub use model_agent_pause::{
     model_agent_pause_id, ModelAgentPauseFact, ModelAgentPauseRequest, ModelAgentPauseState,
 };
 pub use model_process::{
-    model_process_intent_id, ModelProcessAction, ModelProcessFact, ModelProcessRequest,
-    ModelProcessState,
+    model_process_intent_id, ModelProcessAction, ModelProcessFact, ModelProcessProvenance,
+    ModelProcessRequest, ModelProcessState,
 };
 #[cfg(feature = "multiplayer")]
 pub use multiplayer::*;

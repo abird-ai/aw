@@ -136,6 +136,29 @@ fn mixed_job_exposure_positions_interleave_agents_and_finite_jobs_without_duplic
         .unwrap();
     assert_eq!(reserved.state, FiniteExposureState::Reserved);
     assert!(reserved.position > first_position);
+    let reservation = store
+        .commit_events_after(&actor, 0, 128)
+        .unwrap()
+        .into_iter()
+        .find(|event| {
+            event.kind == "job.exposure.reserved"
+                && event.payload["canonical_ref"].as_str() == Some(finite_ref.as_str())
+        })
+        .expect("finite Job reservation provenance event");
+    assert_eq!(reservation.actor.as_deref(), Some(actor.as_str()));
+    assert_eq!(
+        reservation.payload["provenance"]["canonical_job_ref"],
+        finite_ref
+    );
+    assert_eq!(
+        reservation.payload["provenance"]["original_agent_ref"],
+        first_agent_ref
+    );
+    assert_eq!(reservation.payload["provenance"]["original_turn"], 1);
+    assert_eq!(
+        reservation.payload["provenance"]["initiating_actor"],
+        actor.as_str()
+    );
     assert!(
         store
             .finite_job_exposures(&actor, &first, "generation-a", 8)
