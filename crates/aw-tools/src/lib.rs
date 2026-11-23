@@ -18,6 +18,7 @@ pub mod budget;
 pub mod conformance;
 pub mod coordination;
 pub mod diagnostic;
+pub mod event_subject;
 pub mod execution_ref;
 pub mod execution_stop;
 pub mod filesystem;

@@ -2,7 +2,7 @@
 
 Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
-Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASE 1 COMPLETE LOCALLY / PHASE 2 NEXT**
+Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASE 1 COMPLETE LOCALLY / PHASE 2 UNDERWAY**
 
 ## Committed
 
@@ -226,9 +226,21 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       public fresh/derived `sandbox.create` remain Phase 3; View/Extension enrichment and Phase-4 Jobs
       traversal remain in their sealed later phases. No Phase-2 source was started in this checkpoint.
       Defer reachability/flatten acceleration until a real consumer requires it.
-- [ ] **Phase 2 NEXT** — one EventScan for read/subscription/Handler with source-first
-      proof/deny/unknown; final Input/Handler owners retain reauthorization, dedupe and
-      acknowledgment; reuse projection/cursor/registry mechanics.
+- [~] **Phase 2 UNDERWAY** — v44 lands the scan prerequisite first: one canonical
+      `aw-tools::event_subject` grammar, one rebuildable parsed `event_projection_index`, and one
+      StoreScope-bound contiguous `event_projection_state` watermark over immutable `commit_log`.
+      Literal handle `.` encodes as uppercase `%2E`; malformed hierarchy/escaping fails closed.
+      The existing commit writer advances the watermark for every row and projects only reserved v4
+      DL-200 Event markers; Event-marked writes require an existing transaction. Pre-v44 rows remain
+      non-Events. Projection-local dirty triggers make healthy open O(1) while any out-of-band
+      insert/update/delete forces owner-open rebuild from immutable truth; rebuild changes only
+      projection generation/scope/watermark and creates no Event/resource revision. Focused subject
+      and projection regressions are 1/1 each; current-schema aw-tools/aw-store all-target check +
+      strict Clippy are green. Broad aw-store lib is 226 green / 4 historical stale-downgrade reds.
+      **Next:** implement the one private EventScan over this gap-free projection with
+      candidate/proven-skip/blocked-unknown/stale/end and source-first authorization. Do not expose
+      events.read/subscription/Handler until that scanner boundary is correct; source-local event_rev,
+      final envelope emission, EventTypeRegistry and v36 delivery cutover remain later Phase-2 slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

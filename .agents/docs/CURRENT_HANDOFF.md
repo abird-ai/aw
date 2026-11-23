@@ -18,10 +18,10 @@ Normative R6 design:
 ## Current authoritative snapshot — 2026-11-23
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
-complete and published. Phase 1 is now COMPLETE locally after the native Agent state-port cut and a fresh
-SPEC §28 audit. Phase 2 is the next implementation phase; no EventScan/Event cutover source was started in
-this checkpoint. Real-Bubblewrap worker-retirement and Windows-native Process qualification remain
-explicitly deferred evidence and are not claimed green.**
+complete and published. Phase 1 is COMPLETE locally. Phase 2 is now UNDERWAY with the first v44
+Event projection foundation; EventScan/read/subscription/cutover are still next and are not claimed
+implemented by this checkpoint. Real-Bubblewrap worker-retirement and Windows-native Process qualification
+remain explicitly deferred evidence and are not claimed green.**
 
 Verified publication truth:
 
@@ -33,10 +33,9 @@ release/0.17                    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17
 dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
 
-The local Phase-1 implementation line is unpublished. The prior implementation checkpoint is
-`03d1224ef7b2054b3856fa559dcc23ac666f341f` (`Rebuild Agent exposure from owner state`); docs-only
-handoff commits sit above it, and this checkpoint adds the final Phase-1 native Agent-state exposure.
-The local `origin/main` tracking ref is stale and is not publication truth.
+The local Phase-1 implementation line remains unpublished. Its signed completion checkpoint is
+`7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). This checkpoint starts Phase 2
+on top of that line. The local `origin/main` tracking ref is stale and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -517,7 +516,36 @@ in their sealed owning phases rather than being pulled forward: Vault bindings a
 materialization are Phase 3; generic Event provenance/cutover is Phase 2; View/Extension enrichment and
 later Jobs traversal/high-water work remain in their planned phases. Trusted delegation into another
 principal's Project remains a separate future host-policy capability and is not smuggled through raw
-Project fields. Phase 1 is therefore **COMPLETE locally**; Phase 2 is next.
+Project fields. Phase 1 is therefore **COMPLETE locally**.
+
+Phase 2 has now started with the minimum trustworthy scan foundation rather than a temporary direct
+`commit_log` reader. Store schema **v44** adds one rebuildable `event_projection_index` plus one
+StoreScope-bound `event_projection_state` safe watermark. `commit_log` remains the sole immutable
+Event/fact history owner. Pre-v44 rows remain explicit non-DL-200 Events; newly authored rows are Events only
+when their v4 commit payload carries the reserved DL-200 Event marker. The existing commit writer projects
+that marker in the same transaction and advances the contiguous watermark for every commit row, including
+non-Events. Event-marked writes are refused from autocommit so Event truth cannot publish without its
+projection boundary.
+
+Canonical concrete Event-subject syntax now lives once in `aw-tools::event_subject`: typed hierarchy is
+strict, literal handle `.` round-trips through uppercase `%2E`, malformed/noncanonical escapes fail
+closed, and custom `#name` grammar is bounded. Parsing avoids a token-vector allocation. The Store
+projection retains canonical subject/source plus parsed source columns for later source-first authorization.
+Healthy Store open checks projection scope/watermark/dirty state in O(1); projection-local SQLite triggers
+mark any out-of-band insert/update/delete dirty, and owner open rebuilds from immutable `commit_log`,
+advancing only the projection generation and never manufacturing Event/source/resource revisions.
+
+No EventScan, cursor, `events.read`, subscription, Handler, EventInput, EventTypeRegistry, source-local
+`event_rev` owner, or v36 delivery cutover is implemented in this slice. **Next Phase-2 slice:** build the
+one private EventScan over this gap-free projection with candidate/proven-skip/blocked-unknown/stale/end
+outcomes and source-first authorization, before exposing any Event consumer.
+
+Current focused Phase-2 evidence: Event-subject round-trip/canonical-escape regression **1/1** and v44
+projection/watermark/rebuild/restore-scope regression **1/1** are green; current-schema `aw-tools + aw-store`
+all-target check and strict Clippy are green. A broad `aw-store --lib` sweep reached **226 green / 4 red**;
+the four reds are historical manual-downgrade fixture assumptions (three already documented remote-view/
+remote-start fixtures plus the v38→v39 fixture dropping principal tables while later-schema FKs exist), not
+current-schema v44 failures. They were not modified in this checkpoint.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

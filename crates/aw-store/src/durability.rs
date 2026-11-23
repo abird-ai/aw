@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 // Semantic commit-log envelope version. This is intentionally independent of
 // SQLite PRAGMA user_version and the migration coordination schema epoch.
-const COMMIT_EVENT_SCHEMA_VERSION: i64 = 3;
+const COMMIT_EVENT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -364,11 +364,23 @@ pub(crate) fn commit_event_position(
     actor: Option<&PrincipalId>,
     payload: serde_json::Value,
 ) -> Result<StorePos> {
+    if c.is_autocommit() && crate::event_projection::is_event_payload(&payload) {
+        return Err(Error::Storage(
+            "DL-200 Event commit requires an existing Store transaction",
+        ));
+    }
     let store = StoreId::load(c)?;
     let event = id("ev")?;
-    db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![event,store.as_str(),tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
+    db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![&event,store.as_str(),tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
     let position = StorePos::from_insert_rowid(c.last_insert_rowid())?;
     crate::job_exposure::project_commit_event(c, kind, entity_type, entity_id, &payload, position)?;
+    crate::event_projection::project_commit_event(
+        c,
+        &event,
+        COMMIT_EVENT_SCHEMA_VERSION,
+        &payload,
+        position,
+    )?;
     Ok(position)
 }
 #[allow(clippy::too_many_arguments)]
