@@ -19,9 +19,9 @@ Normative R6 design:
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
 complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
-one shared private EventScan, v45 source-local Event authorship, and the first v46 exact-Agent Event read
-consumer are now implemented locally. Broad-selector/waiting read, subscription/Handler delivery and the
-v36 delivery cutover remain later Phase-2 work.
+one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, and the first
+v47 exact-Project wildcard placement are now implemented locally. Wider Principal/Domain selectors,
+subscription/Handler delivery and the v36 delivery cutover remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -624,28 +624,48 @@ covering deadline races and trusted-local commits from another process/Store ins
 ephemeral watch. Thus cross-process wake latency may reach the caller's requested deadline, but correctness
 and no-loss semantics remain entirely projection/cursor-owned rather than requiring new IPC.
 
-The wake is deliberately store-local and coarse: any committed local Event may wake exact-Agent readers,
-which then cheaply prove pattern/source relevance through EventScan. This avoids a per-Agent waiter
-registry/worker until profiling shows a real need. The Tokio `time` feature is the only runtime addition;
-no background task is created. Subagent terminal Agent Events use the same post-commit wake path. No durable
-subscription, Handler, EventInput, EventTypeRegistry or v36 delivery cutover is implemented.
+The wake is deliberately store-local and coarse: any committed local Event may wake readers, which then
+cheaply prove pattern/source relevance through EventScan. This avoids a per-Agent waiter registry/worker
+until profiling shows a real need. The Tokio `time` feature is the only runtime addition; no background
+task is created. Subagent terminal Agent Events use the same post-commit wake path.
+
+Schema **v47** generalizes only the cursor's private placement binding: existing `agent_ref` becomes
+`placement_ref` plus `placement_kind=agent|project`. Migrated exact-Agent cursors retain their existing
+Agent placement-token bytes; no cursor reset is required. The first broader selector shape is deliberately
+narrow and composable: exact `d:<domain>.i:<principal>.p:<workspace>.a:*` with any valid trailing Event
+pattern. `EventPattern::wildcard_agent_project_ref` recognizes only that shape, so Project-level Events,
+wildcard Project, wildcard Principal and wildcard Domain selectors remain fail-closed.
+
+Project admission reuses the existing resource owners rather than adding topology state. The `p:` handle is
+the Workspace ID; the Store must prove that exact Workspace is active, hosted by this Store's local Machine,
+and still belongs to the selector Domain. Broad cursor creation additionally requires current active Domain
+membership as a conservative discovery gate. That membership is **not** frozen into later source
+authorization: every matching concrete Agent/Turn/Job/Node Event still resolves its canonical Agent root and
+uses current Agent `view` authority. An ACL-only collaborator therefore keeps exact-Agent observation but
+cannot broaden into Project discovery merely from one grant. Per-page source checks cache one Agent evidence
+per canonical Agent ref and all visible Agent evidences are revalidated before cursor progress commits.
+Missing current Agent ownership is indeterminate/AuthorizationUnavailable, never silently classified as a
+proven deny. A Project cursor becomes stale if its Workspace is archived/moved away from local hosting or its
+Domain is no longer active; ordinary Agent ACL changes remain visibility changes, not placement staleness.
+
+No durable subscription, Handler, EventInput, EventTypeRegistry or v36 delivery cutover is implemented.
 `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged. The Event
 cursor remains the first implementation of the sealed opaque cursor envelope; extract shared cursor-binding
 mechanics only when the second real cursor consumer lands.
 
 Current focused Phase-2 evidence: Event-subject/pattern **2/2**; EventScan
 source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing attached-Turn
-coexistence regression **1/1** covers v46 end-to-end plus waiting: an owner read is demonstrably pending
-before publication, the committed Turn wakes it to exactly the three root/Turn Events, a drained cursor with
-a 1ms wait returns empty after the deadline recheck, observer revoke→private-skip→regrant remains
-non-retroactive, and v44→v45→v46 migration still preserves immutable commit-log cardinality/source next
-revision. Current-schema `aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad
+coexistence regression **1/1** now covers v47 as well: exact-Agent waiting still returns the three durable
+root/Turn Events, exact-Project `a:*` reads the same three through the shared scanner, an ACL-only observer
+is denied the broad Project cursor, revoke→private-skip→regrant remains non-retroactive on the exact-Agent
+cursor, and v44→v45→v46→v47 migration preserves immutable commit-log cardinality/source next revision.
+Current-schema `aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad
 `aw-store --lib` result remains **226 green / 4 historical stale-downgrade reds** and was not repeated.
 
-**Next Phase-2 slice:** inspect the existing Domain/Workspace placement owners and add only the smallest
-authority-scoped proof needed to admit broader selectors wholly served by this Event store. Keep broad
-selectors fail-closed until one-store completeness is actually provable; do not fabricate a global topology
-generation, per-user Event index or cross-store merged cursor.
+**Next Phase-2 slice:** begin the sealed durable Agent Event-subscription owner on the same supported
+same-store placement scopes, with generation/baseline/scan/lag semantics and no copied backlog. Keep wider
+Principal/Domain selectors fail-closed until an existing placement owner can prove them complete; do not
+invent a topology service or merged cross-store cursor.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

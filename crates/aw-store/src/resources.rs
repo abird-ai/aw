@@ -312,6 +312,67 @@ fn workspace_row(c: &Connection, id: &str) -> Result<WorkspaceInfo> {
     })
 }
 
+pub(crate) fn local_hosted_workspace_exact_in(
+    c: &Connection,
+    workspace_id: &str,
+) -> Result<Option<WorkspaceInfo>> {
+    let local_machine: String = db(c.query_row(
+        "SELECT value FROM store_meta WHERE key='local_machine_id'",
+        [],
+        |r| r.get(0),
+    ))?;
+    let found: bool = db(c.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM workspaces
+             WHERE workspace_id=?1
+               AND host_machine_id=?2
+               AND kind='hosted'
+               AND archived_at IS NULL
+         )",
+        params![workspace_id, local_machine],
+        |r| r.get(0),
+    ))?;
+    if !found {
+        return Ok(None);
+    }
+    workspace_row(c, workspace_id).map(Some)
+}
+
+pub(crate) fn active_local_hosted_workspace_exact_in(
+    c: &Connection,
+    workspace_id: &str,
+) -> Result<Option<WorkspaceInfo>> {
+    let Some(workspace) = local_hosted_workspace_exact_in(c, workspace_id)? else {
+        return Ok(None);
+    };
+    let active: bool = db(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM domains WHERE domain_id=?1 AND status='active')",
+        [&workspace.domain_id],
+        |r| r.get(0),
+    ))?;
+    Ok(active.then_some(workspace))
+}
+
+pub(crate) fn has_active_domain_membership(
+    c: &Connection,
+    actor: &PrincipalId,
+    domain_id: &str,
+) -> Result<bool> {
+    let Some(user) = crate::user_for_principal(c, actor)? else {
+        return Ok(false);
+    };
+    db(c.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM domain_memberships m
+            JOIN domains d ON d.domain_id=m.domain_id
+             WHERE m.domain_id=?1 AND m.user_id=?2
+               AND m.status='active' AND d.status='active'
+         )",
+        params![domain_id, user],
+        |r| r.get(0),
+    ))
+}
+
 fn machine_row(c: &Connection, id: &str) -> Result<MachineInfo> {
     let row=db(c.query_row("SELECT machine_id,owning_domain_id,node_id,display_name,kind,status,key_fingerprint,labels_json,capabilities_json,capability_revision,security_epoch,created_at,last_seen_at FROM machines WHERE machine_id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,u64>(9)?,r.get::<_,u64>(10)?,r.get::<_,i64>(11)?,r.get::<_,Option<i64>>(12)?))).optional())?.ok_or(Error::Denied("machine unavailable or not permitted"))?;
     Ok(MachineInfo {
@@ -889,28 +950,9 @@ impl SessionStore {
     /// Workspace. Display names are intentionally not accepted.
     pub fn local_hosted_workspace_exact(&self, workspace_id: &str) -> Result<WorkspaceInfo> {
         let c = self.connection()?;
-        let local_machine: String = db(c.query_row(
-            "SELECT value FROM store_meta WHERE key='local_machine_id'",
-            [],
-            |r| r.get(0),
-        ))?;
-        let found: bool = db(c.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM workspaces
-                 WHERE workspace_id=?1
-                   AND host_machine_id=?2
-                   AND kind='hosted'
-                   AND archived_at IS NULL
-             )",
-            params![workspace_id, local_machine],
-            |r| r.get(0),
-        ))?;
-        if !found {
-            return Err(Error::Denied(
-                "exact Workspace is not active and hosted by this local Machine",
-            ));
-        }
-        workspace_row(&c, workspace_id)
+        local_hosted_workspace_exact_in(&c, workspace_id)?.ok_or(Error::Denied(
+            "exact Workspace is not active and hosted by this local Machine",
+        ))
     }
     pub fn local_workspace(
         &self,

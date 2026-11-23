@@ -278,11 +278,23 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       attached-Turn regression proves the reader is pending before publication, commit wakes it to the
       three Events, and a drained 1ms wait returns empty. No Event worker/per-Agent waiter registry was
       added; Tokio `time` is the only runtime feature addition.
-      **Next:** extend placement only through existing Domain/Workspace owners that can prove the caller's
-      authorized broad selector is wholly served by this Event store. Keep broad selectors fail-closed and
-      never invent a global topology generation or merged cross-store cursor. Durable subscriptions/
-      Handlers/EventInput, EventTypeRegistry, protected-manifest authority and explicit v36
-      delivery_cutover_rev remain later Phase-2 slices.
+      **v47 exact-Project wildcard placement landed locally:** opaque cursors now persist generic
+      `placement_kind/ref`; migration preserves existing exact-Agent cursor tokens. The only new broad
+      selector shape is exact Domain + Principal + Project with one-token `a:*`; Project-level Events and
+      wildcard Project/Principal/Domain remain fail-closed. The Project handle is the existing Workspace ID;
+      admission proves the exact Workspace is active/local-hosted in the selector Domain and requires active
+      Domain membership as a conservative discovery gate. Concrete matching sources still authorize through
+      current Agent `view`, cached once per Agent per page and rechecked before progress. ACL-only
+      collaborators retain exact-Agent reads but cannot broaden Project discovery. Missing Agent authority
+      is Unknown, not proven deny; Workspace move/archive/Domain deactivation stales Project cursors.
+      Existing attached-Turn coverage now proves exact-Project `a:*` returns the same three Events,
+      ACL-only observer broad admission is denied, exact-Agent wait/revocation semantics remain intact, and
+      v44→v45→v46→v47 migration is green under strict all-target Clippy/check.
+      **Next:** implement the durable Event subscription owner over the same supported same-store placement
+      scopes: generation + baseline + private scan position + active/disabled/lagged state, with repeated
+      active `enabled=true` preserving backlog and no copied Event queue. Keep wider selector placement,
+      EventInput/Handler delivery, EventTypeRegistry, protected-manifest authority and explicit v36
+      delivery_cutover_rev as subsequent Phase-2 slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

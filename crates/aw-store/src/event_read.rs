@@ -9,7 +9,7 @@ use crate::{
         self, EventAuthorization, EventCandidate, EventPlacement, EventScanFence, EventScanResult,
         EventSource, MAX_EVENT_SCAN_ROWS,
     },
-    id, now,
+    id, now, resources,
     store_scope::{StorePos, StoreScope},
     Error, PrincipalId, Result, SessionParticipationAction, SessionStore,
 };
@@ -17,6 +17,7 @@ use aw_tools::event_subject::{EventPattern, EventSubject};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 
 const MAX_VISIBLE_EVENTS: usize = 256;
 const MAX_CURSORS_PER_PRINCIPAL: u64 = 64;
@@ -66,12 +67,58 @@ pub enum EventReadOutcome {
 struct CursorRow {
     principal: String,
     selector_sha256: [u8; 32],
-    agent_ref: String,
+    placement_kind: String,
+    placement_ref: String,
     placement_token: [u8; 32],
     store_id: String,
     restore_generation: u64,
     position: StorePos,
     last_used_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReadPlacement {
+    Agent { reference: String },
+    Project { reference: String },
+}
+
+impl ReadPlacement {
+    fn from_pattern(pattern: &EventPattern) -> Result<Self> {
+        if let Some(reference) = pattern.exact_agent_ref() {
+            return Ok(Self::Agent { reference });
+        }
+        if let Some(reference) = pattern.wildcard_agent_project_ref() {
+            return Ok(Self::Project { reference });
+        }
+        Err(Error::Denied(
+            "Event selector placement is not provably single-store",
+        ))
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Agent { .. } => "agent",
+            Self::Project { .. } => "project",
+        }
+    }
+
+    fn reference(&self) -> &str {
+        match self {
+            Self::Agent { reference } | Self::Project { reference } => reference,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PlacementSnapshot {
+    Agent { session: String, branch: String },
+    Project { domain: String, workspace: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceEvidence {
+    agent_ref: String,
+    access: agent_owner::AgentAccessEvidence,
 }
 
 impl SessionStore {
@@ -135,9 +182,7 @@ impl SessionStore {
         }
         let pattern = EventPattern::parse_absolute(subject)
             .map_err(|_| Error::Denied("invalid Event subject pattern"))?;
-        let agent_ref = pattern.exact_agent_ref().ok_or(Error::Denied(
-            "Event selector placement is not provably single-store",
-        ))?;
+        let placement = ReadPlacement::from_pattern(&pattern)?;
         let selector_sha256 = selector_hash(pattern.as_str());
 
         let mut connection = self.connection()?;
@@ -147,24 +192,7 @@ impl SessionStore {
         match after {
             EventReadAfter::Now => {
                 cleanup_expired_cursors(&tx, actor, at)?;
-                let Some((session, branch)) = agent_owner::key_for_ref_optional(&tx, &agent_ref)?
-                else {
-                    return Err(Error::Denied(
-                        "Event selector unavailable or not authorized",
-                    ));
-                };
-                agent_owner::authorize_access(
-                    &tx,
-                    actor,
-                    agent_owner::AgentKey::new(&session, &branch),
-                    SessionParticipationAction::View,
-                )
-                .map_err(|error| match error {
-                    Error::Denied(_) => {
-                        Error::Denied("Event selector unavailable or not authorized")
-                    }
-                    other => other,
-                })?;
+                let _placement_snapshot = admit_placement(&tx, actor, &placement)?;
 
                 let live: u64 = db(tx.query_row(
                     "SELECT count(*) FROM event_read_cursors_current
@@ -182,23 +210,24 @@ impl SessionStore {
                         "Event projection is unavailable; owner normalization required",
                     ));
                 }
-                let token = placement_token(&projection.scope, &agent_ref);
+                let token = placement_token(&projection.scope, &placement);
                 let cursor = id("evc")?;
                 db(tx.execute(
                     "INSERT INTO event_read_cursors_current(
-                         cursor_id,principal,selector_sha256,agent_ref,placement_token,
-                         store_id,restore_generation,position,created_at,last_used_at
-                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+                         cursor_id,principal,selector_sha256,placement_ref,placement_token,
+                         store_id,restore_generation,position,created_at,last_used_at,placement_kind
+                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
                     params![
                         cursor,
                         actor.as_str(),
                         selector_sha256.as_slice(),
-                        agent_ref,
+                        placement.reference(),
                         token.as_slice(),
                         projection.scope.id().as_str(),
                         projection.scope.restore_generation(),
                         projection.indexed_through.get(),
                         at,
+                        placement.kind(),
                     ],
                 ))?;
                 db(tx.commit())?;
@@ -219,7 +248,7 @@ impl SessionStore {
                     tx,
                     actor,
                     &pattern,
-                    &agent_ref,
+                    &placement,
                     selector_sha256,
                     cursor,
                     limit,
@@ -234,7 +263,7 @@ fn read_cursor_page(
     tx: rusqlite::Transaction<'_>,
     actor: &PrincipalId,
     pattern: &EventPattern,
-    agent_ref: &str,
+    placement: &ReadPlacement,
     selector_sha256: [u8; 32],
     cursor: String,
     limit: usize,
@@ -245,7 +274,8 @@ fn read_cursor_page(
     };
     if row.principal != actor.as_str()
         || row.selector_sha256 != selector_sha256
-        || row.agent_ref != agent_ref
+        || row.placement_kind != placement.kind()
+        || row.placement_ref != placement.reference()
     {
         return Err(Error::Denied(
             "Event read cursor belongs to another selector",
@@ -264,10 +294,10 @@ fn read_cursor_page(
     if row.store_id != scope.id().as_str() || row.restore_generation != scope.restore_generation() {
         return Ok(EventReadOutcome::CursorStale);
     }
-    let Some(agent_key) = current_agent_key(&tx, agent_ref)? else {
+    let Some(placement_snapshot) = placement_snapshot(&tx, placement)? else {
         return Ok(EventReadOutcome::CursorStale);
     };
-    if row.placement_token != placement_token(&scope, agent_ref) {
+    if row.placement_token != placement_token(&scope, placement) {
         return Ok(EventReadOutcome::CursorStale);
     }
     if cursor_behind_retention(&tx, row.position, at)? {
@@ -275,11 +305,13 @@ fn read_cursor_page(
     }
 
     let fence = EventScanFence::capture(&tx)?;
-    let page_authority = current_source_authority(&tx, actor, &agent_key)?;
     let original_position = row.position;
     let mut position = row.position;
     let mut examined = 0usize;
     let mut events = Vec::with_capacity(limit);
+    let mut authority_cache =
+        HashMap::<String, EventAuthorization<agent_owner::AgentAccessEvidence>>::new();
+    let mut visible_evidence = HashMap::<String, agent_owner::AgentAccessEvidence>::new();
 
     while events.len() < limit && examined < MAX_EVENT_SCAN_ROWS {
         let remaining = MAX_EVENT_SCAN_ROWS - examined;
@@ -289,8 +321,8 @@ fn read_cursor_page(
             position,
             pattern,
             remaining,
-            || placement_state(&tx, agent_ref, &agent_key),
-            |source| source_visibility(agent_ref, source, &page_authority),
+            || placement_state(&tx, placement, &placement_snapshot),
+            |source| source_visibility(&tx, actor, placement, source, &mut authority_cache),
             |candidate, _source_evidence| candidate_authority(candidate),
         )?;
         match result {
@@ -304,15 +336,9 @@ fn read_cursor_page(
                     source_evidence,
                     candidate_evidence: (),
                 } = *candidate;
-                match &page_authority {
-                    EventAuthorization::Allow(page_evidence)
-                        if *page_evidence == source_evidence => {}
-                    _ => {
-                        return Err(Error::Storage(
-                            "EventScan source evidence disagrees with page authority",
-                        ))
-                    }
-                }
+                visible_evidence
+                    .entry(source_evidence.agent_ref)
+                    .or_insert(source_evidence.access);
                 events.push(project_event(&event)?);
                 position = event.position;
             }
@@ -340,7 +366,7 @@ fn read_cursor_page(
     if current_scope != scope {
         return Ok(EventReadOutcome::CursorStale);
     }
-    match placement_state(&tx, agent_ref, &agent_key)? {
+    match placement_state(&tx, placement, &placement_snapshot)? {
         EventPlacement::Current => {}
         EventPlacement::Stale => return Ok(EventReadOutcome::CursorStale),
         EventPlacement::Unknown => {
@@ -349,14 +375,17 @@ fn read_cursor_page(
             return Ok(EventReadOutcome::AuthorizationUnavailable { cursor });
         }
     }
-    if !events.is_empty() {
-        let final_authority = current_source_authority(&tx, actor, &agent_key)?;
-        if final_authority != page_authority {
-            touch_cursor(&tx, &cursor, original_position, at)?;
-            db(tx.commit())?;
-            return Ok(EventReadOutcome::AuthorizationUnavailable { cursor });
+    for (agent_ref, expected) in visible_evidence {
+        match authorize_agent_ref(&tx, actor, &agent_ref)? {
+            EventAuthorization::Allow(current) if current == expected => {}
+            _ => {
+                touch_cursor(&tx, &cursor, original_position, at)?;
+                db(tx.commit())?;
+                return Ok(EventReadOutcome::AuthorizationUnavailable { cursor });
+            }
         }
     }
+
     let changed = db(tx.execute(
         "UPDATE event_read_cursors_current
          SET position=?1,last_used_at=?2
@@ -382,22 +411,23 @@ fn read_cursor_page(
 fn cursor_row(connection: &Connection, cursor: &str) -> Result<Option<CursorRow>> {
     db(connection
         .query_row(
-            "SELECT principal,selector_sha256,agent_ref,placement_token,store_id,
+            "SELECT principal,selector_sha256,placement_kind,placement_ref,placement_token,store_id,
                     restore_generation,position,last_used_at
              FROM event_read_cursors_current WHERE cursor_id=?1",
             [cursor],
             |row| {
                 let selector: Vec<u8> = row.get(1)?;
-                let placement: Vec<u8> = row.get(3)?;
+                let placement: Vec<u8> = row.get(4)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     selector,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                     placement,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(5)?,
                     row.get::<_, u64>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )
@@ -406,7 +436,8 @@ fn cursor_row(connection: &Connection, cursor: &str) -> Result<Option<CursorRow>
         |(
             principal,
             selector,
-            agent_ref,
+            placement_kind,
+            placement_ref,
             placement,
             store_id,
             restore_generation,
@@ -419,10 +450,14 @@ fn cursor_row(connection: &Connection, cursor: &str) -> Result<Option<CursorRow>
             let placement_token: [u8; 32] = placement
                 .try_into()
                 .map_err(|_| Error::Storage("invalid Event cursor placement token"))?;
+            if !matches!(placement_kind.as_str(), "agent" | "project") {
+                return Err(Error::Storage("invalid Event cursor placement kind"));
+            }
             Ok(CursorRow {
                 principal,
                 selector_sha256,
-                agent_ref,
+                placement_kind,
+                placement_ref,
                 placement_token,
                 store_id,
                 restore_generation,
@@ -434,16 +469,83 @@ fn cursor_row(connection: &Connection, cursor: &str) -> Result<Option<CursorRow>
     .transpose()
 }
 
-fn current_agent_key(connection: &Connection, agent_ref: &str) -> Result<Option<(String, String)>> {
-    agent_owner::key_for_ref_optional(connection, agent_ref)
+fn admit_placement(
+    connection: &Connection,
+    actor: &PrincipalId,
+    placement: &ReadPlacement,
+) -> Result<PlacementSnapshot> {
+    match placement {
+        ReadPlacement::Agent { reference } => {
+            let Some((session, branch)) = agent_owner::key_for_ref_optional(connection, reference)?
+            else {
+                return Err(Error::Denied(
+                    "Event selector unavailable or not authorized",
+                ));
+            };
+            agent_owner::authorize_access(
+                connection,
+                actor,
+                agent_owner::AgentKey::new(&session, &branch),
+                SessionParticipationAction::View,
+            )
+            .map_err(|error| match error {
+                Error::Denied(_) => Error::Denied("Event selector unavailable or not authorized"),
+                other => other,
+            })?;
+            Ok(PlacementSnapshot::Agent { session, branch })
+        }
+        ReadPlacement::Project { reference } => {
+            let (domain, workspace) = project_coordinates(reference)?;
+            let Some(current) =
+                resources::active_local_hosted_workspace_exact_in(connection, workspace)?
+            else {
+                return Err(Error::Denied(
+                    "Event selector unavailable or not authorized",
+                ));
+            };
+            if current.domain_id != domain
+                || !resources::has_active_domain_membership(connection, actor, domain)?
+            {
+                return Err(Error::Denied(
+                    "Event selector unavailable or not authorized",
+                ));
+            }
+            Ok(PlacementSnapshot::Project {
+                domain: domain.to_owned(),
+                workspace: workspace.to_owned(),
+            })
+        }
+    }
+}
+
+fn placement_snapshot(
+    connection: &Connection,
+    placement: &ReadPlacement,
+) -> Result<Option<PlacementSnapshot>> {
+    match placement {
+        ReadPlacement::Agent { reference } => {
+            Ok(agent_owner::key_for_ref_optional(connection, reference)?
+                .map(|(session, branch)| PlacementSnapshot::Agent { session, branch }))
+        }
+        ReadPlacement::Project { reference } => {
+            let (domain, workspace) = project_coordinates(reference)?;
+            let current = resources::active_local_hosted_workspace_exact_in(connection, workspace)?;
+            Ok(current
+                .filter(|current| current.domain_id == domain)
+                .map(|_| PlacementSnapshot::Project {
+                    domain: domain.to_owned(),
+                    workspace: workspace.to_owned(),
+                }))
+        }
+    }
 }
 
 fn placement_state(
     connection: &Connection,
-    agent_ref: &str,
-    expected: &(String, String),
+    placement: &ReadPlacement,
+    expected: &PlacementSnapshot,
 ) -> Result<EventPlacement> {
-    match current_agent_key(connection, agent_ref) {
+    match placement_snapshot(connection, placement) {
         Ok(Some(current)) if current == *expected => Ok(EventPlacement::Current),
         Ok(_) => Ok(EventPlacement::Stale),
         Err(Error::Conflict(_)) => Ok(EventPlacement::Unknown),
@@ -451,15 +553,44 @@ fn placement_state(
     }
 }
 
-fn current_source_authority(
+fn project_coordinates(reference: &str) -> Result<(&str, &str)> {
+    let mut segments = reference
+        .strip_prefix('/')
+        .ok_or(Error::Storage("invalid Event Project placement ref"))?
+        .split('/');
+    let domain = segments
+        .next()
+        .and_then(|value| value.strip_prefix("d:"))
+        .filter(|value| !value.is_empty())
+        .ok_or(Error::Storage("invalid Event Project placement Domain"))?;
+    let identity = segments
+        .next()
+        .and_then(|value| value.strip_prefix("i:"))
+        .filter(|value| !value.is_empty())
+        .ok_or(Error::Storage("invalid Event Project placement Principal"))?;
+    let workspace = segments
+        .next()
+        .and_then(|value| value.strip_prefix("p:"))
+        .filter(|value| !value.is_empty())
+        .ok_or(Error::Storage("invalid Event Project placement Workspace"))?;
+    if identity.is_empty() || segments.next().is_some() {
+        return Err(Error::Storage("invalid Event Project placement ref"));
+    }
+    Ok((domain, workspace))
+}
+
+fn authorize_agent_ref(
     connection: &Connection,
     actor: &PrincipalId,
-    agent_key: &(String, String),
+    agent_ref: &str,
 ) -> Result<EventAuthorization<agent_owner::AgentAccessEvidence>> {
+    let Some((session, branch)) = agent_owner::key_for_ref_optional(connection, agent_ref)? else {
+        return Ok(EventAuthorization::Unknown);
+    };
     match agent_owner::authorize_access(
         connection,
         actor,
-        agent_owner::AgentKey::new(&agent_key.0, &agent_key.1),
+        agent_owner::AgentKey::new(&session, &branch),
         SessionParticipationAction::View,
     ) {
         Ok(evidence) => Ok(EventAuthorization::Allow(evidence)),
@@ -469,22 +600,73 @@ fn current_source_authority(
     }
 }
 
-fn source_visibility(
-    agent_ref: &str,
-    source: &EventSource,
-    authority: &EventAuthorization<agent_owner::AgentAccessEvidence>,
-) -> Result<EventAuthorization<agent_owner::AgentAccessEvidence>> {
-    let belongs = source.reference == agent_ref
+fn source_agent_ref(source: &EventSource) -> Result<String> {
+    let identity = source
+        .identity
+        .as_deref()
+        .ok_or(Error::Storage("Agent Event source lacks Principal handle"))?;
+    let project = source
+        .project
+        .as_deref()
+        .ok_or(Error::Storage("Agent Event source lacks Project handle"))?;
+    let agent = source
+        .agent
+        .as_deref()
+        .ok_or(Error::Storage("Event selector matched a non-Agent source"))?;
+    let root = format!("/d:{}/i:{identity}/p:{project}/a:{agent}", source.domain);
+    let belongs = source.reference == root
         || source
             .reference
-            .strip_prefix(agent_ref)
+            .strip_prefix(&root)
             .is_some_and(|suffix| suffix.starts_with("/t:"));
-    if !belongs || source.agent.is_none() {
+    if !belongs {
         return Err(Error::Storage(
-            "Agent-scoped Event projection contains a source outside its Agent root",
+            "Event projection source disagrees with its Agent root",
         ));
     }
-    Ok(authority.clone())
+    Ok(root)
+}
+
+fn source_visibility(
+    connection: &Connection,
+    actor: &PrincipalId,
+    placement: &ReadPlacement,
+    source: &EventSource,
+    cache: &mut HashMap<String, EventAuthorization<agent_owner::AgentAccessEvidence>>,
+) -> Result<EventAuthorization<SourceEvidence>> {
+    let agent_ref = source_agent_ref(source)?;
+    match placement {
+        ReadPlacement::Agent { reference } if &agent_ref != reference => {
+            return Err(Error::Storage(
+                "exact-Agent Event scan escaped its placement root",
+            ));
+        }
+        ReadPlacement::Project { reference }
+            if !agent_ref
+                .strip_prefix(reference)
+                .is_some_and(|suffix| suffix.starts_with("/a:")) =>
+        {
+            return Err(Error::Storage(
+                "Project Event scan escaped its placement root",
+            ));
+        }
+        _ => {}
+    }
+
+    let authority = if let Some(authority) = cache.get(&agent_ref) {
+        authority.clone()
+    } else {
+        let authority = authorize_agent_ref(connection, actor, &agent_ref)?;
+        cache.insert(agent_ref.clone(), authority.clone());
+        authority
+    };
+    Ok(match authority {
+        EventAuthorization::Allow(access) => {
+            EventAuthorization::Allow(SourceEvidence { agent_ref, access })
+        }
+        EventAuthorization::Deny => EventAuthorization::Deny,
+        EventAuthorization::Unknown => EventAuthorization::Unknown,
+    })
 }
 
 fn candidate_authority(candidate: &EventCandidate) -> Result<EventAuthorization<()>> {
@@ -571,13 +753,16 @@ fn selector_hash(subject: &str) -> [u8; 32] {
     hash.finalize().into()
 }
 
-fn placement_token(scope: &StoreScope, agent_ref: &str) -> [u8; 32] {
+fn placement_token(scope: &StoreScope, placement: &ReadPlacement) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"aw-event-agent-placement-v1\0");
+    hash.update(match placement {
+        ReadPlacement::Agent { .. } => b"aw-event-agent-placement-v1\0".as_slice(),
+        ReadPlacement::Project { .. } => b"aw-event-project-placement-v1\0".as_slice(),
+    });
     hash.update((scope.id().as_str().len() as u64).to_be_bytes());
     hash.update(scope.id().as_str().as_bytes());
-    hash.update((agent_ref.len() as u64).to_be_bytes());
-    hash.update(agent_ref.as_bytes());
+    hash.update((placement.reference().len() as u64).to_be_bytes());
+    hash.update(placement.reference().as_bytes());
     hash.finalize().into()
 }
 

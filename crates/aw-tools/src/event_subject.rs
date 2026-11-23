@@ -295,6 +295,30 @@ impl EventPattern {
         Some(out)
     }
 
+    /// Exact Project root for selectors whose Agent component is one-token wildcard.
+    ///
+    /// This admits broad observation only across Agent descendants of one concrete
+    /// Project. Project-level Events and broader Domain/Principal/Project wildcards
+    /// deliberately remain outside this placement shape.
+    pub fn wildcard_agent_project_ref(&self) -> Option<String> {
+        let mut tokens = self.raw.split('.');
+        let mut out = String::with_capacity(self.raw.len().min(MAX_REF_BYTES));
+        for expected in ["d", "i", "p"] {
+            let token = tokens.next()?;
+            let (kind, encoded) = token.split_once(':')?;
+            if kind != expected || encoded == "*" {
+                return None;
+            }
+            let decoded = decode_handle(encoded).ok()?;
+            out.push('/');
+            out.push_str(expected);
+            out.push(':');
+            out.push_str(&decoded);
+        }
+        let (kind, encoded) = tokens.next()?.split_once(':')?;
+        (kind == "a" && encoded == "*").then_some(out)
+    }
+
     pub fn matches_canonical(&self, subject: &str) -> bool {
         let pattern = self.raw.split('.');
         let mut subject = subject.split('.');
@@ -425,10 +449,21 @@ mod tests {
     fn absolute_patterns_keep_typed_nats_cardinality_without_partial_globs() {
         let subtree = EventPattern::parse_absolute("d:acme.i:alice.p:core.a:*.>").unwrap();
         assert_eq!(subtree.exact_agent_ref(), None);
+        assert_eq!(
+            subtree.wildcard_agent_project_ref().as_deref(),
+            Some("/d:acme/i:alice/p:core")
+        );
         let exact_agent = EventPattern::parse_absolute("d:acme.i:alice.p:foo%2Ebar.a:2.>").unwrap();
         assert_eq!(
             exact_agent.exact_agent_ref().as_deref(),
             Some("/d:acme/i:alice/p:foo.bar/a:2")
+        );
+        assert_eq!(exact_agent.wildcard_agent_project_ref(), None);
+        assert_eq!(
+            EventPattern::parse_absolute("d:acme.i:alice.p:core.e:*")
+                .unwrap()
+                .wildcard_agent_project_ref(),
+            None
         );
         assert!(subtree.matches_canonical("d:acme.i:alice.p:core.a:2.e:changed"));
         assert!(subtree.matches_canonical("d:acme.i:alice.p:core.a:2.t:7.j:test.e:result"));

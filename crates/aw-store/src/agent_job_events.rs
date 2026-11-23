@@ -854,12 +854,25 @@ mod tests {
             aw_tools::event_subject::EventSubject::from_resource_ref(&root, "result")
                 .unwrap()
                 .into_string();
-        let read_pattern = format!(
-            "{}.>",
-            root_subject
-                .strip_suffix(".e:result")
-                .expect("concrete Event subject has final event token")
-        );
+        let root_subject_prefix = root_subject
+            .strip_suffix(".e:result")
+            .expect("concrete Event subject has final event token");
+        let read_pattern = format!("{root_subject_prefix}.>");
+        let project_subject_prefix = root_subject_prefix
+            .rsplit_once(".a:")
+            .expect("Agent Event subject has final Agent token")
+            .0;
+        let project_pattern = format!("{project_subject_prefix}.a:*.>");
+        let owner_project_cursor = match store
+            .events_read_page(&actor, &project_pattern, crate::EventReadAfter::Now, 16)
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => {
+                assert!(page.events.is_empty());
+                page.cursor
+            }
+            other => panic!("unexpected Project Event cursor outcome: {other:?}"),
+        };
         let owner_cursor = match store
             .events_read_page(&actor, &read_pattern, crate::EventReadAfter::Now, 16)
             .unwrap()
@@ -919,6 +932,10 @@ mod tests {
                 revision,
             )
             .unwrap();
+        assert!(matches!(
+            store.events_read_page(&observer, &project_pattern, crate::EventReadAfter::Now, 16,),
+            Err(Error::Denied(_))
+        ));
         let observer_cursor = match store
             .events_read_page(&observer, &read_pattern, crate::EventReadAfter::Now, 16)
             .unwrap()
@@ -1036,6 +1053,31 @@ mod tests {
             crate::EventReadOutcome::Page(page) => page,
             other => panic!("unexpected owner Event wait outcome: {other:?}"),
         };
+        let project_page = match store
+            .events_read_page(
+                &actor,
+                &project_pattern,
+                crate::EventReadAfter::Cursor(owner_project_cursor),
+                16,
+            )
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => page,
+            other => panic!("unexpected Project Event read outcome: {other:?}"),
+        };
+        assert_eq!(project_page.events.len(), 3);
+        assert_eq!(
+            project_page
+                .events
+                .iter()
+                .map(|event| event.subject.as_str())
+                .collect::<Vec<_>>(),
+            owner_page
+                .events
+                .iter()
+                .map(|event| event.subject.as_str())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(owner_page.cursor, owner_cursor);
         assert_eq!(owner_page.events.len(), 3);
         assert!(owner_page.events.iter().all(|event| event.event_rev == 1));
@@ -1200,11 +1242,12 @@ mod tests {
             .unwrap();
         crate::migrate_event_sources(&mut connection).unwrap();
         crate::migrate_event_read_cursors(&mut connection).unwrap();
+        crate::migrate_event_read_placement(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            46
+            47
         );
         for source in [&root, &turn_ref] {
             assert_eq!(
