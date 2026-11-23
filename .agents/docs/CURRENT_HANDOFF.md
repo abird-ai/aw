@@ -18,10 +18,11 @@ Normative R6 design:
 ## Current authoritative snapshot — 2026-11-23
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
-complete and published. Phase 1 is COMPLETE locally. Phase 2 is now UNDERWAY with the first v44
-Event projection foundation; EventScan/read/subscription/cutover are still next and are not claimed
-implemented by this checkpoint. Real-Bubblewrap worker-retirement and Windows-native Process qualification
-remain explicitly deferred evidence and are not claimed green.**
+complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection
+foundation and the one private EventScan boundary are now implemented locally; real Event emission,
+events.read/subscription/Handler consumers and the v36 delivery cutover remain later Phase-2 work.
+Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
+evidence and are not claimed green.**
 
 Verified publication truth:
 
@@ -34,8 +35,10 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
 
 The local Phase-1 implementation line remains unpublished. Its signed completion checkpoint is
-`7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). This checkpoint starts Phase 2
-on top of that line. The local `origin/main` tracking ref is stale and is not publication truth.
+`7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 started at signed local
+checkpoint `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`); this checkpoint
+adds the private EventScan boundary on top. The local `origin/main` tracking ref is stale and is not
+publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -535,17 +538,40 @@ Healthy Store open checks projection scope/watermark/dirty state in O(1); projec
 mark any out-of-band insert/update/delete dirty, and owner open rebuilds from immutable `commit_log`,
 advancing only the projection generation and never manufacturing Event/source/resource revisions.
 
-No EventScan, cursor, `events.read`, subscription, Handler, EventInput, EventTypeRegistry, source-local
-`event_rev` owner, or v36 delivery cutover is implemented in this slice. **Next Phase-2 slice:** build the
-one private EventScan over this gap-free projection with candidate/proven-skip/blocked-unknown/stale/end
-outcomes and source-first authorization, before exposing any Event consumer.
+The one private **EventScan** boundary is now implemented over that gap-free projection. Absolute
+`EventPattern` syntax lives with `EventSubject` in `aw-tools` and implements the sealed typed NATS
+cardinality: typed `*` matches exactly one token of the same kind, terminal `>` matches one-or-more
+trailing tokens, literal handle encoding stays canonical, and contextual expansion remains a host-edge
+concern. Matching allocates nothing after pattern parse.
 
-Current focused Phase-2 evidence: Event-subject round-trip/canonical-escape regression **1/1** and v44
-projection/watermark/rebuild/restore-scope regression **1/1** are green; current-schema `aw-tools + aw-store`
-all-target check and strict Clippy are green. A broad `aw-store --lib` sweep reached **226 green / 4 red**;
-the four reds are historical manual-downgrade fixture assumptions (three already documented remote-view/
-remote-start fixtures plus the v38→v39 fixture dropping principal tables while later-schema FKs exist), not
-current-schema v44 failures. They were not modified in this checkpoint.
+EventScan captures only StoreScope + projection generation. Selector-placement identity remains owned by
+the caller's existing placement owner: the scanner asks a zero-cost `Current | Stale | Unknown` callback
+before traversal and again before returning any candidate/progress, rather than inventing a placement-token
+type. Each bounded scan examines at most 4096 projected Event rows. Proven pattern nonmatch/source denial/
+deeper denial may advance private progress; any source/deeper/placement Unknown returns
+`BlockedUnknown` with no progress. Dirty/rebuilt/scope-mismatched projection or changed placement returns
+`Stale`. The scanner loads the immutable commit payload **only after** a matching concrete source has been
+allowed, so hidden sources cannot trigger deeper payload/manifest/provider work.
+
+Authorization callbacks are statically dispatched and return `Allow(evidence) | Deny | Unknown`.
+Source evidence is passed into the deeper check, and both source + deeper preliminary evidence are retained
+with an allowed candidate for the consumer's mandatory final-owner reauthorization. This permits a future
+consumer to carry `()` for purely local proofs or an owned provider fence/receipt without a trait object,
+global authority service or allocation on skip/blocked/end outcomes. Only the already-large visible
+candidate is boxed so the result enum stays small.
+
+No cursor, public `events.read`, subscription, Handler, EventInput, EventTypeRegistry, source-local
+`event_rev` owner or v36 delivery cutover is implemented yet. The scanner/snapshot seam therefore has a
+narrow temporary non-test dead-code allowance until the first real consumer lands; do not make it public
+merely to silence reachability. **Next Phase-2 slice:** establish real source-local Event revision/emission
+and exact source/deeper authority composition, then attach the first real consumer to this scanner and
+remove that temporary allowance.
+
+Current focused Phase-2 evidence: Event-subject/pattern regressions **2/2**, EventScan source-first/
+bounded/Unknown/stale/evidence regression **1/1**, and v44 projection/watermark/rebuild/restore-scope
+regression **1/1** are green. Current-schema `aw-tools + aw-store` all-target check and strict Clippy are
+green. The prior broad `aw-store --lib` result remains **226 green / 4 historical stale-downgrade reds**;
+it was not repeated for this scanner-only cut, and those unrelated fixtures were not modified.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

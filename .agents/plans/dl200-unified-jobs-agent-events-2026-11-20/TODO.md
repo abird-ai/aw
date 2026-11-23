@@ -237,10 +237,21 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       projection generation/scope/watermark and creates no Event/resource revision. Focused subject
       and projection regressions are 1/1 each; current-schema aw-tools/aw-store all-target check +
       strict Clippy are green. Broad aw-store lib is 226 green / 4 historical stale-downgrade reds.
-      **Next:** implement the one private EventScan over this gap-free projection with
-      candidate/proven-skip/blocked-unknown/stale/end and source-first authorization. Do not expose
-      events.read/subscription/Handler until that scanner boundary is correct; source-local event_rev,
-      final envelope emission, EventTypeRegistry and v36 delivery cutover remain later Phase-2 slices.
+      **EventScan boundary landed locally:** one absolute typed `EventPattern` matcher implements
+      one-token typed `*` + terminal one-or-more `>` with canonical encoded handles; one bounded private
+      scanner rechecks StoreScope/projection generation plus caller-owned placement `Current/Stale/Unknown`
+      before scan and before returning candidate/progress. Pattern nonmatch and proven source/deeper deny
+      advance privately; Unknown never advances; dirty/rebuilt/scope/placement mismatch is stale. Immutable
+      payload is loaded only after matching source allow. Source and deeper checks are statically dispatched
+      `Allow(evidence)|Deny|Unknown`; both preliminary evidence values travel with an allowed candidate for
+      mandatory consumer-side final reauthorization. The visible candidate alone is boxed to keep skip/
+      blocked/end outcomes small. Focused pattern 2/2, scanner 1/1 and projection 1/1 are green with strict
+      current-schema all-target Clippy/check. The private scanner has a narrow temporary non-test dead-code
+      allowance until its first real consumer lands; do not publish a fake API to remove it.
+      **Next:** add real source-local event_rev + transaction-coupled Event emission and exact source/deeper
+      authority composition, then attach the first real Event consumer to this same scanner and remove the
+      temporary reachability allowance. events.read/subscription/Handler, EventTypeRegistry and v36 delivery
+      cutover remain later Phase-2 slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

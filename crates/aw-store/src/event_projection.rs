@@ -44,6 +44,15 @@ struct ProjectionState {
     dirty: bool,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct EventProjectionSnapshot {
+    pub(crate) scope: StoreScope,
+    pub(crate) generation: u64,
+    pub(crate) indexed_through: StorePos,
+    pub(crate) usable: bool,
+}
+
 impl ProjectionState {
     fn matches_scope(&self, scope: &StoreScope) -> bool {
         self.store_id == scope.id().as_str()
@@ -146,6 +155,18 @@ pub(crate) fn project_commit_event(
         ));
     }
     Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn snapshot(connection: &Connection) -> Result<EventProjectionSnapshot> {
+    let current = state(connection)?;
+    let scope = StoreScope::load(connection)?;
+    Ok(EventProjectionSnapshot {
+        usable: current.matches_scope(&scope) && !current.dirty,
+        scope,
+        generation: current.generation,
+        indexed_through: current.indexed_through,
+    })
 }
 
 pub(crate) fn normalize(connection: &mut Connection) -> Result<()> {

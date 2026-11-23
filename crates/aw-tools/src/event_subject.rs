@@ -199,6 +199,108 @@ impl EventSubject {
     }
 }
 
+/// One already-contextualized absolute Event selector.
+///
+/// Contextual expansion belongs to the host edge; the shared matcher sees only
+/// the canonical typed namespace. Matching is allocation-free after parse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EventPattern {
+    raw: String,
+}
+
+impl EventPattern {
+    pub fn parse_absolute(value: &str) -> Result<Self, EventSubjectError> {
+        if value.is_empty() || value.len() > MAX_EVENT_SUBJECT_BYTES || !value.is_ascii() {
+            return Err(if value.len() > MAX_EVENT_SUBJECT_BYTES {
+                EventSubjectError::TooLong
+            } else {
+                EventSubjectError::InvalidSyntax
+            });
+        }
+
+        let mut kinds = [Kind::Domain; 8];
+        let mut kind_count = 0usize;
+        let mut tokens = value.split('.').peekable();
+        while let Some(token) = tokens.next() {
+            if token == ">" {
+                if tokens.next().is_some() || kind_count == 0 {
+                    return Err(EventSubjectError::InvalidHierarchy);
+                }
+                validate_hierarchy(&kinds[..kind_count])?;
+                return Ok(Self {
+                    raw: value.to_owned(),
+                });
+            }
+
+            let (prefix, encoded) = token
+                .split_once(':')
+                .ok_or(EventSubjectError::InvalidSyntax)?;
+            if prefix == "e" {
+                if tokens.next().is_some() || kind_count == 0 {
+                    return Err(EventSubjectError::InvalidHierarchy);
+                }
+                validate_hierarchy(&kinds[..kind_count])?;
+                if encoded != "*" {
+                    validate_event_name(encoded)?;
+                }
+                return Ok(Self {
+                    raw: value.to_owned(),
+                });
+            }
+
+            if prefix.len() != 1 || encoded.is_empty() || encoded.contains(':') {
+                return Err(EventSubjectError::InvalidSyntax);
+            }
+            let kind = Kind::parse(prefix)?;
+            let slot = kinds
+                .get_mut(kind_count)
+                .ok_or(EventSubjectError::InvalidHierarchy)?;
+            *slot = kind;
+            kind_count += 1;
+            if encoded != "*" {
+                if kind == Kind::Node {
+                    parse_node(encoded)?;
+                } else {
+                    decode_handle(encoded)?;
+                }
+            }
+        }
+
+        Err(EventSubjectError::InvalidHierarchy)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn matches_canonical(&self, subject: &str) -> bool {
+        let pattern = self.raw.split('.');
+        let mut subject = subject.split('.');
+        for pattern_token in pattern {
+            if pattern_token == ">" {
+                return subject.next().is_some();
+            }
+            let Some(subject_token) = subject.next() else {
+                return false;
+            };
+            let Some((pattern_kind, pattern_value)) = pattern_token.split_once(':') else {
+                return false;
+            };
+            if pattern_value == "*" {
+                let Some((subject_kind, subject_value)) = subject_token.split_once(':') else {
+                    return false;
+                };
+                if pattern_kind != subject_kind || subject_value.is_empty() {
+                    return false;
+                }
+            } else if pattern_token != subject_token {
+                return false;
+            }
+        }
+        subject.next().is_none()
+    }
+}
+
 fn validate_hierarchy(kinds: &[Kind]) -> Result<(), EventSubjectError> {
     use Kind::{Agent, Domain, Identity, Job, Node, Project, Sandbox, Turn};
     match kinds {
@@ -296,6 +398,32 @@ fn validate_event_name(value: &str) -> Result<(), EventSubjectError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_patterns_keep_typed_nats_cardinality_without_partial_globs() {
+        let subtree = EventPattern::parse_absolute("d:acme.i:alice.p:core.a:*.>").unwrap();
+        assert!(subtree.matches_canonical("d:acme.i:alice.p:core.a:2.e:changed"));
+        assert!(subtree.matches_canonical("d:acme.i:alice.p:core.a:2.t:7.j:test.e:result"));
+        assert!(!subtree.matches_canonical("d:acme.i:alice.p:other.a:2.e:changed"));
+
+        let direct = EventPattern::parse_absolute("d:acme.i:alice.p:core.a:*.e:*").unwrap();
+        assert!(direct.matches_canonical("d:acme.i:alice.p:core.a:2.e:#ready"));
+        assert!(!direct.matches_canonical("d:acme.i:alice.p:core.a:2.t:7.e:settled"));
+
+        let dotted =
+            EventPattern::parse_absolute("d:acme.i:alice.p:foo%2Ebar.a:*.e:changed").unwrap();
+        assert!(dotted.matches_canonical("d:acme.i:alice.p:foo%2Ebar.a:2.e:changed"));
+
+        for invalid in [
+            "d:acme.p:*.e:*",
+            "d:acme.i:alice.p:core.a:*.e:#*",
+            "d:acme.i:alice.p:foo%2ebar.a:*.e:*",
+            "d:acme.i:alice.p:core.a:*.>.e:changed",
+            "d:acme.i:alice.p:core.a:*",
+        ] {
+            assert!(EventPattern::parse_absolute(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn concrete_subjects_round_trip_typed_resource_refs_and_encode_literal_dots() {

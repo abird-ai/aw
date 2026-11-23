@@ -36,6 +36,8 @@ pub mod context;
 mod coordination;
 pub mod durability;
 mod event_projection;
+#[cfg_attr(not(test), allow(dead_code))]
+mod event_scan;
 mod extension_secret;
 mod history_owner;
 mod identity_continuity;
