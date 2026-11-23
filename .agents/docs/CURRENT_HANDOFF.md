@@ -1,10 +1,13 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md).
+[AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md](AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-R6-NEXT-AGENT-2026-11-22.md](AW-DL200-R6-NEXT-AGENT-2026-11-22.md).
+[AW-DL200-PHASE1-NEXT-AGENT-2026-11-23.md](AW-DL200-PHASE1-NEXT-AGENT-2026-11-23.md).
+
+Previous R6 comprehensive handoff remains historical design/implementation provenance:
+[AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md).
 
 Normative R6 design:
 - [README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md)
