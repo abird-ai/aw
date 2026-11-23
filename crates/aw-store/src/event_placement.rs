@@ -44,6 +44,14 @@ impl EventSelectorPlacement {
         }
     }
 
+    pub(crate) fn from_stored(kind: &str, reference: String) -> Result<Self> {
+        match kind {
+            "agent" => Ok(Self::Agent { reference }),
+            "project" => Ok(Self::Project { reference }),
+            _ => Err(Error::Storage("invalid Event selector placement kind")),
+        }
+    }
+
     pub(crate) fn token(&self, scope: &StoreScope) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(match self {

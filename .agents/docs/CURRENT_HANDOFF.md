@@ -20,9 +20,10 @@ Normative R6 design:
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
 complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
-exact-Project wildcard placement, and the v48 durable subscription state owner are now implemented locally.
-EventInput/subscription delivery, wider Principal/Domain selectors, Handler delivery and the v36 delivery
-cutover remain later Phase-2 work.
+exact-Project wildcard placement, v48 durable subscription state, and v49 replay-safe typed EventInput
+subscription delivery are now implemented locally. Protected-manifest audience closure, inherited causal
+execution propagation, wider Principal/Domain selectors, Handler delivery and the v36 delivery cutover
+remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -682,25 +683,63 @@ never leave the owner. Disabled tombstones are omitted. The `lagged` owner state
 semantics exist now, but active→lagged is intentionally **not** manufactured by list/open-time mutation; the
 future subscription scanner will set it when it actually proves retention or placement failure.
 
-No EventInput admission, subscription scanner/delivery, Handler, EventTypeRegistry or v36 delivery cutover
-is implemented yet. Therefore an allowed matching Event cannot be advanced as “delivered” by v48 state
-alone. `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+The third shared prerequisite extraction is similarly narrow. `event_authority` now owns the current
+Agent-source visibility + immutable envelope validation used by read and subscription delivery; source
+visibility remains first, and the deeper candidate step validates subject/source/marker agreement,
+actor/Turn/causal bounds and the same object/4096-byte/depth-8 Event-data contract used by publication.
+A retained Event carrying `disclosure_manifest` remains Unknown before any payload disclosure.
+`event_retention` likewise owns only the already-sealed seven-day-or-newest-65,536 logical retention
+floor, with read choosing CursorExpired and subscription choosing lagged.
+
+Schema **v49** adds append-only `agent_event_inputs` plus the small
+`event_causal_roots_current` safety projection. EventInput is a typed immutable Agent-input fact, **not**
+a second pending Event queue; subscription scan position remains the only Event backlog. A deterministic
+delivery identity is SHA-256 over recipient + normalized subscription subject + generation + immutable
+Event.id. The admission transaction reloads the exact active subscription generation/StoreScope/placement,
+revalidates the creating principal's current recipient control-or-manage ownership plus current recipient
+`submit`, proves source Agent `view` before deeper Event authority, suppresses source-Agent==recipient,
+revalidates the preliminary source/envelope evidence, deduplicates before budget charging, appends one
+EventInput, charges the causal root exactly once and advances recipient Agent rev for the newly accepted
+input. A fresh Event with no inherited root uses its existing opaque immutable Event.id as the causal root,
+so no second random identity owner was introduced. The projection allows at most 256 accepted EventInputs
+per root and records max observed Event hop through 16.
+
+`SessionStore::event_subscription_deliver` is the explicit lower trusted Rust host-scheduler seam; it
+creates no worker and performs no polling. It runs one bounded EventScan window (<=4096 examined,
+<=256 terminal candidates) under the persisted creator/placement. Proven pattern/source denial advances
+privately without EventInput work. A visible candidate enters the EventInput transaction; accepted,
+deduplicated or proven-denied results may advance scan, while AuthorizationUnavailable holds at the
+candidate. Proven StoreScope/placement mismatch or retention overtake marks the exact generation `lagged`
+and stops retention pinning. Scan advancement and all accepted EventInputs for the sweep commit in the same
+`BEGIN IMMEDIATE` transaction. The scheduler status exposes accepted/deduplicated/skipped/blocked/lagged
+to trusted Rust callers; its Store position remains crate-private and is not an Events RPC field.
+
+This cut deliberately does **not** claim protected-content delivery closure yet. Current locally emitted
+result/settled Events are metadata-only source-policy facts and can deliver through the source/recipient
+checks above. Any Event carrying a DisclosureManifest blocks with unchanged scan until the real
+manifest/provider + recipient-audience authorizer exists. Causal delivery counting is now durable and
+replay-safe, but EventInput→Turn causal execution scope, descendant Event root/hop inheritance and the
+one host-visible exhaustion attention fact remain pending; v49 does not claim those propagation surfaces.
+No Handler, EventTypeRegistry, custom/model Event publication or v36 delivery cutover is implemented.
+`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
 
 Current focused Phase-2 evidence: Event-subject/pattern **2/2**; EventScan
 source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing attached-Turn
-coexistence regression **1/1** now covers v48 subscription ownership in addition to read/wait/Project
-placement: first subscription baseline=scan, repeated active enable leaves positions/timestamps unchanged,
-disable preserves generation 1, re-enable mints generation 2 at the post-Event tail, management inspection
-exposes no private progress fields, recipient close has already disabled the row, and
-v44→v45→v46→v47→v48 migration preserves immutable Event history/source revision. Current-schema
+coexistence regression **1/1** now covers v49 without a new fixture harness. A separate recipient
+subscription accepts exactly the three real root/Turn Events as typed EventInputs and advances recipient
+Agent rev three times; the source Agent's own broad subscription proves self-delivery suppression by
+advancing across the same three with zero EventInputs; a drained second sweep creates nothing; three fresh
+Event IDs become three causal roots with count=1; all prior read/wait/Project/privacy/subscription-state
+checks remain green; and v44→v45→v46→v47→v48→v49 migration remains history-preserving. Current-schema
 `aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad `aw-store --lib`
 result remains **226 green / 4 historical stale-downgrade reds** and was not repeated.
 
-**Next Phase-2 slice:** implement the replay-safe typed EventInput admission transaction plus deterministic
-delivery identity/causal-budget owner, then attach the durable subscription as EventScan's second consumer.
-Only that input-owner transaction may accept/dedupe/proven-deny a candidate and advance subscription scan;
-Unknown holds progress, retention/placement failure marks the row lagged, and self-delivery is suppressed.
-Keep protected-manifest delivery fail-closed until its real authority closure exists.
+**Next Phase-2 slice:** finish the remaining EventInput disclosure/causal closure before adding more
+surfaces: compose the real DisclosureManifest/provider + recipient-audience authorizer for protected
+Events, carry EventInput causal root into admitted Turn execution, inherit/advance that root on descendant
+Event publication, and emit the bounded host-visible exhaustion attention fact. Keep Unknown fail-closed
+with unchanged progress. After that, land the final one-leaf EventTypeRegistry staging owner before custom
+host/model publication; Handler remains the third EventScan consumer and v36 delivery cutover stays later.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

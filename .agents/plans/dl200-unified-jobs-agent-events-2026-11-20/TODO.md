@@ -303,11 +303,26 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Turn regression proves baseline/scan equality, active replay timestamp/position stability,
       disable→generation-2 rebaseline, close fencing, private inspection, and
       v44→v45→v46→v47→v48 migration under strict all-target Clippy/check.
-      **Next:** add the replay-safe typed EventInput admission + deterministic delivery identity/causal
-      budget, then make durable subscription the second EventScan consumer. Accepted/deduped/proven-denied
-      results may advance scan; Unknown must hold; proven retention/placement failure marks lagged;
-      self-delivery is suppressed. Keep protected-manifest delivery fail-closed until the real authority
-      closure exists, and leave Handler/EventTypeRegistry/v36 delivery_cutover_rev for subsequent slices.
+      **v49 typed EventInput + subscription delivery landed locally:** `event_authority` shares exact
+      Agent source-first evidence + immutable envelope/data validation across read/delivery, while
+      `event_retention` shares only the sealed logical retention floor. `agent_event_inputs` is append-only
+      typed Agent input fact storage, not a second Event queue; deterministic delivery IDs bind recipient +
+      normalized subscription + generation + Event.id. One same-Store admission transaction reloads the
+      active generation/affinity, rechecks creator control-or-manage plus recipient submit, source Agent
+      view and preliminary envelope evidence, suppresses self-delivery, dedupes before charging the durable
+      causal root, inserts the EventInput and advances recipient Agent rev. Fresh Event.id is the causal root
+      when none is inherited; the current projection counts <=256 accepted deliveries/root and max hop<=16.
+      The explicit lower `event_subscription_deliver` host-scheduler sweep is bounded/no-worker/no-polling:
+      accepted/deduped/proven-denied may advance; Unknown holds; proven placement/retention failure lags the
+      generation. Current metadata-only system Events deliver; any DisclosureManifest remains Unknown.
+      Existing combined Event coverage proves 3 real EventInputs to a separate recipient, 3 self-suppressed
+      skips to the source Agent, drained replay no-op, 3 fresh causal roots at count1, all prior privacy/state
+      contracts, and v44→v45→v46→v47→v48→v49 migration under strict all-target Clippy/check.
+      **Next:** finish protected Event disclosure + causal propagation: real DisclosureManifest/provider and
+      recipient-audience reauthorization, EventInput→Turn causal scope, descendant Event root/hop inheritance
+      and one bounded durable host-visible exhaustion attention fact. Then land the final one-leaf
+      EventTypeRegistry staging owner before custom/model publication. Handler remains the third EventScan
+      consumer; wider selector placement and explicit v36 delivery_cutover_rev remain subsequent slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

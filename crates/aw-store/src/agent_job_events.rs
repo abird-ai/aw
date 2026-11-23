@@ -936,6 +936,25 @@ mod tests {
         assert!(!public_subscription.contains("scan_position"));
         assert!(!public_subscription.contains("placement_token"));
 
+        let (event_target, event_target_branch) =
+            store.create(&actor, "event target", binding()).unwrap();
+        let event_target_ref = {
+            let connection = store.connection().unwrap();
+            crate::agent_owner::canonical_ref(
+                &connection,
+                crate::agent_owner::AgentKey::new(&event_target.id, &event_target_branch.id),
+            )
+            .unwrap()
+        };
+        let target_subscription = store
+            .events_subscribe(&actor, &read_pattern, &event_target_ref, true)
+            .unwrap();
+        assert!(target_subscription.changed);
+        assert_eq!(target_subscription.generation, Some(1));
+        let event_target_rev_before = store
+            .agent_public_revision(&actor, &event_target.id, &event_target_branch.id)
+            .unwrap();
+
         let owner_project_cursor = match store
             .events_read_page(&actor, &project_pattern, crate::EventReadAfter::Now, 16)
             .unwrap()
@@ -1192,6 +1211,75 @@ mod tests {
         };
         assert!(owner_empty.events.is_empty());
 
+        let delivered = store
+            .event_subscription_deliver(&event_target_ref, &read_pattern, 16)
+            .unwrap();
+        assert_eq!(delivered.accepted, 3);
+        assert_eq!(delivered.deduplicated, 0);
+        assert_eq!(delivered.skipped, 0);
+        assert!(!delivered.blocked);
+        assert!(!delivered.lagged);
+        assert_eq!(
+            store
+                .agent_public_revision(&actor, &event_target.id, &event_target_branch.id)
+                .unwrap(),
+            event_target_rev_before + 3,
+            "each newly accepted EventInput is one factual Agent input"
+        );
+        let self_delivery = store
+            .event_subscription_deliver(&root, &project_pattern, 16)
+            .unwrap();
+        assert_eq!(self_delivery.accepted, 0);
+        assert_eq!(self_delivery.deduplicated, 0);
+        assert_eq!(self_delivery.skipped, 3);
+        assert!(!self_delivery.blocked);
+        assert!(!self_delivery.lagged);
+        {
+            let connection = store.connection().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM agent_event_inputs WHERE recipient_ref=?1",
+                        [&event_target_ref],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM agent_event_inputs WHERE recipient_ref=?1",
+                        [&root],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                0,
+                "self-delivery must advance privately without creating EventInput"
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM event_causal_roots_current
+                         WHERE accepted_event_input_count=1 AND state='active'",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                3,
+                "fresh source Events use their immutable Event IDs as causal roots"
+            );
+        }
+        let drained_delivery = store
+            .event_subscription_deliver(&event_target_ref, &read_pattern, 16)
+            .unwrap();
+        assert_eq!(drained_delivery.accepted, 0);
+        assert_eq!(drained_delivery.deduplicated, 0);
+        assert_eq!(
+            drained_delivery.through, delivered.through,
+            "drained delivery must preserve private progress"
+        );
+
         let disabled_subscription = store
             .events_subscribe(&actor, &project_pattern, &root, false)
             .unwrap();
@@ -1350,7 +1438,9 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE event_subscriptions_current;
+                "DROP TABLE agent_event_inputs;
+                 DROP TABLE event_causal_roots_current;
+                 DROP TABLE event_subscriptions_current;
                  DROP TABLE event_read_cursors_current;
                  DROP TABLE event_sources_current;
                  UPDATE store_meta SET value='44' WHERE key='schema_epoch';
@@ -1367,11 +1457,12 @@ mod tests {
         crate::migrate_event_read_cursors(&mut connection).unwrap();
         crate::migrate_event_read_placement(&mut connection).unwrap();
         crate::migrate_event_subscriptions(&mut connection).unwrap();
+        crate::migrate_event_inputs(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            48
+            49
         );
         for source in [&root, &turn_ref] {
             assert_eq!(

@@ -5,13 +5,18 @@
 //! EventInputs, run delivery workers or acknowledge EventHandlers.
 
 use crate::{
-    agent_owner, db,
+    agent_owner, db, event_authority, event_input,
     event_placement::{self, EventSelectorPlacement},
-    event_projection, now, Error, PrincipalId, Result, SessionStore,
+    event_projection, event_retention,
+    event_scan::{self, EventAuthorization, EventScanFence, EventScanResult, MAX_EVENT_SCAN_ROWS},
+    now,
+    store_scope::{StorePos, StoreScope},
+    Error, PrincipalId, Result, SessionStore,
 };
 use aw_tools::event_subject::EventPattern;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const HOST_AUTHORITY_REF: &str = "host:events.subscribe";
 
@@ -46,14 +51,30 @@ pub struct EventSubscriptionView {
     pub created_at: i64,
 }
 
-struct StoredSubscription {
-    generation: u64,
-    state: String,
-    store_id: String,
-    restore_generation: u64,
-    placement_kind: String,
-    placement_ref: String,
-    placement_token: [u8; 32],
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventSubscriptionDeliveryRun {
+    pub accepted: usize,
+    pub deduplicated: usize,
+    pub skipped: usize,
+    pub blocked: bool,
+    pub lagged: bool,
+    /// Private Store position reached by this lower scheduler sweep.
+    pub(crate) through: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredSubscription {
+    pub(crate) recipient_ref: String,
+    pub(crate) subject: String,
+    pub(crate) generation: u64,
+    pub(crate) state: String,
+    pub(crate) store_id: String,
+    pub(crate) restore_generation: u64,
+    pub(crate) placement_kind: String,
+    pub(crate) placement_ref: String,
+    pub(crate) placement_token: [u8; 32],
+    pub(crate) scan_position: u64,
+    pub(crate) created_by: String,
 }
 
 impl SessionStore {
@@ -333,6 +354,246 @@ impl SessionStore {
             })
             .collect::<rusqlite::Result<Vec<_>>>())
     }
+
+    /// Lower host-scheduler seam: consume one bounded subscription window.
+    ///
+    /// This creates no worker and performs no polling. The caller decides when
+    /// to invoke it; EventScan supplies ordered candidates and EventInput owns
+    /// the only acceptance/dedupe linearization transaction.
+    pub fn event_subscription_deliver(
+        &self,
+        recipient_ref: &str,
+        subject: &str,
+        limit: usize,
+    ) -> Result<EventSubscriptionDeliveryRun> {
+        if limit == 0 || limit > 256 {
+            return Err(Error::Limit(
+                "Event subscription delivery limit must be 1..256",
+            ));
+        }
+        let pattern = EventPattern::parse_absolute(subject)
+            .map_err(|_| Error::Denied("invalid Event subscription subject"))?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let Some(subscription) = subscription_row(&tx, recipient_ref, pattern.as_str())? else {
+            return Err(Error::Denied("Event subscription is unavailable"));
+        };
+        let mut run = EventSubscriptionDeliveryRun {
+            through: subscription.scan_position,
+            lagged: subscription.state == "lagged",
+            ..Default::default()
+        };
+        if subscription.state != "active" {
+            db(tx.commit())?;
+            return Ok(run);
+        }
+
+        let placement = EventSelectorPlacement::from_stored(
+            &subscription.placement_kind,
+            subscription.placement_ref.clone(),
+        )?;
+        let parsed_placement = EventSelectorPlacement::from_pattern(&pattern)?;
+        if parsed_placement != placement {
+            return Err(Error::Storage(
+                "Event subscription pattern disagrees with stored placement",
+            ));
+        }
+
+        let scope = StoreScope::load(&tx)?;
+        if subscription.store_id != scope.id().as_str()
+            || subscription.restore_generation != scope.restore_generation()
+            || subscription.placement_token != placement.token(&scope)
+        {
+            lag_subscription_in(&tx, &subscription, "store_scope_stale")?;
+            db(tx.commit())?;
+            run.lagged = true;
+            return Ok(run);
+        }
+        let placement_snapshot = match event_placement::snapshot(&tx, &placement) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                lag_subscription_in(&tx, &subscription, "placement_stale")?;
+                db(tx.commit())?;
+                run.lagged = true;
+                return Ok(run);
+            }
+            Err(Error::Conflict(_)) => {
+                run.blocked = true;
+                db(tx.commit())?;
+                return Ok(run);
+            }
+            Err(other) => return Err(other),
+        };
+        let start = StorePos::new(subscription.scan_position);
+        if event_retention::expired_now(&tx, start)? {
+            lag_subscription_in(&tx, &subscription, "retention_overtook_scan")?;
+            db(tx.commit())?;
+            run.lagged = true;
+            return Ok(run);
+        }
+
+        let creator = PrincipalId::new(subscription.created_by.clone())?;
+        let fence = EventScanFence::capture(&tx)?;
+        let mut position = start;
+        let mut examined = 0usize;
+        let mut terminal = 0usize;
+        let mut authority_cache =
+            HashMap::<String, EventAuthorization<agent_owner::AgentAccessEvidence>>::new();
+
+        while terminal < limit && examined < MAX_EVENT_SCAN_ROWS {
+            let remaining = MAX_EVENT_SCAN_ROWS - examined;
+            let result = event_scan::scan_events(
+                &tx,
+                &fence,
+                position,
+                &pattern,
+                remaining,
+                || event_placement::state(&tx, &placement, &placement_snapshot),
+                |source| {
+                    event_authority::source_visibility(
+                        &tx,
+                        &creator,
+                        &placement,
+                        source,
+                        &mut authority_cache,
+                    )
+                },
+                |candidate, _source_evidence| event_authority::candidate_authority(candidate),
+            )?;
+            match result {
+                EventScanResult::Candidate {
+                    candidate,
+                    examined: scanned,
+                } => {
+                    examined = examined.saturating_add(scanned);
+                    let event_scan::EventScanCandidate {
+                        event,
+                        source_evidence,
+                        candidate_evidence,
+                    } = *candidate;
+                    match event_input::admit_subscription_candidate(
+                        &tx,
+                        &subscription,
+                        &event,
+                        &source_evidence,
+                        &candidate_evidence,
+                    )? {
+                        event_input::EventInputAdmission::Accepted { .. } => {
+                            run.accepted += 1;
+                            terminal += 1;
+                            position = event.position;
+                        }
+                        event_input::EventInputAdmission::Deduplicated { .. } => {
+                            run.deduplicated += 1;
+                            terminal += 1;
+                            position = event.position;
+                        }
+                        event_input::EventInputAdmission::ProvenDenied => {
+                            run.skipped += 1;
+                            terminal += 1;
+                            position = event.position;
+                        }
+                        event_input::EventInputAdmission::AuthorizationUnavailable => {
+                            run.blocked = true;
+                            break;
+                        }
+                        event_input::EventInputAdmission::PlacementStale => {
+                            lag_subscription_in(&tx, &subscription, "placement_stale")?;
+                            run.lagged = true;
+                            break;
+                        }
+                    }
+                }
+                EventScanResult::ProvenSkip {
+                    through,
+                    examined: scanned,
+                } => {
+                    examined = examined.saturating_add(scanned);
+                    run.skipped = run.skipped.saturating_add(scanned);
+                    position = through;
+                }
+                EventScanResult::BlockedUnknown => {
+                    run.blocked = true;
+                    break;
+                }
+                EventScanResult::Stale => {
+                    lag_subscription_in(&tx, &subscription, "placement_stale")?;
+                    run.lagged = true;
+                    break;
+                }
+                EventScanResult::End { through } => {
+                    position = through;
+                    break;
+                }
+            }
+        }
+
+        if !run.lagged && position != start {
+            advance_scan_in(&tx, &subscription, start, position)?;
+        }
+        run.through = position.get();
+        db(tx.commit())?;
+        Ok(run)
+    }
+}
+
+fn advance_scan_in(
+    connection: &rusqlite::Connection,
+    subscription: &StoredSubscription,
+    expected: StorePos,
+    through: StorePos,
+) -> Result<()> {
+    let changed = db(connection.execute(
+        "UPDATE event_subscriptions_current
+         SET scan_position=?1,updated_at=?2
+         WHERE recipient_ref=?3 AND subject=?4 AND generation=?5
+           AND state='active' AND scan_position=?6
+           AND store_id=?7 AND restore_generation=?8",
+        params![
+            through.get(),
+            now(),
+            subscription.recipient_ref,
+            subscription.subject,
+            subscription.generation,
+            expected.get(),
+            subscription.store_id,
+            subscription.restore_generation,
+        ],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Conflict(
+            "Event subscription scan progress changed concurrently",
+        ));
+    }
+    Ok(())
+}
+
+fn lag_subscription_in(
+    connection: &rusqlite::Connection,
+    subscription: &StoredSubscription,
+    reason: &str,
+) -> Result<()> {
+    if reason.is_empty() || reason.len() > 256 {
+        return Err(Error::Storage("invalid Event subscription lag reason"));
+    }
+    let changed = db(connection.execute(
+        "UPDATE event_subscriptions_current
+         SET state='lagged',lag_reason=?1,updated_at=?2
+         WHERE recipient_ref=?3 AND subject=?4 AND generation=?5 AND state='active'",
+        params![
+            reason,
+            now(),
+            subscription.recipient_ref,
+            subscription.subject,
+            subscription.generation,
+        ],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Conflict(
+            "Event subscription lag state changed concurrently",
+        ));
+    }
+    Ok(())
 }
 
 /// Recipient lifecycle fence used by the Agent close owners.
@@ -352,51 +613,60 @@ pub(crate) fn disable_recipient_in(
     ))
 }
 
-fn subscription_row(
+pub(crate) fn subscription_row(
     connection: &rusqlite::Connection,
     recipient_ref: &str,
     subject: &str,
 ) -> Result<Option<StoredSubscription>> {
     db(connection
         .query_row(
-            "SELECT generation,state,store_id,restore_generation,
-                    placement_kind,placement_ref,placement_token
+            "SELECT recipient_ref,subject,generation,state,store_id,restore_generation,
+                    placement_kind,placement_ref,placement_token,scan_position,created_by
              FROM event_subscriptions_current
              WHERE recipient_ref=?1 AND subject=?2",
             params![recipient_ref, subject],
             |row| {
-                let token: Vec<u8> = row.get(6)?;
                 Ok((
-                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    token,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, u64>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .optional())?
     .map(
         |(
+            recipient_ref,
+            subject,
             generation,
             state,
             store_id,
             restore_generation,
             placement_kind,
             placement_ref,
-            token,
+            placement_token,
+            scan_position,
+            created_by,
         )| {
             if !matches!(state.as_str(), "active" | "lagged" | "disabled")
                 || !matches!(placement_kind.as_str(), "agent" | "project")
             {
                 return Err(Error::Storage("invalid Event subscription state"));
             }
-            let placement_token: [u8; 32] = token
+            let placement_token: [u8; 32] = placement_token
                 .try_into()
                 .map_err(|_| Error::Storage("invalid Event subscription placement token"))?;
             Ok(StoredSubscription {
+                recipient_ref,
+                subject,
                 generation,
                 state,
                 store_id,
@@ -404,13 +674,15 @@ fn subscription_row(
                 placement_kind,
                 placement_ref,
                 placement_token,
+                scan_position,
+                created_by,
             })
         },
     )
     .transpose()
 }
 
-fn authorize_management(
+pub(crate) fn authorize_management(
     connection: &rusqlite::Connection,
     actor: &PrincipalId,
     recipient: agent_owner::AgentKey<'_>,

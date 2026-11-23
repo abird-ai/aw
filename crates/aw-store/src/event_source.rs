@@ -4,15 +4,13 @@
 //! one monotonic Event revision per concrete source transition and writes bounded
 //! immutable Event envelopes into the existing commit_log transaction.
 
-use crate::{db, durability, event_projection, now, Error, PrincipalId, Result};
+use crate::{db, durability, event_authority, event_projection, now, Error, PrincipalId, Result};
 use aw_tools::{event_subject::EventSubject, job_event::SourceEventBook};
 use rusqlite::{params, Connection};
 use sha2::{Digest as _, Sha256};
 
 const STORE_SCHEMA_VERSION: i64 = 45;
 const MAX_EVENTS_PER_TRANSITION: usize = 32;
-const MAX_EVENT_DATA_BYTES: usize = 4096;
-const MAX_EVENT_DATA_DEPTH: usize = 8;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SystemEvent<'a> {
@@ -109,7 +107,7 @@ pub(crate) fn emit_system_events(
             ));
         }
         if let Some(data) = event.data {
-            validate_data(data)?;
+            event_authority::validate_data(data)?;
         }
     }
 
@@ -194,34 +192,4 @@ fn reserve_revision(
         ));
     }
     Ok(current)
-}
-
-fn validate_data(data: &serde_json::Value) -> Result<()> {
-    if !data.is_object() {
-        return Err(Error::Denied("Event data must be a JSON object"));
-    }
-    if json_depth(data, 0)? > MAX_EVENT_DATA_DEPTH {
-        return Err(Error::Limit("Event data nesting exceeds 8 levels"));
-    }
-    let encoded =
-        serde_json::to_vec(data).map_err(|_| Error::Storage("cannot encode Event data"))?;
-    if encoded.len() > MAX_EVENT_DATA_BYTES {
-        return Err(Error::Limit("Event data exceeds 4096 bytes"));
-    }
-    Ok(())
-}
-
-fn json_depth(value: &serde_json::Value, depth: usize) -> Result<usize> {
-    if depth > MAX_EVENT_DATA_DEPTH {
-        return Ok(depth);
-    }
-    match value {
-        serde_json::Value::Array(values) => values.iter().try_fold(depth, |max, value| {
-            Ok(max.max(json_depth(value, depth + 1)?))
-        }),
-        serde_json::Value::Object(values) => values.values().try_fold(depth, |max, value| {
-            Ok(max.max(json_depth(value, depth + 1)?))
-        }),
-        _ => Ok(depth),
-    }
 }

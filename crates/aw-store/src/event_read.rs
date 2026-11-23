@@ -5,17 +5,18 @@
 
 use crate::{
     agent_owner, db,
+    event_authority::{self, EventEnvelope},
     event_placement::{self, EventSelectorPlacement},
-    event_projection,
+    event_projection, event_retention,
     event_scan::{
         self, EventAuthorization, EventCandidate, EventPlacement, EventScanFence, EventScanResult,
-        EventSource, MAX_EVENT_SCAN_ROWS,
+        MAX_EVENT_SCAN_ROWS,
     },
     id, now,
     store_scope::{StorePos, StoreScope},
-    Error, PrincipalId, Result, SessionParticipationAction, SessionStore,
+    Error, PrincipalId, Result, SessionStore,
 };
-use aw_tools::event_subject::{EventPattern, EventSubject};
+use aw_tools::event_subject::EventPattern;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -24,8 +25,6 @@ use std::collections::HashMap;
 const MAX_VISIBLE_EVENTS: usize = 256;
 const MAX_CURSORS_PER_PRINCIPAL: u64 = 64;
 const CURSOR_IDLE_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
-const EVENT_RETENTION_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
-const MIN_RETAINED_EVENTS: i64 = 65_536;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventReadAfter {
@@ -76,12 +75,6 @@ struct CursorRow {
     restore_generation: u64,
     position: StorePos,
     last_used_at: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SourceEvidence {
-    agent_ref: String,
-    access: agent_owner::AgentAccessEvidence,
 }
 
 impl SessionStore {
@@ -263,7 +256,7 @@ fn read_cursor_page(
     if row.placement_token != placement.token(&scope) {
         return Ok(EventReadOutcome::CursorStale);
     }
-    if cursor_behind_retention(&tx, row.position, at)? {
+    if event_retention::position_is_expired(&tx, row.position, at)? {
         return Ok(EventReadOutcome::CursorExpired);
     }
 
@@ -285,8 +278,16 @@ fn read_cursor_page(
             pattern,
             remaining,
             || event_placement::state(&tx, placement, &placement_snapshot),
-            |source| source_visibility(&tx, actor, placement, source, &mut authority_cache),
-            |candidate, _source_evidence| candidate_authority(candidate),
+            |source| {
+                event_authority::source_visibility(
+                    &tx,
+                    actor,
+                    placement,
+                    source,
+                    &mut authority_cache,
+                )
+            },
+            |candidate, _source_evidence| event_authority::candidate_authority(candidate),
         )?;
         match result {
             EventScanResult::Candidate {
@@ -297,12 +298,12 @@ fn read_cursor_page(
                 let event_scan::EventScanCandidate {
                     event,
                     source_evidence,
-                    candidate_evidence: (),
+                    candidate_evidence,
                 } = *candidate;
                 visible_evidence
                     .entry(source_evidence.agent_ref)
                     .or_insert(source_evidence.access);
-                events.push(project_event(&event)?);
+                events.push(project_event(&event, candidate_evidence));
                 position = event.position;
             }
             EventScanResult::ProvenSkip {
@@ -339,7 +340,7 @@ fn read_cursor_page(
         }
     }
     for (agent_ref, expected) in visible_evidence {
-        match authorize_agent_ref(&tx, actor, &agent_ref)? {
+        match event_authority::authorize_agent_ref(&tx, actor, &agent_ref)? {
             EventAuthorization::Allow(current) if current == expected => {}
             _ => {
                 touch_cursor(&tx, &cursor, original_position, at)?;
@@ -432,170 +433,17 @@ fn cursor_row(connection: &Connection, cursor: &str) -> Result<Option<CursorRow>
     .transpose()
 }
 
-fn authorize_agent_ref(
-    connection: &Connection,
-    actor: &PrincipalId,
-    agent_ref: &str,
-) -> Result<EventAuthorization<agent_owner::AgentAccessEvidence>> {
-    let Some((session, branch)) = agent_owner::key_for_ref_optional(connection, agent_ref)? else {
-        return Ok(EventAuthorization::Unknown);
-    };
-    match agent_owner::authorize_access(
-        connection,
-        actor,
-        agent_owner::AgentKey::new(&session, &branch),
-        SessionParticipationAction::View,
-    ) {
-        Ok(evidence) => Ok(EventAuthorization::Allow(evidence)),
-        Err(Error::Denied(_)) => Ok(EventAuthorization::Deny),
-        Err(Error::Conflict(_)) => Ok(EventAuthorization::Unknown),
-        Err(other) => Err(other),
-    }
-}
-
-fn source_agent_ref(source: &EventSource) -> Result<String> {
-    let identity = source
-        .identity
-        .as_deref()
-        .ok_or(Error::Storage("Agent Event source lacks Principal handle"))?;
-    let project = source
-        .project
-        .as_deref()
-        .ok_or(Error::Storage("Agent Event source lacks Project handle"))?;
-    let agent = source
-        .agent
-        .as_deref()
-        .ok_or(Error::Storage("Event selector matched a non-Agent source"))?;
-    let root = format!("/d:{}/i:{identity}/p:{project}/a:{agent}", source.domain);
-    let belongs = source.reference == root
-        || source
-            .reference
-            .strip_prefix(&root)
-            .is_some_and(|suffix| suffix.starts_with("/t:"));
-    if !belongs {
-        return Err(Error::Storage(
-            "Event projection source disagrees with its Agent root",
-        ));
-    }
-    Ok(root)
-}
-
-fn source_visibility(
-    connection: &Connection,
-    actor: &PrincipalId,
-    placement: &EventSelectorPlacement,
-    source: &EventSource,
-    cache: &mut HashMap<String, EventAuthorization<agent_owner::AgentAccessEvidence>>,
-) -> Result<EventAuthorization<SourceEvidence>> {
-    let agent_ref = source_agent_ref(source)?;
-    match placement {
-        EventSelectorPlacement::Agent { reference } if &agent_ref != reference => {
-            return Err(Error::Storage(
-                "exact-Agent Event scan escaped its placement root",
-            ));
-        }
-        EventSelectorPlacement::Project { reference }
-            if !agent_ref
-                .strip_prefix(reference)
-                .is_some_and(|suffix| suffix.starts_with("/a:")) =>
-        {
-            return Err(Error::Storage(
-                "Project Event scan escaped its placement root",
-            ));
-        }
-        _ => {}
-    }
-
-    let authority = if let Some(authority) = cache.get(&agent_ref) {
-        authority.clone()
-    } else {
-        let authority = authorize_agent_ref(connection, actor, &agent_ref)?;
-        cache.insert(agent_ref.clone(), authority.clone());
-        authority
-    };
-    Ok(match authority {
-        EventAuthorization::Allow(access) => {
-            EventAuthorization::Allow(SourceEvidence { agent_ref, access })
-        }
-        EventAuthorization::Deny => EventAuthorization::Deny,
-        EventAuthorization::Unknown => EventAuthorization::Unknown,
-    })
-}
-
-fn candidate_authority(candidate: &EventCandidate) -> Result<EventAuthorization<()>> {
-    let concrete = EventSubject::parse(&candidate.subject)
-        .map_err(|_| Error::Storage("Event projection subject is not canonical"))?;
-    if concrete.source_ref() != candidate.source.reference {
-        return Err(Error::Storage(
-            "Event projection source disagrees with immutable subject",
-        ));
-    }
-    let marker = event_marker(candidate)?;
-    if marker.get("disclosure_manifest").is_some() {
-        return Ok(EventAuthorization::Unknown);
-    }
-    Ok(EventAuthorization::Allow(()))
-}
-
-fn event_marker(candidate: &EventCandidate) -> Result<&serde_json::Map<String, serde_json::Value>> {
-    let marker = candidate
-        .payload
-        .get(event_projection::EVENT_MARKER)
-        .and_then(serde_json::Value::as_object)
-        .ok_or(Error::Storage("DL-200 Event envelope is unavailable"))?;
-    if marker.get("version").and_then(serde_json::Value::as_u64)
-        != Some(event_projection::EVENT_MARKER_VERSION)
-        || marker.get("subject").and_then(serde_json::Value::as_str)
-            != Some(candidate.subject.as_str())
-        || marker.get("event_rev").and_then(serde_json::Value::as_u64) != Some(candidate.event_rev)
-    {
-        return Err(Error::Storage(
-            "DL-200 Event envelope disagrees with its projection",
-        ));
-    }
-    Ok(marker)
-}
-
-fn project_event(candidate: &EventCandidate) -> Result<EventReadEvent> {
-    let marker = event_marker(candidate)?;
-    let actor = marker
-        .get("actor")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| candidate.actor.clone());
-    if let (Some(marker_actor), Some(commit_actor)) = (actor.as_deref(), candidate.actor.as_deref())
-    {
-        if marker_actor != commit_actor {
-            return Err(Error::Storage(
-                "DL-200 Event actor provenance disagrees with immutable commit actor",
-            ));
-        }
-    }
-    let turn = marker.get("turn").and_then(serde_json::Value::as_u64);
-    if turn == Some(0) {
-        return Err(Error::Storage("invalid DL-200 Event Turn provenance"));
-    }
-    let causal_hop = marker
-        .get("causal_hop")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    if causal_hop > 16 {
-        return Err(Error::Storage("invalid DL-200 Event causal hop"));
-    }
-    let causal_root = marker
-        .get("causal_root")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    Ok(EventReadEvent {
+fn project_event(candidate: &EventCandidate, envelope: EventEnvelope) -> EventReadEvent {
+    EventReadEvent {
         id: candidate.event_id.clone(),
         subject: candidate.subject.clone(),
         event_rev: candidate.event_rev,
-        data: marker.get("data").cloned(),
-        actor,
-        turn,
-        causal_root,
-        causal_hop,
-    })
+        data: envelope.data,
+        actor: envelope.actor,
+        turn: envelope.turn,
+        causal_root: envelope.causal_root,
+        causal_hop: envelope.causal_hop,
+    }
 }
 
 fn selector_hash(subject: &str) -> [u8; 32] {
@@ -625,39 +473,4 @@ fn touch_cursor(connection: &Connection, cursor: &str, position: StorePos, at: i
         return Err(Error::Conflict("Event read cursor changed concurrently"));
     }
     Ok(())
-}
-
-fn cursor_behind_retention(connection: &Connection, position: StorePos, at: i64) -> Result<bool> {
-    let count_floor: Option<u64> = db(connection
-        .query_row(
-            "SELECT commit_position FROM event_projection_index
-             ORDER BY commit_position DESC LIMIT 1 OFFSET ?1",
-            [MIN_RETAINED_EVENTS - 1],
-            |row| row.get(0),
-        )
-        .optional())?;
-    let Some(count_floor) = count_floor else {
-        return Ok(false);
-    };
-    let cutoff = at.saturating_sub(EVENT_RETENTION_MICROS);
-    let time_floor: Option<u64> = db(connection.query_row(
-        "SELECT MIN(p.commit_position)
-         FROM event_projection_index p
-         JOIN commit_log c ON c.seq=p.commit_position
-         WHERE c.created_at>=?1",
-        [cutoff],
-        |row| row.get(0),
-    ))?;
-    let retained_from = time_floor.map_or(count_floor, |time_floor| time_floor.min(count_floor));
-    if position.get() >= retained_from {
-        return Ok(false);
-    }
-    db(connection.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM event_projection_index
-             WHERE commit_position>?1 AND commit_position<?2
-         )",
-        params![position.get(), retained_from],
-        |row| row.get(0),
-    ))
 }
