@@ -20,11 +20,11 @@ Normative R6 design:
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
 complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
-exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery
-and v50 disclosure/causal execution closure are now implemented locally. Materialized/provider audience
-expansion remains Unknown until its provider-held principal fence exists; wider Principal/Domain selectors,
-EventTypeRegistry/custom publication, Handler delivery and the v36 delivery cutover remain later Phase-2
-work.
+exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery,
+v50 disclosure/causal execution closure, and the v51 one-leaf EventTypeRegistry + custom Event publication
+owner are now implemented locally. Materialized/provider audience expansion remains Unknown until its
+provider-held principal fence exists; model/headless Events tool exposure, wider Principal/Domain selectors,
+EventHandler delivery and the v36 delivery cutover remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -38,16 +38,13 @@ release/0.17                    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17
 dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
 
-The local Phase-1 implementation line remains unpublished. Its signed completion checkpoint is
-`7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 started at signed local
-checkpoint `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`), followed by
-`7e54a9d248a3b9536e95a62ba1fa1886673fe346` (`Add private Event scan`),
-`9958b7e80b8aca8c25218b1b96893048f51e29b0` (`Own source Event revisions`),
-`57d3940d1c50d912e6a39058faee2fa7022f6485` (`Add exact Agent Event reads`),
-`639cebdb86ba729ff992bac4767efab0495f7a54` (`Wake exact Agent Event reads`) and
-`1c777dcf95b7269016d77d53ce884eb8ed187911` (`Broaden Event reads to exact Projects`). This checkpoint
-adds the v48 durable Event subscription owner. The local `origin/main` tracking ref is stale and is not
-publication truth.
+The local Phase-1/2 implementation line remains unpublished. Phase-1 completion is
+`7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 began at
+`14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and currently runs
+through `bd18dcd2dbbcd77641d9da8a437710754fbab38a` (`Propagate Event disclosure and causality`), with the
+intermediate private EventScan/source/read/wake/Project/subscription/EventInput checkpoints preserved in
+Git history. This checkpoint adds the v51 final EventType leaf and custom publication owner. The local
+`origin/main` tracking ref is stale and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -764,14 +761,66 @@ v44→v45→v46→v47→v48→v49→v50. Current-schema `aw-tools + aw-store` al
 focused diff-check are green. The prior broad `aw-store --lib` result remains
 **226 green / 4 historical stale-downgrade reds** and was not repeated.
 
-No EventTypeRegistry, custom/model Event publication, EventHandler consumer or v36 delivery cutover is
-implemented. `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+Schema **v51** adds the final one-leaf EventTypeRegistry and custom Event publication without inventing a
+temporary root registry. `aw-agent-core::registry` is one private staged mutation primitive layered directly
+over the existing left-right immutable `publication` owner: stage captures one base generation, builds and
+validates one complete successor exactly once, then publication performs a same-writer-lock generation CAS.
+An ordinary validation/conflict error leaves the published snapshot unchanged; reader handles remain
+lock-free immutable snapshots. The new publication CAS primitive is crate-private rather than a second
+public registry API.
 
-**Next Phase-2 slice:** land the final one-leaf EventTypeRegistry through the sealed private staged
-publication mechanics, then use that exact registry for bounded custom host/model `#name` publication
-without replacing its identity later during ExtensionRegistry composition. After custom publication is
-real, add EventHandler as EventScan's third consumer with its separate at-least-once receipt/ack owner.
-Keep wider selector placement and explicit v36 `delivery_cutover_rev` cutover as later slices.
+`EventTypeRegistry` is the final EventType definition owner from its first implementation. Durable identity
+is `{extension local-id schema-version}`; in-process `TypeId` only binds the Rust payload type. A typed
+`EventKey<T>` additionally pins the exact registration revision so removing/re-registering one definition
+stales only that exact handle; unrelated EventType publications do not. Runtime
+`EventTypeRegistryReader` revalidates handles against lock-free snapshots before typed publication or
+decode. Qualified wire custom names are deterministically/collision-safely derived inside the ordinary
+`#...` Event namespace. A raw Event may intentionally use the same subject; absence of the matching
+immutable `schema` tag keeps it generic and typed decoding fails closed. No separate typed Event instance,
+history or grant namespace exists.
+
+Custom Event envelopes now carry optional `EventSchemaRef`, which is validated on retained reads, exposed
+as optional public read metadata and copied into immutable EventInput facts for later typed consumers.
+`SessionStore::events_publish` is the trusted Rust host form: one exact canonical open Agent, current
+`control`, bounded custom `#name`/data, and a disclosure ceiling derived from the Agent's current local
+head plus inherited HistoryBase/source authority. `events_publish_typed` adds exact current registry-key
+revalidation and the schema tag.
+
+`SessionHandle::publish_model_event` / `publish_typed_event` are the lower trusted-runtime model forms.
+Source Agent and actor are not caller-selectable: both derive from the exact currently-running original Turn.
+The v50 Turn disclosure manifest and causal run scope are reused, so model custom Events preserve protected
+dependencies and inherited root/hop exactly like system Events. Successful model custom publications are
+durably capped at **32 per Turn** by `event_custom_turn_counts`; causal exhaustion does not consume that
+success budget. These Store methods intentionally do **not** manufacture or bypass the model
+`events_publish` capability: actual model/tool exposure remains with the existing tools-adapter capability
+owner and is the next thin surface.
+
+Until explicit v36 cutover, custom publication also keeps the legacy Job-only source revision book aligned
+in the same transaction through one pure transitional `advance_revision_without_delivery` primitive.
+Custom Events never enter the legacy pending-delivery queue. Any revision disagreement aborts the whole
+custom publication, so the next legacy/system transition cannot silently fork the source-local sequence.
+
+Focused v51 evidence stays compact. The one-leaf registry regression proves complete staged publication,
+invalid-stage revision neutrality, unrelated-definition handle stability, exact removal staleness and
+remove/re-register identity renewal. The existing combined Event lifecycle regression now additionally
+publishes one generic and one typed model custom Event from an EventInput-derived Turn, verifies both retain
+the same causal root/hop, then publishes a raw host Event on the **same typed subject** and proves only the
+schema-tagged Event decodes as `T`. It also creates a real legacy bookkeeping row first: two custom
+revisions create zero legacy custom deliveries and the following system result lands at revision 3,
+demonstrating pre-cutover sequence alignment. Migration now exercises
+v44→v45→v46→v47→v48→v49→v50→v51. EventType **1/1**, Job Event **4/4**, Event subject **2/2**,
+EventScan **1/1**, Event projection **1/1**, combined Event lifecycle **1/1**, all-target check and strict
+Clippy are green. The prior broad `aw-store --lib` result remains
+**226 green / 4 historical stale-downgrade reds** and was not repeated.
+
+No model/headless Events tool adapter, EventHandler consumer or v36 delivery cutover is implemented.
+`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+
+**Next Phase-2 slice:** expose the already-authoritative `events_publish` and `events_subscribe` model/tool
+forms through the existing `aw-tools-adapter` exact capability owner—no Store-local capability registry,
+no alternate Event owner. Then add EventHandler as EventScan's third consumer with its separate
+at-least-once receipt/ack state. Keep wider selector placement and explicit v36
+`delivery_cutover_rev` cutover as later slices.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

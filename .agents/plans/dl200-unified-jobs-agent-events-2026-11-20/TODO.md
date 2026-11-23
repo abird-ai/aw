@@ -335,10 +335,24 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       publication-time max-hop projection, retry inheritance without reusing the EventInput ID, all prior
       Event semantics and v44→…→v50 migration; focused history disclosure tests + strict Clippy/check are
       green.
-      **Next:** land the final one-leaf EventTypeRegistry staged owner and use it for bounded custom host/model
-      `#name` publication without later owner/identity replacement. Then add EventHandler as EventScan's
-      third consumer with separate at-least-once receipt/ack. Wider selector placement and explicit v36
-      delivery_cutover_rev remain subsequent slices.
+      **v51 EventTypeRegistry + custom publication landed locally:** the first definition leaf introduces
+      one shared private staged-registry primitive over the existing left-right immutable publication owner:
+      complete successor build+validation once, exact base-generation CAS publish, lock-free registered
+      readers, no placeholder root clock. EventType durable identity is Extension/local id + schema version;
+      typed Rust handles pin registration revision/TypeId so unrelated definitions do not stale them while
+      exact remove/re-register does. Schema tags ride ordinary Event envelopes/read/EventInput metadata;
+      same-subject raw Events remain generic and cannot typed-decode. Host custom publication requires exact
+      open Agent + current control and derives the Agent disclosure ceiling. Lower Turn/model publication
+      derives source/actor from the exact running Turn, inherits v50 disclosure+causal scope and durably caps
+      successful custom publishes at 32/Turn. Pre-cutover custom revisions advance an existing legacy
+      SourceEventBook without fabricating legacy deliveries, so the next system transition stays on one
+      source-local sequence. Combined coverage proves generic+typed model publication, raw host collision on
+      the typed subject, schema-only decode, causal inheritance, legacy revision alignment, and
+      v44→…→v51 migration; EventType staging **1/1**, Job Event **4/4**, strict all-target Clippy/check green.
+      **Next:** wire the already-authoritative `events_publish` + `events_subscribe` model/tool surfaces
+      through the existing aw-tools-adapter exact capability authority; do not add a Store capability owner.
+      Then add EventHandler as EventScan's third consumer with independent at-least-once receipt/ack.
+      Wider selector placement and explicit v36 delivery_cutover_rev remain subsequent slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

@@ -411,6 +411,58 @@ pub(crate) fn event_input_manifest(
     }
 }
 
+fn event_publication_manifest_at(
+    connection: &Connection,
+    session: &str,
+    branch: &str,
+    head: &str,
+) -> Result<String> {
+    let agent = agent_owner::AgentKey::new(session, branch);
+    let source_agent_ref = agent_owner::canonical_ref(connection, agent)?;
+    let local = dependency_manifest(connection, head)?;
+    let mut manifest = event_input_manifest(connection, &source_agent_ref, Some(&local))?;
+    let inherited: Option<String> = db(connection.query_row(
+        "SELECT b.manifest_digest
+         FROM agent_state_current a
+         LEFT JOIN history_bases b ON b.base_id=a.history_base_id
+         WHERE a.session_id=?1 AND a.branch_id=?2",
+        params![session, branch],
+        |row| row.get(0),
+    ))?;
+    if let Some(inherited) = inherited {
+        manifest = union_manifests(connection, &manifest, &inherited)?;
+    }
+    Ok(manifest)
+}
+
+pub(crate) fn event_publication_manifest_for_agent(
+    connection: &Connection,
+    session: &str,
+    branch: &str,
+) -> Result<String> {
+    let current = branch_in(connection, session, branch)?;
+    event_publication_manifest_at(connection, session, branch, &current.head)
+}
+
+pub(crate) fn event_publication_manifest_for_turn(
+    connection: &Connection,
+    session: &str,
+    branch: &str,
+    turn: u64,
+) -> Result<String> {
+    if turn == 0 {
+        return Err(Error::Storage("invalid Event publication Turn"));
+    }
+    let prompt_node: String = db(connection.query_row(
+        "SELECT prompt_node FROM runs
+         WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3
+         ORDER BY started_at DESC LIMIT 1",
+        params![session, branch, turn],
+        |row| row.get(0),
+    ))?;
+    event_publication_manifest_at(connection, session, branch, &prompt_node)
+}
+
 fn base_row(connection: &Connection, base_id: &str) -> Result<HistoryBaseRef> {
     db(connection.query_row(
         "SELECT base_id,history_content_digest,manifest_digest,total_turns,next_turn

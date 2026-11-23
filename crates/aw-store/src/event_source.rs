@@ -8,6 +8,7 @@ use crate::{
     db, durability, event_authority, event_causal, event_projection, now, Error, PrincipalId,
     Result,
 };
+use aw_agent_core::EventSchemaRef;
 use aw_tools::{event_subject::EventSubject, job_event::SourceEventBook};
 use rusqlite::{params, Connection};
 use sha2::{Digest as _, Sha256};
@@ -25,6 +26,144 @@ impl<'a> SystemEvent<'a> {
     pub(crate) const fn new(name: &'a str) -> Self {
         Self { name, data: None }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CustomEventEmission {
+    pub(crate) subject: String,
+    pub(crate) event_rev: u64,
+    pub(crate) causal_root: Option<String>,
+    pub(crate) causal_hop: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CustomEventEmitOutcome {
+    Published(CustomEventEmission),
+    CausalExhausted { event_rev: u64, root: String },
+}
+
+impl CustomEventEmitOutcome {
+    pub(crate) const fn event_rev(&self) -> u64 {
+        match self {
+            Self::Published(emission) => emission.event_rev,
+            Self::CausalExhausted { event_rev, .. } => *event_rev,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_custom_event(
+    connection: &Connection,
+    source_ref: &str,
+    actor: &PrincipalId,
+    turn: Option<u64>,
+    name: &str,
+    data: Option<&serde_json::Value>,
+    schema: Option<&EventSchemaRef>,
+    disclosure_manifest: &str,
+) -> Result<CustomEventEmitOutcome> {
+    if connection.is_autocommit() {
+        return Err(Error::Storage(
+            "DL-200 Event emission requires an existing Store transaction",
+        ));
+    }
+    if !schema_active(connection)? {
+        return Err(Error::Storage("custom Event schema is not active"));
+    }
+    if turn == Some(0) || !name.starts_with('#') {
+        return Err(Error::Denied(
+            "custom Event publication requires a #name and valid Turn provenance",
+        ));
+    }
+    if disclosure_manifest.len() != 64
+        || !disclosure_manifest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::Storage("invalid custom Event disclosure manifest"));
+    }
+    let subject = EventSubject::from_resource_ref(source_ref, name)
+        .map_err(|_| Error::Denied("invalid custom Event subject"))?;
+    if let Some(data) = data {
+        event_authority::validate_data(data)?;
+    }
+    if let Some(schema) = schema {
+        if schema.version == 0
+            || schema.extension.is_empty()
+            || schema.id.is_empty()
+            || schema.extension.len() > 48
+            || schema.id.len() > 48
+        {
+            return Err(Error::Denied("invalid EventType schema identity"));
+        }
+    }
+
+    let event_rev = reserve_revision(connection, source_ref, None)?;
+    let causal = event_causal::descendant_event_scope(connection, source_ref, turn, actor)?;
+    if let event_causal::DescendantEventScope::Exhausted { root } = causal {
+        return Ok(CustomEventEmitOutcome::CausalExhausted { event_rev, root });
+    }
+    if let event_causal::DescendantEventScope::Inherited { root, event_hop } = &causal {
+        event_causal::observe_event_hop(connection, root, *event_hop)?;
+    }
+    let (causal_root, causal_hop) = match &causal {
+        event_causal::DescendantEventScope::Fresh => (None, 0),
+        event_causal::DescendantEventScope::Inherited { root, event_hop } => {
+            (Some(root.clone()), *event_hop)
+        }
+        event_causal::DescendantEventScope::Exhausted { .. } => unreachable!(),
+    };
+
+    let mut envelope = serde_json::json!({
+        "version": event_projection::EVENT_MARKER_VERSION,
+        "subject": subject.as_str(),
+        "event_rev": event_rev,
+        "actor": actor.as_str(),
+        "causal_hop": causal_hop,
+        "disclosure_manifest": disclosure_manifest
+    });
+    let object = envelope
+        .as_object_mut()
+        .expect("Event envelope fixture is always an object");
+    if let Some(turn) = turn {
+        object.insert("turn".into(), serde_json::Value::from(turn));
+    }
+    if let Some(root) = causal_root.as_deref() {
+        object.insert(
+            "causal_root".into(),
+            serde_json::Value::String(root.to_owned()),
+        );
+    }
+    if let Some(data) = data {
+        object.insert("data".into(), data.clone());
+    }
+    if let Some(schema) = schema {
+        object.insert(
+            "schema".into(),
+            serde_json::to_value(schema)
+                .map_err(|_| Error::Storage("cannot encode EventType schema identity"))?,
+        );
+    }
+
+    let txid = durability::tx_id()?;
+    let entity_id = format!("{:x}", Sha256::digest(source_ref.as_bytes()));
+    let mut payload = serde_json::Map::with_capacity(1);
+    payload.insert(event_projection::EVENT_MARKER.to_owned(), envelope);
+    durability::commit_event(
+        connection,
+        &txid,
+        "event.emitted",
+        "event_source",
+        &entity_id,
+        Some(actor),
+        serde_json::Value::Object(payload),
+    )?;
+    Ok(CustomEventEmitOutcome::Published(CustomEventEmission {
+        subject: subject.as_str().to_owned(),
+        event_rev,
+        causal_root,
+        causal_hop,
+    }))
 }
 
 pub(crate) fn seed_legacy_sources(connection: &Connection) -> Result<()> {

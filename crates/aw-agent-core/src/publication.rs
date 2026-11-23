@@ -149,12 +149,25 @@ impl<T> Publisher<T> {
     /// Publication is synchronous; read guards only clone an Arc or inspect a bounded authorization verdict.
     /// At most one replacement is unpublished, with no deferred work queue.
     pub fn update<R>(&self, update: impl FnOnce(&T) -> Result<(T, R)>) -> Result<(u64, R)> {
+        self.update_if(None, update)
+    }
+
+    /// CAS-style publication for a successor already staged against one exact
+    /// immutable generation. A mismatch never invokes the mutator.
+    pub(crate) fn update_if<R>(
+        &self,
+        expected_generation: Option<u64>,
+        update: impl FnOnce(&T) -> Result<(T, R)>,
+    ) -> Result<(u64, R)> {
         check(&self.available)?;
         let mut writer = self.writer.lock().map_err(|_| {
             self.available.store(false, Ordering::Release);
             Error::Storage("publication writer poisoned")
         })?;
         check(&self.available)?;
+        if expected_generation.is_some_and(|expected| expected != writer.current.generation) {
+            return Err(Error::Conflict("published generation changed"));
+        }
         let _panic = PanicFence(&self.available);
         let generation = writer
             .current

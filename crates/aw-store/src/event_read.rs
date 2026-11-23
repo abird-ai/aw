@@ -16,6 +16,7 @@ use crate::{
     store_scope::{StorePos, StoreScope},
     Error, PrincipalId, Result, SessionStore,
 };
+use aw_agent_core::EventSchemaRef;
 use aw_tools::event_subject::EventPattern;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,8 @@ pub struct EventReadEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub causal_root: Option<String>,
     pub causal_hop: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<EventSchemaRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -445,6 +448,7 @@ fn project_event(candidate: &EventCandidate, envelope: EventEnvelope) -> EventRe
         turn: envelope.turn,
         causal_root: envelope.causal_root,
         causal_hop: envelope.causal_hop,
+        schema: envelope.schema,
     }
 }
 

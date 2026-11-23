@@ -302,6 +302,16 @@ impl SourceEventBook {
         self.replace(recipient_ref, &authority_ref, EventRuleSet::default())
     }
 
+    /// Transitional DL-200 compatibility: advance the shared source-local
+    /// revision for a custom Event without manufacturing a legacy Job delivery.
+    pub fn advance_revision_without_delivery(&mut self) -> Result<u64, &'static str> {
+        self.next_event_rev = self
+            .next_event_rev
+            .checked_add(1)
+            .ok_or("Job event revision exhausted")?;
+        Ok(self.next_event_rev)
+    }
+
     /// Commit one factual source checkpoint. All events in the slice share one
     /// event_rev so the receiver can coalesce result+settled when their effective
     /// modes agree.
@@ -323,11 +333,7 @@ impl SourceEventBook {
         let mut canonical = events.to_vec();
         canonical.sort();
         canonical.dedup();
-        self.next_event_rev = self
-            .next_event_rev
-            .checked_add(1)
-            .ok_or("Job event revision exhausted")?;
-        let event_rev = self.next_event_rev;
+        let event_rev = self.advance_revision_without_delivery()?;
         let mut out = Vec::new();
         for (recipient_ref, subscription) in &self.subscriptions {
             for event in &canonical {

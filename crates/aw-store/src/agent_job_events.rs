@@ -157,6 +157,48 @@ fn row(c: &rusqlite::Connection, source: &str) -> Result<Option<SourceState>> {
         .transpose()
 }
 
+pub(crate) fn advance_legacy_revision_without_delivery_in(
+    c: &rusqlite::Connection,
+    source_ref: &str,
+    expected_revision: u64,
+) -> Result<()> {
+    let encoded: Option<String> = db(c
+        .query_row(
+            "SELECT event_book_json FROM agent_job_event_sources WHERE source_ref=?1",
+            [source_ref],
+            |row| row.get(0),
+        )
+        .optional())?;
+    let Some(encoded) = encoded else {
+        return Ok(());
+    };
+    let mut book: SourceEventBook = serde_json::from_str(&encoded)
+        .map_err(|_| Error::Storage("cannot decode Agent Job event source state"))?;
+    book.validate().map_err(Error::Storage)?;
+    let revision = book
+        .advance_revision_without_delivery()
+        .map_err(Error::Storage)?;
+    if revision != expected_revision {
+        return Err(Error::Storage(
+            "legacy and DL-200 source Event revisions diverged",
+        ));
+    }
+    let encoded = serde_json::to_string(&book)
+        .map_err(|_| Error::Storage("cannot encode Agent Job event source state"))?;
+    let changed = db(c.execute(
+        "UPDATE agent_job_event_sources
+         SET event_book_json=?1,updated_at=?2
+         WHERE source_ref=?3",
+        params![encoded, now(), source_ref],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Storage(
+            "Agent Job event source disappeared during revision alignment",
+        ));
+    }
+    Ok(())
+}
+
 fn save(
     c: &rusqlite::Connection,
     binding: &AgentBindingInfo,
@@ -727,14 +769,19 @@ impl SessionStore {
 mod tests {
     use super::*;
     use aw_agent_core::{
-        Agent, AgentOptions, CompletionFuture, DeltaSink, Message, Outcome, Provider, Turn,
-        TurnJournal, TurnStart,
+        Agent, AgentOptions, CompletionFuture, DeltaSink, EventTypeRegistry, Message, Outcome,
+        Provider, Turn, TurnJournal, TurnStart,
     };
     use aw_store_api::SessionBinding;
     use aw_tools::job_event::{EventRule, JobWakeMode};
     use std::{path::PathBuf, sync::Arc};
 
     struct UnusedProvider;
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct TypedFixtureEvent {
+        value: u64,
+    }
 
     impl Provider for UnusedProvider {
         fn stream<'a>(
@@ -946,6 +993,23 @@ mod tests {
             )
             .unwrap()
         };
+        let target_legacy_recipient = "/d:0/i:0/p:0/a:100";
+        let (_, target_legacy) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &event_target.id,
+                &event_target_branch.id,
+                None,
+                None,
+                target_legacy_recipient,
+                authority,
+                EventRuleSet::new([EventRule::new(JobEventKind::Result, JobWakeMode::Queue)])
+                    .unwrap(),
+                8,
+            )
+            .unwrap();
+        assert!(target_legacy.changed);
+
         let target_subscription = store
             .events_subscribe(&actor, &read_pattern, &event_target_ref, true)
             .unwrap();
@@ -1317,6 +1381,34 @@ mod tests {
             ));
             (causal_root, manifest)
         };
+        let event_types = EventTypeRegistry::new();
+        let typed_key = event_types
+            .register::<TypedFixtureEvent>("fixture", "decision_accepted", 1)
+            .unwrap();
+        let event_types_reader = event_types.reader().unwrap();
+        let target_subject = aw_tools::event_subject::EventSubject::from_resource_ref(
+            &event_target_ref,
+            "#model_ready",
+        )
+        .unwrap();
+        let target_pattern = format!(
+            "{}.>",
+            target_subject
+                .as_str()
+                .strip_suffix(".e:#model_ready")
+                .expect("custom Event has final Event token")
+        );
+        let target_cursor = match store
+            .events_read_page(&actor, &target_pattern, crate::EventReadAfter::Now, 16)
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => {
+                assert!(page.events.is_empty());
+                page.cursor
+            }
+            other => panic!("unexpected target Event cursor outcome: {other:?}"),
+        };
+
         let (_, target_journal) = store
             .activate(&actor, &event_target.id, &event_target_branch.id)
             .unwrap();
@@ -1331,6 +1423,54 @@ mod tests {
             })
             .await
             .unwrap();
+        let raw_model = target_journal
+            .publish_model_event(
+                1,
+                "#model_ready",
+                Some(&serde_json::json!({"kind":"generic"})),
+            )
+            .unwrap();
+        match raw_model {
+            crate::EventPublishOutcome::Published(event) => {
+                assert_eq!(event.turn, Some(1));
+                assert_eq!(event.causal_root.as_deref(), Some(bound_root.as_str()));
+                assert_eq!(event.causal_hop, 1);
+                assert!(event.schema.is_none());
+            }
+            other => panic!("unexpected generic model Event outcome: {other:?}"),
+        }
+        let typed_model = target_journal
+            .publish_typed_event(
+                1,
+                &event_types_reader,
+                &typed_key,
+                &TypedFixtureEvent { value: 7 },
+            )
+            .unwrap();
+        match typed_model {
+            crate::EventPublishOutcome::Published(event) => {
+                assert_eq!(event.turn, Some(1));
+                assert_eq!(event.causal_root.as_deref(), Some(bound_root.as_str()));
+                assert_eq!(event.causal_hop, 1);
+                assert_eq!(event.schema.as_ref(), Some(&typed_key.schema()));
+            }
+            other => panic!("unexpected typed model Event outcome: {other:?}"),
+        }
+        {
+            let connection = store.connection().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT published_count FROM event_custom_turn_counts
+                         WHERE session_id=?1 AND branch_id=?2 AND turn_id=1",
+                        params![&event_target.id, &event_target_branch.id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                2
+            );
+        }
+
         target_journal
             .finish(Turn {
                 id: 1,
@@ -1349,6 +1489,77 @@ mod tests {
             })
             .await
             .unwrap();
+
+        let typed_subject = aw_tools::event_subject::EventSubject::from_resource_ref(
+            &event_target_ref,
+            typed_key.event(),
+        )
+        .unwrap();
+        let raw_same_subject = store
+            .events_publish(
+                &actor,
+                &event_target_ref,
+                typed_key.event(),
+                Some(&serde_json::json!({"value":9})),
+            )
+            .unwrap();
+        match raw_same_subject {
+            crate::EventPublishOutcome::Published(event) => {
+                assert_eq!(event.subject, typed_subject.as_str());
+                assert!(event.turn.is_none());
+                assert!(event.causal_root.is_none());
+                assert_eq!(event.causal_hop, 0);
+                assert!(event.schema.is_none());
+            }
+            other => panic!("unexpected raw same-subject Event outcome: {other:?}"),
+        }
+
+        let target_page = match store
+            .events_read_page(
+                &actor,
+                &target_pattern,
+                crate::EventReadAfter::Cursor(target_cursor),
+                16,
+            )
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => page,
+            other => panic!("unexpected target Event read outcome: {other:?}"),
+        };
+        assert_eq!(target_page.events.len(), 6);
+        let same_subject = target_page
+            .events
+            .iter()
+            .filter(|event| event.subject == typed_subject.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(same_subject.len(), 2);
+        let typed = same_subject
+            .iter()
+            .find(|event| event.schema.is_some())
+            .expect("typed Event must retain schema identity");
+        assert_eq!(
+            event_types_reader
+                .decode(&typed_key, typed.schema.as_ref(), typed.data.as_ref())
+                .unwrap(),
+            TypedFixtureEvent { value: 7 }
+        );
+        let generic = same_subject
+            .iter()
+            .find(|event| event.schema.is_none())
+            .expect("raw same-subject Event remains generic");
+        assert!(event_types_reader
+            .decode(&typed_key, generic.schema.as_ref(), generic.data.as_ref())
+            .is_err());
+        let target_legacy_pending = store
+            .pending_agent_job_events(&actor, &event_target.id, &event_target_branch.id)
+            .unwrap();
+        assert_eq!(target_legacy_pending.len(), 1);
+        assert_eq!(target_legacy_pending[0].event, JobEventKind::Result);
+        assert_eq!(
+            target_legacy_pending[0].event_rev, 3,
+            "two custom revisions must advance legacy bookkeeping without creating legacy custom deliveries"
+        );
+
         {
             let connection = store.connection().unwrap();
             let (delivery, run_root, parent_hop): (String, String, u64) = connection
@@ -1371,6 +1582,7 @@ mod tests {
                      FROM event_projection_index p
                      JOIN commit_log c ON c.seq=p.commit_position
                      WHERE p.source_ref IN (?1,?2)
+                       AND p.event_name IN ('result','settled')
                      ORDER BY p.commit_position",
                 )
                 .unwrap();
@@ -1583,7 +1795,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE agent_event_input_audience;
+                "DROP TABLE event_custom_turn_counts;
+                 DROP TABLE agent_event_input_audience;
                  DROP TABLE event_causal_attention;
                  DROP INDEX runs_event_input_delivery;
                  ALTER TABLE runs DROP COLUMN event_input_delivery_id;
@@ -1610,11 +1823,12 @@ mod tests {
         crate::migrate_event_subscriptions(&mut connection).unwrap();
         crate::migrate_event_inputs(&mut connection).unwrap();
         crate::migrate_event_disclosure_causal(&mut connection).unwrap();
+        crate::migrate_custom_events(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            50
+            51
         );
         for source in [&root, &turn_ref] {
             assert_eq!(

@@ -11,6 +11,7 @@ use crate::{
     event_scan::{EventAuthorization, EventCandidate, EventSource},
     Error, PrincipalId, Result, SessionParticipationAction,
 };
+use aw_agent_core::EventSchemaRef;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
@@ -30,6 +31,7 @@ pub(crate) struct EventEnvelope {
     pub(crate) turn: Option<u64>,
     pub(crate) causal_root: Option<String>,
     pub(crate) causal_hop: u64,
+    pub(crate) schema: Option<EventSchemaRef>,
     pub(crate) disclosure_manifest: Option<String>,
 }
 
@@ -146,6 +148,22 @@ pub(crate) fn candidate_envelope(candidate: &EventCandidate) -> Result<EventEnve
             "DL-200 Event envelope disagrees with its projection",
         ));
     }
+    let schema = marker
+        .get("schema")
+        .map(|value| {
+            serde_json::from_value::<EventSchemaRef>(value.clone())
+                .map_err(|_| Error::Storage("invalid DL-200 Event schema identity"))
+        })
+        .transpose()?;
+    if schema.as_ref().is_some_and(|schema| {
+        schema.version == 0
+            || schema.extension.is_empty()
+            || schema.id.is_empty()
+            || schema.extension.len() > 48
+            || schema.id.len() > 48
+    }) {
+        return Err(Error::Storage("invalid DL-200 Event schema identity"));
+    }
     let disclosure_manifest = marker
         .get("disclosure_manifest")
         .and_then(serde_json::Value::as_str)
@@ -203,6 +221,7 @@ pub(crate) fn candidate_envelope(candidate: &EventCandidate) -> Result<EventEnve
         turn,
         causal_root,
         causal_hop,
+        schema,
         disclosure_manifest,
     })
 }

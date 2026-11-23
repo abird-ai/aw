@@ -225,15 +225,16 @@ pub(crate) fn admit_subscription_candidate(
     }
 
     let data_json = envelope.data.as_ref().map(json).transpose()?;
+    let schema_json = envelope.schema.as_ref().map(json).transpose()?;
     db(connection.execute(
         "INSERT INTO agent_event_inputs(
              delivery_id,recipient_session_id,recipient_branch_id,recipient_ref,
              subscription_subject,subscription_generation,event_id,event_position,
              source_ref,source_agent_ref,subject,event_rev,source_actor,source_turn,
              causal_root,causal_hop,data_json,created_by,source_access_generation,
-             recipient_access_generation,created_at,disclosure_manifest
+             recipient_access_generation,created_at,disclosure_manifest,event_schema_json
          ) VALUES(
-             ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22
+             ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23
          )",
         params![
             delivery_id,
@@ -258,6 +259,7 @@ pub(crate) fn admit_subscription_candidate(
             recipient_access.access_generation.as_slice(),
             now(),
             retained_manifest,
+            schema_json,
         ],
     ))?;
     for (ordinal, (principal_kind, principal_handle)) in audience.iter().enumerate() {
