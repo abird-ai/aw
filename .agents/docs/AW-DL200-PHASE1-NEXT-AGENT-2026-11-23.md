@@ -32,7 +32,7 @@ Read first, in this order:
 12. dotlink/.agents/docs/CURRENT_HANDOFF.md
 13. live source/tests for every owner you touch.
 
-Current local AW HEAD:
+Current implementation checkpoint beneath the handoff documentation:
 
 03d1224ef7b2054b3856fa559dcc23ac666f341f — Rebuild Agent exposure from owner state
 
@@ -51,7 +51,8 @@ release/0.17:
 576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
 
 The local AW tracking ref origin/main is stale; do not use it as publication truth.
-AW local HEAD is 9 commits ahead of the actual verified remote main.
+The implementation line through 03d1224 is 9 implementation commits ahead of the actual verified remote
+main; docs-only handoff commits may sit above it.
 
 R6 and the shared Process/release-correction amendment are sealed.
 

@@ -141,14 +141,13 @@ Expected signature:
 
 ## 2. Exact current Git/publication state
 
-### 2.1 AW local implementation HEAD
+### 2.1 AW implementation checkpoint beneath this handoff documentation
 
     03d1224ef7b2054b3856fa559dcc23ac666f341f
     Rebuild Agent exposure from owner state
 
-Branch:
-
-    main
+The branch is main. This handoff may sit one or more docs-only commits above that implementation
+checkpoint; do not confuse a documentation commit with a new implementation boundary.
 
 ### 2.2 Actual verified remote refs
 
@@ -166,7 +165,8 @@ Read-only remote verification on 2026-11-23:
     576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2
     v0.17.9
 
-AW local HEAD is **9 commits ahead of the verified remote AW main**.
+The implementation line through 03d1224 is **9 implementation commits ahead of the verified remote AW
+main**. Docs-only handoff commits may sit above it.
 
 The local origin/main tracking ref is stale at 0f3f3eb...; do not use that stale tracking ref as
 publication truth.
