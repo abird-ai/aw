@@ -3392,6 +3392,7 @@ mod tests {
             bash: None,
             process_input: false,
             agent_jobs: Default::default(),
+            events: Default::default(),
             operation_router: Default::default(),
             graph_policy_router: Default::default(),
             graph_host_tools: Default::default(),

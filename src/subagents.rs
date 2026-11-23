@@ -2723,8 +2723,19 @@ You are a bounded aw subagent in an isolated child Session. Complete only the de
                     child_tools.allow_wake = true;
                     let router_slot =
                         Arc::new(aw_tools_adapter::agent_jobs::AgentJobRouterSlot::default());
-                    router_slot.replace(self.agent_jobs_router()?)?;
+                    let router = self.agent_jobs_router()?;
+                    router_slot.replace(router.clone())?;
                     child_tools.agent_jobs = router_slot;
+                    let event_slot =
+                        Arc::new(aw_tools_adapter::events::EventRouterSlot::default());
+                    event_slot.replace(router)?;
+                    child_tools.events = event_slot;
+                    for name in [
+                        aw_tools_adapter::events::EVENTS_PUBLISH,
+                        aw_tools_adapter::events::EVENTS_SUBSCRIBE,
+                    ] {
+                        child_tools.selected_tools.push(name.into());
+                    }
                 }
                 child_tools.execution_site = format!("subagent:{}", info.id);
                 child_tools.concurrency = inner.child_tool_concurrency;
@@ -4098,13 +4109,13 @@ mod tests {
             Box::pin(async move {
                 if Self::is_child(messages) {
                     self.child_calls.fetch_add(1, Ordering::SeqCst);
-                    assert!(
-                        tools.iter().all(|tool| tool.name == "jobs_subscribe"),
-                        "stable model-only child may expose only jobs_subscribe: {:?}",
+                    assert_eq!(
                         tools
                             .iter()
                             .map(|tool| tool.name.as_str())
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>(),
+                        vec!["events_publish", "events_subscribe", "jobs_subscribe"],
+                        "stable model-only child exposes only bounded Agent/Event controls"
                     );
                     sink("model-first child answer")?;
                     return Ok(ModelReply {
@@ -4922,7 +4933,10 @@ mod tests {
                     .iter()
                     .any(|message| message.content == "level2 task")
                 {
-                    assert_eq!(names, vec!["jobs_subscribe"]);
+                    assert_eq!(
+                        names,
+                        vec!["events_publish", "events_subscribe", "jobs_subscribe"]
+                    );
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     sink("level2 answer")?;
                     return Ok(ModelReply {
@@ -4936,7 +4950,15 @@ mod tests {
                         ..Default::default()
                     });
                 }
-                assert_eq!(names, vec!["agent", "jobs_subscribe"]);
+                assert_eq!(
+                    names,
+                    vec![
+                        "agent",
+                        "events_publish",
+                        "events_subscribe",
+                        "jobs_subscribe"
+                    ]
+                );
                 assert!(messages
                     .iter()
                     .any(|message| message.content == "level1 task"));
@@ -5023,7 +5045,17 @@ mod tests {
                     .iter()
                     .map(|tool| tool.name.as_str())
                     .collect::<Vec<_>>();
-                assert_eq!(names, vec!["edit", "jobs_subscribe", "read", "write"]);
+                assert_eq!(
+                    names,
+                    vec![
+                        "edit",
+                        "events_publish",
+                        "events_subscribe",
+                        "jobs_subscribe",
+                        "read",
+                        "write"
+                    ]
+                );
                 assert!(!names.contains(&"agent"));
                 assert!(!names.contains(&"bash"));
                 self.calls.fetch_add(1, Ordering::SeqCst);
@@ -5096,7 +5128,15 @@ mod tests {
                     .iter()
                     .map(|tool| tool.name.as_str())
                     .collect::<Vec<_>>();
-                assert_eq!(names, vec!["jobs_subscribe", "read"]);
+                assert_eq!(
+                    names,
+                    vec![
+                        "events_publish",
+                        "events_subscribe",
+                        "jobs_subscribe",
+                        "read"
+                    ]
+                );
                 if messages
                     .last()
                     .is_some_and(|message| message.role == Role::Tool)

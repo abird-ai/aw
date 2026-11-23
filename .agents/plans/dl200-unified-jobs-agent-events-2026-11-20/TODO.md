@@ -349,9 +349,26 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       source-local sequence. Combined coverage proves generic+typed model publication, raw host collision on
       the typed subject, schema-only decode, causal inheritance, legacy revision alignment, and
       v44→…→v51 migration; EventType staging **1/1**, Job Event **4/4**, strict all-target Clippy/check green.
-      **Next:** wire the already-authoritative `events_publish` + `events_subscribe` model/tool surfaces
-      through the existing aw-tools-adapter exact capability authority; do not add a Store capability owner.
-      Then add EventHandler as EventScan's third consumer with independent at-least-once receipt/ack.
+      **model Events tool exposure landed locally:** `aw-tools-adapter::events` adds only
+      `events_publish` + `events_subscribe` definitions and a composition-only EventRouterSlot. They use
+      normal exact Host/Control ToolPolicy grants + Actor Envelope; no Store capability registry and no fake
+      OperationId/OperationRouter entry. The existing durable Agent router is reused as the Store-backed
+      EventRouter and rechecks exact Host/Control provenance, ToolContext actor, journal scope, canonical
+      execution owner and Store binding. Host-created root + stable delegated Agents install that same router
+      in both Jobs/Events slots; legacy one-shot children stay unchanged. The existing durable top-level
+      Agent, whose router is available only after persistence load, registers the same two trusted host tools
+      at that bind point; remote MCP execution-site owners leave them unavailable rather than mislabel local
+      Store effects as remote. Model publish has implicit current source/actor/Turn and reaches the v51
+      running-Turn owner directly; this fixed the rejected re-activate-during-active-Turn seam by extracting
+      `SessionStore::events_publish_turn`, with SessionHandle remaining a convenience delegate. Model
+      subscribe has implicit current recipient, resolves Agent/Project-relative patterns and permits only
+      exact same-Project Agent or current-Project `a:*` placement; wider scope stays fail-closed. Focused
+      adapter **1/1** proves exact grants/installed-router gating/unchanged ToolContext, Store-backed router
+      **1/1** proves relative subscription + real Turn publication/readback + cross-Project denial, and the
+      existing v51 combined Event lifecycle remains green. Zero-test filtered historical subagent commands
+      are not counted as evidence.
+      **Next:** add EventHandler as EventScan's third consumer with separate definition/activation and
+      at-least-once receipt/ACK ownership; do not reuse EventInput and do not add a second Event queue.
       Wider selector placement and explicit v36 delivery_cutover_rev remain subsequent slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.

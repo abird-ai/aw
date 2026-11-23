@@ -640,6 +640,9 @@ impl HostAgentActivation {
         let mut tools = self.tools.clone();
         tools.root = session.binding.tool_root.clone();
         tools.agent_jobs.replace(self.router.clone())?;
+        let event_slot = Arc::new(aw_tools_adapter::events::EventRouterSlot::default());
+        event_slot.replace(self.router.clone())?;
+        tools.events = event_slot;
         tools.allow_wake = true;
         if self.selection.supports_tools()
             && !tools
@@ -649,6 +652,18 @@ impl HostAgentActivation {
             && (tools.mode == aw_tools_adapter::ToolMode::Off || !tools.selected_tools.is_empty())
         {
             tools.selected_tools.push("jobs_subscribe".into());
+        }
+        if self.selection.supports_tools()
+            && (tools.mode == aw_tools_adapter::ToolMode::Off || !tools.selected_tools.is_empty())
+        {
+            for name in [
+                aw_tools_adapter::events::EVENTS_PUBLISH,
+                aw_tools_adapter::events::EVENTS_SUBSCRIBE,
+            ] {
+                if !tools.selected_tools.iter().any(|selected| selected == name) {
+                    tools.selected_tools.push(name.into());
+                }
+            }
         }
 
         let builder = Agent::builder_from_selection(self.selection.clone(), options);

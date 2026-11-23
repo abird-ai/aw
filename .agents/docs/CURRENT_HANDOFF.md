@@ -21,10 +21,11 @@ Normative R6 design:
 complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
 exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery,
-v50 disclosure/causal execution closure, and the v51 one-leaf EventTypeRegistry + custom Event publication
-owner are now implemented locally. Materialized/provider audience expansion remains Unknown until its
-provider-held principal fence exists; model/headless Events tool exposure, wider Principal/Domain selectors,
-EventHandler delivery and the v36 delivery cutover remain later Phase-2 work.
+v50 disclosure/causal execution closure, the v51 one-leaf EventTypeRegistry + custom Event publication
+owner, and the model-facing `events_publish` / `events_subscribe` adapter over those exact owners are now
+implemented locally. Materialized/provider audience expansion remains Unknown until its provider-held
+principal fence exists; wider Principal/Domain selectors, EventHandler delivery and the v36 delivery cutover
+remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -813,14 +814,61 @@ EventScan **1/1**, Event projection **1/1**, combined Event lifecycle **1/1**, a
 Clippy are green. The prior broad `aw-store --lib` result remains
 **226 green / 4 historical stale-downgrade reds** and was not repeated.
 
-No model/headless Events tool adapter, EventHandler consumer or v36 delivery cutover is implemented.
-`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+The model/tool surface is now a thin composition over those v48/v51 owners rather than another Event API.
+`aw-tools-adapter::events` defines only the two model-visible Tools plus a host-injected `EventRouterSlot`.
+The slot stores no Event state and grants nothing. `events_publish` and `events_subscribe` are ordinary
+Host/Control Tool definitions, so the existing ToolPolicy + Actor Envelope machinery remains the exact
+capability owner. They are intentionally not forced through the generic filesystem/Jobs
+`OperationRouter`: Events have no canonical `OperationId`, and inventing one merely to satisfy adapter
+plumbing would create the wrong semantic owner. A selected Event tool with no installed host router fails
+closed, including ToolMode::Off.
 
-**Next Phase-2 slice:** expose the already-authoritative `events_publish` and `events_subscribe` model/tool
-forms through the existing `aw-tools-adapter` exact capability owner—no Store-local capability registry,
-no alternate Event owner. Then add EventHandler as EventScan's third consumer with its separate
-at-least-once receipt/ack state. Keep wider selector placement and explicit v36
-`delivery_cutover_rev` cutover as later slices.
+The durable root composition reuses the existing `agent_jobs::Router` instance as the EventRouter because
+that object already owns the exact Store + authenticated principal + Agent-binding resolver; it gains no
+Event state. Before either model operation it proves ToolContext actor and immutable invocation actor match
+the durable router principal, requires a journaled scope, and checks execution-owner canonical
+Agent/session/branch **and** scope session/branch against the authoritative Store binding. Host-created
+root and stable delegated Agents install the same router object into both the Jobs and Events adapter slots;
+legacy one-shot children remain unchanged. The pre-existing durable top-level CLI/web Agent is composed in a
+different order (Agent first, Store router after persistence load), so it uses the existing trusted
+`Agent::register_host_tool` path to add those exact two definitions only when the Store-local router is
+actually bound. A truly remote MCP execution-site owner leaves the Event slot empty and does not advertise
+these unrouted Store-owner controls rather than falsely claiming a remote execution-site grant.
+
+Model `events_publish` accepts only `event` + optional object `data`; the custom `#name` grammar is
+validated at the adapter edge and the model cannot name another source. The router calls the Store's exact
+running-Turn primitive, so actor/source/disclosure/causal provenance remain v51 facts. This pass also fixed a
+v51 lower-seam bug exposed by the real integration test: obtaining a fresh `SessionHandle` by
+`SessionStore::activate` during an already-running Turn correctly conflicted with the existing owner.
+`SessionStore::events_publish_turn(session,branch,turn,...)` now publishes directly against that factual
+active run; `SessionHandle::publish_model_event` is only a convenience delegate. No second run/Agent owner
+is created.
+
+Model `events_subscribe` has implicit recipient=current Agent and no scheduling-mode argument.
+Relative `e:/t:/>` patterns resolve from the current Agent; `a:` patterns resolve from the current
+Project. Absolute patterns are accepted only if the already-implemented placement can prove the selector is
+an exact Agent under the current Project or current-Project `a:*`; cross-Project/Principal/Domain model
+selectors fail closed for now. The normalized absolute selector is handed unchanged to the durable v48
+subscription owner, which still reauthorizes concrete Event sources at delivery.
+
+Focused adapter evidence is deliberately small: one adapter regression proves ToolMode::Off exposes exactly
+the two explicitly selected Events tools only when an EventRouter is installed, both bindings are exact
+trusted-Host/Control grants at the configured execution site, and the router receives the unchanged
+authenticated ToolContext/current Agent rather than model-selected source/recipient data. One real
+Store-backed root regression proves relative `e:#ready` becomes the current Agent's canonical selector,
+cross-Project subscription is denied, a real active Turn publishes `#ready`, and the existing Event cursor
+reads that exact Turn/data back; disabling the same relative subscription reaches the same durable row.
+The existing v51 combined lifecycle regression remains green after the Store running-Turn refactor.
+Repository fmt, full workspace all-target compilation, strict root+adapter+Store Clippy and scoped diff-check
+are green. The attempted historical subagent long-test filters execute zero tests in the current harness
+and are **not** counted as evidence; their changed visible-tool expectations are compile-checked instead.
+
+No EventHandler consumer or v36 delivery cutover is implemented. `delivery_cutover_rev` remains NULL and
+legacy pending delivery/ACK ownership is unchanged.
+
+**Next Phase-2 slice:** add EventHandler as EventScan's third consumer, with definition/activation kept
+separate and an independent at-least-once receipt/ACK owner—no EventInput reuse and no second Event queue.
+Keep wider selector placement and explicit v36 `delivery_cutover_rev` cutover as later slices.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

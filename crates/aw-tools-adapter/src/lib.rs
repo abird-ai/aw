@@ -11,6 +11,7 @@ use std::{
 pub mod agent_jobs;
 mod binary;
 mod edit;
+pub mod events;
 mod exposure;
 pub mod job_host;
 pub mod job_runtime;
@@ -786,6 +787,9 @@ pub struct LocalToolOptions {
     /// Host-injected Agent/Turn jobs_* router. The slot itself is not authority
     /// and finite-only/standalone hosts leave it empty.
     pub agent_jobs: Arc<agent_jobs::AgentJobRouterSlot>,
+    /// Host-injected DL-200 Events router. The slot itself grants nothing;
+    /// model visibility still comes only from exact ToolPolicy registration.
+    pub events: Arc<events::EventRouterSlot>,
     /// Optional host-owned semantic execution router. Empty preserves the exact
     /// existing Local executor with no auxiliary model/delegate work.
     pub operation_router: Arc<operation_router::OperationRouterSlot>,
@@ -823,6 +827,7 @@ impl LocalToolOptions {
             bash: None,
             process_input: false,
             agent_jobs: Arc::new(agent_jobs::AgentJobRouterSlot::default()),
+            events: Arc::new(events::EventRouterSlot::default()),
             operation_router: Arc::new(operation_router::OperationRouterSlot::default()),
             graph_policy_router: Arc::new(operation_router::GraphPolicyRouterSlot::default()),
             graph_host_tools: Arc::new(operation_router::GraphHostToolSlot::default()),
@@ -941,6 +946,23 @@ fn offer_shared(
         Ok(builder)
     }
 }
+fn offer_unrouted_shared(
+    builder: AgentBuilder,
+    tool: Arc<dyn Tool>,
+    context: &mut OfferContext<'_, '_>,
+) -> Result<AgentBuilder> {
+    let spec = tool.spec();
+    context.available.insert(spec.name.clone());
+    if context.selected.is_empty() || context.selected.contains(spec.name.as_str()) {
+        context
+            .policy
+            .permit_host(context.actor.clone(), &spec.name, &spec.effect)?;
+        Ok(builder.shared_tool(tool))
+    } else {
+        Ok(builder)
+    }
+}
+
 fn offer_required<T: Tool + 'static>(
     builder: AgentBuilder,
     tool: T,
@@ -1013,12 +1035,25 @@ fn configure_inner(
                 job_runtime: None,
             });
         }
-        let agent_subscribe_only = options.selected_tools.len() == 1
-            && options.selected_tools[0] == "jobs_subscribe"
-            && options.agent_jobs.is_installed()?;
-        if !agent_subscribe_only {
+        let host_backed_only = options.selected_tools.iter().all(|name| {
+            matches!(
+                name.as_str(),
+                "jobs_subscribe" | events::EVENTS_PUBLISH | events::EVENTS_SUBSCRIBE
+            )
+        });
+        let jobs_ready = !options
+            .selected_tools
+            .iter()
+            .any(|name| name == "jobs_subscribe")
+            || options.agent_jobs.is_installed()?;
+        let events_ready = !options
+            .selected_tools
+            .iter()
+            .any(|name| events::EVENT_TOOL_NAMES.contains(&name.as_str()))
+            || options.events.is_installed()?;
+        if !(host_backed_only && jobs_ready && events_ready) {
             return Err(Error::Denied(
-                "ToolMode::Off permits only host-backed jobs_subscribe",
+                "ToolMode::Off permits only installed host-backed Agent/Event controls",
             ));
         }
     }
@@ -1174,6 +1209,12 @@ fn configure_inner(
         router: &options.operation_router,
         catalog,
     };
+    if options.events.is_installed()? {
+        for tool in events::model_tools(options.events.clone()) {
+            builder = offer_unrouted_shared(builder, tool, &mut offered)?;
+        }
+    }
+
     let job_runtime = if wants_jobs {
         let runtime = job_runtime::JobRuntime::new_with_native_tools_bounded(
             root.clone(),

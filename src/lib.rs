@@ -37,6 +37,8 @@ pub mod approval_ui;
 pub mod context;
 #[cfg(feature = "durable")]
 pub mod context_flow;
+#[cfg(feature = "durable")]
+mod events;
 pub mod extension_prompts;
 #[cfg(feature = "durable")]
 pub mod extension_secrets;

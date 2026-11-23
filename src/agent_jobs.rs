@@ -209,6 +209,45 @@ impl Router {
         }
     }
 
+    pub(crate) fn event_store(&self) -> &SessionStore {
+        &self.store
+    }
+
+    pub(crate) fn current_event_agent(
+        &self,
+        ctx: &ToolContext,
+    ) -> Result<(String, String, String)> {
+        if ctx.actor != self.actor
+            || ctx.identity.actor != self.actor
+            || ctx.source != ToolSource::trusted_host()
+            || ctx.effect != ToolEffect::Control
+        {
+            return Err(Error::Denied(
+                "Event tool provenance differs from its exact Host/Control grant",
+            ));
+        }
+        let execution = ctx.execution_owner.as_ref().ok_or(Error::Denied(
+            "Event tool requires a bound Agent execution owner",
+        ))?;
+        let current = Self::current_agent(ctx)?;
+        let binding = self.binding_for_agent_ref(&current)?;
+        let canonical = Self::canonical(&binding);
+        let scope = ctx.scope.as_ref().ok_or(Error::Denied(
+            "Event tool requires the current journaled Agent Turn scope",
+        ))?;
+        if execution.canonical_ref() != canonical
+            || execution.session_id() != binding.session_id
+            || execution.branch_id() != binding.branch_id
+            || scope.session_id != binding.session_id
+            || scope.branch_id != binding.branch_id
+        {
+            return Err(Error::Denied(
+                "Event tool execution scope disagrees with authoritative Agent binding",
+            ));
+        }
+        Ok((canonical, binding.session_id, binding.branch_id))
+    }
+
     pub fn has_live_owner(&self, canonical_agent_ref: &str) -> Result<bool> {
         let parsed = ExecutionRef::parse(canonical_agent_ref)
             .map_err(|_| Error::Denied("invalid canonical Agent owner ref"))?;

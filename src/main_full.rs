@@ -2323,6 +2323,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
         process_input: false,
         agent_jobs: Default::default(),
+        events: Default::default(),
         operation_router: Default::default(),
         graph_policy_router: Default::default(),
         graph_host_tools: Default::default(),
@@ -5056,6 +5057,7 @@ impl Host {
             "loading durable Session history",
         )?;
         let remote_execution = self.mcp.execution_site_binding()?;
+        let local_event_controls = remote_execution.is_none();
         if remote_execution.is_some() && self.persistent.is_none() {
             return Err(Error::Denied(
                 "remote MCP execution sites require a durable SQLite Session owner",
@@ -5196,6 +5198,21 @@ impl Host {
                 )?));
                 self.agent_jobs_owner = Some(owner);
             }
+            if local_event_controls {
+                self.tools.events.replace(router.clone())?;
+                let registered = agent
+                    .tool_specs()
+                    .into_iter()
+                    .map(|spec| spec.name)
+                    .collect::<std::collections::BTreeSet<_>>();
+                for tool in aw_tools_adapter::events::model_tools(self.tools.events.clone()) {
+                    if !registered.contains(&tool.spec().name) {
+                        agent.register_host_tool(tool)?;
+                    }
+                }
+            } else {
+                self.tools.events.clear()?;
+            }
             self.tools.agent_jobs.replace(router)?;
         } else {
             // Never leave a router/owner for a previously active SQLite Agent
@@ -5207,6 +5224,7 @@ impl Host {
             self.agent_inputs_owner = None;
             self.sandbox_owner = None;
             self.tools.agent_jobs.clear()?;
+            self.tools.events.clear()?;
             self.tools.operation_router.clear()?;
             self.tools
                 .graph_host_tools

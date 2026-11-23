@@ -114,37 +114,27 @@ impl SessionStore {
     }
 }
 
-impl SessionHandle {
-    /// Lower host-runtime seam for model custom Events. The source is always this
-    /// exact Agent/current branch and the actor is the immutable running Turn
-    /// identity; there is no API parameter for another source.
-    pub fn publish_model_event(
+impl SessionStore {
+    /// Lower trusted-runtime seam for one already-running factual Turn.
+    ///
+    /// The host supplies only the exact Store-owned session/branch/turn binding;
+    /// source Agent and actor are derived again from authoritative state.
+    pub fn events_publish_turn(
         &self,
+        session: &str,
+        branch: &str,
         turn: u64,
         event: &str,
         data: Option<&serde_json::Value>,
     ) -> Result<EventPublishOutcome> {
-        self.publish_turn_event_inner(turn, event, data, None)
+        self.events_publish_turn_inner(session, branch, turn, event, data, None)
     }
 
-    pub fn publish_typed_event<T: EventPayload>(
+    #[allow(clippy::too_many_arguments)]
+    fn events_publish_turn_inner(
         &self,
-        turn: u64,
-        registry: &EventTypeRegistryReader,
-        key: &EventKey<T>,
-        value: &T,
-    ) -> Result<EventPublishOutcome> {
-        let descriptor = registry.revalidate(key)?;
-        let data = serde_json::to_value(value)
-            .map_err(|_| Error::Denied("typed Event payload cannot be encoded"))?;
-        event_authority::validate_data(&data)?;
-        let schema = key.schema();
-        debug_assert_eq!(descriptor.event, key.event());
-        self.publish_turn_event_inner(turn, key.event(), Some(&data), Some(&schema))
-    }
-
-    fn publish_turn_event_inner(
-        &self,
+        session: &str,
+        branch: &str,
         turn: u64,
         event: &str,
         data: Option<&serde_json::Value>,
@@ -155,11 +145,9 @@ impl SessionHandle {
                 "model Event publication requires a current Turn",
             ));
         }
-        let branch = self.branch()?;
-        let store = self.store();
-        let mut connection = store.connection()?;
+        let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let agent = agent_owner::AgentKey::new(self.session_id(), &branch.id);
+        let agent = agent_owner::AgentKey::new(session, branch);
         let (lifecycle, _) = agent_owner::lifecycle(&tx, agent)?;
         if lifecycle != "open" {
             return Err(Error::Conflict(
@@ -172,7 +160,7 @@ impl SessionHandle {
                  FROM runs r JOIN branches b ON b.active_run=r.id
                  WHERE r.session_id=?1 AND r.branch_id=?2 AND r.turn_id=?3
                    AND r.status='running' AND b.id=?2",
-                params![self.session_id(), branch.id, turn],
+                params![session, branch, turn],
                 |row| row.get(0),
             )
             .optional())?;
@@ -190,7 +178,7 @@ impl SessionHandle {
                   WHERE session_id=?1 AND branch_id=?2 AND turn_id=?3),
                  0
              )",
-            params![self.session_id(), branch.id, turn],
+            params![session, branch, turn],
             |row| row.get(0),
         ))?;
         if current_count >= MAX_MODEL_CUSTOM_EVENTS_PER_TURN {
@@ -199,12 +187,8 @@ impl SessionHandle {
             ));
         }
 
-        let manifest = history_owner::event_publication_manifest_for_turn(
-            &tx,
-            self.session_id(),
-            &branch.id,
-            turn,
-        )?;
+        let manifest =
+            history_owner::event_publication_manifest_for_turn(&tx, session, branch, turn)?;
         let outcome = event_source::emit_custom_event(
             &tx,
             &source_ref,
@@ -231,7 +215,7 @@ impl SessionHandle {
                          published_count=event_custom_turn_counts.published_count+1,
                          updated_at=excluded.updated_at
                      WHERE event_custom_turn_counts.published_count<32",
-                    params![self.session_id(), branch.id, turn, now()],
+                    params![session, branch, turn, now()],
                 ))?;
                 if changed != 1 {
                     return Err(Error::Limit(
@@ -256,9 +240,47 @@ impl SessionHandle {
         };
         db(tx.commit())?;
         if matches!(result, EventPublishOutcome::Published(_)) {
-            store.signal_event_wake();
+            self.signal_event_wake();
         }
         Ok(result)
+    }
+}
+
+impl SessionHandle {
+    /// Convenience projection over the same Store-owned running-Turn primitive.
+    pub fn publish_model_event(
+        &self,
+        turn: u64,
+        event: &str,
+        data: Option<&serde_json::Value>,
+    ) -> Result<EventPublishOutcome> {
+        let branch = self.branch()?;
+        self.store()
+            .events_publish_turn(self.session_id(), &branch.id, turn, event, data)
+    }
+
+    pub fn publish_typed_event<T: EventPayload>(
+        &self,
+        turn: u64,
+        registry: &EventTypeRegistryReader,
+        key: &EventKey<T>,
+        value: &T,
+    ) -> Result<EventPublishOutcome> {
+        let descriptor = registry.revalidate(key)?;
+        let data = serde_json::to_value(value)
+            .map_err(|_| Error::Denied("typed Event payload cannot be encoded"))?;
+        event_authority::validate_data(&data)?;
+        let schema = key.schema();
+        debug_assert_eq!(descriptor.event, key.event());
+        let branch = self.branch()?;
+        self.store().events_publish_turn_inner(
+            self.session_id(),
+            &branch.id,
+            turn,
+            key.event(),
+            Some(&data),
+            Some(&schema),
+        )
     }
 }
 

@@ -2036,6 +2036,125 @@ fn read_only_graph_schemas_do_not_advertise_mutation_nodes() {
     }
 }
 
+#[tokio::test]
+async fn event_tools_are_exact_host_grants_and_route_only_current_context() {
+    struct ProviderFixture;
+    impl aw_agent_core::Provider for ProviderFixture {
+        fn stream<'a>(
+            &'a self,
+            _: &'a [aw_agent_core::Message],
+            _: &'a str,
+            _: &'a mut aw_agent_core::DeltaSink<'_>,
+        ) -> aw_agent_core::CompletionFuture<'a> {
+            Box::pin(async { Err(aw_agent_core::Error::Protocol("provider unused")) })
+        }
+    }
+
+    #[derive(Default)]
+    struct Router {
+        calls: Mutex<Vec<Value>>,
+    }
+    impl crate::events::EventRouter for Router {
+        fn publish(&self, ctx: &ToolContext, event: &str, data: Option<&Value>) -> Result<Value> {
+            self.calls.lock().unwrap().push(json!({
+                "kind":"publish",
+                "actor":ctx.actor.as_str(),
+                "turn":ctx.turn_id,
+                "agent":ctx.execution_owner.as_ref().map(|owner| owner.canonical_ref()),
+                "event":event,
+                "data":data
+            }));
+            Ok(json!({"status":"published"}))
+        }
+
+        fn subscribe(&self, ctx: &ToolContext, subject: &str, enabled: bool) -> Result<Value> {
+            self.calls.lock().unwrap().push(json!({
+                "kind":"subscribe",
+                "actor":ctx.actor.as_str(),
+                "turn":ctx.turn_id,
+                "agent":ctx.execution_owner.as_ref().map(|owner| owner.canonical_ref()),
+                "subject":subject,
+                "enabled":enabled
+            }));
+            Ok(json!({"status":"subscribed"}))
+        }
+    }
+
+    let tree = Tree::new();
+    let actor = PrincipalId::new("local").unwrap();
+    let router = Arc::new(Router::default());
+    let slot = Arc::new(crate::events::EventRouterSlot::default());
+    slot.replace(router.clone()).unwrap();
+
+    let builder = aw_agent_core::Agent::builder(
+        Arc::new(ProviderFixture),
+        aw_agent_core::AgentOptions::new("fixture", "model"),
+    );
+    let mut options = LocalToolOptions::new(&tree.0, ToolMode::Off);
+    options.events = slot.clone();
+    options.selected_tools = crate::events::EVENT_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    let agent = configure(builder, actor.clone(), &options)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let names = agent
+        .tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        crate::events::EVENT_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect()
+    );
+
+    let authority = agent.tool_binding_authority();
+    for name in crate::events::EVENT_TOOL_NAMES {
+        let binding = authority.permitted_binding(&actor, name).unwrap();
+        assert_eq!(binding.effect, ToolEffect::Control);
+        assert_eq!(binding.source, aw_agent_core::ToolSource::trusted_host());
+        assert_eq!(binding.execution_site, "local");
+    }
+
+    let event_tools = crate::events::model_tools(slot.clone());
+    let publish = event_tools
+        .iter()
+        .find(|tool| tool.spec().name == crate::events::EVENTS_PUBLISH)
+        .unwrap();
+    let publish_args = json!({"event":"#ready","data":{"n":1}});
+    let publish_output = publish.execute(context(), &publish_args).await.unwrap();
+    assert!(!publish_output.is_error);
+
+    let subscribe = event_tools
+        .iter()
+        .find(|tool| tool.spec().name == crate::events::EVENTS_SUBSCRIBE)
+        .unwrap();
+    let subscribe_args = json!({"subject":"e:#ready","enabled":false});
+    let subscribe_output = subscribe.execute(context(), &subscribe_args).await.unwrap();
+    assert!(!subscribe_output.is_error);
+
+    let calls = router.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["agent"], "/d:0/i:0/p:0/a:0");
+    assert_eq!(calls[0]["turn"], 1);
+    assert_eq!(calls[1]["agent"], "/d:0/i:0/p:0/a:0");
+    assert_eq!(calls[1]["enabled"], false);
+
+    let builder = aw_agent_core::Agent::builder(
+        Arc::new(ProviderFixture),
+        aw_agent_core::AgentOptions::new("fixture", "model"),
+    );
+    let mut unavailable = LocalToolOptions::new(&tree.0, ToolMode::Off);
+    unavailable.selected_tools = vec![crate::events::EVENTS_PUBLISH.into()];
+    assert!(configure(builder, actor, &unavailable).is_err());
+}
+
 #[test]
 fn canonical_job_surface_uses_flat_jobs_without_start_or_restart() {
     struct ProviderFixture;
