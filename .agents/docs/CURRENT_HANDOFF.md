@@ -19,8 +19,9 @@ Normative R6 design:
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
 complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
-one private EventScan, and v45 source-local Event revision/emission owner are now implemented locally.
-events.read/subscription/Handler consumers and the v36 delivery cutover remain later Phase-2 work.
+one shared private EventScan, v45 source-local Event authorship, and the first v46 exact-Agent Event read
+consumer are now implemented locally. Broad-selector/waiting read, subscription/Handler delivery and the
+v36 delivery cutover remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -37,8 +38,9 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 The local Phase-1 implementation line remains unpublished. Its signed completion checkpoint is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 started at signed local
 checkpoint `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`), followed by
-`7e54a9d248a3b9536e95a62ba1fa1886673fe346` (`Add private Event scan`). This checkpoint adds the v45
-source-local Event owner and first real Agent/Turn system envelopes. The local `origin/main` tracking ref
+`7e54a9d248a3b9536e95a62ba1fa1886673fe346` (`Add private Event scan`) and
+`9958b7e80b8aca8c25218b1b96893048f51e29b0` (`Own source Event revisions`). This checkpoint adds the
+first real v46 EventScan consumer and exact-Agent opaque read cursor. The local `origin/main` tracking ref
 is stale and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
@@ -581,21 +583,58 @@ deep/non-object Event data, and revision exhaustion. Metadata-only result/settle
 no DisclosureManifest: section 26.5 permits source-policy-only system facts, and the existing history
 manifest code has no generic current-viewer authorizer that should be repurposed into a second policy owner.
 
-No cursor, public `events.read`, subscription, Handler, EventInput, EventTypeRegistry or v36 delivery
-cutover is implemented yet. `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership
-is unchanged. The scanner/snapshot seam therefore still has its narrow temporary non-test dead-code
-allowance until the first real consumer lands. **Next Phase-2 slice:** compose the exact current Agent/Turn
-source-visibility adapter (and deeper evidence only where a real Event carries it), attach the first real
-Event consumer to the existing EventScan, then remove that temporary reachability allowance. Do not invent
-a generic DisclosureManifest authority service merely to satisfy the scanner.
+Schema **v46** adds the first durable Event read consumer. `event_read_cursors_current` stores only
+opaque random cursor identity plus authenticated principal, normalized selector digest, exact Agent
+placement binding, StoreScope, private position and created/last-used time. Public pages never expose
+StorePos, hidden-row counts, source evidence or disclosure-manifest identity. Cursors expire after 24 hours
+idle and are capped at 64 live rows per principal after opportunistic cleanup. The logical replay floor is
+the sealed union of all Events from the last seven days and at least the newest 65,536 Event rows; stores
+below 65,536 Events short-circuit that check without a time-floor scan.
 
-Current focused Phase-2 evidence: legacy Job-event pure tests **4/4**; Event-subject/pattern **2/2**;
-EventScan source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing
-attached-Turn legacy regression **1/1** now additionally proves generic root/Turn next-revision alignment,
-three real projected envelopes at exact revision 1, stable commit-log Event IDs, actor/Turn provenance, and
-v44→v45 reseeding to next revision 2 without changing commit-log cardinality. Current-schema
+`SessionStore::events_read_page` is the first real EventScan consumer and deliberately implements only
+the placement scope that is complete today: an absolute selector wholly rooted at one **exact Agent**.
+`EventPattern::exact_agent_ref` extracts that root syntactically; wildcard Domain/Principal/Project/Agent
+selectors fail closed rather than pretending this Store is globally complete. `after=Now` requires current
+Agent `view`, captures the projection's current safe watermark, and returns an empty page with an opaque
+cursor. Cursor reads bind principal + selector + StoreId/restore generation + exact Agent placement, scan
+at most 4096 underlying Event rows, and return at most 256 visible Events. The current Agent owner is the
+placement proof: missing/moved ownership is stale; ACL changes themselves do not stale a cursor.
+
+For one read transaction, exact-Agent `view` evidence is resolved once and reused across the bounded
+scanner because the existing `BEGIN IMMEDIATE` Store transaction makes that authority snapshot immutable;
+a visible page performs one final evidence recheck before cursor progress commits. This avoids per-Event
+ACL point lookups without weakening the final-owner boundary. Proven pattern nonmatch/source denial advances
+only the private position. A caller whose `view` is revoked therefore skips unread matching Events without
+seeing their identities; restoring `view` later does not reveal rows already skipped. Candidate payload/
+manifest work still happens only after source allow. Current metadata-only result/settled Events have no
+manifest and pass source policy; any future envelope carrying `disclosure_manifest` returns the
+candidate-oblivious `AuthorizationUnavailable` with unchanged progress until the real manifest/provider
+authorizer exists. StoreScope/projection/placement changes return `CursorStale`; idle/missing/retention
+loss returns `CursorExpired`. Public Event projection revalidates immutable marker subject/revision/source
+agreement and actor/Turn/causal bounds.
+
+This removes the scanner's temporary non-test dead-code allowance: EventScan and its projection snapshot
+are now production-reachable through a real consumer. It does **not** claim full section-26.2 completion
+yet: `events_read_page` is the bounded single-attempt Store primitive; `wait_ms`/wake composition and
+authority-scoped broad-selector placement remain pending. No durable subscription, Handler, EventInput,
+EventTypeRegistry or v36 delivery cutover is implemented. `delivery_cutover_rev` remains NULL and legacy
+pending delivery/ACK ownership is unchanged. The Event cursor is the first implementation of the sealed
+opaque cursor envelope; extract shared cursor-binding mechanics when the second real cursor consumer lands
+rather than pre-building a generic unused cursor framework.
+
+Current focused Phase-2 evidence: Event-subject/pattern **2/2**; EventScan
+source-first/bounded/Unknown/stale/evidence **1/1**; v44 projection **1/1**; and the existing attached-Turn
+coexistence regression **1/1** now also covers v46 end-to-end: owner `Now` cursor reads exactly the three
+new root/Turn Events once, repeat is empty, observer cursor created with `view` privately skips all three
+after revocation, and regrant cannot reveal them retroactively. The same regression performs
+v44→v45→v46 migration and preserves immutable commit-log cardinality/source next revision. Current-schema
 `aw-tools + aw-store` all-target check and strict Clippy are green. The prior broad `aw-store --lib`
 result remains **226 green / 4 historical stale-downgrade reds** and was not repeated for this focused cut.
+
+**Next Phase-2 slice:** finish exact-Agent section-26.2 observation by composing Event wake +
+`wait_ms` around this single-attempt primitive without polling or another worker, then decide the smallest
+existing placement-owner extension needed for broader selectors. Keep broad selectors fail-closed until
+one-store completeness can actually be proven; do not fabricate a global topology generation.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

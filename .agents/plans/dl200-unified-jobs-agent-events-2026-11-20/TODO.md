@@ -246,8 +246,8 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       `Allow(evidence)|Deny|Unknown`; both preliminary evidence values travel with an allowed candidate for
       mandatory consumer-side final reauthorization. The visible candidate alone is boxed to keep skip/
       blocked/end outcomes small. Focused pattern 2/2, scanner 1/1 and projection 1/1 are green with strict
-      current-schema all-target Clippy/check. The private scanner has a narrow temporary non-test dead-code
-      allowance until its first real consumer lands; do not publish a fake API to remove it.
+      current-schema all-target Clippy/check. The temporary reachability allowance is now removed by the
+      real v46 read consumer below; no fake/public scanner surface was introduced.
       **v45 source-local Event authorship landed locally:** one generic `event_sources_current` owns
       exact source ref + first-unissued event_rev + nullable future delivery cutover. Migration seeds every
       legacy SourceEventBook at its exact next revision without rewriting Event history. New legacy source
@@ -258,11 +258,21 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       subject, factual actor/Turn provenance and source-only disclosure for these metadata facts. Focused
       legacy 4/4 + subject 2/2 + scanner 1/1 + projection 1/1 + attached-Turn coexistence/migration 1/1 are
       green with strict current-schema all-target Clippy/check.
-      **Next:** compose exact current Agent/Turn source visibility into EventScan and attach the first real
-      Event consumer, removing the temporary scanner dead-code allowance. Add deeper manifest/provider
-      evidence only for Event types that genuinely carry protected dependencies; do not create a generic
-      manifest authority service. events.read/subscription/Handler, EventTypeRegistry and the explicit v36
-      delivery_cutover_rev transition remain later Phase-2 slices.
+      **v46 first EventScan consumer landed locally:** one opaque durable read cursor binds principal +
+      canonical selector hash + exact-Agent placement + StoreScope + private position; 24h idle/64-principal
+      bounds and the seven-day-or-newest-65,536 replay floor are enforced. The first read scope is
+      intentionally exact-Agent only: broader selectors fail closed until the placement owner can prove
+      one-store completeness. `after=Now` captures the current safe watermark; cursor reads scan <=4096
+      rows for <=256 visible Events. One Store transaction caches current Agent-view evidence for the page
+      and rechecks it once before visible progress commits; proven denial/nonmatch advances privately,
+      protected/indeterminate deeper authority returns candidate-oblivious AuthorizationUnavailable without
+      progress, and scope/placement changes stale the cursor. The existing attached-Turn regression now
+      proves owner read-once semantics plus revoke->private-skip->regrant non-retroactivity and
+      v44→v45→v46 migration. EventScan is production-reachable and its dead-code allowance is gone.
+      **Next:** add event wake + wait_ms around this exact-Agent single-attempt read without polling/another
+      worker, then extend placement only through an existing owner that can prove authorized broad selectors
+      wholly store-local. Durable subscriptions/Handlers/EventInput, EventTypeRegistry, protected-manifest
+      authority and explicit v36 delivery_cutover_rev remain later Phase-2 slices.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

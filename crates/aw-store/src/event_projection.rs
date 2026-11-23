@@ -44,7 +44,6 @@ struct ProjectionState {
     dirty: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct EventProjectionSnapshot {
     pub(crate) scope: StoreScope,
@@ -157,7 +156,6 @@ pub(crate) fn project_commit_event(
     Ok(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn snapshot(connection: &Connection) -> Result<EventProjectionSnapshot> {
     let current = state(connection)?;
     let scope = StoreScope::load(connection)?;

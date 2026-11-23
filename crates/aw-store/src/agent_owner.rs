@@ -753,21 +753,36 @@ pub(crate) fn authorize_access(
     authorize_permission(connection, actor, agent, permission)
 }
 
-pub(crate) fn key_for_ref(connection: &Connection, reference: &str) -> Result<(String, String)> {
-    let candidate: (String, String) = db(connection.query_row(
-        "SELECT session_id,branch_id FROM job_exposure_current
-         WHERE kind='agent' AND generation='' AND state='published' AND canonical_ref=?1",
-        [reference],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ))?;
+pub(crate) fn key_for_ref_optional(
+    connection: &Connection,
+    reference: &str,
+) -> Result<Option<(String, String)>> {
+    let candidate: Option<(String, String)> = db(connection
+        .query_row(
+            "SELECT session_id,branch_id FROM job_exposure_current
+             WHERE kind='agent' AND generation='' AND state='published' AND canonical_ref=?1",
+            [reference],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional())?;
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
     let actual = canonical_ref(
         connection,
         AgentKey::new(candidate.0.as_str(), candidate.1.as_str()),
     )?;
     if actual != reference {
-        return Err(Error::Denied("Agent ref is unavailable or not authorized"));
+        return Err(Error::Storage(
+            "Agent exposure canonical ref disagrees with authoritative owner state",
+        ));
     }
-    Ok(candidate)
+    Ok(Some(candidate))
+}
+
+pub(crate) fn key_for_ref(connection: &Connection, reference: &str) -> Result<(String, String)> {
+    key_for_ref_optional(connection, reference)?
+        .ok_or(Error::Denied("Agent ref is unavailable or not authorized"))
 }
 
 pub(crate) fn changed_acl(

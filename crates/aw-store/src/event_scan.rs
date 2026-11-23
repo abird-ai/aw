@@ -77,11 +77,9 @@ pub(crate) struct EventCandidate {
     pub(crate) event_id: String,
     pub(crate) subject: String,
     pub(crate) source: EventSource,
-    pub(crate) event_name: String,
     pub(crate) event_rev: u64,
     pub(crate) actor: Option<String>,
     pub(crate) payload: serde_json::Value,
-    pub(crate) created_at: i64,
 }
 
 #[derive(Debug)]
@@ -114,11 +112,19 @@ impl EventScanFence {
 
 #[derive(Debug)]
 pub(crate) enum EventScanResult<SourceEvidence, CandidateEvidence> {
-    Candidate(Box<EventScanCandidate<SourceEvidence, CandidateEvidence>>),
-    ProvenSkip { through: StorePos },
+    Candidate {
+        candidate: Box<EventScanCandidate<SourceEvidence, CandidateEvidence>>,
+        examined: usize,
+    },
+    ProvenSkip {
+        through: StorePos,
+        examined: usize,
+    },
     BlockedUnknown,
     Stale,
-    End { through: StorePos },
+    End {
+        through: StorePos,
+    },
 }
 
 struct IndexedEvent {
@@ -126,7 +132,6 @@ struct IndexedEvent {
     event_id: String,
     subject: String,
     source: EventSource,
-    event_name: String,
     event_rev: u64,
 }
 
@@ -183,7 +188,7 @@ where
         "SELECT
              commit_position,event_id,subject,source_ref,source_kind,
              domain_handle,identity_handle,project_handle,sandbox_handle,agent_handle,
-             turn_handle,job_handle,node_coordinate,event_name,event_rev
+             turn_handle,job_handle,node_coordinate,event_rev
          FROM event_projection_index
          WHERE commit_position>?1 AND commit_position<=?2
          ORDER BY commit_position
@@ -245,11 +250,8 @@ where
                     .get(12)
                     .map_err(|_| Error::Storage("invalid Event projection Node"))?,
             },
-            event_name: row
-                .get(13)
-                .map_err(|_| Error::Storage("invalid Event projection event name"))?,
             event_rev: row
-                .get(14)
+                .get(13)
                 .map_err(|_| Error::Storage("invalid Event projection event revision"))?,
         };
 
@@ -277,13 +279,14 @@ where
             EventAuthorization::Allow(evidence) => evidence,
         };
         return match check_fence(connection, fence, &mut placement)? {
-            FenceState::Current(_) => {
-                Ok(EventScanResult::Candidate(Box::new(EventScanCandidate {
+            FenceState::Current(_) => Ok(EventScanResult::Candidate {
+                candidate: Box::new(EventScanCandidate {
                     event: candidate,
                     source_evidence,
                     candidate_evidence,
-                })))
-            }
+                }),
+                examined,
+            }),
             FenceState::Blocked => Ok(EventScanResult::BlockedUnknown),
             FenceState::Stale => Ok(EventScanResult::Stale),
         };
@@ -296,6 +299,7 @@ where
         FenceState::Stale => Ok(EventScanResult::Stale),
         FenceState::Current(_) if examined == scan_limit => Ok(EventScanResult::ProvenSkip {
             through: last_proven,
+            examined,
         }),
         FenceState::Current(_) => Ok(EventScanResult::End {
             through: projection.indexed_through,
@@ -326,15 +330,15 @@ where
 }
 
 fn load_candidate(connection: &Connection, indexed: IndexedEvent) -> Result<EventCandidate> {
-    let row: Option<(String, Option<String>, String, i64)> = db(connection
+    let row: Option<(String, Option<String>, String)> = db(connection
         .query_row(
-            "SELECT event_id,actor,payload_json,created_at
+            "SELECT event_id,actor,payload_json
              FROM commit_log WHERE seq=?1",
             [indexed.position.get()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional())?;
-    let Some((event_id, actor, payload, created_at)) = row else {
+    let Some((event_id, actor, payload)) = row else {
         return Err(Error::Storage(
             "Event projection references a missing immutable commit row",
         ));
@@ -351,11 +355,9 @@ fn load_candidate(connection: &Connection, indexed: IndexedEvent) -> Result<Even
         event_id: indexed.event_id,
         subject: indexed.subject,
         source: indexed.source,
-        event_name: indexed.event_name,
         event_rev: indexed.event_rev,
         actor,
         payload,
-        created_at,
     })
 }
 
@@ -464,10 +466,11 @@ mod tests {
             },
         )
         .unwrap();
-        let EventScanResult::ProvenSkip { through } = first else {
+        let EventScanResult::ProvenSkip { through, examined } = first else {
             panic!("bounded proven skips must return private progress");
         };
         assert_eq!(through, denied);
+        assert_eq!(examined, 3);
         assert_eq!(
             source_calls,
             vec!["/d:acme/i:alice/p:core/a:2", "/d:acme/i:alice/p:core/a:3"]
@@ -501,9 +504,14 @@ mod tests {
             },
         )
         .unwrap();
-        let EventScanResult::Candidate(candidate) = third else {
+        let EventScanResult::Candidate {
+            candidate,
+            examined,
+        } = third
+        else {
             panic!("same blocked row must remain retryable from unchanged progress");
         };
+        assert_eq!(examined, 1);
         assert_eq!(candidate.source_evidence, "/d:acme/i:alice/p:core/a:4");
         assert_eq!(candidate.candidate_evidence, "manifest-evidence");
         let candidate = &candidate.event;
@@ -511,11 +519,9 @@ mod tests {
         assert_eq!(candidate.source.reference, "/d:acme/i:alice/p:core/a:4");
         assert_eq!(candidate.subject, "d:acme.i:alice.p:core.a:4.e:changed");
         assert!(!candidate.event_id.is_empty());
-        assert_eq!(candidate.event_name, "changed");
         assert_eq!(candidate.event_rev, 1);
         assert_eq!(candidate.actor, None);
         assert_eq!(candidate.payload["tag"], "blocked");
-        assert!(candidate.created_at > 0);
 
         let placement_unknown = scan_events(
             &connection,

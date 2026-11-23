@@ -273,6 +273,28 @@ impl EventPattern {
         &self.raw
     }
 
+    /// Exact Agent root that wholly contains this selector, when one exists.
+    ///
+    /// This is syntax only: placement and current authority remain host/store
+    /// concerns. Broad selectors return None rather than claiming completeness.
+    pub fn exact_agent_ref(&self) -> Option<String> {
+        let mut tokens = self.raw.split('.');
+        let mut out = String::with_capacity(self.raw.len().min(MAX_REF_BYTES));
+        for expected in ["d", "i", "p", "a"] {
+            let token = tokens.next()?;
+            let (kind, encoded) = token.split_once(':')?;
+            if kind != expected || encoded == "*" {
+                return None;
+            }
+            let decoded = decode_handle(encoded).ok()?;
+            out.push('/');
+            out.push_str(expected);
+            out.push(':');
+            out.push_str(&decoded);
+        }
+        Some(out)
+    }
+
     pub fn matches_canonical(&self, subject: &str) -> bool {
         let pattern = self.raw.split('.');
         let mut subject = subject.split('.');
@@ -402,6 +424,12 @@ mod tests {
     #[test]
     fn absolute_patterns_keep_typed_nats_cardinality_without_partial_globs() {
         let subtree = EventPattern::parse_absolute("d:acme.i:alice.p:core.a:*.>").unwrap();
+        assert_eq!(subtree.exact_agent_ref(), None);
+        let exact_agent = EventPattern::parse_absolute("d:acme.i:alice.p:foo%2Ebar.a:2.>").unwrap();
+        assert_eq!(
+            exact_agent.exact_agent_ref().as_deref(),
+            Some("/d:acme/i:alice/p:foo.bar/a:2")
+        );
         assert!(subtree.matches_canonical("d:acme.i:alice.p:core.a:2.e:changed"));
         assert!(subtree.matches_canonical("d:acme.i:alice.p:core.a:2.t:7.j:test.e:result"));
         assert!(!subtree.matches_canonical("d:acme.i:alice.p:other.a:2.e:changed"));

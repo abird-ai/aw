@@ -850,6 +850,64 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        let root_subject =
+            aw_tools::event_subject::EventSubject::from_resource_ref(&root, "result")
+                .unwrap()
+                .into_string();
+        let read_pattern = format!(
+            "{}.>",
+            root_subject
+                .strip_suffix(".e:result")
+                .expect("concrete Event subject has final event token")
+        );
+        let owner_cursor = match store
+            .events_read_page(&actor, &read_pattern, crate::EventReadAfter::Now, 16)
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => {
+                assert!(page.events.is_empty());
+                page.cursor
+            }
+            other => panic!("unexpected owner Event cursor outcome: {other:?}"),
+        };
+
+        let observer = PrincipalId::new("internal:fixture:event-observer").unwrap();
+        let observer_ref = {
+            let connection = store.connection().unwrap();
+            let observer_user = crate::ensure_user_for_principal(&connection, &observer).unwrap();
+            let domain = root
+                .strip_prefix("/d:")
+                .and_then(|value| value.split('/').next())
+                .expect("canonical Agent ref has Domain");
+            format!("/d:{domain}/i:{observer_user}")
+        };
+        let revision = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        store
+            .agent_access_set(
+                &actor,
+                &session.id,
+                &branch.id,
+                &observer_ref,
+                Some(crate::AgentPermissions {
+                    view: true,
+                    ..Default::default()
+                }),
+                revision,
+            )
+            .unwrap();
+        let observer_cursor = match store
+            .events_read_page(&observer, &read_pattern, crate::EventReadAfter::Now, 16)
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => {
+                assert!(page.events.is_empty());
+                page.cursor
+            }
+            other => panic!("unexpected observer Event cursor outcome: {other:?}"),
+        };
+
         journal
             .finish(Turn {
                 id: 1,
@@ -952,6 +1010,113 @@ mod tests {
             assert!(projected.iter().all(|event| event.5 == 1));
         }
 
+        let owner_page = match store
+            .events_read_page(
+                &actor,
+                &read_pattern,
+                crate::EventReadAfter::Cursor(owner_cursor.clone()),
+                16,
+            )
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => page,
+            other => panic!("unexpected owner Event read outcome: {other:?}"),
+        };
+        assert_eq!(owner_page.cursor, owner_cursor);
+        assert_eq!(owner_page.events.len(), 3);
+        assert!(owner_page.events.iter().all(|event| event.event_rev == 1));
+        assert!(owner_page
+            .events
+            .iter()
+            .all(|event| event.actor.as_deref() == Some(actor.as_str())));
+        assert!(owner_page.events.iter().all(|event| event.turn == Some(1)));
+        assert!(owner_page.events.iter().all(|event| event.causal_hop == 0));
+        assert_eq!(
+            owner_page
+                .events
+                .iter()
+                .map(|event| event.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                root_subject.as_str(),
+                aw_tools::event_subject::EventSubject::from_resource_ref(&turn_ref, "result")
+                    .unwrap()
+                    .as_str(),
+                aw_tools::event_subject::EventSubject::from_resource_ref(&turn_ref, "settled")
+                    .unwrap()
+                    .as_str(),
+            ]
+        );
+        let owner_empty = match store
+            .events_read_page(
+                &actor,
+                &read_pattern,
+                crate::EventReadAfter::Cursor(owner_page.cursor.clone()),
+                16,
+            )
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => page,
+            other => panic!("unexpected repeated owner Event read outcome: {other:?}"),
+        };
+        assert!(owner_empty.events.is_empty());
+
+        let revision = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        let revoked_revision = store
+            .agent_access_set(
+                &actor,
+                &session.id,
+                &branch.id,
+                &observer_ref,
+                None,
+                revision,
+            )
+            .unwrap();
+        let hidden_page = match store
+            .events_read_page(
+                &observer,
+                &read_pattern,
+                crate::EventReadAfter::Cursor(observer_cursor.clone()),
+                16,
+            )
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => page,
+            other => panic!("unexpected hidden observer Event read outcome: {other:?}"),
+        };
+        assert!(hidden_page.events.is_empty());
+        store
+            .agent_access_set(
+                &actor,
+                &session.id,
+                &branch.id,
+                &observer_ref,
+                Some(crate::AgentPermissions {
+                    view: true,
+                    ..Default::default()
+                }),
+                revoked_revision,
+            )
+            .unwrap();
+        let regained_page = match store
+            .events_read_page(
+                &observer,
+                &read_pattern,
+                crate::EventReadAfter::Cursor(hidden_page.cursor),
+                16,
+            )
+            .unwrap()
+        {
+            crate::EventReadOutcome::Page(page) => page,
+            other => panic!("unexpected regained observer Event read outcome: {other:?}"),
+        };
+        assert!(
+            regained_page.events.is_empty(),
+            "regaining view cannot reveal Events already privately skipped while denied"
+        );
+
         store
             .ack_agent_job_event(&actor, &session.id, &branch.id, root_result)
             .unwrap();
@@ -1005,7 +1170,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE event_sources_current;
+                "DROP TABLE event_read_cursors_current;
+                 DROP TABLE event_sources_current;
                  UPDATE store_meta SET value='44' WHERE key='schema_epoch';
                  UPDATE schema_meta
                     SET schema_epoch=44,activation_epoch=44,migration_phase='ready'
@@ -1017,11 +1183,12 @@ mod tests {
             )
             .unwrap();
         crate::migrate_event_sources(&mut connection).unwrap();
+        crate::migrate_event_read_cursors(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            45
+            46
         );
         for source in [&root, &turn_ref] {
             assert_eq!(
