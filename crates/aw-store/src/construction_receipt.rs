@@ -696,6 +696,101 @@ pub(crate) fn publish_sources<F: SourcePublicationFence, T>(
     Ok(result)
 }
 
+/// Re-read the same immutable initial source claim through its indexed
+/// current receipt, not a second provenance copy.
+fn current_source_claim_in(
+    connection: &Connection,
+    claim: &ConstructionPreparation,
+) -> Result<ConstructionPreparation> {
+    let receipt = lookup_in(connection, claim.operation, &claim.scope, &claim.request_id)?.ok_or(
+        Error::Storage("prepared source claim lost its current receipt"),
+    )?;
+    if claim.creator != receipt.creator
+        || claim.parent_session_id != receipt.parent_session_id
+        || claim.parent_branch_id != receipt.parent_branch_id
+        || claim.fingerprint != receipt.fingerprint
+        || claim.candidate != receipt.candidate
+        || claim.task != receipt.task
+        || claim.sources != receipt.sources
+        || claim.capture_boundary != receipt.capture_boundary
+        || claim.restore_boundary != receipt.restore_boundary
+    {
+        return Err(Error::Storage(
+            "prepared source receipt changed its recovery identity",
+        ));
+    }
+    Ok(receipt)
+}
+
+/// Exact original restore provenance of a published Sandbox. The initial
+/// claim index is keyed by candidate Session ID; sharing Agents cannot
+/// substitute their own restore or another operation's descriptors.
+pub(crate) fn restored_sources_for_sandbox_in(
+    connection: &Connection,
+    sandbox: &str,
+) -> Result<PreparedSourceSet> {
+    let mut query = db(connection.prepare_cached(
+        "SELECT session_id,action,actor,data_json,created_at FROM audit
+         WHERE action='construction.preparation'
+           AND json_extract(data_json,'$.state')='prepared'
+           AND json_type(data_json,'$.sources')='object'
+           AND json_extract(data_json,'$.operation')='checkpoint_restore'
+           AND json_extract(data_json,'$.candidate.sandbox')=?1
+           AND json_extract(data_json,'$.sources.prepare_id') IN (
+               SELECT session_id FROM agent_state_current WHERE sandbox_id=?1
+           )
+         LIMIT 2",
+    ))?;
+    let mut rows = db(query.query([sandbox]))?;
+    let claim = decode_receipt(
+        connection,
+        db(rows.next())?.ok_or(Error::Denied(
+            "original Sandbox restore preparation unavailable",
+        ))?,
+    )?;
+    if db(rows.next())?.is_some() {
+        return Err(Error::Storage(
+            "ambiguous original Sandbox restore preparation",
+        ));
+    }
+    let receipt = current_source_claim_in(connection, &claim)?;
+    let ConstructionCandidate::Agent {
+        session,
+        branch,
+        sandbox: Some(original),
+        ..
+    } = &receipt.candidate
+    else {
+        return Err(Error::Storage("original restore has no Sandbox candidate"));
+    };
+    if receipt.state != PreparationState::Applied
+        || receipt.operation != ConstructionOperation::CheckpointRestore
+        || receipt.restore_boundary.is_none()
+        || original != sandbox
+    {
+        return Err(Error::Denied("Sandbox restore has not been applied"));
+    }
+    let bound: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_state_current
+         WHERE session_id=?1 AND branch_id=?2 AND sandbox_id=?3)",
+        params![session, branch, sandbox],
+        |row| row.get(0),
+    ))?;
+    if !bound
+        || receipt.result_ref.as_deref()
+            != Some(
+                agent_owner::canonical_ref(connection, AgentKey::new(session, branch))?.as_str(),
+            )
+    {
+        return Err(Error::Storage(
+            "original restore publication identity changed",
+        ));
+    }
+    receipt
+        .sources
+        .ok_or(Error::Storage("original restore source custody missing"))
+}
+
 /// Stream only the current source-bearing unresolved receipts. Missing schemas
 /// remain a diagnostic, never a reason to delete or reinterpret the descriptor.
 /// The same read-side registry snapshot is used by all durable source owners.
@@ -720,24 +815,7 @@ pub(crate) fn visit_unresolved_sources(
     let mut rows = db(query.query([]))?;
     while let Some(row) = db(rows.next())? {
         let claim = decode_receipt(connection, row)?;
-        let receipt = lookup_in(connection, claim.operation, &claim.scope, &claim.request_id)?
-            .ok_or(Error::Storage(
-                "prepared source claim lost its current receipt",
-            ))?;
-        if claim.creator != receipt.creator
-            || claim.parent_session_id != receipt.parent_session_id
-            || claim.parent_branch_id != receipt.parent_branch_id
-            || claim.fingerprint != receipt.fingerprint
-            || claim.candidate != receipt.candidate
-            || claim.task != receipt.task
-            || claim.sources != receipt.sources
-            || claim.capture_boundary != receipt.capture_boundary
-            || claim.restore_boundary != receipt.restore_boundary
-        {
-            return Err(Error::Storage(
-                "prepared source receipt changed its recovery identity",
-            ));
-        }
+        let receipt = current_source_claim_in(connection, &claim)?;
         if !receipt.state.unresolved() {
             continue;
         }

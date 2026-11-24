@@ -137,11 +137,16 @@ impl RestorePlan {
         Ok(())
     }
 
-    fn repository(&self, driver: &GitSourceDriver) -> Result<Repository> {
+    fn origin_repository(&self, driver: &GitSourceDriver) -> Result<Repository> {
         self.check_parent()?;
         let repo = driver.binding_repository(&self.origin)?;
-        verify_retained(&repo, &self.anchor)?;
         repo.guard_managed_checkout().map_err(git_error)?;
+        Ok(repo)
+    }
+
+    fn repository(&self, driver: &GitSourceDriver) -> Result<Repository> {
+        let repo = self.origin_repository(driver)?;
+        verify_retained(&repo, &self.anchor)?;
         Ok(repo)
     }
 
@@ -315,7 +320,20 @@ fn validate_restored_repo(
         return Err(Error::Conflict("Git restored worktree binding changed"));
     }
     let expected = format!("{}\n", lock_reason(prepared));
-    let file = aw_platform::open_nofollow_read(&repo.git_dir.join("locked"))?;
+    if !lock_matches(&repo.git_dir, &expected)? {
+        return Err(Error::Conflict(
+            "Git restored worktree belongs to another operation",
+        ));
+    }
+    Ok(())
+}
+
+fn lock_matches(admin: &Path, expected: &str) -> Result<bool> {
+    let file = match aw_platform::open_nofollow_read(&admin.join("locked")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     if !file.metadata()?.is_file() {
         return Err(Error::Conflict(
             "Git restore operation marker is not a regular file",
@@ -324,12 +342,39 @@ fn validate_restored_repo(
     let mut bytes = Vec::new();
     file.take((expected.len() + 1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes != expected.as_bytes() {
-        return Err(Error::Conflict(
-            "Git restored worktree belongs to another operation",
-        ));
+    Ok(bytes == expected.as_bytes())
+}
+
+/// The old pathname may be absent while the original operation-marked
+/// worktree survives under another name (or with a broken registration).
+fn require_released(
+    origin: &Repository,
+    plan: &RestorePlan,
+    prepared: &PreparedSourceOperation,
+) -> Result<()> {
+    check_fresh(origin, &plan.target)?;
+    let admin = origin.common.join("worktrees");
+    let entries = match fs::read_dir(&admin) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return plan.check_parent(),
+        Err(error) => return Err(error.into()),
+    };
+    let expected = format!("{}\n", lock_reason(prepared));
+    for (index, entry) in entries.enumerate() {
+        if index >= 1024 {
+            return Err(Error::Limit("Git worktree administration count"));
+        }
+        let path = entry?.path();
+        if !fs::symlink_metadata(&path)?.is_dir() || aw_platform::path_is_link_like(&path)? {
+            return Err(Error::Conflict("Git worktree administration changed"));
+        }
+        if lock_matches(&path, &expected)? {
+            return Err(Error::Conflict(
+                "original Git restore registration still exists",
+            ));
+        }
     }
-    Ok(())
+    plan.check_parent()
 }
 
 fn restored_repo(
@@ -491,6 +536,74 @@ impl GitSourceDriver {
             &prepared.descriptor.prepared_identity,
         )?;
         RecoveryInspection::completed(binding, evidence)
+    }
+
+    /// Reconcile an already-published, retired restore materialization.
+    /// Trusted caller holds the source, repository and destination fences,
+    /// independently authorizes disposal of this exact managed checkout,
+    /// and excludes other live backing dependencies through settlement.
+    /// The original Prepared operation and published binding are identities,
+    /// not grants. New work, changed index/HEAD/lock or foreign content
+    /// requires explicit reconciliation; never discard it implicitly.
+    pub fn release_restored_materialization(
+        &self,
+        prepared: &PreparedSourceOperation,
+        binding: &SourceBinding,
+    ) -> Result<()> {
+        let plan = RestorePlan::decode(prepared)?;
+        let (_, path) = materialization_parts(binding)?;
+        let mut expected = plan.origin.clone();
+        expected
+            .materialization
+            .clone_from(&binding.materialization);
+        if path != plan.target || expected != *binding {
+            return Err(Error::Conflict(
+                "Git retirement differs from original restore binding",
+            ));
+        }
+
+        // The checkpoint may already be retired. The original descriptor
+        // and checkout binding suffice for ownership; retained object
+        // content is needed only when there is still a worktree to remove.
+        let origin = plan.origin_repository(self)?;
+        match fs::symlink_metadata(&plan.target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Both the target and its registration must be absent.
+                // Partial removal is Unknown; never prune or unlock it.
+                return require_released(&origin, &plan, prepared);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+
+        let child = restored_repo(&origin, &plan, prepared)?;
+        if plan.binding(&child)? != *binding {
+            return Err(Error::Conflict("Git retirement checkout identity changed"));
+        }
+        let trees = plan.trees(&origin)?;
+        verify_restored(&child, &trees.base, trees.captured())?;
+        validate_restored_repo(&origin, &child, &plan, prepared)?;
+        let admin = child.git_dir.clone();
+        // Keep the original lock marker until Git removes the worktree.
+        // Git requires two force flags for a locked checkout (and a dirty
+        // captured tree). The exact tree/index/marker checks above and the
+        // independent live physical fence are prerequisites, not a generic
+        // discard switch. No recursive caller-side deletion or broad prune.
+        let args = [
+            "worktree",
+            "remove",
+            "--force",
+            "--force",
+            "--",
+            target_text(&plan.target)?,
+        ]
+        .map(OsString::from);
+        run_os(&origin, &args, None, None).map_err(|_| {
+            Error::Conflict("Git restore retirement uncertain; inspect original materialization")
+        })?;
+        plan.check_parent()?;
+        absent(&admin)?;
+        require_released(&origin, &plan, prepared)
     }
 
     /// Revalidate exact materialization under the live host barrier before

@@ -845,6 +845,10 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
     assert!(restarted
         .revalidate_restore(&dirty_plan, &restored_dirty)
         .is_err());
+    assert!(restarted
+        .release_restored_materialization(&dirty_plan, &restored_dirty)
+        .is_err());
+    assert!(dirty_path.join("ignored-extra").is_file());
     std::fs::remove_file(dirty_path.join("ignored-extra")).unwrap();
     child_git(&dirty_path, &["read-tree", &dirty.captured_commit]);
     assert!(matches!(
@@ -865,6 +869,21 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         RecoveryInspection::Unknown
     ));
     assert!(restarted.execute_restore(&dirty_plan).is_err());
+    assert!(restarted
+        .release_restored_materialization(&dirty_plan, &restored_dirty)
+        .is_err());
+    assert!(dirty_path.is_dir());
+    f.run(&["worktree", "unlock", dirty_path.to_str().unwrap()]);
+    f.run(&[
+        "worktree",
+        "lock",
+        "--reason",
+        &format!("aw-restore-v1:{}", dirty_plan.descriptor.prepared_identity),
+        dirty_path.to_str().unwrap(),
+    ]);
+    assert!(restarted
+        .release_restored_materialization(&dirty_plan, &restored_clean)
+        .is_err());
 
     // A crash after registration, before index/checkout, remains Unknown.
     let partial_path = destinations.join("partial");
@@ -936,6 +955,73 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         .plan_restore(&f.root, &changed, &missing, "op_missing_nested")
         .is_err());
     assert!(!missing.exists());
+
+    // Retired cleanup uses the original exact published checkout even
+    // after checkpoint retention has been released. It cannot discard
+    // post-restore edits, repointed checkouts or a different binding.
+    std::fs::write(clean_path.join("a.txt"), b"later edit").unwrap();
+    assert!(restarted
+        .release_restored_materialization(&clean_plan, &restored_clean)
+        .is_err());
+    assert_eq!(
+        std::fs::read(clean_path.join("a.txt")).unwrap(),
+        b"later edit"
+    );
+    std::fs::write(clean_path.join("a.txt"), b"one\ntwo\n").unwrap();
+    let clean_repo = aw_git::Repository::discover(&f.git, &clean_path).unwrap();
+    let gitdir = clean_repo.git_dir().join("gitdir");
+    let registration = std::fs::read(&gitdir).unwrap();
+    drop(clean_repo);
+    let moved = destinations.join("moved-clean");
+    std::fs::rename(&clean_path, &moved).unwrap();
+    // Registration survives, so missing target alone is not proof.
+    assert!(restarted
+        .release_restored_materialization(&clean_plan, &restored_clean)
+        .is_err());
+    std::fs::create_dir(&clean_path).unwrap();
+    assert!(restarted
+        .release_restored_materialization(&clean_plan, &restored_clean)
+        .is_err());
+    std::fs::remove_dir(&clean_path).unwrap();
+    // Repoint registration too: old path and old registration name are
+    // gone, but the original operation still owns this worktree.
+    std::fs::write(&gitdir, format!("{}\n", moved.join(".git").display())).unwrap();
+    assert!(restarted
+        .release_restored_materialization(&clean_plan, &restored_clean)
+        .is_err());
+    assert!(moved.is_dir());
+    std::fs::write(&gitdir, registration).unwrap();
+    std::fs::rename(&moved, &clean_path).unwrap();
+    restarted.release_retired_anchor(&f.root, &clean).unwrap();
+    restarted.release_retired_anchor(&f.root, &dirty).unwrap();
+    assert!(restarted.verify_anchor(&f.root, &clean).is_err());
+    restarted
+        .release_restored_materialization(&clean_plan, &restored_clean)
+        .unwrap();
+    restarted
+        .release_restored_materialization(&dirty_plan, &restored_dirty)
+        .unwrap();
+    restarted
+        .release_restored_materialization(&dirty_plan, &restored_dirty)
+        .unwrap();
+    assert!(!clean_path.exists() && !dirty_path.exists());
+    assert!(link_source.is_dir() && partial_path.is_dir());
+    let remaining = f.run(&["worktree", "list", "--porcelain", "-z"]).stdout;
+    for path in [&clean_path, &dirty_path] {
+        assert!(!remaining
+            .windows(path.to_str().unwrap().len())
+            .any(|part| part == path.to_str().unwrap().as_bytes()));
+    }
+    // A new occupant at the retired name must not be removed by replay.
+    std::fs::create_dir(&dirty_path).unwrap();
+    std::fs::write(dirty_path.join("unrelated"), b"keep").unwrap();
+    assert!(restarted
+        .release_restored_materialization(&dirty_plan, &restored_dirty)
+        .is_err());
+    assert_eq!(
+        std::fs::read(dirty_path.join("unrelated")).unwrap(),
+        b"keep"
+    );
 
     assert_eq!(f.run(&["rev-parse", "HEAD"]).stdout, original_head);
     assert_eq!(

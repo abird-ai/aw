@@ -1554,6 +1554,7 @@ mod tests {
 
         // Logical close of the actual restored Agent/Sandbox uses their
         // original lifecycle owners. No driver call or filesystem cleanup.
+        assert!(store.sandbox_restore_preparation(&actor, &sandbox).is_err());
         assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
         store
             .agent_request_close(&actor, &restored_ref, None)
@@ -1621,6 +1622,7 @@ mod tests {
         assert_eq!(closed.lifecycle, crate::SandboxLifecycle::Closed);
         assert_eq!(closed.rev, before.rev + 1);
         assert_eq!(closed.sources, before.sources);
+        assert!(store.sandbox_restore_preparation(&actor, &sandbox).is_err());
         assert_eq!(store.sandbox_close(&actor, &sandbox, None).unwrap(), closed);
         assert!(store
             .sandbox_close(&actor, &sandbox, Some(before.rev))
@@ -1670,6 +1672,21 @@ mod tests {
         assert_eq!(revalidated.lifecycle, crate::SandboxLifecycle::Closed);
         assert_eq!(revalidated.rev, closed.rev);
         assert_eq!(revalidated.sources, snapshot.sources);
+        // Original Applied restore provenance survives checkpoint anchor
+        // release. No inference from the current binding or Git marker.
+        store
+            .checkpoint_reconcile_retired_sources(&actor, &checkpoint, |set| {
+                assert_eq!(set, &anchors);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.sandbox_restore_preparation(&actor, &sandbox).unwrap(),
+            *receipt.sources.as_ref().unwrap()
+        );
+        assert!(store
+            .sandbox_restore_preparation(&viewer, &sandbox)
+            .is_err());
         let anchor = &anchors.anchors[0];
         let incoming = SourceBinding {
             name: anchor.name.clone(),
@@ -1736,6 +1753,9 @@ mod tests {
         store
             .sandbox_close(&actor, &shared.canonical_ref, None)
             .unwrap();
+        assert!(store
+            .sandbox_restore_preparation(&actor, &shared.canonical_ref)
+            .is_err());
         let held = store
             .acquire_source_mutation_barrier(&set, "fixture:busy-cleanup")
             .unwrap();
@@ -1796,6 +1816,10 @@ mod tests {
             SourceSetLimit::new(1).unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            store.sandbox_restore_preparation(&actor, &sandbox).unwrap(),
+            *receipt.sources.as_ref().unwrap()
+        );
         let released = store
             .sandbox_reconcile_closed_sources(&actor, &sandbox, |current, retained| {
                 assert_retained(current, retained);
@@ -1815,6 +1839,7 @@ mod tests {
         assert_eq!(released.lifecycle, crate::SandboxLifecycle::Closed);
         assert_eq!(released.rev, revalidated.rev + 1);
         assert!(released.sources.is_empty());
+        assert!(store.sandbox_restore_preparation(&actor, &sandbox).is_err());
         assert_eq!(
             store
                 .sandbox_reconcile_closed_sources::<()>(&actor, &sandbox, |_, _| panic!(

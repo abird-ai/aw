@@ -41,7 +41,8 @@ with deferred post-journal settlement, concrete registered Git materialization r
 root-free native-only tool registration, live native source approval, explicit Actor host
 activation selection, quiescent metadata-only source binding mutation, checkpoint
 retirement/retained-anchor reconciliation, source-bearing Sandbox logical close and
-exact closed-Sandbox materialization reconciliation with proven retained-layout release
+exact closed-Sandbox materialization reconciliation with proven retained-layout release,
+and managed Git restore-materialization release with original Applied restore provenance
 are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
@@ -1898,14 +1899,51 @@ Sandbox **4/4**, checkpoint/capture/restore **4/4**, barrier/construction receip
 **1/1 each**, real Host source effects **2/2**; strict Store all-target Clippy,
 workspace all-target check, fmt and scoped diff-check green.
 
+GitSourceDriver::release_restored_materialization now reconciles exact original
+managed restore ownership using the original Prepared descriptor and published
+SourceBinding. Reuse the existing private parent stamp, source/checkout identities,
+detached base, worktree registration/lock marker and exact restored tree/index verifier.
+An unchanged clean or captured-dirty checkout may be released after independent
+physical authorization. Later edits, ignored extras, changed index/HEAD/marker,
+substituted directories, mismatched binding or unavailable original objects fail
+closed. Only Git's exact worktree removal is invoked; its two force flags are required
+for a locked checkout and captured dirty delta and are gated by these verification
+and live host-fence requirements. No unlock/retry gap, broad prune, recursive
+caller-side deletion or shared object-store deletion. Revalidate target, registration
+and original admin absence; bounded original marker check also refuses a relocated
+or partially registered original operation. Absence is a cleanup observation, never
+restore NotStarted. No private retention ref is required after retirement; original
+commit/tree content must remain available for exact present-worktree verification.
+
+Store owner-private sandbox_restore_preparation retrieves the exact original Applied
+restore SourceSet descriptors through the existing indexed immutable construction
+receipt. Validate initial/current claim identity, exact candidate Sandbox and bound
+Agent/result identity and compatible recovery schemas. No copying locator metadata
+into another ledger. Current Project writer and independent source metadata authority
+are required; closed retained Sandbox only. It works after checkpoint anchor release
+and restart, including a lowered host admission limit. Shared current_source_claim_in
+also serves unresolved receipt validation. Trusted host can compose this lookup and
+Git driver release inside the existing closed-Sandbox reconciliation, independently
+authorizing all source/destination physical fences and proving the entire layout
+safe before settlement. No automatic production cleanup worker, arbitrary dirty
+worktree discard, unpublished candidate cleanup or provider fence is introduced.
+Real Git grouped restore regression covers unchanged clean/captured-dirty release
+after checkpoint ref retirement, modified content/extra files/lock/binding refusal,
+substituted or moved registration refusal, absence replay and preservation of
+unrelated worktrees, original HEAD/index. Store grouped restore regression covers
+exact original provenance after retirement/anchor release/restart, missing-driver,
+wrong Sandbox/actor and released metadata refusal. Only isolated fixtures were
+physically removed. Git repository **32/32**, checkpoint/capture/restore **4/4**,
+Sandbox **4/4**, construction receipt/barrier **1/1 each**; strict Git/Store
+all-target Clippy, workspace all-target check, fmt and scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, implement exact managed Git restore-materialization cleanup/reconciliation
-using original restore ownership and safe physical verification, or the independent
-history-only baseline constructor. Independent host approval provisioning, incomplete-
-effect reconciliation, multi-source policy, custom ACL/task, candidate cleanup,
-final-source removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain
-pending. Store schema v58.
+While blocked, implement the independent history-only/empty Auto baseline constructor,
+or exact unpublished candidate cleanup. Independent host approval provisioning,
+incomplete-effect reconciliation, multi-source policy, custom ACL/task, production
+cleanup composition and physical authority, final-source removal/effectful mutation,
+Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

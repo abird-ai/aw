@@ -529,6 +529,36 @@ fn require_unshared_materializations_in(
 }
 
 impl SessionStore {
+    /// Owner-private restore provenance for physical reconciliation. The
+    /// trusted host independently authorizes source/provider metadata.
+    /// This does not confer source access or authorize disposal; it works
+    /// even after the source checkpoint has released its anchor rows.
+    pub fn sandbox_restore_preparation(
+        &self,
+        actor: &PrincipalId,
+        sandbox_ref: &str,
+    ) -> Result<aw_agent_core::PreparedSourceSet> {
+        let key = super::parse_sandbox_ref(sandbox_ref)?;
+        let sandbox = key.canonical();
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        super::authorize_project(&tx, actor, &key.project, true)?;
+        if super::snapshot_row(&tx, &sandbox)?.lifecycle != super::SandboxLifecycle::Closed
+            || !has_sources(&tx, &sandbox)?
+        {
+            return Err(Error::Denied(
+                "restore cleanup requires retained closed Sandbox",
+            ));
+        }
+        let sources = crate::construction_receipt::restored_sources_for_sandbox_in(&tx, &sandbox)?;
+        let registry = self.inner.source_drivers.reader()?;
+        for source in &sources.sources {
+            registry.resolve(&source.prepared.descriptor.pin()?)?;
+        }
+        db(tx.commit())?;
+        Ok(sources)
+    }
+
     /// Trusted closed-Sandbox physical reconciliation. Independently
     /// authorize and inspect the exact original materializations and whole
     /// layout, preserving all other live backing dependencies. Success
