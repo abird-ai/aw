@@ -1,4 +1,4 @@
-use super::{Error, Result, SpawnControl};
+use super::{spawn_fenced, Error, LaunchFence, Result, SpawnControl, Spawned};
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
@@ -7,20 +7,13 @@ use std::{
     },
 };
 use tokio::{
-    process::{Child, Command},
+    process::Command,
     runtime::Handle,
     sync::{mpsc, oneshot},
     time::sleep_until,
 };
 
 const SPAWN_QUEUE: usize = 64;
-
-pub(crate) struct Spawned {
-    // Scope first so its containment Drop runs before Child's kill-on-drop.
-    pub(crate) platform: aw_platform::DirectScope,
-    pub(crate) child: Child,
-    pub(crate) pid: u32,
-}
 
 struct Request {
     command: Command,
@@ -33,6 +26,7 @@ struct Request {
 struct LaneControl {
     deadline: tokio::time::Instant,
     cancelled: Box<dyn Fn() -> bool + Send + 'static>,
+    launch_fence: Option<LaunchFence>,
 }
 
 #[repr(u8)]
@@ -144,7 +138,7 @@ fn facility() -> Result<Facility> {
 fn launch(
     mut command: Command,
     runtime: Handle,
-    control: Option<LaneControl>,
+    mut control: Option<LaneControl>,
     gate: Arc<LaunchGate>,
     reply: &oneshot::Sender<Result<Spawned>>,
 ) -> Result<Spawned> {
@@ -172,26 +166,24 @@ fn launch(
     // This call is the parent-lifetime critical section. The lane enters the
     // request's runtime only so Tokio can register the Child with its reactor.
     let _runtime = runtime.enter();
-    let mut child = command.spawn()?;
-    let Some(pid) = child.id() else {
-        let _ = child.start_kill();
-        return Err(Error::SetupUncertain(
-            "process launched but PID/setup outcome is uncertain",
-        ));
-    };
-    let platform = match aw_platform::DirectScope::attach(pid) {
-        Ok(scope) => scope,
-        Err(_) => {
-            let _ = child.start_kill();
-            return Err(Error::SetupUncertain(
-                "process launched but Process scope setup is uncertain",
+    let fence = control
+        .as_mut()
+        .and_then(|control| control.launch_fence.take());
+    spawn_fenced(&mut command, fence, || {
+        if reply.is_closed() {
+            return Err(Error::OwnerGone(
+                "process spawn caller disappeared before launch",
             ));
         }
-    };
-    Ok(Spawned {
-        platform,
-        child,
-        pid,
+        if let Some(control) = control.as_ref() {
+            if (control.cancelled)() {
+                return Err(Error::CancelledBeforeSpawn);
+            }
+            if tokio::time::Instant::now() >= control.deadline {
+                return Err(Error::TimedOutBeforeSpawn);
+            }
+        }
+        Ok(())
     })
 }
 
@@ -214,10 +206,12 @@ pub(crate) async fn spawn(command: Command, control: Option<SpawnControl>) -> Re
             deadline,
             cancelled,
             cancelled_signal,
+            launch_fence,
         }) => (
             Some(LaneControl {
                 deadline,
                 cancelled,
+                launch_fence,
             }),
             Some((deadline, cancelled_signal)),
         ),

@@ -50,7 +50,8 @@ ACL construction, captured-source restore initial-task custody/publication,
 task-only baseline restore/recovery, concrete fenced Git checkpoint capture/restore/
 retention reconciliation, managed closed-Sandbox retirement, effectful versioned
 baseline restore host consumers, and v59 Agent VaultGrant references with the final
-staged VaultProvider leaf and concrete local signing broker are implemented locally.
+staged VaultProvider leaf, concrete local signing broker and fenced Process proof
+projection are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2270,16 +2271,49 @@ The new migration adds no domain-principal dependency and changes none of those
 owners. Full suite not claimed green or rerun on the corrected tree; parent build
 was not rerun. Do not repair unrelated owners as part of this checkpoint.
 
+Process-level derived Vault proof projection now composes the original
+`PreparedSandboxEffect`/ToolStarted claim, exact source lease set, current Sandbox
+and ToolBinding authority, registered SigningVaultProvider and current named Env
+VaultGrant. `SandboxEffectLaunch` is an owned one-shot revalidation boundary, not
+new admission or settlement ownership. The lane rechecks the original intent,
+source bindings, writer and complete held leases; the common Vault check verifies
+exact grant/actor/access/Store/provider generations. Its synchronous read-only
+IMMEDIATE transaction and live provider/tool guards cover OS spawn and scope
+attachment. `SpawnControl::new_fenced` and `SpawnOnce` are Agent-neutral,
+opt-in; the original Process retains all factual launch results. Cancellation and
+absolute deadline are checked again before OS spawn. Driver pins stay held through
+launch/attachment; a refused unused token is definite no-spawn. No second Process,
+ledger, durable proof or schema change. Ordinary launch uses the same spawn/attach
+helper without allocating a launch fence. `start_source_process_with_vault` selects
+one explicitly authorized provider-defined integration, `AW_VAULT_SIGNING_PROOF`:
+a domain-separated HMAC over length-framed Store ID/generation, exact Agent/actor,
+binding/entry/scope, original effect ID, grant revision and bounded challenge.
+The key remains encrypted in the provider backend; only the derived proof reaches
+the approved child environment. Explicit or ambient reserved-name collisions refuse;
+no arbitrary model target, generic credential/env read or retroactive revocation.
+The consuming trusted driver must actually support the reserved integration and
+isolate its child; this is not general Bubblewrap realization or a relying-service
+freshness/expiry protocol. The original grouped source Process fixture validates
+stale rotated grant refusal, collision refusal and real proof-bearing child with
+ordinary ToolFinished/source settlement (held source association remains fixture-only).
+Process regression exercises cancellation during the final fence. Final Process
+**7/7**, adapter Process **27/27**, Vault **1/1**, Sandbox **4/4**, Host **16/16**,
+strict affected all-target/all-feature Clippy, workspace all-target/all-feature
+check and scoped fmt/diff passed. Linux runtime qualified; no Windows-native
+runtime or production containment claim. The earlier broad Store failures remain
+recorded above, not rerun here. No new production source admission, raw key
+projection, socket/file delivery or public RPC.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer independent production authority or a real Process projection
-through the original Process/Sandbox/tool admission owners; do not open held routes.
-Independent host approval provisioning, other effectful baseline materialization,
-incomplete-effect reconciliation, multi-source policy, general unpublished partial/
-scratch cleanup and production cleanup composition/physical authority, final-source
-removal/effectful mutation, Vault Process broker/socket/file/env integration, persistent
-provider configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault
-host RPCs remain pending. Store schema v59.
+While blocked, prefer independent production authority/containment or incomplete-effect
+reconciliation through the original owners; do not open held routes. Independent host
+approval provisioning, other effectful baseline materialization, incomplete-effect
+reconciliation, multi-source policy, general unpublished partial/scratch cleanup and
+production cleanup composition/physical authority, final-source removal/effectful
+mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
+configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
+RPCs remain pending. Store schema v59.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

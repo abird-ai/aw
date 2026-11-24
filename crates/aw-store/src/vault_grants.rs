@@ -61,6 +61,14 @@ pub struct VaultGrantPolicy {
 }
 
 impl VaultGrantPolicy {
+    pub(crate) fn store_id(&self) -> &str {
+        &self.store_id
+    }
+
+    pub(crate) fn restore_generation(&self) -> u64 {
+        self.restore_generation
+    }
+
     fn validate(&self) -> Result<()> {
         self.target.validate()?;
         opaque(&self.authority_ref)?;
@@ -208,6 +216,33 @@ impl Grant {
         }
         Ok(())
     }
+}
+
+/// The existing grant owner checks an exact live provider decision under
+/// the caller's original admission transaction. Actor/Agent/site authority
+/// and any additional effect-specific gates remain with that caller.
+pub(crate) fn require_projection_in(
+    c: &Connection,
+    registry: &VaultProviderRegistryReader,
+    authority: &impl VaultGrantAuthority,
+    expected_grant_rev: u64,
+    projection: VaultProjection,
+) -> Result<()> {
+    let policy = authority.policy();
+    let target = &policy.target;
+    if target.projection != projection {
+        return Err(Error::Denied(
+            "Vault projection differs from authorized kind",
+        ));
+    }
+    registry.require_projection(&target.entry, projection)?;
+    let (session, branch) = exact_key(c, &target.agent_ref)?;
+    let key = AgentKey::new(&session, &branch);
+    let grant = grant_in(c, key, &target.agent_ref, &target.name)?
+        .filter(|grant| grant.rev == expected_grant_rev && grant.policy == *policy)
+        .ok_or(Error::Denied("Vault grant unavailable or changed"))?;
+    grant.require_current(c, key)?;
+    authority.authorize_use()
 }
 
 impl SessionStore {
@@ -427,7 +462,6 @@ impl SessionStore {
         }
         let policy = authority.policy();
         let target = &policy.target;
-        registry.require_projection(&target.entry, target.projection)?;
         if &target.actor != actor || target.projection != VaultProjection::Broker {
             return Err(Error::Denied(
                 "Vault broker differs from authorized actor/projection",
@@ -439,11 +473,13 @@ impl SessionStore {
         let key = AgentKey::new(&session, &branch);
         agent_owner::require_future_admission(&tx, key)?;
         workspace_writer::require_workspace_writer_for_session(&tx, &session)?;
-        let grant = grant_in(&tx, key, &target.agent_ref, &target.name)?
-            .filter(|grant| grant.rev == expected_grant_rev && grant.policy == *policy)
-            .ok_or(Error::Denied("Vault broker grant unavailable or changed"))?;
-        grant.require_current(&tx, key)?;
-        authority.authorize_use()?;
+        require_projection_in(
+            &tx,
+            registry,
+            authority,
+            expected_grant_rev,
+            VaultProjection::Broker,
+        )?;
         let result = operation()?;
         db(tx.commit())?;
         Ok(result)

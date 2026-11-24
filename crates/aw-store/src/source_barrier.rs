@@ -100,13 +100,44 @@ pub struct SourceMutationBarrier<'a> {
     leases: Vec<LocalCoordinationLease>,
 }
 
+/// Read-only verification of the original complete lease set, transferable
+/// to the launch lane. Cannot acquire, recover or settle those leases.
+pub(crate) struct SourceMutationPin {
+    store_scope: StoreScope,
+    process: ProcessIdentity,
+    leases: Vec<LocalCoordinationLease>,
+}
+
+impl SourceMutationPin {
+    pub(crate) fn require_held_in(&self, tx: &Transaction<'_>) -> Result<()> {
+        require_held_in(tx, &self.store_scope, &self.process, &self.leases)
+    }
+}
+
+fn require_held_in(
+    tx: &Transaction<'_>,
+    scope: &StoreScope,
+    process: &ProcessIdentity,
+    leases: &[LocalCoordinationLease],
+) -> Result<()> {
+    if StoreScope::load(tx)? != *scope {
+        return Err(Error::Conflict("source barrier Store scope changed"));
+    }
+    coordination::require_source_leases_in(tx, process, leases)
+}
+
 impl SourceMutationBarrier<'_> {
+    pub(crate) fn launch_pin(&self) -> SourceMutationPin {
+        SourceMutationPin {
+            store_scope: self.store_scope.clone(),
+            process: self.process.clone(),
+            leases: self.leases.clone(),
+        }
+    }
+
     /// The final owner transaction must still hold the exact whole set.
     pub(crate) fn require_held_in(&self, tx: &Transaction<'_>) -> Result<()> {
-        if StoreScope::load(tx)? != self.store_scope {
-            return Err(Error::Conflict("source barrier Store scope changed"));
-        }
-        coordination::require_source_leases_in(tx, &self.process, &self.leases)
+        require_held_in(tx, &self.store_scope, &self.process, &self.leases)
     }
 
     /// Exact operation identity and whole held set, for the shared constructor.

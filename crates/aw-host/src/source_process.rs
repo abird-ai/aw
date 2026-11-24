@@ -131,6 +131,78 @@ where
     })
 }
 
+/// Opt-in provider-defined proof projection through the same original
+/// source Process and factual settlement. No generic secret environment,
+/// arbitrary target mapping or alternative source/tool admission.
+pub async fn start_source_process_with_vault<'a, P, A, S>(
+    prepared: PreparedSandboxEffect<'a, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
+    deadline: Instant,
+    cancellation: CancellationToken,
+    registry: aw_agent_core::VaultProviderRegistryReader,
+    handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
+    selection: aw_store::SigningProcessProof,
+) -> Result<SourceProcessStart<'a>>
+where
+    P: Send + 'static,
+    A: SandboxEffectAuthority + Send + 'static,
+    S: aw_store::SecretStore + 'static,
+{
+    let tool = prepared.authority().tool.clone();
+    let signal_tool = tool.clone();
+    let check_cancel = cancellation.clone();
+    let (launch, source) = prepared
+        .start_with_launch_authority(move |launch, authority, boundary| {
+            PipeProcess::spawn_prepared_fenced_until(
+                launch.with_custody(authority),
+                deadline,
+                // The final synchronous fence itself owns the ToolBinding read
+                // guard. Do not re-enter that guard from the cancellation probe.
+                move || check_cancel.is_cancelled(),
+                async move {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {},
+                        _ = signal_tool.wait_until_not_live() => {},
+                    }
+                },
+                move |mut spawn, (_, authority)| {
+                    // Only the actual registered provider and current original
+                    // intent may project this value. A refusal leaves the
+                    // one-shot spawn token unused, yielding definite no-spawn.
+                    let _ = aw_store::SigningVaultProvider::with_process_proof(
+                        &registry,
+                        &handle,
+                        boundary,
+                        authority,
+                        selection,
+                        |proof| {
+                            let mut hex = [0u8; 64];
+                            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+                            for (byte, pair) in proof.iter().zip(hex.chunks_exact_mut(2)) {
+                                pair[0] = DIGITS[(byte >> 4) as usize];
+                                pair[1] = DIGITS[(byte & 15) as usize];
+                            }
+                            spawn
+                                .insert_reserved_env(
+                                    aw_store::SIGNING_PROOF_ENV,
+                                    std::str::from_utf8(&hex).expect("ASCII proof"),
+                                )
+                                .map_err(|_| {
+                                    Error::Denied("reserved Vault projection collision")
+                                })?;
+                            spawn.spawn();
+                            Ok(())
+                        },
+                    );
+                },
+            )
+        })
+        .await?;
+    Ok(SourceProcessStart {
+        launch,
+        source: SourceProcessLease { source, tool },
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -204,12 +276,21 @@ mod tests {
         }
     }
 
+    fn fixture_command(id: &str) -> &'static str {
+        if id.starts_with("host:vault-") {
+            r#"[[ "$AW_VAULT_SIGNING_PROOF" =~ ^[0-9a-f]{64}$ ]] || exit 21; printf changed > code; printf done"#
+        } else {
+            "printf changed > code; printf done"
+        }
+    }
+
     impl FixtureDriver {
         fn prepare(
             &self,
             plan: &SandboxEffectPlan,
             missing: bool,
             lock: Arc<RwLock<()>>,
+            id: &str,
         ) -> PreparedPipeLaunch<LaunchPin> {
             assert_eq!(plan.grant.sources.len(), 1);
             assert_eq!(plan.grant.sources[0].access, SourceAccess::ReadWrite);
@@ -222,12 +303,10 @@ mod tests {
             command
                 .env_clear()
                 .current_dir(&plan.sandbox.working_directory)
-                .args([
-                    "--noprofile",
-                    "--norc",
-                    "-c",
-                    "printf changed > code; printf done",
-                ]);
+                .args(["--noprofile", "--norc", "-c", fixture_command(id)]);
+            if id == "host:vault-collision" {
+                command.env(aw_store::SIGNING_PROOF_ENV, "untrusted-reserved-value");
+            }
             PreparedPipeLaunch::from_trusted_command(command, false, LaunchPin(lock))
         }
     }
@@ -250,9 +329,7 @@ mod tests {
             call: ToolCall {
                 id: id.into(),
                 name: "bash".into(),
-                arguments: r#"{"command":"printf changed > code; printf done"}"#
-                    .parse()
-                    .unwrap(),
+                arguments: serde_json::json!({"command": fixture_command(id)}),
             },
             effect: ToolEffect::Process,
             execution_site: "local".into(),
@@ -378,6 +455,9 @@ mod tests {
             "host:stale",
             "host:cancelled",
             "host:missing",
+            "host:vault-stale",
+            "host:vault-collision",
+            "host:vault-valid",
             "host:write",
             "host:unproven",
         ];
@@ -496,7 +576,7 @@ mod tests {
                         evidence,
                     )
                 },
-                |driver, plan, _| Ok(driver.prepare(plan, missing, policy_lock.clone())),
+                |driver, plan, _| Ok(driver.prepare(plan, missing, policy_lock.clone(), effect_id)),
             )
         };
         let deadline = || Instant::now() + Duration::from_secs(5);
@@ -568,6 +648,133 @@ mod tests {
             sandbox.rev
         );
 
+        // An actual registered provider, using the original encrypted
+        // SecretStore under a separate trusted root. Only its proof enters
+        // the fixture's fixed child command; the raw key never leaves custody.
+        let vault_root = temp.0.join("vault-provider");
+        std::fs::create_dir(&vault_root).unwrap();
+        let vault_key = DriverKey::builtin("fixture-signing").unwrap();
+        let vault_registry = aw_agent_core::VaultProviderRegistry::new();
+        let vault_handle = aw_store::SigningVaultProvider::new(
+            vault_key.clone(),
+            aw_store::LocalSecretStore::open(&vault_root).unwrap(),
+        )
+        .unwrap()
+        .register(&vault_registry)
+        .unwrap();
+        let provider = vault_registry.reader().unwrap().get(&vault_handle).unwrap();
+        let target = aw_store::VaultGrantTarget {
+            agent_ref: reference.clone(),
+            actor: actor.clone(),
+            name: SourceName::new("signing").unwrap(),
+            entry: aw_agent_core::VaultEntryRef {
+                provider: vault_key,
+                entry: "fixture".into(),
+            },
+            projection: aw_agent_core::VaultProjection::Env,
+            scope: "fixture-process".into(),
+        };
+        let attach = || {
+            store
+                .agent_vault_attach_signing(
+                    &actor,
+                    &reference,
+                    &target.name,
+                    store.agent_get(&actor, &reference).unwrap().rev,
+                    &vault_registry.reader().unwrap(),
+                    &vault_handle,
+                    &target.entry.entry,
+                )
+                .unwrap()
+        };
+        provider
+            .provision(&store, &actor, target.clone(), &[41; 32])
+            .unwrap();
+        let stale_rev = attach();
+        let stale = prepare("host:vault-stale", capture(), false).unwrap();
+        provider
+            .provision(&store, &actor, target.clone(), &[73; 32])
+            .unwrap();
+        let current_rev = attach();
+        let selection = |grant_rev| aw_store::SigningProcessProof {
+            name: target.name.clone(),
+            entry: target.entry.entry.clone(),
+            scope: target.scope.clone(),
+            grant_rev,
+            challenge: b"fixture challenge".to_vec(),
+        };
+        let collision = prepare("host:vault-collision", capture(), false).unwrap();
+        for (id, prepared, rev) in [
+            ("host:vault-stale", stale, stale_rev),
+            ("host:vault-collision", collision, current_rev),
+        ] {
+            let SourceProcessStart { launch, source } = start_source_process_with_vault(
+                prepared,
+                deadline(),
+                CancellationToken::new(),
+                vault_registry.reader().unwrap(),
+                vault_handle.clone(),
+                selection(rev),
+            )
+            .await
+            .unwrap();
+            let Err(failure) = launch else {
+                panic!("refused Vault projection spawned a Process");
+            };
+            assert!(matches!(
+                failure,
+                PipeLaunchFailure::NotStarted(Error::Denied(_))
+            ));
+            assert_eq!(std::fs::read(&code).unwrap(), b"initial");
+            final_records.push(
+                finish_tool(
+                    &journal,
+                    id,
+                    ToolStatus::Failed,
+                    ToolOutput::error("Vault launch refused"),
+                )
+                .await,
+            );
+            assert_eq!(
+                source.settle_after_recorded_failure(&failure).unwrap(),
+                SandboxEffectOutcome::NotStarted
+            );
+        }
+        let valid = prepare("host:vault-valid", capture(), false).unwrap();
+        let SourceProcessStart { launch, source } = start_source_process_with_vault(
+            valid,
+            deadline(),
+            CancellationToken::new(),
+            vault_registry.reader().unwrap(),
+            vault_handle.clone(),
+            selection(current_rev),
+        )
+        .await
+        .unwrap();
+        let receipt = launch
+            .unwrap()
+            .wait(source.wait_until_not_live(), Duration::from_secs(5))
+            .await;
+        assert_eq!(receipt.terminal.exit, ProcessExit::Code(0));
+        assert_eq!(receipt.output.stdout.head, b"done");
+        assert_eq!(std::fs::read(&code).unwrap(), b"changed");
+        final_records.push(
+            finish_tool(
+                &journal,
+                "host:vault-valid",
+                ToolStatus::Succeeded,
+                ToolOutput::text("done"),
+            )
+            .await,
+        );
+        assert_eq!(
+            source
+                .settle_after_recorded_terminal(&receipt.terminal, |_| Ok(()))
+                .unwrap(),
+            SandboxEffectOutcome::Settled
+        );
+        provider.revoke(&target.entry.entry).unwrap();
+
         let prepared = prepare("host:write", capture(), false).unwrap();
         let effect_id = prepared.plan().effect_id.clone();
         assert!(store
@@ -625,7 +832,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 1
+            sandbox.rev + 2
         );
         assert_eq!(store.agent_get(&actor, &reference).unwrap(), agent_before);
         assert_eq!(
@@ -742,7 +949,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 1
+            sandbox.rev + 2
         );
         assert_eq!(
             reopened
@@ -788,7 +995,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 2
+            sandbox.rev + 3
         );
         reopened
             .acquire_source_mutation_barrier(&set, "host:after-recovery")

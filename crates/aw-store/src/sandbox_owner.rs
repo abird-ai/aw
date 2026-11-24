@@ -19,8 +19,9 @@ const MAX_SANDBOX_LIST: usize = 256;
 mod effects;
 pub(crate) use effects::journal::EFFECT_PREFIX as JOURNALED_SOURCE_EFFECT_PREFIX;
 pub use effects::{
-    PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLease, SandboxEffectOrigin,
-    SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest, SandboxToolRecovery,
+    PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch, SandboxEffectLease,
+    SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest,
+    SandboxToolRecovery,
 };
 mod grants;
 pub use grants::{

@@ -147,11 +147,12 @@ fn observe_in(
     policy: &SandboxGrantPolicy,
     tool_ceiling: &[NamedSourceAccess],
     tool_binding: Option<&ToolBindingSnapshot>,
+    admitted: Option<&journal::Intent>,
 ) -> Result<Boundary> {
     let (effect_id, intent) = match (&request.origin, tool_binding) {
         (SandboxEffectOrigin::Host(id), None) => (id.clone(), None),
         (SandboxEffectOrigin::Tool { turn_id, call }, Some(binding)) => {
-            let intent = journal::admit_in(tx, request, *turn_id, call, binding)?;
+            let intent = journal::admit_in(tx, request, *turn_id, call, binding, admitted)?;
             (intent.effect_id(), Some(intent))
         }
         _ => {
@@ -257,6 +258,40 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
         self,
         start: impl FnOnce(P, A) -> F,
     ) -> Result<(R, SandboxEffectLease<'a>)> {
+        let (prepared, authority, lease, _, _) = self.admit()?;
+        let result = start(prepared, authority).await;
+        Ok((result, lease))
+    }
+
+    /// Opt-in handoff for a driver that must revalidate at actual OS
+    /// launch. The original claim is consumed only once; the lane gets an
+    /// owned, non-cloneable revalidation boundary, not settlement authority.
+    pub async fn start_with_launch_authority<R, F: Future<Output = R>>(
+        self,
+        start: impl FnOnce(P, A, SandboxEffectLaunch) -> F,
+    ) -> Result<(R, SandboxEffectLease<'a>)> {
+        if self.boundary.intent.is_none()
+            || self
+                .authority
+                .tool_binding()
+                .is_none_or(|binding| binding.effect != aw_agent_core::ToolEffect::Process)
+        {
+            return Err(Error::Denied(
+                "fenced launch requires original Process tool intent",
+            ));
+        }
+        let (prepared, authority, lease, request, boundary) = self.admit()?;
+        let launch = SandboxEffectLaunch {
+            store: lease.store.clone(),
+            request,
+            boundary,
+            pin: lease.barrier.launch_pin(),
+        };
+        let result = start(prepared, authority, launch).await;
+        Ok((result, lease))
+    }
+
+    fn admit(self) -> Result<(P, A, SandboxEffectLease<'a>, SandboxEffectRequest, Boundary)> {
         let Self {
             store,
             request,
@@ -278,6 +313,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
                 policy,
                 tool_ceiling,
                 tool_binding,
+                None,
             )?;
             if current != boundary {
                 return Err(Error::Conflict(
@@ -302,14 +338,77 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
         let lease = SandboxEffectLease {
             store,
             barrier,
-            actor: request.actor,
-            sandbox: boundary.plan.grant.sandbox_ref,
-            effect_id: boundary.plan.effect_id,
-            intent: boundary.intent,
+            actor: request.actor.clone(),
+            sandbox: boundary.plan.grant.sandbox_ref.clone(),
+            effect_id: boundary.plan.effect_id.clone(),
+            intent: boundary.intent.clone(),
             write_capable,
         };
-        let result = start(prepared, authority).await;
-        Ok((result, lease))
+        Ok((prepared, authority, lease, request, boundary))
+    }
+}
+
+/// One-shot, owned final launch boundary of the original admitted source
+/// Process. No new journal intent, replay or authority to settle the effect.
+#[must_use = "consume only at the original launch boundary"]
+pub struct SandboxEffectLaunch {
+    store: SessionStore,
+    request: SandboxEffectRequest,
+    boundary: Boundary,
+    pin: crate::source_barrier::SourceMutationPin,
+}
+
+impl SandboxEffectLaunch {
+    /// Trusted provider-specific projection. Hold the actual source/tool
+    /// authority and provider guard across the read-only Store transaction
+    /// and synchronous final spawn. No writes, async work or second effect
+    /// belong in the callback. Existing active intent, not future admission.
+    pub fn with_vault_projection<R>(
+        self,
+        source: &impl SandboxEffectAuthority,
+        registry: &aw_agent_core::VaultProviderRegistryReader,
+        vault: &impl crate::VaultGrantAuthority,
+        expected_grant_rev: u64,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let target = &vault.policy().target;
+        if target.agent_ref != self.request.agent_ref || target.actor != self.request.actor {
+            return Err(Error::Denied(
+                "Vault projection differs from original Process actor",
+            ));
+        }
+        source.with_admission(|| {
+            let mut connection = self.store.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let current = observe_in(
+                &self.store,
+                &tx,
+                &self.request,
+                &self.boundary.plan.driver,
+                source.policy(),
+                source.tool_ceiling(),
+                source.tool_binding(),
+                self.boundary.intent.as_ref(),
+            )?;
+            if current != self.boundary {
+                return Err(Error::Conflict("original Process launch boundary changed"));
+            }
+            self.pin.require_held_in(&tx)?;
+            crate::vault_grants::require_projection_in(
+                &tx,
+                registry,
+                vault,
+                expected_grant_rev,
+                aw_agent_core::VaultProjection::Env,
+            )?;
+            // No commit or fallible settlement after an OS spawn: this
+            // transaction only excludes writers while the effect is launched.
+            operation()
+        })
+    }
+
+    pub fn effect_id(&self) -> &str {
+        &self.boundary.plan.effect_id
     }
 }
 
@@ -456,6 +555,7 @@ impl SessionStore {
                 policy,
                 tool_ceiling,
                 tool_binding,
+                None,
             )?;
             boundary.mutation_set()?.require_unleased_in(&tx)?;
             db(tx.commit())?;

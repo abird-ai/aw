@@ -210,11 +210,11 @@ pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
-    EffectiveSourceBinding, PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLease,
-    SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest,
-    SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus, SandboxLifecycle,
-    SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant, SandboxToolRecovery,
-    SourceBindingCompatibility, SourceBindingSummary,
+    EffectiveSourceBinding, PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch,
+    SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
+    SandboxEffectRequest, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
+    SandboxLifecycle, SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant,
+    SandboxToolRecovery, SourceBindingCompatibility, SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
@@ -242,7 +242,7 @@ pub use types::*;
 pub use vault_grants::{
     VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus, VaultGrantSummary, VaultGrantTarget,
 };
-pub use vault_signing::SigningVaultProvider;
+pub use vault_signing::{SigningProcessProof, SigningVaultProvider, SIGNING_PROOF_ENV};
 pub use workspace_replica::*;
 pub use workspace_writer::{WorkspaceWriterEventInfo, WorkspaceWriterInfo};
 

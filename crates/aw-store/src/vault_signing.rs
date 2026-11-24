@@ -2,8 +2,9 @@
 //! provider's SecretStore, not Agent state, inference custody or tool output.
 //! Only a domain-separated HMAC operation is exposed; never a key read.
 use crate::{
-    id, user_for_principal, Error, LocalSecretStore, Result, SecretStore, SessionStore,
-    VaultGrantAuthority, VaultGrantPolicy, VaultGrantTarget,
+    id, user_for_principal, Error, LocalSecretStore, Result, SandboxEffectAuthority,
+    SandboxEffectLaunch, SecretStore, SessionStore, VaultGrantAuthority, VaultGrantPolicy,
+    VaultGrantTarget,
 };
 use aw_agent_core::{
     DriverKey, PrincipalId, SourceName, VaultProjection, VaultProviderHandle,
@@ -71,7 +72,11 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
     }
 
     pub fn register(self, registry: &VaultProviderRegistry) -> Result<VaultProviderHandle<Self>> {
-        registry.register(self.provider.clone(), vec![VaultProjection::Broker], self)
+        registry.register(
+            self.provider.clone(),
+            vec![VaultProjection::Broker, VaultProjection::Env],
+            self,
+        )
     }
 
     /// Install or rotate a dedicated signing key and exact grant ceiling.
@@ -86,11 +91,14 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
         key: &[u8],
     ) -> Result<()> {
         if target.entry.provider != self.provider
-            || target.projection != VaultProjection::Broker
+            || !matches!(
+                target.projection,
+                VaultProjection::Broker | VaultProjection::Env
+            )
             || !(32..=128).contains(&key.len())
         {
             return Err(Error::Denied(
-                "signing Vault requires a dedicated 32..128 byte broker key",
+                "signing Vault requires a dedicated 32..128 byte signing key",
             ));
         }
         let mut state = self
@@ -162,6 +170,78 @@ impl<S: SecretStore + 'static> SigningVaultProvider<S> {
         // Actual provider guard retained until the Store transaction and
         // operation return, not a cloned decision detached from authority.
         f(Authority { entry })
+    }
+}
+
+/// Trusted host selects the exact named entry and provider-owned scope.
+/// The challenge is a bounded, application-selected nonce or request.
+#[derive(Clone, Debug)]
+pub struct SigningProcessProof {
+    pub name: SourceName,
+    pub entry: String,
+    pub scope: String,
+    pub grant_rev: u64,
+    pub challenge: Vec<u8>,
+}
+
+/// Provider-owned integration point. Neither the Agent nor the grant may
+/// select another environment name or obtain the actual signing key.
+pub const SIGNING_PROOF_ENV: &str = "AW_VAULT_SIGNING_PROOF";
+
+impl<S: SecretStore + 'static> SigningVaultProvider<S> {
+    /// Materialize only a domain-separated, exact-Process-bound proof. The
+    /// provider guard and original Store/Tool/Sandbox boundary remain held
+    /// while the trusted driver hands the proof to actual synchronous spawn.
+    /// A materialized proof cannot be retroactively revoked.
+    pub fn with_process_proof<R>(
+        registry: &VaultProviderRegistryReader,
+        handle: &VaultProviderHandle<Self>,
+        launch: SandboxEffectLaunch,
+        source: &impl SandboxEffectAuthority,
+        selection: SigningProcessProof,
+        project: impl FnOnce(&[u8; 32]) -> Result<R>,
+    ) -> Result<R> {
+        if selection.challenge.len() > 64 * 1024 || selection.challenge.is_empty() {
+            return Err(Error::Limit(
+                "Vault Process proof requires 1..65536 challenge bytes",
+            ));
+        }
+        let provider = registry.get(handle)?;
+        provider.with_entry(&selection.entry, |authority| {
+            let target = &authority.policy().target;
+            if target.name != selection.name
+                || target.scope != selection.scope
+                || target.projection != VaultProjection::Env
+            {
+                return Err(Error::Denied(
+                    "Vault Process proof scope or projection changed",
+                ));
+            }
+            let effect = launch.effect_id().to_owned();
+            launch.with_vault_projection(source, registry, &authority, selection.grant_rev, || {
+                let key = provider.keys.get(&authority.entry.key_ref)?;
+                let signing_key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+                let mut mac = hmac::Context::with_key(&signing_key);
+                mac.update(b"aw-vault-process-proof-v1\0");
+                for part in [
+                    authority.policy().store_id().as_bytes(),
+                    &authority.policy().restore_generation().to_be_bytes(),
+                    target.agent_ref.as_bytes(),
+                    target.actor.as_str().as_bytes(),
+                    target.name.as_str().as_bytes(),
+                    target.entry.entry.as_bytes(),
+                    target.scope.as_bytes(),
+                    effect.as_bytes(),
+                    &selection.grant_rev.to_be_bytes(),
+                    &selection.challenge,
+                ] {
+                    mac.update(&(part.len() as u64).to_be_bytes());
+                    mac.update(part);
+                }
+                let proof = mac.sign();
+                project(proof.as_ref().try_into().expect("HMAC-SHA256 tag length"))
+            })
+        })
     }
 }
 
@@ -399,7 +479,7 @@ mod tests {
         assert!(sign(&store, &owner, &other_ref, rev, &target.scope).is_err());
         assert!(sign(&store, &owner, &reference, rev, "wrong-scope").is_err());
         assert!(reader
-            .require_projection(&target.entry, VaultProjection::Env)
+            .require_projection(&target.entry, VaultProjection::Socket)
             .is_err());
         assert!(store
             .agent_vault_list::<()>(&owner, &reference, |_, _| Err(Error::Denied(

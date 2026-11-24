@@ -173,6 +173,7 @@ pub(super) fn admit_in(
     turn_id: u64,
     call: &aw_agent_core::ToolCall,
     binding: &ToolBindingSnapshot,
+    admitted: Option<&Intent>,
 ) -> Result<Intent> {
     let observed = observe(tx, &request.agent_ref, turn_id, &call.id)?;
     if !observed.active
@@ -195,7 +196,19 @@ pub(super) fn admit_in(
     }
     let (session, _) = agent_owner::key_for_ref(tx, &request.agent_ref)?;
     crate::workspace_writer::verify_writer_epoch_for_session(tx, &session, observed.writer_epoch)?;
-    if claim_in(tx, &observed.intent.effect_id())?.is_some() {
+    if let Some(admitted) = admitted {
+        if admitted != &observed.intent {
+            return Err(Error::Conflict("original admitted tool intent changed"));
+        }
+        require_claim(tx, admitted)?;
+        if fact_in::<Release>(tx, &admitted.effect_id(), RELEASED)?.is_some()
+            || fact_in::<SandboxEffectOutcome>(tx, &admitted.effect_id(), QUIESCENT)?.is_some()
+        {
+            return Err(Error::Conflict(
+                "original source effect is no longer launchable",
+            ));
+        }
+    } else if claim_in(tx, &observed.intent.effect_id())?.is_some() {
         return Err(Error::Conflict(
             "original source effect was already claimed; never relaunch",
         ));

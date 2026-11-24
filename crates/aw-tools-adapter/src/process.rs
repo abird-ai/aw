@@ -671,12 +671,17 @@ fn map_process_error(error: aw_process::Error) -> crate::Error {
         aw_process::Error::Limit(message) => crate::Error::Limit(message),
         aw_process::Error::InputClosed(message) => crate::Error::Denied(message),
         aw_process::Error::Conflict(message) => crate::Error::Conflict(message),
+        aw_process::Error::DeniedBeforeSpawn => {
+            crate::Error::Denied("process launch authority denied")
+        }
         aw_process::Error::CancelledBeforeSpawn => crate::Error::Cancelled,
         aw_process::Error::TimedOutBeforeSpawn | aw_process::Error::Timeout => {
             crate::Error::Timeout
         }
     }
 }
+
+pub use aw_process::SpawnOnce;
 
 /// A trusted driver's already-prepared command and launch pins. No model
 /// arguments select this capability; the driver owns containment and policy.
@@ -720,6 +725,7 @@ impl PipeLaunchFailure {
             error,
             aw_process::Error::Io(_)
                 | aw_process::Error::Limit(_)
+                | aw_process::Error::DeniedBeforeSpawn
                 | aw_process::Error::CancelledBeforeSpawn
                 | aw_process::Error::TimedOutBeforeSpawn
         );
@@ -850,6 +856,36 @@ impl PipeProcess {
                 cancelled()
             },
             cancelled_signal,
+        );
+        Self::spawn_command_inner(
+            command,
+            stdin_open,
+            SpawnOutputTarget::None,
+            None,
+            Some(control),
+        )
+        .await
+    }
+
+    /// Opt-in final authority and projection at the original spawn lane.
+    /// Custody moves into the fence, including cancellation before launch.
+    pub async fn spawn_prepared_fenced_until<P: Send + 'static>(
+        launch: PreparedPipeLaunch<P>,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+        fence: impl FnOnce(SpawnOnce<'_>, &P) + Send + 'static,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
+        let PreparedPipeLaunch {
+            command,
+            stdin_open,
+            pins,
+        } = launch;
+        let control = aw_process::SpawnControl::new_fenced(
+            deadline,
+            cancelled,
+            cancelled_signal,
+            move |spawn| fence(spawn, &pins),
         );
         Self::spawn_command_inner(
             command,

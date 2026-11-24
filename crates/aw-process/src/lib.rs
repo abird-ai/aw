@@ -64,6 +64,8 @@ pub enum Error {
     OwnerGone(&'static str),
     #[error("{0}")]
     Conflict(&'static str),
+    #[error("process launch authority denied before spawn")]
+    DeniedBeforeSpawn,
     #[error("process launch cancelled before spawn")]
     CancelledBeforeSpawn,
     #[error("process launch deadline expired before spawn")]
@@ -89,10 +91,113 @@ pub trait OutputSink: Send + 'static {
     fn finish(&mut self) -> std::result::Result<(), SinkError>;
 }
 
+// Scope first: containment Drop precedes the child's kill-on-drop.
+struct Spawned {
+    platform: aw_platform::DirectScope,
+    child: Child,
+    pid: u32,
+}
+
+fn spawn_attached(command: &mut Command) -> Result<Spawned> {
+    let mut child = command.spawn()?;
+    let Some(pid) = child.id() else {
+        let _ = child.start_kill();
+        return Err(Error::SetupUncertain(
+            "process launched but PID/setup outcome is uncertain",
+        ));
+    };
+    #[cfg(unix)]
+    let scope = aw_platform::DirectScope::attach(pid);
+    #[cfg(windows)]
+    let scope = {
+        let Some(handle) = child.raw_handle() else {
+            let _ = child.start_kill();
+            return Err(Error::SetupUncertain(
+                "process launched but Windows handle/setup outcome is uncertain",
+            ));
+        };
+        aw_platform::DirectScope::attach(pid, handle)
+    };
+    let platform = match scope {
+        Ok(scope) => scope,
+        Err(_) => {
+            let _ = child.start_kill();
+            return Err(Error::SetupUncertain(
+                "process launched but Process scope setup is uncertain",
+            ));
+        }
+    };
+    Ok(Spawned {
+        platform,
+        child,
+        pid,
+    })
+}
+
+type LaunchFence = Box<dyn FnOnce(SpawnOnce<'_>) + Send + 'static>;
+
+/// Trusted synchronous authority boundary on the actual spawn lane.
+/// Consuming this token is the only way to authorize the original spawn.
+/// The runtime retains its result, including OS failure; returning without
+/// consumption denies launch. No second executor or result can be supplied.
+pub struct SpawnOnce<'a> {
+    command: &'a mut Command,
+    check: &'a mut dyn FnMut() -> Result<()>,
+    outcome: &'a mut Option<Result<Spawned>>,
+}
+
+impl SpawnOnce<'_> {
+    /// Insert a trusted provider-reserved environment value without
+    /// overwriting an existing command or ambient value. This does not
+    /// expose command, stdio, containment or a second spawn surface.
+    pub fn insert_reserved_env(&mut self, name: &str, value: &str) -> Result<()> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            || value.contains('\0')
+            || std::env::var_os(name).is_some()
+            || self
+                .command
+                .as_std()
+                .get_envs()
+                .any(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+        {
+            return Err(Error::DeniedBeforeSpawn);
+        }
+        self.command.env(name, value);
+        Ok(())
+    }
+
+    pub fn spawn(self) {
+        *self.outcome = Some((self.check)().and_then(|()| spawn_attached(self.command)));
+    }
+}
+
+fn spawn_fenced(
+    command: &mut Command,
+    fence: Option<LaunchFence>,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<Spawned> {
+    match fence {
+        None => spawn_attached(command),
+        Some(fence) => {
+            let mut outcome = None;
+            fence(SpawnOnce {
+                command,
+                check: &mut check,
+                outcome: &mut outcome,
+            });
+            outcome.unwrap_or(Err(Error::DeniedBeforeSpawn))
+        }
+    }
+}
+
 pub struct SpawnControl {
     deadline: Instant,
     cancelled: Box<dyn Fn() -> bool + Send + 'static>,
     cancelled_signal: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    launch_fence: Option<LaunchFence>,
 }
 
 impl SpawnControl {
@@ -105,7 +210,29 @@ impl SpawnControl {
             deadline,
             cancelled: Box::new(cancelled),
             cancelled_signal: Box::pin(cancelled_signal),
+            launch_fence: None,
         }
+    }
+
+    /// Hold synchronous authority across actual spawn, not across await.
+    /// The bounded callback must consume the token only while authorized.
+    /// A cancellation/deadline recheck runs immediately before OS spawn.
+    pub fn new_fenced(
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+        fence: impl FnOnce(SpawnOnce<'_>) + Send + 'static,
+    ) -> Self {
+        let mut control = Self::new(deadline, cancelled, cancelled_signal);
+        control.launch_fence = Some(Box::new(fence));
+        control
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn launch(mut self, command: &mut Command) -> Result<Spawned> {
+        self.check()?;
+        let fence = self.launch_fence.take();
+        spawn_fenced(command, fence, || self.check())
     }
 
     pub const fn deadline(&self) -> Instant {
@@ -625,64 +752,17 @@ impl Process {
         aw_platform::configure_managed_process(command.as_std_mut());
 
         #[cfg(target_os = "linux")]
-        let (mut platform, mut child, pid) = {
-            let spawned = linux_spawn::spawn(command, control).await?;
-            (spawned.platform, spawned.child, spawned.pid)
+        let spawned = linux_spawn::spawn(command, control).await?;
+        #[cfg(not(target_os = "linux"))]
+        let spawned = match control {
+            Some(control) => control.launch(&mut command)?,
+            None => spawn_attached(&mut command)?,
         };
-
-        #[cfg(all(unix, not(target_os = "linux")))]
-        let (mut platform, mut child, pid) = {
-            if let Some(control) = control.as_ref() {
-                control.check()?;
-            }
-            let mut child = command.spawn()?;
-            let Some(pid) = child.id() else {
-                let _ = child.start_kill();
-                return Err(Error::SetupUncertain(
-                    "process launched but PID/setup outcome is uncertain",
-                ));
-            };
-            let platform = match aw_platform::DirectScope::attach(pid) {
-                Ok(scope) => scope,
-                Err(_) => {
-                    let _ = child.start_kill();
-                    return Err(Error::SetupUncertain(
-                        "process launched but Process scope setup is uncertain",
-                    ));
-                }
-            };
-            (platform, child, pid)
-        };
-
-        #[cfg(windows)]
-        let (mut platform, mut child, pid) = {
-            if let Some(control) = control.as_ref() {
-                control.check()?;
-            }
-            let mut child = command.spawn()?;
-            let Some(pid) = child.id() else {
-                let _ = child.start_kill();
-                return Err(Error::SetupUncertain(
-                    "process launched but PID/setup outcome is uncertain",
-                ));
-            };
-            let Some(handle) = child.raw_handle() else {
-                let _ = child.start_kill();
-                return Err(Error::SetupUncertain(
-                    "process launched but Windows handle/setup outcome is uncertain",
-                ));
-            };
-            let platform = match aw_platform::DirectScope::attach(pid, handle) {
-                Ok(scope) => scope,
-                Err(_) => {
-                    let _ = child.start_kill();
-                    return Err(Error::SetupUncertain(
-                        "process launched but Windows Process scope setup is uncertain",
-                    ));
-                }
-            };
-            (platform, child, pid)
-        };
+        let Spawned {
+            mut platform,
+            mut child,
+            pid,
+        } = spawned;
 
         let Some(stdout_pipe) = child.stdout.take() else {
             let _ = platform.terminate();
@@ -1227,6 +1307,34 @@ mod tests {
         };
         assert!(matches!(error, Error::CancelledBeforeSpawn));
         assert!(probes.load(Ordering::SeqCst) >= 2);
+
+        // Once the synchronous authority fence is entered, cancellation
+        // still wins before the real OS call (an invalid program would
+        // otherwise give Io). No authority callback fabricates a result.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = cancelled.clone();
+        let control = SpawnControl::new_fenced(
+            Instant::now() + Duration::from_secs(3),
+            move || probe.load(Ordering::Acquire),
+            std::future::pending(),
+            move |spawn| {
+                cancelled.store(true, Ordering::Release);
+                spawn.spawn();
+            },
+        );
+        let error = match Process::spawn(
+            Command::new("/definitely/not/an/aw-process-command"),
+            SpawnOptions {
+                control: Some(control),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("fenced cancellation must suppress exec"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::CancelledBeforeSpawn));
     }
 
     #[cfg(unix)]
