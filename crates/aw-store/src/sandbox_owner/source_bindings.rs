@@ -5,33 +5,12 @@ use aw_agent_core::{
     SourceDriverRegistry, SourceDriverRegistryReader, SourceName, SourceSetLimit,
     HARD_MAX_SOURCES_PER_SANDBOX,
 };
-use rusqlite::{params, Connection, Row, TransactionBehavior};
+use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceBindingCompatibility {
-    Compatible,
-    RecoveryRequired,
-}
-
-impl SourceBindingCompatibility {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "compatible" => Ok(Self::Compatible),
-            "recovery_required" => Ok(Self::RecoveryRequired),
-            _ => Err(Error::Storage("invalid SourceBinding compatibility")),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Compatible => "compatible",
-            Self::RecoveryRequired => "recovery_required",
-        }
-    }
-}
+use crate::source_compatibility::compatibility;
+pub use crate::source_compatibility::SourceCompatibility as SourceBindingCompatibility;
 
 /// Project-authorized metadata only; opaque source identities and materialization
 /// locators require their own source disclosure authority.
@@ -144,17 +123,6 @@ pub(super) fn summaries(
         .collect())
 }
 
-fn compatibility(
-    registry: &SourceDriverRegistryReader,
-    binding: &SourceBinding,
-) -> Result<SourceBindingCompatibility> {
-    match registry.resolve(&binding.pin()?) {
-        Ok(_) => Ok(SourceBindingCompatibility::Compatible),
-        Err(Error::Denied(_)) => Ok(SourceBindingCompatibility::RecoveryRequired),
-        Err(error) => Err(error),
-    }
-}
-
 /// Complete-set admission before any driver work or publication.
 pub(super) fn validate_set(
     limit: SourceSetLimit,
@@ -220,20 +188,15 @@ pub(super) fn insert(
 
 /// Reconcile compatibility, not source state. No driver effect is executed.
 /// A compatible registration is not authority to materialize or execute.
-pub(crate) fn revalidate(
-    connection: &mut Connection,
-    registry: &SourceDriverRegistry,
-) -> Result<()> {
-    let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryReader) -> Result<()> {
     let any: bool = db(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sandbox_source_bindings_current)",
         [],
         |row| row.get(0),
     ))?;
     if !any {
-        return db(tx.commit());
+        return Ok(());
     }
-    let registry = registry.reader()?;
     // Until realization exists, no Agent can be bound to a source-bearing Sandbox.
     // Reject unexpected persisted combinations rather than allowing layout-only execution.
     let bound: bool = db(tx.query_row(
@@ -260,8 +223,8 @@ pub(crate) fn revalidate(
         let mut rows = db(query.query([]))?;
         while let Some(row) = db(rows.next())? {
             let sandbox: String = db(row.get(0))?;
-            for stored in bindings_in(&tx, &sandbox)? {
-                let next = compatibility(&registry, &stored.binding)?;
+            for stored in bindings_in(tx, &sandbox)? {
+                let next = compatibility(registry, &stored.binding.pin()?)?;
                 if next != stored.compatibility {
                     db(tx.execute(
                         "UPDATE sandbox_source_bindings_current SET compatibility=?1
@@ -272,5 +235,5 @@ pub(crate) fn revalidate(
             }
         }
     }
-    db(tx.commit())
+    Ok(())
 }

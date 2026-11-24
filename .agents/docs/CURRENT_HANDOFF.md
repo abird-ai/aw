@@ -27,8 +27,9 @@ v50 disclosure/causal execution closure, v51 EventTypeRegistry + custom Event pu
 v53 same-store cross-Domain Event-universe completeness, and v54 serialized v36 delivery cutover +
 compatibility provenance are implemented locally. Phase 3 is now UNDERWAY with the first final
 SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary and v55 named
-SourceBinding persistence/restart compatibility plus built-in Git clean/dirty capture, private retention,
-explicit gitlink semantics and isolated Prepared restore implemented locally.
+SourceBinding persistence/restart compatibility, built-in Git clean/dirty capture/private retention,
+explicit gitlink semantics, isolated Prepared restore and v56 immutable Checkpoint/SourceSet
+persistence with trusted history-only replay are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1202,10 +1203,53 @@ content/index/lock/parent refusal. Strict Git feature Clippy, default-feature-in
 all-target check, full workspace all-target check, repository fmt and scoped diff-check are green
 on L5. No Windows-native runtime qualification is claimed.
 
-**Next Phase-3 slice:** SourceAnchor/Checkpoint/SourceSet persistence and restart dependency pinning,
-then multi-source recovery and shared Prepared publication. Source realization, candidate/retention
-cleanup, quiescent binding mutation, SandboxGrant/Vault and checkpoint RPC effects remain pending.
-Store schema stays v55.
+Schema **v56** adds `checkpoints` and `checkpoint_sources`, starting empty on migration.
+The core SourceAnchor carries DriverKey + anchor_schema, immutable version/retention identities,
+name and captured access/checkpoint policy, and bounded typed non-secret identity fields. The
+same identity-field validator serves recovery descriptors (existing RecoveryField aliases/wire
+unchanged). SourceSet validates coverage, unique names and the shared effective/absolute source
+bounds. Git converts its typed clean/dirty anchors to/from this common envelope without losing
+base/captured OIDs or private retention identity. Store has no Git dependency.
+
+Checkpoint rows retain exact sealed HistoryBase/head and immutable source Agent identity,
+coverage, creator/note/time and indexed authenticated request provenance. A live checkpoint's
+generated FK retains the existing HistoryBase; retirement can preserve original identity and
+replay without that live root. Source rows retain only immutable driver anchor data and captured
+layout metadata. SQL protects immutable anchors and live source retention; compatibility diagnostics
+can change. The lower transactional publication helper admits the complete set and resolves exact
+anchor schemas; it is private, with source-bearing use limited to storage qualification until the
+effect-fenced constructor lands. No production caller can inject arbitrary source anchors.
+
+Trusted Rust-only history-only construction uses the existing latest-settled-history seal and
+current Agent view authority; the trusted host must admit checkpoint-create capability and pass its
+stable scoped envelope request identity. Indexed replay lookup precedes target resolution; exact
+replay preserves the original checkpoint even after newer history or retirement, changed request
+semantics refuse, and lost view prevents payload disclosure. No Agent rev/ACL/history-pointer
+mutation and no external effects. Metadata get rechecks current view and exposes source name,
+driver/schema, captured maxima and schema diagnostic only; protected source/anchor/retention
+identities remain withheld. No public checkpoint RPC or source-bearing create/restore is promoted.
+
+Existing owner/direct startup and staged backup restore now share one read-side registry snapshot
+and one compatibility transaction for bindings and retained checkpoint anchors. Missing or
+incompatible artifact schemas retain exact durable truth and mark recovery_required; compatible
+reinstallation clears diagnostics without rewriting identity or advancing Agent/Sandbox revs.
+Retired anchor rows awaiting cleanup remain dependencies until removed. This is schema
+compatibility, not evidence of actual retained objects. The registry remains add-only; unresolved
+recovery descriptor custody/pinning must land in the existing operation receipt with Prepared
+construction, not a speculative replay catalog.
+
+The grouped real disk checkpoint-owner regression **1/1** covers v55→v56 migration, settled
+history during an active turn, replay/current ACL, revision neutrality, immutable source storage,
+bounded complete-set admission, metadata redaction, incompatible restart, compatible reinstall,
+staged restore/direct open and hard corruption ceiling. Existing Sandbox owner **2/2** and
+SourceDriver leaf **1/1** remain green. Git feature suite **32/32** includes real typed anchor
+roundtrip. Strict affected-crate all-target Clippy with the Git source-driver feature, full workspace
+all-target check, repository fmt and scoped diff-check are green.
+
+**Next Phase-3 slice:** durable per-source Prepared recovery descriptors in the existing operation
+receipt, exact unresolved dependency resolution, then multi-source barriers/recovery and the shared
+publication constructor. Source realization, candidate/retention reconciliation, quiescent binding
+mutation, SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v56.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

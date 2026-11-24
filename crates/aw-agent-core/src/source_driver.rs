@@ -22,9 +22,11 @@ const MAX_SOURCE_DRIVERS: usize = 1024;
 const MAX_SOURCE_NAME_BYTES: usize = 64;
 const MAX_SOURCE_BINDING_IDENTITY_BYTES: usize = 2048;
 const MAX_PREPARE_ID_BYTES: usize = 128;
-const MAX_RECOVERY_FIELDS: usize = 32;
-const MAX_RECOVERY_FIELD_NAME_BYTES: usize = 48;
-const MAX_RECOVERY_FIELD_VALUE_BYTES: usize = 2048;
+const MAX_SOURCE_FIELDS: usize = 32;
+const MAX_SOURCE_FIELD_NAME_BYTES: usize = 48;
+const MAX_SOURCE_FIELD_VALUE_BYTES: usize = 2048;
+/// Bounded encoded driver-specific anchor fields (including JSON escaping).
+pub const MAX_SOURCE_ANCHOR_FIELDS_BYTES: usize = 256 * 1024;
 const MAX_EVIDENCE_KIND_BYTES: usize = 48;
 const MAX_EVIDENCE_VALUE_BYTES: usize = 2048;
 
@@ -315,7 +317,7 @@ pub enum SourceOperationKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RecoveryFieldKind {
+pub enum SourceIdentityFieldKind {
     Id,
     Digest,
     Version,
@@ -323,18 +325,22 @@ pub enum RecoveryFieldKind {
     OpaqueHandle,
 }
 
+pub use SourceIdentityFieldKind as RecoveryFieldKind;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RecoveryField {
+pub struct SourceIdentityField {
     pub name: String,
-    pub kind: RecoveryFieldKind,
+    pub kind: SourceIdentityFieldKind,
     pub value: String,
 }
 
-impl RecoveryField {
+pub use SourceIdentityField as RecoveryField;
+
+impl SourceIdentityField {
     pub fn new(
         name: impl Into<String>,
-        kind: RecoveryFieldKind,
+        kind: SourceIdentityFieldKind,
         value: impl Into<String>,
     ) -> Result<Self> {
         let field = Self {
@@ -349,23 +355,144 @@ impl RecoveryField {
     pub fn validate(&self) -> Result<()> {
         let name = self.name.as_bytes();
         if name.is_empty()
-            || name.len() > MAX_RECOVERY_FIELD_NAME_BYTES
+            || name.len() > MAX_SOURCE_FIELD_NAME_BYTES
             || !name[0].is_ascii_lowercase()
             || !name.iter().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(*byte, b'_' | b'-')
             })
         {
-            return Err(Error::Config("invalid recovery field name".into()));
+            return Err(Error::Config("invalid source identity field name".into()));
         }
         if self.value.is_empty()
-            || self.value.len() > MAX_RECOVERY_FIELD_VALUE_BYTES
+            || self.value.len() > MAX_SOURCE_FIELD_VALUE_BYTES
             || self.value.chars().any(char::is_control)
         {
             return Err(Error::Config(
-                "recovery field must be bounded non-control identity evidence".into(),
+                "source field must be bounded non-control identity evidence".into(),
             ));
         }
         Ok(())
+    }
+}
+
+fn validate_identity_fields(fields: &[SourceIdentityField]) -> Result<()> {
+    if fields.len() > MAX_SOURCE_FIELDS {
+        return Err(Error::Limit("too many source identity fields"));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for field in fields {
+        field.validate()?;
+        if !names.insert(field.name.as_str()) {
+            return Err(Error::Config(
+                "source identity field names must be unique".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Immutable, driver-issued source version and retention identity. Layout
+/// metadata records captured maxima, never authority. Fields are non-secret
+/// version/provenance IDs, not credentials or a mutable materialization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceAnchor {
+    pub name: SourceName,
+    pub driver: DriverKey,
+    pub anchor_schema: u32,
+    pub source_ref: String,
+    pub access: SourceAccess,
+    pub checkpoint_policy: CheckpointPolicy,
+    pub identity: String,
+    pub retention: String,
+    pub fields: Vec<SourceIdentityField>,
+}
+
+impl SourceAnchor {
+    pub fn pin(&self) -> Result<DriverSchemaPin> {
+        DriverSchemaPin::new(
+            self.driver.clone(),
+            DriverArtifact::Anchor,
+            self.anchor_schema,
+        )
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.name.validate()?;
+        self.pin()?;
+        for value in [&self.source_ref, &self.identity, &self.retention] {
+            validate_identity(
+                value,
+                MAX_SOURCE_FIELD_VALUE_BYTES,
+                "source anchor identity",
+            )?;
+            if value.contains("://") {
+                return Err(Error::Config(
+                    "source anchor requires opaque identities, not URLs".into(),
+                ));
+            }
+        }
+        validate_identity_fields(&self.fields)?;
+        if self.fields.iter().any(|field| field.value.contains("://")) {
+            return Err(Error::Config(
+                "source anchor requires opaque fields, not URLs".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCoverage {
+    AutoAllRequired,
+    Selected,
+    None,
+}
+
+/// One checkpoint's immutable named SourceSet. A lowered host limit affects
+/// new admission, not decoding a previously retained set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSet {
+    pub coverage: SourceCoverage,
+    pub anchors: Vec<SourceAnchor>,
+}
+
+impl SourceSet {
+    pub fn validate(&self) -> Result<()> {
+        validate_source_set_hard_limit(self.anchors.len())?;
+        match self.coverage {
+            SourceCoverage::None if !self.anchors.is_empty() => {
+                return Err(Error::Config("history-only SourceSet must be empty".into()));
+            }
+            SourceCoverage::Selected if self.anchors.is_empty() => {
+                return Err(Error::Config(
+                    "selected SourceSet requires named sources".into(),
+                ));
+            }
+            _ => {}
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for anchor in &self.anchors {
+            anchor.validate()?;
+            if !names.insert(anchor.name.as_str()) {
+                return Err(Error::Conflict("duplicate SourceAnchor name"));
+            }
+            if self.coverage == SourceCoverage::AutoAllRequired
+                && anchor.checkpoint_policy != CheckpointPolicy::Required
+            {
+                return Err(Error::Config(
+                    "automatic SourceSet may contain only required sources".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn admit(&self, limit: SourceSetLimit) -> Result<()> {
+        limit.admit(self.anchors.len())?;
+        self.validate()
     }
 }
 
@@ -467,22 +594,10 @@ impl RecoveryDescriptor {
         validate_identity(&self.prepare_id, MAX_PREPARE_ID_BYTES, "prepare identity")?;
         validate_identity(
             &self.prepared_identity,
-            MAX_RECOVERY_FIELD_VALUE_BYTES,
+            MAX_SOURCE_FIELD_VALUE_BYTES,
             "prepared source identity",
         )?;
-        if self.fields.len() > MAX_RECOVERY_FIELDS {
-            return Err(Error::Limit("too many recovery descriptor fields"));
-        }
-        let mut names = std::collections::BTreeSet::new();
-        for field in &self.fields {
-            field.validate()?;
-            if !names.insert(field.name.as_str()) {
-                return Err(Error::Config(
-                    "recovery descriptor field names must be unique".into(),
-                ));
-            }
-        }
-        Ok(())
+        validate_identity_fields(&self.fields)
     }
 }
 

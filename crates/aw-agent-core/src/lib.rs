@@ -86,10 +86,11 @@ pub use routing::{RoutingExecutor, RoutingInput, RoutingJournal, RoutingResult};
 pub use source_driver::{
     validate_source_set_hard_limit, CheckpointPolicy, DriverArtifact, DriverKey, DriverNamespace,
     DriverSchemaPin, ExternalEvidence, PreparedSourceOperation, RecoveryDescriptor, RecoveryField,
-    RecoveryFieldKind, RecoveryInspection, SchemaSupport, SourceAccess, SourceBinding,
-    SourceDriverDescriptor, SourceDriverHandle, SourceDriverRegistry, SourceDriverRegistryReader,
-    SourceDriverSchemas, SourceName, SourceOperationKind, SourceSetLimit,
-    DEFAULT_MAX_SOURCES_PER_SANDBOX, HARD_MAX_SOURCES_PER_SANDBOX,
+    RecoveryFieldKind, RecoveryInspection, SchemaSupport, SourceAccess, SourceAnchor,
+    SourceBinding, SourceCoverage, SourceDriverDescriptor, SourceDriverHandle,
+    SourceDriverRegistry, SourceDriverRegistryReader, SourceDriverSchemas, SourceIdentityField,
+    SourceIdentityFieldKind, SourceName, SourceOperationKind, SourceSet, SourceSetLimit,
+    DEFAULT_MAX_SOURCES_PER_SANDBOX, HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
 pub use tool::{
     ExecutionOwnershipLease, ExecutionOwnershipScope, Tool, ToolCall, ToolContext, ToolEffect,

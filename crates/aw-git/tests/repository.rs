@@ -127,6 +127,13 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     ));
 
     let anchor = driver.execute_capture(&prepared).unwrap();
+    let durable = aw_agent_core::SourceAnchor::try_from(&anchor).unwrap();
+    let durable: aw_agent_core::SourceAnchor =
+        serde_json::from_slice(&serde_json::to_vec(&durable).unwrap()).unwrap();
+    assert_eq!(
+        aw_git::source_driver::GitSourceAnchor::try_from(&durable).unwrap(),
+        anchor
+    );
     assert_eq!(anchor.retention_ref(), private_ref);
     assert_eq!(
         anchor.captured_commit.as_bytes(),
@@ -415,6 +422,11 @@ fn prepared_git_capture_preserves_final_dirty_tree_and_exact_gitlinks() {
     ));
 
     let anchor = driver.execute_capture(&prepared).unwrap();
+    let durable = aw_agent_core::SourceAnchor::try_from(&anchor).unwrap();
+    assert_eq!(
+        aw_git::source_driver::GitSourceAnchor::try_from(&durable).unwrap(),
+        anchor
+    );
     assert!(anchor.is_dirty());
     assert_eq!(anchor.base_commit, base);
     assert_eq!(

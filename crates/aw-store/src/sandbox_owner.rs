@@ -776,7 +776,9 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP TABLE sandbox_source_bindings_current;
+                    "DROP TABLE checkpoint_sources;
+                 DROP TABLE checkpoints;
+                 DROP TABLE sandbox_source_bindings_current;
                  UPDATE store_meta SET value='54' WHERE key='schema_epoch';
                  UPDATE schema_meta SET schema_epoch=54,activation_epoch=54 WHERE singleton=1;
                  UPDATE migration_lease SET current_epoch=54 WHERE singleton=1;
@@ -807,7 +809,7 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            55
+            56
         );
 
         let sources = [

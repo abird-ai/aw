@@ -12,8 +12,9 @@ use crate::{valid_object_id, Error as GitError, Repository};
 use aw_agent_core::{
     CheckpointPolicy, DriverArtifact, DriverKey, DriverNamespace, DriverSchemaPin, Error,
     ExternalEvidence, PreparedSourceOperation, RecoveryDescriptor, RecoveryField,
-    RecoveryFieldKind, RecoveryInspection, Result, SchemaSupport, SourceAccess, SourceBinding,
-    SourceDriverHandle, SourceDriverRegistry, SourceDriverSchemas, SourceName, SourceOperationKind,
+    RecoveryFieldKind, RecoveryInspection, Result, SchemaSupport, SourceAccess, SourceAnchor,
+    SourceBinding, SourceDriverHandle, SourceDriverRegistry, SourceDriverSchemas,
+    SourceIdentityField, SourceIdentityFieldKind, SourceName, SourceOperationKind,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -279,6 +280,65 @@ impl GitSourceAnchor {
 
     pub fn is_dirty(&self) -> bool {
         self.captured_commit != self.base_commit
+    }
+}
+
+impl TryFrom<&GitSourceAnchor> for SourceAnchor {
+    type Error = Error;
+
+    fn try_from(anchor: &GitSourceAnchor) -> Result<Self> {
+        anchor.validate()?;
+        let result = Self {
+            name: anchor.name.clone(),
+            driver: anchor.driver.clone(),
+            anchor_schema: anchor.anchor_schema,
+            source_ref: anchor.source_ref.clone(),
+            access: anchor.access,
+            checkpoint_policy: anchor.checkpoint_policy,
+            identity: anchor.captured_commit.clone(),
+            retention: anchor.retention_ref(),
+            fields: vec![SourceIdentityField::new(
+                "base",
+                SourceIdentityFieldKind::Version,
+                &anchor.base_commit,
+            )?],
+        };
+        result.validate()?;
+        Ok(result)
+    }
+}
+
+impl TryFrom<&SourceAnchor> for GitSourceAnchor {
+    type Error = Error;
+
+    fn try_from(anchor: &SourceAnchor) -> Result<Self> {
+        anchor.validate()?;
+        let [base] = anchor.fields.as_slice() else {
+            return Err(Error::Denied("invalid Git anchor fields"));
+        };
+        if base.name != "base" || base.kind != SourceIdentityFieldKind::Version {
+            return Err(Error::Denied("invalid Git anchor base identity"));
+        }
+        let checkpoint_id = anchor
+            .retention
+            .strip_prefix("refs/aw/checkpoints/")
+            .and_then(|reference| reference.split_once('/'))
+            .filter(|(_, name)| *name == anchor.name.as_str())
+            .map(|(checkpoint, _)| checkpoint)
+            .ok_or(Error::Denied("invalid Git anchor retention identity"))?;
+        let result = Self {
+            name: anchor.name.clone(),
+            driver: anchor.driver.clone(),
+            anchor_schema: anchor.anchor_schema,
+            source_ref: anchor.source_ref.clone(),
+            access: anchor.access,
+            checkpoint_policy: anchor.checkpoint_policy,
+            checkpoint_id: checkpoint_id.into(),
+            base_commit: base.value.clone(),
+            captured_commit: anchor.identity.clone(),
+        };
+        result.validate()?;
+        Ok(result)
     }
 }
 

@@ -22,6 +22,7 @@ mod archive;
 mod auth_session;
 mod authority;
 mod authority_replica;
+mod checkpoint_owner;
 #[cfg(target_os = "linux")]
 mod cold_activation_consent;
 #[cfg(target_os = "linux")]
@@ -79,6 +80,7 @@ mod schedules;
 mod secret_custody_inventory;
 mod secret_store;
 mod session_participation;
+mod source_compatibility;
 mod store_scope;
 mod subagents;
 #[cfg(feature = "pipelines")]
@@ -132,6 +134,7 @@ use aw_agent_core::{
     InvocationContext, InvocationIdentity, InvocationPurpose, JournalFuture, Outcome, PrincipalId,
     Result, Role, SourceDriverRegistry, SourceSetLimit,
 };
+pub use checkpoint_owner::{CheckpointLifecycle, CheckpointSnapshot, CheckpointSourceSummary};
 pub use context::{
     ApplyContext, ApplyMode, ContextApplied, ContextJournal, ContextNode, ContextPlan,
     MaterializedContextProjection, MaterializedContextRequest, PlanKind, PrepareContext, Selection,
@@ -207,6 +210,7 @@ pub use session_participation::{
     SessionParticipationAction, SessionParticipationEvidence, SessionParticipationPermissions,
 };
 use sha2::{Digest, Sha256};
+pub use source_compatibility::SourceCompatibility;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -303,8 +307,9 @@ pub const EVENT_UNIVERSE_PLACEMENT_SCHEMA: &str =
 pub const EVENT_DELIVERY_CUTOVER_SCHEMA: &str =
     include_str!("../migrations/054_event_delivery_cutover.sql");
 pub const SOURCE_BINDING_SCHEMA: &str = include_str!("../migrations/055_source_bindings.sql");
+pub const CHECKPOINT_SCHEMA: &str = include_str!("../migrations/056_checkpoints.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 55;
+const LATEST_SCHEMA_VERSION: i64 = 56;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -1216,7 +1221,7 @@ impl SessionStore {
         validate_private_sqlite_sidecars(&directory)?;
         let mut conn = db(Connection::open(directory.join("sessions.sqlite3")))?;
         initialize(&mut conn)?;
-        sandbox_owner::source_bindings::revalidate(&mut conn, &source_drivers)?;
+        source_compatibility::revalidate(&mut conn, &source_drivers)?;
         let process = coordination::register_owner_process(&mut conn)?;
         let out = Self {
             inner: Arc::new(Inner {
@@ -1306,7 +1311,7 @@ impl SessionStore {
         };
         {
             let mut connection = out.connection()?;
-            sandbox_owner::source_bindings::revalidate(&mut connection, &out.inner.source_drivers)?;
+            source_compatibility::revalidate(&mut connection, &out.inner.source_drivers)?;
         }
         out.recover()?;
         Ok(out)
@@ -2586,7 +2591,7 @@ impl SessionStore {
                 previous_live_generation,
                 source_generation,
             )?;
-            sandbox_owner::source_bindings::revalidate(&mut staged, &self.inner.source_drivers)?;
+            source_compatibility::revalidate(&mut staged, &self.inner.source_drivers)?;
             let check: String = db(staged.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
             let fk: i64 = db(staged.query_row(
                 "SELECT count(*) FROM pragma_foreign_key_check",
@@ -2981,7 +2986,11 @@ fn initialize(c: &mut Connection) -> Result<()> {
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current == 54 {
-        migrate_source_bindings(c)?;
+        migrate_source_schema(c, 55, "source-bindings", SOURCE_BINDING_SCHEMA)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 55 {
+        migrate_source_schema(c, 56, "checkpoints", CHECKPOINT_SCHEMA)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {
@@ -3465,21 +3474,27 @@ fn migrate_event_projection(c: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_source_bindings(c: &mut Connection) -> Result<()> {
+// Additive source-owner migrations use the existing lease and epoch boundary.
+fn migrate_source_schema(
+    c: &mut Connection,
+    target: i64,
+    holder: &str,
+    schema: &str,
+) -> Result<()> {
     let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
     let lease_changed = db(tx.execute(
         "UPDATE migration_lease
-         SET holder_client_id='source-bindings',generation=generation+1,
-             target_epoch=55,lease_expires_at=?1,updated_at=?2
-         WHERE singleton=1 AND holder_client_id IS NULL",
-        params![now().saturating_add(60_000_000), now()],
+         SET holder_client_id=?1,generation=generation+1,
+             target_epoch=?2,lease_expires_at=?3,updated_at=?4
+         WHERE singleton=1 AND holder_client_id IS NULL AND current_epoch=?2-1",
+        params![holder, target, now().saturating_add(60_000_000), now()],
     ))?;
     if lease_changed != 1 {
         return Err(Error::Conflict(
-            "another migration lease is active; schema upgrade is excluded",
+            "another migration lease is active or schema epoch changed",
         ));
     }
-    db(tx.execute_batch(SOURCE_BINDING_SCHEMA))?;
+    db(tx.execute_batch(schema))?;
     let violations: i64 = db(tx.query_row(
         "SELECT count(*) FROM pragma_foreign_key_check",
         [],
@@ -3487,28 +3502,27 @@ fn migrate_source_bindings(c: &mut Connection) -> Result<()> {
     ))?;
     if violations != 0 {
         return Err(Error::Storage(
-            "SourceBinding migration foreign-key check failed; old transaction retained",
+            "source schema migration foreign-key check failed; old transaction retained",
         ));
     }
     db(tx.execute(
-        "UPDATE store_meta SET value='55' WHERE key='schema_epoch'",
-        [],
+        "UPDATE store_meta SET value=?1 WHERE key='schema_epoch'",
+        [target.to_string()],
     ))?;
     db(tx.execute(
         "UPDATE schema_meta
-         SET schema_epoch=55,activation_epoch=55,migration_phase='ready',updated_at=?1
+         SET schema_epoch=?1,activation_epoch=?1,migration_phase='ready',updated_at=?2
          WHERE singleton=1",
-        [now()],
+        params![target, now()],
     ))?;
     db(tx.execute(
         "UPDATE migration_lease
-         SET holder_client_id=NULL,generation=generation+1,current_epoch=55,target_epoch=NULL,
-             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
-        [now()],
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=?1,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?2 WHERE singleton=1",
+        params![target, now()],
     ))?;
-    db(tx.pragma_update(None, "user_version", 55))?;
-    db(tx.commit())?;
-    Ok(())
+    db(tx.pragma_update(None, "user_version", target))?;
+    db(tx.commit())
 }
 
 fn migrate_event_delivery_cutover(c: &mut Connection) -> Result<()> {
