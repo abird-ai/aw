@@ -678,6 +678,66 @@ fn map_process_error(error: aw_process::Error) -> crate::Error {
     }
 }
 
+/// A trusted driver's already-prepared command and launch pins. No model
+/// arguments select this capability; the driver owns containment and policy.
+/// Process runtime still owns stdio, scope, launch and terminal facts.
+pub struct PreparedPipeLaunch<P = ()> {
+    command: Command,
+    stdin_open: bool,
+    pins: P,
+}
+
+impl<P> PreparedPipeLaunch<P> {
+    pub fn from_trusted_command(command: std::process::Command, stdin_open: bool, pins: P) -> Self {
+        Self {
+            command: Command::from(command),
+            stdin_open,
+            pins,
+        }
+    }
+
+    /// Transfer additional live authority/capability custody with this launch.
+    pub fn with_custody<A>(self, authority: A) -> PreparedPipeLaunch<(P, A)> {
+        PreparedPipeLaunch {
+            command: self.command,
+            stdin_open: self.stdin_open,
+            pins: (self.pins, authority),
+        }
+    }
+}
+
+/// Preserve the runtime's distinction between definite no-spawn and
+/// uncertain setup. Neither case fabricates a ProcessTerminal.
+#[derive(Debug)]
+pub enum PipeLaunchFailure {
+    NotStarted(crate::Error),
+    Unknown(crate::Error),
+}
+
+impl PipeLaunchFailure {
+    fn from_runtime(error: aw_process::Error) -> Self {
+        let not_started = matches!(
+            error,
+            aw_process::Error::Io(_)
+                | aw_process::Error::Limit(_)
+                | aw_process::Error::CancelledBeforeSpawn
+                | aw_process::Error::TimedOutBeforeSpawn
+        );
+        let error = map_process_error(error);
+        if not_started {
+            Self::NotStarted(error)
+        } else {
+            Self::Unknown(error)
+        }
+    }
+
+    pub fn into_error(self) -> crate::Error {
+        match self {
+            Self::NotStarted(error) | Self::Unknown(error) => error,
+        }
+    }
+}
+
 pub struct PipeProcess {
     process: aw_process::Process,
     spools: Option<ProcessSpoolAccess>,
@@ -765,6 +825,42 @@ impl PipeProcess {
         .await
     }
 
+    /// Consume a driver-prepared launch capability through the same Process
+    /// owner as PipeSpec. Pins stay live until the async launch returns.
+    /// No fallback to a layout-only command.
+    pub async fn spawn_prepared_until<P: Send + 'static>(
+        launch: PreparedPipeLaunch<P>,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
+        let PreparedPipeLaunch {
+            command,
+            stdin_open,
+            pins,
+        } = launch;
+        // The existing spawn control moves its level-triggered probe into
+        // the Linux launch lane with the command. Capture custody there,
+        // not merely in this awaiter: dropping the caller during launch
+        // must not close/reuse the driver's pinned descriptors.
+        let control = aw_process::SpawnControl::new(
+            deadline,
+            move || {
+                let _custody = &pins;
+                cancelled()
+            },
+            cancelled_signal,
+        );
+        Self::spawn_command_inner(
+            command,
+            stdin_open,
+            SpawnOutputTarget::None,
+            None,
+            Some(control),
+        )
+        .await
+    }
+
     async fn spawn_inner(
         spec: PipeSpec,
         target: SpawnOutputTarget,
@@ -772,10 +868,46 @@ impl PipeProcess {
         control: Option<aw_process::SpawnControl>,
     ) -> crate::Result<Self> {
         spec.validate()?;
+        let mut command = Command::new(spec.program);
+        command.args(spec.args).current_dir(spec.root).env_clear();
+        for (key, value) in spec.env {
+            command.env(key, value);
+        }
+        Self::spawn_command_inner(command, spec.stdin_open, target, event_sink, control)
+            .await
+            .map_err(PipeLaunchFailure::into_error)
+    }
 
-        // Validate/reserve product-owned output capabilities before external
-        // spawn. Only the tiny OutputSink adapter crosses into aw-process.
-        let output = match target {
+    async fn spawn_command_inner(
+        command: Command,
+        stdin_open: bool,
+        target: SpawnOutputTarget,
+        event_sink: Option<Arc<dyn ExecutionEventSink>>,
+        control: Option<aw_process::SpawnControl>,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
+        let output = Self::prepare_outputs(target).map_err(PipeLaunchFailure::NotStarted)?;
+        let process = aw_process::Process::spawn(
+            command,
+            aw_process::SpawnOptions {
+                stdin_open,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                event_sink,
+                control,
+            },
+        )
+        .await
+        .map_err(PipeLaunchFailure::from_runtime)?;
+        Ok(Self {
+            process,
+            spools: output.spools,
+        })
+    }
+
+    // Validate/reserve product-owned output capabilities before external
+    // spawn. Only the tiny OutputSink adapter crosses into aw-process.
+    fn prepare_outputs(target: SpawnOutputTarget) -> crate::Result<RuntimeOutput> {
+        Ok(match target {
             SpawnOutputTarget::Legacy(files) => {
                 {
                     let _quota_check = files.session_quota.lock().map_err(|_| {
@@ -835,32 +967,6 @@ impl PipeProcess {
                 stdout: None,
                 stderr: None,
             },
-        };
-
-        // The host chooses and authorizes executable/root/arguments/environment.
-        // Lifecycle-sensitive stdio/containment/spawn is finalized by aw-process.
-        let mut command = Command::new(spec.program);
-        command.args(spec.args).current_dir(spec.root).env_clear();
-        for (key, value) in spec.env {
-            command.env(key, value);
-        }
-
-        let process = aw_process::Process::spawn(
-            command,
-            aw_process::SpawnOptions {
-                stdin_open: spec.stdin_open,
-                stdout: output.stdout,
-                stderr: output.stderr,
-                event_sink,
-                control,
-            },
-        )
-        .await
-        .map_err(map_process_error)?;
-
-        Ok(Self {
-            process,
-            spools: output.spools,
         })
     }
 

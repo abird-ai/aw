@@ -50,7 +50,7 @@ minimal = ["jsonl"]
 # Full durable control-plane backend. Today this selects SQLite because Domain,
 # coordination, multi-user and distributed-resource commands require its full
 # capability set. Session-only JSONL is a separate lightweight backend.
-sqlite = ["dep:aw-store"]
+sqlite = ["dep:aw-store", "aw-host/source-effects"]
 durable = ["sqlite", "dep:aw-store-api", "dep:sha2", "dep:zeroize", "dep:getrandom", "dep:base64"]
 jsonl = ["dep:aw-store-jsonl", "dep:aw-store-api", "session-interop"]
 session-interop = ["dep:aw-session-format"]

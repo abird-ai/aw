@@ -405,8 +405,10 @@ dependencies = [
  "aw-agent-core",
  "aw-policy",
  "aw-session",
+ "aw-store",
  "aw-tools",
  "aw-tools-adapter",
+ "rusqlite",
  "sha2 0.10.9",
  "tokio",
 ]

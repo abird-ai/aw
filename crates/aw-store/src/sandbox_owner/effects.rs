@@ -21,6 +21,14 @@ use std::future::Future;
 pub trait SandboxEffectAuthority {
     fn policy(&self) -> &SandboxGrantPolicy;
     fn tool_ceiling(&self) -> &[NamedSourceAccess];
+
+    /// Compose the original synchronous authority owner's final admission
+    /// fence with the Store commit. A live external guard remains owned by
+    /// self through launch; a ToolBinding publication lock need not cross
+    /// an await. Its revocation after admission uses normal Process stop.
+    fn with_admission<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
+        admit()
+    }
 }
 
 /// Trusted host effect request, not a model selector. The existing effect
@@ -160,26 +168,47 @@ pub struct PreparedSandboxEffect<'a, P, A> {
     store: &'a SessionStore,
     request: SandboxEffectRequest,
     boundary: Boundary,
-    authority: A,
+    // Drop inert capability pins before the guard authorizing them.
     prepared: P,
+    authority: A,
 }
 
 impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
     pub fn plan(&self) -> &SandboxEffectPlan {
         &self.boundary.plan
     }
+
+    pub fn authority(&self) -> &A {
+        &self.authority
+    }
 }
 
 impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
-    /// One-shot handoff to the existing effect owner (e.g. Process::spawn).
-    /// The owner must have durable intent before invoking this boundary.
-    /// The guard is held through the start future, not the Process lifetime.
+    /// One-shot start whose future itself owns the complete start boundary.
+    /// The original effect owner must already have durable intent.
+    /// For queued/detached launch ownership use start_with_authority instead.
     /// A dropped/panicking start leaves the durable source claims unresolved.
     /// The result is returned even if launch failed: its owner must settle
     /// the lease according to actual start/terminal evidence.
     pub async fn start<R, F: Future<Output = R>>(
         self,
         start: impl FnOnce(P) -> F,
+    ) -> Result<(R, SandboxEffectLease<'a>)> {
+        self.start_with_authority(|prepared, authority| async move {
+            let result = start(prepared).await;
+            drop(authority);
+            result
+        })
+        .await
+    }
+
+    /// For a start handed to another execution owner (e.g. the bounded
+    /// Process spawn lane), transfer the live authority together with the
+    /// prepared capability. That owner must retain it through actual launch,
+    /// even if this caller stops awaiting the result.
+    pub async fn start_with_authority<R, F: Future<Output = R>>(
+        self,
+        start: impl FnOnce(P, A) -> F,
     ) -> Result<(R, SandboxEffectLease<'a>)> {
         let Self {
             store,
@@ -188,7 +217,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
             authority,
             prepared,
         } = self;
-        let barrier = {
+        let barrier = authority.with_admission(|| {
             let policy = authority.policy();
             let tool_ceiling = authority.tool_ceiling();
             let mut connection = store.connection()?;
@@ -210,8 +239,8 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
             let barrier =
                 store.acquire_source_mutation_barrier_in(&tx, &set, &request.effect_id)?;
             db(tx.commit())?;
-            barrier
-        };
+            Ok(barrier)
+        })?;
         let write_capable = boundary
             .plan
             .grant
@@ -226,8 +255,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
             effect_id: request.effect_id,
             write_capable,
         };
-        let result = start(prepared).await;
-        drop(authority);
+        let result = start(prepared, authority).await;
         Ok((result, lease))
     }
 }
@@ -324,7 +352,7 @@ impl SessionStore {
         request.canonicalize(self)?;
         let implementation = registry.get(driver)?;
         let authority = resolve(&request)?;
-        let boundary = {
+        let boundary = authority.with_admission(|| {
             let policy = authority.policy();
             let tool_ceiling = authority.tool_ceiling();
             let mut connection = self.connection()?;
@@ -339,8 +367,8 @@ impl SessionStore {
             )?;
             boundary.mutation_set()?.require_unleased_in(&tx)?;
             db(tx.commit())?;
-            boundary
-        };
+            Ok(boundary)
+        })?;
         let prepared = prepare(&implementation, &boundary.plan, &authority)?;
         Ok(PreparedSandboxEffect {
             store: self,

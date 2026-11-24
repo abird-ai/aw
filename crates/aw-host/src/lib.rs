@@ -29,6 +29,9 @@ pub use aw_policy::{
 #[cfg(feature = "sessions")]
 pub use aw_session::{CoordinatorBinding, Sessions};
 
+#[cfg(feature = "source-effects")]
+pub mod source_process;
+
 #[derive(Clone, Debug)]
 pub struct AuthenticatedToolGrantEvidence {
     actor: PrincipalId,

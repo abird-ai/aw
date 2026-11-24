@@ -34,8 +34,8 @@ recovery custody, Store-local complete-set source mutation barriers, receipt-bou
 checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic
 checkpoint publication, receipt-bound non-destructive restore preparation/restart inspection
 and atomic held Agent + fresh source-bearing Sandbox restore publication, plus v58 independent
-SandboxGrant evidence/source-access preflight and typed SandboxDriver/fenced source-effect
-handoff, are implemented locally.
+SandboxGrant evidence/source-access preflight, typed SandboxDriver/fenced source-effect
+handoff and original PipeProcess source-aware host composition are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1552,11 +1552,54 @@ All Sandbox owner tests **4/4**, checkpoint/capture/restore **4/4**, receipt/bar
 SourceDriver **1/1 each**, strict Core/Store all-target Clippy, workspace all-target
 check, fmt and scoped diff-check are green.
 
-**Next Phase-3 slice:** integrate the typed handoff into the concrete trusted host
-policy/realization and original Process/tool effect owners, retaining the held gate
-until every applicable runtime path participates. History-only baseline, custom
-ACL/task, exact candidate/retention and effect recovery, quiescent binding mutation,
-Vault and checkpoint/Sandbox host RPCs remain pending. Store schema is v58.
+The SQLite-only aw-host source-effects feature now consumes the exact prepared source
+effect through the original PipeProcess / aw-process owner. ProcessToolAuthority
+composes the independent live source-policy guard with the original authenticated
+ToolBindingAuthority evidence (exact Process effect, actor and Sandbox scope).
+Both read-side preflight and the final source-claim commit use the existing synchronous
+ToolBinding publication fence; no synchronous lock crosses await. Revocation after
+that admission uses the original cancellation/authority-loss signal through the spawn
+control and the original Process owner's wait. No new ToolPolicy grant is minted.
+
+PreparedPipeLaunch carries the trusted driver's already-built command and typed
+launch pins, not a layout-only PipeSpec fallback. All PipeSpec/driver commands share
+the same existing output preparation and aw-process spawn path. start_with_authority
+transfers the source-policy guard together with the capability into the existing
+spawn control's lane-owned cancellation probe; caller drop during queued/actual spawn
+cannot release those pins before the lane finishes. Ordinary start keeps its guard
+in the owning start future for non-detached effects. No new queue, Process lifecycle,
+physical Sandbox implementation or per-launch registry is introduced.
+
+PipeLaunchFailure preserves definite NotStarted vs Unknown from the actual shared
+runtime, without fabricating ProcessTerminal. The original effect owner receives the
+actual PipeProcess plus source custody, or the launch failure plus source custody,
+and must record its original effect fact before settling. SourceProcessLease uses
+the actual known ProcessTerminal and reviewed driver proof of source quiescence;
+a stop operation reaching a live scope or an empty Unix process-group observation
+alone cannot prove descendants cannot still mutate sources. Unproven quiescence
+preserves Unknown. Output completeness remains independent of physical settlement.
+NotStarted releases without Sandbox rev; settled write-capable effects advance it
+once through the existing Store settlement transaction. Terminal facts remain with
+the original owner, including if settlement fails.
+
+Grouped host regression **1/1** executes a real fixed trusted fixture Process with
+current ToolBindingAuthority, driver pins and a real disk Store; revoked preparation,
+pre-cancel and OS refusal, actual source mutation, original receipt, post-revocation
+settlement and unproven quiescence across restart. It is not a proof of arbitrary
+shell containment. No model/RPC launch path has been promoted. Existing physical
+Bubblewrap BwrapPlan owns its own child; do not route it here by creating a second
+Process owner or bypassing frozen physical work. Held source-bearing Agent admission
+still refuses legacy Turn/tool/queue routes. Host **14/14**, existing PipeProcess
+**27/27**, Sandbox owner **4/4**, strict Host/Adapter/Store all-target Clippy,
+workspace all-target check, minimal build and fmt/diff-check are green. Minimal
+normal dependency tree excludes aw-store/rusqlite; minimal check retains the
+two existing CLI dead-code warnings (configured_agent_options/local_provider_account).
+
+**Next Phase-3 slice:** connect exact original durable effect intent/terminal custody
+and recovery to the source-effect claim, then wire reviewed concrete containment
+and the original tool/Job dispatch paths before opening held admission. History-only
+baseline, custom ACL/task, exact candidate/retention reconciliation, quiescent binding
+mutation, Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 
