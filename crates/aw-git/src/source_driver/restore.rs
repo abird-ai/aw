@@ -26,6 +26,52 @@ struct RestorePlan {
     parent_stamp: String,
 }
 
+/// Independently approved physical locations for one named restore. These
+/// identities are observations, not authority: the host must hold the live
+/// repository and destination fence across planning, effects and publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRestoreLocation {
+    pub name: SourceName,
+    pub repository: PathBuf,
+    pub repository_identity: (u64, u64),
+    pub target: PathBuf,
+    pub parent_identity: (u64, u64),
+}
+
+impl GitRestoreLocation {
+    fn check_directories(&self) -> Result<()> {
+        target_text(&self.target)?;
+        let parent = self
+            .target
+            .parent()
+            .ok_or(Error::Denied("Git restore destination has no parent"))?;
+        for (path, expected) in [
+            (self.repository.as_path(), self.repository_identity),
+            (parent, self.parent_identity),
+        ] {
+            if !path.is_absolute() || path.canonicalize()? != path {
+                return Err(Error::Denied(
+                    "Git restore approval requires canonical directories",
+                ));
+            }
+            let pin = aw_platform::DirectoryIdentity::open(path)?;
+            if pin.identity()? != expected || !pin.is_current(path)? {
+                return Err(Error::Conflict("approved Git restore directory changed"));
+            }
+        }
+        // An approved checkout root is not permission to discover a
+        // repository by ascending into its unapproved ancestors.
+        let dotgit = self.repository.join(".git");
+        let metadata = fs::symlink_metadata(&dotgit)?;
+        if !(metadata.is_file() || metadata.is_dir()) || aw_platform::path_is_link_like(&dotgit)? {
+            return Err(Error::Denied(
+                "Git restore approval requires an exact checkout root",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn target_text(path: &Path) -> Result<&str> {
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(Error::Denied(
@@ -492,9 +538,71 @@ impl GitSourceDriver {
         prepare_id: &str,
     ) -> Result<PreparedSourceOperation> {
         let repo = self.repository(repository)?;
-        verify_retained(&repo, anchor)?;
+        Self::plan_restore_in(&repo, anchor, target, prepare_id)
+    }
+
+    /// Plan only at the exact independently approved checkout and private
+    /// destination parent. Never resolve a persisted locator as authority.
+    pub fn plan_restore_approved(
+        &self,
+        location: &GitRestoreLocation,
+        anchor: &GitSourceAnchor,
+        prepare_id: &str,
+    ) -> Result<PreparedSourceOperation> {
+        if location.name != anchor.name {
+            return Err(Error::Denied("Git restore approval names another source"));
+        }
+        location.check_directories()?;
+        let repo = self.repository(&location.repository)?;
+        if repo.root() != location.repository
+            || repo.root_identity().map_err(git_error)? != location.repository_identity
+        {
+            return Err(Error::Conflict(
+                "Git restore approval differs from repository root",
+            ));
+        }
+        Self::plan_restore_in(&repo, anchor, &location.target, prepare_id)
+    }
+
+    /// Before executing or inspecting any original descriptor, require the
+    /// current host-approved locations to match it exactly. No Git probe
+    /// at an unapproved persisted origin or destination.
+    pub fn verify_restore_location(
+        &self,
+        location: &GitRestoreLocation,
+        anchor: &GitSourceAnchor,
+        prepared: &PreparedSourceOperation,
+    ) -> Result<()> {
+        let plan = RestorePlan::decode(prepared)?;
+        let (_, origin) = materialization_parts(&plan.origin)?;
+        if location.name != anchor.name
+            || plan.anchor != *anchor
+            || origin != location.repository
+            || plan.target != location.target
+        {
+            return Err(Error::Denied(
+                "Git restore descriptor differs from approved locations",
+            ));
+        }
+        location.check_directories()?;
+        plan.check_parent()?;
+        self.verify_materialization(
+            &plan.origin,
+            &location.repository,
+            location.repository_identity,
+        )?;
+        Ok(())
+    }
+
+    fn plan_restore_in(
+        repo: &Repository,
+        anchor: &GitSourceAnchor,
+        target: &Path,
+        prepare_id: &str,
+    ) -> Result<PreparedSourceOperation> {
+        verify_retained(repo, anchor)?;
         let origin = binding_for_repo(
-            &repo,
+            repo,
             anchor.name.clone(),
             anchor.access,
             anchor.checkpoint_policy,
@@ -505,8 +613,8 @@ impl GitSourceDriver {
             target: target.to_owned(),
             parent_stamp: parent_stamp(target)?,
         };
-        check_fresh(&repo, target)?;
-        plan.trees(&repo)?;
+        check_fresh(repo, target)?;
+        plan.trees(repo)?;
         plan.prepare(prepare_id)
     }
 

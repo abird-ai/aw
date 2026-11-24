@@ -46,8 +46,9 @@ exact closed-Sandbox materialization reconciliation with proven retained-layout 
 managed Git restore-materialization release with original Applied restore provenance,
 metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
 unpublished capture/restore candidate reconciliation, shared custom initial history
-ACL construction, captured-source restore initial-task custody/publication and
-task-only baseline restore/recovery are implemented locally.
+ACL construction, captured-source restore initial-task custody/publication,
+task-only baseline restore/recovery and the concrete fenced Git checkpoint
+restore host consumer are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2118,11 +2119,45 @@ checkpoint/capture/restore **4/4**, construction receipt **1/1**, task create **
 Sandbox **4/4**, SecretStore **6/6**, queue restart/missing master **2/2**; strict
 Store all-target Clippy, workspace all-target check, fmt and scoped diff-check green.
 
+Concrete captured-source Git checkpoint restore now composes the registered
+`GitSourceDriver` with the existing Store owners in
+`aw-host::source_checkpoint::GitCheckpointRestoreHost` (git-source-effects).
+Fresh restore replays Applied before selecting layout or asking for authority;
+otherwise the trusted host supplies an inert layout and one live, independent
+whole-set `GitRestoreFence` covering current disclosure, repository
+administration/retention, destination isolation and physical/provider authority.
+The driver checks approved canonical checkout and parent identities, exact
+anchor/descriptor locations, and refuses ambient ancestor discovery. All named
+locations must match the captured SourceSet, without overlapping destinations
+or origins. Plan read-only, then use the original durable Prepared receipt
+and source barrier before worktree effects. The actual host fence remains
+held through driver revalidation, fresh Agent/Sandbox/history/optional initial
+task/Applied publication and cleanup settlement. A saved fence handle, directory
+pin or Git worktree lock is not authority. Explicit resume freshly authorizes
+and inspects the original descriptors only; no blind retry, replan or new
+candidate. Explicit abandon invokes exact Git candidate release under current
+cleanup authority through Rejected, with Applied protected. No new schema,
+registry, execution ledger or Agent-to-Sandbox rebinding.
+
+One grouped disk regression captures two dirty Git sources via the ordinary
+Store owners, rejects incomplete approval before effects, aborts final
+publication, reopens the Store, refuses a different destination, resumes the
+original materializations with a live guard held through publication, replays
+Applied and abandons a second unpublished candidate. Both original HEADs
+and indexes remain unchanged. Host **16/16**, Git **32/32**, Store checkpoint
+owner **4/4**; strict Host/Git all-target/all-feature Clippy, workspace all-target/all-feature
+check, scoped rustfmt and diff-check green. This is a trusted blocking host composition seam, not production
+authority provisioning or RPC admission; the embedding authority owner must
+supply the real physical/provider fence and ensure cross-Store/alias exclusion.
+Only captured Git SourceSets are supported here; effectful baseline, mixed
+driver coordination and arbitrary partial/scratch cleanup remain separate.
+Source-bearing Agent/Turn admission stays held.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer an independent remaining production host/restore composition
-or effectful baseline Prepared custody boundary; do not add speculative admission
-layers. Independent host approval provisioning, effectful baseline materialization,
+While blocked, prefer independent production authority/cleanup composition or
+effectful baseline Prepared custody; do not add speculative admission layers.
+Independent host approval provisioning, effectful baseline materialization,
 incomplete-effect reconciliation, multi-source policy, general unpublished partial/
 scratch cleanup and production cleanup composition/physical authority, final-source
 removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.

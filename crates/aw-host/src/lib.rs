@@ -33,6 +33,8 @@ pub use aw_session::{CoordinatorBinding, Sessions};
 pub mod source_approval;
 #[cfg(feature = "source-effects")]
 pub mod source_authority;
+#[cfg(feature = "git-source-effects")]
+pub mod source_checkpoint;
 #[cfg(feature = "source-effects")]
 pub mod source_filesystem;
 #[cfg(feature = "git-source-effects")]

@@ -6,6 +6,7 @@
 mod restore;
 mod tree;
 
+pub use restore::GitRestoreLocation;
 use tree::{PrivateIndexes, Snapshot};
 
 use crate::{valid_object_id, Error as GitError, Repository};
