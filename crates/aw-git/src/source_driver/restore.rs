@@ -183,6 +183,44 @@ impl RestorePlan {
         Ok(())
     }
 
+    fn require_binding(&self, binding: &SourceBinding) -> Result<()> {
+        let (_, path) = materialization_parts(binding)?;
+        let mut expected = self.origin.clone();
+        expected
+            .materialization
+            .clone_from(&binding.materialization);
+        if path != self.target || expected != *binding {
+            return Err(Error::Conflict(
+                "Git retirement differs from original restore binding",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_location(
+        &self,
+        driver: &GitSourceDriver,
+        location: &GitRestoreLocation,
+    ) -> Result<()> {
+        let (_, origin) = materialization_parts(&self.origin)?;
+        if location.name != self.anchor.name
+            || origin != location.repository
+            || self.target != location.target
+        {
+            return Err(Error::Denied(
+                "Git restore descriptor differs from approved locations",
+            ));
+        }
+        location.check_directories()?;
+        self.check_parent()?;
+        driver.verify_materialization(
+            &self.origin,
+            &location.repository,
+            location.repository_identity,
+        )?;
+        Ok(())
+    }
+
     fn origin_repository(&self, driver: &GitSourceDriver) -> Result<Repository> {
         self.check_parent()?;
         let repo = driver.binding_repository(&self.origin)?;
@@ -574,24 +612,28 @@ impl GitSourceDriver {
         prepared: &PreparedSourceOperation,
     ) -> Result<()> {
         let plan = RestorePlan::decode(prepared)?;
-        let (_, origin) = materialization_parts(&plan.origin)?;
-        if location.name != anchor.name
-            || plan.anchor != *anchor
-            || origin != location.repository
-            || plan.target != location.target
-        {
+        if plan.anchor != *anchor {
             return Err(Error::Denied(
-                "Git restore descriptor differs from approved locations",
+                "Git restore descriptor differs from checkpoint anchor",
             ));
         }
-        location.check_directories()?;
-        plan.check_parent()?;
-        self.verify_materialization(
-            &plan.origin,
-            &location.repository,
-            location.repository_identity,
-        )?;
-        Ok(())
+        plan.verify_location(self, location)
+    }
+
+    /// Verify the exact independently approved origin/target of a published
+    /// restore before retirement. The original Prepared descriptor carries
+    /// the anchor identity even after checkpoint retention has been released.
+    /// This is read-only preflight, not proof that the materialization was
+    /// released or authority to remove it.
+    pub fn verify_restored_materialization_location(
+        &self,
+        location: &GitRestoreLocation,
+        prepared: &PreparedSourceOperation,
+        binding: &SourceBinding,
+    ) -> Result<()> {
+        let plan = RestorePlan::decode(prepared)?;
+        plan.require_binding(binding)?;
+        plan.verify_location(self, location)
     }
 
     fn plan_restore_in(
@@ -688,16 +730,7 @@ impl GitSourceDriver {
         binding: &SourceBinding,
     ) -> Result<()> {
         let plan = RestorePlan::decode(prepared)?;
-        let (_, path) = materialization_parts(binding)?;
-        let mut expected = plan.origin.clone();
-        expected
-            .materialization
-            .clone_from(&binding.materialization);
-        if path != plan.target || expected != *binding {
-            return Err(Error::Conflict(
-                "Git retirement differs from original restore binding",
-            ));
-        }
+        plan.require_binding(binding)?;
 
         // The checkpoint may already be retired. The original descriptor
         // and checkout binding suffice for ownership; retained object

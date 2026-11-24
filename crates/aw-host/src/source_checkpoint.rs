@@ -8,8 +8,13 @@ use aw_agent_core::{
 };
 use aw_git::source_driver::{GitRestoreLocation, GitSourceAnchor, GitSourceDriver};
 use aw_store::{
-    CheckpointRestoreRequest, CheckpointRestoreResult, InspectedCheckpointRestore, SessionBinding,
-    SessionStore,
+    CheckpointRestoreRequest, CheckpointRestoreResult, InspectedCheckpointRestore, SandboxSnapshot,
+    SessionBinding, SessionStore, VersionedSourceBinding,
+};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Component, Path},
 };
 
 /// Live, independently authorized, whole-layout physical/provider fence.
@@ -17,7 +22,9 @@ use aw_store::{
 /// The trusted authority owner must guarantee current actor/source disclosure,
 /// repository administration and retention, destination isolation (including
 /// aliases and other Stores), and the permitted restore or cleanup effect until
-/// this guard drops. Locations are immutable, in canonical anchor-name order.
+/// this guard drops. Retirement additionally requires authority over the entire
+/// retained execution layout, including any external physical dependencies.
+/// Locations are immutable, in canonical source-name order.
 /// Neither a path pin, Git worktree lock nor a saved evidence handle suffices.
 /// Acquisition before Prepared must be read-only, not a materializing effect.
 pub trait GitRestoreFence {
@@ -53,6 +60,15 @@ fn approved_anchors(
             "Git restore approval must cover the exact named SourceSet",
         ));
     }
+    require_disjoint_locations(locations)?;
+    anchors
+        .anchors
+        .iter()
+        .map(GitSourceAnchor::try_from)
+        .collect()
+}
+
+fn require_disjoint_locations(locations: &[GitRestoreLocation]) -> Result<()> {
     // Cheap lexical checks in addition to (not in place of) the host's
     // physical alias/administration/whole-layout isolation guarantee.
     for (i, location) in locations.iter().enumerate() {
@@ -70,11 +86,77 @@ fn approved_anchors(
             return Err(Error::Denied("Git restore destination overlaps an origin"));
         }
     }
-    anchors
-        .anchors
-        .iter()
-        .map(GitSourceAnchor::try_from)
-        .collect()
+    Ok(())
+}
+
+/// Only layouts whose complete release can be proven without deleting any
+/// additional user or host files. The physical fence must exclude outside
+/// users, aliases and mounts, not merely hold the directory open.
+enum ManagedGitLayout<'a> {
+    Checkout(&'a Path),
+    Directory(&'a Path),
+}
+
+impl<'a> ManagedGitLayout<'a> {
+    fn check(sandbox: &'a SandboxSnapshot, locations: &[GitRestoreLocation]) -> Result<Self> {
+        let root = sandbox.tool_root.as_path();
+        let cwd = sandbox
+            .working_directory
+            .strip_prefix(root)
+            .map_err(|_| Error::Denied("Git retirement requires cwd inside the managed layout"))?;
+        if cwd
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(Error::Denied(
+                "Git retirement requires a contained working directory",
+            ));
+        }
+        if let [location] = locations {
+            if location.target == root {
+                return Ok(Self::Checkout(root));
+            }
+        }
+        if locations.is_empty()
+            || locations
+                .iter()
+                .any(|location| location.target.parent() != Some(root))
+            || root.canonicalize()? != root
+        {
+            return Err(Error::Denied("unsupported managed Git retirement layout"));
+        }
+        // The approved parent was already identity-checked by the driver.
+        // Refuse foreign entries before deleting any managed checkout.
+        let targets = locations
+            .iter()
+            .map(|location| location.target.as_path())
+            .collect::<HashSet<_>>();
+        for entry in fs::read_dir(root)? {
+            if !targets.contains(entry?.path().as_path()) {
+                return Err(Error::Conflict(
+                    "managed Git layout contains unrelated files",
+                ));
+            }
+        }
+        Ok(Self::Directory(root))
+    }
+
+    fn require_released(self) -> Result<()> {
+        match self {
+            Self::Checkout(root) => match fs::symlink_metadata(root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+                Ok(_) => Err(Error::Conflict("managed Git checkout remains present")),
+            },
+            Self::Directory(root) => {
+                if root.canonicalize()? != root || fs::read_dir(root)?.next().transpose()?.is_some()
+                {
+                    return Err(Error::Conflict("managed Git layout is not empty"));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 fn plan(
@@ -280,6 +362,62 @@ impl<'a> GitCheckpointRestoreHost<'a> {
                 for source in &sources.sources {
                     driver.release_prepared_restore(&source.prepared)?;
                 }
+                Ok(fence)
+            })
+    }
+
+    /// Reconcile a closed, retained Sandbox created by a captured-Git
+    /// restore. Only the original, unmodified binding set is supported.
+    /// Authorize the whole layout and exact Applied descriptors independently.
+    /// Keep the external fence through Store settlement; never remove shared
+    /// backing or unrelated files. Already released layouts do not reauthorize.
+    pub fn reconcile_closed_sandbox<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        authorize: impl FnOnce(
+            &SandboxSnapshot,
+            &[VersionedSourceBinding],
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        self.store
+            .sandbox_reconcile_closed_sources(actor, sandbox, |snapshot, bindings| {
+                let prepared = self
+                    .store
+                    .sandbox_restore_preparation(actor, &snapshot.canonical_ref)?;
+                let fence = authorize(snapshot, bindings, &prepared)?;
+                let locations = fence.locations();
+                if prepared.sources.len() != bindings.len()
+                    || bindings.len() != locations.len()
+                    || bindings.iter().zip(&prepared.sources).zip(locations).any(
+                        |((binding, source), location)| {
+                            binding.binding_rev != 1
+                                || binding.binding.name != source.name
+                                || source.name != location.name
+                        },
+                    )
+                {
+                    return Err(Error::Conflict(
+                        "retained Git bindings differ from the original restore",
+                    ));
+                }
+                require_disjoint_locations(locations)?;
+                let driver = self.store.source_driver(self.driver)?;
+                for ((binding, source), location) in
+                    bindings.iter().zip(&prepared.sources).zip(locations)
+                {
+                    driver.verify_restored_materialization_location(
+                        location,
+                        &source.prepared,
+                        &binding.binding,
+                    )?;
+                }
+                let layout = ManagedGitLayout::check(snapshot, locations)?;
+                for (binding, source) in bindings.iter().zip(&prepared.sources) {
+                    driver.release_restored_materialization(&source.prepared, &binding.binding)?;
+                }
+                layout.require_released()?;
                 Ok(fence)
             })
     }
@@ -628,7 +766,7 @@ mod tests {
             .is_err());
         drop(store);
         clear_failure();
-        let store = SessionStore::open_with_sources(&state, registry, limit).unwrap();
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
         let host = GitCheckpointRestoreHost::new(&store, &driver);
         let other = root.join("wrong");
         private_dir(&other);
@@ -693,6 +831,117 @@ mod tests {
             panic!("terminal abandonment authorized again")
         })
         .unwrap();
+
+        // Retire the published layout through its original Agent, queue and
+        // Sandbox owners. The checkpoint need not retain its anchor rows.
+        let sandbox = restored.agent.sandbox_ref.as_deref().unwrap();
+        assert!(host
+            .reconcile_closed_sandbox::<Fence<'_>>(&actor, sandbox, |_, _, _| {
+                panic!("open Sandbox cleanup authorized")
+            })
+            .is_err());
+        let agent = store
+            .agent_execution_binding(&actor, &restored.agent.canonical_ref)
+            .unwrap();
+        let queue = store.actor_queue_list(&actor, agent.session_id()).unwrap();
+        assert_eq!(queue.len(), 1);
+        store
+            .actor_queue_delete(
+                &actor,
+                agent.session_id(),
+                &queue[0].request.request_id,
+                queue[0].request.writer_epoch,
+            )
+            .unwrap();
+        store
+            .agent_request_close(&actor, &restored.agent.canonical_ref, None)
+            .unwrap();
+        let closed_agent = store
+            .agent_finish_close(&actor, &restored.agent.canonical_ref)
+            .unwrap();
+        let closed = store.sandbox_close(&actor, sandbox, None).unwrap();
+        store
+            .checkpoint_delete(&actor, &request.checkpoint)
+            .unwrap();
+        {
+            let _guard = authority.read().unwrap();
+            store
+                .checkpoint_reconcile_retired_sources(&actor, &request.checkpoint, |set| {
+                    for anchor in &set.anchors {
+                        git_driver.release_retired_anchor(
+                            &source_root.join(anchor.name.as_str()),
+                            &GitSourceAnchor::try_from(anchor)?,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(host
+            .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
+                Ok(fence(locations(&other), 3))
+            })
+            .is_err());
+        let foreign = destination.join("unrelated");
+        fs::write(&foreign, b"keep").unwrap();
+        assert!(host
+            .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
+                Ok(fence(locations(&destination), 3))
+            })
+            .is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+        assert!(destination.join("code").exists() && destination.join("data").exists());
+        fs::remove_file(&foreign).unwrap();
+
+        // A real partial release leaves the whole original layout reserved.
+        // Later user work is not discarded even when an earlier checkout
+        // was removed successfully.
+        let modified = destination.join("data/tracked");
+        fs::write(&modified, b"user work").unwrap();
+        assert!(host
+            .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
+                Ok(fence(locations(&destination), 3))
+            })
+            .is_err());
+        assert!(!destination.join("code").exists());
+        assert_eq!(fs::read(&modified).unwrap(), b"user work");
+        assert_eq!(store.sandbox_get(&actor, sandbox).unwrap(), closed);
+        assert!(store
+            .create(&actor, "retained layout", layout(&destination))
+            .is_err());
+        drop(store);
+
+        // The original Applied descriptors and closed binding set survive
+        // restart, retirement and a lower new-admission limit.
+        let store =
+            SessionStore::open_with_sources(&state, registry, SourceSetLimit::new(1).unwrap())
+                .unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        fs::write(&modified, b"data").unwrap();
+        let released = host
+            .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
+                Ok(fence(locations(&destination), 3))
+            })
+            .unwrap();
+        assert!(released.sources.is_empty());
+        assert_eq!(released.rev, closed.rev + 1);
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        assert_eq!(
+            host.reconcile_closed_sandbox::<Fence<'_>>(&actor, sandbox, |_, _, _| {
+                panic!("released Sandbox cleanup authorized again")
+            })
+            .unwrap(),
+            released
+        );
+        assert_eq!(
+            store
+                .agent_get(&actor, &restored.agent.canonical_ref)
+                .unwrap(),
+            closed_agent
+        );
+        assert!(store
+            .activate(&actor, agent.session_id(), agent.branch_id())
+            .is_err());
         assert!(authority.try_write().is_ok());
         for (name, head) in ["code", "data"].into_iter().zip(original_heads) {
             let repo = source_root.join(name);

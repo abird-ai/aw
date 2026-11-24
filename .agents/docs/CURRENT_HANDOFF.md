@@ -47,8 +47,8 @@ managed Git restore-materialization release with original Applied restore proven
 metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
 unpublished capture/restore candidate reconciliation, shared custom initial history
 ACL construction, captured-source restore initial-task custody/publication,
-task-only baseline restore/recovery and the concrete fenced Git checkpoint
-restore host consumer are implemented locally.
+task-only baseline restore/recovery, concrete fenced Git checkpoint restore
+and managed closed-Sandbox retirement host consumers are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2152,6 +2152,32 @@ supply the real physical/provider fence and ensure cross-Store/alias exclusion.
 Only captured Git SourceSets are supported here; effectful baseline, mixed
 driver coordination and arbitrary partial/scratch cleanup remain separate.
 Source-bearing Agent/Turn admission stays held.
+
+Managed closed-Sandbox Git retirement now composes the original Store
+`sandbox_reconcile_closed_sources` and Applied restore-provenance lookup with
+`GitCheckpointRestoreHost::reconcile_closed_sandbox`. The independent whole-layout
+`GitRestoreFence` covers exact original source/parent identities and physical
+cleanup authority through the existing settlement transaction. Shared driver
+checks bind the approved origin/target and retained binding to the original
+descriptor even after checkpoint-anchor release. Only the complete unchanged
+initial Git binding set is supported; changed generations, mismatched locations
+and overlapping destinations refuse. Support one managed checkout root or a
+private directory whose direct children are exactly the managed checkout
+locations, with cwd contained in the root. Foreign entries refuse before any
+removal. Exact driver release proves each worktree/registration absent, then
+the entire root must be absent or empty under the live fence. No parent removal,
+unrelated-file deletion, broad prune, shared backing GC or new cleanup ledger.
+Partial cleanup keeps the original full binding set and layout reservation;
+reconcile only that custody, including after restart and a lower admission
+limit. Already released Sandboxes replay without another authorization or probe.
+The extended grouped Host regression uses two real dirty Git restores, actual
+checkpoint retention release, normal Agent/queue/Sandbox close, wrong location
+and foreign file refusal, real partial cleanup with later user work preserved,
+and exact recovery/replay. Host **16/16**, Git **32/32**, strict affected
+all-target/all-feature Clippy, workspace all-target/all-feature check and scoped
+fmt/diff passed. Production physical/provider fences remain supplied
+by the embedding authority owner; arbitrary layouts, changed bindings, mixed
+drivers and general partial/scratch cleanup are not promoted.
 
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
