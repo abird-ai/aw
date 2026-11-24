@@ -3043,6 +3043,20 @@ pub(crate) fn create_in_workspace_with_ids_tx(
     target: Option<SessionExecutionTarget>,
     ids: SessionCandidateIds,
 ) -> Result<(SessionInfo, BranchInfo)> {
+    create_in_workspace_with_ids_and_sandbox_tx(c, owner, title, b, workspace, target, ids, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_in_workspace_with_ids_and_sandbox_tx(
+    c: &Connection,
+    owner: &PrincipalId,
+    title: &str,
+    b: &SessionBinding,
+    workspace: &str,
+    target: Option<SessionExecutionTarget>,
+    ids: SessionCandidateIds,
+    fresh: Option<&crate::sandbox_owner::FreshSandbox>,
+) -> Result<(SessionInfo, BranchInfo)> {
     let user = ensure_user_for_principal(c, owner)?;
     let allowed:Option<(String,String)>=db(c.query_row("SELECT w.domain_id,w.kind FROM workspaces w JOIN domain_memberships dm ON dm.domain_id=w.domain_id WHERE w.workspace_id=?1 AND w.archived_at IS NULL AND dm.user_id=?2 AND dm.status='active'",params![workspace,user],|r|Ok((r.get(0)?,r.get(1)?))).optional())?;
     let Some((workspace_domain, workspace_kind)) = allowed else {
@@ -3156,10 +3170,11 @@ pub(crate) fn create_in_workspace_with_ids_tx(
         Some(owner),
         serde_json::json!({"session_id":session,"branch_id":branch,"head":root,"workspace_id":workspace,"target":target}),
     )?;
-    crate::agent_owner::created(
+    crate::agent_owner::created_with_fresh_sandbox(
         c,
         crate::agent_owner::AgentKey::new(&session, &branch),
         None,
+        fresh,
     )?;
     Ok((session_in(c, &session)?, branch_in(c, &session, &branch)?))
 }

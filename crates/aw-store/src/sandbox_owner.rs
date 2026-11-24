@@ -8,8 +8,8 @@ use crate::{
     db, durability, id, now, session_in, user_for_principal, workspace_writer, Error, PrincipalId,
     Result, SessionBinding, SessionStore,
 };
-use aw_agent_core::{SourceBinding, SourceSetLimit};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use aw_agent_core::{SourceBinding, SourceDriverRegistry, SourceSetLimit};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -319,12 +319,174 @@ fn insert_sandbox(
     Ok(canonical)
 }
 
+/// Reject a known existing layout for an isolated construction. The
+/// trusted driver/host still owns physical isolation (including aliases).
+pub(crate) fn require_fresh_layout_in(
+    connection: &Connection,
+    project_ref: &str,
+    binding: &SessionBinding,
+) -> Result<()> {
+    let project = parse_project_ref(project_ref)?;
+    let layout = layout(binding)?;
+    let exists: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sandboxes_current
+         WHERE domain_handle=?1 AND identity_handle=?2 AND project_handle=?3
+           AND lifecycle='open' AND layout_digest=?4
+           AND working_directory=?5 AND tool_root=?6)",
+        params![
+            project.domain,
+            project.identity,
+            project.project,
+            layout.digest,
+            layout.working_directory,
+            layout.tool_root
+        ],
+        |row| row.get(0),
+    ))?;
+    if exists {
+        return Err(Error::Conflict(
+            "isolated construction requires a fresh Sandbox layout",
+        ));
+    }
+    Ok(())
+}
+
+/// Constructor-owned fresh Sandbox identity. Only its publication owner can
+/// mint this token; ordinary layout selection cannot attach source-bearing
+/// state or reinterpret a fresh candidate as a shared Sandbox.
+pub(crate) struct FreshSandbox {
+    reference: String,
+}
+
+pub(crate) fn publish_fresh_in(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    canonical_ref: &str,
+    binding: &SessionBinding,
+    sources: &[SourceBinding],
+    registry: &SourceDriverRegistry,
+    limit: SourceSetLimit,
+) -> Result<FreshSandbox> {
+    source_bindings::validate_set(limit, registry, sources)?;
+    let key = parse_sandbox_ref(canonical_ref)?;
+    authorize_project(tx, actor, &key.project, true)?;
+    let reference = insert_sandbox(
+        tx,
+        &key.project,
+        &key.sandbox,
+        None,
+        &layout(binding)?,
+        Some(actor),
+    )?;
+    source_bindings::insert(tx, &reference, sources)?;
+    Ok(FreshSandbox { reference })
+}
+
+/// Attach only as part of the original Agent creation. Source-bearing
+/// execution remains held until the grant/realization owner can admit it.
+pub(crate) fn bind_fresh_initial_in(
+    connection: &Connection,
+    session: &str,
+    branch: &str,
+    fresh: &FreshSandbox,
+) -> Result<()> {
+    if connection.is_autocommit() {
+        return Err(Error::Storage(
+            "fresh Sandbox binding requires the construction transaction",
+        ));
+    }
+    let (project, expected, current, rev, lifecycle) =
+        agent_project_and_layout(connection, session, branch)?;
+    let sandbox = snapshot_row(connection, &fresh.reference)?;
+    let used: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_state_current WHERE sandbox_id=?1)",
+        [&fresh.reference],
+        |row| row.get(0),
+    ))?;
+    if current.is_some()
+        || rev != 1
+        || lifecycle != "open"
+        || used
+        || sandbox.rev != 1
+        || sandbox.lifecycle != SandboxLifecycle::Open
+        || sandbox.project_ref != project.canonical()
+        || sandbox.layout_digest != expected.digest
+        || sandbox.working_directory.to_str() != Some(expected.working_directory.as_str())
+        || sandbox.tool_root.to_str() != Some(expected.tool_root.as_str())
+    {
+        return Err(Error::Conflict(
+            "fresh Sandbox differs from initial Agent layout",
+        ));
+    }
+    let has_sources = source_bindings::has_sources(connection, &fresh.reference)?;
+    let changed = db(connection.execute(
+        "UPDATE agent_state_current SET sandbox_id=?1,admission=?2
+         WHERE session_id=?3 AND branch_id=?4 AND sandbox_id IS NULL AND rev=1",
+        params![
+            fresh.reference,
+            if has_sources { "held" } else { "open" },
+            session,
+            branch
+        ],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Conflict("fresh Sandbox initial binding changed"));
+    }
+    Ok(())
+}
+
+/// The backing Session must not bypass source-aware execution admission via
+/// a legacy activation/branch/tool path. Until realization and grants are
+/// installed, any source-bearing Agent in that Session is effect-inert.
+pub(crate) fn require_execution_in(connection: &Connection, session: &str) -> Result<()> {
+    let blocked: bool = db(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_state_current a
+             JOIN sandbox_source_bindings_current b ON b.sandbox_id=a.sandbox_id
+             WHERE a.session_id=?1
+         )",
+        [session],
+        |row| row.get(0),
+    ))?;
+    if blocked {
+        return Err(Error::Denied(
+            "source-bearing Agent Sandbox realization is unavailable",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_layout(
     connection: &Connection,
     project: &ProjectKey,
     layout: &Layout,
     event_actor: Option<&PrincipalId>,
 ) -> Result<String> {
+    if source_bindings::available(connection)? {
+        let source_layout: bool = db(connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sandboxes_current s
+                 JOIN sandbox_source_bindings_current b ON b.sandbox_id=s.sandbox_id
+                 WHERE s.domain_handle=?1 AND s.identity_handle=?2 AND s.project_handle=?3
+                   AND s.lifecycle='open' AND s.layout_digest=?4
+                   AND s.working_directory=?5 AND s.tool_root=?6
+             )",
+            params![
+                project.domain,
+                project.identity,
+                project.project,
+                layout.digest,
+                layout.working_directory,
+                layout.tool_root
+            ],
+            |row| row.get(0),
+        ))?;
+        if source_layout {
+            return Err(Error::Denied(
+                "source-bearing Agent Sandbox realization is unavailable",
+            ));
+        }
+    }
     let existing: Option<String> = db(connection
         .query_row(
             "SELECT sandbox_id FROM sandboxes_current
@@ -428,6 +590,9 @@ fn bind_auto(
             ));
         }
         return Ok(Some(current));
+    }
+    if source_bindings::available(connection)? {
+        require_execution_in(connection, session)?;
     }
     let sandbox = ensure_layout(connection, &project, &layout, event_actor)?;
     let changed = db(connection.execute(
@@ -645,22 +810,22 @@ impl SessionStore {
         binding: &SessionBinding,
         sources: &[SourceBinding],
     ) -> Result<SandboxSnapshot> {
-        source_bindings::validate_set(
-            self.source_set_limit(),
-            &self.inner.source_drivers,
-            sources,
-        )?;
         let mutation_set = crate::SourceMutationSet::from_bindings(sources)?;
         let project = parse_project_ref(project_ref)?;
-        let layout = layout(binding)?;
+        let canonical = format!("{}/s:{}", project.canonical(), id("sbx")?);
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        authorize_project(&tx, actor, &project, true)?;
         mutation_set.require_unleased_in(&tx)?;
-        let handle = id("sbx")?;
-        let canonical = insert_sandbox(&tx, &project, &handle, None, &layout, Some(actor))?;
-        source_bindings::insert(&tx, &canonical, sources)?;
-        let snapshot = snapshot_with_sources(&tx, &canonical)?;
+        let fresh = publish_fresh_in(
+            &tx,
+            actor,
+            &canonical,
+            binding,
+            sources,
+            &self.inner.source_drivers,
+            self.source_set_limit(),
+        )?;
+        let snapshot = snapshot_with_sources(&tx, &fresh.reference)?;
         db(tx.commit())?;
         Ok(snapshot)
     }

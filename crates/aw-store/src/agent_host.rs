@@ -525,7 +525,7 @@ fn parent_if_visible(
     }
 }
 
-fn snapshot_in(
+pub(crate) fn snapshot_in(
     connection: &Connection,
     actor: &PrincipalId,
     canonical_ref: &str,

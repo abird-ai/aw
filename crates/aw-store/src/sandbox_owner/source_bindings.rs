@@ -268,21 +268,57 @@ pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryRead
     if !any {
         return Ok(());
     }
-    // Until realization exists, no Agent can be bound to a source-bearing Sandbox.
-    // Reject unexpected persisted combinations rather than allowing layout-only execution.
-    let bound: bool = db(tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM agent_state_current a
-             JOIN sandbox_source_bindings_current b ON b.sandbox_id=a.sandbox_id
-         )",
-        [],
-        |row| row.get(0),
+    // A restored source-bearing Agent is discoverable but effect-inert
+    // until the actual source realization/grant admission exists. Never
+    // accept an executable or unresolved legacy association on reopen.
+    let mut query = db(tx.prepare(
+        "SELECT a.session_id,a.branch_id,a.admission,b.active_run
+         FROM agent_state_current a
+         JOIN branches b ON b.session_id=a.session_id AND b.id=a.branch_id
+         WHERE EXISTS(SELECT 1 FROM sandbox_source_bindings_current s
+                      WHERE s.sandbox_id=a.sandbox_id)",
     ))?;
-    if bound {
-        return Err(Error::Denied(
-            "source-bearing Agent Sandbox realization is unavailable",
-        ));
+    let mut rows = db(query.query([]))?;
+    while let Some(row) = db(rows.next())? {
+        let session: String = db(row.get(0))?;
+        let branch: String = db(row.get(1))?;
+        let admission: String = db(row.get(2))?;
+        let active_run: Option<String> = db(row.get(3))?;
+        if admission != "held" || active_run.is_some() {
+            return Err(Error::Denied(
+                "source-bearing Agent requires held quiescent admission",
+            ));
+        }
+        let (project, layout, sandbox, _, lifecycle) =
+            super::agent_project_and_layout(tx, &session, &branch)?;
+        let sandbox = super::snapshot_row(
+            tx,
+            &sandbox.ok_or(Error::Storage("source-bearing Agent lost its Sandbox"))?,
+        )?;
+        if sandbox.project_ref != project.canonical()
+            || sandbox.layout_digest != layout.digest
+            || sandbox.working_directory.to_str() != Some(layout.working_directory.as_str())
+            || sandbox.tool_root.to_str() != Some(layout.tool_root.as_str())
+            || (lifecycle == "open" && sandbox.lifecycle != super::SandboxLifecycle::Open)
+        {
+            return Err(Error::Conflict(
+                "persisted source-bearing Agent Sandbox layout changed",
+            ));
+        }
+        let unresolved: bool = db(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hazards WHERE session_id=?1 AND state<>'settled')
+                 OR EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND status='running')",
+            [&session],
+            |row| row.get(0),
+        ))?;
+        if unresolved {
+            return Err(Error::Denied(
+                "source-bearing Agent has unresolved execution",
+            ));
+        }
     }
+    drop(rows);
+    drop(query);
     {
         // One bounded Sandbox at a time; no global materialization/descriptor allocation.
         let mut query = db(tx.prepare(

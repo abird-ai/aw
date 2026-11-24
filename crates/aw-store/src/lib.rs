@@ -137,9 +137,10 @@ use aw_agent_core::{
     Result, Role, SourceDriverRegistry, SourceSetLimit,
 };
 pub use checkpoint_owner::{
-    CheckpointCaptureSelection, CheckpointLifecycle, CheckpointRestoreRequest, CheckpointSnapshot,
-    CheckpointSourceSummary, InspectedCheckpointCapture, InspectedCheckpointRestore,
-    PreparedCheckpointCapture, PreparedCheckpointRestore,
+    CheckpointCaptureSelection, CheckpointLifecycle, CheckpointRestoreRequest,
+    CheckpointRestoreResult, CheckpointSnapshot, CheckpointSourceSummary,
+    InspectedCheckpointCapture, InspectedCheckpointRestore, PreparedCheckpointCapture,
+    PreparedCheckpointRestore,
 };
 pub use context::{
     ApplyContext, ApplyMode, ContextApplied, ContextJournal, ContextNode, ContextPlan,
@@ -2206,6 +2207,7 @@ impl SessionStore {
         // Activation keeps its historical ID-or-name selector. Pinned readers
         // use exact IDs and never receive this effect-capable handle.
         let view = read_branch_view_in(&c, actor, session, branch, false)?;
+        sandbox_owner::require_execution_in(&c, &view.session.id)?;
         let handle = SessionHandle::new(
             self.clone(),
             actor.clone(),

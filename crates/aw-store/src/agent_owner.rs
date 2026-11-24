@@ -364,6 +364,15 @@ pub(crate) fn created(
     agent: AgentKey<'_>,
     parent: Option<AgentKey<'_>>,
 ) -> Result<()> {
+    created_with_fresh_sandbox(connection, agent, parent, None)
+}
+
+pub(crate) fn created_with_fresh_sandbox(
+    connection: &Connection,
+    agent: AgentKey<'_>,
+    parent: Option<AgentKey<'_>>,
+    fresh: Option<&crate::sandbox_owner::FreshSandbox>,
+) -> Result<()> {
     validate(agent)?;
     let parent_ref = parent
         .map(|key| canonical_ref(connection, key))
@@ -417,7 +426,16 @@ pub(crate) fn created(
     ))?;
     if inserted == 1 {
         seed_acl_for_agent(connection, agent)?;
-        crate::sandbox_owner::bind_auto_if_available(connection, agent.session, agent.branch)?;
+        if let Some(fresh) = fresh {
+            crate::sandbox_owner::bind_fresh_initial_in(
+                connection,
+                agent.session,
+                agent.branch,
+                fresh,
+            )?;
+        } else {
+            crate::sandbox_owner::bind_auto_if_available(connection, agent.session, agent.branch)?;
+        }
         crate::agent_input_plan::ensure_for_agent_if_available(
             connection,
             agent.session,
@@ -426,6 +444,9 @@ pub(crate) fn created(
         return Ok(());
     }
 
+    if fresh.is_some() {
+        return Err(Error::Conflict("fresh Sandbox requires a new Agent"));
+    }
     let existing: (String, String, String, String, String, Option<String>) =
         db(connection.query_row(
             "SELECT domain_handle,identity_handle,project_handle,agent_handle,owner_handle,parent_agent_ref
@@ -510,7 +531,7 @@ pub(crate) fn require_future_admission(connection: &Connection, agent: AgentKey<
     if admission != "open" {
         return Err(Error::Denied("Agent admission is held"));
     }
-    Ok(())
+    crate::sandbox_owner::require_execution_in(connection, agent.session)
 }
 
 pub(crate) fn request_close(connection: &Connection, agent: AgentKey<'_>) -> Result<bool> {
@@ -1090,6 +1111,9 @@ pub(crate) fn set_admission(
         return Err(Error::Conflict(
             "Agent admission cannot change after close begins",
         ));
+    }
+    if state == "open" {
+        crate::sandbox_owner::require_execution_in(connection, agent.session)?;
     }
     if admission == state {
         return Ok((rev, false));

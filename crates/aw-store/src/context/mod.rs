@@ -1006,6 +1006,7 @@ fn authorize_model_context_after_append_authorized(
     branch: &BranchInfo,
     identity: &aw_agent_core::InvocationIdentity,
 ) -> Result<()> {
+    crate::sandbox_owner::require_execution_in(c, session)?;
     authorize_node(c, session, &branch.head, &identity.actor)?;
     materialized::authorize_projected_for_model(c, &identity.actor, session, branch)?;
     let mut refs = Vec::new();

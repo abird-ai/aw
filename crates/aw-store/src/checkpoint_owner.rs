@@ -18,7 +18,8 @@ pub use capture::{
     CheckpointCaptureSelection, InspectedCheckpointCapture, PreparedCheckpointCapture,
 };
 pub use restore::{
-    CheckpointRestoreRequest, InspectedCheckpointRestore, PreparedCheckpointRestore,
+    CheckpointRestoreRequest, CheckpointRestoreResult, InspectedCheckpointRestore,
+    PreparedCheckpointRestore,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};

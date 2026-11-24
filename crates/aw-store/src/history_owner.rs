@@ -2251,6 +2251,7 @@ pub(crate) fn create_agent_from_resolved_history_with_ids_in(
     destination_owner: &PrincipalId,
     destination_workspace: &str,
     ids: resources::SessionCandidateIds,
+    fresh: Option<&crate::sandbox_owner::FreshSandbox>,
 ) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
     authorize_fork_destination_in(
         connection,
@@ -2259,15 +2260,17 @@ pub(crate) fn create_agent_from_resolved_history_with_ids_in(
         destination_owner,
         destination_workspace,
     )?;
-    let (destination_session, destination_branch) = resources::create_in_workspace_with_ids_tx(
-        connection,
-        destination_owner,
-        title,
-        binding,
-        destination_workspace,
-        None,
-        ids,
-    )?;
+    let (destination_session, destination_branch) =
+        resources::create_in_workspace_with_ids_and_sandbox_tx(
+            connection,
+            destination_owner,
+            title,
+            binding,
+            destination_workspace,
+            None,
+            ids,
+            fresh,
+        )?;
     attach_resolved_history_to_destination_in(
         connection,
         actor,
@@ -2321,6 +2324,7 @@ pub(crate) fn create_agent_from_history_ref_with_ids_in(
         &destination_owner,
         &workspace,
         ids,
+        None,
     )
 }
 
@@ -2371,6 +2375,7 @@ pub(crate) fn create_agent_from_history_ref_with_ids_in_project(
         destination_owner,
         destination_workspace,
         ids,
+        None,
     )
 }
 

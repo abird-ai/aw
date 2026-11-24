@@ -576,10 +576,23 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       and task-bearing Agent create **1/1 each**; strict Store Clippy, workspace all-target
       check, fmt and scoped diff-check green. Source-bearing Agent realization/publication
       remains closed; no migration.
-      **Next:** fresh Sandbox/Agent realization and source-bearing execution admission,
-      then shared fenced restore publication. History-only baseline, custom ACL/initial task,
-      writer participation, candidate/retention cleanup (unresolved restore retains anchors),
-      quiescent mutation, SandboxGrant/Vault and host RPCs remain. Store schema is v57.
+      **Atomic source-bearing restore publication landed:** existing Sandbox owner publishes
+      fresh candidate bindings; constructor-owned FreshSandbox selection enters the ordinary
+      resource/Agent/exact-history constructor without an intermediate auto Sandbox. Complete
+      live driver proof set, current retained history/destination/writer/registry checks,
+      fresh layout, new Agent/Sandbox/HistoryGrant, commit-log provenance, Applied receipt and
+      complete lease settlement share one commit. Rollback preserves unresolved custody.
+      Original fingerprint replay survives checkpoint retirement. Restored Agents are readable
+      but held; direct Session activation/model-context admission, Actor/queue admission and
+      reopening refuse pending actual source-aware execution authority. Startup accepts only
+      held quiescent exact-layout associations; missing drivers degrade metadata. No copied
+      grants/secrets/live state or new visibility owner. Grouped restore **1/1** includes actual
+      publication/rollback/restart; capture **2/2**, checkpoint **1/1**, Sandbox **2/2**,
+      History **4/4**, receipt/barrier/task-bearing create **1/1 each**, Actor admission **2/2**,
+      Session view **6/6**, strict Store Clippy, workspace all-target check, fmt/diff-check green.
+      **Next:** source-aware SandboxGrant/realization admission and writer participation for
+      published held Agents. History-only baseline, custom ACL/initial task, candidate/retention
+      cleanup, quiescent mutation, Vault and host RPCs remain. Store schema is v57.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -684,4 +697,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic checkpoint publication/replay and receipt-bound non-destructive restore preparation/inspection are live; remaining work is source-bearing restore realization and atomic publication, source realization/writer participation/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, full contextual replay/preflight ordering, SandboxGrant/Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery, evidence-fenced atomic checkpoint publication/replay, receipt-bound non-destructive restore preparation/inspection and atomic held Agent/Sandbox restore publication are live; remaining work is source-bearing runtime realization/admission, writer participation, quiescent mutation, candidate/retention cleanup, history-only baseline and custom ACL/task integration, concrete provider fences, full contextual replay/preflight ordering, SandboxGrant/Vault and host RPCs.

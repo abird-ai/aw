@@ -1263,6 +1263,10 @@ impl SessionStore {
         // queue Claim transaction, before custody/ref decryption or claim
         // append. A rejected attempt must leave Pending intact, including
         // after process restart or an uncertain original paid Turn.
+        crate::agent_owner::require_future_admission(
+            &tx,
+            crate::agent_owner::AgentKey::new(session, branch),
+        )?;
         crate::model_agent_pause::require_future_admission(&tx, session, branch)?;
         let turn = safe_to_claim(&tx, session, branch)?;
         let all = events(&tx, session)?;

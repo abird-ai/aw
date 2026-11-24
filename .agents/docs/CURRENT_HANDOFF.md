@@ -32,8 +32,8 @@ explicit gitlink semantics, isolated Prepared restore, v56 immutable Checkpoint/
 persistence with trusted history-only replay, v57 indexed construction receipt/source
 recovery custody, Store-local complete-set source mutation barriers, receipt-bound
 checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic
-checkpoint publication, plus receipt-bound non-destructive restore preparation and exact
-restart inspection, are implemented locally.
+checkpoint publication, receipt-bound non-destructive restore preparation/restart inspection
+and atomic held Agent + fresh source-bearing Sandbox restore publication are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1447,12 +1447,44 @@ History owner **4/4**, capture owner **2/2**, checkpoint owner **1/1**, construc
 **1/1**, source barrier **1/1**, task-bearing Agent create **1/1**, strict Store all-target
 Clippy, full workspace all-target check, fmt and scoped diff-check are green.
 
-**Next Phase-3 slice:** realize the fresh Sandbox/Agent under the ordinary source-bearing
-execution admission/authority gate, then use the existing fenced publication boundary to
-publish restored history, Sandbox, Agent, grants and optional initial input atomically.
-History-only fresh baseline, custom ACL/task integration, writer/effect participation,
-candidate/retention reconciliation, quiescent binding mutation, SandboxGrant/Vault and host
-RPCs remain pending. Store schema is v57.
+Restore now consumes the shared source publication boundary. The trusted verifier receives
+the exact inspected binding results and original anchors/descriptors, validates destination
+isolation and source authority, and returns the complete live publication proof set. Final
+Store transaction repeats retained history, current destination/writer and source compatibility
+checks. Known existing same-Project layouts refuse fresh restore. Physical isolation, including
+path aliases/external writers, still belongs to the reviewed host/driver verifier.
+
+The existing Sandbox owner publishes the private candidate with all restored bindings, and
+its constructor-owned FreshSandbox token enters the ordinary resource/Agent/exact-history
+constructor. Initial selection never creates an intermediate auto Sandbox, never rebinds an
+existing Agent, and checks the fresh same-Project layout. Agent, Sandbox, HistoryGrant,
+commit-log provenance, Applied receipt and complete source lease settlement share one commit.
+Failed publication rolls back every resource; the original receipt and hazards remain
+recoverable. The replay lookup uses the original request fingerprint and current destination
+Agent disclosure, even if the checkpoint is subsequently retired.
+
+Source-bearing restored Agents are discoverable/readable with ordinary admission held. This
+is not a second publication state or a source grant. The shared source-execution gate denies
+legacy Session activation/model context, future Actor admission, queue Claim and attempts to
+open admission; auto Sandbox selection does not fall back to a source-less alias of the same
+layout. Startup accepts only held quiescent source-bearing associations with exact layout/
+Project placement; incompatible driver schemas degrade binding metadata without erasing
+the published Agent. No source-bearing runtime effects are enabled, and no prior runtime
+authority, credentials, leases, staged inputs or Vault state are copied. The host/driver
+realization and SandboxGrant admission cut is still required before these Agents may execute.
+
+Grouped restore **1/1** now also exercises actual atomic publication of the fresh held Agent
+and Sandbox, exact retained history, failed HistoryGrant insertion rollback, lease settlement,
+current replay after checkpoint retirement, restart with missing/reinstalled driver and
+direct/model/queue/open-admission refusal. Capture **2/2**, Checkpoint **1/1**, Sandbox **2/2**,
+History **4/4**, receipt/barrier/task-bearing create **1/1 each**, Actor admission **2/2**,
+Session view **6/6**, strict Store Clippy, workspace all-target check, fmt and scoped diff-check
+are green.
+
+**Next Phase-3 slice:** establish the source-aware SandboxGrant/realization admission and
+writer/effect participation for the now-published held Agents. History-only fresh baseline,
+custom ACL/task integration, candidate/retention reconciliation, quiescent binding mutation,
+Vault and checkpoint/Sandbox host RPCs remain pending. Store schema is v57.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 
