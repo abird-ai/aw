@@ -231,7 +231,7 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
     }
 }
 
-impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
+impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
     /// One-shot start whose future itself owns the complete start boundary.
     /// The original effect owner must already have durable intent.
     /// For queued/detached launch ownership use start_with_authority instead.
@@ -241,7 +241,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
     pub async fn start<R, F: Future<Output = R>>(
         self,
         start: impl FnOnce(P) -> F,
-    ) -> Result<(R, SandboxEffectLease<'a>)> {
+    ) -> Result<(R, SandboxEffectLease)> {
         self.start_with_authority(|prepared, authority| async move {
             let result = start(prepared).await;
             drop(authority);
@@ -257,10 +257,19 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
     pub async fn start_with_authority<R, F: Future<Output = R>>(
         self,
         start: impl FnOnce(P, A) -> F,
-    ) -> Result<(R, SandboxEffectLease<'a>)> {
-        let (prepared, authority, lease, _, _) = self.admit()?;
+    ) -> Result<(R, SandboxEffectLease)> {
+        let (prepared, authority, lease) = self.admit_with_authority()?;
         let result = start(prepared, authority).await;
         Ok((result, lease))
+    }
+
+    /// Admit once and transfer the live capability, authority and source
+    /// custody to the actual worker. The caller must keep the whole tuple
+    /// together through factual settlement, including when its awaiter is
+    /// dropped. No second claim or new execution admission is introduced.
+    pub fn admit_with_authority(self) -> Result<(P, A, SandboxEffectLease)> {
+        let (prepared, authority, lease, _, _) = self.admit()?;
+        Ok((prepared, authority, lease))
     }
 
     /// Opt-in handoff for a driver that must revalidate at actual OS
@@ -269,7 +278,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
     pub async fn start_with_launch_authority<R, F: Future<Output = R>>(
         self,
         start: impl FnOnce(P, A, SandboxEffectLaunch) -> F,
-    ) -> Result<(R, SandboxEffectLease<'a>)> {
+    ) -> Result<(R, SandboxEffectLease)> {
         if self.boundary.intent.is_none()
             || self
                 .authority
@@ -282,7 +291,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
         }
         let (prepared, authority, lease, request, boundary) = self.admit()?;
         let launch = SandboxEffectLaunch {
-            store: lease.store.clone(),
+            store: lease.barrier.store().clone(),
             request,
             boundary,
             pin: lease.barrier.launch_pin(),
@@ -291,7 +300,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
         Ok((result, lease))
     }
 
-    fn admit(self) -> Result<(P, A, SandboxEffectLease<'a>, SandboxEffectRequest, Boundary)> {
+    fn admit(self) -> Result<(P, A, SandboxEffectLease, SandboxEffectRequest, Boundary)> {
         let Self {
             store,
             request,
@@ -336,7 +345,6 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
             .iter()
             .any(|source| source.access == SourceAccess::ReadWrite);
         let lease = SandboxEffectLease {
-            store,
             barrier,
             actor: request.actor.clone(),
             sandbox: boundary.plan.grant.sandbox_ref.clone(),
@@ -425,9 +433,8 @@ pub enum SandboxEffectOutcome {
 /// Holds every participating source (reads included) until the original
 /// effect owner can prove settlement. Dropping does not release claims.
 #[must_use = "settle against factual effect evidence; abandoned claims remain fenced"]
-pub struct SandboxEffectLease<'a> {
-    store: &'a SessionStore,
-    barrier: SourceMutationBarrier<'a>,
+pub struct SandboxEffectLease {
+    barrier: SourceMutationBarrier,
     actor: PrincipalId,
     sandbox: String,
     effect_id: String,
@@ -435,7 +442,7 @@ pub struct SandboxEffectLease<'a> {
     write_capable: bool,
 }
 
-impl SandboxEffectLease<'_> {
+impl SandboxEffectLease {
     /// The original tool returns before the Agent writes ToolFinished.
     /// Keep a positive, trusted physical settlement fact with the exact
     /// claims; the original receipt owner can release them after its commit.
@@ -447,7 +454,7 @@ impl SandboxEffectLease<'_> {
         let intent = self.intent.as_ref().ok_or(Error::Conflict(
             "deferred source settlement requires an original tool intent",
         ))?;
-        let mut connection = self.store.connection()?;
+        let mut connection = self.barrier.store().connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         journal::record_quiescence_in(&tx, intent, outcome)?;
         self.barrier
@@ -459,7 +466,7 @@ impl SandboxEffectLease<'_> {
     /// factual settlement. Unknown preserves all source hazards. A known
     /// settled write-capable effect advances Sandbox rev once with release.
     pub fn settle(self, outcome: SandboxEffectOutcome) -> Result<()> {
-        let mut connection = self.store.connection()?;
+        let mut connection = self.barrier.store().connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         match self.settle_in(&tx, outcome) {
             Ok(()) => db(tx.commit()),

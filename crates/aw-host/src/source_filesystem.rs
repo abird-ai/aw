@@ -292,41 +292,45 @@ where
             |driver, plan, _| Ok((driver.prepare(plan, directory)?, request)),
         )?;
         let live = prepared.authority().tool.clone();
-        let (result, lease) = prepared
-            .start_with_authority(|(capability, request), authority| async move {
-                // Both the policy guard and pinned directory follow the actual
-                // blocking worker even if the Agent drops the awaiter.
-                tokio::task::spawn_blocking(move || {
-                    let result = if cancellation.is_cancelled() || !live.is_live() {
-                        (Err(Error::Cancelled), SandboxEffectOutcome::NotStarted)
-                    } else {
-                        let result = request.execute(&capability, &|| cancellation.is_cancelled());
+        let ((capability, request), authority, lease) = prepared.admit_with_authority()?;
+        // The actual worker owns the Store lease as well as the pinned
+        // directory and live policy. A dropped awaiter must not lose a
+        // factual completion or release the original Store owner.
+        tokio::task::spawn_blocking(move || {
+            let (result, outcome) = if cancellation.is_cancelled() || !live.is_live() {
+                (Err(Error::Cancelled), SandboxEffectOutcome::NotStarted)
+            } else {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    request.execute(&capability, &|| cancellation.is_cancelled())
+                })) {
+                    Ok(result) => {
                         let outcome = if result.is_ok() {
                             SandboxEffectOutcome::Settled
                         } else {
                             SandboxEffectOutcome::Unknown
                         };
                         (result, outcome)
-                    };
-                    drop(capability);
-                    drop(authority);
-                    result
-                })
-                .await
-            })
-            .await?;
-        match result {
-            Ok((result, outcome)) => {
-                lease.defer_until_tool_finished(outcome)?;
-                result
-            }
-            Err(_) => {
-                lease.settle(SandboxEffectOutcome::Unknown)?;
-                Err(Error::Protocol(
-                    "native source worker outcome uncertain; inspect before retry",
-                ))
-            }
-        }
+                    }
+                    Err(_) => (
+                        Err(Error::Protocol(
+                            "native source worker panicked; inspect before retry",
+                        )),
+                        SandboxEffectOutcome::Unknown,
+                    ),
+                }
+            };
+            drop(capability);
+            // Persist positive quiescence (or Unknown) while the worker
+            // still holds its independent authority, before any result
+            // can reach the original ToolFinished owner.
+            lease.defer_until_tool_finished(outcome)?;
+            drop(authority);
+            result
+        })
+        .await
+        .map_err(|_| {
+            Error::Protocol("native source worker outcome uncertain; inspect before retry")
+        })?
     }
 }
 

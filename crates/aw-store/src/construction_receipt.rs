@@ -628,13 +628,13 @@ pub(crate) fn claim_in(
     append_in(tx, actor, receipt)
 }
 
-pub(crate) fn claim_sources_in<'a>(
-    store: &'a SessionStore,
+pub(crate) fn claim_sources_in(
+    store: &SessionStore,
     tx: &Transaction<'_>,
     actor: &PrincipalId,
     receipt: &ConstructionPreparation,
     set: &crate::SourceMutationSet,
-) -> Result<SourceMutationBarrier<'a>> {
+) -> Result<SourceMutationBarrier> {
     let barrier =
         store.acquire_source_mutation_barrier_in(tx, set, receipt.candidate.prepare_id())?;
     claim_in(
@@ -651,7 +651,7 @@ pub(crate) fn require_current_sources_in(
     tx: &Transaction<'_>,
     actor: &PrincipalId,
     receipt: &ConstructionPreparation,
-    barrier: &SourceMutationBarrier<'_>,
+    barrier: &SourceMutationBarrier,
 ) -> Result<()> {
     current_unresolved_in(tx, actor, receipt)?;
     barrier.require_preparation_in(tx, receipt.candidate.prepare_id())
@@ -661,7 +661,7 @@ pub(crate) fn mark_sources_unknown(
     store: &SessionStore,
     actor: &PrincipalId,
     receipt: &ConstructionPreparation,
-    barrier: &SourceMutationBarrier<'_>,
+    barrier: &SourceMutationBarrier,
 ) -> Result<()> {
     let mut connection = store.connection()?;
     let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
@@ -805,7 +805,7 @@ pub(crate) fn require_unpublished_sources_in(
     tx: &Transaction<'_>,
     actor: &PrincipalId,
     receipt: &ConstructionPreparation,
-    barrier: &SourceMutationBarrier<'_>,
+    barrier: &SourceMutationBarrier,
 ) -> Result<()> {
     require_current_sources_in(tx, actor, receipt, barrier)?;
     require_original_source_claim_in(tx, receipt)?;
@@ -832,7 +832,7 @@ pub(crate) fn reconcile_unpublished_sources<F>(
     store: &SessionStore,
     actor: &PrincipalId,
     receipt: &ConstructionPreparation,
-    barrier: &SourceMutationBarrier<'_>,
+    barrier: &SourceMutationBarrier,
     reconcile: impl FnOnce() -> Result<F>,
 ) -> Result<()> {
     let result = (|| {
@@ -1032,7 +1032,7 @@ pub(crate) fn publish_sources<F: SourcePublicationFence, T>(
     store: &SessionStore,
     actor: &PrincipalId,
     expected: &ConstructionPreparation,
-    barrier: &SourceMutationBarrier<'_>,
+    barrier: &SourceMutationBarrier,
     evidence: &[ExternalEvidence],
     proofs: Vec<SourcePublicationProof<F>>,
     publish: impl FnOnce(&Transaction<'_>) -> Result<(String, T)>,

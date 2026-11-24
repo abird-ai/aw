@@ -256,7 +256,7 @@ pub struct PreparedCheckpointCapture<'a> {
     store: &'a SessionStore,
     actor: PrincipalId,
     receipt: ConstructionPreparation,
-    barrier: SourceMutationBarrier<'a>,
+    barrier: SourceMutationBarrier,
 }
 
 impl PreparedCheckpointCapture<'_> {

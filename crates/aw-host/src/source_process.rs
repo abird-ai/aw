@@ -19,20 +19,20 @@ pub type ProcessToolAuthority<A> = SourceToolAuthority<A>;
 /// custody. Keep the actual result by value; no allocation or second
 /// Process lifecycle. Record the result before settling its source lease.
 #[must_use = "retain source custody until the original effect is recorded and settled"]
-pub struct SourceProcessStart<'a> {
+pub struct SourceProcessStart {
     pub launch: std::result::Result<PipeProcess, PipeLaunchFailure>,
-    pub source: SourceProcessLease<'a>,
+    pub source: SourceProcessLease,
 }
 
 /// Only source custody and the original ToolBinding revocation watch.
 /// Waiting, stopping, stdin, output and terminal facts remain on PipeProcess.
 #[must_use = "settle using the original recorded Process terminal and source quiescence"]
-pub struct SourceProcessLease<'a> {
-    source: SandboxEffectLease<'a>,
+pub struct SourceProcessLease {
+    source: SandboxEffectLease,
     tool: LiveSourceTool,
 }
 
-impl SourceProcessLease<'_> {
+impl SourceProcessLease {
     /// Compose with the original Process owner's normal cancellation future.
     pub async fn wait_until_not_live(&self) {
         self.tool.wait_until_not_live().await
@@ -92,7 +92,7 @@ pub async fn start_source_process<'a, P, A>(
     prepared: PreparedSandboxEffect<'a, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
     deadline: Instant,
     cancellation: CancellationToken,
-) -> Result<SourceProcessStart<'a>>
+) -> Result<SourceProcessStart>
 where
     P: Send + 'static,
     A: SandboxEffectAuthority + Send + 'static,
@@ -141,7 +141,7 @@ pub async fn start_source_process_with_vault<'a, P, A, S>(
     registry: aw_agent_core::VaultProviderRegistryReader,
     handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
     selection: aw_store::SigningProcessProof,
-) -> Result<SourceProcessStart<'a>>
+) -> Result<SourceProcessStart>
 where
     P: Send + 'static,
     A: SandboxEffectAuthority + Send + 'static,
@@ -210,11 +210,10 @@ mod tests {
     use aw_agent_core::{
         provider::{CompletionFuture, DeltaSink, Provider},
         AccountOwner, Agent, AgentOptions, BillingOwner, CheckpointPolicy, CredentialCustody,
-        DriverKey, InvocationIdentity, JournalEntry, Message, NamedSourceAccess, Outcome,
-        PrincipalId, Role, SandboxDriverRegistry, SchemaSupport, SourceAccess, SourceBinding,
-        SourceDriverRegistry, SourceDriverSchemas, SourceName, SourceSetLimit, ToolCall,
-        ToolOutput, ToolRecord, ToolSource, ToolSourceEvidence, ToolStatus, Turn, TurnJournal,
-        TurnStart,
+        DriverKey, InvocationIdentity, JournalEntry, Message, NamedSourceAccess, PrincipalId, Role,
+        SandboxDriverRegistry, SchemaSupport, SourceAccess, SourceBinding, SourceDriverRegistry,
+        SourceDriverSchemas, SourceName, SourceSetLimit, ToolCall, ToolOutput, ToolRecord,
+        ToolSource, ToolSourceEvidence, ToolStatus, Turn, TurnJournal, TurnStart,
     };
     use aw_store::{
         SandboxEffectOrigin, SandboxEffectPlan, SandboxEffectRequest, SandboxGrantPolicy,
@@ -1130,11 +1129,60 @@ mod tests {
         use aw_agent_core::{
             AgentExecutionBinding, Extension, HookContext, HookEvent, InvocationScope, ToolContext,
         };
-        use aw_tools::{filesystem::schema::Tool as FsTool, OperationId};
+        use aw_tools::{
+            filesystem::{private_artifact, schema::Tool as FsTool},
+            OperationId,
+        };
         use aw_tools_adapter::{
             native_filesystem::{GrantSpec, PrivateArtifactRegistry},
             operation_router::OperationRouter,
         };
+
+        // Pause exactly one real staged write inside its existing artifact
+        // reservation boundary, so losing the awaiter is deterministic.
+        struct StagePause {
+            started: tokio::sync::oneshot::Sender<()>,
+            resume: std::sync::mpsc::Receiver<()>,
+        }
+        #[derive(Default)]
+        struct PausedArtifacts(std::sync::Mutex<Option<StagePause>>);
+        impl private_artifact::Store for PausedArtifacts {
+            fn durable(&self) -> bool {
+                false
+            }
+            fn load(
+                &self,
+            ) -> std::result::Result<Vec<private_artifact::Record>, private_artifact::Error>
+            {
+                Ok(Vec::new())
+            }
+            fn reserve(
+                &self,
+                _: &private_artifact::Record,
+            ) -> std::result::Result<(), private_artifact::Error> {
+                if let Some(pause) = self.0.lock().unwrap().take() {
+                    let _ = pause.started.send(());
+                    pause
+                        .resume
+                        .recv()
+                        .map_err(|_| private_artifact::Error::Conflict)?;
+                }
+                Ok(())
+            }
+            fn finalize(
+                &self,
+                _: &private_artifact::Record,
+                _: &private_artifact::Record,
+            ) -> std::result::Result<(), private_artifact::Error> {
+                Ok(())
+            }
+            fn retire(
+                &self,
+                _: &private_artifact::Record,
+            ) -> std::result::Result<(), private_artifact::Error> {
+                Ok(())
+            }
+        }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1297,12 +1345,20 @@ mod tests {
             ToolEffect::Read,
             serde_json::json!({"path":".git/config"}),
         ));
-        records.push((
-            "native:write",
-            FsTool::Write,
-            ToolEffect::Write,
-            serde_json::json!({"path":"code","content":"native changed"}),
-        ));
+        records.extend([
+            (
+                "native:write",
+                FsTool::Write,
+                ToolEffect::Write,
+                serde_json::json!({"path":"code","content":"native changed"}),
+            ),
+            (
+                "native:detached",
+                FsTool::Write,
+                ToolEffect::Write,
+                serde_json::json!({"path":"code","content":"detached changed"}),
+            ),
+        ]);
         let records: Vec<_> = records
             .into_iter()
             .map(|(id, tool, effect, arguments)| ToolRecord {
@@ -1341,6 +1397,7 @@ mod tests {
             c.execute("UPDATE agent_state_current SET sandbox_id=?1,admission='held' WHERE session_id=?2 AND branch_id=?3",
                 params![sandbox.canonical_ref, session.id, branch.id]).unwrap();
         }
+        let artifacts = Arc::new(PausedArtifacts::default());
         let approval = NativeSourceApproval::pin(
             store.clone(),
             NativeSourceApprovalSpec {
@@ -1355,7 +1412,7 @@ mod tests {
                 },
                 directory: GrantSpec::read_write(&root),
             },
-            PrivateArtifactRegistry::memory(),
+            PrivateArtifactRegistry::open(artifacts.clone()).unwrap(),
         )
         .unwrap();
         let set = SourceMutationSet::from_bindings(&[binding]).unwrap();
@@ -1517,6 +1574,76 @@ mod tests {
                     .await
                     .is_err());
             }
+            if id == "native:detached" {
+                // The preceding completed native write missed its hook.
+                // Consume the existing positive fact, not another effect.
+                assert_eq!(
+                    store
+                        .sandbox_get(&actor, &sandbox.canonical_ref)
+                        .unwrap()
+                        .rev,
+                    sandbox.rev
+                );
+                assert_eq!(
+                    store
+                        .sandbox_recover_tool_source_effect(
+                            &actor,
+                            &reference,
+                            1,
+                            "native:write",
+                            |_| panic!("recorded native proof cannot need reinspection")
+                        )
+                        .unwrap(),
+                    SandboxEffectOutcome::Settled
+                );
+
+                let (started, entered) = tokio::sync::oneshot::channel();
+                let (resume, wait) = std::sync::mpsc::channel();
+                *artifacts.0.lock().unwrap() = Some(StagePause {
+                    started,
+                    resume: wait,
+                });
+                let mut pending =
+                    route.execute(op, ctx, &record.call.arguments, Arc::new(NoFallback));
+                tokio::select! {
+                    result = &mut pending => panic!("native worker finished before pause: {result:?}"),
+                    entered = tokio::time::timeout(Duration::from_secs(5), entered) => entered.unwrap().unwrap(),
+                }
+                drop(pending);
+                assert_eq!(std::fs::read(root.join("code")).unwrap(), b"native changed");
+                assert!(store
+                    .acquire_source_mutation_barrier(&set, "host:detached-active")
+                    .is_err());
+                let revoke = approval.revoke();
+                tokio::pin!(revoke);
+                tokio::select! {
+                    biased;
+                    _ = &mut revoke => panic!("withdrawal released a live detached worker"),
+                    _ = std::future::ready(()) => {},
+                }
+                assert!(approval.read().is_err());
+                resume.send(()).unwrap();
+                assert!(tokio::time::timeout(Duration::from_secs(5), &mut revoke)
+                    .await
+                    .unwrap());
+                assert_eq!(
+                    std::fs::read(root.join("code")).unwrap(),
+                    b"detached changed"
+                );
+                // Guard release follows durable worker quiescence. There
+                // is still no ToolFinished for the dropped async result.
+                assert!(store
+                    .acquire_source_mutation_barrier(&set, "host:detached-unrecorded")
+                    .is_err());
+                assert!(store
+                    .sandbox_recover_tool_source_effect(&actor, &reference, 1, &id, |_| panic!(
+                        "unfinished Run cannot release the source"
+                    ))
+                    .is_err());
+                record.status = ToolStatus::Interrupted;
+                final_records.push(record);
+                continue;
+            }
             let output = route
                 .execute(op, ctx, &record.call.arguments, Arc::new(NoFallback))
                 .await
@@ -1586,36 +1713,16 @@ mod tests {
             }
             final_records.push(record);
         }
-        // Source write physically finished and original ToolFinished
-        // committed; simulate loss of the post-receipt callback.
+        // The detached write physically finished and recorded its own
+        // quiescence, but the Sandbox revision awaits original Run closure.
         assert_eq!(
             store
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev
+            sandbox.rev + 1
         );
-        assert!(store
-            .acquire_source_mutation_barrier(&set, "host:missed-hook")
-            .is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
-
-        // Host withdrawal cannot drop the live pin while an admitted worker
-        // retains the original guard. Persisted grant evidence does not
-        // become an independent approval after withdrawal.
-        {
-            let live = approval.read().unwrap();
-            let revoke = approval.revoke();
-            tokio::pin!(revoke);
-            tokio::select! {
-                biased;
-                _ = &mut revoke => panic!("withdrawal released a live authority guard"),
-                _ = std::future::ready(()) => {},
-            }
-            assert!(approval.read().is_err());
-            drop(live);
-            assert!(revoke.await);
-        }
         assert!(approval.read().is_err());
         assert!(approval.publish_grant(&actor, 1).is_err());
         assert!(
@@ -1629,33 +1736,8 @@ mod tests {
         assert!(host
             .preflight(&store, &actor, &agent_binding, &options)
             .is_err());
-        journal
-            .append(
-                1,
-                JournalEntry::Assistant {
-                    message: Message::text(1026, Role::Assistant, "fixture complete"),
-                },
-            )
-            .await
-            .unwrap();
-        journal
-            .finish(Turn {
-                id: 1,
-                prompt: "native source fixture".into(),
-                answer: "fixture complete".into(),
-                model: identity.model,
-                profile: identity.account_id,
-                outcome: Outcome::Completed,
-                meta: None,
-                error: None,
-                actor: Some(actor.clone()),
-                tool_records: final_records,
-                invocations: Vec::new(),
-                context_messages: Vec::new(),
-                needs_reconciliation: false,
-            })
-            .await
-            .unwrap();
+        // No synthesized ToolFinished: the original journal owner recovers
+        // this lost Run on reopen.
         drop(agent);
         drop(options);
         drop(route);
@@ -1665,18 +1747,29 @@ mod tests {
         drop(journal);
         drop(store);
         let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        let recovered_turn: Turn = {
+            let c = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+            let payload: String = c.query_row(
+                "SELECT n.payload FROM runs r JOIN nodes n ON n.id=r.final_node WHERE r.session_id=?1 AND r.turn_id=1 AND r.status='interrupted'",
+                [&session.id], |row| row.get(0)
+            ).unwrap();
+            serde_json::from_str(&payload).unwrap()
+        };
         assert_eq!(
-            store
-                .sandbox_recover_tool_source_effect(
-                    &actor,
-                    &reference,
-                    1,
-                    "native:write",
-                    |_| panic!("recorded quiescence needs no external reinspection"),
-                )
-                .unwrap(),
-            SandboxEffectOutcome::Settled
+            serde_json::to_value(&recovered_turn.tool_records).unwrap(),
+            serde_json::to_value(&final_records).unwrap()
         );
+        assert!(recovered_turn.needs_reconciliation);
+        for id in ["native:write", "native:detached"] {
+            assert_eq!(
+                store
+                    .sandbox_recover_tool_source_effect(&actor, &reference, 1, id, |_| panic!(
+                        "recorded quiescence needs no external reinspection"
+                    ))
+                    .unwrap(),
+                SandboxEffectOutcome::Settled
+            );
+        }
         assert_eq!(
             store
                 .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, "native:write")
@@ -1688,7 +1781,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 1
+            sandbox.rev + 2
         );
         assert!(store.activate(&actor, &session.id, &branch.id).is_err());
     }

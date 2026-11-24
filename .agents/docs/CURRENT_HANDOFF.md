@@ -51,7 +51,8 @@ task-only baseline restore/recovery, concrete fenced Git checkpoint capture/rest
 retention reconciliation, managed closed-Sandbox retirement, effectful versioned
 baseline restore host consumers, and v59 Agent VaultGrant references with the final
 staged VaultProvider leaf, concrete local signing broker, fenced Process proof
-projection and interrupted source-effect custody recovery are implemented locally.
+projection, interrupted source-effect custody recovery and worker-owned native
+source quiescence are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2331,10 +2332,36 @@ Clippy, workspace all-target/all-feature check and scoped fmt/diff passed. Earli
 broad Store failures remain recorded, not rerun. Production physical proof acquisition
 and whole-Run hazard reconciliation are distinct.
 
+Native filesystem physical completion now belongs to the actual blocking worker,
+not the async result awaiter. The existing non-cloneable `SourceMutationBarrier`
+owns one cheap SessionStore reference; `SandboxEffectLease` uses that same Store
+owner rather than a second reference. No new lease type, registry, journal or schema.
+`PreparedSandboxEffect::admit_with_authority` uses the original admission/claim
+transaction and transfers capability, live policy and owned lease together; existing
+async Process handoffs and checkpoint custody reuse that owner. The concrete native
+worker records its original positive quiescence or Unknown before it releases the
+live authority and returns. Dropping the awaiter no longer drops worker settlement
+custody or the Store owner. Caught executor panic is Unknown, never inferred success;
+actual process loss or failed physical proof commit still leaves unresolved custody.
+The grouped native Host regression pauses an actual staged write through the existing
+artifact reservation seam, drops its awaiter and verifies live source exclusion and
+withdrawal waiting on the real worker. The worker completes, records its proof and
+releases authority; the original journal recovers an Interrupted Turn after reopen
+and consumes that proof without external reinspection or rewriting the tool receipt.
+Ordinary ToolFinished/missed-hook recovery and Git exclusions remain exercised.
+Final source barrier **1/1**, construction receipt **1/1**, checkpoint **4/4**,
+Sandbox **4/4**, Host **16/16**, strict affected all-target/all-feature Clippy,
+workspace all-target/all-feature check and scoped fmt/diff passed. Earlier broad
+Store failures remain recorded, not rerun. This is native-worker completion,
+not arbitrary Process containment, crash-time
+private artifact cleanup or automatic whole-Run hazard acknowledgement. The source
+bearing association remains fixture-only. Shared barrier/result API no longer needs
+borrow lifetimes, allowing other trusted workers to retain the real owner.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer independent production authority/containment or exact physical
-recovery proof acquisition through existing owners; do not open held routes. Independent
+While blocked, prefer independent production authority/containment or remaining
+physical recovery proof acquisition through existing owners; do not open held routes. Independent
 host approval provisioning, other effectful baseline materialization, broader Run-hazard
 reconciliation, multi-source policy, general unpublished partial/scratch cleanup and
 production cleanup composition/physical authority, final-source removal/effectful

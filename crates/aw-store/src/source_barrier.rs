@@ -88,13 +88,14 @@ pub enum SourceMutationOutcome {
     Unknown,
 }
 
-/// Non-cloneable owner-lifetime source barrier. Acquisition and settlement
+/// Non-cloneable, owned source barrier. Retains the original Store owner
+/// across worker handoff, even when the submitting task is dropped. Acquisition and settlement
 /// are complete-set transactions. Dropping without settlement deliberately
 /// keeps the durable claims; owner restart turns them into hazards. Never
 /// release unknown effects merely because the Rust token went out of scope.
 #[must_use = "settle the source barrier explicitly; abandoned claims remain fenced"]
-pub struct SourceMutationBarrier<'a> {
-    store: &'a SessionStore,
+pub struct SourceMutationBarrier {
+    store: SessionStore,
     store_scope: StoreScope,
     process: ProcessIdentity,
     leases: Vec<LocalCoordinationLease>,
@@ -126,7 +127,11 @@ fn require_held_in(
     coordination::require_source_leases_in(tx, process, leases)
 }
 
-impl SourceMutationBarrier<'_> {
+impl SourceMutationBarrier {
+    pub(crate) fn store(&self) -> &SessionStore {
+        &self.store
+    }
+
     pub(crate) fn launch_pin(&self) -> SourceMutationPin {
         SourceMutationPin {
             store_scope: self.store_scope.clone(),
@@ -198,7 +203,7 @@ impl SessionStore {
         &self,
         set: &SourceMutationSet,
         prepare_id: &str,
-    ) -> Result<SourceMutationBarrier<'_>> {
+    ) -> Result<SourceMutationBarrier> {
         if prepare_id.starts_with(crate::sandbox_owner::JOURNALED_SOURCE_EFFECT_PREFIX)
             || prepare_id.starts_with(crate::checkpoint_owner::RETENTION_CLEANUP_PREFIX)
             || prepare_id.starts_with(crate::sandbox_owner::RETENTION_CLEANUP_PREFIX)
@@ -221,7 +226,7 @@ impl SessionStore {
         tx: &Transaction<'_>,
         set: &SourceMutationSet,
         prepare_id: &str,
-    ) -> Result<SourceMutationBarrier<'_>> {
+    ) -> Result<SourceMutationBarrier> {
         self.inner.source_limit.admit(set.count)?;
         self.claim_source_mutation_barrier_in(tx, set, prepare_id)
     }
@@ -234,7 +239,7 @@ impl SessionStore {
         tx: &Transaction<'_>,
         set: &SourceMutationSet,
         prepare_id: &str,
-    ) -> Result<SourceMutationBarrier<'_>> {
+    ) -> Result<SourceMutationBarrier> {
         let unresolved: bool = db(tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM local_coordination_leases
              WHERE scope_kind='execution' AND scope_key GLOB 'source-mutation:*'
@@ -254,7 +259,7 @@ impl SessionStore {
         tx: &Transaction<'_>,
         set: &SourceMutationSet,
         prepare_id: &str,
-    ) -> Result<SourceMutationBarrier<'_>> {
+    ) -> Result<SourceMutationBarrier> {
         if set.scopes.is_empty() {
             return Err(Error::Config(
                 "source mutation barrier requires a nonempty set".into(),
@@ -277,7 +282,7 @@ impl SessionStore {
         let store_scope = StoreScope::load(tx)?;
         let leases = coordination::acquire_source_leases_in(tx, &process, &set.scopes, prepare_id)?;
         Ok(SourceMutationBarrier {
-            store: self,
+            store: self.clone(),
             store_scope,
             process,
             leases,
@@ -291,7 +296,7 @@ impl SessionStore {
         tx: &Transaction<'_>,
         set: &SourceMutationSet,
         prepare_id: &str,
-    ) -> Result<SourceMutationBarrier<'_>> {
+    ) -> Result<SourceMutationBarrier> {
         if self.inner.mode != StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "source recovery requires the exclusive Store owner",
@@ -301,7 +306,7 @@ impl SessionStore {
         let store_scope = StoreScope::load(tx)?;
         let leases = coordination::recover_source_leases_in(tx, &process, &set.scopes, prepare_id)?;
         Ok(SourceMutationBarrier {
-            store: self,
+            store: self.clone(),
             store_scope,
             process,
             leases,

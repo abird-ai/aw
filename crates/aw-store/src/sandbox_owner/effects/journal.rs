@@ -679,21 +679,20 @@ fn released_in(
     Ok(Some(release.outcome))
 }
 
-fn reclaim_in<'a>(
-    store: &'a SessionStore,
+fn reclaim_in(
+    store: &SessionStore,
     tx: &Transaction<'_>,
     actor: &PrincipalId,
     intent: Intent,
     claim: &Claim,
     sources: &[EffectiveSourceBinding],
-) -> Result<super::SandboxEffectLease<'a>> {
+) -> Result<super::SandboxEffectLease> {
     let effect_id = intent.effect_id();
     let set = crate::SourceMutationSet::from_binding_refs(
         sources.iter().map(|source| &source.binding.binding),
     )?;
     let barrier = store.recover_source_mutation_barrier_in(tx, &set, &effect_id)?;
     Ok(super::SandboxEffectLease {
-        store,
         barrier,
         actor: actor.clone(),
         sandbox: claim.sandbox_ref.clone(),

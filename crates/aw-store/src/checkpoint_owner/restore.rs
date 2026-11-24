@@ -483,7 +483,7 @@ pub struct PreparedCheckpointRestore<'a> {
     actor: PrincipalId,
     receipt: ConstructionPreparation,
     anchors: SourceSet,
-    barrier: SourceMutationBarrier<'a>,
+    barrier: SourceMutationBarrier,
 }
 
 impl<'a> PreparedCheckpointRestore<'a> {
