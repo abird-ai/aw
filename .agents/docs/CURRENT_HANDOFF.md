@@ -28,8 +28,9 @@ v53 same-store cross-Domain Event-universe completeness, and v54 serialized v36 
 compatibility provenance are implemented locally. Phase 3 is now UNDERWAY with the first final
 SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary and v55 named
 SourceBinding persistence/restart compatibility, built-in Git clean/dirty capture/private retention,
-explicit gitlink semantics, isolated Prepared restore and v56 immutable Checkpoint/SourceSet
-persistence with trusted history-only replay are implemented locally.
+explicit gitlink semantics, isolated Prepared restore, v56 immutable Checkpoint/SourceSet
+persistence with trusted history-only replay and v57 indexed construction receipt/source
+recovery custody are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1234,9 +1235,8 @@ and one compatibility transaction for bindings and retained checkpoint anchors. 
 incompatible artifact schemas retain exact durable truth and mark recovery_required; compatible
 reinstallation clears diagnostics without rewriting identity or advancing Agent/Sandbox revs.
 Retired anchor rows awaiting cleanup remain dependencies until removed. This is schema
-compatibility, not evidence of actual retained objects. The registry remains add-only; unresolved
-recovery descriptor custody/pinning must land in the existing operation receipt with Prepared
-construction, not a speculative replay catalog.
+compatibility, not evidence of actual retained objects. The registry remains add-only; v57 adds unresolved recovery descriptor custody/pinning to
+the existing construction operation receipt, not a speculative replay catalog.
 
 The grouped real disk checkpoint-owner regression **1/1** covers v55→v56 migration, settled
 history during an active turn, replay/current ACL, revision neutrality, immutable source storage,
@@ -1246,10 +1246,52 @@ SourceDriver leaf **1/1** remain green. Git feature suite **32/32** includes rea
 roundtrip. Strict affected-crate all-target Clippy with the Git source-driver feature, full workspace
 all-target check, repository fmt and scoped diff-check are green.
 
-**Next Phase-3 slice:** durable per-source Prepared recovery descriptors in the existing operation
-receipt, exact unresolved dependency resolution, then multi-source barriers/recovery and the shared
-publication constructor. Source realization, candidate/retention reconciliation, quiescent binding
-mutation, SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v56.
+Schema **v57** extends the existing immutable construction audit receipt family, not a new
+operation/replay table. One exact replay index spans the historical task-only action and the
+current typed construction receipt. Existing task-bearing Agent creation uses the shared
+claim/lookup/CAS transition functions; historical receipts decode without rewriting audit
+facts and recover their original stable creator from the matching security audit fact.
+The source-preparation index uniquely reserves the operation-owned prepare identity.
+Current receipts carry semantic operation, authenticated scope/creator, origin Agent, original
+request/fingerprint, typed candidate IDs, optional initial-task custody and an optional complete
+PreparedSourceSet. Ordinary task-only creation preserves its established scope and fingerprint
+semantics; full contextual replay/preflight ordering remains part of the shared constructor cut.
+
+The core PreparedSourceSet validates the existing effective/absolute source bounds, unique names
+and effect identities, common operation and owner-minted preparation identity; descriptors retain
+exact DriverKey/recovery schema and bounded non-secret fields. Capture claims identify their
+candidate checkpoint; restore claims identify the fresh Agent/Sandbox candidate. Complete schema
+admission and claim happen transactionally before any future external effect. Exact request or
+prepare-ID reuse cannot create another claim. History-only checkpoint creation and task-free Agent
+creation cannot consume a previously Prepared effectful request under changed semantics.
+Full descriptor data stays in the owner-private audit receipt; security audit metadata receives
+only operation/state, avoiding disclosure and duplicate large descriptor payloads.
+
+Owner/direct startup and staged backup restore now also stream the indexed initial source
+claims, resolve their exact current receipts, and validate unresolved per-source recovery pins
+against the same registry snapshot as bindings/anchors. The current receipt must preserve original
+candidate and descriptor identity. Compatibility is a derived diagnostic, not a rewrite of the
+immutable receipt or authority to execute. Missing/incompatible definitions preserve Prepared/
+Unknown custody; compatible reinstall resolves the same durable schema regardless of runtime
+registration order. A lower host limit cannot erase old dependencies. No driver is invoked on open.
+Source-bearing claims cannot become Applied or Rejected through the task-only transition path;
+that requires future proven publication/cleanup. No source-bearing production constructor or
+candidate resource is exposed by this slice.
+
+The grouped construction-owner disk regression **1/1** covers v56→v57 migration and legacy
+receipt decoding, exact named capture/restore custody, duplicate/mismatched/unsupported/over-limit
+claims, shared checkpoint replay namespace, no public candidates, CAS Unknown, schema degradation/
+reinstall and staged backup restore. The actual task-bearing Agent create/replay regression **1/1**
+passes through the new receipt owner. Checkpoint owner **1/1**, Sandbox owner **2/2**, SourceDriver
+leaf **1/1**, strict affected-crate all-target Clippy, workspace all-target check, repository fmt and
+scoped diff-check are green. The broader Agent-host test group is **1/2**: its unchanged
+legacy nonempty Job Event subscription fixture is denied by the v54 cutover; this slice does not
+change that Event owner or claim the broader group green.
+
+**Next Phase-3 slice:** acquire and hold the multi-source mutation/publication barrier and implement
+the shared Prepared inspection/recovery and atomic publication constructor, using these exact
+receipts. Source realization, candidate/retention reconciliation, quiescent binding mutation,
+SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v57.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

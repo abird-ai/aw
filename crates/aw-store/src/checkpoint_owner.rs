@@ -424,6 +424,20 @@ impl SessionStore {
             };
         }
 
+        // Source-bearing Prepared claims share this constructor's request
+        // namespace. Removing sources from a retry cannot create a new row.
+        if crate::construction_receipt::lookup_in(
+            &tx,
+            crate::construction_receipt::ConstructionOperation::CheckpointCreate,
+            &creator,
+            request_id,
+        )?
+        .is_some()
+        {
+            return Err(Error::Conflict(
+                "checkpoint request is non-retryable; inspect its prepared receipt",
+            ));
+        }
         let (session, branch) = agent_owner::key_for_ref(&tx, reference)?;
         let source = AgentKey::new(&session, &branch);
         agent_owner::authorize_permission(&tx, actor, source, AgentPermission::View)?;
@@ -547,7 +561,10 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP TABLE checkpoint_sources;
+                    "DROP INDEX construction_legacy_actor;
+                 DROP INDEX construction_source_prepare_id;
+                 DROP INDEX construction_receipt_replay;
+                 DROP TABLE checkpoint_sources;
                  DROP TABLE checkpoints;
                  UPDATE store_meta SET value='55' WHERE key='schema_epoch';
                  UPDATE schema_meta SET schema_epoch=55,activation_epoch=55 WHERE singleton=1;
@@ -575,7 +592,7 @@ mod tests {
             assert_eq!(
                 conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                     .unwrap(),
-                56
+                57
             );
             assert_eq!(
                 conn.query_row("SELECT count(*) FROM checkpoints", [], |row| row

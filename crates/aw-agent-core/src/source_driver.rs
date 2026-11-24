@@ -623,6 +623,75 @@ impl PreparedSourceOperation {
     }
 }
 
+/// One named driver's exact prepared operation, owned by the enclosing
+/// construction receipt, not a separately replayable resource.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedPreparedSource {
+    pub name: SourceName,
+    pub prepared: PreparedSourceOperation,
+}
+
+/// One operation-owned identity and bounded set of per-source descriptors.
+/// All entries describe the same capture or restore. No saved evidence is a
+/// live fence, and none of these fields is credential custody.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedSourceSet {
+    pub prepare_id: String,
+    pub operation: SourceOperationKind,
+    pub sources: Vec<NamedPreparedSource>,
+}
+
+impl PreparedSourceSet {
+    pub fn validate(&self) -> Result<()> {
+        validate_identity(&self.prepare_id, MAX_PREPARE_ID_BYTES, "prepare identity")?;
+        validate_source_set_hard_limit(self.sources.len())?;
+        if self.sources.is_empty() || self.prepare_id.contains("://") {
+            return Err(Error::Config(
+                "invalid prepared source set identity or size".into(),
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut effects = std::collections::BTreeSet::new();
+        for source in &self.sources {
+            source.name.validate()?;
+            source.prepared.validate()?;
+            let descriptor = &source.prepared.descriptor;
+            if source.prepared.operation != self.operation
+                || descriptor.prepare_id != self.prepare_id
+            {
+                return Err(Error::Conflict(
+                    "source preparation belongs to another operation",
+                ));
+            }
+            if !names.insert(source.name.as_str())
+                || !effects.insert((&descriptor.driver, descriptor.prepared_identity.as_str()))
+            {
+                return Err(Error::Conflict(
+                    "duplicate prepared source name or effect identity",
+                ));
+            }
+            if descriptor.prepared_identity.contains("://")
+                || descriptor
+                    .fields
+                    .iter()
+                    .any(|field| field.value.contains("://"))
+            {
+                return Err(Error::Config(
+                    "prepared sources require non-secret opaque identities, not URLs".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn admit(&self, limit: SourceSetLimit) -> Result<()> {
+        limit.admit(self.sources.len())?;
+        self.validate()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryInspection<T> {
     NotStarted,

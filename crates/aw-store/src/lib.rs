@@ -33,6 +33,7 @@ mod cold_effect_reconciliation;
 mod cold_quarantine_review;
 #[cfg(unix)]
 mod composite_staging;
+mod construction_receipt;
 pub mod context;
 mod coordination;
 pub mod durability;
@@ -308,8 +309,10 @@ pub const EVENT_DELIVERY_CUTOVER_SCHEMA: &str =
     include_str!("../migrations/054_event_delivery_cutover.sql");
 pub const SOURCE_BINDING_SCHEMA: &str = include_str!("../migrations/055_source_bindings.sql");
 pub const CHECKPOINT_SCHEMA: &str = include_str!("../migrations/056_checkpoints.sql");
+pub const CONSTRUCTION_RECEIPT_SCHEMA: &str =
+    include_str!("../migrations/057_construction_receipts.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 56;
+const LATEST_SCHEMA_VERSION: i64 = 57;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -818,10 +821,25 @@ pub(crate) fn audit(
     action: &str,
     data: serde_json::Value,
 ) -> Result<()> {
+    audit_with_security_metadata(conn, session, actor, action, data, None)
+}
+
+/// Owner-private receipt data need not be copied into security audit metadata.
+pub(crate) fn audit_with_security_metadata(
+    conn: &Connection,
+    session: &str,
+    actor: &PrincipalId,
+    action: &str,
+    data: serde_json::Value,
+    security_metadata: Option<serde_json::Value>,
+) -> Result<()> {
     let created = now();
+    let encoded = json(&data)?;
+    let security_metadata = security_metadata.as_ref().map(json).transpose()?;
+    let security_data = security_metadata.as_deref().unwrap_or(&encoded);
     db(conn.execute(
         "INSERT INTO audit(session_id,actor,action,data_json,created_at) VALUES(?1,?2,?3,?4,?5)",
-        params![session, actor.as_str(), action, json(&data)?, created],
+        params![session, actor.as_str(), action, encoded, created],
     ))?;
     let user = ensure_user_for_principal(conn, actor)?;
     let store: String = db(conn.query_row(
@@ -829,7 +847,7 @@ pub(crate) fn audit(
         [],
         |r| r.get(0),
     ))?;
-    db(conn.execute("INSERT INTO security_audit_events(audit_id,store_id,realm_id,actor_user_id,action,resource_type,resource_id,outcome,metadata_json,created_at) SELECT ?1,?2,u.realm_id,?3,?4,'session',?5,'allowed',?6,?7 FROM users u WHERE u.user_id=?3",params![id("audit")?,store,user,action,session,json(&data)?,created]))?;
+    db(conn.execute("INSERT INTO security_audit_events(audit_id,store_id,realm_id,actor_user_id,action,resource_type,resource_id,outcome,metadata_json,created_at) SELECT ?1,?2,u.realm_id,?3,?4,'session',?5,'allowed',?6,?7 FROM users u WHERE u.user_id=?3",params![id("audit")?,store,user,action,session,security_data,created]))?;
     Ok(())
 }
 
@@ -2991,6 +3009,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current == 55 {
         migrate_source_schema(c, 56, "checkpoints", CHECKPOINT_SCHEMA)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 56 {
+        migrate_source_schema(c, 57, "construction-receipts", CONSTRUCTION_RECEIPT_SCHEMA)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {

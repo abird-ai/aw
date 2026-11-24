@@ -48,5 +48,8 @@ pub(crate) fn revalidate(
     let registry = registry.reader()?;
     crate::sandbox_owner::source_bindings::revalidate_in(&tx, &registry)?;
     crate::checkpoint_owner::revalidate_in(&tx, &registry)?;
+    // Compatibility is derived on demand from retained descriptors; never
+    // rewrite an immutable receipt or treat compatibility as live authority.
+    crate::construction_receipt::visit_unresolved_sources(&tx, &registry, |_, _, _| Ok(()))?;
     db(tx.commit())
 }

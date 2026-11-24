@@ -491,10 +491,26 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Git suite **32/32** (typed anchor roundtrip). Strict affected-crate all-target Clippy with
       Git source-driver, full workspace all-target check, repository fmt and scoped diff-check
       are green.
-      **Next:** Prepared per-source descriptor custody and unresolved dependency resolution within
-      the existing operation receipt, then multi-source recovery and shared Prepared publication.
-      Source realization, candidate/retention cleanup, quiescent mutation, SandboxGrant/Vault and
-      host RPCs remain pending. Store schema is v56.
+      **v57 construction receipt/source recovery custody landed locally:** existing immutable
+      construction audit owner now has one indexed replay lookup across historical task-only and
+      current typed receipts. Task-bearing Agent construction uses the shared claim/CAS transition;
+      legacy receipts decode their original stable creator without rewriting audit. Named
+      PreparedSourceSet uses the common source bound, exact operation/preparation ID, unique names/
+      effect identities and driver recovery schema. The indexed prepare identity is reserved once.
+      Unresolved capture/restore receipts retain private candidates/descriptors; history-only/
+      task-free constructors cannot bypass a consumed effectful request. Security audit metadata
+      omits protected descriptors. Startup/staged restore resolve current unresolved dependencies
+      from indexed original claims and the same SourceDriver snapshot as bindings/anchors.
+      Missing/incompatible definitions leave exact Prepared/Unknown custody; no blind retry,
+      external effect or terminal source transition. Grouped construction receipt **1/1**, actual
+      task-bearing Agent create/replay **1/1**, checkpoint owner **1/1**, Sandbox owner **2/2**,
+      SourceDriver **1/1**, strict affected-crate Clippy, workspace all-target check, fmt and
+      scoped diff-check are green. Broader Agent-host **1/2**: unchanged legacy
+      subscription fixture refuses at v54 cutover (not claimed green).
+      **Next:** multi-source mutation/publication barriers and shared Prepared inspection/recovery
+      and atomic publication; full contextual replay/preflight ordering, source realization,
+      candidate/retention cleanup, quiescent mutation, SandboxGrant/Vault and host RPCs remain.
+      Store schema is v57.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -599,4 +615,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, plus v56 immutable checkpoint/source storage and trusted history-only replay are live; remaining work is Prepared source descriptor custody and unresolved dependency pinning, source realization/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, SandboxGrant/Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, plus v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution are live; remaining work is source realization/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, full contextual replay/preflight ordering, SandboxGrant/Vault and host RPCs.

@@ -18,7 +18,11 @@ use std::collections::BTreeSet;
 
 const MAX_AGENT_LIST: usize = 256;
 const MAX_INITIAL_ACCESS: usize = 512;
-const AGENT_CREATE_PREPARATION_ACTION: &str = "agent.create.preparation";
+use crate::construction_receipt::{
+    self, ConstructionCandidate, ConstructionOperation,
+    ConstructionPreparation as AgentCreatePreparation, InitialTask,
+    PreparationState as AgentCreatePreparationState,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,32 +150,6 @@ pub struct AgentCreateContext {
     /// Trusted logical execution site selected by the host. Never accepted
     /// from model-visible Agent constructor arguments.
     pub execution_site: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AgentCreatePreparationState {
-    Prepared,
-    Applied,
-    Rejected,
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentCreatePreparation {
-    request_id: String,
-    fingerprint: String,
-    state: AgentCreatePreparationState,
-    parent_branch_id: String,
-    candidate_session_id: String,
-    candidate_root_id: String,
-    candidate_branch_id: String,
-    queue_request_id: String,
-    payload_ref: String,
-    payload_sha256: String,
-    result_ref: Option<String>,
-    note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -360,45 +338,16 @@ fn agent_create_preparation_in(
     parent_branch: &str,
     request_id: &str,
 ) -> Result<Option<AgentCreatePreparation>> {
-    let encoded: Option<String> = db(connection
-        .query_row(
-            "SELECT data_json FROM audit
-             WHERE session_id=?1 AND action=?2
-               AND json_extract(data_json,'$.request_id')=?3
-               AND json_extract(data_json,'$.parent_branch_id')=?4
-             ORDER BY seq DESC LIMIT 1",
-            params![
-                parent_session,
-                AGENT_CREATE_PREPARATION_ACTION,
-                request_id,
-                parent_branch
-            ],
-            |row| row.get(0),
-        )
-        .optional())?;
-    encoded
-        .map(|value| crate::decode::<AgentCreatePreparation>(&value))
-        .transpose()
-}
-
-fn append_agent_create_preparation(
-    connection: &Connection,
-    actor: &PrincipalId,
-    parent_session: &str,
-    preparation: &AgentCreatePreparation,
-) -> Result<()> {
-    audit(
-        connection,
-        parent_session,
-        actor,
-        AGENT_CREATE_PREPARATION_ACTION,
-        serde_json::to_value(preparation)
-            .map_err(|_| Error::Storage("cannot encode Agent create preparation"))?,
-    )
+    let operation = ConstructionOperation::AgentCreate;
+    let scope = operation.scope(
+        "",
+        agent_owner::AgentKey::new(parent_session, parent_branch),
+    );
+    construction_receipt::lookup_in(connection, operation, &scope, request_id)
 }
 
 fn transition_agent_create_preparation(
-    connection: &Connection,
+    tx: &rusqlite::Transaction<'_>,
     actor: &PrincipalId,
     parent_session: &str,
     parent_branch: &str,
@@ -407,28 +356,10 @@ fn transition_agent_create_preparation(
     result_ref: Option<String>,
     note: Option<String>,
 ) -> Result<AgentCreatePreparation> {
-    let current = agent_create_preparation_in(
-        connection,
-        parent_session,
-        parent_branch,
-        &expected.request_id,
-    )?
-    .ok_or(Error::Storage(
-        "Agent create preparation receipt disappeared",
-    ))?;
-    if &current != expected {
-        return Err(Error::Conflict(
-            "Agent create preparation receipt changed; inspect before retry",
-        ));
+    if expected.parent_session_id != parent_session || expected.parent_branch_id != parent_branch {
+        return Err(Error::Conflict("Agent create receipt origin changed"));
     }
-    let next = AgentCreatePreparation {
-        state,
-        result_ref,
-        note,
-        ..expected.clone()
-    };
-    append_agent_create_preparation(connection, actor, parent_session, &next)?;
-    Ok(next)
+    construction_receipt::transition_in(tx, actor, expected, state, result_ref, note)
 }
 
 fn persist_agent_create_preparation_transition(
@@ -936,7 +867,7 @@ impl SessionStore {
                 title,
             )?;
 
-            let (parent_session, parent_branch) = {
+            let (parent_session, parent_branch, creator) = {
                 let connection = self.connection()?;
                 authorize_project_create(&connection, actor, &selected_project)?;
                 if let Some((canonical_source, _, _)) = source.as_ref() {
@@ -972,6 +903,7 @@ impl SessionStore {
                 if let Some(existing) =
                     agent_create_preparation_in(&connection, &session, &branch, request_id)?
                 {
+                    existing.require_actor(&connection, actor)?;
                     if existing.fingerprint != fingerprint {
                         return Err(Error::Denied(
                             "Agent create request identity was reused with changed semantics",
@@ -991,24 +923,40 @@ impl SessionStore {
                         )),
                     };
                 }
-                (session, branch)
+                let creator = user_for_principal(&connection, actor)?
+                    .ok_or(Error::Denied("Agent create caller unavailable"))?;
+                (session, branch, creator)
             };
 
             let ids = resources::mint_session_candidate_ids()?;
             let queue_request_id = initial_task_request_id(request_id, &ids.session);
             let custody =
                 actor_queue::mint_prepared_queue_custody(&ids.session, &queue_request_id, task)?;
+            let operation = ConstructionOperation::AgentCreate;
             let preparation = AgentCreatePreparation {
+                operation,
+                scope: operation.scope(
+                    &creator,
+                    agent_owner::AgentKey::new(&parent_session, &parent_branch),
+                ),
+                creator,
+                parent_session_id: parent_session.clone(),
+                parent_branch_id: parent_branch.clone(),
                 request_id: request_id.to_owned(),
                 fingerprint,
                 state: AgentCreatePreparationState::Prepared,
-                parent_branch_id: parent_branch.clone(),
-                candidate_session_id: ids.session,
-                candidate_root_id: ids.root,
-                candidate_branch_id: ids.branch,
-                queue_request_id,
-                payload_ref: custody.payload_ref.clone(),
-                payload_sha256: custody.payload_sha256.clone(),
+                candidate: ConstructionCandidate::Agent {
+                    session: ids.session,
+                    root: ids.root,
+                    branch: ids.branch,
+                    sandbox: None,
+                },
+                task: Some(InitialTask {
+                    queue_request_id,
+                    payload_ref: custody.payload_ref.clone(),
+                    payload_sha256: custody.payload_sha256.clone(),
+                }),
+                sources: None,
                 result_ref: None,
                 note: None,
             };
@@ -1052,12 +1000,13 @@ impl SessionStore {
                     agent_owner::AgentKey::new(&session, &branch),
                     AgentPermission::View,
                 )?;
-                if agent_create_preparation_in(&tx, &session, &branch, request_id)?.is_some() {
-                    return Err(Error::Conflict(
-                        "Agent create request identity was claimed concurrently",
-                    ));
-                }
-                append_agent_create_preparation(&tx, actor, &session, &preparation)?;
+                construction_receipt::claim_in(
+                    &tx,
+                    actor,
+                    &self.inner.source_drivers,
+                    self.inner.source_limit,
+                    &preparation,
+                )?;
                 db(tx.commit())?;
             }
 
@@ -1131,14 +1080,28 @@ impl SessionStore {
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))
             .map_err(&reject_precommit)?;
         let publication = (|| -> Result<String> {
-            authorize_project_create(&tx, actor, &selected_project)?;
-            let candidate_ids = prepared_task.as_ref().map(|(_, _, preparation, _)| {
-                resources::SessionCandidateIds {
-                    session: preparation.candidate_session_id.clone(),
-                    root: preparation.candidate_root_id.clone(),
-                    branch: preparation.candidate_branch_id.clone(),
+            // Do not turn a consumed effectful request into a store-only
+            // constructor by removing its task on retry.
+            if request.task.is_none() {
+                if let (Some(request_id), Some(origin)) = (
+                    context.request_id.as_deref(),
+                    context.current_agent_ref.as_deref(),
+                ) {
+                    validate_host_request_id(request_id)?;
+                    let (session, branch) = key_for_ref_in(&tx, origin)?;
+                    if agent_create_preparation_in(&tx, &session, &branch, request_id)?.is_some() {
+                        return Err(Error::Conflict(
+                            "Agent create request is non-retryable; inspect its prepared receipt",
+                        ));
+                    }
                 }
-            });
+            }
+
+            authorize_project_create(&tx, actor, &selected_project)?;
+            let candidate_ids = prepared_task
+                .as_ref()
+                .map(|(_, _, preparation, _)| preparation.candidate.agent_ids())
+                .transpose()?;
             let (session, branch) =
                 if let Some((canonical_source, source_is_agent, _)) = source.as_ref() {
                     let fork_access = match &request.access {
@@ -1216,9 +1179,8 @@ impl SessionStore {
             }
 
             if let Some((_, _, preparation, custody)) = &prepared_task {
-                if session.id != preparation.candidate_session_id
-                    || branch.id != preparation.candidate_branch_id
-                {
+                let ids = preparation.candidate.agent_ids()?;
+                if session.id != ids.session || branch.id != ids.branch {
                     return Err(Error::Conflict(
                         "published Agent identity differs from prepared candidate",
                     ));
@@ -1230,7 +1192,7 @@ impl SessionStore {
                     &tx,
                     &owner,
                     ActorQueueRequest {
-                        request_id: preparation.queue_request_id.clone(),
+                        request_id: preparation.initial_task()?.queue_request_id.clone(),
                         session_id: session.id.clone(),
                         branch_id: branch.id.clone(),
                         recipient_site: context.execution_site.clone(),
@@ -1263,7 +1225,7 @@ impl SessionStore {
                     "project":selected_project.canonical(),
                     "access":request.access,
                     "sandbox":selected_sandbox,
-                    "initial_task":prepared_task.as_ref().map(|(_,_,preparation,_)| preparation.queue_request_id.as_str()),
+                    "initial_task":prepared_task.as_ref().and_then(|(_,_,preparation,_)| preparation.task.as_ref().map(|task| task.queue_request_id.as_str())),
                 }),
             )?;
             if let Some((parent_session, parent_branch, preparation, _)) = &prepared_task {
