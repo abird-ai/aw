@@ -1,4 +1,4 @@
-//! Concrete captured-source Git restore. Store owns Prepared custody,
+//! Concrete Git checkpoint lifecycle. Store owns Prepared custody,
 //! recovery, history and final publication; the host owns physical authority.
 //! Blocking trusted-host operations, not an Actor/model/RPC admission route.
 use aw_agent_core::{
@@ -17,6 +17,9 @@ use std::{
     fs,
     path::{Component, Path},
 };
+
+mod capture;
+pub use capture::{GitCheckpointCaptureHost, GitSourceFence};
 
 /// Live, independently authorized, whole-layout physical/provider fence.
 ///
@@ -39,7 +42,7 @@ struct Publication<'a, F> {
     evidence: ExternalEvidence,
 }
 
-impl<F: GitRestoreFence> SourcePublicationFence for Publication<'_, F> {
+impl<F> SourcePublicationFence for Publication<'_, F> {
     fn evidence(&self) -> &ExternalEvidence {
         &self.evidence
     }
@@ -545,12 +548,13 @@ mod tests {
     // Fixture authority is a real held read guard. All writers to this
     // isolated fixture are under the test's ownership, not a production
     // claim that a mutex excludes arbitrary filesystem writers.
-    struct Fence<'a> {
-        locations: Vec<GitRestoreLocation>,
+    struct Fence<'a, L = GitRestoreLocation> {
+        locations: Vec<L>,
         _guard: RwLockReadGuard<'a, ()>,
         authority: &'a RwLock<()>,
         database: &'a Path,
         expected_agents: u64,
+        expected_retained: Option<u64>,
     }
 
     impl GitRestoreFence for Fence<'_> {
@@ -559,10 +563,25 @@ mod tests {
         }
     }
 
-    impl Drop for Fence<'_> {
+    impl GitSourceFence for Fence<'_, aw_git::source_driver::GitSourceLocation> {
+        fn locations(&self) -> &[aw_git::source_driver::GitSourceLocation] {
+            &self.locations
+        }
+    }
+
+    impl<L> Drop for Fence<'_, L> {
         fn drop(&mut self) {
             assert!(self.authority.try_write().is_err());
             assert_eq!(count_agents(self.database), self.expected_agents);
+            if let Some(expected) = self.expected_retained {
+                let count: u64 = Connection::open(self.database)
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM checkpoint_sources", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, expected);
+            }
         }
     }
 
@@ -661,79 +680,170 @@ mod tests {
                 "local",
             )
             .unwrap();
-        let capture = store
-            .checkpoint_prepare_capture(
+        let authority = RwLock::new(());
+        let capture_locations = || {
+            ["code", "data"]
+                .into_iter()
+                .map(|name| {
+                    let repo = source_root.join(name);
+                    aw_git::source_driver::GitSourceLocation {
+                        name: SourceName::new(name).unwrap(),
+                        repository_identity: identity(&repo),
+                        repository: repo,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let capture_fence = |locations, expected_agents, expected_retained| Fence {
+            locations,
+            _guard: authority.read().unwrap(),
+            authority: &authority,
+            database: &database,
+            expected_agents,
+            expected_retained: Some(expected_retained),
+        };
+        let capture_host = GitCheckpointCaptureHost::new(&store, &driver);
+        let mut incomplete = capture_locations();
+        incomplete.pop();
+        assert!(capture_host
+            .capture(
                 &actor,
                 &source.agent.canonical_ref,
                 CheckpointCaptureSelection::Auto,
                 None,
                 "fixture:capture",
-                |id, bindings| {
-                    Ok(PreparedSourceSet {
-                        prepare_id: id.to_owned(),
-                        operation: SourceOperationKind::Capture,
-                        sources: bindings
-                            .iter()
-                            .map(|binding| {
-                                Ok(NamedPreparedSource {
-                                    name: binding.binding.name.clone(),
-                                    prepared: git_driver.plan_capture(&binding.binding, id, id)?,
-                                })
-                            })
-                            .collect::<Result<_>>()?,
-                    })
-                },
+                |_| Ok(capture_fence(incomplete, 2, 0))
             )
-            .unwrap();
-        capture.revalidate().unwrap();
-        for source in &capture.sources().sources {
-            git_driver.execute_capture(&source.prepared).unwrap();
-        }
-        let captured = capture
-            .inspect(|_, _, prepared| {
-                prepared
-                    .sources
-                    .iter()
-                    .map(|source| {
-                        let RecoveryInspection::Completed { result, evidence } =
-                            git_driver.inspect_capture(&source.prepared)?
-                        else {
-                            return Err(Error::Conflict("fixture capture incomplete"));
-                        };
-                        RecoveryInspection::completed((&result).try_into()?, evidence)
-                    })
-                    .collect()
-            })
-            .unwrap();
-        // Fixture destination policy independently selects these already
-        // retained versions. No effectful baseline selection or new capture.
-        let baseline = SourceSet {
-            coverage: aw_agent_core::SourceCoverage::Selected,
-            anchors: captured.source_set().anchors.clone(),
+            .is_err());
+        assert!(store
+            .checkpoint_replay_capture(
+                &actor,
+                &source.agent.canonical_ref,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "fixture:capture"
+            )
+            .unwrap()
+            .is_none());
+
+        let fail_capture = || {
+            Connection::open(&database)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER fixture_fail_capture BEFORE INSERT ON checkpoint_sources
+                 BEGIN SELECT RAISE(ABORT,'fixture capture publication failure'); END;",
+                )
+                .unwrap()
         };
-        let checkpoint = captured
-            .publish::<std::convert::Infallible>(|_, _, prepared, sources, evidence| {
-                prepared
-                    .sources
-                    .iter()
-                    .zip(&sources.anchors)
-                    .zip(evidence)
-                    .map(|((source, anchor), evidence)| {
-                        git_driver.revalidate_capture(
-                            &source.prepared,
-                            &GitSourceAnchor::try_from(anchor)?,
-                        )?;
-                        Ok(SourcePublicationProof::Immutable(evidence.clone()))
-                    })
-                    .collect()
+        let clear_capture_failure = || {
+            Connection::open(&database)
+                .unwrap()
+                .execute_batch("DROP TRIGGER fixture_fail_capture;")
+                .unwrap()
+        };
+        fail_capture();
+        assert!(capture_host
+            .capture(
+                &actor,
+                &source.agent.canonical_ref,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "fixture:capture",
+                |_| Ok(capture_fence(capture_locations(), 2, 0))
+            )
+            .is_err());
+        for name in ["code", "data"] {
+            assert!(!git(
+                &executable,
+                &source_root.join(name),
+                &["for-each-ref", "refs/aw/checkpoints/"]
+            )
+            .is_empty());
+        }
+        assert!(capture_host
+            .capture::<Fence<'_, aw_git::source_driver::GitSourceLocation>>(
+                &actor,
+                &source.agent.canonical_ref,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "fixture:capture",
+                |_| panic!("unresolved capture authorized again")
+            )
+            .is_err());
+        drop(store);
+        clear_capture_failure();
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let capture_host = GitCheckpointCaptureHost::new(&store, &driver);
+        let mut wrong = capture_locations();
+        wrong[0].repository = wrong[1].repository.clone();
+        wrong[0].repository_identity = wrong[1].repository_identity;
+        assert!(capture_host
+            .resume(&actor, "fixture:capture", |_, _| Ok(capture_fence(
+                wrong, 2, 0
+            )))
+            .is_err());
+        let checkpoint = capture_host
+            .resume(&actor, "fixture:capture", |_, _| {
+                Ok(capture_fence(capture_locations(), 2, 2))
             })
+            .unwrap();
+        assert_eq!(
+            capture_host
+                .capture::<Fence<'_, aw_git::source_driver::GitSourceLocation>>(
+                    &actor,
+                    &source.agent.canonical_ref,
+                    CheckpointCaptureSelection::Auto,
+                    None,
+                    "fixture:capture",
+                    |_| panic!("Applied capture authorized again")
+                )
+                .unwrap(),
+            checkpoint
+        );
+
+        // An independent abandoned capture must not release the published refs.
+        let before = git(
+            &executable,
+            &source_root.join("code"),
+            &["for-each-ref", "refs/aw/checkpoints/"],
+        );
+        fail_capture();
+        assert!(capture_host
+            .capture(
+                &actor,
+                &source.agent.canonical_ref,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "fixture:abandon-capture",
+                |_| Ok(capture_fence(capture_locations(), 2, 2))
+            )
+            .is_err());
+        clear_capture_failure();
+        capture_host
+            .abandon(&actor, "fixture:abandon-capture", |_, _| {
+                Ok(capture_fence(capture_locations(), 2, 2))
+            })
+            .unwrap();
+        assert_eq!(
+            git(
+                &executable,
+                &source_root.join("code"),
+                &["for-each-ref", "refs/aw/checkpoints/"]
+            ),
+            before
+        );
+        capture_host
+            .abandon::<Fence<'_, aw_git::source_driver::GitSourceLocation>>(
+                &actor,
+                "fixture:abandon-capture",
+                |_, _| panic!("terminal capture cleanup authorized again"),
+            )
             .unwrap();
         let request = CheckpointRestoreRequest {
             checkpoint: checkpoint.id,
             task: Some("restore fixture".into()),
             ..request
         };
-        let authority = RwLock::new(());
         let locations = |destination: &Path| {
             ["code", "data"]
                 .into_iter()
@@ -755,12 +865,16 @@ mod tests {
             authority: &authority,
             database: &database,
             expected_agents,
+            expected_retained: None,
         };
         let destination = root.join("restored");
         private_dir(&destination);
         let host = GitCheckpointRestoreHost::new(&store, &driver);
         let mut incomplete = locations(&destination);
         incomplete.pop();
+        // Fixture policy selects these independently retained versions via
+        // the real authorized restore observation, never fabricated anchors.
+        let mut baseline = None;
         assert!(host
             .restore(
                 &actor,
@@ -768,9 +882,16 @@ mod tests {
                 "fixture:restore",
                 "local",
                 || Ok(layout(&destination)),
-                |_, _| Ok(fence(incomplete, 2))
+                |_, set| {
+                    baseline = Some(SourceSet {
+                        coverage: aw_agent_core::SourceCoverage::Selected,
+                        anchors: set.anchors.clone(),
+                    });
+                    Ok(fence(incomplete, 2))
+                }
             )
             .is_err());
+        let baseline = baseline.expect("authorized retained source observation");
         assert!(store
             .checkpoint_replay_restore(&actor, &request, "fixture:restore")
             .unwrap()
@@ -1058,20 +1179,46 @@ mod tests {
         store
             .checkpoint_delete(&actor, &request.checkpoint)
             .unwrap();
-        {
-            let _guard = authority.read().unwrap();
-            store
-                .checkpoint_reconcile_retired_sources(&actor, &request.checkpoint, |set| {
-                    for anchor in &set.anchors {
-                        git_driver.release_retired_anchor(
-                            &source_root.join(anchor.name.as_str()),
-                            &GitSourceAnchor::try_from(anchor)?,
-                        )?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
+        let capture_host = GitCheckpointCaptureHost::new(&store, &driver);
+        // Physical retention release succeeds, but the Store transaction
+        // fails. Exact original anchors remain in Unknown custody; replay
+        // reconciles already-absent refs rather than recapturing anything.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fixture_fail_retirement BEFORE DELETE ON checkpoint_sources
+             BEGIN SELECT RAISE(ABORT,'fixture retirement publication failure'); END;",
+            )
+            .unwrap();
+        assert!(capture_host
+            .reconcile_retired(&actor, &request.checkpoint, |_| {
+                Ok(capture_fence(capture_locations(), 4, 2))
+            })
+            .is_err());
+        for name in ["code", "data"] {
+            assert!(git(
+                &executable,
+                &source_root.join(name),
+                &["for-each-ref", "refs/aw/checkpoints/"]
+            )
+            .is_empty());
         }
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_retirement;")
+            .unwrap();
+        capture_host
+            .reconcile_retired(&actor, &request.checkpoint, |_| {
+                Ok(capture_fence(capture_locations(), 4, 0))
+            })
+            .unwrap();
+        capture_host
+            .reconcile_retired::<Fence<'_, aw_git::source_driver::GitSourceLocation>>(
+                &actor,
+                &request.checkpoint,
+                |_| panic!("released retention authorized again"),
+            )
+            .unwrap();
         assert!(host
             .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
                 Ok(fence(locations(&other), 4))

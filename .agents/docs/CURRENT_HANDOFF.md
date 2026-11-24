@@ -47,9 +47,9 @@ managed Git restore-materialization release with original Applied restore proven
 metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
 unpublished capture/restore candidate reconciliation, shared custom initial history
 ACL construction, captured-source restore initial-task custody/publication,
-task-only baseline restore/recovery, concrete fenced Git checkpoint restore,
-managed closed-Sandbox retirement and effectful versioned baseline restore host
-consumers are implemented locally.
+task-only baseline restore/recovery, concrete fenced Git checkpoint capture/restore/
+retention reconciliation, managed closed-Sandbox retirement and effectful versioned
+baseline restore host consumers are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2204,10 +2204,37 @@ Production baseline selection and retention authority
 remain the embedding host's responsibility; creating a new version/snapshot or
 unversioned baseline assets is not implemented by this slice.
 
+Concrete fenced Git checkpoint capture and retention reconciliation now compose
+`GitCheckpointCaptureHost` with the same registered driver and original Store
+Prepared/replay/inspection/publication/abandonment owners. `GitSourceLocation`
+records exact named independently approved checkout identity. Shared checkout pin
+verification refuses noncanonical paths, changed directory identity and ambient
+ancestor discovery before Git probes; approved capture planning reuses the same
+read-only driver planner. The whole selected set and original descriptor/binding/
+checkpoint identities are checked before first effects and on recovery. New capture
+replays before approval and runs only after Prepared; resume inspects only, while
+abandon conditionally releases exact unpublished retention. Immutable Git commit
+content does not imply immutable authority or retention: the actual independent
+`GitSourceFence` remains held through the Store commit. Logical retirement remains
+`checkpoint_delete`; `reconcile_retired` checks the exact full retained anchor set
+against approved Git repositories and holds that same authority through existing
+Store settlement, including failure. Already absent refs may reconcile; no broad
+prune, backing GC or worktree removal. No new Store owner, schema or ledger.
+The existing grouped two-source Host lifecycle regression now uses this host
+instead of hand-composing capture callbacks: incomplete approval, failed capture
+publication, restart, wrong location, exact resume/replay, separate abandoned
+capture, retention deletion followed by failed Store settlement, and exact retry
+of reconciliation with absent refs. Restore, baseline and closed-Sandbox recovery
+remain in that same fixture; original HEAD/index unchanged. Host **16/16**,
+Git repository **32/32**, strict affected all-target/all-feature Clippy, workspace
+all-target/all-feature check and scoped fmt/diff passed. Production authority
+provisioning and arbitrary scratch cleanup remain explicitly open.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer independent authority/cleanup composition or Vault owner work
-with an actual consumer; do not add speculative admission layers.
+While blocked, prefer a production authority owner or Vault with an actual safe
+consumer and original Process/broker admission fence; do not add speculative
+admission or a standalone definition registry without a consumer.
 Independent host approval provisioning, other effectful baseline materialization,
 incomplete-effect reconciliation, multi-source policy, general unpublished partial/
 scratch cleanup and production cleanup composition/physical authority, final-source

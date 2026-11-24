@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -795,6 +796,36 @@ fn binding_for_repo(
     Ok(binding)
 }
 
+/// Exact independently authorized checkout location. A physical identity
+/// observes a directory, but grants no access to it or its Git backing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitSourceLocation {
+    pub name: SourceName,
+    pub repository: PathBuf,
+    pub repository_identity: (u64, u64),
+}
+
+fn pin_checkout(root: &Path, identity: (u64, u64)) -> Result<aw_platform::DirectoryIdentity> {
+    if !root.is_absolute() || root.canonicalize()? != root {
+        return Err(Error::Denied(
+            "Git approval requires a canonical checkout root",
+        ));
+    }
+    let pin = aw_platform::DirectoryIdentity::open(root)?;
+    if pin.identity()? != identity || !pin.is_current(root)? {
+        return Err(Error::Conflict("approved Git checkout directory changed"));
+    }
+    // Never discover a repository by ascending outside the approved root.
+    let dotgit = root.join(".git");
+    let metadata = fs::symlink_metadata(&dotgit)?;
+    if !(metadata.is_file() || metadata.is_dir()) || aw_platform::path_is_link_like(&dotgit)? {
+        return Err(Error::Denied(
+            "Git approval requires an exact checkout root",
+        ));
+    }
+    Ok(pin)
+}
+
 /// Concrete built-in registration. The host chooses an absolute trusted Git
 /// executable and authorized repositories; registry publication grants nothing.
 pub struct GitSourceDriver {
@@ -872,10 +903,7 @@ impl GitSourceDriver {
         }
         // Refuse a substituted directory before even querying Git there.
         // Keep the original pin until the verified repository pins exist.
-        let approved = aw_platform::DirectoryIdentity::open(approved_root)?;
-        if approved.identity()? != approved_identity {
-            return Err(Error::Conflict("approved Git checkout directory changed"));
-        }
+        let approved = pin_checkout(approved_root, approved_identity)?;
         let repo = self.binding_repository(binding)?;
         if repo.root_identity().map_err(git_error)? != approved_identity
             || !approved.is_current(approved_root)?
@@ -895,16 +923,67 @@ impl GitSourceDriver {
         checkpoint_id: &str,
         prepare_id: &str,
     ) -> Result<PreparedSourceOperation> {
-        validate_checkpoint_id(checkpoint_id)?;
         let repo = self.binding_repository(binding)?;
+        Self::plan_capture_in(&repo, binding, checkpoint_id, prepare_id)
+    }
+
+    /// Read-only planning at the exact independently authorized checkout.
+    pub fn plan_capture_approved(
+        &self,
+        location: &GitSourceLocation,
+        binding: &SourceBinding,
+        checkpoint_id: &str,
+        prepare_id: &str,
+    ) -> Result<PreparedSourceOperation> {
+        if location.name != binding.name {
+            return Err(Error::Denied("Git capture approval names another source"));
+        }
+        let repo = self.verify_materialization(
+            binding,
+            &location.repository,
+            location.repository_identity,
+        )?;
+        Self::plan_capture_in(&repo, binding, checkpoint_id, prepare_id)
+    }
+
+    /// Validate original descriptor identity before probing any persisted
+    /// checkout locator. A later inspection/cleanup must use this same
+    /// descriptor and current independent physical/provider authority.
+    pub fn verify_capture_location(
+        &self,
+        location: &GitSourceLocation,
+        binding: &SourceBinding,
+        checkpoint_id: &str,
+        prepared: &PreparedSourceOperation,
+    ) -> Result<()> {
+        let plan = CapturePlan::decode(prepared)?;
+        if location.name != binding.name
+            || plan.binding != *binding
+            || plan.checkpoint_id != checkpoint_id
+        {
+            return Err(Error::Denied(
+                "Git capture descriptor differs from approved source",
+            ));
+        }
+        self.verify_materialization(binding, &location.repository, location.repository_identity)?;
+        Ok(())
+    }
+
+    fn plan_capture_in(
+        repo: &Repository,
+        binding: &SourceBinding,
+        checkpoint_id: &str,
+        prepare_id: &str,
+    ) -> Result<PreparedSourceOperation> {
+        validate_checkpoint_id(checkpoint_id)?;
         let reference = retention_ref(checkpoint_id, &binding.name);
-        if retained_commit(&repo, &reference)?.is_some() {
+        if retained_commit(repo, &reference)?.is_some() {
             return Err(Error::Conflict(
                 "Git retention identity already exists; inspect its operation",
             ));
         }
-        let snapshot = Snapshot::read(&repo, false)?;
-        verify_commit_tree(&repo, &snapshot.base)?;
+        let snapshot = Snapshot::read(repo, false)?;
+        verify_commit_tree(repo, &snapshot.base)?;
         CapturePlan {
             binding: binding.clone(),
             checkpoint_id: checkpoint_id.into(),
@@ -1073,6 +1152,32 @@ impl GitSourceDriver {
             return Err(Error::Conflict("retired Git anchor repository changed"));
         }
         release_exact_retention(&repo, anchor)
+    }
+
+    /// Check the exact approved repository against a retained anchor's
+    /// stable source identity, without requiring the retention to exist.
+    /// This supports reconciliation after a prior successful release.
+    pub fn verify_anchor_location(
+        &self,
+        location: &GitSourceLocation,
+        anchor: &GitSourceAnchor,
+    ) -> Result<()> {
+        anchor.validate()?;
+        if location.name != anchor.name {
+            return Err(Error::Denied("Git retention approval names another source"));
+        }
+        let pin = pin_checkout(&location.repository, location.repository_identity)?;
+        let repo = self.repository(&location.repository)?;
+        if repo.root() != location.repository
+            || repo.root_identity().map_err(git_error)? != location.repository_identity
+            || !pin.is_current(&location.repository)?
+            || repository_stamps(&repo)?.0 != anchor.source_ref
+        {
+            return Err(Error::Conflict(
+                "Git retention approval differs from original source",
+            ));
+        }
+        Ok(())
     }
 
     /// Read-only retention validation independent of the current HEAD. A

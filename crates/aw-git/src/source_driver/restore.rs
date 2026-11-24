@@ -45,28 +45,15 @@ impl GitRestoreLocation {
             .target
             .parent()
             .ok_or(Error::Denied("Git restore destination has no parent"))?;
-        for (path, expected) in [
-            (self.repository.as_path(), self.repository_identity),
-            (parent, self.parent_identity),
-        ] {
-            if !path.is_absolute() || path.canonicalize()? != path {
-                return Err(Error::Denied(
-                    "Git restore approval requires canonical directories",
-                ));
-            }
-            let pin = aw_platform::DirectoryIdentity::open(path)?;
-            if pin.identity()? != expected || !pin.is_current(path)? {
-                return Err(Error::Conflict("approved Git restore directory changed"));
-            }
-        }
-        // An approved checkout root is not permission to discover a
-        // repository by ascending into its unapproved ancestors.
-        let dotgit = self.repository.join(".git");
-        let metadata = fs::symlink_metadata(&dotgit)?;
-        if !(metadata.is_file() || metadata.is_dir()) || aw_platform::path_is_link_like(&dotgit)? {
+        super::pin_checkout(&self.repository, self.repository_identity)?;
+        if !parent.is_absolute() || parent.canonicalize()? != parent {
             return Err(Error::Denied(
-                "Git restore approval requires an exact checkout root",
+                "Git restore approval requires a canonical parent",
             ));
+        }
+        let pin = aw_platform::DirectoryIdentity::open(parent)?;
+        if pin.identity()? != self.parent_identity || !pin.is_current(parent)? {
+            return Err(Error::Conflict("approved Git restore parent changed"));
         }
         Ok(())
     }
