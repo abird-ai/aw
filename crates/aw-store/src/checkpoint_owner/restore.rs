@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Trusted lower checkpoint restore request. The destination layout is
-/// independently selected by the host. Initial task and custom access will
-/// use the common Agent constructor; neither is accepted by this seam yet.
+/// independently selected by the host. Access uses the common exact-history
+/// constructor; initial task custody remains a separate pending cut.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointRestoreRequest {
@@ -93,6 +93,7 @@ impl RestoreBoundary {
         }
         label(&self.source_agent_ref, 2048)?;
         label(&self.title, 160)?;
+        self.access.validate()?;
         let project = parse_project_ref(&self.destination_project)?;
         let ConstructionCandidate::Agent {
             sandbox: Some(sandbox),
@@ -251,7 +252,7 @@ fn observe_in(
         connection,
         actor,
         &source,
-        request.access,
+        &request.access,
         &stable_user_principal(&project.identity)?,
         &project.project,
     )?;
@@ -273,7 +274,7 @@ fn observe_in(
         destination_project: project.canonical(),
         destination_writer_epoch: writer.writer_epoch,
         title: title.to_owned(),
-        access: request.access,
+        access: request.access.clone(),
         binding_digest: binding_digest.to_owned(),
     };
     Ok(RestoreObservation {
@@ -412,7 +413,7 @@ impl<'a> PreparedCheckpointRestore<'a> {
                 checkpoint: boundary.checkpoint.clone(),
                 project: Some(boundary.destination_project.clone()),
                 title: Some(boundary.title.clone()),
-                access: boundary.access,
+                access: boundary.access.clone(),
             },
             &binding_digest(binding)?,
             self.store.inner.source_limit,
@@ -678,7 +679,7 @@ fn publish_restored_agent_in(
         history,
         &boundary.title,
         binding,
-        boundary.access,
+        boundary.access.clone(),
         &stable_user_principal(&project.identity)?,
         &project.project,
         receipt.candidate.agent_ids()?,
@@ -743,6 +744,7 @@ fn restore_fingerprint(request: &CheckpointRestoreRequest, request_id: &str) -> 
     if let Some(title) = &request.title {
         label(title, 160)?;
     }
+    request.access.validate()?;
     fingerprint(b"aw-checkpoint-restore-v1\0", request)
 }
 
@@ -1370,6 +1372,44 @@ mod tests {
                 rev,
             )
             .unwrap();
+        // The same custom ACL is admitted for both restore paths. Resolve
+        // the actual current destination principal before any driver plan.
+        let grant = crate::AgentCreateAccessGrant {
+            principal: viewer_ref.clone(),
+            permissions: crate::AgentPermissions::VIEW_ONLY,
+        };
+        for invalid in [
+            vec![grant.clone(), grant.clone()],
+            vec![crate::AgentCreateAccessGrant {
+                principal: format!(
+                    "/d:other-domain/i:{}",
+                    viewer_ref.rsplit_once("/i:").unwrap().1
+                ),
+                ..grant.clone()
+            }],
+            vec![crate::AgentCreateAccessGrant {
+                principal: store.agent_get(&actor, &reference).unwrap().owner_ref,
+                ..grant.clone()
+            }],
+        ] {
+            let invalid = CheckpointRestoreRequest {
+                access: AgentHistoryForkAccess::Custom(invalid),
+                ..request.clone()
+            };
+            assert!(store
+                .checkpoint_prepare_restore(
+                    &actor,
+                    &invalid,
+                    &layout,
+                    "host:bad-acl",
+                    |_, _, _| panic!("invalid custom audience must refuse before planning"),
+                )
+                .is_err());
+        }
+        let request = CheckpointRestoreRequest {
+            access: AgentHistoryForkAccess::Custom(vec![grant]),
+            ..request
+        };
         assert!(store
             .checkpoint_prepare_restore(
                 &viewer,
@@ -1451,6 +1491,58 @@ mod tests {
             .unwrap();
         assert_eq!(history_view.history.turns.len(), 2);
         assert_eq!(history_view.session.binding, baseline_layout);
+        let assert_custom_audience = |store: &SessionStore, agent: &AgentSnapshot, turns: usize| {
+            let acl = store
+                .agent_access_list_ref(&actor, &agent.canonical_ref)
+                .unwrap();
+            let entry = acl
+                .entries
+                .iter()
+                .find(|entry| entry.principal_ref == viewer_ref)
+                .unwrap();
+            assert_eq!(entry.permissions, crate::AgentPermissions::VIEW_ONLY);
+            assert_eq!(entry.grant_revision, 1);
+            assert_eq!(acl.rev, 1);
+            assert_eq!(acl.acl_rev, 1);
+            let (session, branch) =
+                agent_owner::key_for_ref(&store.connection().unwrap(), &agent.canonical_ref)
+                    .unwrap();
+            let visible = store
+                .read_agent_branch_view(&viewer, &session, &branch)
+                .unwrap();
+            assert_eq!(visible.history.turns.len(), turns);
+            assert_eq!(
+                store
+                    .agent_get(&viewer, &agent.canonical_ref)
+                    .unwrap()
+                    .caller_permissions,
+                crate::AgentPermissions::VIEW_ONLY
+            );
+            let connection = store.connection().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM history_grants WHERE destination_agent_ref=?1",
+                        [&agent.canonical_ref],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                1,
+                "initial audience needs only one HistoryGrant"
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM agent_sandbox_grants_current WHERE session_id=?1 AND branch_id=?2",
+                        params![session, branch],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                0,
+                "custom history ACL cannot mint source authority"
+            );
+        };
+        assert_custom_audience(&store, &restored_history.agent, 2);
         // An empty Auto selection preserves its original earlier prefix.
         // Fresh policy may supply ephemeral, never uncaptured required, sources.
         let auto_root = temp.0.join("auto-baseline");
@@ -1930,6 +2022,7 @@ mod tests {
         );
         assert_eq!(restored.agent.admission, crate::AgentAdmission::Held);
         assert_eq!(restored.agent.rev, 1);
+        assert_custom_audience(&store, &restored.agent, 1);
         let restored_ref = restored.agent.canonical_ref.clone();
         let ids = receipt.candidate.agent_ids().unwrap();
         let snapshot = store.sandbox_get(&actor, &sandbox).unwrap();

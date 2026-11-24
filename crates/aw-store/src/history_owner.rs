@@ -29,11 +29,21 @@ pub(crate) struct HistoryBaseRef {
     pub(crate) next_turn: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentHistoryForkAccess {
     Private,
     Inherit,
+    Custom(Vec<crate::AgentCreateAccessGrant>),
+}
+
+impl AgentHistoryForkAccess {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Self::Custom(grants) = self {
+            crate::agent_host::validate_initial_custom_access(grants)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1978,10 +1988,8 @@ pub(crate) fn prepare_disclosure_expansion(
     Ok(Some(grant_id))
 }
 
-type InheritedAcl = Vec<(String, String, agent_owner::AgentPermissions)>;
-
 struct ForkAudience {
-    inherited_acl: InheritedAcl,
+    acl: crate::agent_host::InitialAcl,
     audience: BTreeSet<(String, String)>,
 }
 
@@ -1990,7 +1998,8 @@ fn fork_audience_in(
     actor: &PrincipalId,
     source: &ResolvedHistorySource,
     destination_owner: &str,
-    access: AgentHistoryForkAccess,
+    destination_domain: &str,
+    access: &AgentHistoryForkAccess,
 ) -> Result<ForkAudience> {
     let source_agent = agent_owner::AgentKey::new(&source.session_id, &source.branch_id);
     let (owner_kind, _owner_handle): (String, String) = db(connection.query_row(
@@ -2004,31 +2013,59 @@ fn fork_audience_in(
             "exact-history constructor currently requires a user-owned source Project",
         ));
     }
-    let inherited_acl = match access {
+    let acl = match access {
         AgentHistoryForkAccess::Private => Vec::new(),
         AgentHistoryForkAccess::Inherit => direct_acl_rows(connection, source_agent)?,
+        AgentHistoryForkAccess::Custom(grants) => {
+            // Ordinary custom construction previously required Manage on
+            // the fresh destination. Only its authenticated owner can
+            // choose a custom initial audience here.
+            if user_for_principal(connection, actor)?.as_deref() != Some(destination_owner) {
+                return Err(Error::Denied(
+                    "custom initial access requires destination owner",
+                ));
+            }
+            crate::agent_host::resolve_initial_custom_access(
+                connection,
+                destination_domain,
+                "user",
+                destination_owner,
+                grants,
+            )?
+        }
     };
     let mut audience = BTreeSet::from([("user".to_owned(), destination_owner.to_owned())]);
-    for (kind, handle, permissions) in &inherited_acl {
+    for (kind, handle, permissions) in &acl {
         if permissions.view {
             audience.insert((kind.clone(), handle.clone()));
         }
     }
     for (kind, handle) in &audience {
-        validate_fork_manifest_for_principal(
-            connection,
-            actor,
-            &source.base.manifest_digest,
-            source.current_grant_id.as_deref(),
-            kind,
-            handle,
-        )?;
+        if matches!(access, AgentHistoryForkAccess::Custom(_))
+            && (kind != "user" || handle != destination_owner)
+        {
+            // Preserve the ordinary explicit audience-expansion contract:
+            // new custom viewers must pass current source-share checks,
+            // not merely inherit a historical grant's legacy coverage.
+            validate_manifest_expansion(
+                connection,
+                actor,
+                &source.base.manifest_digest,
+                kind,
+                handle,
+            )?;
+        } else {
+            validate_fork_manifest_for_principal(
+                connection,
+                actor,
+                &source.base.manifest_digest,
+                source.current_grant_id.as_deref(),
+                kind,
+                handle,
+            )?;
+        }
     }
-
-    Ok(ForkAudience {
-        inherited_acl,
-        audience,
-    })
+    Ok(ForkAudience { acl, audience })
 }
 
 fn attach_resolved_history_to_destination_in(
@@ -2039,22 +2076,27 @@ fn attach_resolved_history_to_destination_in(
     destination_branch: &str,
     access: AgentHistoryForkAccess,
 ) -> Result<()> {
-    let (destination_owner_kind, destination_owner): (String, String) = db(connection.query_row(
-        "SELECT owner_kind,owner_handle
+    let (destination_owner_kind, destination_owner, destination_domain): (String, String, String) =
+        db(connection.query_row(
+            "SELECT owner_kind,owner_handle,domain_handle
              FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
-        params![destination_session, destination_branch],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ))?;
+            params![destination_session, destination_branch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ))?;
     if destination_owner_kind != "user" {
         return Err(Error::Denied(
             "exact-history destination currently requires a user-owned Project",
         ));
     }
 
-    let ForkAudience {
-        inherited_acl,
-        audience,
-    } = fork_audience_in(connection, actor, source, &destination_owner, access)?;
+    let ForkAudience { acl, audience } = fork_audience_in(
+        connection,
+        actor,
+        source,
+        &destination_owner,
+        &destination_domain,
+        &access,
+    )?;
 
     let destination_ref: String = db(connection.query_row(
         "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
@@ -2065,29 +2107,16 @@ fn attach_resolved_history_to_destination_in(
     ))?;
     let created_by = user_for_principal(connection, actor)?
         .ok_or(Error::Denied("Agent fork creator identity is inactive"))?;
-    for (kind, handle, permissions) in &inherited_acl {
-        db(connection.execute(
-            "INSERT INTO agent_acl_current(
-                 session_id,branch_id,principal_kind,principal_handle,
-                 can_view,can_contribute,can_submit,can_control,can_derive,can_share,can_manage,
-                 grant_rev,granted_by_handle,updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,?12,?13)",
-            params![
-                destination_session,
-                destination_branch,
-                kind,
-                handle,
-                i64::from(permissions.view),
-                i64::from(permissions.contribute),
-                i64::from(permissions.submit),
-                i64::from(permissions.control),
-                i64::from(permissions.derive),
-                i64::from(permissions.share),
-                i64::from(permissions.manage),
-                created_by,
-                now(),
-            ],
-        ))?;
+    let destination = agent_owner::AgentKey::new(destination_session, destination_branch);
+    for (kind, handle, permissions) in acl {
+        agent_owner::initialize_acl(
+            connection,
+            destination,
+            &kind,
+            &handle,
+            permissions,
+            &created_by,
+        )?;
     }
     let grant_id = mint_destination_grant(
         connection,
@@ -2226,7 +2255,7 @@ pub(crate) fn preflight_resolved_history_in_project(
     connection: &Connection,
     actor: &PrincipalId,
     source: &ResolvedHistorySource,
-    access: AgentHistoryForkAccess,
+    access: &AgentHistoryForkAccess,
     destination_owner: &PrincipalId,
     destination_workspace: &str,
 ) -> Result<()> {
@@ -2237,7 +2266,19 @@ pub(crate) fn preflight_resolved_history_in_project(
         destination_owner,
         destination_workspace,
     )?;
-    fork_audience_in(connection, actor, source, &destination_user, access)?;
+    let domain: String = db(connection.query_row(
+        "SELECT domain_id FROM workspaces WHERE workspace_id=?1 AND archived_at IS NULL",
+        [destination_workspace],
+        |row| row.get(0),
+    ))?;
+    fork_audience_in(
+        connection,
+        actor,
+        source,
+        &destination_user,
+        &domain,
+        access,
+    )?;
     Ok(())
 }
 
@@ -2793,6 +2834,59 @@ mod tests {
                 )
                 .unwrap()
         };
+        // Ordinary agent.create(from=...) and checkpoint restore share the
+        // same custom initial audience, rather than minting one grant per
+        // ACL entry after private history construction.
+        let custom = store
+            .agent_create(
+                &owner,
+                &crate::AgentCreateContext {
+                    current_project_ref: source_ref.rsplit_once("/a:").unwrap().0.to_owned(),
+                    current_agent_ref: Some(source_ref.clone()),
+                    binding: binding(),
+                    auto_sandbox_ref: None,
+                    request_id: None,
+                    execution_site: "local".into(),
+                },
+                crate::AgentCreateRequest {
+                    from: Some(inherited_ref.clone()),
+                    title: Some("custom inherited history".into()),
+                    access: crate::AgentCreateAccess::Custom(vec![crate::AgentCreateAccessGrant {
+                        principal: bob_ref.clone(),
+                        permissions: crate::AgentPermissions::VIEW_ONLY,
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(custom.rev, 1);
+        assert_eq!(
+            store
+                .agent_get(&bob, &custom.canonical_ref)
+                .unwrap()
+                .caller_permissions,
+            crate::AgentPermissions::VIEW_ONLY
+        );
+        let (custom_session, custom_branch) =
+            agent_owner::key_for_ref(&store.connection().unwrap(), &custom.canonical_ref).unwrap();
+        let custom_view = store
+            .read_agent_branch_view(&bob, &custom_session, &custom_branch)
+            .unwrap();
+        assert_eq!(custom_view.history.turns.len(), 1);
+        assert_eq!(custom_view.history.turns[0].answer, "seed answer");
+        assert_eq!(
+            store
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM history_grants WHERE destination_agent_ref=?1",
+                    [&custom.canonical_ref],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            1
+        );
+
         let (reforked_turn, reforked_turn_branch) = store
             .create_agent_from_history_ref(
                 &owner,

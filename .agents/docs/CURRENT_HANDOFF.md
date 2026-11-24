@@ -44,7 +44,8 @@ retirement/retained-anchor reconciliation, source-bearing Sandbox logical close 
 exact closed-Sandbox materialization reconciliation with proven retained-layout release,
 managed Git restore-materialization release with original Applied restore provenance,
 metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
-unpublished capture/restore candidate reconciliation are implemented locally.
+unpublished capture/restore candidate reconciliation and shared custom initial history
+ACL construction are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2012,10 +2013,38 @@ Git repository **32/32**, checkpoint/capture/restore **4/4**, Sandbox **4/4**,
 construction receipt/barrier **1/1 each**; strict Git/Store all-target Clippy,
 workspace all-target check, fmt and scoped diff-check green.
 
+Custom initial ACL construction now uses the original AgentCreateAccessGrant,
+bounded validation/resolution and Agent ACL initialization primitives. The shared
+AgentHistoryForkAccess adds Custom(Vec<AgentCreateAccessGrant>) (Clone, no longer
+Copy; existing private/inherit serialized forms unchanged). Ordinary history-derived
+agent.create and both checkpoint restore paths resolve the destination-domain custom
+principals and publish one complete initial ACL + HistoryGrant, rather than expanding
+a private grant one viewer at a time. Explicit custom audience expansion retains
+the current manifest/source-share checks (no historical legacy-coverage shortcut).
+Destination owner remains implicit; reject duplicate/empty/foreign-domain/owner
+entries. Custom requires authenticated destination owner. Before source preparation
+and again at publication, restore revalidates the complete audience and current
+history/source disclosure. No new ACL owner, source grant, provider authority, or
+Agent revision fanout. Original request fingerprint/receipt preserves literal access
+semantics; initial task custody remains separate.
+
+Grouped restore regression exercises custom ACL on baseline and actual source-bearing
+restore, invalid audience refusal before planning, exact viewer history and permissions,
+one HistoryGrant, initial revs and no SandboxGrant. Existing history fork regression
+also exercises ordinary agent.create(from=...) custom access. The initial test-only
+SandboxGrant assertion used a wrong column and was corrected. Broad agent_host state-shell
+test still fails at its unchanged legacy replace_agent_job_subscription call, which
+is deliberately denied after Phase-2 cutover; not fixed by weakening that gate or
+changing unrelated Event tests. Task-bearing Agent create regression passes.
+Final focused gates: checkpoint/capture/restore **4/4**, history owner **4/4**,
+task-bearing Agent create **1/1**, Sandbox **4/4**, construction receipt **1/1**;
+strict Store all-target Clippy, workspace all-target check, fmt and scoped
+diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, shared task/custom ACL constructor integration or independent
-effectful baseline custody remain available. Independent host approval provisioning,
+While blocked, share initial-task construction custody/publication with restore or
+implement independent effectful baseline custody. Independent host approval provisioning,
 incomplete-effect reconciliation, multi-source policy, general unpublished partial/
 scratch cleanup and production cleanup composition/physical authority, final-source
 removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.

@@ -616,6 +616,52 @@ pub(crate) fn snapshot_in(
     })
 }
 
+pub(crate) fn validate_initial_custom_access(grants: &[AgentCreateAccessGrant]) -> Result<()> {
+    if grants.len() > MAX_INITIAL_ACCESS {
+        return Err(Error::Limit("initial Agent access list exceeds bound"));
+    }
+    let mut principals = BTreeSet::new();
+    for grant in grants {
+        if grant.permissions.validate()?.is_empty() {
+            return Err(Error::Denied(
+                "initial Agent access grants cannot be empty; omit the principal instead",
+            ));
+        }
+        if !principals.insert(grant.principal.as_str()) {
+            return Err(Error::Denied("duplicate principal in initial Agent access"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) type InitialAcl = Vec<(String, String, AgentPermissions)>;
+
+/// Resolve the exact initial ACL against the destination Domain. Both
+/// ordinary construction and history construction use this owner.
+pub(crate) fn resolve_initial_custom_access(
+    connection: &Connection,
+    domain: &str,
+    owner_kind: &str,
+    owner_handle: &str,
+    grants: &[AgentCreateAccessGrant],
+) -> Result<InitialAcl> {
+    validate_initial_custom_access(grants)?;
+    let mut seen = BTreeSet::new();
+    let mut resolved = Vec::with_capacity(grants.len());
+    for grant in grants {
+        let (kind, handle) =
+            principal_groups::resolve_principal_ref(connection, domain, &grant.principal)?;
+        if kind == owner_kind && handle == owner_handle {
+            return Err(Error::Denied("Agent owner access is implicit"));
+        }
+        if !seen.insert((kind.clone(), handle.clone())) {
+            return Err(Error::Denied("duplicate principal in initial Agent access"));
+        }
+        resolved.push((kind, handle, grant.permissions));
+    }
+    Ok(resolved)
+}
+
 fn install_initial_custom_access(
     connection: &Connection,
     actor: &PrincipalId,
@@ -623,9 +669,6 @@ fn install_initial_custom_access(
     branch: &str,
     grants: &[AgentCreateAccessGrant],
 ) -> Result<()> {
-    if grants.len() > MAX_INITIAL_ACCESS {
-        return Err(Error::Limit("initial Agent access list exceeds bound"));
-    }
     let agent = agent_owner::AgentKey::new(session, branch);
     agent_owner::authorize_permission(connection, actor, agent, AgentPermission::Manage)?;
     let (domain, owner_kind, owner_handle): (String, String, String) = db(connection.query_row(
@@ -636,22 +679,9 @@ fn install_initial_custom_access(
     ))?;
     let manager = user_for_principal(connection, actor)?
         .ok_or(Error::Denied("Agent manager identity is inactive"))?;
-    let mut seen = BTreeSet::new();
-    for grant in grants {
-        let permissions = grant.permissions.validate()?;
-        if permissions.is_empty() {
-            return Err(Error::Denied(
-                "initial Agent access grants cannot be empty; omit the principal instead",
-            ));
-        }
-        let (kind, handle) =
-            principal_groups::resolve_principal_ref(connection, &domain, &grant.principal)?;
-        if kind == owner_kind && handle == owner_handle {
-            return Err(Error::Denied("Agent owner access is implicit"));
-        }
-        if !seen.insert((kind.clone(), handle.clone())) {
-            return Err(Error::Denied("duplicate principal in initial Agent access"));
-        }
+    for (kind, handle, permissions) in
+        resolve_initial_custom_access(connection, &domain, &owner_kind, &owner_handle, grants)?
+    {
         if permissions.view {
             history_owner::prepare_disclosure_expansion(connection, actor, agent, &kind, &handle)?;
         }
@@ -849,20 +879,7 @@ impl SessionStore {
             ));
         }
         if let AgentCreateAccess::Custom(grants) = &request.access {
-            if grants.len() > MAX_INITIAL_ACCESS {
-                return Err(Error::Limit("initial Agent access list exceeds bound"));
-            }
-            let mut principals = BTreeSet::new();
-            for grant in grants {
-                if grant.permissions.validate()?.is_empty() {
-                    return Err(Error::Denied(
-                        "initial Agent access grants cannot be empty; omit the principal instead",
-                    ));
-                }
-                if !principals.insert(grant.principal.as_str()) {
-                    return Err(Error::Denied("duplicate principal in initial Agent access"));
-                }
-            }
+            validate_initial_custom_access(grants)?;
         }
 
         let prepared_task = if let Some(task) = request.task.as_deref() {
@@ -1127,8 +1144,9 @@ impl SessionStore {
             let (session, branch) =
                 if let Some((canonical_source, source_is_agent, _)) = source.as_ref() {
                     let fork_access = match &request.access {
-                        AgentCreateAccess::Private | AgentCreateAccess::Custom(_) => {
-                            AgentHistoryForkAccess::Private
+                        AgentCreateAccess::Private => AgentHistoryForkAccess::Private,
+                        AgentCreateAccess::Custom(grants) => {
+                            AgentHistoryForkAccess::Custom(grants.clone())
                         }
                         AgentCreateAccess::Inherit if *source_is_agent => {
                             AgentHistoryForkAccess::Inherit
@@ -1196,8 +1214,12 @@ impl SessionStore {
                 requested_sandbox,
             )?;
 
-            if let AgentCreateAccess::Custom(grants) = &request.access {
-                install_initial_custom_access(&tx, actor, &session.id, &branch.id, grants)?;
+            // Exact-history construction already installed the complete
+            // custom ACL and its initial HistoryGrant together.
+            if source.is_none() {
+                if let AgentCreateAccess::Custom(grants) = &request.access {
+                    install_initial_custom_access(&tx, actor, &session.id, &branch.id, grants)?;
+                }
             }
 
             if let Some((_, _, preparation, custody)) = &prepared_task {
