@@ -91,22 +91,8 @@ pub(crate) fn source_visibility(
     cache: &mut HashMap<String, EventAuthorization<agent_owner::AgentAccessEvidence>>,
 ) -> Result<EventAuthorization<EventSourceEvidence>> {
     let agent_ref = source_agent_ref(source)?;
-    match placement {
-        EventSelectorPlacement::Agent { reference } if &agent_ref != reference => {
-            return Err(Error::Storage(
-                "exact-Agent Event scan escaped its placement root",
-            ));
-        }
-        EventSelectorPlacement::Project { reference }
-            if !agent_ref
-                .strip_prefix(reference)
-                .is_some_and(|suffix| suffix.starts_with("/a:")) =>
-        {
-            return Err(Error::Storage(
-                "Project Event scan escaped its placement root",
-            ));
-        }
-        _ => {}
+    if !placement.source_matches(connection, actor, source, &agent_ref)? {
+        return Ok(EventAuthorization::Deny);
     }
 
     let authority = if let Some(authority) = cache.get(&agent_ref) {

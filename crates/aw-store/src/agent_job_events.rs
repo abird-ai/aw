@@ -1827,11 +1827,12 @@ mod tests {
         crate::migrate_event_disclosure_causal(&mut connection).unwrap();
         crate::migrate_custom_events(&mut connection).unwrap();
         crate::migrate_event_handlers(&mut connection).unwrap();
+        crate::migrate_event_universe_placement(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            52
+            53
         );
         for source in [&root, &turn_ref] {
             assert_eq!(

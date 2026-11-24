@@ -22,10 +22,10 @@ complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v4
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
 exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery,
 v50 disclosure/causal execution closure, the v51 one-leaf EventTypeRegistry + custom Event publication
-owner, the model-facing `events_publish` / `events_subscribe` adapter, and v52 EventHandler
-definition/activation/receipt ownership are now implemented locally. Materialized/provider audience expansion
-remains Unknown until its provider-held principal fence exists; same-store cross-Domain selector completeness
-and the v36 delivery cutover remain later Phase-2 work.
+owner, the model-facing `events_publish` / `events_subscribe` adapter, v52 EventHandler
+definition/activation/receipt ownership, and v53 same-store cross-Domain Event-universe completeness are now
+implemented locally. Materialized/provider audience expansion remains Unknown until its provider-held
+principal fence exists; the explicit v36 delivery cutover is the remaining Phase-2 Event slice.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -42,10 +42,10 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 The local Phase-1/2 implementation line remains unpublished. Phase-1 completion is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 began at
 `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and currently runs
-through `a0549147f2c2bee2791dcca5760b3057deea21d3` (`Expose model Event tools`), with the
-intermediate private EventScan/source/read/wake/Project/subscription/EventInput/disclosure/custom-publication
-checkpoints preserved in Git history. This checkpoint adds the v52 EventHandler definition + durable
-at-least-once receipt owner. The local `origin/main` tracking ref is stale and is not publication truth.
+through `53490a6d19d542c98416a6f3a67f085b4ffc73ed` (`Own durable EventHandler receipts`), with the
+intermediate private EventScan/source/read/wake/Project/subscription/EventInput/disclosure/custom-publication/
+model-tool checkpoints preserved in Git history. This checkpoint adds v53 same-store cross-Domain Event
+universe completeness. The local `origin/main` tracking ref is stale and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -927,15 +927,73 @@ v44→...→v52. Repository fmt, full workspace all-target check, strict affecte
 scoped diff-check are green. The historical broad Store result remains
 **226 green / 4 stale downgrade-fixture reds** and was not rerun.
 
-No same-store broad cross-Domain selector or v36 delivery cutover is implemented.
+Schema **v53** closes sealed Phase-2 step 12 without adding a topology service or merged cursor. Event
+placement now has a third private shape, `universe`, for the reviewed broad Agent-subtree grammar:
+`d:<exact|*>.i:<exact|*>.p:*.a:*...`. Exact Agent and exact-Project/`a:*` placement are unchanged.
+The syntax helper only recognizes that shape; Store placement remains authoritative.
+
+The Store completeness proof is authority-scoped. For a broad universe, the existing resource owner resolves
+the caller to its current user and enumerates only **active Domains with active membership for that caller**,
+optionally filtered by an exact Domain. For every included Domain it proves (a) the Domain's existing
+`authority_store_id` is this StoreId and (b) every active Workspace is the existing `hosted` kind on this
+Store's local Machine. If any currently-authorized matching Domain/Workspace is remote, unknown or otherwise
+not wholly local, admission fails closed; an already-live cursor becomes stale and subscription/Handler
+becomes lagged. Hidden Domains never enter this query, so their creation or remote placement cannot perturb
+another principal's affinity or reveal topology.
+
+No global/per-user topology generation was introduced. The durable placement token still binds
+`StoreScope + normalized selector`; every use recomputes the caller's authorized completeness before scan
+and before progress. This is intentional under the **live resource-owner invariant**: current production
+owners create/project Domain/Workspace placement but do not retarget `domains.authority_store_id` or
+`workspaces.host_machine_id` in place. Workspace writer failover has its own writer epoch/revision but does
+not move Event-store placement and therefore must not spuriously stale Event cursors. A future reviewed
+owner that adds in-place Event-store movement must expose a monotonic placement fence before such moves are
+accepted by this proof; v53 does not invent that dormant state today.
+
+Concrete source visibility remains separate from placement completeness. A broad Event source must still
+match the selector's exact/wildcard Domain+Principal coordinates, the scanning principal must still hold
+current Domain membership for that concrete source, and the exact source Agent still requires current
+`view`; DisclosureManifest authorization remains after source visibility. Revoking membership therefore
+privately denies future concrete matches rather than revealing or retroactively replaying them. Gaining
+same-store authority can expose future matching Events without needlessly invalidating the cursor; gaining
+authority to a remote Domain makes completeness stale instead of silently returning a partial world.
+
+All three durable consumers use the same actor-aware placement proof:
+- `events.read` returns `cursor_stale` on incomplete authorized universe;
+- Agent subscriptions lag and stop retention pinning/delivery;
+- EventHandlers lag and require explicit rebaseline.
+The final EventInput transaction also recomputes structural completeness **and** re-runs the same
+placement-aware `source_visibility` evidence before admission, closing scan→commit races where Domain
+membership or one-store completeness changes after the advisory EventScan.
+
+Persistence changes are mechanical only. v53 rebuilds the three existing durable placement tables to extend
+their CHECK from `agent|project` to `agent|project|universe`, preserving cursor/subscription/Handler
+identity, private progress and Handler receipts. No placement-index/topology table was added. The existing
+v44→... migration regression now reaches v53.
+
+The model contextualizer is widened only to shapes the Store can now prove: exact Agent, exact
+Project/`a:*`, and `p:*.a:*`, `i:*.p:*.a:*`, or `d:*.i:*.p:*.a:*` Agent universes. Source and recipient
+remain implicit/current; unsupported mixed wildcards still fail before Store dispatch. Actual authorization
+and one-store completeness remain Store-owned rather than being inferred from the model string.
+
+Focused v53 evidence uses one grouped three-consumer regression rather than parallel fixtures. Two **real
+Agents in two distinct authorized local Domains** publish matching `#ready` Events. The broad cursor reads
+both; the Agent subscription self-suppresses its own Event and accepts the other Domain's EventInput; the
+Handler receives/ACKs both. A hidden principal's remote Domain leaves all three consumers current. Changing
+one Domain actually authorized for the caller to a remote authority-store fixture makes read stale and
+subscription/Handler lagged, proving no partial world. EventSubject **2/2**, the cross-Domain grouped
+regression **1/1**, Handler lifecycle **1/1**, combined Event migration/lifecycle **1/1**, model selector
+contextualization **1/1**, real model router **1/1**, repository fmt, full workspace all-target check,
+strict affected Clippy and scoped diff-check are green.
+
+The only remaining Phase-2 Event slice is the explicit v36 legacy-delivery cutover.
 `delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
 
-**Next Phase-2 slice:** implement sealed step 12: one-store v1 cross-Domain selector completeness using only
-the host's authoritative Domain-placement universe. Hidden Domains must not perturb caller affinity; a
-currently authorized matching Domain that cannot be proven in the same Event store must fail/stale rather
-than return a partial merged world. Keep exact per-source authorization and no merged/global Event cursor.
-After that, perform the explicit v36 `delivery_cutover_rev` source-owner transaction as the final Phase-2
-legacy-delivery cutover.
+**Next Phase-2 slice:** perform sealed step 13 as one source-owner serialized transaction:
+set `delivery_cutover_rev = current next_event_rev`, preserve whole-revision ownership across the boundary,
+install post-cutover DL-200 subscription state, fence legacy new delivery admission, and bridge only genuinely
+pending pre-cutover deliveries with deterministic identity/conservative compatibility disclosure provenance.
+Crash/restart must reread the cutover and no source revision may be owned by both delivery paths.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

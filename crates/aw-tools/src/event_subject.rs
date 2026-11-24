@@ -208,6 +208,22 @@ pub struct EventPattern {
     raw: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EventAgentUniverse {
+    domain: Option<String>,
+    identity: Option<String>,
+}
+
+impl EventAgentUniverse {
+    pub fn domain(&self) -> Option<&str> {
+        self.domain.as_deref()
+    }
+
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+}
+
 impl EventPattern {
     pub fn parse_absolute(value: &str) -> Result<Self, EventSubjectError> {
         if value.is_empty() || value.len() > MAX_EVENT_SUBJECT_BYTES || !value.is_ascii() {
@@ -317,6 +333,39 @@ impl EventPattern {
         }
         let (kind, encoded) = tokens.next()?.split_once(':')?;
         (kind == "a" && encoded == "*").then_some(out)
+    }
+
+    /// Broad Agent-subtree placement shape whose Project and Agent coordinates
+    /// are wildcards. Domain/Principal may be exact or wildcard.
+    ///
+    /// This is syntax only. Store completeness and current Domain authority are
+    /// proved by the Event placement owner.
+    pub fn wildcard_project_agent_universe(&self) -> Option<EventAgentUniverse> {
+        let mut tokens = self.raw.split('.');
+        let (domain_kind, domain) = tokens.next()?.split_once(':')?;
+        let (identity_kind, identity) = tokens.next()?.split_once(':')?;
+        let (project_kind, project) = tokens.next()?.split_once(':')?;
+        let (agent_kind, agent) = tokens.next()?.split_once(':')?;
+        if domain_kind != "d"
+            || identity_kind != "i"
+            || project_kind != "p"
+            || agent_kind != "a"
+            || project != "*"
+            || agent != "*"
+        {
+            return None;
+        }
+        let domain = if domain == "*" {
+            None
+        } else {
+            Some(decode_handle(domain).ok()?)
+        };
+        let identity = if identity == "*" {
+            None
+        } else {
+            Some(decode_handle(identity).ok()?)
+        };
+        Some(EventAgentUniverse { domain, identity })
     }
 
     pub fn matches_canonical(&self, subject: &str) -> bool {
@@ -459,6 +508,30 @@ mod tests {
             Some("/d:acme/i:alice/p:foo.bar/a:2")
         );
         assert_eq!(exact_agent.wildcard_agent_project_ref(), None);
+        assert_eq!(
+            EventPattern::parse_absolute("d:acme.i:alice.p:*.a:*.>")
+                .unwrap()
+                .wildcard_project_agent_universe(),
+            Some(EventAgentUniverse {
+                domain: Some("acme".into()),
+                identity: Some("alice".into())
+            })
+        );
+        assert_eq!(
+            EventPattern::parse_absolute("d:*.i:*.p:*.a:*.e:#ready")
+                .unwrap()
+                .wildcard_project_agent_universe(),
+            Some(EventAgentUniverse {
+                domain: None,
+                identity: None
+            })
+        );
+        assert_eq!(
+            EventPattern::parse_absolute("d:acme.i:alice.p:core.a:*.>")
+                .unwrap()
+                .wildcard_project_agent_universe(),
+            None
+        );
         assert_eq!(
             EventPattern::parse_absolute("d:acme.i:alice.p:core.e:*")
                 .unwrap()

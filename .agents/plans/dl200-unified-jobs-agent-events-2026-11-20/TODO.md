@@ -382,11 +382,28 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       reused rather than cloned. Focused Handler registry **1/1**, real receipt lifecycle **1/1**, EventScan
       **1/1**, projection **1/1**, EventType **1/1**, combined Event migration/lifecycle **1/1** and strict
       affected Clippy/check are green; migration now reaches v52.
-      **Next:** sealed Phase-2 step 12 — same-store cross-Domain selector completeness under the authoritative
-      Domain-placement universe, with hidden Domains excluded from affinity and explicit stale/failure rather
-      than partial results for any authorized matching Domain outside the one Event store. No merged/global
-      cursor. Then land the explicit v36 delivery_cutover_rev source-owner transaction as the final legacy
-      delivery cutover.
+      **v53 same-store cross-Domain Event universes landed locally:** the reviewed broad Agent-subtree
+      grammar is exact/wildcard Domain + exact/wildcard Principal + wildcard Project + wildcard Agent. One
+      private `universe` placement shape reuses StoreScope and the existing Domain/Workspace owners; for the
+      scanning principal it enumerates only currently-authorized active Domains and requires each included
+      Domain's authority Store to equal this StoreId and every active Workspace to be locally hosted.
+      Hidden remote Domains do not perturb affinity; an authorized remote Domain makes read stale and
+      subscription/Handler lagged rather than returning a partial world. Concrete source membership + Agent
+      view + DisclosureManifest checks remain per Event, and EventInput admission rechecks the same placement-
+      aware source evidence after scan. No topology generation or merged cursor was added: production
+      Domain/Workspace owners do not retarget Event-store placement in place; Workspace writer epochs are
+      intentionally not misused as Event placement generations. v53 only widens the existing three durable
+      placement-kind CHECKs to include `universe` while preserving progress/receipts. Model contextualization
+      now exposes only these same provable exact/Project/universe shapes. One grouped regression uses real
+      Agents in two distinct local Domains: read sees both Events, subscription self-suppresses one and admits
+      the cross-Domain EventInput, Handler ACKs both; hidden remote Domain is invisible to affinity, while an
+      authorized remote fixture stales/lags all three. EventSubject **2/2**, cross-Domain grouped **1/1**,
+      Handler lifecycle **1/1**, combined migration/lifecycle **1/1**, model contextualizer **1/1**, model
+      router **1/1**, affected all-target check and strict Clippy are green; migration now reaches v53.
+      **Next:** sealed Phase-2 step 13, the explicit v36 `delivery_cutover_rev = current next_event_rev`
+      source-owner transaction. Whole revisions must belong to exactly one delivery owner, legacy new
+      admission is fenced atomically, genuinely pending pre-cutover deliveries bridge once with deterministic
+      identity/conservative disclosure sidecars, and restart must reread the cutover rather than guess.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

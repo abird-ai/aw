@@ -353,6 +353,58 @@ pub(crate) fn active_local_hosted_workspace_exact_in(
     Ok(active.then_some(workspace))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EventDomainPlacement {
+    pub(crate) domain_id: String,
+    pub(crate) authority_store_id: String,
+    pub(crate) all_active_workspaces_local: bool,
+}
+
+pub(crate) fn authorized_event_domain_placements(
+    c: &Connection,
+    actor: &PrincipalId,
+    exact_domain: Option<&str>,
+) -> Result<Vec<EventDomainPlacement>> {
+    let Some(user) = crate::user_for_principal(c, actor)? else {
+        return Ok(Vec::new());
+    };
+    let local_machine: String = db(c.query_row(
+        "SELECT value FROM store_meta WHERE key='local_machine_id'",
+        [],
+        |r| r.get(0),
+    ))?;
+    let mut query = db(c.prepare(
+        "SELECT d.domain_id,d.authority_store_id,
+                NOT EXISTS(
+                    SELECT 1 FROM workspaces w
+                     WHERE w.domain_id=d.domain_id
+                       AND w.archived_at IS NULL
+                       AND (
+                           w.kind<>'hosted'
+                           OR w.host_machine_id IS NULL
+                           OR w.host_machine_id<>?3
+                       )
+                )
+         FROM domain_memberships m
+         JOIN domains d ON d.domain_id=m.domain_id
+         WHERE m.user_id=?1
+           AND m.status='active'
+           AND d.status='active'
+           AND (?2 IS NULL OR d.domain_id=?2)
+         ORDER BY d.domain_id",
+    ))?;
+    let rows = db(
+        query.query_map(params![user, exact_domain, local_machine], |row| {
+            Ok(EventDomainPlacement {
+                domain_id: row.get(0)?,
+                authority_store_id: row.get(1)?,
+                all_active_workspaces_local: row.get(2)?,
+            })
+        }),
+    )?;
+    db(rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
 pub(crate) fn has_active_domain_membership(
     c: &Connection,
     actor: &PrincipalId,

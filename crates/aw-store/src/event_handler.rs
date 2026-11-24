@@ -825,7 +825,7 @@ fn handler_placement_check(
     placement: &EventSelectorPlacement,
     authority: &EventHandlerAuthority,
 ) -> Result<HandlerPlacementCheck> {
-    let structural = match event_placement::snapshot(connection, placement) {
+    let structural = match event_placement::snapshot(connection, &authority.principal, placement) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return Ok(HandlerPlacementCheck::Stale),
         Err(Error::Conflict(_)) => return Ok(HandlerPlacementCheck::Blocked),
@@ -858,7 +858,14 @@ fn scan_handler_once(
         StorePos::new(current.scan_position),
         pattern,
         MAX_EVENT_SCAN_ROWS,
-        || event_placement::state(connection, placement, placement_snapshot),
+        || {
+            event_placement::state(
+                connection,
+                &authority.principal,
+                placement,
+                placement_snapshot,
+            )
+        },
         |source| {
             event_authority::source_visibility(
                 connection,

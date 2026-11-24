@@ -127,8 +127,9 @@ impl SessionStore {
 
     /// Read one bounded Event page for a selector wholly contained by one exact Agent.
     ///
-    /// Broad Project/Domain selectors remain rejected until the placement owner
-    /// can prove one-store completeness for the caller.
+    /// Broad Project/Principal/Domain Agent-universe selectors are admitted only
+    /// when the placement owner proves one-store completeness for the caller's
+    /// currently-authorized matching Domain universe.
     pub fn events_read_page(
         &self,
         actor: &PrincipalId,
@@ -253,7 +254,7 @@ fn read_cursor_page(
     if row.store_id != scope.id().as_str() || row.restore_generation != scope.restore_generation() {
         return Ok(EventReadOutcome::CursorStale);
     }
-    let Some(placement_snapshot) = event_placement::snapshot(&tx, placement)? else {
+    let Some(placement_snapshot) = event_placement::snapshot(&tx, actor, placement)? else {
         return Ok(EventReadOutcome::CursorStale);
     };
     if row.placement_token != placement.token(&scope) {
@@ -280,7 +281,7 @@ fn read_cursor_page(
             position,
             pattern,
             remaining,
-            || event_placement::state(&tx, placement, &placement_snapshot),
+            || event_placement::state(&tx, actor, placement, &placement_snapshot),
             |source| {
                 event_authority::source_visibility(
                     &tx,
@@ -335,7 +336,7 @@ fn read_cursor_page(
     if current_scope != scope {
         return Ok(EventReadOutcome::CursorStale);
     }
-    match event_placement::state(&tx, placement, &placement_snapshot)? {
+    match event_placement::state(&tx, actor, placement, &placement_snapshot)? {
         EventPlacement::Current => {}
         EventPlacement::Stale => return Ok(EventReadOutcome::CursorStale),
         EventPlacement::Unknown => {
@@ -419,7 +420,7 @@ fn cursor_row(connection: &Connection, cursor: &str) -> Result<Option<CursorRow>
             let placement_token: [u8; 32] = placement
                 .try_into()
                 .map_err(|_| Error::Storage("invalid Event cursor placement token"))?;
-            if !matches!(placement_kind.as_str(), "agent" | "project") {
+            if !matches!(placement_kind.as_str(), "agent" | "project" | "universe") {
                 return Err(Error::Storage("invalid Event cursor placement kind"));
             }
             Ok(CursorRow {

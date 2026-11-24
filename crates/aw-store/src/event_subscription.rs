@@ -402,6 +402,7 @@ impl SessionStore {
             ));
         }
 
+        let creator = PrincipalId::new(subscription.created_by.clone())?;
         let scope = StoreScope::load(&tx)?;
         if subscription.store_id != scope.id().as_str()
             || subscription.restore_generation != scope.restore_generation()
@@ -412,7 +413,7 @@ impl SessionStore {
             run.lagged = true;
             return Ok(run);
         }
-        let placement_snapshot = match event_placement::snapshot(&tx, &placement) {
+        let placement_snapshot = match event_placement::snapshot(&tx, &creator, &placement) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
                 lag_subscription_in(&tx, &subscription, "placement_stale")?;
@@ -435,7 +436,6 @@ impl SessionStore {
             return Ok(run);
         }
 
-        let creator = PrincipalId::new(subscription.created_by.clone())?;
         let fence = EventScanFence::capture(&tx)?;
         let mut position = start;
         let mut examined = 0usize;
@@ -451,7 +451,7 @@ impl SessionStore {
                 position,
                 &pattern,
                 remaining,
-                || event_placement::state(&tx, &placement, &placement_snapshot),
+                || event_placement::state(&tx, &creator, &placement, &placement_snapshot),
                 |source| {
                     event_authority::source_visibility(
                         &tx,
@@ -664,7 +664,7 @@ pub(crate) fn subscription_row(
             created_by,
         )| {
             if !matches!(state.as_str(), "active" | "lagged" | "disabled")
-                || !matches!(placement_kind.as_str(), "agent" | "project")
+                || !matches!(placement_kind.as_str(), "agent" | "project" | "universe")
             {
                 return Err(Error::Storage("invalid Event subscription state"));
             }

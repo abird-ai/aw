@@ -65,17 +65,12 @@ fn contextualize_pattern(current_agent_ref: &str, value: &str) -> Result<String>
 
     let pattern = EventPattern::parse_absolute(&raw)
         .map_err(|_| Error::Denied("invalid Event subscription pattern"))?;
-    let exact_same_project = pattern.exact_agent_ref().is_some_and(|agent| {
-        agent
-            .strip_prefix(project_ref)
-            .is_some_and(|suffix| suffix.starts_with("/a:"))
-    });
-    let wildcard_current_project = pattern
-        .wildcard_agent_project_ref()
-        .is_some_and(|project| project == project_ref);
-    if !(exact_same_project || wildcard_current_project) {
+    if pattern.exact_agent_ref().is_none()
+        && pattern.wildcard_agent_project_ref().is_none()
+        && pattern.wildcard_project_agent_universe().is_none()
+    {
         return Err(Error::Denied(
-            "model Event subscription is limited to the current Project placement scope",
+            "model Event subscription selector has no supported single-store placement shape",
         ));
     }
     Ok(pattern.as_str().to_owned())
@@ -130,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn model_subject_context_is_project_bounded() {
+    fn model_subject_context_expands_through_supported_store_scopes() {
         let current = "/d:acme/i:alice/p:core/a:one";
         assert_eq!(
             contextualize_pattern(current, "e:#ready").unwrap(),
@@ -144,8 +139,19 @@ mod tests {
             contextualize_pattern(current, "a:*.e:#ready").unwrap(),
             "d:acme.i:alice.p:core.a:*.e:#ready"
         );
-        assert!(contextualize_pattern(current, "d:acme.i:alice.p:other.a:*.e:#ready").is_err());
-        assert!(contextualize_pattern(current, "d:other.i:alice.p:core.a:one.e:#ready").is_err());
+        assert_eq!(
+            contextualize_pattern(current, "p:*.a:*.>").unwrap(),
+            "d:acme.i:alice.p:*.a:*.>"
+        );
+        assert_eq!(
+            contextualize_pattern(current, "i:*.p:*.a:*.>").unwrap(),
+            "d:acme.i:*.p:*.a:*.>"
+        );
+        assert_eq!(
+            contextualize_pattern(current, "d:*.i:*.p:*.a:*.e:#ready").unwrap(),
+            "d:*.i:*.p:*.a:*.e:#ready"
+        );
+        assert!(contextualize_pattern(current, "d:*.i:*.p:core.a:*.e:#ready").is_err());
     }
 
     #[tokio::test]

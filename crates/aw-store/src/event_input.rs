@@ -16,6 +16,7 @@ use crate::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 
 const MAX_CAUSAL_DELIVERIES: u64 = 256;
 
@@ -69,6 +70,12 @@ pub(crate) fn admit_subscription_candidate(
     }
 
     let creator = PrincipalId::new(current.created_by.clone())?;
+    match event_placement::snapshot(connection, &creator, &placement) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(EventInputAdmission::PlacementStale),
+        Err(Error::Conflict(_)) => return Ok(EventInputAdmission::AuthorizationUnavailable),
+        Err(other) => return Err(other),
+    }
     match event_placement::admit(connection, &creator, &placement) {
         Ok(_) => {}
         Err(Error::Denied(_)) => return Ok(EventInputAdmission::ProvenDenied),
@@ -104,23 +111,27 @@ pub(crate) fn admit_subscription_candidate(
         Err(other) => return Err(other),
     };
 
-    let source_agent_ref = event_authority::source_agent_ref(&candidate.source)?;
-    if source_agent_ref == current.recipient_ref {
+    let mut source_cache =
+        HashMap::<String, EventAuthorization<agent_owner::AgentAccessEvidence>>::new();
+    let source_evidence = match event_authority::source_visibility(
+        connection,
+        &creator,
+        &placement,
+        &candidate.source,
+        &mut source_cache,
+    )? {
+        EventAuthorization::Allow(evidence) => evidence,
+        EventAuthorization::Deny => return Ok(EventInputAdmission::ProvenDenied),
+        EventAuthorization::Unknown => return Ok(EventInputAdmission::AuthorizationUnavailable),
+    };
+    if source_evidence.agent_ref == current.recipient_ref {
         return Ok(EventInputAdmission::ProvenDenied);
     }
-    let source_access =
-        match event_authority::authorize_agent_ref(connection, &creator, &source_agent_ref)? {
-            EventAuthorization::Allow(evidence) => evidence,
-            EventAuthorization::Deny => return Ok(EventInputAdmission::ProvenDenied),
-            EventAuthorization::Unknown => {
-                return Ok(EventInputAdmission::AuthorizationUnavailable)
-            }
-        };
-    if source_agent_ref != preliminary_source.agent_ref
-        || source_access != preliminary_source.access
-    {
+    if source_evidence != *preliminary_source {
         return Ok(EventInputAdmission::AuthorizationUnavailable);
     }
+    let source_agent_ref = source_evidence.agent_ref;
+    let source_access = source_evidence.access;
 
     let envelope = event_authority::candidate_envelope(candidate)?;
     if envelope != *preliminary_envelope {
