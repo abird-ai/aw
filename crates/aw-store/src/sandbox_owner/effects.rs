@@ -1,0 +1,705 @@
+//! Trusted host handoff for source-aware realization. The driver prepares a
+//! capability; the existing effect owner starts and settles it. No Process
+//! ownership, runtime dispatch or admission-state changes live here.
+use super::{
+    parse_sandbox_ref, snapshot_row, SandboxGrantObservation, SandboxGrantPolicy, SandboxSnapshot,
+};
+use crate::{
+    db, durability, label, now, store_scope::StoreScope, workspace_writer, Error, Result,
+    SessionStore, SourceMutationBarrier, SourceMutationOutcome, SourceMutationSet, StoreMode,
+};
+use aw_agent_core::{
+    NamedSourceAccess, PrincipalId, SandboxDriverDescriptor, SandboxDriverHandle,
+    SandboxDriverRegistryReader, SourceAccess,
+};
+use rusqlite::{params, Transaction, TransactionBehavior};
+use std::future::Future;
+
+/// A live decision of the trusted policy/tool authority owner. Implementors
+/// must guarantee these exact decisions through launch handoff until dropped.
+/// Returning a copy of persisted grant evidence is not such a guarantee.
+pub trait SandboxEffectAuthority {
+    fn policy(&self) -> &SandboxGrantPolicy;
+    fn tool_ceiling(&self) -> &[NamedSourceAccess];
+}
+
+/// Trusted host effect request, not a model selector. The existing effect
+/// owner supplies its unique, durably owned operation identity. This seam
+/// cannot admit a new Agent Turn or bypass its held execution admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxEffectRequest {
+    pub actor: PrincipalId,
+    pub agent_ref: String,
+    pub effect_id: String,
+    /// Complete source set the capability may expose, including reads.
+    pub sources: Vec<NamedSourceAccess>,
+}
+
+impl SandboxEffectRequest {
+    fn canonicalize(&mut self, store: &SessionStore) -> Result<()> {
+        label(&self.agent_ref, 2048)?;
+        if self.effect_id.is_empty()
+            || self.effect_id.len() > 128
+            || !self
+                .effect_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-:".contains(&b))
+        {
+            return Err(Error::Config("invalid source effect identity".into()));
+        }
+        store.source_set_limit().admit(self.sources.len())?;
+        for source in &self.sources {
+            source.name.validate()?;
+        }
+        self.sources
+            .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        if self.sources.is_empty()
+            || self
+                .sources
+                .windows(2)
+                .any(|pair| pair[0].name == pair[1].name)
+        {
+            return Err(Error::Conflict(
+                "source effect requires a nonempty unique source set",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact authorized inputs for a registered driver. Each source's effective
+/// access is the requested mode; the binding maximum remains metadata.
+/// The driver must expose only these sources at these effective modes and
+/// obey the live host policy, including physical layout and containment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxEffectPlan {
+    pub sandbox: SandboxSnapshot,
+    pub grant: SandboxGrantObservation,
+    pub driver: SandboxDriverDescriptor,
+    pub effect_id: String,
+}
+
+#[derive(PartialEq, Eq)]
+struct Boundary {
+    plan: SandboxEffectPlan,
+    writer: workspace_writer::WorkspaceWriterInfo,
+    store_scope: StoreScope,
+}
+
+impl Boundary {
+    fn mutation_set(&self) -> Result<SourceMutationSet> {
+        SourceMutationSet::from_binding_refs(
+            self.plan
+                .grant
+                .sources
+                .iter()
+                .map(|source| &source.binding.binding),
+        )
+    }
+}
+
+fn observe_in(
+    store: &SessionStore,
+    tx: &Transaction<'_>,
+    request: &SandboxEffectRequest,
+    driver: &SandboxDriverDescriptor,
+    policy: &SandboxGrantPolicy,
+    tool_ceiling: &[NamedSourceAccess],
+) -> Result<Boundary> {
+    let mut grant = store.sandbox_grant_preflight_in(
+        tx,
+        &request.actor,
+        &request.agent_ref,
+        policy,
+        tool_ceiling,
+    )?;
+    // Both collections are in canonical name order. Consume the exact
+    // requested subset once; a narrower permission is a refusal, not a
+    // silently different capability.
+    let mut permitted = grant.sources.into_iter().peekable();
+    let mut selected = Vec::with_capacity(request.sources.len());
+    for requested in &request.sources {
+        while permitted
+            .peek()
+            .is_some_and(|source| source.binding.binding.name.as_str() < requested.name.as_str())
+        {
+            permitted.next();
+        }
+        let mut source = permitted
+            .next()
+            .filter(|source| {
+                source.binding.binding.name == requested.name
+                    && source.access.permits(requested.access)
+            })
+            .ok_or(Error::Denied(
+                "requested source access exceeds current Sandbox authority",
+            ))?;
+        source.access = requested.access;
+        selected.push(source);
+    }
+    grant.sources = selected;
+    let sandbox = snapshot_row(tx, &grant.sandbox_ref)?;
+    let project = parse_sandbox_ref(&grant.sandbox_ref)?.project;
+    let writer = workspace_writer::require_workspace_writer(tx, &project.project)?;
+    Ok(Boundary {
+        plan: SandboxEffectPlan {
+            sandbox,
+            grant,
+            driver: driver.clone(),
+            effect_id: request.effect_id.clone(),
+        },
+        writer,
+        store_scope: StoreScope::load(tx)?,
+    })
+}
+
+/// Read-only prepared driver capability and live host authority. No effect
+/// or source lease exists until start atomically revalidates and admits it.
+#[must_use = "start only through the fenced handoff"]
+pub struct PreparedSandboxEffect<'a, P, A> {
+    store: &'a SessionStore,
+    request: SandboxEffectRequest,
+    boundary: Boundary,
+    authority: A,
+    prepared: P,
+}
+
+impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
+    pub fn plan(&self) -> &SandboxEffectPlan {
+        &self.boundary.plan
+    }
+}
+
+impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
+    /// One-shot handoff to the existing effect owner (e.g. Process::spawn).
+    /// The owner must have durable intent before invoking this boundary.
+    /// The guard is held through the start future, not the Process lifetime.
+    /// A dropped/panicking start leaves the durable source claims unresolved.
+    /// The result is returned even if launch failed: its owner must settle
+    /// the lease according to actual start/terminal evidence.
+    pub async fn start<R, F: Future<Output = R>>(
+        self,
+        start: impl FnOnce(P) -> F,
+    ) -> Result<(R, SandboxEffectLease<'a>)> {
+        let Self {
+            store,
+            request,
+            boundary,
+            authority,
+            prepared,
+        } = self;
+        let barrier = {
+            let policy = authority.policy();
+            let tool_ceiling = authority.tool_ceiling();
+            let mut connection = store.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let current = observe_in(
+                store,
+                &tx,
+                &request,
+                &boundary.plan.driver,
+                policy,
+                tool_ceiling,
+            )?;
+            if current != boundary {
+                return Err(Error::Conflict(
+                    "Sandbox effect boundary changed during preparation",
+                ));
+            }
+            let set = current.mutation_set()?;
+            let barrier =
+                store.acquire_source_mutation_barrier_in(&tx, &set, &request.effect_id)?;
+            db(tx.commit())?;
+            barrier
+        };
+        let write_capable = boundary
+            .plan
+            .grant
+            .sources
+            .iter()
+            .any(|source| source.access == SourceAccess::ReadWrite);
+        let lease = SandboxEffectLease {
+            store,
+            barrier,
+            actor: request.actor,
+            sandbox: boundary.plan.grant.sandbox_ref,
+            effect_id: request.effect_id,
+            write_capable,
+        };
+        let result = start(prepared).await;
+        drop(authority);
+        Ok((result, lease))
+    }
+}
+
+/// Factual source-effect settlement, supplied by the original effect owner.
+/// Settled includes unsuccessful effects that may have changed sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxEffectOutcome {
+    NotStarted,
+    Settled,
+    Unknown,
+}
+
+/// Holds every participating source (reads included) until the original
+/// effect owner can prove settlement. Dropping does not release claims.
+#[must_use = "settle against factual effect evidence; abandoned claims remain fenced"]
+pub struct SandboxEffectLease<'a> {
+    store: &'a SessionStore,
+    barrier: SourceMutationBarrier<'a>,
+    actor: PrincipalId,
+    sandbox: String,
+    effect_id: String,
+    write_capable: bool,
+}
+
+impl SandboxEffectLease<'_> {
+    /// No current grant check here: revocation governs new effects, not
+    /// factual settlement. Unknown preserves all source hazards. A known
+    /// settled write-capable effect advances Sandbox rev once with release.
+    pub fn settle(self, outcome: SandboxEffectOutcome) -> Result<()> {
+        let mut connection = self.store.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        if outcome == SandboxEffectOutcome::Settled && self.write_capable {
+            let changed = db(tx.execute(
+                "UPDATE sandboxes_current SET rev=rev+1,updated_at=?1
+                 WHERE sandbox_id=?2 AND lifecycle='open' AND rev<9223372036854775807",
+                params![now(), self.sandbox],
+            ))?;
+            if changed != 1 {
+                return Err(Error::Conflict(
+                    "source effect Sandbox revision unavailable",
+                ));
+            }
+            durability::commit_event(
+                &tx,
+                &durability::tx_id()?,
+                "sandbox.sources.changed",
+                "sandbox",
+                &self.sandbox,
+                Some(&self.actor),
+                serde_json::json!({"sync_scope":"local","aspect":"sources","effect_id":self.effect_id}),
+            )?;
+        }
+        self.barrier.settle_in(
+            &tx,
+            if outcome == SandboxEffectOutcome::Unknown {
+                SourceMutationOutcome::Unknown
+            } else {
+                SourceMutationOutcome::Settled
+            },
+        )?;
+        db(tx.commit())
+    }
+}
+
+impl SessionStore {
+    /// Trusted host source-effect seam. Resolve the actual current policy
+    /// and tool guard outside SQLite, select the exact registered native
+    /// driver, then prepare an inert capability without materializing or
+    /// starting an effect. The driver must pin and enforce the authorized
+    /// source/layout and all other host policy constraints; it cannot use
+    /// this observation as filesystem/network/device authority by itself.
+    ///
+    /// This does not install a runtime resolver or open held Agent
+    /// admission. Concrete runtime owners must use the fenced start and
+    /// factual settlement path for every source-bearing effect.
+    pub fn sandbox_prepare_source_effect<D, P, A>(
+        &self,
+        mut request: SandboxEffectRequest,
+        registry: &SandboxDriverRegistryReader,
+        driver: &SandboxDriverHandle<D>,
+        resolve: impl FnOnce(&SandboxEffectRequest) -> Result<A>,
+        prepare: impl FnOnce(&D, &SandboxEffectPlan, &A) -> Result<P>,
+    ) -> Result<PreparedSandboxEffect<'_, P, A>>
+    where
+        D: Send + Sync + 'static,
+        A: SandboxEffectAuthority,
+    {
+        if self.inner.mode != StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "source effect requires the exclusive persistent Store owner",
+            ));
+        }
+        request.canonicalize(self)?;
+        let implementation = registry.get(driver)?;
+        let authority = resolve(&request)?;
+        let boundary = {
+            let policy = authority.policy();
+            let tool_ceiling = authority.tool_ceiling();
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let boundary = observe_in(
+                self,
+                &tx,
+                &request,
+                driver.descriptor(),
+                policy,
+                tool_ceiling,
+            )?;
+            boundary.mutation_set()?.require_unleased_in(&tx)?;
+            db(tx.commit())?;
+            boundary
+        };
+        let prepared = prepare(&implementation, &boundary.plan, &authority)?;
+        Ok(PreparedSandboxEffect {
+            store: self,
+            request,
+            boundary,
+            authority,
+            prepared,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        agent_owner::{self, AgentKey},
+        resources, user_for_principal, SandboxPolicyEvidence, SandboxSourceGrant, SessionBinding,
+        VersionedSourceBinding,
+    };
+    use aw_agent_core::{
+        CheckpointPolicy, DriverKey, SandboxDriverRegistry, SchemaSupport, SourceBinding,
+        SourceDriverRegistry, SourceDriverSchemas, SourceName, SourceSetLimit,
+    };
+    use std::{
+        fs::{File, OpenOptions},
+        io::{Read, Write},
+        path::PathBuf,
+        sync::{RwLock, RwLockReadGuard},
+    };
+
+    struct Temp(PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Authority<'a> {
+        _guard: RwLockReadGuard<'a, ()>,
+        policy: &'a SandboxGrantPolicy,
+        tools: &'a [NamedSourceAccess],
+    }
+
+    impl SandboxEffectAuthority for Authority<'_> {
+        fn policy(&self) -> &SandboxGrantPolicy {
+            self.policy
+        }
+        fn tool_ceiling(&self) -> &[NamedSourceAccess] {
+            self.tools
+        }
+    }
+
+    // Real file handles for this narrow fixture driver; no claim about OS
+    // containment. Opening existing files prepares but never changes them.
+    struct FileDriver;
+    impl FileDriver {
+        fn prepare(&self, plan: &SandboxEffectPlan) -> Result<Vec<File>> {
+            plan.grant
+                .sources
+                .iter()
+                .map(|source| {
+                    OpenOptions::new()
+                        .read(true)
+                        .write(source.access == SourceAccess::ReadWrite)
+                        .open(&source.binding.binding.materialization)
+                        .map_err(Error::from)
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn fenced_source_effect_handoff_preserves_live_authority_and_factual_settlement() {
+        let temp = Temp(std::env::temp_dir().join(crate::id("aw-source-effect").unwrap()));
+        let registry = SourceDriverRegistry::new();
+        let driver = DriverKey::builtin("fixture-file").unwrap();
+        let schema = SchemaSupport::new(1, 1).unwrap();
+        registry
+            .register(
+                driver.clone(),
+                SourceDriverSchemas {
+                    binding: schema,
+                    anchor: schema,
+                    recovery: schema,
+                },
+                (),
+            )
+            .unwrap();
+        let limit = SourceSetLimit::new(2).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
+        let actor = PrincipalId::new("internal:fixture:source-effect").unwrap();
+        let layout = |root: PathBuf| SessionBinding {
+            working_directory: root.clone(),
+            tool_root: root,
+            system_prompt: "fixture".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "fixture".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let (root, root_branch) = store
+            .create(&actor, "root", layout(PathBuf::from("/tmp")))
+            .unwrap();
+        let root_ref = agent_owner::canonical_ref(
+            &store.connection().unwrap(),
+            AgentKey::new(&root.id, &root_branch.id),
+        )
+        .unwrap();
+        let project = store.agent_get(&actor, &root_ref).unwrap().project_ref;
+        let sandbox = format!("{project}/s:{}", crate::id("sbx").unwrap());
+        let source_root = temp.0.join("source-layout");
+        std::fs::create_dir(&source_root).unwrap();
+        let bindings = ["code", "data"].map(|name| {
+            let path = source_root.join(name);
+            std::fs::write(&path, b"initial").unwrap();
+            SourceBinding {
+                name: SourceName::new(name).unwrap(),
+                driver: driver.clone(),
+                binding_schema: 1,
+                source_ref: format!("fixture:{name}"),
+                materialization: path.to_str().unwrap().into(),
+                access: if name == "code" {
+                    SourceAccess::ReadWrite
+                } else {
+                    SourceAccess::ReadOnly
+                },
+                checkpoint_policy: CheckpointPolicy::Required,
+            }
+        });
+        let (session, branch) = {
+            let mut connection = store.connection().unwrap();
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let binding = layout(source_root.clone());
+            let fresh = super::super::publish_fresh_in(
+                &tx, &actor, &sandbox, &binding, &bindings, &registry, limit,
+            )
+            .unwrap();
+            let project_key = parse_sandbox_ref(&sandbox).unwrap().project;
+            let result = resources::create_in_workspace_with_ids_and_sandbox_tx(
+                &tx,
+                &actor,
+                "source effect",
+                &binding,
+                &project_key.project,
+                None,
+                resources::mint_session_candidate_ids().unwrap(),
+                Some(&fresh),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            result
+        };
+        let reference = agent_owner::canonical_ref(
+            &store.connection().unwrap(),
+            AgentKey::new(&session.id, &branch.id),
+        )
+        .unwrap();
+        let policy = SandboxGrantPolicy {
+            agent_ref: reference.clone(),
+            sandbox_ref: sandbox.clone(),
+            actor: actor.clone(),
+            actor_user_id: user_for_principal(&store.connection().unwrap(), &actor)
+                .unwrap()
+                .unwrap(),
+            evidence: SandboxPolicyEvidence {
+                policy_ref: "host:fixture-policy".into(),
+                policy_digest: [1; 32],
+                authority_ref: "host:fixture-authority".into(),
+                authority_generation: 1,
+            },
+            sources: bindings
+                .iter()
+                .cloned()
+                .map(|binding| {
+                    let mode = binding.access;
+                    SandboxSourceGrant::from_binding(
+                        &VersionedSourceBinding {
+                            binding,
+                            binding_rev: 1,
+                        },
+                        mode,
+                    )
+                })
+                .collect(),
+        };
+        store
+            .sandbox_grant_set(&actor, &reference, 0, Some(&policy))
+            .unwrap();
+        let requested = bindings
+            .iter()
+            .map(|binding| NamedSourceAccess {
+                name: binding.name.clone(),
+                access: binding.access,
+            })
+            .collect::<Vec<_>>();
+        let request = |effect_id: &str| SandboxEffectRequest {
+            actor: actor.clone(),
+            agent_ref: reference.clone(),
+            effect_id: effect_id.into(),
+            sources: requested.clone(),
+        };
+        let policy_lock = RwLock::new(());
+        let resolve = |_: &SandboxEffectRequest| {
+            Ok(Authority {
+                _guard: policy_lock.read().unwrap(),
+                policy: &policy,
+                tools: &requested,
+            })
+        };
+        let drivers = SandboxDriverRegistry::new();
+        let reader = drivers.reader().unwrap();
+        let key = DriverKey::builtin("fixture-realization").unwrap();
+        let handle = drivers.register(key.clone(), FileDriver).unwrap();
+        assert!(drivers.register(key.clone(), FileDriver).is_err());
+        let foreign = SandboxDriverRegistry::new();
+        foreign.register(key, FileDriver).unwrap();
+        assert!(foreign.reader().unwrap().get(&handle).is_err());
+        drivers
+            .register(DriverKey::builtin("other").unwrap(), ())
+            .unwrap();
+        let prepare =
+            |driver: &FileDriver, plan: &SandboxEffectPlan, _: &Authority<'_>| driver.prepare(plan);
+        let set = SourceMutationSet::from_bindings(&bindings).unwrap();
+        let agent_before = store.agent_get(&actor, &reference).unwrap();
+        let sandbox_before = store.sandbox_get(&actor, &sandbox).unwrap();
+
+        let mut too_broad = request("host:denied");
+        too_broad.sources[1].access = SourceAccess::ReadWrite;
+        assert!(store
+            .sandbox_prepare_source_effect(
+                too_broad,
+                &reader,
+                &handle,
+                resolve,
+                |_, _, _| -> Result<Vec<File>> { panic!("unauthorized source cannot prepare") },
+            )
+            .is_err());
+
+        // Preparation is inert. Revocation committed during preparation
+        // prevents the final handoff, even while the provider guard is live.
+        let prepared = store
+            .sandbox_prepare_source_effect(
+                request("host:stale"),
+                &reader,
+                &handle,
+                resolve,
+                prepare,
+            )
+            .unwrap();
+        store
+            .acquire_source_mutation_barrier(&set, "host:before-start")
+            .unwrap()
+            .settle(SourceMutationOutcome::Settled)
+            .unwrap();
+        store
+            .sandbox_grant_set(&actor, &reference, 1, None)
+            .unwrap();
+        assert!(prepared
+            .start(|_| async { panic!("revoked grant cannot start") })
+            .await
+            .is_err());
+        assert!(policy_lock.try_write().is_ok());
+        store
+            .sandbox_grant_set(&actor, &reference, 2, Some(&policy))
+            .unwrap();
+
+        let prepared = store
+            .sandbox_prepare_source_effect(
+                request("host:write"),
+                &reader,
+                &handle,
+                resolve,
+                prepare,
+            )
+            .unwrap();
+        let (result, lease) = prepared
+            .start(|mut files| {
+                let policy_lock = &policy_lock;
+                let bindings = &bindings;
+                let store = &store;
+                async move {
+                    assert!(policy_lock.try_write().is_err());
+                    for binding in bindings {
+                        let scope = SourceMutationSet::from_bindings(std::slice::from_ref(binding))
+                            .unwrap();
+                        assert!(store
+                            .acquire_source_mutation_barrier(&scope, "host:overlap")
+                            .is_err());
+                    }
+                    files[0].write_all(b"changed").unwrap();
+                    let mut data = String::new();
+                    files[1].read_to_string(&mut data).unwrap();
+                    assert_eq!(data, "initial");
+                    assert!(files[1].write_all(b"forbidden").is_err());
+                    data
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, "initial");
+        assert!(policy_lock.try_write().is_ok());
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "host:while-running")
+            .is_err());
+        // Factual settlement is independent of future authority.
+        store
+            .sandbox_grant_set(&actor, &reference, 3, None)
+            .unwrap();
+        lease.settle(SandboxEffectOutcome::Settled).unwrap();
+        assert_eq!(
+            store.sandbox_get(&actor, &sandbox).unwrap().rev,
+            sandbox_before.rev + 1
+        );
+        assert_eq!(store.agent_get(&actor, &reference).unwrap(), agent_before);
+        assert_eq!(std::fs::read(source_root.join("code")).unwrap(), b"changed");
+        assert!(store.activate(&actor, &session.id, &branch.id).is_err());
+
+        store
+            .sandbox_grant_set(&actor, &reference, 4, Some(&policy))
+            .unwrap();
+        let prepared = store
+            .sandbox_prepare_source_effect(
+                request("host:not-started"),
+                &reader,
+                &handle,
+                resolve,
+                prepare,
+            )
+            .unwrap();
+        let ((), lease) = prepared.start(|_| async {}).await.unwrap();
+        lease.settle(SandboxEffectOutcome::NotStarted).unwrap();
+        assert_eq!(
+            store.sandbox_get(&actor, &sandbox).unwrap().rev,
+            sandbox_before.rev + 1
+        );
+        let prepared = store
+            .sandbox_prepare_source_effect(
+                request("host:unknown"),
+                &reader,
+                &handle,
+                resolve,
+                prepare,
+            )
+            .unwrap();
+        let ((), lease) = prepared.start(|_| async {}).await.unwrap();
+        lease.settle(SandboxEffectOutcome::Unknown).unwrap();
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "host:unknown-conflict")
+            .is_err());
+        drop(store);
+        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "host:restart-conflict")
+            .is_err());
+        assert_eq!(
+            store.sandbox_get(&actor, &sandbox).unwrap().rev,
+            sandbox_before.rev + 1
+        );
+        assert!(store.activate(&actor, &session.id, &branch.id).is_err());
+    }
+}

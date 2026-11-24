@@ -16,6 +16,11 @@ use std::path::PathBuf;
 
 const MAX_SANDBOX_LIST: usize = 256;
 
+mod effects;
+pub use effects::{
+    PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLease, SandboxEffectOutcome,
+    SandboxEffectPlan, SandboxEffectRequest,
+};
 mod grants;
 pub use grants::{
     EffectiveSourceBinding, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,

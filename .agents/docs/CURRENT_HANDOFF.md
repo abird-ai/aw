@@ -34,7 +34,8 @@ recovery custody, Store-local complete-set source mutation barriers, receipt-bou
 checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic
 checkpoint publication, receipt-bound non-destructive restore preparation/restart inspection
 and atomic held Agent + fresh source-bearing Sandbox restore publication, plus v58 independent
-SandboxGrant evidence and source-access preflight, are implemented locally.
+SandboxGrant evidence/source-access preflight and typed SandboxDriver/fenced source-effect
+handoff, are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1517,11 +1518,45 @@ owner including capture/restore **4/4**, receipt/barrier/SourceDriver **1/1 each
 strict Core/Store all-target Clippy, workspace all-target check, fmt and scoped
 diff-check are green.
 
-**Next Phase-3 slice:** bind the trusted current host policy resolver and exact
-SandboxGrant observation to actual source-aware realization/effect admission and
-complete-set source mutation claims. History-only fresh baseline, custom ACL/task
-integration, candidate/retention reconciliation, quiescent binding mutation, Vault
-and checkpoint/Sandbox host RPCs remain pending. Store schema is v58.
+The final typed SandboxDriverRegistry leaf now uses the existing StagedRegistry
+publication primitive and the shared NativeDefinition implementation custody also
+used by SourceDriver. Add-only until live/unresolved execution dependencies can be
+checked; typed handles bind the owning registry and exact registration. No physical
+Sandbox policy or Process owner is introduced.
+
+Trusted host source-effect handoff now resolves a live policy/tool guard outside
+SQLite, observes the exact current grant and requested named modes, pins the
+destination writer/layout/Store scope, and prepares an inert driver capability
+outside the transaction. The one-shot start repeats that observation under the
+existing complete-set mutation-barrier transaction before handing the capability
+to the original effect owner. Read and write source exposures both participate.
+The host guard is retained through the start future and dropped before the
+existing effect owner waits/settles. The caller must own durable operation intent
+and its exact effect ID; the handoff adds no independent execution/replay ledger.
+No source-bearing Agent runtime route uses this seam yet, and held admission stays
+closed. Reviewed concrete host resolver, driver containment and runtime effect
+ownership remain required; the frozen physical Sandbox plan is unchanged.
+
+The source-effect lease settles independently of current grant revocation.
+NotStarted releases without mutation revision; factual Settled of a write-capable
+effect advances Sandbox rev once with local source-change provenance and lease
+release in the same transaction. Unknown retains the whole hazard set. Abandoned
+claims stay fenced; exact effect-owner recovery and public Sandbox changed Event
+projection remain pending. No synthetic Agent rev fanout.
+
+Grouped effect regression **1/1** covers actual fixture file handles and writes,
+typed registration/cross-registry refusal, stale grant at start, guard lifetime,
+complete read/write exclusion, post-revocation settlement, no-start neutrality
+and Unknown across restart. No production containment or Process launch is claimed.
+All Sandbox owner tests **4/4**, checkpoint/capture/restore **4/4**, receipt/barrier/
+SourceDriver **1/1 each**, strict Core/Store all-target Clippy, workspace all-target
+check, fmt and scoped diff-check are green.
+
+**Next Phase-3 slice:** integrate the typed handoff into the concrete trusted host
+policy/realization and original Process/tool effect owners, retaining the held gate
+until every applicable runtime path participates. History-only baseline, custom
+ACL/task, exact candidate/retention and effect recovery, quiescent binding mutation,
+Vault and checkpoint/Sandbox host RPCs remain pending. Store schema is v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

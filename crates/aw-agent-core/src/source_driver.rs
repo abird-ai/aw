@@ -10,11 +10,7 @@ use crate::{
     Error, Result,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    any::{Any, TypeId},
-    collections::BTreeMap,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 pub const DEFAULT_MAX_SOURCES_PER_SANDBOX: usize = 128;
 pub const HARD_MAX_SOURCES_PER_SANDBOX: usize = 1024;
@@ -836,8 +832,7 @@ impl<T> SourceDriverHandle<T> {
 #[derive(Clone)]
 struct SourceDriverEntry {
     descriptor: SourceDriverDescriptor,
-    type_id: TypeId,
-    implementation: Arc<dyn Any + Send + Sync>,
+    implementation: registry::NativeDefinition,
 }
 
 #[derive(Clone, Default)]
@@ -915,7 +910,7 @@ impl SourceDriverRegistry {
     ) -> Result<SourceDriverHandle<T>> {
         driver.validate()?;
         validate_schemas(schemas)?;
-        let implementation: Arc<dyn Any + Send + Sync> = Arc::new(implementation);
+        let implementation = registry::NativeDefinition::new(implementation);
         let stage = self.owner.stage(
             expected_revision,
             |current, next_revision| {
@@ -932,7 +927,6 @@ impl SourceDriverRegistry {
                     driver.clone(),
                     SourceDriverEntry {
                         descriptor,
-                        type_id: TypeId::of::<T>(),
                         implementation,
                     },
                 );
@@ -974,17 +968,12 @@ impl SourceDriverRegistryReader {
             .entries
             .get(&handle.driver)
             .ok_or(Error::Denied("SourceDriver handle is stale"))?;
-        if entry.type_id != TypeId::of::<T>()
-            || entry.descriptor.registration_revision != handle.registration_revision
+        if entry.descriptor.registration_revision != handle.registration_revision
             || entry.descriptor.schemas != handle.schemas
         {
             return Err(Error::Denied("SourceDriver handle is stale"));
         }
-        entry
-            .implementation
-            .clone()
-            .downcast::<T>()
-            .map_err(|_| Error::Denied("SourceDriver implementation type changed"))
+        entry.implementation.get::<T>()
     }
 
     pub fn resolve(&self, pin: &DriverSchemaPin) -> Result<SourceDriverDescriptor> {

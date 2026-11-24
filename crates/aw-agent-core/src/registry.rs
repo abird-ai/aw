@@ -5,7 +5,25 @@
 //! EventTypeRegistry; later leaf registries reuse this exact owner.
 
 use crate::{publication, Error, Result};
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
+
+/// Shared native implementation custody for typed definition leaves.
+/// Type erasure is confined to registration/lookup; callers get Arc<T>.
+#[derive(Clone)]
+pub(crate) struct NativeDefinition(Arc<dyn Any + Send + Sync>);
+
+impl NativeDefinition {
+    pub(crate) fn new<T: Send + Sync + 'static>(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+
+    pub(crate) fn get<T: Send + Sync + 'static>(&self) -> Result<Arc<T>> {
+        self.0
+            .clone()
+            .downcast::<T>()
+            .map_err(|_| Error::Denied("native definition implementation type changed"))
+    }
+}
 
 pub(crate) const MAX_REGISTRATION_COMPONENT_BYTES: usize = 48;
 

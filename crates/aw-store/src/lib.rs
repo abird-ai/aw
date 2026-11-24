@@ -208,9 +208,10 @@ pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
-    EffectiveSourceBinding, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
-    SandboxLifecycle, SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant,
-    SourceBindingCompatibility, SourceBindingSummary,
+    EffectiveSourceBinding, PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLease,
+    SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest, SandboxGrantObservation,
+    SandboxGrantPolicy, SandboxGrantStatus, SandboxLifecycle, SandboxPolicyEvidence,
+    SandboxSnapshot, SandboxSourceGrant, SourceBindingCompatibility, SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
