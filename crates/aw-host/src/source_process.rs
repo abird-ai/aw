@@ -460,6 +460,7 @@ mod tests {
             "host:vault-valid",
             "host:write",
             "host:unproven",
+            "host:interrupted",
         ];
         let mut assistant = Message::text(1025, Role::Assistant, "");
         assistant.tool_calls = calls
@@ -903,33 +904,54 @@ mod tests {
                 }
             )
             .is_err());
-        journal
-            .append(
+        // Existing ToolFinished recovery still works and retains its
+        // original numeric release receipt. This exact fixed child has
+        // no descendants; its known terminal proves fixture quiescence.
+        assert_eq!(
+            store
+                .sandbox_recover_tool_source_effect(
+                    &actor,
+                    &reference,
+                    1,
+                    "host:unproven",
+                    |recovery| {
+                        assert_eq!(recovery.effect_id, unresolved_id);
+                        assert!(matches!(
+                            recovery.terminal_ref,
+                            aw_store::SandboxToolTerminalRef::ToolFinished(_)
+                        ));
+                        assert_eq!(recovery.terminal.status, ToolStatus::Succeeded);
+                        Ok(SandboxEffectOutcome::Settled)
+                    }
+                )
+                .unwrap(),
+            SandboxEffectOutcome::Settled
+        );
+
+        // Loss after a real Process terminal but before ToolFinished.
+        // Drop the original owner without finishing the Run; startup
+        // must reconstruct the Interrupted projection from its journal.
+        let prepared = prepare("host:interrupted", capture(), false).unwrap();
+        let unresolved_id = prepared.plan().effect_id.clone();
+        let SourceProcessStart { launch, source } =
+            start_source_process(prepared, deadline(), CancellationToken::new())
+                .await
+                .unwrap();
+        let receipt = launch
+            .unwrap()
+            .wait(std::future::pending(), Duration::from_secs(5))
+            .await;
+        assert_eq!(receipt.terminal.exit, ProcessExit::Code(0));
+        drop(source);
+        assert!(store
+            .sandbox_recover_tool_source_effect(
+                &actor,
+                &reference,
                 1,
-                JournalEntry::Assistant {
-                    message: Message::text(1026, Role::Assistant, "fixture complete"),
-                },
+                "host:interrupted",
+                |_| panic!("a live unfinished Run is not an interrupted terminal")
             )
-            .await
-            .unwrap();
-        journal
-            .finish(Turn {
-                id: 1,
-                prompt: "source effect fixture".into(),
-                answer: "fixture complete".into(),
-                model: identity.model,
-                profile: identity.account_id,
-                outcome: Outcome::Completed,
-                meta: None,
-                error: None,
-                actor: Some(actor.clone()),
-                tool_records: final_records,
-                invocations: Vec::new(),
-                context_messages: Vec::new(),
-                needs_reconciliation: false,
-            })
-            .await
-            .unwrap();
+            .is_err());
         drop(journal);
         drop(store);
 
@@ -938,9 +960,13 @@ mod tests {
             .acquire_source_mutation_barrier(&set, "host:restart")
             .is_err());
         assert!(reopened
-            .sandbox_recover_tool_source_effect(&actor, &reference, 1, "host:unproven", |_| panic!(
-                "missing SourceDriver cannot inspect"
-            ))
+            .sandbox_recover_tool_source_effect(
+                &actor,
+                &reference,
+                1,
+                "host:interrupted",
+                |_| panic!("missing SourceDriver cannot inspect")
+            )
             .is_err());
         drop(reopened);
         let reopened = SessionStore::open_with_sources(&temp.0, drivers, limit).unwrap();
@@ -949,7 +975,45 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 2
+            sandbox.rev + 3
+        );
+        // No physical proof from the original reconstructed Interrupted
+        // record itself. Unknown inspection keeps all original hazards.
+        assert_eq!(
+            reopened
+                .sandbox_recover_tool_source_effect(
+                    &actor,
+                    &reference,
+                    1,
+                    "host:interrupted",
+                    |recovery| {
+                        assert_eq!(recovery.terminal.status, ToolStatus::Interrupted);
+                        Ok(SandboxEffectOutcome::Unknown)
+                    }
+                )
+                .unwrap(),
+            SandboxEffectOutcome::Unknown
+        );
+        assert!(reopened
+            .acquire_source_mutation_barrier(&set, "host:unknown-after-restart")
+            .is_err());
+        let history = || -> (String, String, u64, String) {
+            let c = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+            c.query_row(
+                "SELECT r.status,n.payload,(SELECT count(*) FROM run_events WHERE run_id=r.id),
+                   (SELECT state FROM hazards WHERE run_id=r.id)
+                 FROM runs r JOIN nodes n ON n.id=r.final_node WHERE r.session_id=?1 AND r.turn_id=1",
+                [&session.id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))
+            ).unwrap()
+        };
+        let original_history = history();
+        assert_eq!(original_history.0, "interrupted");
+        assert_eq!(original_history.3, "needs_inspection");
+        final_records.push(record("host:interrupted", ToolStatus::Interrupted, None));
+        let original_turn: Turn = serde_json::from_str(&original_history.1).unwrap();
+        assert_eq!(
+            serde_json::to_value(&original_turn.tool_records).unwrap(),
+            serde_json::to_value(&final_records).unwrap()
         );
         assert_eq!(
             reopened
@@ -957,13 +1021,18 @@ mod tests {
                     &actor,
                     &reference,
                     1,
-                    "host:unproven",
+                    "host:interrupted",
                     |recovery| {
                         assert_eq!(recovery.effect_id, unresolved_id);
                         assert_eq!(recovery.actor, actor);
                         assert_eq!(&recovery.driver, &handle.descriptor().driver);
-                        assert_eq!(recovery.original.call.id, "host:unproven");
-                        assert_eq!(recovery.terminal.status, ToolStatus::Succeeded);
+                        assert_eq!(recovery.original.call.id, "host:interrupted");
+                        assert_eq!(recovery.terminal.status, ToolStatus::Interrupted);
+                        assert!(recovery.terminal.output.is_none());
+                        assert!(matches!(
+                            &recovery.terminal_ref,
+                            aw_store::SandboxToolTerminalRef::InterruptedTurn(_)
+                        ));
                         assert_eq!(recovery.sources.len(), 1);
                         assert_eq!(
                             recovery.sources[0].binding.binding.materialization,
@@ -984,7 +1053,7 @@ mod tests {
                     &actor,
                     &reference,
                     1,
-                    "host:unproven",
+                    "host:interrupted",
                     |_| panic!("released custody cannot replay inspection")
                 )
                 .unwrap(),
@@ -995,13 +1064,39 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 3
+            sandbox.rev + 4
         );
+        // No rewritten history, new tool receipt or blanket Run-hazard
+        // acknowledgement from physical source settlement.
+        assert_eq!(history(), original_history);
         reopened
             .acquire_source_mutation_barrier(&set, "host:after-recovery")
             .unwrap()
             .settle(SourceMutationOutcome::Settled)
             .unwrap();
+        assert!(reopened.activate(&actor, &session.id, &branch.id).is_err());
+        drop(reopened);
+        // Terminal replay is lookup-only even on a later degraded owner
+        // reopen. The broader unresolved Run still gates future effects.
+        let reopened = SessionStore::open(&temp.0).unwrap();
+        for id in ["host:unproven", "host:interrupted"] {
+            assert_eq!(
+                reopened
+                    .sandbox_recover_tool_source_effect(&actor, &reference, 1, id, |_| panic!(
+                        "terminal replay requires no provider or inspection"
+                    ))
+                    .unwrap(),
+                SandboxEffectOutcome::Settled
+            );
+        }
+        assert_eq!(history(), original_history);
+        assert_eq!(
+            reopened
+                .sandbox_get(&actor, &sandbox.canonical_ref)
+                .unwrap()
+                .rev,
+            sandbox.rev + 4
+        );
         assert!(reopened.activate(&actor, &session.id, &branch.id).is_err());
     }
 

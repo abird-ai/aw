@@ -9,8 +9,8 @@ use crate::{
 };
 use aw_agent_core::{
     tool::ToolBindingSnapshot, DriverKey, InvocationIdentity, JournalEntry, NamedSourceAccess,
-    PrincipalId, SourceAccess, SourceSetLimit, ToolEffect, ToolRecord, ToolSourceEvidence,
-    ToolStatus,
+    Outcome, PrincipalId, SourceAccess, SourceSetLimit, ToolEffect, ToolRecord, ToolSourceEvidence,
+    ToolStatus, Turn,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -344,11 +344,97 @@ fn require_claim(c: &Connection, intent: &Intent) -> Result<Claim> {
     Ok(claim)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The existing journal owns both forms of logical closure. An interrupted
+/// Turn is not a fabricated ToolFinished or a known physical outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxToolTerminalRef {
+    ToolFinished(u64),
+    InterruptedTurn(String),
+}
+
+fn terminal_in(
+    c: &Connection,
+    observed: &Observation,
+) -> Result<(SandboxToolTerminalRef, ToolRecord)> {
+    if let Some((seq, record)) = &observed.terminal {
+        return Ok((SandboxToolTerminalRef::ToolFinished(*seq), record.clone()));
+    }
+    // A missing ToolFinished can only be closed by the original Run owner.
+    // Require its settled, immutable Turn and exact Interrupted projection.
+    // Never interpret a missing active branch pointer alone as closure.
+    let (session, prompt, node_id): (String, String, String) = db(c
+        .query_row(
+            "SELECT r.session_id,r.prompt_node,r.final_node FROM runs r
+         JOIN branches b ON b.session_id=r.session_id AND b.id=r.branch_id
+         WHERE r.id=?1 AND r.status IN ('failed','cancelled','incomplete','interrupted')
+           AND r.ended_at IS NOT NULL AND r.final_node IS NOT NULL
+           AND r.attach_status IN ('attached','conflict') AND b.active_run IS NOT r.id",
+            [&observed.intent.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional())?
+    .ok_or(Error::Conflict(
+        "original tool has no settled journal boundary",
+    ))?;
+    let node = crate::node_in(c, &session, &node_id)?;
+    if node.kind != "turn" || node.parent_id.as_deref() != Some(prompt.as_str()) {
+        return Err(Error::Storage("original settled Run Turn identity changed"));
+    }
+    let turn: Turn = serde_json::from_value(node.payload)
+        .map_err(|_| Error::Storage("invalid original settled Run Turn"))?;
+    if turn.id != observed.intent.turn_id
+        || turn.outcome == Outcome::Completed
+        || !turn.needs_reconciliation
+    {
+        return Err(Error::Conflict(
+            "original Turn did not preserve interrupted effect",
+        ));
+    }
+    let mut matches = turn
+        .tool_records
+        .into_iter()
+        .filter(|record| record.call.id == observed.intent.call_id);
+    let record = matches.next().ok_or(Error::Conflict(
+        "original Turn lacks interrupted tool intent",
+    ))?;
+    if record.call != observed.record.call
+        || record.effect != observed.record.effect
+        || record.execution_site != observed.record.execution_site
+        || record.status != ToolStatus::Interrupted
+        || record.output.is_some()
+        || matches.next().is_some()
+    {
+        return Err(Error::Conflict(
+            "original Turn differs from interrupted tool intent",
+        ));
+    }
+    Ok((SandboxToolTerminalRef::InterruptedTurn(node_id), record))
+}
+
+/// Retain only the original closure identity, never a second tool result.
+/// Existing numeric ToolFinished release receipts keep their exact encoding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Release {
-    terminal_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interrupted_turn: Option<String>,
     outcome: SandboxEffectOutcome,
+}
+
+impl Release {
+    fn new(terminal: SandboxToolTerminalRef, outcome: SandboxEffectOutcome) -> Self {
+        let (terminal_seq, interrupted_turn) = match terminal {
+            SandboxToolTerminalRef::ToolFinished(seq) => (Some(seq), None),
+            SandboxToolTerminalRef::InterruptedTurn(node) => (None, Some(node)),
+        };
+        Self {
+            terminal_seq,
+            interrupted_turn,
+            outcome,
+        }
+    }
 }
 
 /// Positive physical settlement, separate from the logical ToolFinished.
@@ -381,9 +467,7 @@ pub(super) fn release_in(
     if observed.intent != *intent {
         return Err(Error::Conflict("original source effect intent changed"));
     }
-    let (terminal_seq, record) = observed.terminal.ok_or(Error::Conflict(
-        "original ToolFinished is required before releasing source custody",
-    ))?;
+    let (terminal, record) = terminal_in(tx, &observed)?;
     if outcome == SandboxEffectOutcome::Unknown
         || fact_in::<SandboxEffectOutcome>(tx, &intent.effect_id(), QUIESCENT)?
             .is_some_and(|prior| prior != outcome)
@@ -399,10 +483,7 @@ pub(super) fn release_in(
         &intent.effect_id(),
         RELEASED,
         actor,
-        &Release {
-            terminal_seq,
-            outcome,
-        },
+        &Release::new(terminal, outcome),
     )
 }
 
@@ -415,7 +496,7 @@ pub struct SandboxToolRecovery {
     pub actor: PrincipalId,
     pub driver: DriverKey,
     pub started_seq: u64,
-    pub terminal_seq: u64,
+    pub terminal_ref: SandboxToolTerminalRef,
     pub original: ToolRecord,
     pub terminal: ToolRecord,
     pub source: ToolSourceEvidence,
@@ -440,11 +521,7 @@ fn authorize_recovery_in(
     Ok((observed, claim))
 }
 
-fn require_current_sandbox_in(
-    tx: &Transaction<'_>,
-    key: AgentKey<'_>,
-    claim: &Claim,
-) -> Result<()> {
+fn require_current_sandbox_in(tx: &Connection, key: AgentKey<'_>, claim: &Claim) -> Result<()> {
     let current: Option<String> = db(tx.query_row(
         "SELECT sandbox_id FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
         params![key.session, key.branch],
@@ -452,6 +529,84 @@ fn require_current_sandbox_in(
     ))?;
     if current.as_deref() != Some(&claim.sandbox_ref) {
         return Err(Error::Conflict("source effect Sandbox identity changed"));
+    }
+    Ok(())
+}
+
+/// Exclusive owner restart may expose held source-bearing metadata for
+/// original journal recovery. Every unresolved Run in the Session must
+/// have its own exact source-effect provenance. This is not new admission
+/// or physical proof, and does not require an installed SourceDriver.
+pub(crate) fn require_owner_recovery_in(
+    c: &Connection,
+    session: &str,
+    branch: &str,
+    active_run: Option<&str>,
+) -> Result<()> {
+    if let Some(run) = active_run {
+        let exact: bool = db(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1 AND session_id=?2 AND branch_id=?3)",
+            params![run, session, branch],
+            |row| row.get(0),
+        ))?;
+        if !exact {
+            return Err(Error::Conflict(
+                "source-bearing Agent active Run identity changed",
+            ));
+        }
+    }
+    let mut runs = db(c.prepare_cached(
+        "SELECT r.id,r.branch_id,r.turn_id FROM runs r
+         JOIN branches b ON b.session_id=r.session_id AND b.id=r.branch_id
+         WHERE r.session_id=?1 AND (r.status='running' OR b.active_run IS r.id
+           OR EXISTS(SELECT 1 FROM hazards h WHERE h.run_id=r.id AND h.state<>'settled'))",
+    ))?;
+    let mut rows = db(runs.query([session]))?;
+    while let Some(row) = db(rows.next())? {
+        let run: String = db(row.get(0))?;
+        let branch: String = db(row.get(1))?;
+        let turn: u64 = db(row.get(2))?;
+        let key = AgentKey::new(session, &branch);
+        let held: bool = db(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_state_current a
+             WHERE a.session_id=?1 AND a.branch_id=?2 AND a.admission='held'
+               AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current s WHERE s.sandbox_id=a.sandbox_id))",
+            params![session, branch], |row| row.get(0),
+        ))?;
+        if !held {
+            return Err(Error::Denied(
+                "unresolved Run has no held source-bearing Agent",
+            ));
+        }
+        let reference = agent_owner::canonical_ref(c, key)?;
+        let mut starts = db(c.prepare_cached(
+            "SELECT e.seq,json_extract(e.payload,'$.record.call.id') FROM run_events e
+             WHERE e.run_id=?1 AND e.kind='tool_started' AND EXISTS(
+               SELECT 1 FROM commit_log l WHERE l.entity_type='source_effect'
+                 AND l.kind='source.effect.claimed' AND l.entity_id='source-tool:'||e.seq)
+             ORDER BY e.seq LIMIT 513",
+        ))?;
+        let mut starts = db(starts.query([&run]))?;
+        let mut count = 0;
+        while let Some(start) = db(starts.next())? {
+            count += 1;
+            if count > 512 {
+                return Err(Error::Limit("original source effect journal exceeds bound"));
+            }
+            let seq: u64 = db(start.get(0))?;
+            let call: String = db(start.get(1))?;
+            let observed = observe(c, &reference, turn, &call)?;
+            if observed.intent.run_id != run || observed.intent.started_seq != seq {
+                return Err(Error::Conflict("source effect startup intent changed"));
+            }
+            let claim = require_claim(c, &observed.intent)?;
+            require_current_sandbox_in(c, key, &claim)?;
+        }
+        if count == 0 {
+            return Err(Error::Denied(
+                "unresolved Run has no original source custody",
+            ));
+        }
     }
     Ok(())
 }
@@ -509,18 +664,14 @@ fn recovery_sources_in(
 fn released_in(
     tx: &Transaction<'_>,
     observed: &Observation,
+    terminal: &SandboxToolTerminalRef,
 ) -> Result<Option<SandboxEffectOutcome>> {
-    let terminal_seq = observed
-        .terminal
-        .as_ref()
-        .ok_or(Error::Conflict(
-            "original ToolFinished is required for terminal-linked recovery",
-        ))?
-        .0;
     let Some(release) = fact_in::<Release>(tx, &observed.intent.effect_id(), RELEASED)? else {
         return Ok(None);
     };
-    if release.terminal_seq != terminal_seq || release.outcome == SandboxEffectOutcome::Unknown {
+    if release != Release::new(terminal.clone(), release.outcome)
+        || release.outcome == SandboxEffectOutcome::Unknown
+    {
         return Err(Error::Storage(
             "source custody release differs from original terminal",
         ));
@@ -583,7 +734,8 @@ impl SessionStore {
             return Ok(None);
         };
         let claim = require_claim(&tx, &observed.intent)?;
-        if let Some(outcome) = released_in(&tx, &observed)? {
+        let (terminal_ref, _) = terminal_in(&tx, &observed)?;
+        if let Some(outcome) = released_in(&tx, &observed, &terminal_ref)? {
             return Ok(Some(outcome));
         }
         let Some(outcome) =
@@ -606,8 +758,11 @@ impl SessionStore {
     /// Recover only original journal-linked source custody. The trusted
     /// inspector independently authorizes source disclosure and proves
     /// factual quiescence/no-start for the original effect. Never launch,
-    /// replan or mint a terminal receipt here. Missing original terminals
-    /// remain fenced for their own journal/reconciliation owner.
+    /// replan or mint a terminal receipt here. If ToolFinished is absent,
+    /// only the original settled Run's exact Interrupted Turn may close
+    /// the logical side; physical proof is still required. The proof must
+    /// establish permanent quiescence of the original effect, not a
+    /// transient empty process scan. Broader Run hazards are not changed.
     pub fn sandbox_recover_tool_source_effect(
         &self,
         manager: &PrincipalId,
@@ -627,15 +782,13 @@ impl SessionStore {
                 db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
             let (observed, claim) =
                 authorize_recovery_in(&tx, manager, agent_ref, turn_id, call_id)?;
-            if let Some(outcome) = released_in(&tx, &observed)? {
+            let (terminal_ref, terminal) = terminal_in(&tx, &observed)?;
+            if let Some(outcome) = released_in(&tx, &observed, &terminal_ref)? {
                 return Ok(outcome);
             }
             let recorded =
                 fact_in::<SandboxEffectOutcome>(&tx, &observed.intent.effect_id(), QUIESCENT)?;
             let intent = observed.intent;
-            let (terminal_seq, terminal) = observed.terminal.ok_or(Error::Conflict(
-                "original ToolFinished is required for terminal-linked recovery",
-            ))?;
             let sources = recovery_sources_in(self, &tx, &claim)?;
             let lease = reclaim_in(self, &tx, manager, intent.clone(), &claim, &sources)?;
             if let Some(outcome) = recorded {
@@ -653,7 +806,7 @@ impl SessionStore {
                 actor: intent.actor,
                 driver: claim.driver,
                 started_seq: intent.started_seq,
-                terminal_seq,
+                terminal_ref,
                 original: observed.record,
                 terminal,
                 source: observed.source,

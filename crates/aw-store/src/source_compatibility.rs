@@ -43,10 +43,11 @@ pub(crate) fn compatibility(
 pub(crate) fn revalidate(
     connection: &mut Connection,
     registry: &SourceDriverRegistry,
+    exclusive_owner_recovery: bool,
 ) -> Result<()> {
     let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
     let registry = registry.reader()?;
-    crate::sandbox_owner::source_bindings::revalidate_in(&tx, &registry)?;
+    crate::sandbox_owner::source_bindings::revalidate_in(&tx, &registry, exclusive_owner_recovery)?;
     crate::checkpoint_owner::revalidate_in(&tx, &registry)?;
     // Compatibility is derived on demand from retained descriptors; never
     // rewrite an immutable receipt or treat compatibility as live authority.

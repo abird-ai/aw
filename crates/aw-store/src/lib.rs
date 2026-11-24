@@ -214,7 +214,7 @@ pub use sandbox_owner::{
     SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
     SandboxEffectRequest, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
     SandboxLifecycle, SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant,
-    SandboxToolRecovery, SourceBindingCompatibility, SourceBindingSummary,
+    SandboxToolRecovery, SandboxToolTerminalRef, SourceBindingCompatibility, SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
@@ -1260,7 +1260,7 @@ impl SessionStore {
         validate_private_sqlite_sidecars(&directory)?;
         let mut conn = db(Connection::open(directory.join("sessions.sqlite3")))?;
         initialize(&mut conn)?;
-        source_compatibility::revalidate(&mut conn, &source_drivers)?;
+        source_compatibility::revalidate(&mut conn, &source_drivers, true)?;
         let process = coordination::register_owner_process(&mut conn)?;
         let out = Self {
             inner: Arc::new(Inner {
@@ -1350,7 +1350,7 @@ impl SessionStore {
         };
         {
             let mut connection = out.connection()?;
-            source_compatibility::revalidate(&mut connection, &out.inner.source_drivers)?;
+            source_compatibility::revalidate(&mut connection, &out.inner.source_drivers, false)?;
         }
         out.recover()?;
         Ok(out)
@@ -2637,7 +2637,7 @@ impl SessionStore {
                 previous_live_generation,
                 source_generation,
             )?;
-            source_compatibility::revalidate(&mut staged, &self.inner.source_drivers)?;
+            source_compatibility::revalidate(&mut staged, &self.inner.source_drivers, false)?;
             let check: String = db(staged.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
             let fk: i64 = db(staged.query_row(
                 "SELECT count(*) FROM pragma_foreign_key_check",

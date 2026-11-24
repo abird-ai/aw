@@ -50,8 +50,8 @@ ACL construction, captured-source restore initial-task custody/publication,
 task-only baseline restore/recovery, concrete fenced Git checkpoint capture/restore/
 retention reconciliation, managed closed-Sandbox retirement, effectful versioned
 baseline restore host consumers, and v59 Agent VaultGrant references with the final
-staged VaultProvider leaf, concrete local signing broker and fenced Process proof
-projection are implemented locally.
+staged VaultProvider leaf, concrete local signing broker, fenced Process proof
+projection and interrupted source-effect custody recovery are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2304,11 +2304,38 @@ runtime or production containment claim. The earlier broad Store failures remain
 recorded above, not rerun here. No new production source admission, raw key
 projection, socket/file delivery or public RPC.
 
+Interrupted source-effect custody recovery now reuses the original settled Run's
+immutable Turn projection when ToolFinished is absent. `SandboxToolTerminalRef`
+distinguishes the actual numeric ToolFinished sequence from the original interrupted
+Turn node; release facts retain only that closure identity and the factual physical
+outcome, with existing numeric receipt encoding unchanged. The exact original call,
+effect, execution site, Interrupted status, absent output and unique membership are
+verified against the settled non-completed Run result. Running or pending-attachment
+state is not closure; exact settled attachment conflict is supported. No new ToolFinished, inferred Process exit,
+second journal or Run-hazard acknowledgement. Current external disclosure and
+permanent physical quiescence/no-start proof are still independently required;
+Unknown retains the original complete source claims. The existing release transaction
+advances Sandbox rev once for settled write-capable effects, with lookup-only replay.
+Exclusive owner startup compatibility permits held source-bearing unresolved Runs
+only when each such Run has original journal-linked source custody for its exact
+Agent/Sandbox and Store scope. Original Store recovery settles the Run; compatibility
+never authorizes a new effect. Direct/staged backup validation remains quiescent-only,
+open admission/unowned associations remain denied, and missing SourceDriver stays
+recovery-required before physical inspection. Extended existing grouped Process
+regression exercises loss before ToolFinished, exclusive Store reopen, Unknown,
+missing-driver refusal and exact interrupted custody release without changing original
+journal/Turn or broader inspection hazard. Terminal-linked recovery and lookup-only
+replay across degraded reopen remain supported. Final Sandbox **4/4**, checkpoint
+**4/4**, source barrier **1/1**, Host **16/16**, strict affected all-target/all-feature
+Clippy, workspace all-target/all-feature check and scoped fmt/diff passed. Earlier
+broad Store failures remain recorded, not rerun. Production physical proof acquisition
+and whole-Run hazard reconciliation are distinct.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer independent production authority/containment or incomplete-effect
-reconciliation through the original owners; do not open held routes. Independent host
-approval provisioning, other effectful baseline materialization, incomplete-effect
+While blocked, prefer independent production authority/containment or exact physical
+recovery proof acquisition through existing owners; do not open held routes. Independent
+host approval provisioning, other effectful baseline materialization, broader Run-hazard
 reconciliation, multi-source policy, general unpublished partial/scratch cleanup and
 production cleanup composition/physical authority, final-source removal/effectful
 mutation, remaining Vault broker/socket/file/other env integrations, persistent provider

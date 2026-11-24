@@ -666,7 +666,11 @@ impl SessionStore {
 
 /// Reconcile compatibility, not source state. No driver effect is executed.
 /// A compatible registration is not authority to materialize or execute.
-pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryReader) -> Result<()> {
+pub(crate) fn revalidate_in(
+    tx: &Connection,
+    registry: &SourceDriverRegistryReader,
+    exclusive_owner_recovery: bool,
+) -> Result<()> {
     let any: bool = db(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sandbox_source_bindings_current)",
         [],
@@ -677,7 +681,9 @@ pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryRead
     }
     // A restored source-bearing Agent is discoverable but effect-inert
     // until the actual source realization/grant admission exists. Never
-    // accept an executable or unresolved legacy association on reopen.
+    // accept an executable or unowned legacy association on reopen.
+    // Exclusive owner startup may recover original journal-linked effects
+    // while admission remains held. Direct/staged paths stay quiescent-only.
     let mut query = db(tx.prepare(
         "SELECT a.session_id,a.branch_id,a.admission,b.active_run
          FROM agent_state_current a
@@ -691,9 +697,9 @@ pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryRead
         let branch: String = db(row.get(1))?;
         let admission: String = db(row.get(2))?;
         let active_run: Option<String> = db(row.get(3))?;
-        if admission != "held" || active_run.is_some() {
+        if admission != "held" {
             return Err(Error::Denied(
-                "source-bearing Agent requires held quiescent admission",
+                "source-bearing Agent requires held admission",
             ));
         }
         let (project, layout, sandbox, _, lifecycle) =
@@ -718,10 +724,18 @@ pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryRead
             [&session],
             |row| row.get(0),
         ))?;
-        if unresolved {
-            return Err(Error::Denied(
-                "source-bearing Agent has unresolved execution",
-            ));
+        if unresolved || active_run.is_some() {
+            if !exclusive_owner_recovery {
+                return Err(Error::Denied(
+                    "source-bearing Agent has unresolved execution",
+                ));
+            }
+            super::effects::journal::require_owner_recovery_in(
+                tx,
+                &session,
+                &branch,
+                active_run.as_deref(),
+            )?;
         }
     }
     drop(rows);
