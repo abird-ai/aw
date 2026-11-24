@@ -31,7 +31,8 @@ SourceBinding persistence/restart compatibility, built-in Git clean/dirty captur
 explicit gitlink semantics, isolated Prepared restore, v56 immutable Checkpoint/SourceSet
 persistence with trusted history-only replay, v57 indexed construction receipt/source
 recovery custody, Store-local complete-set source mutation barriers, receipt-bound
-checkpoint capture preparation and exact restart inspection/recovery are implemented locally.
+checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic
+checkpoint publication are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1374,10 +1375,45 @@ Source barrier **1/1**, construction receipt **1/1**, checkpoint owner **1/1**, 
 coordination **1/1**, strict Store all-target Clippy, full workspace all-target check,
 repository fmt and scoped diff-check are green.
 
-**Next Phase-3 slice:** connect inspected exact results to driver-evidence revalidation and
-atomic checkpoint publication, then reuse the shared construction path for restore. Source
-realization, writer/effect participation, candidate/retention reconciliation, quiescent binding
-mutation, SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v57.
+Inspected captures now publish through one shared source-bearing construction boundary.
+Core SourcePublicationProof distinguishes revalidated immutable/non-revocable evidence from
+an actual provider-owned SourcePublicationFence guard; the latter must guarantee the exact
+evidence and authority until dropped. Immutable content alone is not non-revocable authority,
+and a saved HeldFence handle cannot enter the immutable branch. The trusted verifier receives
+the exact original named descriptors, bindings, anchors and inspected evidence outside SQLite.
+It must revalidate actual driver results, source/capture authority and fingerprints. The proof
+set is complete and identity-matched; guards are owned through commit or rollback (static
+generic dispatch, no new registry). This seam relies on reviewed host/driver implementations,
+not a claim that all concrete provider fences are implemented.
+
+The private shared construction receipt publication function checks the original unresolved
+receipt and exact preparation-owned barrier, invokes the existing resource owner inside one
+immediate transaction, verifies the candidate result, records Applied and settles the whole
+barrier atomically. The checkpoint owner revalidates current view/access generation, exact
+Sandbox/source revisions, settled HistoryBase, quiescence and schemas in that transaction.
+Checkpoint row, all anchors, local checkpoint.created commit-log provenance, Applied receipt
+and released source claims have one commit boundary. Failed verification or rollback preserves
+Unknown custody and source hazards; no partial public resource. The guards are dropped only
+after the transaction and Store connection guard finish. No Agent revision fanout; optional
+public Agent changed Events remain separate.
+
+History-only and source-bearing replay share the indexed checkpoint result lookup and original
+semantic fingerprint; the trusted source-bearing replay method returns the same disclosed
+published snapshot without planning/inspection. Unresolved claims remain non-retryable and
+changed semantics refuse. Source-bearing Agent realization and public host RPC remain closed.
+
+Grouped capture-owner regressions **2/2** now also cover final-transaction view revocation
+during external verification, saved-fence-handle refusal, actual fixture-provider read guard
+held through commit/rollback, rollback after partial anchor insertion, exact Applied replay
+and released complete-set leases. Checkpoint owner **1/1**, construction receipt **1/1**,
+source barrier **1/1**, task-bearing Agent create **1/1**, SourceDriver **1/1**, strict
+Core/Store all-target Clippy, workspace all-target check, fmt and scoped diff-check are green.
+
+**Next Phase-3 slice:** reuse the shared Prepared publication boundary for non-destructive
+restore, with exact checkpoint source/history authorization, fresh Agent and Sandbox candidates,
+and actual current source materialization/fence admission. Source realization, writer/effect
+participation, candidate/retention reconciliation, quiescent binding mutation, SandboxGrant/Vault
+and checkpoint RPC effects remain pending. Store schema is v57.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

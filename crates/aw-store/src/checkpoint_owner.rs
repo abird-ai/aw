@@ -296,12 +296,13 @@ fn snapshot_in(
 }
 
 /// All fields belong to the one publication transaction. Source-bearing
-/// callers must later use the shared Prepared constructor and hold the live
-/// mutation/cleanup fences. No public Rust API accepts caller-made anchors.
+/// callers use the shared Prepared publication boundary and hold the live
+/// mutation/cleanup fences.
 struct Publication<'a> {
+    actor: &'a PrincipalId,
     checkpoint: &'a str,
     source: AgentKey<'a>,
-    history: &'a history_owner::HistoryBaseRef,
+    history_base_id: &'a str,
     sources: &'a SourceSet,
     note: Option<&'a str>,
     creator: &'a str,
@@ -322,7 +323,7 @@ fn publish_in(
         registry.resolve(&anchor.pin()?)?;
     }
     let reference = agent_owner::canonical_ref(tx, publication.source)?;
-    let history_head = history_head_in(tx, &publication.history.id)?;
+    let history_head = history_head_in(tx, publication.history_base_id)?;
     db(tx.execute(
         "INSERT INTO checkpoints(checkpoint_id,source_agent_ref,source_session_id,source_branch_id,
              history_base_id,history_head,source_coverage,lifecycle,note,created_by,created_at,
@@ -333,7 +334,7 @@ fn publish_in(
             reference,
             publication.source.session,
             publication.source.branch,
-            publication.history.id,
+            publication.history_base_id,
             history_head,
             coverage_name(publication.sources.coverage),
             publication.note,
@@ -343,6 +344,17 @@ fn publish_in(
             publication.request_fingerprint
         ],
     ))?;
+    // Local owner provenance only. Public Agent changed Events and their
+    // disclosure are separate from the checkpoint collection membership.
+    crate::durability::commit_event(
+        tx,
+        &crate::durability::tx_id()?,
+        "checkpoint.created",
+        "checkpoint",
+        publication.checkpoint,
+        Some(publication.actor),
+        serde_json::json!({"sync_scope":"local","checkpoint_id":publication.checkpoint}),
+    )?;
     if publication.sources.anchors.is_empty() {
         return Ok(());
     }
@@ -373,6 +385,54 @@ fn publish_in(
         ]))?;
     }
     Ok(())
+}
+
+/// Stable replay across the history-only and source-bearing constructors.
+fn replay_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    creator: &str,
+    request_id: &str,
+    fingerprint: &str,
+) -> Result<Option<CheckpointSnapshot>> {
+    let replay: Option<(String, String)> = db(connection
+        .query_row(
+            "SELECT checkpoint_id,request_fingerprint FROM checkpoints
+             WHERE created_by=?1 AND request_id=?2",
+            params![creator, request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional())?;
+    if let Some((checkpoint, stored)) = replay {
+        if stored != fingerprint {
+            return Err(Error::Denied(
+                "checkpoint request identity reused with different semantics",
+            ));
+        }
+        return match snapshot_in(connection, actor, &checkpoint) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(Error::Denied(_)) => Err(Error::Denied(
+                "prior invocation is non-retryable; result unavailable",
+            )),
+            Err(error) => Err(error),
+        };
+    }
+    if let Some(receipt) = crate::construction_receipt::lookup_in(
+        connection,
+        crate::construction_receipt::ConstructionOperation::CheckpointCreate,
+        creator,
+        request_id,
+    )? {
+        if receipt.fingerprint != fingerprint {
+            return Err(Error::Denied(
+                "checkpoint request identity reused with different semantics",
+            ));
+        }
+        return Err(Error::Conflict(
+            "checkpoint request is non-retryable; inspect its prepared receipt",
+        ));
+    }
+    Ok(None)
 }
 
 fn fingerprint(reference: &str, note: Option<&str>) -> Result<String> {
@@ -406,42 +466,8 @@ impl SessionStore {
         let creator = user_for_principal(&tx, actor)?
             .ok_or(Error::Denied("checkpoint caller is inactive or unknown"))?;
         // Replay lookup precedes target resolution and current admission.
-        let replay: Option<(String, String)> = db(tx
-            .query_row(
-                "SELECT checkpoint_id,request_fingerprint FROM checkpoints
-             WHERE created_by=?1 AND request_id=?2",
-                params![creator, request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional())?;
-        if let Some((checkpoint, stored)) = replay {
-            if stored != fingerprint {
-                return Err(Error::Denied(
-                    "checkpoint request identity reused with different semantics",
-                ));
-            }
-            return match snapshot_in(&tx, actor, &checkpoint) {
-                Ok(snapshot) => Ok(snapshot),
-                Err(Error::Denied(_)) => Err(Error::Denied(
-                    "prior invocation is non-retryable; result unavailable",
-                )),
-                Err(error) => Err(error),
-            };
-        }
-
-        // Source-bearing Prepared claims share this constructor's request
-        // namespace. Removing sources from a retry cannot create a new row.
-        if crate::construction_receipt::lookup_in(
-            &tx,
-            crate::construction_receipt::ConstructionOperation::CheckpointCreate,
-            &creator,
-            request_id,
-        )?
-        .is_some()
-        {
-            return Err(Error::Conflict(
-                "checkpoint request is non-retryable; inspect its prepared receipt",
-            ));
+        if let Some(snapshot) = replay_in(&tx, actor, &creator, request_id, &fingerprint)? {
+            return Ok(snapshot);
         }
         let (session, branch) = agent_owner::key_for_ref(&tx, reference)?;
         let source = AgentKey::new(&session, &branch);
@@ -454,9 +480,10 @@ impl SessionStore {
             &registry,
             self.inner.source_limit,
             Publication {
+                actor,
                 checkpoint: &checkpoint,
                 source,
-                history: &history,
+                history_base_id: &history.id,
                 sources: &SourceSet {
                     coverage: SourceCoverage::None,
                     anchors: Vec::new(),
@@ -770,9 +797,10 @@ mod tests {
                 &store.inner.source_drivers.reader()?,
                 limit,
                 Publication {
+                    actor: &actor,
                     checkpoint: id,
                     source: key,
-                    history: &history,
+                    history_base_id: &history.id,
                     sources: set,
                     note: None,
                     creator: &creator,

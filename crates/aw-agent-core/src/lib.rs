@@ -90,8 +90,8 @@ pub use source_driver::{
     SchemaSupport, SourceAccess, SourceAnchor, SourceBinding, SourceCoverage,
     SourceDriverDescriptor, SourceDriverHandle, SourceDriverRegistry, SourceDriverRegistryReader,
     SourceDriverSchemas, SourceIdentityField, SourceIdentityFieldKind, SourceName,
-    SourceOperationKind, SourceSet, SourceSetLimit, DEFAULT_MAX_SOURCES_PER_SANDBOX,
-    HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
+    SourceOperationKind, SourcePublicationFence, SourcePublicationProof, SourceSet, SourceSetLimit,
+    DEFAULT_MAX_SOURCES_PER_SANDBOX, HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
 pub use tool::{
     ExecutionOwnershipLease, ExecutionOwnershipScope, Tool, ToolCall, ToolContext, ToolEffect,

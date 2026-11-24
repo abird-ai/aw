@@ -3,7 +3,11 @@
 //! publish external effects.
 
 use super::*;
-use aw_agent_core::{ExternalEvidence, RecoveryInspection, SourceAnchor, SourceSet};
+use crate::checkpoint_owner::{publish_in, snapshot_in, CheckpointSnapshot, Publication};
+use aw_agent_core::{
+    ExternalEvidence, RecoveryInspection, SourceAnchor, SourcePublicationFence,
+    SourcePublicationProof, SourceSet,
+};
 
 /// Exact inspected anchors and evidence, under the original operation's
 /// complete live Store-local barrier. Evidence identities are not provider
@@ -37,6 +41,81 @@ impl InspectedCheckpointCapture<'_> {
 
     pub fn mark_unknown(self) -> Result<()> {
         self.capture.mark_unknown()
+    }
+
+    /// Trusted publication of the exact inspected operation. The verifier
+    /// must revalidate every original driver descriptor, captured fingerprint,
+    /// retained anchor and current source/capture authority. It must return
+    /// immutable/non-revocable proof or own the actual provider-enforced
+    /// guard for each source in canonical order, not a saved fence handle.
+    /// Guards remain owned through the complete SQLite publication commit.
+    ///
+    /// This is a lower host seam, not model/RPC admission. The caller must
+    /// hold source authority independently of Agent view and the local barrier.
+    pub fn publish<F: SourcePublicationFence>(
+        self,
+        verify: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &[VersionedSourceBinding],
+            &PreparedSourceSet,
+            &SourceSet,
+            &[ExternalEvidence],
+        ) -> Result<Vec<SourcePublicationProof<F>>>,
+    ) -> Result<CheckpointSnapshot> {
+        let result = (|| {
+            let capture = &self.capture;
+            let boundary = capture.boundary();
+            let registry = {
+                let mut connection = capture.store.connection()?;
+                let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+                let registry = capture.require_current_in(&tx)?;
+                db(tx.rollback())?;
+                registry
+            };
+            let proofs = verify(
+                &registry,
+                &boundary.bindings,
+                capture.sources(),
+                &self.sources,
+                &self.evidence,
+            )?;
+            construction_receipt::publish_sources(
+                capture.store,
+                &capture.actor,
+                &capture.receipt,
+                &capture.barrier,
+                &self.evidence,
+                proofs,
+                |tx| {
+                    capture.require_current_boundary_in(tx, &registry)?;
+                    publish_in(
+                        tx,
+                        &registry,
+                        capture.store.inner.source_limit,
+                        Publication {
+                            actor: &capture.actor,
+                            checkpoint: capture.checkpoint_id(),
+                            source: capture.receipt.origin(),
+                            history_base_id: &boundary.history_base_id,
+                            sources: &self.sources,
+                            note: boundary.checkpoint_note.as_deref(),
+                            creator: &capture.receipt.creator,
+                            request_id: &capture.receipt.request_id,
+                            request_fingerprint: &capture.receipt.fingerprint,
+                        },
+                    )?;
+                    let snapshot = snapshot_in(tx, &capture.actor, capture.checkpoint_id())?;
+                    Ok((snapshot.id.clone(), snapshot))
+                },
+            )
+        })();
+        match result {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                self.capture.mark_unknown()?;
+                Err(error)
+            }
+        }
     }
 }
 

@@ -109,6 +109,25 @@ impl SourceMutationBarrier<'_> {
         coordination::require_source_leases_in(tx, &self.process, &self.leases)
     }
 
+    /// Exact operation identity and whole held set, for the shared constructor.
+    pub(crate) fn require_preparation_in(
+        &self,
+        tx: &Transaction<'_>,
+        prepare_id: &str,
+    ) -> Result<()> {
+        if self.leases.is_empty()
+            || self
+                .leases
+                .iter()
+                .any(|lease| lease.run_id.as_deref() != Some(prepare_id))
+        {
+            return Err(Error::Conflict(
+                "source mutation barrier belongs to another preparation",
+            ));
+        }
+        self.require_held_in(tx)
+    }
+
     /// Settle in the same transaction as resource/receipt publication.
     /// Another writer cannot acquire the scopes until this commit succeeds.
     pub(crate) fn settle_in(

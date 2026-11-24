@@ -547,6 +547,56 @@ impl ExternalEvidence {
     }
 }
 
+/// A provider/driver-owned live guard. Its owner must guarantee the exact
+/// represented evidence and external authority through the entire publication
+/// transaction, until this guard is dropped. A validity check, opaque handle,
+/// TTL or deserialized receipt is not an implementation of that guarantee.
+/// Implement only at the trusted provider/driver boundary.
+pub trait SourcePublicationFence {
+    fn evidence(&self) -> &ExternalEvidence;
+}
+
+// Immutable-only implementations need no fictitious fence.
+impl SourcePublicationFence for std::convert::Infallible {
+    fn evidence(&self) -> &ExternalEvidence {
+        match *self {}
+    }
+}
+
+/// Revalidated evidence from the trusted driver. Immutable is appropriate
+/// only when both the fact and the necessary external authority cannot be
+/// invalidated during commit. Held owns a real provider guard (including
+/// when immutable content has revocable authority). Never serialized.
+pub enum SourcePublicationProof<F> {
+    Immutable(ExternalEvidence),
+    Held(F),
+}
+
+impl<F: SourcePublicationFence> SourcePublicationProof<F> {
+    /// Bind live proof to the exact inspected identity. The driver must also
+    /// have checked the original descriptor/result and capture fingerprint.
+    pub fn require_evidence(&self, expected: &ExternalEvidence) -> Result<()> {
+        let actual = match self {
+            Self::Immutable(evidence) => {
+                if !matches!(evidence, ExternalEvidence::Immutable { .. }) {
+                    return Err(Error::Denied(
+                        "revocable source evidence requires a live fence",
+                    ));
+                }
+                evidence
+            }
+            Self::Held(fence) => fence.evidence(),
+        };
+        actual.validate()?;
+        if actual != expected {
+            return Err(Error::Conflict(
+                "source publication evidence identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryDescriptor {

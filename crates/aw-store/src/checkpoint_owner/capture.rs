@@ -33,9 +33,9 @@ pub enum CheckpointCaptureSelection {
 }
 
 impl CheckpointCaptureSelection {
-    fn canonicalize(mut self, limit: SourceSetLimit) -> Result<Self> {
+    fn canonicalize(mut self) -> Result<Self> {
         if let Self::Named(names) = &mut self {
-            limit.admit(names.len())?;
+            validate_source_set_hard_limit(names.len())?;
             for name in names.iter() {
                 name.validate()?;
             }
@@ -256,9 +256,8 @@ mod recovery;
 pub use recovery::InspectedCheckpointCapture;
 
 /// Trusted, live Prepared checkpoint capture. No Clone, no implicit release.
-/// Driver effects still require independently held source authority. No
-/// source-bearing publication is exposed until its final authority/driver
-/// evidence fence is implemented.
+/// Driver effects still require independently held source authority. Only
+/// inspected, revalidated results can enter the final publication boundary.
 #[must_use = "retain the prepared capture until publication or recovery"]
 pub struct PreparedCheckpointCapture<'a> {
     store: &'a SessionStore,
@@ -305,13 +304,14 @@ impl PreparedCheckpointCapture<'_> {
         Ok(())
     }
 
-    /// Current Store authority, exact history and source revisions, receipt
-    /// and barrier must all still agree. The eventual publication path must
-    /// call this inside its own final transaction, not trust a saved check.
-    fn require_current_in(&self, tx: &Transaction<'_>) -> Result<()> {
-        self.require_receipt_in(tx)?;
+    /// Recheck the owner-specific boundary inside the publication transaction.
+    /// The shared constructor separately checks the receipt and barrier.
+    fn require_current_boundary_in(
+        &self,
+        tx: &Transaction<'_>,
+        registry: &SourceDriverRegistryReader,
+    ) -> Result<()> {
         let boundary = self.boundary();
-        let registry = self.store.inner.source_drivers.reader()?;
         let observed = observe_in(
             tx,
             &self.actor,
@@ -319,7 +319,7 @@ impl PreparedCheckpointCapture<'_> {
             &boundary.selection,
             boundary.checkpoint_note.as_deref(),
             self.store.inner.source_limit,
-            &registry,
+            registry,
         )?;
         if &observed != boundary {
             return Err(Error::Conflict("checkpoint capture boundary changed"));
@@ -328,6 +328,13 @@ impl PreparedCheckpointCapture<'_> {
             registry.resolve(&source.prepared.descriptor.pin()?)?;
         }
         Ok(())
+    }
+
+    fn require_current_in(&self, tx: &Transaction<'_>) -> Result<SourceDriverRegistryReader> {
+        self.require_receipt_in(tx)?;
+        let registry = self.store.inner.source_drivers.reader()?;
+        self.require_current_boundary_in(tx, &registry)?;
+        Ok(registry)
     }
 
     /// Revalidate before driver execution/inspection. This is not a
@@ -360,6 +367,33 @@ impl PreparedCheckpointCapture<'_> {
 }
 
 impl SessionStore {
+    /// Replay the original source-bearing constructor request without planning
+    /// or inspecting external effects. Current disclosure is checked on the
+    /// published result; unresolved requests cannot become fresh invocations.
+    pub fn checkpoint_replay_capture(
+        &self,
+        actor: &PrincipalId,
+        reference: &str,
+        selection: CheckpointCaptureSelection,
+        note: Option<&str>,
+        request_id: &str,
+    ) -> Result<Option<super::CheckpointSnapshot>> {
+        label(reference, 2048)?;
+        label(request_id, 256)?;
+        if let Some(note) = note {
+            label(note, 2048)?;
+        }
+        let selection = selection.canonicalize()?;
+        let fingerprint = fingerprint(reference, &selection, note)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        let creator = user_for_principal(&tx, actor)?
+            .ok_or(Error::Denied("checkpoint caller is inactive or unknown"))?;
+        let result = super::replay_in(&tx, actor, &creator, request_id, &fingerprint)?;
+        db(tx.commit())?;
+        Ok(result)
+    }
+
     /// Trusted lower host seam, not an RPC or a model grant. The caller must
     /// independently admit checkpoint-create and exact source capture
     /// authority. The planner is read-only and must authorize the *complete*
@@ -389,7 +423,7 @@ impl SessionStore {
             ));
         }
         let limit = self.inner.source_limit;
-        let selection = selection.canonicalize(limit)?;
+        let selection = selection.canonicalize()?;
         let fingerprint = fingerprint(reference, &selection, note)?;
         let (creator, session, branch, boundary, store_scope) = {
             let mut connection = self.connection()?;
@@ -844,16 +878,52 @@ mod tests {
                 .unwrap();
         }
         prepared.revalidate().unwrap();
+        let creator = prepared.receipt.creator.clone();
+        let boundary = prepared.boundary().clone();
+        let inspected = prepared
+            .inspect(|_, bindings, sources| {
+                bindings
+                    .iter()
+                    .zip(&sources.sources)
+                    .map(|(version, source)| {
+                        let binding = &version.binding;
+                        let identity = &source.prepared.descriptor.prepared_identity;
+                        aw_agent_core::RecoveryInspection::completed(
+                            aw_agent_core::SourceAnchor {
+                                name: binding.name.clone(),
+                                driver: binding.driver.clone(),
+                                anchor_schema: 1,
+                                source_ref: binding.source_ref.clone(),
+                                access: binding.access,
+                                checkpoint_policy: binding.checkpoint_policy,
+                                identity: identity.clone(),
+                                retention: format!("fixture:{identity}"),
+                                fields: Vec::new(),
+                            },
+                            aw_agent_core::ExternalEvidence::immutable(
+                                "fixture_version",
+                                identity,
+                            )?,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap();
+        // Revoke view after Store preflight, while the trusted external
+        // verifier runs. The final transaction must recheck current ACLs.
         let rev = store
             .agent_public_revision(&actor, &session.id, &branch.id)
             .unwrap();
-        store
-            .agent_access_set(&actor, &session.id, &branch.id, &viewer_ref, None, rev)
-            .unwrap();
-        assert!(prepared.revalidate().is_err());
-        let creator = prepared.receipt.creator.clone();
-        let boundary = prepared.boundary().clone();
-        prepared.mark_unknown().unwrap();
+        assert!(inspected
+            .publish::<std::convert::Infallible>(|_, _, _, _, evidence| {
+                store.agent_access_set(&actor, &session.id, &branch.id, &viewer_ref, None, rev)?;
+                Ok(evidence
+                    .iter()
+                    .cloned()
+                    .map(aw_agent_core::SourcePublicationProof::Immutable)
+                    .collect())
+            })
+            .is_err());
         assert!(store
             .checkpoint_inspect_capture(&viewer, "host:capture", |_, _, _| {
                 panic!("revoked view must not disclose recovery descriptors")
@@ -1040,7 +1110,11 @@ mod tests {
                             retention: format!("fixture-retention:{version}"),
                             fields: Vec::new(),
                         },
-                        ExternalEvidence::immutable("fixture_version", version)?,
+                        if binding.name.as_str() == "data" {
+                            ExternalEvidence::held_fence("fixture_provider", version)?
+                        } else {
+                            ExternalEvidence::immutable("fixture_version", version)?
+                        },
                     )
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1145,5 +1219,216 @@ mod tests {
         assert!(store
             .acquire_source_mutation_barrier(&set, "still-hazard")
             .is_err());
+
+        // A saved provider handle is not an immutable publication proof.
+        use aw_agent_core::{SourcePublicationFence, SourcePublicationProof};
+        use std::sync::{RwLock, RwLockReadGuard};
+        let inspected = store
+            .checkpoint_inspect_capture(&actor, "host:recover", inspect)
+            .unwrap();
+        assert!(inspected
+            .publish::<std::convert::Infallible>(|_, _, _, _, evidence| {
+                Ok(evidence
+                    .iter()
+                    .cloned()
+                    .map(SourcePublicationProof::Immutable)
+                    .collect())
+            })
+            .is_err());
+
+        // The fixture provider owns an actual live fence. Its destructor
+        // observes the outcome while still holding the read guard, proving
+        // the guard outlives the entire Store transaction.
+        struct FixtureFence<'a> {
+            evidence: ExternalEvidence,
+            _guard: RwLockReadGuard<'a, ()>,
+            provider: &'a RwLock<()>,
+            store: &'a SessionStore,
+            candidate: &'a str,
+            committed: bool,
+        }
+        impl SourcePublicationFence for FixtureFence<'_> {
+            fn evidence(&self) -> &ExternalEvidence {
+                &self.evidence
+            }
+        }
+        impl Drop for FixtureFence<'_> {
+            fn drop(&mut self) {
+                assert!(self.provider.try_write().is_err());
+                let connection = self.store.connection().unwrap();
+                let published: bool = connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id=?1)",
+                        [self.candidate],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(published, self.committed);
+                let fact: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commit_log WHERE kind='checkpoint.created' AND entity_id=?1)",
+                    [self.candidate], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(fact, self.committed);
+            }
+        }
+        let provider = RwLock::new(());
+        let verify = |committed| {
+            let store = &store;
+            let set = &set;
+            let receipt = &receipt;
+            let provider = &provider;
+            let candidate = &candidate;
+            move |registry: &SourceDriverRegistryReader,
+                  observed: &[VersionedSourceBinding],
+                  sources: &PreparedSourceSet,
+                  anchors: &aw_agent_core::SourceSet,
+                  evidence: &[ExternalEvidence]| {
+                assert_eq!(sources, receipt.sources.as_ref().unwrap());
+                assert!(store
+                    .acquire_source_mutation_barrier(set, "during-verify")
+                    .is_err());
+                let inspected = inspect(registry, observed, sources)?;
+                assert_eq!(inspected.len(), anchors.anchors.len());
+                let mut proofs = Vec::new();
+                for ((current, anchor), expected) in
+                    inspected.into_iter().zip(&anchors.anchors).zip(evidence)
+                {
+                    let RecoveryInspection::Completed {
+                        result,
+                        evidence: actual,
+                    } = current
+                    else {
+                        return Err(Error::Conflict("fixture retention disappeared"));
+                    };
+                    assert_eq!(&result, anchor);
+                    assert_eq!(&actual, expected);
+                    proofs.push(match actual {
+                        ExternalEvidence::Immutable { .. } => {
+                            SourcePublicationProof::Immutable(actual)
+                        }
+                        ExternalEvidence::HeldFence { .. } => {
+                            SourcePublicationProof::Held(FixtureFence {
+                                evidence: actual,
+                                _guard: provider.read().unwrap(),
+                                provider,
+                                store,
+                                candidate,
+                                committed,
+                            })
+                        }
+                    });
+                }
+                Ok(proofs)
+            }
+        };
+
+        // Force a real failure after the checkpoint row and first anchor
+        // have been inserted. The whole transaction, including provenance,
+        // must roll back; the original receipt remains recoverable.
+        {
+            let connection = store.connection().unwrap();
+            connection.execute_batch(
+                "CREATE TEMP TRIGGER fixture_fail_checkpoint BEFORE INSERT ON checkpoint_sources
+                 WHEN NEW.source_name='data'
+                 BEGIN SELECT RAISE(ABORT,'fixture publication failure'); END;"
+            ).unwrap();
+        }
+        let inspected = store
+            .checkpoint_inspect_capture(&actor, "host:recover", inspect)
+            .unwrap();
+        assert!(inspected.publish(verify(false)).is_err());
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch("DROP TRIGGER fixture_fail_checkpoint")
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM checkpoint_sources", [], |row| row
+                        .get::<_, usize>(
+                        0
+                    ))
+                    .unwrap(),
+                0
+            );
+            let current = construction_receipt::lookup_in(
+                &connection,
+                receipt.operation,
+                &receipt.scope,
+                &receipt.request_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(current.state, PreparationState::Unknown);
+            assert_eq!(current.sources, receipt.sources);
+        }
+
+        let before_rev = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        let inspected = store
+            .checkpoint_inspect_capture(&actor, "host:recover", inspect)
+            .unwrap();
+        let snapshot = inspected.publish(verify(true)).unwrap();
+        assert_eq!(snapshot.id, candidate);
+        assert_eq!(
+            snapshot.history_base_id,
+            receipt.capture_boundary.as_ref().unwrap().history_base_id
+        );
+        assert_eq!(snapshot.source_coverage, SourceCoverage::AutoAllRequired);
+        assert_eq!(snapshot.sources.len(), 2);
+        assert_eq!(
+            store
+                .agent_public_revision(&actor, &session.id, &branch.id)
+                .unwrap(),
+            before_rev
+        );
+        assert!(provider.try_write().is_ok());
+        let replay = store
+            .checkpoint_replay_capture(
+                &actor,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:recover",
+            )
+            .unwrap();
+        assert_eq!(replay, Some(snapshot));
+        assert!(store
+            .checkpoint_replay_capture(
+                &actor,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                Some("changed"),
+                "host:recover"
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_inspect_capture(&actor, "host:recover", |_, _, _| panic!(
+                "applied receipt cannot inspect again"
+            ))
+            .is_err());
+        {
+            let connection = store.connection().unwrap();
+            let current = construction_receipt::lookup_in(
+                &connection,
+                receipt.operation,
+                &receipt.scope,
+                &receipt.request_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(current.state, PreparationState::Applied);
+            assert_eq!(current.result_ref.as_deref(), Some(candidate.as_str()));
+            assert_eq!(connection.query_row(
+                "SELECT count(*) FROM local_coordination_leases WHERE scope_kind='execution' AND run_id=?1 AND state='released'",
+                [&candidate], |row| row.get::<_, usize>(0),
+            ).unwrap(), 2);
+        }
+        store
+            .acquire_source_mutation_barrier(&set, "after-publication")
+            .unwrap()
+            .settle(SourceMutationOutcome::Settled)
+            .unwrap();
     }
 }

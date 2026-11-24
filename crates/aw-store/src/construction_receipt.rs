@@ -5,14 +5,15 @@ use crate::{
     audit_with_security_metadata, db, label,
     resources::SessionCandidateIds,
     source_compatibility::{compatibility, SourceCompatibility},
-    user_for_principal, Error, Result,
+    user_for_principal, Error, Result, SessionStore, SourceMutationBarrier, SourceMutationOutcome,
 };
 use aw_agent_core::{
-    NamedPreparedSource, PreparedSourceSet, PrincipalId, SourceDriverRegistry,
-    SourceDriverRegistryReader, SourceOperationKind, SourceSetLimit, HARD_MAX_SOURCES_PER_SANDBOX,
+    ExternalEvidence, NamedPreparedSource, PreparedSourceSet, PrincipalId, SourceDriverRegistry,
+    SourceDriverRegistryReader, SourceOperationKind, SourcePublicationFence,
+    SourcePublicationProof, SourceSetLimit, HARD_MAX_SOURCES_PER_SANDBOX,
     MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
-use rusqlite::{params, Connection, Row, Transaction};
+use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 // Each descriptor's bounded fields fit within the same encoded allowance as
@@ -467,15 +468,10 @@ pub(crate) fn claim_in(
     append_in(tx, actor, receipt)
 }
 
-/// CAS on the exact previous receipt. Source-bearing terminal transitions
-/// stay closed until the common publication/cleanup owner can prove them.
-pub(crate) fn transition_in(
+fn current_unresolved_in(
     tx: &Transaction<'_>,
     actor: &PrincipalId,
     expected: &ConstructionPreparation,
-    state: PreparationState,
-    result_ref: Option<String>,
-    note: Option<String>,
 ) -> Result<ConstructionPreparation> {
     expected.require_actor(tx, actor)?;
     let current = lookup_in(
@@ -490,6 +486,20 @@ pub(crate) fn transition_in(
             "construction receipt changed; inspect before retry",
         ));
     }
+    Ok(current)
+}
+
+/// CAS on the exact previous receipt. Source-bearing terminal transitions
+/// must use the fenced publication or reconciled cleanup path.
+pub(crate) fn transition_in(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    expected: &ConstructionPreparation,
+    state: PreparationState,
+    result_ref: Option<String>,
+    note: Option<String>,
+) -> Result<ConstructionPreparation> {
+    let current = current_unresolved_in(tx, actor, expected)?;
     if state == PreparationState::Prepared
         || (expected.sources.is_some() && state != PreparationState::Unknown)
     {
@@ -508,6 +518,110 @@ pub(crate) fn transition_in(
         append_in(tx, actor, &next)?;
     }
     Ok(next)
+}
+
+/// The common source-bearing publication boundary. Resource owners supply
+/// their exact in-transaction authority revalidation and publication using
+/// their existing lower constructors. All external guards are owned here
+/// until SQLite has finished committing (or rolling back).
+pub(crate) fn publish_sources<F: SourcePublicationFence, T>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    expected: &ConstructionPreparation,
+    barrier: &SourceMutationBarrier<'_>,
+    evidence: &[ExternalEvidence],
+    proofs: Vec<SourcePublicationProof<F>>,
+    publish: impl FnOnce(&Transaction<'_>) -> Result<(String, T)>,
+) -> Result<T> {
+    let sources = expected.sources.as_ref().ok_or(Error::Storage(
+        "source construction has no prepared descriptors",
+    ))?;
+    if evidence.len() != sources.sources.len() || proofs.len() != evidence.len() {
+        return Err(Error::Conflict(
+            "source publication requires the complete evidence set",
+        ));
+    }
+    for (proof, inspected) in proofs.iter().zip(evidence) {
+        proof.require_evidence(inspected)?;
+    }
+
+    let mut connection = store.connection()?;
+    let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let current = current_unresolved_in(&tx, actor, expected)?;
+    barrier.require_preparation_in(&tx, &sources.prepare_id)?;
+    let (result_ref, result) = publish(&tx)?;
+    // The resource constructor must have published the operation-owned
+    // candidate, not an existing or substituted resource.
+    let candidate_ref = match &current.candidate {
+        ConstructionCandidate::Checkpoint { checkpoint } => {
+            let published: bool = db(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id=?1
+                    AND created_by=?2 AND request_id=?3 AND request_fingerprint=?4)",
+                params![
+                    checkpoint,
+                    current.creator,
+                    current.request_id,
+                    current.fingerprint
+                ],
+                |row| row.get(0),
+            ))?;
+            if !published {
+                return Err(Error::Conflict(
+                    "prepared checkpoint candidate was not published",
+                ));
+            }
+            checkpoint.clone()
+        }
+        ConstructionCandidate::Agent {
+            session,
+            branch,
+            sandbox,
+            ..
+        } => {
+            let actual_sandbox: Option<String> = db(tx.query_row(
+                "SELECT sandbox_id FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+                params![session, branch],
+                |row| row.get(0),
+            ))?;
+            if &actual_sandbox != sandbox {
+                return Err(Error::Conflict(
+                    "prepared Agent Sandbox differs from publication",
+                ));
+            }
+            agent_owner::canonical_ref(&tx, AgentKey::new(session, branch))?
+        }
+        ConstructionCandidate::Sandbox { sandbox } => {
+            let published: bool = db(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?1 AND lifecycle='open')",
+                [sandbox], |row| row.get(0),
+            ))?;
+            if !published {
+                return Err(Error::Conflict(
+                    "prepared Sandbox candidate was not published",
+                ));
+            }
+            sandbox.clone()
+        }
+    };
+    if result_ref != candidate_ref {
+        return Err(Error::Conflict(
+            "publication result differs from prepared candidate",
+        ));
+    }
+    let applied = ConstructionPreparation {
+        state: PreparationState::Applied,
+        result_ref: Some(result_ref),
+        note: None,
+        ..current
+    };
+    applied.validate()?;
+    append_in(&tx, actor, &applied)?;
+    barrier.settle_in(&tx, SourceMutationOutcome::Settled)?;
+    db(tx.commit())?;
+    // Provider guard destructors may need Store access.
+    drop(connection);
+    drop(proofs);
+    Ok(result)
 }
 
 /// Stream only the current source-bearing unresolved receipts. Missing schemas
