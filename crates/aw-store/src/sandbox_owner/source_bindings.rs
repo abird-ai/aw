@@ -135,6 +135,17 @@ fn bindings_in(connection: &Connection, sandbox: &str) -> Result<Vec<StoredBindi
     Ok(bindings)
 }
 
+/// All retained binding identities, including missing/incompatible drivers.
+/// Logical retirement is not a new source effect or source-set admission.
+pub(super) fn require_unleased_layout_in(
+    tx: &rusqlite::Transaction<'_>,
+    sandbox: &str,
+) -> Result<()> {
+    let bindings = bindings_in(tx, sandbox)?;
+    SourceMutationSet::from_binding_refs(bindings.iter().map(|stored| &stored.binding))?
+        .require_unleased_in(tx)
+}
+
 pub(super) fn summaries(
     connection: &Connection,
     sandbox: &str,
@@ -317,6 +328,17 @@ impl SessionStore {
         if old.map(|stored| &stored.binding) == binding {
             return super::snapshot_with_sources(&tx, &sandbox);
         }
+        super::require_no_retained_layout_in(
+            &tx,
+            current
+                .tool_root
+                .to_str()
+                .ok_or(Error::Storage("invalid Sandbox tool root"))?,
+            current
+                .working_directory
+                .to_str()
+                .ok_or(Error::Storage("invalid Sandbox working directory"))?,
+        )?;
         let count = bindings.len() - usize::from(old.is_some()) + usize::from(binding.is_some());
         if count == 0 {
             // Removing the last binding must not turn a protected source
@@ -477,7 +499,7 @@ pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryRead
             || sandbox.layout_digest != layout.digest
             || sandbox.working_directory.to_str() != Some(layout.working_directory.as_str())
             || sandbox.tool_root.to_str() != Some(layout.tool_root.as_str())
-            || (lifecycle == "open" && sandbox.lifecycle != super::SandboxLifecycle::Open)
+            || (lifecycle != "closed" && sandbox.lifecycle != super::SandboxLifecycle::Open)
         {
             return Err(Error::Conflict(
                 "persisted source-bearing Agent Sandbox layout changed",
@@ -501,7 +523,7 @@ pub(crate) fn revalidate_in(tx: &Connection, registry: &SourceDriverRegistryRead
         // One bounded Sandbox at a time; no global materialization/descriptor allocation.
         let mut query = db(tx.prepare(
             "SELECT s.sandbox_id FROM sandboxes_current s
-             WHERE s.lifecycle='open' AND EXISTS(
+             WHERE EXISTS(
                  SELECT 1 FROM sandbox_source_bindings_current b WHERE b.sandbox_id=s.sandbox_id
              ) ORDER BY s.sandbox_id",
         ))?;

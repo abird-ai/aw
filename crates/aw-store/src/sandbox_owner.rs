@@ -330,6 +330,37 @@ fn insert_sandbox(
     Ok(canonical)
 }
 
+/// Closed source-bearing layouts retain their physical root reservation
+/// until a separate, proven materialization retirement releases custody.
+/// Match exact known paths across this Store; aliases and ancestor access
+/// still belong to the independently authorized physical host policy.
+fn require_no_retained_layout_in(
+    connection: &Connection,
+    tool_root: &str,
+    working_directory: &str,
+) -> Result<()> {
+    if !source_bindings::available(connection)? {
+        return Ok(());
+    }
+    let blocked: bool = db(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sandboxes_current s
+             WHERE s.lifecycle='closed'
+               AND (s.tool_root IN (?1,?2) OR s.working_directory IN (?1,?2))
+               AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
+                          WHERE b.sandbox_id=s.sandbox_id)
+         )",
+        params![tool_root, working_directory],
+        |row| row.get(0),
+    ))?;
+    if blocked {
+        return Err(Error::Conflict(
+            "Sandbox layout retains closed source custody",
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a known existing layout for an isolated construction. The
 /// trusted driver/host still owns physical isolation (including aliases).
 pub(crate) fn require_fresh_layout_in(
@@ -339,6 +370,7 @@ pub(crate) fn require_fresh_layout_in(
 ) -> Result<()> {
     let project = parse_project_ref(project_ref)?;
     let layout = layout(binding)?;
+    require_no_retained_layout_in(connection, &layout.tool_root, &layout.working_directory)?;
     let exists: bool = db(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sandboxes_current
          WHERE domain_handle=?1 AND identity_handle=?2 AND project_handle=?3
@@ -381,14 +413,9 @@ pub(crate) fn publish_fresh_in(
     source_bindings::validate_set(limit, registry, sources)?;
     let key = parse_sandbox_ref(canonical_ref)?;
     authorize_project(tx, actor, &key.project, true)?;
-    let reference = insert_sandbox(
-        tx,
-        &key.project,
-        &key.sandbox,
-        None,
-        &layout(binding)?,
-        Some(actor),
-    )?;
+    let layout = layout(binding)?;
+    require_no_retained_layout_in(tx, &layout.tool_root, &layout.working_directory)?;
+    let reference = insert_sandbox(tx, &key.project, &key.sandbox, None, &layout, Some(actor))?;
     source_bindings::insert(tx, &reference, sources)?;
     Ok(FreshSandbox { reference })
 }
@@ -455,6 +482,15 @@ pub(crate) fn require_execution_in(connection: &Connection, session: &str) -> Re
              SELECT 1 FROM agent_state_current a
              JOIN sandbox_source_bindings_current b ON b.sandbox_id=a.sandbox_id
              WHERE a.session_id=?1
+         ) OR EXISTS(
+             SELECT 1 FROM sessions r JOIN sandboxes_current s
+               ON s.tool_root IN (json_extract(r.binding_json,'$.tool_root'),
+                                  json_extract(r.binding_json,'$.working_directory'))
+               OR s.working_directory IN (json_extract(r.binding_json,'$.tool_root'),
+                                          json_extract(r.binding_json,'$.working_directory'))
+             WHERE r.id=?1 AND s.lifecycle='closed'
+               AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
+                          WHERE b.sandbox_id=s.sandbox_id)
          )",
         [session],
         |row| row.get(0),
@@ -508,6 +544,7 @@ fn ensure_layout(
     event_actor: Option<&PrincipalId>,
 ) -> Result<String> {
     if source_bindings::available(connection)? {
+        require_no_retained_layout_in(connection, &layout.tool_root, &layout.working_directory)?;
         let source_layout: bool = db(connection.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM sandboxes_current s
@@ -624,6 +661,13 @@ fn bind_auto(
                 "source-bearing Agent Sandbox realization is unavailable",
             ));
         }
+        if lifecycle != "closed" {
+            require_no_retained_layout_in(
+                connection,
+                &layout.tool_root,
+                &layout.working_directory,
+            )?;
+        }
         if sandbox.project_ref != project.canonical()
             || sandbox.layout_digest != layout.digest
             || sandbox.working_directory.to_str() != Some(layout.working_directory.as_str())
@@ -693,6 +737,8 @@ pub(crate) fn preflight_initial_selection(
     binding: &SessionBinding,
     requested: Option<&str>,
 ) -> Result<()> {
+    let expected = layout(binding)?;
+    require_no_retained_layout_in(connection, &expected.tool_root, &expected.working_directory)?;
     let Some(requested) = requested else {
         return Ok(());
     };
@@ -714,7 +760,6 @@ pub(crate) fn preflight_initial_selection(
             "source-bearing Agent Sandbox realization is unavailable",
         ));
     }
-    let expected = layout(binding)?;
     if sandbox.lifecycle != SandboxLifecycle::Open
         || sandbox.layout_digest != expected.digest
         || sandbox.working_directory.to_str() != Some(expected.working_directory.as_str())
@@ -744,6 +789,7 @@ pub(crate) fn select_initial_agent_sandbox(
             "initial Sandbox selection requires a newly created open Agent",
         ));
     }
+    require_no_retained_layout_in(connection, &expected.tool_root, &expected.working_directory)?;
     let target = if let Some(requested) = requested {
         preflight_initial_selection(
             connection,
@@ -902,13 +948,6 @@ impl SessionStore {
             db(tx.commit())?;
             return snapshot_with_sources(&connection, &key.canonical());
         }
-        // Retain live dependencies until the source lifecycle/cleanup contract
-        // is implemented; closing must not drop a required driver dependency.
-        if source_bindings::has_sources(&tx, &current.canonical_ref)? {
-            return Err(Error::Conflict(
-                "source-bearing Sandbox close requires SourceDriver lifecycle support",
-            ));
-        }
         let live_agents: u64 = db(tx.query_row(
             "SELECT count(*) FROM agent_state_current
              WHERE sandbox_id=?1 AND lifecycle IN ('open','closing')",
@@ -919,6 +958,53 @@ impl SessionStore {
             return Err(Error::Conflict(
                 "Sandbox close requires every bound Agent to be closed",
             ));
+        }
+        // Logical close releases neither driver dependencies nor physical
+        // materializations. Missing drivers do not prevent retirement.
+        require_layout_quiescent_in(
+            &tx,
+            &current.canonical_ref,
+            &crate::tool_root_key(&current.tool_root)?,
+        )?;
+        if source_bindings::has_sources(&tx, &current.canonical_ref)? {
+            if self.inner.mode != crate::StoreMode::OwnerLock {
+                return Err(Error::Denied(
+                    "source Sandbox close requires the exclusive Store owner",
+                ));
+            }
+            let cwd = current
+                .working_directory
+                .to_str()
+                .ok_or(Error::Storage("invalid Sandbox working directory"))?;
+            let root = current
+                .tool_root
+                .to_str()
+                .ok_or(Error::Storage("invalid Sandbox tool root"))?;
+            // Do not newly quarantine an already-live Agent in a different
+            // Sandbox that uses one of these known exact execution paths.
+            let aliases: bool = db(tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_state_current a JOIN sessions r ON r.id=a.session_id
+                     WHERE a.lifecycle IN ('open','closing')
+                       AND (json_extract(r.binding_json,'$.tool_root') IN (?1,?2)
+                            OR json_extract(r.binding_json,'$.working_directory') IN (?1,?2))
+                 )",
+                params![root, cwd],
+                |row| row.get(0),
+            ))?;
+            if aliases {
+                return Err(Error::Conflict(
+                    "source Sandbox layout is still used by a live Agent",
+                ));
+            }
+            if current.working_directory != current.tool_root {
+                require_layout_quiescent_in(
+                    &tx,
+                    &current.canonical_ref,
+                    &crate::tool_root_key(&current.working_directory)?,
+                )?;
+            }
+            source_bindings::require_unleased_layout_in(&tx, &current.canonical_ref)?;
         }
         let changed = db(tx.execute(
             "UPDATE sandboxes_current
@@ -939,8 +1025,9 @@ impl SessionStore {
             Some(actor),
             serde_json::json!({"sandbox_ref":key.canonical(),"rev":current.rev + 1}),
         )?;
+        let result = snapshot_with_sources(&tx, &key.canonical())?;
         db(tx.commit())?;
-        snapshot_with_sources(&connection, &key.canonical())
+        Ok(result)
     }
 }
 
@@ -1154,10 +1241,6 @@ mod tests {
                 )
             );
         }
-        assert!(matches!(
-            store.sandbox_close(&actor, &created.canonical_ref, None),
-            Err(Error::Conflict(_))
-        ));
         assert!(matches!(
             preflight_initial_selection(
                 &store.connection().unwrap(),

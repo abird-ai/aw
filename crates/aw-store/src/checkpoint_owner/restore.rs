@@ -1540,7 +1540,7 @@ mod tests {
             .all(|source| source.compatibility == crate::SourceCompatibility::RecoveryRequired));
         assert!(store.activate(&actor, &ids.session, &ids.branch).is_err());
         drop(store);
-        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
         assert_eq!(store.sandbox_get(&actor, &sandbox).unwrap(), snapshot);
         assert_eq!(
             store
@@ -1551,5 +1551,153 @@ mod tests {
         assert!(store
             .agent_admission(&actor, &restored_ref, crate::AgentAdmission::Open, None)
             .is_err());
+
+        // Logical close of the actual restored Agent/Sandbox uses their
+        // original lifecycle owners. No driver call or filesystem cleanup.
+        assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
+        store
+            .agent_request_close(&actor, &restored_ref, None)
+            .unwrap();
+        assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
+        let closed_agent = store.agent_finish_close(&actor, &restored_ref).unwrap();
+
+        // The same tool root with a different cwd must not be silently
+        // quarantined while a legacy Agent is still live.
+        let alias_layout = SessionBinding {
+            working_directory: temp.0.join("different-cwd"),
+            ..layout.clone()
+        };
+        std::fs::create_dir(&alias_layout.working_directory).unwrap();
+        let (alias, alias_branch) = store
+            .create(&actor, "same root", alias_layout.clone())
+            .unwrap();
+        let alias_ref = agent_owner::canonical_ref(
+            &store.connection().unwrap(),
+            AgentKey::new(&alias.id, &alias_branch.id),
+        )
+        .unwrap();
+        let alias_agent = store.agent_get(&actor, &alias_ref).unwrap();
+        let alias_sandbox = alias_agent.sandbox_ref.unwrap();
+        let unused_alias = store
+            .sandbox_create_fresh(&actor, &snapshot.project_ref, &alias_layout)
+            .unwrap();
+        assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
+        store.agent_request_close(&actor, &alias_ref, None).unwrap();
+        store.agent_finish_close(&actor, &alias_ref).unwrap();
+
+        let set = SourceMutationSet::from_anchors(&anchors.anchors).unwrap();
+        let barrier = store
+            .acquire_source_mutation_barrier(&set, "fixture:close")
+            .unwrap();
+        assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
+        barrier
+            .settle(crate::SourceMutationOutcome::Unknown)
+            .unwrap();
+        assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
+        {
+            let mut connection = store.connection().unwrap();
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let barrier = store
+                .recover_source_mutation_barrier_in(&tx, &set, "fixture:close")
+                .unwrap();
+            db(tx.commit()).unwrap();
+            drop(connection);
+            barrier
+                .settle(crate::SourceMutationOutcome::Settled)
+                .unwrap();
+        }
+
+        // A missing driver does not make metadata retirement impossible.
+        // Reopen with no implementations, then close without touching
+        // the physical marker files or dropping any durable dependency.
+        drop(store);
+        let store = SessionStore::open(&temp.0).unwrap();
+        let before = store.sandbox_get(&actor, &sandbox).unwrap();
+        let closed = store
+            .sandbox_close(&actor, &sandbox, Some(before.rev))
+            .unwrap();
+        assert_eq!(closed.lifecycle, crate::SandboxLifecycle::Closed);
+        assert_eq!(closed.rev, before.rev + 1);
+        assert_eq!(closed.sources, before.sources);
+        assert_eq!(store.sandbox_close(&actor, &sandbox, None).unwrap(), closed);
+        assert!(store
+            .sandbox_close(&actor, &sandbox, Some(before.rev))
+            .is_err());
+        assert_eq!(
+            store.agent_get(&actor, &restored_ref).unwrap(),
+            closed_agent
+        );
+        for source in &anchors.anchors {
+            assert!(marker(source.name.as_str()).is_file());
+        }
+        // Exact retained paths are fenced across construction and execution,
+        // including an alternate cwd and a pre-existing empty Sandbox.
+        let project = closed.project_ref.clone();
+        assert!(store
+            .create(&actor, "retained root", layout.clone())
+            .is_err());
+        assert!(store
+            .create(&actor, "retained alternate cwd", alias_layout.clone())
+            .is_err());
+        assert!(store
+            .sandbox_create_fresh(&actor, &project, &alias_layout)
+            .is_err());
+        {
+            let connection = store.connection().unwrap();
+            assert!(sandbox_owner::require_execution_in(&connection, &alias.id).is_err());
+            assert!(
+                sandbox_owner::require_fresh_layout_in(&connection, &project, &layout).is_err()
+            );
+            let binding =
+                crate::agent_binding_in(&connection, &actor, &alias.id, &alias_branch.id).unwrap();
+            assert!(sandbox_owner::preflight_initial_selection(
+                &connection,
+                &actor,
+                &binding.domain_handle,
+                &binding.identity_handle,
+                &binding.project_handle,
+                &alias_layout,
+                Some(&alias_sandbox),
+            )
+            .is_err());
+        }
+        drop(store);
+        // Closed dependencies are still validated on every owner restart.
+        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        let revalidated = store.sandbox_get(&actor, &sandbox).unwrap();
+        assert_eq!(revalidated.lifecycle, crate::SandboxLifecycle::Closed);
+        assert_eq!(revalidated.rev, closed.rev);
+        assert_eq!(revalidated.sources, snapshot.sources);
+        let anchor = &anchors.anchors[0];
+        let incoming = SourceBinding {
+            name: anchor.name.clone(),
+            driver: anchor.driver.clone(),
+            binding_schema: 1,
+            source_ref: anchor.source_ref.clone(),
+            materialization: "fixture:retained".into(),
+            access: anchor.access,
+            checkpoint_policy: anchor.checkpoint_policy,
+        };
+        assert!(matches!(
+            store.sandbox_sources_set(
+                &actor,
+                &unused_alias.canonical_ref,
+                &incoming.name,
+                Some(&incoming),
+                unused_alias.rev
+            ),
+            Err(Error::Conflict(
+                "Sandbox layout retains closed source custody"
+            ))
+        ));
+        assert_eq!(
+            store
+                .sandbox_get(&actor, &unused_alias.canonical_ref)
+                .unwrap(),
+            unused_alias
+        );
+        assert!(store.activate(&actor, &ids.session, &ids.branch).is_err());
     }
 }

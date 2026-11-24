@@ -39,8 +39,9 @@ handoff, original PipeProcess source-aware host composition and direct journal-l
 source-effect custody/terminal recovery, and pinned native single-source filesystem route
 with deferred post-journal settlement, concrete registered Git materialization resolution,
 root-free native-only tool registration, live native source approval, explicit Actor host
-activation selection, quiescent metadata-only source binding mutation and checkpoint
-retirement/retained-anchor reconciliation are implemented locally.
+activation selection, quiescent metadata-only source binding mutation, checkpoint
+retirement/retained-anchor reconciliation and source-bearing Sandbox logical close
+with retained-layout fencing are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1841,14 +1842,41 @@ substituted checkout refusal. Git repository **32/32**, checkpoint/capture/resto
 **4/4**, Sandbox **4/4**, barrier/construction receipt **1/1 each**; strict Git/Store
 all-target Clippy, workspace all-target check, fmt and scoped diff-check green.
 
+Source-bearing Sandbox logical close now uses the existing Project-writer lifecycle
+owner. Requires exclusive Store ownership, every bound Agent closed, no known live
+Agent sharing either exact execution path, legacy layout quiescence and the complete
+retained SourceBinding mutation set free of active/Unknown claims. Logical close
+does not require a compatible installed driver or a new effect admission limit; it
+increments Sandbox rev once and keeps every original binding, generation, materialization
+and dependency. Closed retained binding compatibility is revalidated on restart.
+A closing/open bound Agent cannot coexist with a closed source-bearing Sandbox.
+No physical deletion, mount change, or grant resurrection.
+
+Known closed retained tool-root/working-directory paths are fenced across the Store
+(including different Project or cwd) at fresh layout validation, publication, automatic
+and explicit selection, legacy execution admission, and real source binding mutation.
+An older empty Sandbox cannot re-adopt that retained layout. Matching is exact known
+path metadata, not a claim of physical alias/ancestor or cross-Store containment;
+independent host physical authority still owns those boundaries. Source rows continue
+to reserve the layout until a separately proved physical retirement releases them.
+Existing source-bearing execution gates stay held. The original grouped restore
+regression now covers actual Agent close, live same-root/different-cwd Agent refusal,
+active/Unknown source claim refusal and recovery, missing-driver logical close,
+unchanged bindings and physical markers, CAS/replay, legacy/explicit/fresh selection
+and mutation refusal, and compatible-driver restart. A test-only connection guard
+was dropped before reacquiring the Store for recovery settlement. Sandbox **4/4**,
+checkpoint/capture/restore **4/4**, barrier and construction receipt **1/1 each**,
+real Host source effects **2/2**; strict Store all-target Clippy, workspace all-target
+check, fmt and scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, implement source-bearing Sandbox logical close with retained-layout
-fencing and subsequent materialization/retention cleanup; never allow a closed retained
-source layout to become a legacy ambient root. Independent host approval provisioning,
-incomplete-effect reconciliation, multi-source policy, history-only baseline, custom
-ACL/task, candidate/retention cleanup, final-source removal/effectful mutation,
-Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
+While blocked, implement exact closed-Sandbox materialization retention reconciliation
+under independent physical authority, keeping retained layouts fenced until proved
+release. Independent host approval provisioning, incomplete-effect reconciliation,
+multi-source policy, history-only baseline, custom ACL/task, candidate/retention cleanup,
+final-source removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain
+pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 
