@@ -143,36 +143,6 @@ impl CaptureBoundary {
     }
 }
 
-// Source capture is stricter than history-only capture. The existing run
-// and hazard owner remains authoritative for legacy execution roots; future
-// source-bearing runtime writers must additionally hold the shared source
-// claims. No inference from a missing Process row establishes quiescence.
-fn require_quiescent(connection: &Connection, origin: AgentKey<'_>, sandbox: &str) -> Result<()> {
-    let physical_root = key(&session_in(connection, origin.session)?.binding)?;
-    let blocked: bool = db(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM runs WHERE root_key=?1 AND status='running')
-         OR EXISTS(SELECT 1 FROM hazards WHERE root_key=?1 AND state<>'settled')
-         OR EXISTS(
-            SELECT 1 FROM agent_state_current a JOIN branches b
-              ON b.session_id=a.session_id AND b.id=a.branch_id
-            WHERE a.sandbox_id=?2 AND b.active_run IS NOT NULL
-         )
-         OR EXISTS(
-            SELECT 1 FROM hazards h JOIN runs r ON r.id=h.run_id
-            JOIN agent_state_current a ON a.session_id=r.session_id AND a.branch_id=r.branch_id
-            WHERE a.sandbox_id=?2 AND h.state<>'settled'
-         )",
-        params![physical_root, sandbox],
-        |row| row.get(0),
-    ))?;
-    if blocked {
-        return Err(Error::Conflict(
-            "checkpoint source has active work or unresolved execution hazards",
-        ));
-    }
-    Ok(())
-}
-
 fn observe_in(
     connection: &Connection,
     actor: &PrincipalId,
@@ -196,7 +166,11 @@ fn observe_in(
         params![origin.session, origin.branch],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ))?;
-    require_quiescent(connection, origin, &sandbox_ref)?;
+    crate::sandbox_owner::require_layout_quiescent_in(
+        connection,
+        &sandbox_ref,
+        &key(&session_in(connection, origin.session)?.binding)?,
+    )?;
     let bindings =
         source_bindings::select_in(connection, &sandbox_ref, selection.names(), limit, registry)?;
     if bindings.is_empty() {

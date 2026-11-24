@@ -467,6 +467,40 @@ pub(crate) fn require_execution_in(connection: &Connection, session: &str) -> Re
     Ok(())
 }
 
+/// Legacy runs/hazards still fence a source layout until every writer
+/// participates in source custody. Include the whole backing Session of
+/// every sharing Agent, as well as the exact legacy tool-root key.
+pub(crate) fn require_layout_quiescent_in(
+    connection: &Connection,
+    sandbox: &str,
+    root_key: &str,
+) -> Result<()> {
+    let blocked: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE root_key=?1 AND status='running')
+         OR EXISTS(SELECT 1 FROM hazards WHERE root_key=?1 AND state<>'settled')
+         OR EXISTS(
+            SELECT 1 FROM agent_state_current a JOIN branches b ON b.session_id=a.session_id
+            WHERE a.sandbox_id=?2 AND b.active_run IS NOT NULL
+         )
+         OR EXISTS(
+            SELECT 1 FROM agent_state_current a JOIN runs r ON r.session_id=a.session_id
+            WHERE a.sandbox_id=?2 AND r.status='running'
+         )
+         OR EXISTS(
+            SELECT 1 FROM agent_state_current a JOIN hazards h ON h.session_id=a.session_id
+            WHERE a.sandbox_id=?2 AND h.state<>'settled'
+         )",
+        params![root_key, sandbox],
+        |row| row.get(0),
+    ))?;
+    if blocked {
+        return Err(Error::Conflict(
+            "Sandbox layout has active work or unresolved execution hazards",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_layout(
     connection: &Connection,
     project: &ProjectKey,

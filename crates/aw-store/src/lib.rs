@@ -648,10 +648,11 @@ pub(crate) fn label(s: &str, max: usize) -> Result<()> {
     }
 }
 pub(crate) fn key(binding: &SessionBinding) -> Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(json(&binding.tool_root)?.as_bytes())
-    ))
+    tool_root_key(&binding.tool_root)
+}
+
+fn tool_root_key(root: &Path) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(json(&root)?.as_bytes())))
 }
 pub fn stable_user_principal(user_id: &str) -> Result<PrincipalId> {
     if !user_id.starts_with("usr_")

@@ -656,6 +656,34 @@ mod tests {
             },
             checkpoint_policy: CheckpointPolicy::Required,
         });
+        // A first binding can attach to an independently prepared unused
+        // layout, but cannot retrofit the existing ambient Agent layout.
+        assert!(store
+            .sandbox_sources_set(&owner, &sandbox, &sources[0].name, Some(&sources[0]), 1,)
+            .is_err());
+        let unused_layout = SessionBinding {
+            working_directory: temp.0.join("unused"),
+            tool_root: temp.0.join("unused"),
+            system_prompt: "fixture".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "fixture".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let project = store.agent_get(&owner, &reference).unwrap().project_ref;
+        let unused = store
+            .sandbox_create_fresh(&owner, &project, &unused_layout)
+            .unwrap();
+        let attached = store
+            .sandbox_sources_set(
+                &owner,
+                &unused.canonical_ref,
+                &sources[0].name,
+                Some(&sources[0]),
+                unused.rev,
+            )
+            .unwrap();
+        assert_eq!(attached.rev, unused.rev + 1);
+        assert_eq!(attached.sources[0].binding_rev, attached.rev);
         // Test-only structural association: both Agents share a real
         // persisted Sandbox but are held. Production attach/realization is
         // still closed; this fixture does not add a rebind API.
@@ -832,27 +860,69 @@ mod tests {
             .unwrap();
         assert_eq!(observation.grant_revision, 2);
 
-        // Changed binding identity/revision cannot inherit the old grant,
-        // even if a trusted reissue races a name replacement.
-        {
-            let connection = store.connection().unwrap();
-            connection
-                .execute(
-                    "UPDATE sandbox_source_bindings_current SET binding_rev=binding_rev+1,
-                    source_ref='fixture-source:replacement'
-                 WHERE sandbox_id=?1 AND source_name='code'",
-                    [&sandbox],
-                )
+        // Real metadata mutation owner: CAS, independent Project authority,
+        // complete old/new barrier coverage, and no resurrection of a grant
+        // when an identical source is removed and later reattached.
+        let before_agent = store.agent_get(&owner, &reference).unwrap();
+        let before_other = store.agent_get(&owner, &other_ref).unwrap();
+        let current = store.sandbox_get(&owner, &sandbox).unwrap();
+        let mut replacement = sources[0].clone();
+        replacement.source_ref = "fixture-source:replacement".into();
+        let set = |actor: &PrincipalId, binding: Option<&SourceBinding>, rev| {
+            store.sandbox_sources_set(actor, &sandbox, &sources[0].name, binding, rev)
+        };
+        assert!(set(&participant, Some(&replacement), current.rev).is_err());
+        let old_other = crate::SourceMutationSet::from_bindings(&sources[1..]).unwrap();
+        let incoming =
+            crate::SourceMutationSet::from_bindings(std::slice::from_ref(&replacement)).unwrap();
+        for (claim, id) in [
+            (&old_other, "host:old-layout"),
+            (&incoming, "host:incoming"),
+        ] {
+            let barrier = store.acquire_source_mutation_barrier(claim, id).unwrap();
+            assert!(set(&owner, Some(&replacement), current.rev).is_err());
+            assert_eq!(store.sandbox_get(&owner, &sandbox).unwrap(), current);
+            barrier
+                .settle(crate::SourceMutationOutcome::Settled)
                 .unwrap();
         }
+        let mut extra = sources[0].clone();
+        extra.name = SourceName::new("extra").unwrap();
+        assert!(matches!(
+            store.sandbox_sources_set(&owner, &sandbox, &extra.name, Some(&extra), current.rev),
+            Err(Error::Limit(_))
+        ));
+
+        let removed = set(&owner, None, current.rev).unwrap();
+        assert_eq!(removed.rev, current.rev + 1);
+        assert_eq!(removed.sources.len(), 1);
+        assert!(store
+            .sandbox_sources_set(&owner, &sandbox, &sources[1].name, None, removed.rev,)
+            .is_err());
+        let reattached = set(&owner, Some(&sources[0]), removed.rev).unwrap();
+        assert_eq!(reattached.sources[0].binding_rev, reattached.rev);
+        assert!(store
+            .sandbox_grant_preflight(&participant, &reference, &policy, &tool_rw)
+            .is_err());
+        let changed = set(&owner, Some(&replacement), reattached.rev).unwrap();
+        assert_eq!(changed.rev, reattached.rev + 1);
+        assert_eq!(changed.sources[0].binding_rev, changed.rev);
+        assert_eq!(changed.sources[1].binding_rev, 1);
+        assert!(set(&owner, Some(&replacement), current.rev).is_err());
+        assert_eq!(
+            set(&owner, Some(&replacement), changed.rev).unwrap(),
+            changed
+        );
+        assert_eq!(store.agent_get(&owner, &reference).unwrap(), before_agent);
+        assert_eq!(store.agent_get(&owner, &other_ref).unwrap(), before_other);
         assert!(store
             .sandbox_grant_preflight(&participant, &reference, &policy, &tool_rw)
             .is_err());
         assert!(store
             .sandbox_grant_set(&owner, &reference, 2, Some(&policy))
             .is_err());
-        policy.sources[0].binding_rev += 1;
-        policy.sources[0].source_ref = "fixture-source:replacement".into();
+        policy.sources[0].binding_rev = changed.rev;
+        policy.sources[0].source_ref = replacement.source_ref;
         policy.sources[0].access = SourceAccess::ReadOnly;
         assert_eq!(
             store

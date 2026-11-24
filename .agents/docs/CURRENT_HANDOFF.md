@@ -37,9 +37,9 @@ and atomic held Agent + fresh source-bearing Sandbox restore publication, plus v
 SandboxGrant evidence/source-access preflight, typed SandboxDriver/fenced source-effect
 handoff, original PipeProcess source-aware host composition and direct journal-linked
 source-effect custody/terminal recovery, and pinned native single-source filesystem route
-with deferred post-journal settlement, concrete registered Git materialization resolution
-root-free native-only tool registration, live native source approval and explicit
-Actor host activation selection are implemented locally.
+with deferred post-journal settlement, concrete registered Git materialization resolution,
+root-free native-only tool registration, live native source approval, explicit Actor host
+activation selection and quiescent metadata-only source binding mutation are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1769,13 +1769,43 @@ all-target check, durable-only and minimal builds, minimal dependency exclusion
 of Git/SQLite, fmt and scoped diff-check are green. Minimal retains its two existing
 CLI dead-code warnings.
 
+Quiescent metadata-only sandbox_sources_set now uses the original Sandbox owner and
+Project-writer authority, exact Sandbox rev CAS, current driver compatibility and host
+source-set limit. Trusted callers independently authorize old/new sources and the
+complete resulting physical layout (including exclusion of removed/omitted sources),
+verify already-materialized bindings and retain live authority through publication.
+No materialization, deletion, remount or external driver effect is executed. Effectful
+changes still need original Prepared custody. The existing complete old source set and
+incoming source scopes must both be free of active/Unknown claims inside the same
+immediate transaction; no extra persisted lease or receipt for a SQLite-only mutation.
+The shared legacy layout quiescence check is reused by checkpoint capture and mutation:
+exact tool-root run/hazard key plus the whole backing Session of every sharing Agent.
+
+First attachment is limited to an unused Sandbox with no other known open exact tool
+root. Existing source-bearing mutation requires held Agent admission. Final-source
+removal remains refused until verified source-free layout/physical retirement support;
+no ambient legacy fallback. Exact no-op changes preserve revisions and events; each
+real change advances Sandbox rev once and uses that generation for the changed binding
+(initial publication uses rev 1). Removal/reinsertion cannot resurrect an old grant,
+even for identical SourceRef/materialization. Unchanged binding pins and Agent revs
+stay untouched. Local sandbox.sources.changed provenance records only source name/rev,
+not opaque locators. Public Event projection and effectful structural realization remain
+pending. Existing grouped grant regression uses the production mutation owner: unused
+attachment, legacy retrofit refusal, Project authority, complete old/incoming barrier,
+limit, non-final detach, identical reattach, stale grant/CAS, idempotency and restart.
+Sandbox owner **4/4**, checkpoint/capture/restore **4/4**, barrier and construction
+receipt **1/1 each**, real Host source-effect **2/2**, strict Store all-target Clippy,
+workspace all-target check, fmt and scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
-Actor/Turn journal and context/queue gates, coordinating the concurrent journal owner
-before touching their paths. Keep non-native/Job/Process routes unavailable until
-their own containment and authority participation are complete. Independent host
+Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
+While blocked, prefer independent checkpoint/Sandbox retirement and retention ownership
+rather than extra admission abstractions. Keep non-native/Job/Process routes unavailable
+until their own containment and authority participation are complete. Independent host
 approval provisioning, incomplete-effect reconciliation, multi-source policy, history-only
-baseline, custom ACL/task, candidate/retention reconciliation, quiescent binding
-mutation, Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
+baseline, custom ACL/task, candidate/retention reconciliation, final-source removal and
+effectful structural mutation, Vault and checkpoint/Sandbox host RPCs remain pending.
+Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 
