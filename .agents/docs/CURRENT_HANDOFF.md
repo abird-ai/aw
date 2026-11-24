@@ -39,7 +39,8 @@ handoff, original PipeProcess source-aware host composition and direct journal-l
 source-effect custody/terminal recovery, and pinned native single-source filesystem route
 with deferred post-journal settlement, concrete registered Git materialization resolution,
 root-free native-only tool registration, live native source approval, explicit Actor host
-activation selection and quiescent metadata-only source binding mutation are implemented locally.
+activation selection, quiescent metadata-only source binding mutation and checkpoint
+retirement/retained-anchor reconciliation are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1797,15 +1798,57 @@ Sandbox owner **4/4**, checkpoint/capture/restore **4/4**, barrier and construct
 receipt **1/1 each**, real Host source-effect **2/2**, strict Store all-target Clippy,
 workspace all-target check, fmt and scoped diff-check green.
 
+Checkpoint owner now provides bounded live metadata enumeration (exact Agent View,
+immutable creation-order cursor, since-retired cursor accepted), current Agent Manage
+logical delete, and trusted retired-source reconciliation. Retirement is idempotent,
+removes the live history GC root, retains the original request/result tombstone and
+does not advance Agent rev or disclose source locators. Unresolved restore receipts
+retain the checkpoint's history/anchors; refuse retirement until original custody
+is reconciled rather than orphaning their history dependency. No independent Project
+retention-admin authorization path is introduced yet. Applied restore replay remains
+valid after source retirement; fresh restore refuses it.
+
+Retired checkpoint rows and their exact immutable anchor set are the cleanup intent.
+Cleanup requires exclusive Store owner, current Manage and independent trusted source/
+provider cleanup authority, compatible registered schemas, no live anchor sharing
+the driver/source/retention identity, and the whole original source mutation set.
+One reserved checkpoint-retention claim identity derives from the checkpoint ID;
+reclaim exact original hazards, never active/absent claims as recovery. Retained
+cleanup is not new source admission and can exceed a lowered host limit. The trusted
+reconciler inspects exact original anchors outside SQLite and either proves absence
+or conditionally releases them under its live external authority/fence. It does not
+recapture/restore or reclaim materializations/shared backing. Unknown retains all
+anchor rows and fences; final receipt-free local transaction revalidates custody and
+dependencies, removes all retained rows and settles claims with local provenance.
+Already-cleaned tombstones never reinspect. No extra durable cleanup table or ledger.
+
+GitSourceDriver::release_retired_anchor verifies exact source repository identity,
+inspects the private checkpoint ref, refuses symbolic/changed/unreadable refs, and
+uses no-deref expected-OID conditional deletion; verifies absence, never touches
+HEAD/index/other refs/objects. True absence is successful retirement observation,
+not evidence of NotStarted for capture. Git without show-ref --exists fails closed.
+Provider/cross-Store fencing and independently authorized repository resolution
+remain the caller's responsibility. This is a trusted driver primitive, not a
+production automated cleanup worker or public RPC. No real user checkpoint or
+repository was retired during qualification; only isolated fixtures.
+
+Existing checkpoint/restore regressions exercise actual logical retirement, current
+Manage vs View, bounded list, replay, unresolved restore pin, live shared retention,
+complete-set exclusion, partial cleanup/Unknown, missing-driver restart and exact
+recovery with lowered limit. Existing Git regression exercises exact conditional
+release, changed/symbolic refs, absent replay, preserved HEAD/index/other anchor and
+substituted checkout refusal. Git repository **32/32**, checkpoint/capture/restore
+**4/4**, Sandbox **4/4**, barrier/construction receipt **1/1 each**; strict Git/Store
+all-target Clippy, workspace all-target check, fmt and scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer independent checkpoint/Sandbox retirement and retention ownership
-rather than extra admission abstractions. Keep non-native/Job/Process routes unavailable
-until their own containment and authority participation are complete. Independent host
-approval provisioning, incomplete-effect reconciliation, multi-source policy, history-only
-baseline, custom ACL/task, candidate/retention reconciliation, final-source removal and
-effectful structural mutation, Vault and checkpoint/Sandbox host RPCs remain pending.
-Store schema v58.
+While blocked, implement source-bearing Sandbox logical close with retained-layout
+fencing and subsequent materialization/retention cleanup; never allow a closed retained
+source layout to become a legacy ambient root. Independent host approval provisioning,
+incomplete-effect reconciliation, multi-source policy, history-only baseline, custom
+ACL/task, candidate/retention cleanup, final-source removal/effectful mutation,
+Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

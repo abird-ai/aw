@@ -3,6 +3,7 @@
 
 pub(crate) mod capture;
 pub(crate) mod restore;
+mod retirement;
 use crate::{
     agent_owner::{self, AgentKey, AgentPermission},
     db, history_owner, id, label, now,
@@ -21,6 +22,7 @@ pub use restore::{
     CheckpointRestoreRequest, CheckpointRestoreResult, InspectedCheckpointRestore,
     PreparedCheckpointRestore,
 };
+pub(crate) use retirement::RETENTION_CLEANUP_PREFIX;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -719,6 +721,14 @@ mod tests {
         assert_eq!(during.history_base_id, settled.history_base_id);
         assert_eq!(during.history_head, settled.history_head);
         assert_eq!(during.source_coverage, SourceCoverage::None);
+        assert!(store.checkpoint_delete(&viewer, &settled.id).is_err());
+        assert_eq!(
+            store
+                .checkpoint_list_metadata(&viewer, &reference, None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             store
                 .agent_public_revision(&actor, &session.id, &branch.id)
@@ -871,13 +881,22 @@ mod tests {
                     [&checkpoint]
                 )
                 .is_err());
-            // Future retirement changes lifecycle only; replay survives and
+            // Actual retirement changes lifecycle only; replay survives and
             // the historical ID is no longer a live history retention root.
-            conn.execute(
-                "UPDATE checkpoints SET lifecycle='retired' WHERE checkpoint_id=?1",
-                [&settled.id],
-            )
-            .unwrap();
+            drop(conn);
+            let before = store.agent_get(&actor, &reference).unwrap();
+            store.checkpoint_delete(&actor, &settled.id).unwrap();
+            store.checkpoint_delete(&actor, &settled.id).unwrap();
+            assert_eq!(store.agent_get(&actor, &reference).unwrap(), before);
+            assert!(!store
+                .checkpoint_list_metadata(&actor, &reference, None, 256)
+                .unwrap()
+                .iter()
+                .any(|snapshot| snapshot.id == settled.id));
+            assert!(store
+                .checkpoint_list_metadata(&actor, &reference, Some(&settled.id), 1)
+                .is_ok());
+            let conn = store.connection().unwrap();
             let retained: Option<String> = conn
                 .query_row(
                     "SELECT live_history_base_id FROM checkpoints WHERE checkpoint_id=?1",
@@ -957,8 +976,134 @@ mod tests {
             drop(direct);
             SessionStore::open_with_sources(&temp.0, reinstalled.clone(), limit).unwrap()
         };
+        // Use the existing lower anchor fixture to exercise complete-set
+        // retirement/cleanup custody and shared retention. The real Git
+        // conditional ref release is qualified by its repository test.
+        let mut cleanup_set = set.clone();
+        for anchor in &mut cleanup_set.anchors {
+            anchor.retention.push_str("-cleanup");
+        }
+        let first = "cp_cleanup_a";
+        let second = "cp_cleanup_b";
+        insert(&store, first, &cleanup_set, limit).unwrap();
+        insert(&store, second, &cleanup_set, limit).unwrap();
+        assert!(store
+            .checkpoint_reconcile_retired_sources(&actor, first, |_| panic!(
+                "live checkpoint cannot release retention"
+            ))
+            .is_err());
+        let before = store.agent_get(&actor, &reference).unwrap();
+        store.checkpoint_delete(&actor, first).unwrap();
+        assert!(store
+            .checkpoint_reconcile_retired_sources(&actor, first, |_| panic!(
+                "shared live retention must remain pinned"
+            ))
+            .is_err());
+        store.checkpoint_delete(&actor, second).unwrap();
+        assert_eq!(store.agent_get(&actor, &reference).unwrap(), before);
+        let mutations = crate::SourceMutationSet::from_anchors(&cleanup_set.anchors).unwrap();
+        let held = store
+            .acquire_source_mutation_barrier(&mutations, "other-retention")
+            .unwrap();
+        assert!(store
+            .checkpoint_reconcile_retired_sources(&actor, first, |_| panic!(
+                "busy source cannot release retention"
+            ))
+            .is_err());
+        held.settle(crate::SourceMutationOutcome::Settled).unwrap();
+        let paths: Vec<_> = cleanup_set
+            .anchors
+            .iter()
+            .map(|anchor| temp.0.join(anchor.name.as_str()))
+            .collect();
+        for path in &paths {
+            std::fs::write(path, b"retained").unwrap();
+        }
+        assert!(store
+            .checkpoint_reconcile_retired_sources(&actor, first, |original| {
+                assert_eq!(original, &cleanup_set);
+                assert!(store
+                    .acquire_source_mutation_barrier(&mutations, "during-cleanup")
+                    .is_err());
+                std::fs::remove_file(&paths[0])?;
+                Err(Error::Conflict("fixture interruption after first release"))
+            })
+            .is_err());
+        assert!(!paths[0].exists() && paths[1].exists());
+        assert_eq!(
+            sources_in(&store.connection().unwrap(), first, cleanup_set.coverage)
+                .unwrap()
+                .0,
+            cleanup_set
+        );
+        drop(store);
+
+        let missing = SessionStore::open(&temp.0).unwrap();
+        assert!(missing
+            .checkpoint_reconcile_retired_sources(&actor, first, |_| panic!(
+                "missing driver cannot inspect retained source"
+            ))
+            .is_err());
+        assert!(missing
+            .acquire_source_mutation_barrier(&mutations, "restart-cleanup")
+            .is_err());
+        drop(missing);
+        let store = SessionStore::open_with_sources(
+            &temp.0,
+            reinstalled.clone(),
+            SourceSetLimit::new(1).unwrap(),
+        )
+        .unwrap();
+        store
+            .checkpoint_reconcile_retired_sources(&actor, first, |original| {
+                assert_eq!(original, &cleanup_set);
+                for path in &paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        store
+            .checkpoint_reconcile_retired_sources(&actor, first, |_| {
+                panic!("released retention must not replay inspection")
+            })
+            .unwrap();
+        // Shared retired anchor can now observe absence; a lowered source
+        // limit does not make old cleanup dependencies impossible to release.
+        store
+            .checkpoint_reconcile_retired_sources(&actor, second, |original| {
+                assert_eq!(original, &cleanup_set);
+                assert!(paths.iter().all(|path| !path.exists()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .checkpoint_get_metadata(&actor, first)
+                .unwrap()
+                .lifecycle,
+            CheckpointLifecycle::Retired
+        );
+        assert_eq!(
+            store.checkpoint_get_metadata(&actor, &checkpoint).unwrap(),
+            expected
+        );
+        assert_eq!(store.agent_get(&actor, &reference).unwrap(), before);
         {
             let conn = store.connection().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM checkpoint_sources WHERE checkpoint_id IN (?1,?2)",
+                    params![first, second],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+                0
+            );
             conn.execute(
                 "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1023)
                  INSERT INTO checkpoint_sources

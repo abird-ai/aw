@@ -79,6 +79,10 @@ pub(crate) struct RestoreBoundary {
 }
 
 impl RestoreBoundary {
+    pub(crate) fn checkpoint(&self) -> &str {
+        &self.checkpoint
+    }
+
     pub(crate) fn validate(
         &self,
         candidate: &ConstructionCandidate,
@@ -1199,6 +1203,9 @@ mod tests {
             )
             .unwrap();
         prepared.revalidate(&layout).unwrap();
+        // The original unresolved restore pins both retained anchors and
+        // history. Retirement must not remove its last durable history root.
+        assert!(store.checkpoint_delete(&actor, &checkpoint).is_err());
         let receipt = prepared.receipt.clone();
         let candidate = prepared.prepare_id().to_owned();
         let sandbox = prepared.sandbox_ref().to_owned();
@@ -1491,13 +1498,8 @@ mod tests {
                 &identity,
             )
             .is_err());
-            connection
-                .execute(
-                    "UPDATE checkpoints SET lifecycle='retired' WHERE checkpoint_id=?1",
-                    [&checkpoint],
-                )
-                .unwrap();
         }
+        store.checkpoint_delete(&actor, &checkpoint).unwrap();
         assert!(store
             .checkpoint_prepare_restore(
                 &actor,

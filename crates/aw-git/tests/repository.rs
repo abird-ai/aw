@@ -291,8 +291,44 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     ));
     assert_eq!(f.run(&["rev-parse", wrong_ref]).stdout, head);
 
-    // Deleting the retention fact is uncertainty, not a fresh operation.
-    f.run(&["update-ref", "-d", private_ref]);
+    // Retirement owns an exact conditional release, never a broad ref
+    // deletion. A changed or symbolic ref must remain untouched.
+    let current_head = String::from_utf8(f.run(&["rev-parse", "HEAD"]).stdout).unwrap();
+    let current_head = current_head.trim();
+    let current_index = std::fs::read(f.root.join(".git/index")).unwrap();
+    f.run(&["update-ref", private_ref, current_head]);
+    assert!(driver.release_retired_anchor(&f.root, &anchor).is_err());
+    assert_eq!(
+        f.run(&["rev-parse", private_ref]).stdout,
+        format!("{current_head}\n").as_bytes()
+    );
+    f.run(&["symbolic-ref", private_ref, "refs/heads/main"]);
+    assert!(driver.release_retired_anchor(&f.root, &anchor).is_err());
+    assert_eq!(
+        f.run(&["symbolic-ref", private_ref]).stdout,
+        b"refs/heads/main\n"
+    );
+    f.run(&[
+        "update-ref",
+        "--no-deref",
+        private_ref,
+        &anchor.captured_commit,
+    ]);
+    driver.release_retired_anchor(&f.root, &anchor).unwrap();
+    driver.release_retired_anchor(&f.root, &anchor).unwrap();
+    assert_eq!(
+        f.run(&["rev-parse", "HEAD"]).stdout,
+        format!("{current_head}\n").as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(f.root.join(".git/index")).unwrap(),
+        current_index
+    );
+    driver.verify_anchor(&f.root, &legacy_anchor).unwrap();
+    assert!(f.run(&["for-each-ref", private_ref]).stdout.is_empty());
+
+    // Deleting the retention fact is uncertainty for capture, not a
+    // fresh capture operation.
     assert!(matches!(
         driver.inspect_capture(&prepared).unwrap(),
         RecoveryInspection::Unknown
@@ -306,6 +342,7 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     assert!(driver
         .plan_capture(&binding, "cp_replaced", "op_replaced")
         .is_err());
+    assert!(driver.release_retired_anchor(&f.root, &anchor).is_err());
     assert!(matches!(
         driver.inspect_capture(&collision).unwrap(),
         RecoveryInspection::Unknown

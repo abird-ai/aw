@@ -168,9 +168,11 @@ impl SessionStore {
         set: &SourceMutationSet,
         prepare_id: &str,
     ) -> Result<SourceMutationBarrier<'_>> {
-        if prepare_id.starts_with(crate::sandbox_owner::JOURNALED_SOURCE_EFFECT_PREFIX) {
+        if prepare_id.starts_with(crate::sandbox_owner::JOURNALED_SOURCE_EFFECT_PREFIX)
+            || prepare_id.starts_with(crate::checkpoint_owner::RETENTION_CLEANUP_PREFIX)
+        {
             return Err(Error::Denied(
-                "journaled source effects require original tool custody",
+                "reserved source claims require their original owner",
             ));
         }
         let mut connection = self.connection()?;
@@ -189,6 +191,17 @@ impl SessionStore {
         prepare_id: &str,
     ) -> Result<SourceMutationBarrier<'_>> {
         self.inner.source_limit.admit(set.count)?;
+        self.claim_source_mutation_barrier_in(tx, set, prepare_id)
+    }
+
+    /// Retained cleanup is not a new materialization. Its original bounded
+    /// set may exceed a subsequently lowered host admission limit.
+    pub(crate) fn claim_source_mutation_barrier_in(
+        &self,
+        tx: &Transaction<'_>,
+        set: &SourceMutationSet,
+        prepare_id: &str,
+    ) -> Result<SourceMutationBarrier<'_>> {
         if set.scopes.is_empty() {
             return Err(Error::Config(
                 "source mutation barrier requires a nonempty set".into(),

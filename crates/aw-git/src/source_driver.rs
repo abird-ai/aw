@@ -989,6 +989,67 @@ impl GitSourceDriver {
         verify_prepared_anchor(&repo, &plan, prepared, anchor)
     }
 
+    /// Reconcile the private retention of an already-retired checkpoint.
+    /// The trusted host independently authorizes this repository and holds
+    /// the source/retention fence (including other live dependencies).
+    /// Never delete a branch, worktree, object or changed reference.
+    ///
+    /// Inspect first, then conditional delete of the exact retained OID.
+    /// Absence is a successful retirement observation, unlike capture.
+    pub fn release_retired_anchor(
+        &self,
+        repository: &Path,
+        anchor: &GitSourceAnchor,
+    ) -> Result<()> {
+        anchor.validate()?;
+        let repo = self.repository(repository)?;
+        if repository_stamps(&repo)?.0 != anchor.source_ref {
+            return Err(Error::Conflict("retired Git anchor repository changed"));
+        }
+        let reference = anchor.retention_ref();
+        let inspect = || -> Result<Option<String>> {
+            // Distinguish true absence from an unreadable or broken ref.
+            // Older Git without --exists fails closed.
+            match repo.run(&["show-ref", "--exists", &reference], None, false) {
+                Err(GitError::Exit(2)) => {
+                    if retained_commit(&repo, &reference)?.is_some() {
+                        return Err(Error::Conflict("Git retention lookup is inconsistent"));
+                    }
+                    Ok(None)
+                }
+                Ok(_) => retained_commit(&repo, &reference)?
+                    .map(Some)
+                    .ok_or(Error::Conflict("Git retention is present but unreadable")),
+                Err(error) => Err(git_error(error)),
+            }
+        };
+        match inspect()? {
+            None => return Ok(()),
+            Some(current) if current == anchor.captured_commit => {}
+            Some(_) => return Err(Error::Conflict("retired Git retention reference changed")),
+        }
+        repo.validate_binding().map_err(git_error)?;
+        run(
+            &repo,
+            &[
+                "-c",
+                "core.logAllRefUpdates=false",
+                "update-ref",
+                "--no-deref",
+                "-d",
+                &reference,
+                &anchor.captured_commit,
+            ],
+        )
+        .map_err(|_| Error::Conflict("Git retention release uncertain; inspect original anchor"))?;
+        if repository_stamps(&repo)?.0 != anchor.source_ref || inspect()?.is_some() {
+            return Err(Error::Conflict(
+                "Git retention release could not be verified",
+            ));
+        }
+        Ok(())
+    }
+
     /// Read-only retention validation independent of the current HEAD. A
     /// different authorized checkout may access the same object database.
     pub fn verify_anchor(&self, repository: &Path, anchor: &GitSourceAnchor) -> Result<()> {
