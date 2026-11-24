@@ -1402,6 +1402,12 @@ impl SessionStore {
         })
     }
 
+    /// Exact live Store owner identity, for composing host-owned capabilities.
+    /// This is not a durable Store identifier or a resource grant.
+    pub fn shares_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn directory(&self) -> Option<&Path> {
         self.inner.state_dir.as_deref()
     }

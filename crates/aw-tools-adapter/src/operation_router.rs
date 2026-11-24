@@ -408,6 +408,10 @@ impl std::fmt::Debug for OperationRouterSlot {
 }
 
 impl OperationRouterSlot {
+    pub fn is_installed(&self) -> Result<bool> {
+        Ok(self.current()?.is_some())
+    }
+
     /// Install without silently replacing an existing host policy router.
     pub fn install(&self, router: Arc<dyn OperationRouter>) -> Result<()> {
         let mut guard = self

@@ -38,7 +38,8 @@ SandboxGrant evidence/source-access preflight, typed SandboxDriver/fenced source
 handoff, original PipeProcess source-aware host composition and direct journal-linked
 source-effect custody/terminal recovery, and pinned native single-source filesystem route
 with deferred post-journal settlement, concrete registered Git materialization resolution
-and root-free native-only tool registration are implemented locally.
+root-free native-only tool registration, live native source approval and explicit
+Actor host activation selection are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1727,13 +1728,54 @@ Strict Git/Host/Adapter/Store all-target Clippy, workspace all-target check, min
 build with no Git/SQLite normal dependencies, fmt/scoped diff-check green. Minimal
 retains the two existing CLI dead-code warnings.
 
-**Next Phase-3 slice:** connect the trusted host policy/physical approval owner and this
-root-free native builder to original Actor Service activation, coordinating the journal
-owner before promoting any source-bearing runtime path. Complete Job/Process containment
-and dispatch remain required for their corresponding authority. Incomplete-effect
-reconciliation, multi-source policy, history-only baseline, custom ACL/task, candidate/
-retention reconciliation, quiescent binding mutation, Vault and checkpoint/Sandbox host
-RPCs remain pending. Store schema v58.
+NativeSourceApproval owns one explicit independently approved source directory and
+exact Agent/actor/Store binding, retains its physical identity pin, and derives the
+policy digest from the actual native approval. It is not a registry or a reconstructed
+persisted grant. The trusted host supplies the source binding, directory access, original
+private-artifact owner and stable authority identity/generation; it must not reuse a
+withdrawn generation. Publication uses the original Project-writer-authorized
+SandboxGrant CAS. Live withdrawal prevents new reads, waits for admitted guards and
+releases the pin permanently; it does not fabricate a Process stop or automatically
+mutate durable grant evidence. Current Store grant and tool/Actor authority remain
+independent requirements. Trusted host lookup now has an exact authoritative
+AgentExecutionBinding and live Store-owner identity check.
+
+GitNativeSourceHost composes that approval, the actual registered Git SourceDriver,
+and the existing typed native realization handle. Verify materialization against the
+independently approved physical directory, revalidate live authority at resolution,
+refuse non-native or beyond-ceiling selection, configure one root-free Agent builder
+with a fresh per-build router slot, and preserve exact original receipt settlement.
+No automatic grant or ambient path fallback. A persisted grant without live approval
+does not authorize execution.
+
+HostAgentActivation has an explicit workspace-feature Git native host selection;
+the original Store activation gate runs before legacy tool/root realization or the
+native builder. Native selection would install only the approved tools, no Job runtime,
+wake/control capabilities or inherited ambient router. The production source-bearing
+gate remains closed across activation, queue, model context and journal. This slice
+provides the host composition seam but does not claim a live source-bearing Actor,
+production config/RPC issuance, or physical Process containment. Other agent journal
+work was preserved.
+
+The existing native grouped regression exercises the concrete approval owner in both
+Git and generic builds, separate grant publication, wrong Store/backing Agent refusal,
+Git native builder selection, withdrawal with a held guard, denial despite an active
+persisted grant, original file effects and restart settlement. The original source-free
+task-bearing activation regression still passes. Recovered the interrupted working
+tree at f9b9761 and reran its focused gates. Host **15/15** with Git and **15/15**
+without Git, Sandbox/checkpoint **4/4 each**, router **3/3**, original task-bearing
+Actor activation **1/1**. Strict Host/Store/Adapter all-target Clippy, workspace
+all-target check, durable-only and minimal builds, minimal dependency exclusion
+of Git/SQLite, fmt and scoped diff-check are green. Minimal retains its two existing
+CLI dead-code warnings.
+
+**Next Phase-3 slice:** integrate exact live source-aware admission with the original
+Actor/Turn journal and context/queue gates, coordinating the concurrent journal owner
+before touching their paths. Keep non-native/Job/Process routes unavailable until
+their own containment and authority participation are complete. Independent host
+approval provisioning, incomplete-effect reconciliation, multi-source policy, history-only
+baseline, custom ACL/task, candidate/retention reconciliation, quiescent binding
+mutation, Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

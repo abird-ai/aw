@@ -1,12 +1,24 @@
 //! Concrete Git-to-native realization. The original live host decision is
 //! supplied by the authority owner; a stored SandboxGrant is never a grant
 //! to probe or mount arbitrary Git materialization locators.
-use crate::source_filesystem::{ApprovedSourceDirectory, NativeSourceAdmission};
-use aw_agent_core::{Error, Result, SourceAccess, SourceDriverHandle, ToolContext};
+use crate::{
+    source_approval::{NativeSourceApproval, NativeSourceApprovalGuard},
+    source_filesystem::{
+        ApprovedSourceDirectory, NativeFilesystemDriver, NativeSourceAdmission,
+        SourceFilesystemRoute,
+    },
+};
+use aw_agent_core::{
+    AgentBuilder, AgentExecutionBinding, Error, PrincipalId, Result, SandboxDriverHandle,
+    SandboxDriverRegistry, SourceAccess, SourceDriverHandle, ToolContext,
+};
 use aw_git::source_driver::GitSourceDriver;
-use aw_store::{SandboxEffectAuthority, SessionStore};
+use aw_store::{SandboxEffectAuthority, SandboxGrantStatus, SessionStore};
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
-use aw_tools_adapter::native_filesystem::{ExclusionSpec, GrantIdentity, PrivateArtifactRegistry};
+use aw_tools_adapter::{
+    native_filesystem::{ExclusionSpec, GrantIdentity, PrivateArtifactRegistry},
+    LocalToolOptions,
+};
 use std::sync::Arc;
 
 /// Reuse the driver actually registered in the Store. No additional
@@ -105,5 +117,138 @@ impl GitNativeSourceResolver {
             authority,
             directory,
         })
+    }
+}
+
+/// Explicit native-only host composition for one independently approved Git
+/// source. All runtime instances use the same live approval, not a copy of
+/// the durable grant. No automatic approval, activation or policy registry.
+#[derive(Clone)]
+pub struct GitNativeSourceHost {
+    approval: NativeSourceApproval,
+    resolver: Arc<GitNativeSourceResolver>,
+    registry: SandboxDriverRegistry,
+    native: SandboxDriverHandle<NativeFilesystemDriver>,
+}
+
+impl GitNativeSourceHost {
+    pub fn new(
+        approval: NativeSourceApproval,
+        git: SourceDriverHandle<GitSourceDriver>,
+        registry: SandboxDriverRegistry,
+        native: SandboxDriverHandle<NativeFilesystemDriver>,
+    ) -> Result<Self> {
+        registry.reader()?.get(&native)?;
+        let resolver = GitNativeSourceResolver::new(approval.store().clone(), git.clone())?;
+        {
+            let guard = approval.read()?;
+            let physical = guard.physical();
+            approval
+                .store()
+                .source_driver(&git)?
+                .verify_materialization(
+                    &guard.source().binding,
+                    &physical.path,
+                    (physical.volume, physical.object),
+                )?;
+        }
+        Ok(Self {
+            approval,
+            resolver: Arc::new(resolver),
+            registry,
+            native,
+        })
+    }
+
+    /// Independent host approval and durable grant issuance are explicit
+    /// operations, separate from the Actor's eventual activation.
+    pub fn publish_grant(
+        &self,
+        manager: &PrincipalId,
+        expected_revision: u64,
+    ) -> Result<SandboxGrantStatus> {
+        self.approval.publish_grant(manager, expected_revision)
+    }
+
+    pub async fn revoke(&self) -> bool {
+        self.approval.revoke().await
+    }
+
+    pub fn preflight(
+        &self,
+        store: &SessionStore,
+        actor: &PrincipalId,
+        agent: &AgentExecutionBinding,
+        tools: &LocalToolOptions,
+    ) -> Result<()> {
+        let observed = self.approval.preflight(store, actor, agent)?;
+        let [source] = observed.sources.as_slice() else {
+            return Err(Error::Denied(
+                "Git native host requires one approved source",
+            ));
+        };
+        if tools.selected_tools.is_empty()
+            || tools.selected_tools.iter().any(|name| {
+                FsTool::from_name(name).is_none_or(|tool| {
+                    tool == FsTool::Remove
+                        || (tool.action() != Action::Read
+                            && source.access != SourceAccess::ReadWrite)
+                })
+            })
+        {
+            return Err(Error::Denied(
+                "Git native host tool selection exceeds source approval",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn resolve(
+        &self,
+        ctx: &ToolContext,
+        tool: FsTool,
+    ) -> Result<NativeSourceAdmission<NativeSourceApprovalGuard>> {
+        let guard = self.approval.read()?;
+        if ctx.execution_owner.as_ref() != Some(guard.agent()) {
+            return Err(Error::Denied(
+                "Git native approval belongs to another Agent binding",
+            ));
+        }
+        let physical = guard.physical().clone();
+        let private = guard.private_artifacts();
+        self.resolver.resolve(ctx, tool, guard, physical, private)
+    }
+
+    /// Construct the actual root-free tool route on the original builder.
+    /// Does not open source-bearing Store/Turn admission.
+    pub fn configure(
+        &self,
+        store: &SessionStore,
+        actor: PrincipalId,
+        agent: AgentExecutionBinding,
+        builder: AgentBuilder,
+        options: &LocalToolOptions,
+    ) -> Result<AgentBuilder> {
+        self.preflight(store, &actor, &agent, options)?;
+        if options.operation_router.is_installed()? {
+            return Err(Error::Denied(
+                "Git native host cannot replace another operation router",
+            ));
+        }
+        // A fresh slot belongs to this exact builder, not to the reusable
+        // options or a failed/retried activation.
+        let mut options = options.clone();
+        options.operation_router = Arc::new(Default::default());
+        let host = self.clone();
+        let route = Arc::new(SourceFilesystemRoute::new(
+            store.clone(),
+            agent,
+            self.registry.clone(),
+            self.native.clone(),
+            builder.tool_binding_authority(),
+            options.limits,
+            move |ctx, tool| host.resolve(ctx, tool),
+        )?);
+        route.configure(builder, actor, &options)
     }
 }

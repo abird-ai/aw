@@ -577,6 +577,8 @@ pub struct HostAgentActivation {
     options: AgentOptions,
     tools: aw_tools_adapter::LocalToolOptions,
     router: Arc<agent_jobs::Router>,
+    #[cfg(feature = "workspace")]
+    source_host: Option<aw_host::source_git::GitNativeSourceHost>,
 }
 
 impl HostAgentActivation {
@@ -602,7 +604,20 @@ impl HostAgentActivation {
             options,
             tools,
             router,
+            #[cfg(feature = "workspace")]
+            source_host: None,
         })
+    }
+
+    /// Explicit host-approved native source route for this Agent only.
+    /// No persisted grant is promoted into live physical authority.
+    #[cfg(feature = "workspace")]
+    pub fn with_git_native_source_host(
+        mut self,
+        host: aw_host::source_git::GitNativeSourceHost,
+    ) -> Self {
+        self.source_host = Some(host);
+        self
     }
 
     fn binding_for(&self, canonical_ref: &str) -> Result<aw_store_api::AgentBindingInfo> {
@@ -626,19 +641,11 @@ impl HostAgentActivation {
         )
     }
 
-    /// Returns Some only when this call installed the live runtime. Exact
-    /// create replay returns None when the canonical Agent is already live.
-    pub fn activate(&self, canonical_ref: &str) -> Result<Option<ActivatedHostAgent>> {
-        let binding = self.binding_for(canonical_ref)?;
-        if self.router.has_live_owner(canonical_ref)? {
-            return Ok(None);
-        }
-        let session = self.store.session(&self.actor, &binding.session_id)?;
-
-        let mut options = self.options.clone();
-        options.system_prompt = session.binding.system_prompt.clone();
-        let mut tools = self.tools.clone();
-        tools.root = session.binding.tool_root.clone();
+    fn configure_legacy(
+        &self,
+        builder: aw_agent_core::AgentBuilder,
+        mut tools: aw_tools_adapter::LocalToolOptions,
+    ) -> Result<aw_tools_adapter::ConfiguredLocalTools> {
         tools.agent_jobs.replace(self.router.clone())?;
         let event_slot = Arc::new(aw_tools_adapter::events::EventRouterSlot::default());
         event_slot.replace(self.router.clone())?;
@@ -666,21 +673,66 @@ impl HostAgentActivation {
             }
         }
 
-        let builder = Agent::builder_from_selection(self.selection.clone(), options);
-        let configured =
-            aw_tools_adapter::configure_with_runtime(builder, self.actor.clone(), &tools)?;
-        let job_runtime = configured.job_runtime;
-        let mut agent = configured.builder.build()?;
-        let (view, journal) =
-            self.store
-                .activate(&self.actor, &binding.session_id, &binding.branch_id)?;
-        agent.load_history(view.history, Some(Arc::new(journal)))?;
-        agent.bind_execution_owner(AgentExecutionBinding::from_trusted_host(
+        aw_tools_adapter::configure_with_runtime(builder, self.actor.clone(), &tools)
+    }
+
+    /// Returns Some only when this call installed the live runtime. Exact
+    /// create replay returns None when the canonical Agent is already live.
+    pub fn activate(&self, canonical_ref: &str) -> Result<Option<ActivatedHostAgent>> {
+        let binding = self.binding_for(canonical_ref)?;
+        if self.router.has_live_owner(canonical_ref)? {
+            return Ok(None);
+        }
+        let execution = AgentExecutionBinding::from_trusted_host(
             canonical_ref.to_owned(),
             binding.session_id.clone(),
             binding.branch_id.clone(),
-        )?)?;
-        agent.permit_host_capability(self.actor.clone(), "jobs_subscribe", &ToolEffect::Control)?;
+        )?;
+        #[cfg(feature = "workspace")]
+        if let Some(host) = &self.source_host {
+            host.preflight(&self.store, &self.actor, &execution, &self.tools)?;
+        }
+        // Store activation is read-only but authority-bearing. In particular,
+        // a held source-bearing Agent must not open/reconcile an ambient tool
+        // root before the original execution gate has admitted it.
+        let (view, journal) =
+            self.store
+                .activate(&self.actor, &binding.session_id, &binding.branch_id)?;
+        let mut options = self.options.clone();
+        options.system_prompt = view.session.binding.system_prompt.clone();
+        let mut tools = self.tools.clone();
+        tools.root = view.session.binding.tool_root.clone();
+        let builder = Agent::builder_from_selection(self.selection.clone(), options);
+        #[cfg(feature = "workspace")]
+        let (configured, native_source) = match &self.source_host {
+            Some(host) => (
+                aw_tools_adapter::ConfiguredLocalTools {
+                    builder: host.configure(
+                        &self.store,
+                        self.actor.clone(),
+                        execution.clone(),
+                        builder,
+                        &tools,
+                    )?,
+                    job_runtime: None,
+                },
+                true,
+            ),
+            None => (self.configure_legacy(builder, tools)?, false),
+        };
+        #[cfg(not(feature = "workspace"))]
+        let (configured, native_source) = (self.configure_legacy(builder, tools)?, false);
+        let job_runtime = configured.job_runtime;
+        let mut agent = configured.builder.build()?;
+        agent.load_history(view.history, Some(Arc::new(journal)))?;
+        agent.bind_execution_owner(execution)?;
+        if !native_source {
+            agent.permit_host_capability(
+                self.actor.clone(),
+                "jobs_subscribe",
+                &ToolEffect::Control,
+            )?;
+        }
 
         let owner = actor_owner::Service::attach_for_agent(
             self.store.clone(),

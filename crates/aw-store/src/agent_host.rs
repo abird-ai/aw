@@ -667,6 +667,26 @@ impl SessionStore {
         snapshot_in(&connection, actor, canonical_ref)
     }
 
+    /// Exact structural binding for trusted host composition, not an
+    /// execution grant. Resolve through the original Agent owner.
+    pub fn agent_execution_binding(
+        &self,
+        actor: &PrincipalId,
+        canonical_ref: &str,
+    ) -> Result<aw_agent_core::AgentExecutionBinding> {
+        let connection = self.connection()?;
+        let (session, branch) = agent_owner::key_for_ref(&connection, canonical_ref)?;
+        let key = agent_owner::AgentKey::new(&session, &branch);
+        agent_owner::authorize_permission(&connection, actor, key, AgentPermission::View)?;
+        let reference = agent_owner::canonical_ref(&connection, key)?;
+        if reference != canonical_ref {
+            return Err(Error::Denied(
+                "host binding requires an exact canonical Agent",
+            ));
+        }
+        aw_agent_core::AgentExecutionBinding::from_trusted_host(reference, session, branch)
+    }
+
     /// Bounded project-scoped Agent enumeration. after is the canonical ref
     /// returned by the previous page; rows are ordered by immutable creation key.
     pub fn agent_list(

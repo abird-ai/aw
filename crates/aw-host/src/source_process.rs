@@ -819,17 +819,18 @@ mod tests {
 
     #[tokio::test]
     async fn native_source_route_uses_pinned_capability_and_original_receipt() {
+        use crate::source_approval::{NativeSourceApproval, NativeSourceApprovalSpec};
         #[cfg(not(feature = "git-source-effects"))]
         use crate::source_filesystem::{ApprovedSourceDirectory, NativeSourceAdmission};
         use crate::source_filesystem::{NativeFilesystemDriver, SourceFilesystemRoute};
         #[cfg(feature = "git-source-effects")]
-        use crate::source_git::GitNativeSourceResolver;
+        use crate::source_git::GitNativeSourceHost;
         use aw_agent_core::{
             AgentExecutionBinding, Extension, HookContext, HookEvent, InvocationScope, ToolContext,
         };
         use aw_tools::{filesystem::schema::Tool as FsTool, OperationId};
         use aw_tools_adapter::{
-            native_filesystem::{CapabilitySet, GrantSpec, PrivateArtifactRegistry},
+            native_filesystem::{GrantSpec, PrivateArtifactRegistry},
             operation_router::OperationRouter,
         };
         let nonce = std::time::SystemTime::now()
@@ -936,13 +937,13 @@ mod tests {
         let (session, branch) = store
             .create(&actor, "native source", layout.clone())
             .unwrap();
-        let (reference, project, user): (String, String, String) = {
+        let (reference, project): (String, String) = {
             let c = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             c.query_row(
                 "SELECT '/d:'||domain_handle||'/i:'||identity_handle||'/p:'||project_handle||'/a:'||agent_handle,
-                        '/d:'||domain_handle||'/i:'||identity_handle||'/p:'||project_handle,owner_handle
+                        '/d:'||domain_handle||'/i:'||identity_handle||'/p:'||project_handle
                  FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
-                params![session.id,branch.id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                params![session.id,branch.id], |row| Ok((row.get(0)?,row.get(1)?)),
             ).unwrap()
         };
         let sandbox = store
@@ -1038,83 +1039,28 @@ mod tests {
             c.execute("UPDATE agent_state_current SET sandbox_id=?1,admission='held' WHERE session_id=?2 AND branch_id=?3",
                 params![sandbox.canonical_ref, session.id, branch.id]).unwrap();
         }
-        let version = VersionedSourceBinding {
-            binding: binding.clone(),
-            binding_rev: 1,
-        };
-        let policy = SandboxGrantPolicy {
-            agent_ref: reference.clone(),
-            sandbox_ref: sandbox.canonical_ref.clone(),
-            actor: actor.clone(),
-            actor_user_id: user,
-            evidence: SandboxPolicyEvidence {
+        let approval = NativeSourceApproval::pin(
+            store.clone(),
+            NativeSourceApprovalSpec {
+                agent_ref: reference.clone(),
+                actor: actor.clone(),
                 policy_ref: "host:fixture-native".into(),
-                policy_digest: [5; 32],
                 authority_ref: "host:fixture-native-authority".into(),
                 authority_generation: 1,
+                source: VersionedSourceBinding {
+                    binding: binding.clone(),
+                    binding_rev: 1,
+                },
+                directory: GrantSpec::read_write(&root),
             },
-            sources: vec![SandboxSourceGrant::from_binding(
-                &version,
-                SourceAccess::ReadWrite,
-            )],
-        };
-        store
-            .sandbox_grant_set(&actor, &reference, 0, Some(&policy))
-            .unwrap();
+            PrivateArtifactRegistry::memory(),
+        )
+        .unwrap();
         let set = SourceMutationSet::from_bindings(&[binding]).unwrap();
-        let approved = CapabilitySet::open(&root, [GrantSpec::read_write(&root)]).unwrap();
-        let pin = approved.identities().unwrap().pop().unwrap();
-        let private = PrivateArtifactRegistry::memory();
-        let host_lock = Arc::new(RwLock::new(()));
-        let tools = vec![NamedSourceAccess {
-            name: version.binding.name.clone(),
-            access: SourceAccess::ReadWrite,
-        }];
-        #[cfg(feature = "git-source-effects")]
-        let git_resolver = GitNativeSourceResolver::new(store.clone(), git_handle).unwrap();
-        let resolve = {
-            let host_lock = host_lock.clone();
-            move |ctx: &ToolContext, tool: FsTool| {
-                let authority = HostGuard {
-                    _guard: host_lock.clone().try_read_owned().unwrap(),
-                    policy: policy.clone(),
-                    tools: tools.clone(),
-                };
-                #[cfg(feature = "git-source-effects")]
-                {
-                    git_resolver.resolve(ctx, tool, authority, pin.clone(), private.clone())
-                }
-                #[cfg(not(feature = "git-source-effects"))]
-                {
-                    let _ = ctx;
-                    Ok(NativeSourceAdmission {
-                        authority,
-                        directory: ApprovedSourceDirectory::pin(
-                            version.clone(),
-                            pin.clone(),
-                            if tool.action() == aw_tools::filesystem::access::Action::Read {
-                                SourceAccess::ReadOnly
-                            } else {
-                                SourceAccess::ReadWrite
-                            },
-                            private.clone(),
-                            std::iter::empty(),
-                        )?,
-                    })
-                }
-            }
-        };
-        // Explicitly no ambient root or private-artifact reconciliation:
-        // the root-free registration works before any source is realized.
-        let ambient = temp.0.join("unapproved-root");
-        let mut options = LocalToolOptions::new(&ambient, ToolMode::Workspace);
-        options.selected_tools = vec!["read".into(), "write".into()];
-        let builder = Agent::builder(
-            Arc::new(NoInference),
-            AgentOptions::new("fixture", "fixture"),
-        );
         let agent_binding =
             AgentExecutionBinding::from_trusted_host(&reference, &session.id, &branch.id).unwrap();
+        // Physical approval and Agent access alone cannot mint a Store grant.
+        assert!(approval.preflight(&store, &actor, &agent_binding).is_err());
         let drivers = SandboxDriverRegistry::new();
         let handle = drivers
             .register(
@@ -1122,6 +1068,101 @@ mod tests {
                 NativeFilesystemDriver,
             )
             .unwrap();
+        #[cfg(feature = "git-source-effects")]
+        let host = GitNativeSourceHost::new(
+            approval.clone(),
+            git_handle,
+            drivers.clone(),
+            handle.clone(),
+        )
+        .unwrap();
+        #[cfg(feature = "git-source-effects")]
+        assert_eq!(host.publish_grant(&actor, 0).unwrap().revision, 1);
+        #[cfg(not(feature = "git-source-effects"))]
+        assert_eq!(approval.publish_grant(&actor, 0).unwrap().revision, 1);
+        assert_eq!(
+            approval
+                .preflight(&store, &actor, &agent_binding)
+                .unwrap()
+                .sources[0]
+                .access,
+            SourceAccess::ReadWrite
+        );
+        assert!(approval
+            .preflight(&SessionStore::in_memory().unwrap(), &actor, &agent_binding)
+            .is_err());
+        let wrong =
+            AgentExecutionBinding::from_trusted_host(&reference, "other-session", &branch.id)
+                .unwrap();
+        assert!(approval.preflight(&store, &actor, &wrong).is_err());
+
+        // No ambient root or private-artifact reconciliation during
+        // registration, even when the policy has already been approved.
+        let ambient = temp.0.join("unapproved-root");
+        let mut options = LocalToolOptions::new(&ambient, ToolMode::Workspace);
+        options.selected_tools = vec!["read".into(), "write".into()];
+        let builder = Agent::builder(
+            Arc::new(NoInference),
+            AgentOptions::new("fixture", "fixture"),
+        );
+        #[cfg(feature = "git-source-effects")]
+        {
+            // The concrete host activation composition uses the same
+            // original tool registry and the same native-only builder.
+            let mut explicit = options.clone();
+            explicit.operation_router = Arc::new(Default::default());
+            let configured = host
+                .configure(
+                    &store,
+                    actor.clone(),
+                    agent_binding.clone(),
+                    Agent::builder(
+                        Arc::new(NoInference),
+                        AgentOptions::new("fixture", "fixture"),
+                    ),
+                    &explicit,
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(configured.registered_tool_names(), ["read", "write"]);
+            assert!(!explicit.operation_router.is_installed().unwrap());
+            assert!(configured
+                .registered_extension_names()
+                .iter()
+                .any(|name| name == "host-source-filesystem"));
+            explicit.selected_tools.push("bash".into());
+            assert!(host
+                .preflight(&store, &actor, &agent_binding, &explicit)
+                .is_err());
+        }
+        #[cfg(feature = "git-source-effects")]
+        let resolve = {
+            let host = host.clone();
+            move |ctx: &ToolContext, tool: FsTool| host.resolve(ctx, tool)
+        };
+        #[cfg(not(feature = "git-source-effects"))]
+        let resolve = {
+            let approval = approval.clone();
+            move |_: &ToolContext, tool: FsTool| {
+                let authority = approval.read()?;
+                let directory = ApprovedSourceDirectory::pin(
+                    authority.source().clone(),
+                    authority.physical().clone(),
+                    if tool.action() == aw_tools::filesystem::access::Action::Read {
+                        SourceAccess::ReadOnly
+                    } else {
+                        SourceAccess::ReadWrite
+                    },
+                    authority.private_artifacts(),
+                    std::iter::empty(),
+                )?;
+                Ok(NativeSourceAdmission {
+                    authority,
+                    directory,
+                })
+            }
+        };
         let route = Arc::new(
             SourceFilesystemRoute::new(
                 store.clone(),
@@ -1193,7 +1234,7 @@ mod tests {
                 ),
                 _ => unreachable!(),
             }
-            assert!(host_lock.try_write().is_ok());
+            assert!(approval.read().is_ok());
             assert!(store
                 .acquire_source_mutation_barrier(&set, "host:before-receipt")
                 .is_err());
@@ -1256,6 +1297,36 @@ mod tests {
             .acquire_source_mutation_barrier(&set, "host:missed-hook")
             .is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
+
+        // Host withdrawal cannot drop the live pin while an admitted worker
+        // retains the original guard. Persisted grant evidence does not
+        // become an independent approval after withdrawal.
+        {
+            let live = approval.read().unwrap();
+            let revoke = approval.revoke();
+            tokio::pin!(revoke);
+            tokio::select! {
+                biased;
+                _ = &mut revoke => panic!("withdrawal released a live authority guard"),
+                _ = std::future::ready(()) => {},
+            }
+            assert!(approval.read().is_err());
+            drop(live);
+            assert!(revoke.await);
+        }
+        assert!(approval.read().is_err());
+        assert!(approval.publish_grant(&actor, 1).is_err());
+        assert!(
+            store
+                .sandbox_grant_status(&actor, &reference)
+                .unwrap()
+                .active
+        );
+        assert!(approval.preflight(&store, &actor, &agent_binding).is_err());
+        #[cfg(feature = "git-source-effects")]
+        assert!(host
+            .preflight(&store, &actor, &agent_binding, &options)
+            .is_err());
         journal
             .append(
                 1,
@@ -1286,6 +1357,9 @@ mod tests {
         drop(agent);
         drop(options);
         drop(route);
+        #[cfg(feature = "git-source-effects")]
+        drop(host);
+        drop(approval);
         drop(journal);
         drop(store);
         let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
