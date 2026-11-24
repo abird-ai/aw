@@ -290,6 +290,33 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
         RecoveryInspection::Unknown
     ));
     assert_eq!(f.run(&["rev-parse", wrong_ref]).stdout, head);
+    assert!(driver.release_prepared_capture(&collision).is_err());
+    assert_eq!(f.run(&["rev-parse", wrong_ref]).stdout, head);
+    driver.release_prepared_capture(&stale).unwrap();
+
+    // Unpublished dirty capture retirement reuses the exact original
+    // descriptor. A leftover scratch directory is not proof of ownership.
+    f.write("a.txt", b"abandoned dirty capture\n");
+    let abandoned = driver
+        .plan_capture(&binding, "cp_abandoned", "op_abandoned")
+        .unwrap();
+    let retained = driver.execute_capture(&abandoned).unwrap();
+    let scratch = f.root.join(".git").join(format!(
+        "aw-capture-{}",
+        abandoned.descriptor.prepared_identity
+    ));
+    std::fs::create_dir(&scratch).unwrap();
+    assert!(driver.release_prepared_capture(&abandoned).is_err());
+    driver.verify_anchor(&f.root, &retained).unwrap();
+    std::fs::remove_dir(&scratch).unwrap();
+    driver.release_prepared_capture(&abandoned).unwrap();
+    driver.release_prepared_capture(&abandoned).unwrap();
+    assert!(driver.verify_anchor(&f.root, &retained).is_err());
+    assert_eq!(
+        std::fs::read(f.root.join("a.txt")).unwrap(),
+        b"abandoned dirty capture\n"
+    );
+    f.run(&["restore", "a.txt"]);
 
     // Retirement owns an exact conditional release, never a broad ref
     // deletion. A changed or symbolic ref must remain untouched.
@@ -907,6 +934,22 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
     ));
     assert!(restarted.execute_restore(&partial).is_err());
     assert_eq!(std::fs::read_dir(&partial_path).unwrap().count(), 1);
+    std::fs::write(partial_path.join("foreign"), b"keep").unwrap();
+    assert!(restarted.release_prepared_restore(&partial).is_err());
+    assert_eq!(
+        std::fs::read(partial_path.join("foreign")).unwrap(),
+        b"keep"
+    );
+    std::fs::remove_file(partial_path.join("foreign")).unwrap();
+
+    let abandoned_path = destinations.join("abandoned");
+    let abandoned = driver
+        .plan_restore(&f.root, &dirty, &abandoned_path, "op_abandoned_restore")
+        .unwrap();
+    driver.execute_restore(&abandoned).unwrap();
+    restarted.release_prepared_restore(&abandoned).unwrap();
+    restarted.release_prepared_restore(&abandoned).unwrap();
+    assert!(!abandoned_path.exists());
 
     // Existing destination, or a substituted private parent, is not reusable.
     assert!(driver
@@ -1006,6 +1049,11 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         .unwrap();
     assert!(!clean_path.exists() && !dirty_path.exists());
     assert!(link_source.is_dir() && partial_path.is_dir());
+    restarted.release_prepared_restore(&partial).unwrap();
+    restarted.release_prepared_restore(&partial).unwrap();
+    assert!(!partial_path.exists());
+    assert!(restarted.release_prepared_restore(&link_plan).is_err());
+    assert!(link_source.is_dir());
     let remaining = f.run(&["worktree", "list", "--porcelain", "-z"]).stdout;
     for path in [&clean_path, &dirty_path] {
         assert!(!remaining

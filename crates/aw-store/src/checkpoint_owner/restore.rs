@@ -19,7 +19,7 @@ use aw_agent_core::{
     SourceCoverage, SourceDriverRegistryReader, SourceOperationKind, SourcePublicationFence,
     SourcePublicationProof, SourceSet, SourceSetLimit,
 };
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -313,29 +313,18 @@ fn require_candidate_absent(
     connection: &Connection,
     candidate: &ConstructionCandidate,
 ) -> Result<()> {
-    let ConstructionCandidate::Agent {
-        session,
-        root,
-        branch,
-        sandbox: Some(sandbox),
-    } = candidate
-    else {
+    if !matches!(
+        candidate,
+        ConstructionCandidate::Agent {
+            sandbox: Some(_),
+            ..
+        }
+    ) {
         return Err(Error::Storage(
             "restore candidate is not a fresh Agent and Sandbox",
         ));
-    };
-    let exists: bool = db(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)
-             OR EXISTS(SELECT 1 FROM nodes WHERE id=?2)
-             OR EXISTS(SELECT 1 FROM branches WHERE id=?3)
-             OR EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?4)",
-        params![session, root, branch, sandbox],
-        |row| row.get(0),
-    ))?;
-    if exists {
-        return Err(Error::Conflict("restore candidate already exists"));
     }
-    Ok(())
+    candidate.require_absent_in(connection)
 }
 
 /// Live Prepared restore. This is recovery custody, not permission to
@@ -468,6 +457,26 @@ impl<'a> PreparedCheckpointRestore<'a> {
         }
         db(tx.commit())?;
         Ok(registry)
+    }
+
+    /// Abandon this original unpublished candidate under its live custody.
+    /// The trusted reconciler must prove every original materialization
+    /// released or absent, preserving other live resources and returning
+    /// any independent external guard needed through Store settlement.
+    pub fn abandon<F>(
+        self,
+        reconcile: impl FnOnce(&SourceDriverRegistryReader, &SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        construction_receipt::reconcile_unpublished_sources(
+            self.store,
+            &self.actor,
+            &self.receipt,
+            &self.barrier,
+            || {
+                let registry = self.inspection_registry()?;
+                reconcile(&registry, &self.anchors, self.sources())
+            },
+        )
     }
 
     /// Inspect the original private materializations. No execution or
@@ -1053,13 +1062,39 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
     ) -> Result<InspectedCheckpointRestore<'_>> {
+        self.recover_checkpoint_restore(actor, request_id)?
+            .ok_or(Error::Conflict(
+                "checkpoint restore candidate already reconciled",
+            ))?
+            .inspect(inspect)
+    }
+
+    /// Reconcile the original abandoned restore after a crash. Never steal
+    /// active custody, plan a new candidate or inspect on terminal replay.
+    pub fn checkpoint_abandon_restore<F>(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        reconcile: impl FnOnce(&SourceDriverRegistryReader, &SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        match self.recover_checkpoint_restore(actor, request_id)? {
+            Some(restore) => restore.abandon(reconcile),
+            None => Ok(()),
+        }
+    }
+
+    fn recover_checkpoint_restore(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+    ) -> Result<Option<PreparedCheckpointRestore<'_>>> {
         label(request_id, 256)?;
         if self.inner.mode != crate::StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "checkpoint restore recovery requires the exclusive Store owner",
             ));
         }
-        let restore = {
+        {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let creator = user_for_principal(&tx, actor)?
@@ -1071,21 +1106,23 @@ impl SessionStore {
                 request_id,
             )?
             .ok_or(Error::Denied("checkpoint restore receipt unavailable"))?;
+            if construction_receipt::is_reconciled_in(&tx, &receipt)? {
+                return Ok(None);
+            }
             let registry = self.inner.source_drivers.reader()?;
             let anchors = inspection_sources_in(&tx, actor, &receipt, &registry)?;
             let set = SourceMutationSet::from_anchors(&anchors.anchors)?;
             let barrier =
                 self.recover_source_mutation_barrier_in(&tx, &set, receipt.candidate.prepare_id())?;
             db(tx.commit())?;
-            PreparedCheckpointRestore {
+            Ok(Some(PreparedCheckpointRestore {
                 store: self,
                 actor: actor.clone(),
                 receipt,
                 anchors,
                 barrier,
-            }
-        };
-        restore.inspect(inspect)
+            }))
+        }
     }
 }
 
@@ -1100,6 +1137,7 @@ mod tests {
         SourceAnchor, SourceDriverRegistry, SourceDriverSchemas, SourceName, Turn, TurnJournal,
         TurnStart,
     };
+    use rusqlite::params;
     use std::path::PathBuf;
 
     struct PrivateTemp(PathBuf);
@@ -1574,6 +1612,62 @@ mod tests {
             )
             .is_err());
 
+        // Abandon an actual private candidate without touching the source
+        // checkpoint or publishing either candidate identity.
+        let abandoned = store
+            .checkpoint_prepare_restore(&actor, &request, &layout, "host:abandon-restore", plan)
+            .unwrap();
+        let abandoned_id = abandoned.prepare_id().to_owned();
+        let abandoned_sandbox = abandoned.sandbox_ref().to_owned();
+        let abandoned_sources = abandoned.sources().clone();
+        assert!(store
+            .checkpoint_abandon_restore::<()>(&actor, "host:abandon-restore", |_, _, _| panic!(
+                "live candidate cannot be stolen"
+            ))
+            .is_err());
+        abandoned
+            .abandon(|_, selected, sources| {
+                assert_eq!(selected, &anchors);
+                assert_eq!(sources, &abandoned_sources);
+                assert!(store
+                    .acquire_source_mutation_barrier(
+                        &SourceMutationSet::from_anchors(&selected.anchors)?,
+                        "during-abandon",
+                    )
+                    .is_err());
+                // Trusted fixture reports that no materialization was started.
+                Ok(())
+            })
+            .unwrap();
+        store
+            .checkpoint_abandon_restore::<()>(&actor, "host:abandon-restore", |_, _, _| {
+                panic!("rejected receipt must not reinspect")
+            })
+            .unwrap();
+        assert!(store
+            .checkpoint_prepare_restore(
+                &actor,
+                &request,
+                &layout,
+                "host:abandon-restore",
+                |_, _, _| panic!("rejected receipt must not replan"),
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_replay_restore(&actor, &request, "host:abandon-restore")
+            .is_err());
+        assert!(store.sandbox_get(&actor, &abandoned_sandbox).is_err());
+        {
+            let connection = store.connection().unwrap();
+            assert!(!connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                    [&abandoned_id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+
         let prepared = store
             .checkpoint_prepare_restore(
                 &actor,
@@ -1896,6 +1990,11 @@ mod tests {
             )
             .is_err());
         }
+        assert!(store
+            .checkpoint_abandon_restore::<()>(&actor, "host:restore", |_, _, _| panic!(
+                "Applied restore cannot be abandoned"
+            ))
+            .is_err());
         store.checkpoint_delete(&actor, &checkpoint).unwrap();
         assert!(store
             .checkpoint_prepare_restore(

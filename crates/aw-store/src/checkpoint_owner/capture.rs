@@ -1053,7 +1053,7 @@ mod tests {
             })
             .is_err());
         drop(store);
-        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
 
         let inspect = |registry: &SourceDriverRegistryReader,
                        observed: &[VersionedSourceBinding],
@@ -1411,5 +1411,106 @@ mod tests {
             .unwrap()
             .settle(crate::SourceMutationOutcome::Settled)
             .unwrap();
+
+        assert!(store
+            .checkpoint_abandon_capture::<()>(&actor, "host:recover", |_, _, _| panic!(
+                "Applied checkpoint must remain retained"
+            ))
+            .is_err());
+        let abandoned = store
+            .checkpoint_prepare_capture(
+                &actor,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:abandon",
+                plan_fixture,
+            )
+            .unwrap();
+        let abandoned_id = abandoned.checkpoint_id().to_owned();
+        let abandoned_sources = abandoned.sources().clone();
+        let paths: Vec<_> = abandoned_sources
+            .sources
+            .iter()
+            .map(|source| {
+                temp.0
+                    .join(format!("abandoned-{abandoned_id}-{}", source.name.as_str()))
+            })
+            .collect();
+        for path in &paths {
+            std::fs::write(path, b"private candidate").unwrap();
+        }
+        assert!(abandoned
+            .abandon::<()>(|_, _, sources| {
+                assert_eq!(sources, &abandoned_sources);
+                assert!(store
+                    .acquire_source_mutation_barrier(&set, "while-abandoning")
+                    .is_err());
+                std::fs::remove_file(&paths[0])?;
+                Err(Error::Conflict("fixture interruption during cleanup"))
+            })
+            .is_err());
+        assert!(!paths[0].exists() && paths[1].is_file());
+        assert!(store
+            .checkpoint_get_metadata(&actor, &abandoned_id)
+            .is_err());
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "still-abandoned")
+            .is_err());
+        bind_fixture(&store, &original);
+        drop(store);
+        let missing = SessionStore::open(&temp.0).unwrap();
+        assert!(missing
+            .checkpoint_abandon_capture::<()>(&actor, "host:abandon", |_, _, _| panic!(
+                "missing driver must retain original custody"
+            ))
+            .is_err());
+        drop(missing);
+        let store =
+            SessionStore::open_with_sources(&temp.0, registry, SourceSetLimit::new(1).unwrap())
+                .unwrap();
+        store
+            .checkpoint_abandon_capture(&actor, "host:abandon", |_, _, sources| {
+                assert_eq!(sources, &abandoned_sources);
+                assert!(!paths[0].exists());
+                std::fs::remove_file(&paths[1])?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .checkpoint_abandon_capture::<()>(&actor, "host:abandon", |_, _, _| {
+                panic!("terminal cleanup must not repeat")
+            })
+            .unwrap();
+        assert!(store
+            .checkpoint_replay_capture(
+                &actor,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:abandon",
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_get_metadata(&actor, &abandoned_id)
+            .is_err());
+        assert!(store.checkpoint_get_metadata(&actor, &candidate).is_ok());
+        {
+            let connection = store.connection().unwrap();
+            let rejected = construction_receipt::lookup_in(
+                &connection,
+                receipt.operation,
+                &receipt.scope,
+                "host:abandon",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(rejected.state, PreparationState::Rejected);
+            assert_eq!(rejected.sources.as_ref(), Some(&abandoned_sources));
+            assert_eq!(connection.query_row(
+                "SELECT count(*) FROM local_coordination_leases WHERE run_id=?1 AND state='released'",
+                [&abandoned_id], |row| row.get::<_, usize>(0),
+            ).unwrap(), 2);
+        }
     }
 }

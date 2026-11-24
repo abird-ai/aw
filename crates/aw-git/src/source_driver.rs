@@ -621,6 +621,53 @@ fn retained_commit(repo: &Repository, reference: &str) -> Result<Option<String>>
     ))
 }
 
+/// Distinguish absent retention from an unreadable or broken ref.
+fn retained_for_release(repo: &Repository, reference: &str) -> Result<Option<String>> {
+    match repo.run(&["show-ref", "--exists", reference], None, false) {
+        Err(GitError::Exit(2)) => {
+            if retained_commit(repo, reference)?.is_some() {
+                return Err(Error::Conflict("Git retention lookup is inconsistent"));
+            }
+            Ok(None)
+        }
+        Ok(_) => retained_commit(repo, reference)?
+            .map(Some)
+            .ok_or(Error::Conflict("Git retention is present but unreadable")),
+        Err(error) => Err(git_error(error)),
+    }
+}
+
+fn release_exact_retention(repo: &Repository, anchor: &GitSourceAnchor) -> Result<()> {
+    let reference = anchor.retention_ref();
+    match retained_for_release(repo, &reference)? {
+        None => return Ok(()),
+        Some(current) if current == anchor.captured_commit => {}
+        Some(_) => return Err(Error::Conflict("retired Git retention reference changed")),
+    }
+    repo.validate_binding().map_err(git_error)?;
+    run(
+        repo,
+        &[
+            "-c",
+            "core.logAllRefUpdates=false",
+            "update-ref",
+            "--no-deref",
+            "-d",
+            &reference,
+            &anchor.captured_commit,
+        ],
+    )
+    .map_err(|_| Error::Conflict("Git retention release uncertain; inspect original anchor"))?;
+    if repository_stamps(repo)?.0 != anchor.source_ref
+        || retained_for_release(repo, &reference)?.is_some()
+    {
+        return Err(Error::Conflict(
+            "Git retention release could not be verified",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_retained(repo: &Repository, anchor: &GitSourceAnchor) -> Result<Option<String>> {
     anchor.validate()?;
     repo.guard_local_content().map_err(git_error)?;
@@ -989,6 +1036,24 @@ impl GitSourceDriver {
         verify_prepared_anchor(&repo, &plan, prepared, anchor)
     }
 
+    /// Reconcile an unpublished capture, under the original operation's
+    /// complete source fence and independent host cleanup authority. A
+    /// retained ref must match the original descriptor, never an inferred
+    /// current HEAD. Absent retention is a valid cleanup observation, not
+    /// proof that capture never ran. Leave uncertain scratch custody intact.
+    pub fn release_prepared_capture(&self, prepared: &PreparedSourceOperation) -> Result<()> {
+        let plan = CapturePlan::decode(prepared)?;
+        let repo = self.binding_repository(&plan.binding)?;
+        PrivateIndexes::require_absent(&repo, &prepared.descriptor.prepared_identity)?;
+        let reference = retention_ref(&plan.checkpoint_id, &plan.binding.name);
+        if let Some(captured) = retained_for_release(&repo, &reference)? {
+            let anchor = plan.anchor(captured);
+            verify_prepared_anchor(&repo, &plan, prepared, &anchor)?;
+            release_exact_retention(&repo, &anchor)?;
+        }
+        PrivateIndexes::require_absent(&repo, &prepared.descriptor.prepared_identity)
+    }
+
     /// Reconcile the private retention of an already-retired checkpoint.
     /// The trusted host independently authorizes this repository and holds
     /// the source/retention fence (including other live dependencies).
@@ -1006,48 +1071,7 @@ impl GitSourceDriver {
         if repository_stamps(&repo)?.0 != anchor.source_ref {
             return Err(Error::Conflict("retired Git anchor repository changed"));
         }
-        let reference = anchor.retention_ref();
-        let inspect = || -> Result<Option<String>> {
-            // Distinguish true absence from an unreadable or broken ref.
-            // Older Git without --exists fails closed.
-            match repo.run(&["show-ref", "--exists", &reference], None, false) {
-                Err(GitError::Exit(2)) => {
-                    if retained_commit(&repo, &reference)?.is_some() {
-                        return Err(Error::Conflict("Git retention lookup is inconsistent"));
-                    }
-                    Ok(None)
-                }
-                Ok(_) => retained_commit(&repo, &reference)?
-                    .map(Some)
-                    .ok_or(Error::Conflict("Git retention is present but unreadable")),
-                Err(error) => Err(git_error(error)),
-            }
-        };
-        match inspect()? {
-            None => return Ok(()),
-            Some(current) if current == anchor.captured_commit => {}
-            Some(_) => return Err(Error::Conflict("retired Git retention reference changed")),
-        }
-        repo.validate_binding().map_err(git_error)?;
-        run(
-            &repo,
-            &[
-                "-c",
-                "core.logAllRefUpdates=false",
-                "update-ref",
-                "--no-deref",
-                "-d",
-                &reference,
-                &anchor.captured_commit,
-            ],
-        )
-        .map_err(|_| Error::Conflict("Git retention release uncertain; inspect original anchor"))?;
-        if repository_stamps(&repo)?.0 != anchor.source_ref || inspect()?.is_some() {
-            return Err(Error::Conflict(
-                "Git retention release could not be verified",
-            ));
-        }
-        Ok(())
+        release_exact_retention(&repo, anchor)
     }
 
     /// Read-only retention validation independent of the current HEAD. A

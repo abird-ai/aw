@@ -451,6 +451,35 @@ fn inspect_binding(
     Ok(binding)
 }
 
+fn remove_verified_restore(
+    origin: &Repository,
+    child: &Repository,
+    plan: &RestorePlan,
+    prepared: &PreparedSourceOperation,
+) -> Result<()> {
+    let admin = child.git_dir.clone();
+    // Keep the original lock marker until Git removes the worktree.
+    // Git requires two force flags for a locked checkout (and a dirty
+    // captured tree). The exact tree/index/marker checks above and the
+    // independent live physical fence are prerequisites, not a generic
+    // discard switch. No recursive caller-side deletion or broad prune.
+    let args = [
+        "worktree",
+        "remove",
+        "--force",
+        "--force",
+        "--",
+        target_text(&plan.target)?,
+    ]
+    .map(OsString::from);
+    run_os(origin, &args, None, None).map_err(|_| {
+        Error::Conflict("Git restore retirement uncertain; inspect original materialization")
+    })?;
+    plan.check_parent()?;
+    absent(&admin)?;
+    require_released(origin, plan, prepared)
+}
+
 impl GitSourceDriver {
     /// Read-only restore planning. The trusted host chooses a private fresh
     /// destination and authorizes both source retention and materialization.
@@ -583,27 +612,46 @@ impl GitSourceDriver {
         let trees = plan.trees(&origin)?;
         verify_restored(&child, &trees.base, trees.captured())?;
         validate_restored_repo(&origin, &child, &plan, prepared)?;
-        let admin = child.git_dir.clone();
-        // Keep the original lock marker until Git removes the worktree.
-        // Git requires two force flags for a locked checkout (and a dirty
-        // captured tree). The exact tree/index/marker checks above and the
-        // independent live physical fence are prerequisites, not a generic
-        // discard switch. No recursive caller-side deletion or broad prune.
-        let args = [
-            "worktree",
-            "remove",
-            "--force",
-            "--force",
-            "--",
-            target_text(&plan.target)?,
-        ]
-        .map(OsString::from);
-        run_os(&origin, &args, None, None).map_err(|_| {
-            Error::Conflict("Git restore retirement uncertain; inspect original materialization")
-        })?;
-        plan.check_parent()?;
-        absent(&admin)?;
-        require_released(&origin, &plan, prepared)
+        remove_verified_restore(&origin, &child, &plan, prepared)
+    }
+
+    /// Reconcile only the original unpublished candidate, under separately
+    /// authorized repository/destination fences. Exact completed restores,
+    /// untouched registered --no-checkout candidates, and proven absence
+    /// can be settled. Partial/modified content stays Unknown.
+    pub fn release_prepared_restore(&self, prepared: &PreparedSourceOperation) -> Result<()> {
+        let plan = RestorePlan::decode(prepared)?;
+        let origin = plan.origin_repository(self)?;
+        match fs::symlink_metadata(&plan.target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return require_released(&origin, &plan, prepared)
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let child = restored_repo(&origin, &plan, prepared)?;
+        child.guard_managed_checkout().map_err(git_error)?;
+        PrivateIndexes::require_absent(&child, &prepared.descriptor.prepared_identity)?;
+        let untouched = match fs::symlink_metadata(child.git_dir.join("index")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut untouched = true;
+                for entry in fs::read_dir(child.root())? {
+                    if entry?.file_name() != ".git" {
+                        untouched = false;
+                        break;
+                    }
+                }
+                untouched
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => false,
+        };
+        if !untouched {
+            let trees = plan.trees(&origin)?;
+            verify_restored(&child, &trees.base, trees.captured())?;
+        }
+        validate_restored_repo(&origin, &child, &plan, prepared)?;
+        remove_verified_restore(&origin, &child, &plan, prepared)
     }
 
     /// Revalidate exact materialization under the live host barrier before

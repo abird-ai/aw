@@ -159,6 +159,30 @@ impl<'a> PreparedCheckpointCapture<'a> {
         Ok(registry)
     }
 
+    /// Abandon this original unpublished capture under its live custody.
+    /// The trusted reconciler proves release/absence of every original
+    /// retention effect, excluding live dependencies and keeping external
+    /// authority/fences through final settlement.
+    pub fn abandon<F>(
+        self,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &[VersionedSourceBinding],
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<()> {
+        construction_receipt::reconcile_unpublished_sources(
+            self.store,
+            &self.actor,
+            &self.receipt,
+            &self.barrier,
+            || {
+                let registry = self.inspection_registry()?;
+                reconcile(&registry, self.bindings(), self.sources())
+            },
+        )
+    }
+
     /// Read-only driver inspection, on the exact original descriptors. The
     /// trusted host must independently authorize the complete source set and
     /// dispatch each operation using the compatible registered driver. No
@@ -254,13 +278,43 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceAnchor>>>,
     ) -> Result<InspectedCheckpointCapture<'_>> {
+        self.recover_checkpoint_capture(actor, request_id)?
+            .ok_or(Error::Conflict(
+                "checkpoint capture candidate already reconciled",
+            ))?
+            .inspect(inspect)
+    }
+
+    /// Reconcile the original abandoned capture after a crash. Never
+    /// steal active custody or create a new candidate on replay.
+    pub fn checkpoint_abandon_capture<F>(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &[VersionedSourceBinding],
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<()> {
+        match self.recover_checkpoint_capture(actor, request_id)? {
+            Some(capture) => capture.abandon(reconcile),
+            None => Ok(()),
+        }
+    }
+
+    fn recover_checkpoint_capture(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+    ) -> Result<Option<PreparedCheckpointCapture<'_>>> {
         label(request_id, 256)?;
         if self.inner.mode != crate::StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "checkpoint recovery requires the exclusive Store owner",
             ));
         }
-        let capture = {
+        {
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let creator = user_for_principal(&tx, actor)?
@@ -272,6 +326,9 @@ impl SessionStore {
                 request_id,
             )?
             .ok_or(Error::Denied("checkpoint recovery receipt unavailable"))?;
+            if construction_receipt::is_reconciled_in(&tx, &receipt)? {
+                return Ok(None);
+            }
             let registry = self.inner.source_drivers.reader()?;
             require_inspection_authority_in(&tx, actor, &receipt, &registry)?;
             let checkpoint = receipt.candidate.prepare_id();
@@ -295,13 +352,12 @@ impl SessionStore {
                 .mutation_set()?;
             let barrier = self.recover_source_mutation_barrier_in(&tx, &set, checkpoint)?;
             db(tx.commit())?;
-            PreparedCheckpointCapture {
+            Ok(Some(PreparedCheckpointCapture {
                 store: self,
                 actor: actor.clone(),
                 receipt,
                 barrier,
-            }
-        };
-        capture.inspect(inspect)
+            }))
+        }
     }
 }

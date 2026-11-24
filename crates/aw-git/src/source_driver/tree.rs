@@ -602,8 +602,24 @@ pub(super) struct PrivateIndexes {
     identity: aw_platform::DirectoryIdentity,
 }
 impl PrivateIndexes {
+    fn path(repo: &Repository, prepared_identity: &str) -> PathBuf {
+        repo.git_dir.join(format!("aw-capture-{prepared_identity}"))
+    }
+
+    // An interrupted scratch directory has no independently retained
+    // physical identity. Never delete it merely from its derived name.
+    pub(super) fn require_absent(repo: &Repository, prepared_identity: &str) -> Result<()> {
+        match fs::symlink_metadata(Self::path(repo, prepared_identity)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+            Ok(_) => Err(Error::Conflict(
+                "original Git private indexes require reconciliation",
+            )),
+        }
+    }
+
     pub(super) fn create(repo: &Repository, prepared_identity: &str) -> Result<Self> {
-        let path = repo.git_dir.join(format!("aw-capture-{prepared_identity}"));
+        let path = Self::path(repo, prepared_identity);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;

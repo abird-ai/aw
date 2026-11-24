@@ -43,8 +43,8 @@ activation selection, quiescent metadata-only source binding mutation, checkpoin
 retirement/retained-anchor reconciliation, source-bearing Sandbox logical close and
 exact closed-Sandbox materialization reconciliation with proven retained-layout release,
 managed Git restore-materialization release with original Applied restore provenance,
-and metadata-only fresh baseline restore with explicit None/empty Auto coverage
-are implemented locally.
+metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
+unpublished capture/restore candidate reconciliation are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1975,13 +1975,50 @@ restore **4/4**, Sandbox **4/4**, receipt/barrier **1/1 each**, real Host source
 effects **2/2**; strict Store all-target Clippy, workspace all-target check, fmt and
 scoped diff-check green.
 
+Prepared checkpoint capture and restore can now explicitly abandon their original
+private candidates; checkpoint_abandon_capture/restore recover the exact original
+hazards for the original authenticated request after restart, never steal a live
+claim or replan. Reuse the initial indexed Prepared receipt/current immutable claim
+validation, candidate absence checks and complete-set source barrier. Current
+inspection disclosure and independent host cleanup authority are required before
+effects; callback success proves all original operation-owned retention/materializations
+released or absent, without affecting live backing dependencies. Returned external
+guard survives final commit. Revalidate exact original receipt, candidate absence
+(including checkpoint request publication) and barrier; one transaction appends
+Rejected and releases the claims. Failed/partial cleanup remains Unknown with the
+whole original recovery identity. Rejected replay does not reinspect or authorize
+new construction; Applied resources cannot be abandoned. Existing receipt owner,
+no new cleanup state/ledger. Recovery remains available under a lowered admission
+limit. Shared candidate absence primitive also serves ordinary restore preparation.
+
+GitSourceDriver::release_prepared_capture reuses exact descriptor/anchor verification,
+checked retention absence and expected-OID conditional ref deletion, shared with
+retired anchor cleanup. Never infer current HEAD or delete changed/symbolic refs.
+Interrupted scratch directories without proven physical custody remain fenced, not
+deleted by pathname. release_prepared_restore reuses original private parent,
+origin/worktree/operation marker and exact restored tree/index verification and
+the existing verified worktree removal/absence check. Exact completed candidates,
+untouched registered --no-checkout candidates (no index or foreign content), and
+verified absence can be reconciled. Modified or partially materialized content,
+uncertain scratch/registration and missing required verification fail closed.
+No broad prune, shared backing deletion, or automatic production cleanup worker.
+The trusted host must independently verify and authorize original physical
+ownership and preserve external fences. Only isolated Git/Store fixtures were
+removed in validation. Grouped regressions cover live claim exclusion, partial
+cleanup, missing-driver/restart/lowered-limit recovery, terminal replay, Applied
+refusal, exact dirty retention release, changed ref and uncertain scratch refusal,
+completed and untouched registered candidate release, foreign content refusal.
+Git repository **32/32**, checkpoint/capture/restore **4/4**, Sandbox **4/4**,
+construction receipt/barrier **1/1 each**; strict Git/Store all-target Clippy,
+workspace all-target check, fmt and scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, exact unpublished candidate cleanup/reconciliation or shared task/custom
-ACL constructor integration remain independent. Independent host approval provisioning,
-effectful fresh baseline materialization, incomplete-effect reconciliation, multi-source
-policy, production cleanup composition and physical authority, final-source removal/
-effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.
+While blocked, shared task/custom ACL constructor integration or independent
+effectful baseline custody remain available. Independent host approval provisioning,
+incomplete-effect reconciliation, multi-source policy, general unpublished partial/
+scratch cleanup and production cleanup composition/physical authority, final-source
+removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.
 Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.

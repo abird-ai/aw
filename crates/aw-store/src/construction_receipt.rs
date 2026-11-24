@@ -123,6 +123,40 @@ impl ConstructionCandidate {
         }
     }
 
+    /// Candidate identities are private until the resource transaction.
+    /// Never clean up a candidate that already became addressable.
+    pub(crate) fn require_absent_in(&self, connection: &Connection) -> Result<()> {
+        let exists: bool = match self {
+            Self::Agent {
+                session,
+                root,
+                branch,
+                sandbox,
+            } => db(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)
+                     OR EXISTS(SELECT 1 FROM nodes WHERE id=?2)
+                     OR EXISTS(SELECT 1 FROM branches WHERE id=?3)
+                     OR EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?4)",
+                params![session, root, branch, sandbox],
+                |row| row.get(0),
+            ))?,
+            Self::Checkpoint { checkpoint } => db(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id=?1)",
+                [checkpoint],
+                |row| row.get(0),
+            ))?,
+            Self::Sandbox { sandbox } => db(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?1)",
+                [sandbox],
+                |row| row.get(0),
+            ))?,
+        };
+        if exists {
+            return Err(Error::Conflict("construction candidate already exists"));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         match self {
             Self::Agent {
@@ -559,6 +593,109 @@ fn current_unresolved_in(
         ));
     }
     Ok(current)
+}
+
+/// Validate the original indexed Prepared fact, not just the latest
+/// receipt. Cleanup never adopts a replacement descriptor.
+pub(crate) fn is_reconciled_in(
+    connection: &Connection,
+    receipt: &ConstructionPreparation,
+) -> Result<bool> {
+    if receipt.state != PreparationState::Rejected {
+        return Ok(false);
+    }
+    require_original_source_claim_in(connection, receipt)?;
+    receipt.candidate.require_absent_in(connection)?;
+    Ok(true)
+}
+
+fn require_original_source_claim_in(
+    connection: &Connection,
+    receipt: &ConstructionPreparation,
+) -> Result<()> {
+    let mut query = db(connection.prepare_cached(
+        "SELECT session_id,action,actor,data_json,created_at FROM audit
+         WHERE action='construction.preparation'
+           AND json_extract(data_json,'$.state')='prepared'
+           AND json_type(data_json,'$.sources')='object'
+           AND json_extract(data_json,'$.sources.prepare_id')=?1",
+    ))?;
+    let mut rows = db(query.query([receipt.candidate.prepare_id()]))?;
+    let claim = decode_receipt(
+        connection,
+        db(rows.next())?.ok_or(Error::Storage("original source claim unavailable"))?,
+    )?;
+    if db(rows.next())?.is_some() || current_source_claim_in(connection, &claim)? != *receipt {
+        return Err(Error::Storage("original source claim changed"));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_unpublished_sources_in(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    barrier: &SourceMutationBarrier<'_>,
+) -> Result<()> {
+    require_current_sources_in(tx, actor, receipt, barrier)?;
+    require_original_source_claim_in(tx, receipt)?;
+    receipt.candidate.require_absent_in(tx)?;
+    if receipt.operation == ConstructionOperation::CheckpointCreate {
+        let published: bool = db(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE created_by=?1 AND request_id=?2)",
+            params![receipt.creator, receipt.request_id],
+            |row| row.get(0),
+        ))?;
+        if published {
+            return Err(Error::Conflict("checkpoint request already published"));
+        }
+    }
+    Ok(())
+}
+
+/// Trusted reconciliation of the original private candidate. The closure
+/// must independently authorize and account for every external effect;
+/// success proves all operation-owned resources released or absent, with
+/// no remaining live dependencies. Retain its fence through final commit.
+/// Rejection is a terminal replay fact, never permission to retry prepare.
+pub(crate) fn reconcile_unpublished_sources<F>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    barrier: &SourceMutationBarrier<'_>,
+    reconcile: impl FnOnce() -> Result<F>,
+) -> Result<()> {
+    let result = (|| {
+        // Check absence/ownership before any trusted cleanup is invoked.
+        {
+            let mut connection = store.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            require_unpublished_sources_in(&tx, actor, receipt, barrier)?;
+            db(tx.commit())?;
+        }
+        let fence = reconcile()?;
+        let finish = (|| {
+            let mut connection = store.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            require_unpublished_sources_in(&tx, actor, receipt, barrier)?;
+            let rejected = ConstructionPreparation {
+                state: PreparationState::Rejected,
+                result_ref: None,
+                note: Some("unpublished source candidate reconciled".into()),
+                ..receipt.clone()
+            };
+            rejected.validate()?;
+            append_in(&tx, actor, &rejected)?;
+            barrier.settle_in(&tx, SourceMutationOutcome::Settled)?;
+            db(tx.commit())
+        })();
+        drop(fence);
+        finish
+    })();
+    if result.is_err() {
+        mark_sources_unknown(store, actor, receipt, barrier)?;
+    }
+    result
 }
 
 /// CAS on the exact previous receipt. Source-bearing terminal transitions
