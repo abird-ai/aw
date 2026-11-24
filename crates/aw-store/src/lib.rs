@@ -136,7 +136,10 @@ use aw_agent_core::{
     InvocationContext, InvocationIdentity, InvocationPurpose, JournalFuture, Outcome, PrincipalId,
     Result, Role, SourceDriverRegistry, SourceSetLimit,
 };
-pub use checkpoint_owner::{CheckpointLifecycle, CheckpointSnapshot, CheckpointSourceSummary};
+pub use checkpoint_owner::{
+    CheckpointCaptureSelection, CheckpointLifecycle, CheckpointSnapshot, CheckpointSourceSummary,
+    PreparedCheckpointCapture,
+};
 pub use context::{
     ApplyContext, ApplyMode, ContextApplied, ContextJournal, ContextNode, ContextPlan,
     MaterializedContextProjection, MaterializedContextRequest, PlanKind, PrepareContext, Selection,
@@ -201,6 +204,7 @@ pub use reviews::*;
 #[cfg(feature = "routing")]
 pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
     SandboxLifecycle, SandboxSnapshot, SourceBindingCompatibility, SourceBindingSummary,
 };

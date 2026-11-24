@@ -1,0 +1,882 @@
+//! Source-bearing checkpoint preparation. The host authorizes source
+//! capture and supplies read-only driver planning; no effect or publication
+//! occurs here. A Prepared receipt and its complete local barrier commit
+//! together.
+use crate::{
+    agent_owner::{self, AgentKey, AgentPermission},
+    construction_receipt::{
+        self, ConstructionCandidate, ConstructionOperation, ConstructionPreparation,
+        PreparationState,
+    },
+    db, history_owner, id, key, label,
+    sandbox_owner::source_bindings::{self, VersionedSourceBinding},
+    session_in,
+    store_scope::StoreScope,
+    user_for_principal, Error, Result, SessionStore, SourceMutationBarrier, SourceMutationOutcome,
+    SourceMutationSet,
+};
+use aw_agent_core::{
+    validate_source_set_hard_limit, CheckpointPolicy, PreparedSourceSet, PrincipalId,
+    SourceCoverage, SourceDriverRegistryReader, SourceName, SourceOperationKind, SourceSetLimit,
+};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// The source-bearing selection. The ordinary history-only constructor is
+/// separate; an empty automatic set requires that history-only path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode", content = "names")]
+pub enum CheckpointCaptureSelection {
+    Auto,
+    Named(Vec<SourceName>),
+}
+
+impl CheckpointCaptureSelection {
+    fn canonicalize(mut self, limit: SourceSetLimit) -> Result<Self> {
+        if let Self::Named(names) = &mut self {
+            limit.admit(names.len())?;
+            for name in names.iter() {
+                name.validate()?;
+            }
+            names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+            if names.is_empty() || names.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(Error::Config(
+                    "selected checkpoint sources must be nonempty and unique".into(),
+                ));
+            }
+        }
+        Ok(self)
+    }
+
+    fn names(&self) -> Option<&[SourceName]> {
+        match self {
+            Self::Auto => None,
+            Self::Named(names) => Some(names),
+        }
+    }
+
+    pub fn coverage(&self) -> SourceCoverage {
+        match self {
+            Self::Auto => SourceCoverage::AutoAllRequired,
+            Self::Named(_) => SourceCoverage::Selected,
+        }
+    }
+}
+
+/// Durable, exact Store-owned capture inputs; not source authority.
+/// Current compatibility is diagnostic, so it is not part of this identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CaptureBoundary {
+    pub(crate) agent_ref: String,
+    pub(crate) sandbox_ref: String,
+    pub(crate) sandbox_rev: u64,
+    pub(crate) history_base_id: String,
+    pub(crate) access_generation: [u8; 32],
+    pub(crate) selection: CheckpointCaptureSelection,
+    pub(crate) bindings: Vec<VersionedSourceBinding>,
+    pub(crate) checkpoint_note: Option<String>,
+}
+
+impl CaptureBoundary {
+    pub(crate) fn validate(&self, sources: &PreparedSourceSet) -> Result<()> {
+        label(&self.agent_ref, 2048)?;
+        label(&self.sandbox_ref, 2048)?;
+        label(&self.history_base_id, 128)?;
+        if let Some(note) = &self.checkpoint_note {
+            label(note, 2048)?;
+        }
+        validate_source_set_hard_limit(self.bindings.len())?;
+        if self.sandbox_rev == 0
+            || self.bindings.is_empty()
+            || self.bindings.len() != sources.sources.len()
+            || sources.operation != SourceOperationKind::Capture
+        {
+            return Err(Error::Conflict("invalid checkpoint capture boundary"));
+        }
+        // Both collections are bounded. The descriptor is driver-owned,
+        // but the name and driver must match the exact selected binding.
+        // Canonical name order means no lookup or extra indexing is needed.
+        for (binding, source) in self.bindings.iter().zip(&sources.sources) {
+            binding.validate()?;
+            if binding.binding.name != source.name
+                || binding.binding.driver != source.prepared.descriptor.driver
+            {
+                return Err(Error::Conflict(
+                    "prepared descriptor does not match selected SourceBinding",
+                ));
+            }
+            if self.selection == CheckpointCaptureSelection::Auto
+                && binding.binding.checkpoint_policy != CheckpointPolicy::Required
+            {
+                return Err(Error::Conflict(
+                    "automatic capture includes an ephemeral binding",
+                ));
+            }
+        }
+        if self
+            .bindings
+            .windows(2)
+            .any(|pair| pair[0].binding.name.as_str() >= pair[1].binding.name.as_str())
+        {
+            return Err(Error::Conflict(
+                "capture bindings are not unique and canonical",
+            ));
+        }
+        if let Some(names) = self.selection.names() {
+            if names.len() != self.bindings.len()
+                || !names
+                    .iter()
+                    .zip(&self.bindings)
+                    .all(|(name, binding)| *name == binding.binding.name)
+            {
+                return Err(Error::Conflict(
+                    "capture bindings do not match selected names",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn mutation_set(&self) -> Result<SourceMutationSet> {
+        SourceMutationSet::from_binding_refs(self.bindings.iter().map(|binding| &binding.binding))
+    }
+}
+
+// Source capture is stricter than history-only capture. The existing run
+// and hazard owner remains authoritative for legacy execution roots; future
+// source-bearing runtime writers must additionally hold the shared source
+// claims. No inference from a missing Process row establishes quiescence.
+fn require_quiescent(connection: &Connection, origin: AgentKey<'_>, sandbox: &str) -> Result<()> {
+    let physical_root = key(&session_in(connection, origin.session)?.binding)?;
+    let blocked: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE root_key=?1 AND status='running')
+         OR EXISTS(SELECT 1 FROM hazards WHERE root_key=?1 AND state<>'settled')
+         OR EXISTS(
+            SELECT 1 FROM agent_state_current a JOIN branches b
+              ON b.session_id=a.session_id AND b.id=a.branch_id
+            WHERE a.sandbox_id=?2 AND b.active_run IS NOT NULL
+         )
+         OR EXISTS(
+            SELECT 1 FROM hazards h JOIN runs r ON r.id=h.run_id
+            JOIN agent_state_current a ON a.session_id=r.session_id AND a.branch_id=r.branch_id
+            WHERE a.sandbox_id=?2 AND h.state<>'settled'
+         )",
+        params![physical_root, sandbox],
+        |row| row.get(0),
+    ))?;
+    if blocked {
+        return Err(Error::Conflict(
+            "checkpoint source has active work or unresolved execution hazards",
+        ));
+    }
+    Ok(())
+}
+
+fn observe_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    origin: AgentKey<'_>,
+    selection: &CheckpointCaptureSelection,
+    note: Option<&str>,
+    limit: SourceSetLimit,
+    registry: &SourceDriverRegistryReader,
+) -> Result<CaptureBoundary> {
+    let access =
+        agent_owner::authorize_permission(connection, actor, origin, AgentPermission::View)?;
+    let agent_ref = agent_owner::canonical_ref(connection, origin)?;
+    let (sandbox_ref, sandbox_rev): (String, u64) = db(connection.query_row(
+        "SELECT s.sandbox_id,s.rev FROM agent_state_current a
+         JOIN sandboxes_current s ON s.sandbox_id=a.sandbox_id
+         JOIN workspaces w ON w.workspace_id=a.project_handle
+         WHERE a.session_id=?1 AND a.branch_id=?2
+           AND a.lifecycle='open' AND s.lifecycle='open' AND w.archived_at IS NULL
+           AND a.domain_handle=s.domain_handle AND a.identity_handle=s.identity_handle
+           AND a.project_handle=s.project_handle",
+        params![origin.session, origin.branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    require_quiescent(connection, origin, &sandbox_ref)?;
+    let bindings =
+        source_bindings::select_in(connection, &sandbox_ref, selection.names(), limit, registry)?;
+    if bindings.is_empty() {
+        return Err(Error::Conflict(
+            "automatic selection has no required sources; use history-only capture",
+        ));
+    }
+    let history = history_owner::seal_in(connection, origin.session, origin.branch)?;
+    Ok(CaptureBoundary {
+        agent_ref,
+        sandbox_ref,
+        sandbox_rev,
+        history_base_id: history.id,
+        access_generation: access.access_generation,
+        selection: selection.clone(),
+        bindings,
+        checkpoint_note: note.map(str::to_owned),
+    })
+}
+
+fn require_new_request(connection: &Connection, creator: &str, request_id: &str) -> Result<()> {
+    let existing: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE created_by=?1 AND request_id=?2)",
+        params![creator, request_id],
+        |row| row.get(0),
+    ))?;
+    if existing
+        || construction_receipt::lookup_in(
+            connection,
+            ConstructionOperation::CheckpointCreate,
+            creator,
+            request_id,
+        )?
+        .is_some()
+    {
+        return Err(Error::Conflict(
+            "checkpoint request is non-retryable; inspect original result or receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn fingerprint(
+    reference: &str,
+    selection: &CheckpointCaptureSelection,
+    note: Option<&str>,
+) -> Result<String> {
+    let request = crate::json(&(reference, selection, note))?;
+    let mut hash = Sha256::new();
+    hash.update(b"aw-checkpoint-create-sources-v1\0");
+    hash.update(request.as_bytes());
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Trusted, live Prepared checkpoint capture. No Clone, no implicit release.
+/// Driver effects still require independently held source authority. No
+/// source-bearing publication is exposed until its final authority/driver
+/// evidence fence is implemented.
+#[must_use = "retain the prepared capture until publication or recovery"]
+pub struct PreparedCheckpointCapture<'a> {
+    store: &'a SessionStore,
+    actor: PrincipalId,
+    receipt: ConstructionPreparation,
+    barrier: SourceMutationBarrier<'a>,
+}
+
+impl PreparedCheckpointCapture<'_> {
+    pub fn checkpoint_id(&self) -> &str {
+        self.receipt.candidate.prepare_id()
+    }
+
+    pub fn sources(&self) -> &PreparedSourceSet {
+        self.receipt
+            .sources
+            .as_ref()
+            .expect("constructed with sources")
+    }
+
+    pub fn bindings(&self) -> &[VersionedSourceBinding] {
+        &self.boundary().bindings
+    }
+
+    fn boundary(&self) -> &CaptureBoundary {
+        self.receipt
+            .capture_boundary
+            .as_ref()
+            .expect("constructed with capture boundary")
+    }
+
+    /// Current Store authority, exact history and source revisions, receipt
+    /// and barrier must all still agree. The eventual publication path must
+    /// call this inside its own final transaction, not trust a saved check.
+    fn require_current_in(&self, tx: &Transaction<'_>) -> Result<()> {
+        self.barrier.require_held_in(tx)?;
+        self.receipt.require_actor(tx, &self.actor)?;
+        let current = construction_receipt::lookup_in(
+            tx,
+            self.receipt.operation,
+            &self.receipt.scope,
+            &self.receipt.request_id,
+        )?;
+        if current.as_ref() != Some(&self.receipt) {
+            return Err(Error::Conflict("checkpoint capture receipt changed"));
+        }
+        let boundary = self.boundary();
+        let registry = self.store.inner.source_drivers.reader()?;
+        let observed = observe_in(
+            tx,
+            &self.actor,
+            self.receipt.origin(),
+            &boundary.selection,
+            boundary.checkpoint_note.as_deref(),
+            self.store.inner.source_limit,
+            &registry,
+        )?;
+        if &observed != boundary {
+            return Err(Error::Conflict("checkpoint capture boundary changed"));
+        }
+        for source in &self.sources().sources {
+            registry.resolve(&source.prepared.descriptor.pin()?)?;
+        }
+        Ok(())
+    }
+
+    /// Revalidate before driver execution/inspection. This is not a
+    /// publication token or a substitute for the final in-transaction check.
+    pub fn revalidate(&self) -> Result<()> {
+        let mut connection = self.store.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        self.require_current_in(&tx)?;
+        db(tx.rollback())
+    }
+
+    /// Record uncertain effect outcome and preserve the complete barrier as
+    /// hazards in the same commit. Current view revocation does not allow
+    /// forgetting the receipt or freeing an unresolved effect.
+    pub fn mark_unknown(self) -> Result<()> {
+        let mut connection = self.store.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        self.barrier
+            .settle_in(&tx, SourceMutationOutcome::Unknown)?;
+        construction_receipt::transition_in(
+            &tx,
+            &self.actor,
+            &self.receipt,
+            PreparationState::Unknown,
+            None,
+            Some("source effect outcome requires inspection".into()),
+        )?;
+        db(tx.commit())
+    }
+}
+
+impl SessionStore {
+    /// Trusted lower host seam, not an RPC or a model grant. The caller must
+    /// independently admit checkpoint-create and exact source capture
+    /// authority. The planner is read-only and must authorize the *complete*
+    /// observed set before inspecting driver content. It receives the
+    /// owner-minted candidate ID and canonical named binding revisions.
+    ///
+    /// Planning occurs outside the SQLite transaction. No external effect
+    /// may begin until this method returns the durably Prepared capture.
+    /// Full source-bearing execution stays closed pending grant realization.
+    pub fn checkpoint_prepare_capture(
+        &self,
+        actor: &PrincipalId,
+        reference: &str,
+        selection: CheckpointCaptureSelection,
+        note: Option<&str>,
+        request_id: &str,
+        plan: impl FnOnce(&str, &[VersionedSourceBinding]) -> Result<PreparedSourceSet>,
+    ) -> Result<PreparedCheckpointCapture<'_>> {
+        label(reference, 2048)?;
+        label(request_id, 256)?;
+        if let Some(note) = note {
+            label(note, 2048)?;
+        }
+        if self.inner.mode != crate::StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "checkpoint capture requires the exclusive persistent Store owner",
+            ));
+        }
+        let limit = self.inner.source_limit;
+        let selection = selection.canonicalize(limit)?;
+        let fingerprint = fingerprint(reference, &selection, note)?;
+        let (creator, session, branch, boundary, store_scope) = {
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let creator = user_for_principal(&tx, actor)?
+                .ok_or(Error::Denied("checkpoint caller is inactive or unknown"))?;
+            require_new_request(&tx, &creator, request_id)?;
+            let (session, branch) = agent_owner::key_for_ref(&tx, reference)?;
+            let registry = self.inner.source_drivers.reader()?;
+            let boundary = observe_in(
+                &tx,
+                actor,
+                AgentKey::new(&session, &branch),
+                &selection,
+                note,
+                limit,
+                &registry,
+            )?;
+            boundary.mutation_set()?.require_unleased_in(&tx)?;
+            let store_scope = StoreScope::load(&tx)?;
+            db(tx.commit())?;
+            (creator, session, branch, boundary, store_scope)
+        };
+
+        let checkpoint = id("cp")?;
+        let mut sources = plan(&checkpoint, &boundary.bindings)?;
+        sources.admit(limit)?;
+        sources
+            .sources
+            .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        boundary.validate(&sources)?;
+        if sources.prepare_id != checkpoint {
+            return Err(Error::Conflict(
+                "source descriptors belong to another checkpoint candidate",
+            ));
+        }
+        let mutation_set = boundary.mutation_set()?;
+        let receipt = ConstructionPreparation {
+            operation: ConstructionOperation::CheckpointCreate,
+            scope: creator.clone(),
+            creator,
+            parent_session_id: session,
+            parent_branch_id: branch,
+            request_id: request_id.to_owned(),
+            fingerprint,
+            state: PreparationState::Prepared,
+            candidate: ConstructionCandidate::Checkpoint { checkpoint },
+            task: None,
+            sources: Some(sources),
+            capture_boundary: Some(boundary),
+            result_ref: None,
+            note: None,
+        };
+
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        if StoreScope::load(&tx)? != store_scope {
+            return Err(Error::Conflict(
+                "Store generation changed during checkpoint planning",
+            ));
+        }
+        receipt.require_actor(&tx, actor)?;
+        require_new_request(&tx, &receipt.creator, request_id)?;
+        let registry = self.inner.source_drivers.reader()?;
+        let observed = observe_in(
+            &tx,
+            actor,
+            receipt.origin(),
+            &selection,
+            note,
+            limit,
+            &registry,
+        )?;
+        if receipt.capture_boundary.as_ref() != Some(&observed) {
+            return Err(Error::Conflict(
+                "checkpoint capture boundary changed during planning",
+            ));
+        }
+        let barrier = self.acquire_source_mutation_barrier_in(
+            &tx,
+            &mutation_set,
+            receipt.candidate.prepare_id(),
+        )?;
+        construction_receipt::claim_in(&tx, actor, &self.inner.source_drivers, limit, &receipt)?;
+        db(tx.commit())?;
+        Ok(PreparedCheckpointCapture {
+            store: self,
+            actor: actor.clone(),
+            receipt,
+            barrier,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aw_agent_core::{
+        AccountOwner, BillingOwner, CredentialCustody, DriverKey, InvocationIdentity,
+        NamedPreparedSource, Outcome, PreparedSourceOperation, RecoveryDescriptor, RecoveryField,
+        RecoveryFieldKind, SchemaSupport, SourceDriverRegistry, SourceDriverSchemas, Turn,
+        TurnJournal, TurnStart,
+    };
+    use std::path::PathBuf;
+
+    struct PrivateTemp(PathBuf);
+    impl Drop for PrivateTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn plan_fixture(
+        candidate: &str,
+        bindings: &[VersionedSourceBinding],
+    ) -> Result<PreparedSourceSet> {
+        let sources = bindings
+            .iter()
+            .rev()
+            .map(|version| {
+                let binding = &version.binding;
+                Ok(NamedPreparedSource {
+                    name: binding.name.clone(),
+                    prepared: PreparedSourceOperation::new(
+                        SourceOperationKind::Capture,
+                        RecoveryDescriptor::new(
+                            binding.driver.clone(),
+                            1,
+                            candidate,
+                            format!("{candidate}:{}", binding.name.as_str()),
+                            vec![RecoveryField::new(
+                                "source",
+                                RecoveryFieldKind::Reference,
+                                &binding.source_ref,
+                            )?],
+                        )?,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PreparedSourceSet {
+            prepare_id: candidate.into(),
+            operation: SourceOperationKind::Capture,
+            sources,
+        })
+    }
+
+    #[tokio::test]
+    async fn capture_preparation_binds_exact_sources_history_and_receipt() {
+        let temp = PrivateTemp(std::env::temp_dir().join(id("aw-capture-prepare").unwrap()));
+        let actor = PrincipalId::new("internal:fixture:capture-owner").unwrap();
+        let viewer = PrincipalId::new("internal:fixture:capture-viewer").unwrap();
+        let driver = DriverKey::builtin("fixture-git").unwrap();
+        let registry = SourceDriverRegistry::new();
+        let schema = SchemaSupport::new(1, 1).unwrap();
+        registry
+            .register(
+                driver.clone(),
+                SourceDriverSchemas {
+                    binding: schema,
+                    anchor: schema,
+                    recovery: schema,
+                },
+                (),
+            )
+            .unwrap();
+        let store =
+            SessionStore::open_with_sources(&temp.0, registry, SourceSetLimit::new(3).unwrap())
+                .unwrap();
+        let (session, branch) = store
+            .create(
+                &actor,
+                "capture",
+                crate::SessionBinding {
+                    working_directory: PathBuf::from("/tmp"),
+                    tool_root: PathBuf::from("/tmp"),
+                    system_prompt: "system".into(),
+                    profile_hint: "fixture".into(),
+                    model_hint: "model".into(),
+                    destination_fingerprint: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let origin = AgentKey::new(&session.id, &branch.id);
+        let reference = agent_owner::canonical_ref(&store.connection().unwrap(), origin).unwrap();
+        let sandbox = store
+            .agent_get(&actor, &reference)
+            .unwrap()
+            .sandbox_ref
+            .unwrap();
+        let domain = store.default_domain(&actor).unwrap();
+        let viewer_ref = {
+            let connection = store.connection().unwrap();
+            let user = crate::ensure_user_for_principal(&connection, &viewer).unwrap();
+            format!("/d:{}/i:{user}", domain.id)
+        };
+        let rev = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        store
+            .agent_access_set(
+                &actor,
+                &session.id,
+                &branch.id,
+                &viewer_ref,
+                Some(crate::AgentPermissions {
+                    view: true,
+                    ..Default::default()
+                }),
+                rev,
+            )
+            .unwrap();
+        assert!(store
+            .checkpoint_prepare_capture(
+                &viewer,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:empty",
+                |_, _| panic!("empty automatic set must not inspect sources")
+            )
+            .is_err());
+
+        // Real active Turn; source realization is still closed, so attach
+        // fixture bindings only inside this test. No production rebind path.
+        let (_, handle) = store.activate(&actor, &session.id, &branch.id).unwrap();
+        let identity = InvocationIdentity {
+            actor: actor.clone(),
+            account_id: "fixture".into(),
+            account_owner: AccountOwner::User(actor.clone()),
+            payer: BillingOwner::User(actor.clone()),
+            credential_custody: CredentialCustody::UserDevice("fixture".into()),
+            credential_version: None,
+            inference_executor: "local".into(),
+            model: "fixture".into(),
+            grant_revision: 1,
+        };
+        handle
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "settle".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            for (name, policy) in [
+                ("code", "required"),
+                ("data", "required"),
+                ("cache", "ephemeral"),
+            ] {
+                connection.execute(
+                    "INSERT INTO sandbox_source_bindings_current(
+                         sandbox_id,source_name,driver_key,binding_schema,source_ref,materialization,
+                         access,checkpoint_policy,binding_rev,compatibility
+                     ) VALUES(?1,?2,?3,1,?4,?5,'rw',?6,1,'compatible')",
+                    params![sandbox,name,crate::json(&driver).unwrap(),
+                        format!("fixture-source:{name}"),format!("fixture-checkout:{name}"),policy],
+                ).unwrap();
+            }
+        }
+        assert!(store
+            .checkpoint_prepare_capture(
+                &viewer,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:busy",
+                |_, _| panic!("active work must refuse before planning")
+            )
+            .is_err());
+        handle
+            .finish(Turn {
+                id: 1,
+                prompt: "settle".into(),
+                answer: "settled".into(),
+                model: identity.model,
+                profile: identity.account_id,
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(actor.clone()),
+                tool_records: Vec::new(),
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+        let settled = store
+            .checkpoint_create_history_only(&actor, &reference, None, "host:history")
+            .unwrap();
+
+        // Named selection may include ephemeral sources, but not absent
+        // names. Planning outside SQLite permits a concurrent logical edit;
+        // stale observations cannot reserve effects.
+        let named = CheckpointCaptureSelection::Named(vec![
+            SourceName::new("code").unwrap(),
+            SourceName::new("cache").unwrap(),
+        ]);
+        assert!(store
+            .checkpoint_prepare_capture(
+                &viewer,
+                &reference,
+                CheckpointCaptureSelection::Named(vec![SourceName::new("missing").unwrap()]),
+                None,
+                "host:missing",
+                |_, _| panic!("missing source")
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_prepare_capture(
+                &viewer,
+                &reference,
+                named,
+                None,
+                "host:stale",
+                |candidate, bindings| {
+                    assert_eq!(
+                        bindings
+                            .iter()
+                            .map(|b| b.binding.name.as_str())
+                            .collect::<Vec<_>>(),
+                        ["cache", "code"]
+                    );
+                    let plans = plan_fixture(candidate, bindings)?;
+                    let connection = store.connection()?;
+                    db(connection.execute(
+                        "UPDATE sandbox_source_bindings_current SET binding_rev=binding_rev+1
+                     WHERE sandbox_id=?1 AND source_name='code'",
+                        [&sandbox],
+                    ))?;
+                    Ok(plans)
+                }
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_prepare_capture(
+                &viewer,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:partial",
+                |candidate, bindings| {
+                    let mut plans = plan_fixture(candidate, bindings)?;
+                    plans.sources.pop();
+                    Ok(plans)
+                }
+            )
+            .is_err());
+
+        let prepared = store
+            .checkpoint_prepare_capture(
+                &viewer,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                Some("capture"),
+                "host:capture",
+                |candidate, bindings| {
+                    assert_eq!(
+                        bindings
+                            .iter()
+                            .map(|b| b.binding.name.as_str())
+                            .collect::<Vec<_>>(),
+                        ["code", "data"]
+                    );
+                    plan_fixture(candidate, bindings)
+                },
+            )
+            .unwrap();
+        let candidate = prepared.checkpoint_id().to_owned();
+        assert_eq!(prepared.boundary().history_base_id, settled.history_base_id);
+        assert_eq!(prepared.bindings()[0].binding_rev, 2);
+        assert_eq!(prepared.sources().sources[0].name.as_str(), "code");
+        prepared.revalidate().unwrap();
+        let set = prepared.boundary().mutation_set().unwrap();
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "other")
+            .is_err());
+        assert!(store
+            .checkpoint_prepare_capture(
+                &viewer,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:blocked",
+                |_, _| panic!("held source barrier must refuse before planning")
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_prepare_capture(
+                &viewer,
+                "/not-a-target",
+                CheckpointCaptureSelection::Auto,
+                Some("capture"),
+                "host:capture",
+                |_, _| panic!("replay must not plan")
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_create_history_only(&viewer, &reference, None, "host:capture")
+            .is_err());
+        {
+            let connection = store.connection().unwrap();
+            let receipt = construction_receipt::lookup_in(
+                &connection,
+                ConstructionOperation::CheckpointCreate,
+                &prepared.receipt.creator,
+                "host:capture",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(receipt, prepared.receipt);
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM local_coordination_leases WHERE scope_kind='execution'
+                 AND run_id=?1 AND state='active'",
+                    [&candidate],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2);
+            let count: i64 = connection
+                .query_row("SELECT count(*) FROM checkpoints", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+
+        // An exact history boundary and current view are both required at
+        // revalidation. The direct history edit is a stale-boundary fixture,
+        // not a supported source-bearing writer.
+        {
+            let connection = store.connection().unwrap();
+            let current = crate::branch_in(&connection, &session.id, &branch.id)
+                .unwrap()
+                .head;
+            connection
+                .execute(
+                    "UPDATE branches SET head=?1 WHERE id=?2",
+                    params![branch.head, branch.id],
+                )
+                .unwrap();
+            drop(connection);
+            assert!(prepared.revalidate().is_err());
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE branches SET head=?1 WHERE id=?2",
+                    params![current, branch.id],
+                )
+                .unwrap();
+        }
+        prepared.revalidate().unwrap();
+        let rev = store
+            .agent_public_revision(&actor, &session.id, &branch.id)
+            .unwrap();
+        store
+            .agent_access_set(&actor, &session.id, &branch.id, &viewer_ref, None, rev)
+            .unwrap();
+        assert!(prepared.revalidate().is_err());
+        let creator = prepared.receipt.creator.clone();
+        let boundary = prepared.boundary().clone();
+        prepared.mark_unknown().unwrap();
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "retry")
+            .is_err());
+        {
+            let connection = store.connection().unwrap();
+            let receipt = construction_receipt::lookup_in(
+                &connection,
+                ConstructionOperation::CheckpointCreate,
+                &creator,
+                "host:capture",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(receipt.state, PreparationState::Unknown);
+            assert_eq!(receipt.capture_boundary, Some(boundary));
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM local_coordination_leases WHERE scope_kind='execution'
+                 AND run_id=?1 AND state='hazard'",
+                    [&candidate],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM checkpoints", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+}

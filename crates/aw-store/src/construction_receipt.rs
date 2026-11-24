@@ -112,7 +112,7 @@ impl ConstructionCandidate {
         }
     }
 
-    fn prepare_id(&self) -> &str {
+    pub(crate) fn prepare_id(&self) -> &str {
         match self {
             Self::Agent { session, .. } => session,
             Self::Checkpoint { checkpoint } => checkpoint,
@@ -162,6 +162,8 @@ pub(crate) struct ConstructionPreparation {
     pub(crate) task: Option<InitialTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sources: Option<PreparedSourceSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capture_boundary: Option<crate::checkpoint_owner::capture::CaptureBoundary>,
     pub(crate) result_ref: Option<String>,
     pub(crate) note: Option<String>,
 }
@@ -240,6 +242,18 @@ impl ConstructionPreparation {
                 return Err(Error::Storage("invalid initial task custody identity"));
             }
         }
+        if let Some(boundary) = &self.capture_boundary {
+            if self.operation != ConstructionOperation::CheckpointCreate {
+                return Err(Error::Storage(
+                    "capture boundary belongs to checkpoint creation",
+                ));
+            }
+            boundary.validate(
+                self.sources
+                    .as_ref()
+                    .ok_or(Error::Storage("capture descriptors missing"))?,
+            )?;
+        }
         if let Some(sources) = &self.sources {
             sources.validate()?;
             if matches!(
@@ -277,6 +291,11 @@ impl ConstructionPreparation {
             let reader = registry.reader()?;
             for source in &sources.sources {
                 reader.resolve(&source.prepared.descriptor.pin()?)?;
+            }
+            if let Some(boundary) = &self.capture_boundary {
+                for binding in &boundary.bindings {
+                    reader.resolve(&binding.binding.pin()?)?;
+                }
             }
         }
         Ok(())
@@ -355,6 +374,7 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
                 payload_sha256: legacy.payload_sha256,
             }),
             sources: None,
+            capture_boundary: None,
             result_ref: legacy.result_ref,
             note: legacy.note,
         }
@@ -525,6 +545,7 @@ pub(crate) fn visit_unresolved_sources(
             || claim.candidate != receipt.candidate
             || claim.task != receipt.task
             || claim.sources != receipt.sources
+            || claim.capture_boundary != receipt.capture_boundary
         {
             return Err(Error::Storage(
                 "prepared source receipt changed its recovery identity",
@@ -537,8 +558,15 @@ pub(crate) fn visit_unresolved_sources(
             .sources
             .as_ref()
             .ok_or(Error::Storage("source custody missing"))?;
-        for source in &sources.sources {
-            let status = compatibility(registry, &source.prepared.descriptor.pin()?)?;
+        for (index, source) in sources.sources.iter().enumerate() {
+            let mut status = compatibility(registry, &source.prepared.descriptor.pin()?)?;
+            if let Some(boundary) = &receipt.capture_boundary {
+                if compatibility(registry, &boundary.bindings[index].binding.pin()?)?
+                    == SourceCompatibility::RecoveryRequired
+                {
+                    status = SourceCompatibility::RecoveryRequired;
+                }
+            }
             visit(&receipt, source, status)?;
         }
     }
@@ -714,6 +742,7 @@ mod tests {
             candidate,
             task: None,
             sources: Some(sources),
+            capture_boundary: None,
             result_ref: None,
             note: None,
         };

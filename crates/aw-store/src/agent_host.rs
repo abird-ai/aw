@@ -957,6 +957,7 @@ impl SessionStore {
                     payload_sha256: custody.payload_sha256.clone(),
                 }),
                 sources: None,
+                capture_boundary: None,
                 result_ref: None,
                 note: None,
             };

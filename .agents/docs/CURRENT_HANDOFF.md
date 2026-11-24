@@ -30,7 +30,8 @@ SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary an
 SourceBinding persistence/restart compatibility, built-in Git clean/dirty capture/private retention,
 explicit gitlink semantics, isolated Prepared restore, v56 immutable Checkpoint/SourceSet
 persistence with trusted history-only replay, v57 indexed construction receipt/source
-recovery custody and Store-local complete-set source mutation barriers are implemented locally.
+recovery custody, Store-local complete-set source mutation barriers and receipt-bound
+checkpoint capture preparation are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1309,18 +1310,45 @@ scopes inside its transaction. No driver effects, source grants or model/RPC adm
 This is a Store-local coordination primitive, not proof that arbitrary filesystem writers or
 another Store are fenced. Source-bearing Agent execution stays closed until its Process/effect
 admission and structural Sandbox mutation share this barrier; cross-Store/external authority
-needs the reviewed driver/provider fence. Exact SourceSet selection, binding revision/history
-fencing, receipt-bound acquisition and recovery of abandoned claims must be integrated into the
-shared constructor. An unresolved barrier is intentionally not recoverable by a generic lease
-release; the recovery owner must inspect the exact operation first.
+needs the reviewed driver/provider fence. An unresolved barrier is intentionally not recoverable
+by a generic lease release; the recovery owner must inspect the exact operation first.
 
 Grouped source-barrier disk regression **1/1**, affected coordination regressions **3/3**,
 Sandbox owner **2/2**, construction receipt **1/1**, strict Store all-target Clippy, full workspace
 all-target check, repository fmt and scoped diff-check are green. Unchanged Git/Phase-2 suites
 were not repeated.
 
-**Next Phase-3 slice:** integrate the live barrier and exact SourceSet/history/authority observation
-with the existing Prepared receipt, implement inspection/recovery and atomic publication. Source
+Trusted checkpoint capture preparation now reads the exact current named Sandbox bindings, selects
+all required or an explicit nonempty named set, resolves its binding schemas, checks current Agent
+view and open same-Project Agent/Sandbox placement, and fences the settled HistoryBase plus legacy
+active-run/hazard boundaries. The lower source-bearing seam refuses empty auto sets before planning;
+the eventual public auto wrapper must use history-only construction for that case. The independently
+authorized host supplies a read-only planner outside SQLite, receiving the bounded canonical binding
+revisions and owner-minted checkpoint ID. Before any effect, one transaction repeats the exact
+observation, resolves recovery schemas, acquires the complete mutation scopes and commits the
+existing Prepared receipt. No candidate checkpoint is published. Replay checks precede target
+resolution/planning; partial, mismatched and stale source plans refuse.
+
+The receipt now retains exact selected binding revisions, Sandbox rev, history base, current
+Agent access generation, selection and note. This additive optional capture boundary is decoded
+alongside prior v57 receipts and checked for immutable equality and binding/recovery schema
+dependencies during startup inspection. The live non-cloneable PreparedCheckpointCapture exposes
+the exact trusted driver plans and revalidates receipt, leases, history, placement and ACL together.
+Its Unknown transition and whole-set hazard settlement commit atomically even after view
+revocation. No generic release or source-bearing terminal publication path is opened. Actual
+source capability and external fence admission remain the trusted host/driver responsibility;
+source-bearing Agent realization and writer integration are still closed.
+
+The grouped capture-preparation disk regression **1/1** exercises a real active/settled Turn,
+required and named selection, stale binding/history, missing/partial selection, replay and
+revocation, durable exact receipt + active barrier and atomic Unknown hazards. Source-bearing
+binding rows in this regression are a test-only fixture, not a production realization path.
+Checkpoint owner **1/1**, source barrier **1/1**, construction receipt **1/1**, Sandbox owner
+**2/2**, task-bearing Agent constructor **1/1**, strict Store all-target Clippy, full workspace
+all-target check, repository fmt and scoped diff-check are green.
+
+**Next Phase-3 slice:** inspect the exact Prepared operation and its claims after restart, then
+implement driver-evidence revalidation and the shared atomic publication constructor. Source
 realization, writer/effect participation, candidate/retention reconciliation, quiescent binding
 mutation, SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v57.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart

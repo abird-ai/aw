@@ -22,13 +22,19 @@ pub struct SourceMutationSet {
 
 impl SourceMutationSet {
     pub fn from_bindings(bindings: &[SourceBinding]) -> Result<Self> {
+        Self::from_binding_refs(bindings.iter())
+    }
+
+    pub(crate) fn from_binding_refs<'a>(
+        bindings: impl ExactSizeIterator<Item = &'a SourceBinding> + Clone,
+    ) -> Result<Self> {
         validate_source_set_hard_limit(bindings.len())?;
-        for binding in bindings {
+        for binding in bindings.clone() {
             binding.validate()?;
         }
         Self::from_identities(
             bindings.len(),
-            bindings.iter().map(|b| (&b.driver, b.source_ref.as_str())),
+            bindings.map(|b| (&b.driver, b.source_ref.as_str())),
         )
     }
 
@@ -143,6 +149,21 @@ impl SessionStore {
         set: &SourceMutationSet,
         prepare_id: &str,
     ) -> Result<SourceMutationBarrier<'_>> {
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let barrier = self.acquire_source_mutation_barrier_in(&tx, set, prepare_id)?;
+        db(tx.commit())?;
+        Ok(barrier)
+    }
+
+    /// Claim in the caller's existing Prepared transaction. Neither the
+    /// barrier nor the receipt becomes visible if that transaction rolls back.
+    pub(crate) fn acquire_source_mutation_barrier_in(
+        &self,
+        tx: &Transaction<'_>,
+        set: &SourceMutationSet,
+        prepare_id: &str,
+    ) -> Result<SourceMutationBarrier<'_>> {
         self.inner.source_limit.admit(set.count)?;
         if set.scopes.is_empty() {
             return Err(Error::Config(
@@ -163,12 +184,8 @@ impl SessionStore {
             ));
         }
         let process = self.coordinated_process()?;
-        let mut connection = self.connection()?;
-        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let store_scope = StoreScope::load(&tx)?;
-        let leases =
-            coordination::acquire_source_leases_in(&tx, &process, &set.scopes, prepare_id)?;
-        db(tx.commit())?;
+        let store_scope = StoreScope::load(tx)?;
+        let leases = coordination::acquire_source_leases_in(tx, &process, &set.scopes, prepare_id)?;
         Ok(SourceMutationBarrier {
             store: self,
             store_scope,

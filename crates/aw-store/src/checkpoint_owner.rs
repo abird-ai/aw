@@ -1,5 +1,7 @@
 //! Durable checkpoint owner. The final transaction owns the immutable
 //! HistoryBase and complete SourceSet; no materialization is performed here.
+
+pub(crate) mod capture;
 use crate::{
     agent_owner::{self, AgentKey, AgentPermission},
     db, history_owner, id, label, now,
@@ -11,6 +13,7 @@ use aw_agent_core::{
     SourceAnchor, SourceCoverage, SourceDriverRegistryReader, SourceName, SourceSet,
     SourceSetLimit, HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
+pub use capture::{CheckpointCaptureSelection, PreparedCheckpointCapture};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

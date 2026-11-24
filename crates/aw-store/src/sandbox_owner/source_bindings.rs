@@ -26,6 +26,25 @@ pub struct SourceBindingSummary {
     pub compatibility: SourceBindingCompatibility,
 }
 
+/// Exact durable binding revision, for trusted source planning. Neither the
+/// binding nor its revision grants source access.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionedSourceBinding {
+    pub binding: SourceBinding,
+    pub binding_rev: u64,
+}
+
+impl VersionedSourceBinding {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.binding.validate()?;
+        if self.binding_rev == 0 {
+            return Err(Error::Storage("invalid durable SourceBinding revision"));
+        }
+        Ok(())
+    }
+}
+
 struct StoredBinding {
     binding: SourceBinding,
     binding_rev: u64,
@@ -121,6 +140,58 @@ pub(super) fn summaries(
         .into_iter()
         .map(StoredBinding::summary)
         .collect())
+}
+
+/// Select exactly the required bindings (None) or the named subset (Some).
+/// Decode once in canonical name order. Compatibility is resolved against the
+/// live registry snapshot, not a persisted diagnostic bit.
+pub(crate) fn select_in(
+    connection: &Connection,
+    sandbox: &str,
+    names: Option<&[SourceName]>,
+    limit: SourceSetLimit,
+    registry: &SourceDriverRegistryReader,
+) -> Result<Vec<VersionedSourceBinding>> {
+    let requested = if let Some(names) = names {
+        limit.admit(names.len())?;
+        let mut set = BTreeSet::new();
+        for name in names {
+            name.validate()?;
+            if !set.insert(name.as_str()) {
+                return Err(Error::Conflict("duplicate selected SourceBinding name"));
+            }
+        }
+        if set.is_empty() {
+            return Err(Error::Config(
+                "named source selection must be nonempty".into(),
+            ));
+        }
+        Some(set)
+    } else {
+        None
+    };
+    let mut selected = Vec::new();
+    for stored in bindings_in(connection, sandbox)? {
+        let include = match &requested {
+            Some(names) => names.contains(stored.binding.name.as_str()),
+            None => stored.binding.checkpoint_policy == CheckpointPolicy::Required,
+        };
+        if include {
+            limit.admit(selected.len() + 1)?;
+            registry.resolve(&stored.binding.pin()?)?;
+            selected.push(VersionedSourceBinding {
+                binding: stored.binding,
+                binding_rev: stored.binding_rev,
+            });
+        }
+    }
+    if requested
+        .as_ref()
+        .is_some_and(|names| names.len() != selected.len())
+    {
+        return Err(Error::Denied("selected SourceBinding is unavailable"));
+    }
+    Ok(selected)
 }
 
 /// Complete-set admission before any driver work or publication.
