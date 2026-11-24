@@ -6,7 +6,7 @@ use crate::{
     agent_host::{authorize_project_create, parse_project_ref, snapshot_in},
     agent_owner::{self, AgentKey, AgentPermission},
     construction_receipt::{
-        self, ConstructionCandidate, ConstructionOperation, ConstructionPreparation,
+        self, ConstructionCandidate, ConstructionOperation, ConstructionPreparation, InitialTask,
         PreparationState,
     },
     db, history_owner, id, label, resources, sandbox_owner, stable_user_principal,
@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Trusted lower checkpoint restore request. The destination layout is
-/// independently selected by the host. Access uses the common exact-history
-/// constructor; initial task custody remains a separate pending cut.
+/// independently selected by the host. Access and optional initial task
+/// use the existing history and encrypted queue construction owners.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointRestoreRequest {
@@ -33,6 +33,8 @@ pub struct CheckpointRestoreRequest {
     pub project: Option<String>,
     pub title: Option<String>,
     pub access: AgentHistoryForkAccess,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +416,9 @@ impl<'a> PreparedCheckpointRestore<'a> {
                 project: Some(boundary.destination_project.clone()),
                 title: Some(boundary.title.clone()),
                 access: boundary.access.clone(),
+                // History/source revalidation uses the immutable boundary;
+                // task identity belongs to the separate receipt field.
+                task: None,
             },
             &binding_digest(binding)?,
             self.store.inner.source_limit,
@@ -610,6 +615,11 @@ impl InspectedCheckpointRestore<'_> {
                 &self.bindings,
                 &self.evidence,
             )?;
+            if let Some(task) = &restore.receipt.task {
+                restore
+                    .store
+                    .verify_prepared_queue_custody(&task.custody())?;
+            }
             construction_receipt::publish_sources(
                 restore.store,
                 &restore.actor,
@@ -685,6 +695,14 @@ fn publish_restored_agent_in(
         receipt.candidate.agent_ids()?,
         Some(&fresh),
     )?;
+    if let Some(task) = &receipt.task {
+        task.publish_in(
+            tx,
+            &stable_user_principal(&project.identity)?,
+            &session.id,
+            &branch.id,
+        )?;
+    }
     let reference = agent_owner::canonical_ref(tx, AgentKey::new(&session.id, &branch.id))?;
     let agent = snapshot_in(tx, actor, &reference)?;
     Ok((
@@ -745,7 +763,22 @@ fn restore_fingerprint(request: &CheckpointRestoreRequest, request_id: &str) -> 
         label(title, 160)?;
     }
     request.access.validate()?;
-    fingerprint(b"aw-checkpoint-restore-v1\0", request)
+    if let Some(task) = &request.task {
+        // No plaintext task in the semantic receipt. Keep the original
+        // no-task fingerprint byte-for-byte compatible.
+        fingerprint(
+            b"aw-checkpoint-restore-task-v1\0",
+            &(
+                &request.checkpoint,
+                &request.project,
+                &request.title,
+                &request.access,
+                format!("{:x}", Sha256::digest(task.as_bytes())),
+            ),
+        )
+    } else {
+        fingerprint(b"aw-checkpoint-restore-v1\0", request)
+    }
 }
 
 fn replay_restore_in(
@@ -851,6 +884,9 @@ impl SessionStore {
             db(tx.commit())?;
             return Ok(result);
         }
+        if request.task.is_some() {
+            return Err(Error::Denied("initial task requires Prepared source restore; baseline task custody is not available"));
+        }
         let registry = self.inner.source_drivers.reader()?;
         let observed = observe_in(
             &tx,
@@ -936,6 +972,7 @@ impl SessionStore {
         request: &CheckpointRestoreRequest,
         binding: &SessionBinding,
         request_id: &str,
+        execution_site: &str,
         plan: impl FnOnce(&str, &str, &SourceSet) -> Result<PreparedSourceSet>,
     ) -> Result<PreparedCheckpointRestore<'_>> {
         let fingerprint = restore_fingerprint(request, request_id)?;
@@ -976,6 +1013,11 @@ impl SessionStore {
             (creator, observed, store_scope)
         };
         let ids = resources::mint_session_candidate_ids()?;
+        let task = request
+            .task
+            .as_deref()
+            .map(|payload| InitialTask::mint(request_id, &ids.session, payload, execution_site))
+            .transpose()?;
         let sandbox = format!("{}/s:{}", observed.boundary.destination_project, id("sbx")?);
         let mut sources = plan(&ids.session, &sandbox, &observed.sources)?;
         sources.admit(limit)?;
@@ -1001,7 +1043,7 @@ impl SessionStore {
             fingerprint,
             state: PreparationState::Prepared,
             candidate,
-            task: None,
+            task,
             sources: Some(sources),
             capture_boundary: None,
             restore_boundary: Some(observed.boundary),
@@ -1043,13 +1085,27 @@ impl SessionStore {
         )?;
         let barrier = construction_receipt::claim_sources_in(self, &tx, actor, &receipt, &set)?;
         db(tx.commit())?;
-        Ok(PreparedCheckpointRestore {
+        drop(connection);
+        let restore = PreparedCheckpointRestore {
             store: self,
             actor: actor.clone(),
             receipt,
             anchors: observed.sources,
             barrier,
-        })
+        };
+        if let (Some(task), Some(payload)) = (&restore.receipt.task, request.task.as_deref()) {
+            let custody = task.custody();
+            // Prepared and all source claims are durable before the first
+            // external write, including the encrypted task payload.
+            if let Err(error) = self
+                .write_prepared_queue_custody(&custody, payload)
+                .and_then(|()| self.verify_prepared_queue_custody(&custody))
+            {
+                restore.mark_unknown()?;
+                return Err(error);
+            }
+        }
+        Ok(restore)
     }
 
     /// Recover only the original operation's exact hazard set and inspect
@@ -1351,6 +1407,7 @@ mod tests {
             project: None,
             title: Some("restored".into()),
             access: AgentHistoryForkAccess::Private,
+            task: None,
         };
         let viewer = PrincipalId::new("internal:fixture:restore-viewer").unwrap();
         let domain = store.default_domain(&actor).unwrap();
@@ -1402,6 +1459,7 @@ mod tests {
                     &invalid,
                     &layout,
                     "host:bad-acl",
+                    "local",
                     |_, _, _| panic!("invalid custom audience must refuse before planning"),
                 )
                 .is_err());
@@ -1416,6 +1474,7 @@ mod tests {
                 &request,
                 &layout,
                 "host:denied",
+                "local",
                 |_, _, _| panic!("view is not derive/destination/source authority")
             )
             .is_err());
@@ -1455,6 +1514,19 @@ mod tests {
                 &session.binding,
                 &[],
                 "host:old-layout",
+            )
+            .is_err());
+        let task_baseline = CheckpointRestoreRequest {
+            task: Some("unsupported baseline initial task".into()),
+            ..history_only.clone()
+        };
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &task_baseline,
+                &baseline_layout,
+                &[],
+                "host:baseline-task",
             )
             .is_err());
         let restored_history = store
@@ -1687,6 +1759,7 @@ mod tests {
                 &history_only,
                 &layout,
                 "host:no-sources",
+                "local",
                 |_, _, _| panic!("no implicit source-state fallback")
             )
             .is_err());
@@ -1696,6 +1769,7 @@ mod tests {
                 &request,
                 &layout,
                 "host:partial",
+                "local",
                 |candidate, sandbox, selected| {
                     let mut prepared = plan(candidate, sandbox, selected)?;
                     prepared.sources.pop();
@@ -1704,21 +1778,57 @@ mod tests {
             )
             .is_err());
 
+        // From here the captured-source restore also owns initial input
+        // custody. The task is not a journal Turn or a source grant.
+        let task_text = "fixture: restored initial input";
+        let request = CheckpointRestoreRequest {
+            task: Some(task_text.into()),
+            ..request
+        };
+        assert!(store
+            .checkpoint_prepare_restore(
+                &actor,
+                &request,
+                &layout,
+                "host:bad-task-site",
+                "",
+                |_, _, _| panic!("invalid task site must refuse before planning"),
+            )
+            .is_err());
+
         // Abandon an actual private candidate without touching the source
         // checkpoint or publishing either candidate identity.
         let abandoned = store
-            .checkpoint_prepare_restore(&actor, &request, &layout, "host:abandon-restore", plan)
+            .checkpoint_prepare_restore(
+                &actor,
+                &request,
+                &layout,
+                "host:abandon-restore",
+                "local",
+                plan,
+            )
             .unwrap();
         let abandoned_id = abandoned.prepare_id().to_owned();
         let abandoned_sandbox = abandoned.sandbox_ref().to_owned();
         let abandoned_sources = abandoned.sources().clone();
+        let abandoned_task = abandoned.receipt.initial_task().unwrap().clone();
+        store
+            .verify_prepared_queue_custody(&abandoned_task.custody())
+            .unwrap();
         assert!(store
             .checkpoint_abandon_restore::<()>(&actor, "host:abandon-restore", |_, _, _| panic!(
                 "live candidate cannot be stolen"
             ))
             .is_err());
-        abandoned
-            .abandon(|_, selected, sources| {
+        assert!(abandoned
+            .abandon::<()>(|_, _, _| { Err(Error::Conflict("fixture interrupted source cleanup")) })
+            .is_err());
+        // Until every source is settled, retain the original input too.
+        store
+            .verify_prepared_queue_custody(&abandoned_task.custody())
+            .unwrap();
+        store
+            .checkpoint_abandon_restore(&actor, "host:abandon-restore", |_, selected, sources| {
                 assert_eq!(selected, &anchors);
                 assert_eq!(sources, &abandoned_sources);
                 assert!(store
@@ -1731,6 +1841,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        assert!(store
+            .verify_prepared_queue_custody(&abandoned_task.custody())
+            .is_err());
         store
             .checkpoint_abandon_restore::<()>(&actor, "host:abandon-restore", |_, _, _| {
                 panic!("rejected receipt must not reinspect")
@@ -1742,6 +1855,7 @@ mod tests {
                 &request,
                 &layout,
                 "host:abandon-restore",
+                "local",
                 |_, _, _| panic!("rejected receipt must not replan"),
             )
             .is_err());
@@ -1766,6 +1880,7 @@ mod tests {
                 &request,
                 &layout,
                 "host:restore",
+                "fixture:restore-site",
                 |candidate, sandbox, selected| {
                     assert_eq!(selected, &anchors);
                     assert_ne!(sandbox, original_sandbox);
@@ -1778,9 +1893,16 @@ mod tests {
         // history. Retirement must not remove its last durable history root.
         assert!(store.checkpoint_delete(&actor, &checkpoint).is_err());
         let receipt = prepared.receipt.clone();
+        let task = receipt.initial_task().unwrap().clone();
+        assert_eq!(task.execution_site.as_deref(), Some("fixture:restore-site"));
+        store
+            .verify_prepared_queue_custody(&task.custody())
+            .unwrap();
+        assert!(!serde_json::to_string(&receipt).unwrap().contains(task_text));
         let candidate = prepared.prepare_id().to_owned();
         let sandbox = prepared.sandbox_ref().to_owned();
         assert_ne!(candidate, session.id);
+        assert!(store.actor_queue_list(&actor, &candidate).is_err());
         assert_eq!(prepared.boundary().history_base_id, base.id);
         assert_eq!(prepared.anchors(), &anchors);
         assert!(store
@@ -1789,6 +1911,7 @@ mod tests {
                 &request,
                 &layout,
                 "host:restore",
+                "local",
                 |_, _, _| panic!("restore replay cannot replan")
             )
             .is_err());
@@ -1871,6 +1994,9 @@ mod tests {
             .is_err());
         drop(store);
         let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
+        store
+            .verify_prepared_queue_custody(&task.custody())
+            .unwrap();
         let inspect = |registry: &SourceDriverRegistryReader,
                        selected: &SourceSet,
                        prepared: &PreparedSourceSet| {
@@ -1968,12 +2094,15 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            // Fail after the fresh Sandbox and Agent exist inside the
-            // transaction, before the HistoryGrant is attached.
+            // Fail the final receipt after history, ACL and queue publication
+            // inside the same transaction. None may become visible alone.
             connection
                 .execute_batch(
-                    "CREATE TEMP TRIGGER fixture_fail_restore BEFORE INSERT ON history_grants
-                 BEGIN SELECT RAISE(ABORT,'fixture restore failure'); END;",
+                    "CREATE TEMP TRIGGER fixture_fail_restore BEFORE INSERT ON audit
+                     WHEN NEW.action='construction.preparation'
+                      AND json_extract(NEW.data_json,'$.operation')='checkpoint_restore'
+                      AND json_extract(NEW.data_json,'$.state')='applied'
+                     BEGIN SELECT RAISE(ABORT,'fixture restore failure'); END;",
                 )
                 .unwrap();
         }
@@ -1993,7 +2122,11 @@ mod tests {
             .unwrap();
             assert_eq!(current.state, PreparationState::Unknown);
             assert_eq!(current.candidate, receipt.candidate);
+            assert_eq!(current.task, receipt.task);
             require_candidate_absent(&connection, &receipt.candidate).unwrap();
+            assert!(crate::actor_queue::events(&connection, &candidate)
+                .unwrap()
+                .is_empty());
             assert_eq!(
                 connection
                     .query_row("SELECT count(*) FROM sandboxes_current", [], |row| row
@@ -2006,6 +2139,9 @@ mod tests {
                 [&candidate], |row| row.get::<_, usize>(0),
             ).unwrap(), 2);
         }
+        store
+            .verify_prepared_queue_custody(&task.custody())
+            .unwrap();
         let restored = store
             .checkpoint_inspect_restore(&actor, "host:restore", inspect)
             .unwrap()
@@ -2025,6 +2161,27 @@ mod tests {
         assert_custom_audience(&store, &restored.agent, 1);
         let restored_ref = restored.agent.canonical_ref.clone();
         let ids = receipt.candidate.agent_ids().unwrap();
+        let queue = store.actor_queue_list(&actor, &ids.session).unwrap();
+        assert_eq!(queue.len(), 1);
+        let input = &queue[0];
+        assert_eq!(input.state, crate::QueueState::Pending);
+        assert_eq!(input.request.branch_id, ids.branch);
+        assert_eq!(input.request.recipient_site, "fixture:restore-site");
+        assert_eq!(input.request.request_id, task.queue_request_id);
+        assert_eq!(input.payload_ref, task.payload_ref);
+        assert!(!serde_json::to_string(input).unwrap().contains(task_text));
+        let plaintext =
+            crate::SecretStore::get(&store.local_secret_store().unwrap(), &input.payload_ref)
+                .unwrap();
+        assert_eq!(plaintext.as_slice(), task_text.as_bytes());
+        drop(plaintext);
+        let changed_task = CheckpointRestoreRequest {
+            task: Some("different initial input".into()),
+            ..request.clone()
+        };
+        assert!(store
+            .checkpoint_replay_restore(&actor, &changed_task, "host:restore")
+            .is_err());
         let snapshot = store.sandbox_get(&actor, &sandbox).unwrap();
         assert_eq!(snapshot.sources.len(), 2);
         assert_eq!(
@@ -2050,7 +2207,14 @@ mod tests {
             .agent_admission(&actor, &restored_ref, crate::AgentAdmission::Open, None)
             .is_err());
         assert!(store
-            .actor_queue_claim_next(&actor, &ids.session, &ids.branch, "local", "fixture", 1,)
+            .actor_queue_claim_next(
+                &actor,
+                &ids.session,
+                &ids.branch,
+                "fixture:restore-site",
+                "fixture",
+                1,
+            )
             .is_err());
         {
             let connection = store.connection().unwrap();
@@ -2095,6 +2259,7 @@ mod tests {
                 &request,
                 &layout,
                 "host:retired",
+                "local",
                 |_, _, _| panic!("retired checkpoint cannot authorize new restore")
             )
             .is_err());
@@ -2143,6 +2308,19 @@ mod tests {
 
         // Logical close of the actual restored Agent/Sandbox uses their
         // original lifecycle owners. No driver call or filesystem cleanup.
+        assert_eq!(store.actor_queue_list(&actor, &ids.session).unwrap(), queue);
+        store
+            .verify_prepared_queue_custody(&task.custody())
+            .unwrap();
+        // Normal pending-input deletion owns cancellation before terminal
+        // close; restore does not invent a separate task lifecycle.
+        let writer_epoch = queue[0].request.writer_epoch;
+        store
+            .actor_queue_delete(&actor, &ids.session, &task.queue_request_id, writer_epoch)
+            .unwrap();
+        assert!(store
+            .verify_prepared_queue_custody(&task.custody())
+            .is_err());
         assert!(store.sandbox_restore_preparation(&actor, &sandbox).is_err());
         assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
         store

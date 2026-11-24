@@ -1,11 +1,13 @@
 //! Existing immutable construction receipts, shared by task and source custody.
 //! Indexed replay lookup; no separate operation ledger or public resource.
 use crate::{
+    actor_queue::{self, PreparedQueueCustody},
     agent_owner::{self, AgentKey, AgentPermission},
     audit_with_security_metadata, db, label,
     resources::SessionCandidateIds,
     source_compatibility::{compatibility, SourceCompatibility},
-    user_for_principal, Error, Result, SessionStore, SourceMutationBarrier, SourceMutationOutcome,
+    user_for_principal, workspace_writer, ActorQueueRequest, Error, QueueTarget, Result,
+    SessionStore, SourceMutationBarrier, SourceMutationOutcome,
 };
 use aw_agent_core::{
     ExternalEvidence, NamedPreparedSource, PreparedSourceSet, PrincipalId, SourceDriverRegistry,
@@ -15,6 +17,7 @@ use aw_agent_core::{
 };
 use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // Each descriptor's bounded fields fit within the same encoded allowance as
 // an anchor. Decode at most one receipt at a time, including after restart.
@@ -73,6 +76,75 @@ pub(crate) struct InitialTask {
     pub(crate) queue_request_id: String,
     pub(crate) payload_ref: String,
     pub(crate) payload_sha256: String,
+    // Old task-only receipts did not record the trusted site. Keep their
+    // exact encoding; new preparations pin it for restart publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_site: Option<String>,
+}
+
+impl InitialTask {
+    pub(crate) fn mint(
+        request_id: &str,
+        session: &str,
+        payload: &str,
+        execution_site: &str,
+    ) -> Result<Self> {
+        crate::agent_host::validate_execution_site(execution_site)?;
+        // Preserve the original candidate-local initial input namespace.
+        let mut hash = Sha256::new();
+        hash.update(b"aw-host-agent-create-initial-task-v1\0");
+        for part in [request_id.as_bytes(), session.as_bytes()] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        let queue_request_id = format!("hq_{:x}", hash.finalize());
+        let custody =
+            actor_queue::mint_prepared_queue_custody(session, &queue_request_id, payload)?;
+        Ok(Self {
+            queue_request_id,
+            payload_ref: custody.payload_ref,
+            payload_sha256: custody.payload_sha256,
+            execution_site: Some(execution_site.to_owned()),
+        })
+    }
+
+    pub(crate) fn custody(&self) -> PreparedQueueCustody {
+        PreparedQueueCustody {
+            payload_ref: self.payload_ref.clone(),
+            payload_sha256: self.payload_sha256.clone(),
+        }
+    }
+
+    pub(crate) fn publish_in(
+        &self,
+        connection: &Connection,
+        owner: &PrincipalId,
+        session: &str,
+        branch: &str,
+    ) -> Result<()> {
+        let site = self
+            .execution_site
+            .as_ref()
+            .ok_or(Error::Storage("initial task has no pinned execution site"))?;
+        let writer = workspace_writer::require_workspace_writer_for_session(connection, session)?;
+        actor_queue::publish_prepared_queue_in(
+            connection,
+            owner,
+            ActorQueueRequest {
+                request_id: self.queue_request_id.clone(),
+                session_id: session.to_owned(),
+                branch_id: branch.to_owned(),
+                recipient_site: site.clone(),
+                sender: "host:create".into(),
+                message_id: 1,
+                writer_epoch: writer.writer_epoch,
+                target: QueueTarget::Auto,
+                priority: 0,
+            },
+            &self.custody(),
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +350,20 @@ impl ConstructionPreparation {
             if !digest(&task.payload_sha256) || task.payload_ref.contains("://") {
                 return Err(Error::Storage("invalid initial task custody identity"));
             }
+            if let Some(site) = &task.execution_site {
+                crate::agent_host::validate_execution_site(site)?;
+            }
+            if self.operation == ConstructionOperation::CheckpointRestore
+                && (task.execution_site.is_none()
+                    || self.sources.is_none()
+                    || task.payload_ref.len() != 68
+                    || !task.payload_ref.starts_with("sec_")
+                    || !task.payload_ref[4..].bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err(Error::Storage(
+                    "restore task requires exact prepared source custody",
+                ));
+            }
         }
         if let Some(boundary) = &self.capture_boundary {
             if self.operation != ConstructionOperation::CheckpointCreate {
@@ -422,6 +508,7 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
                 queue_request_id: legacy.queue_request_id,
                 payload_ref: legacy.payload_ref,
                 payload_sha256: legacy.payload_sha256,
+                execution_site: None,
             }),
             sources: None,
             capture_boundary: None,
@@ -674,6 +761,11 @@ pub(crate) fn reconcile_unpublished_sources<F>(
             db(tx.commit())?;
         }
         let fence = reconcile()?;
+        // The source barrier also excludes recovery of this operation's
+        // private task. Never discard an Applied candidate's queue input.
+        if let Some(task) = &receipt.task {
+            store.discard_prepared_queue_custody(&task.custody())?;
+        }
         let finish = (|| {
             let mut connection = store.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;

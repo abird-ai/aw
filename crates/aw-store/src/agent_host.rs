@@ -6,9 +6,9 @@
 
 use crate::{
     actor_queue, agent_owner, audit, db, history_owner, principal_groups, resources,
-    stable_user_principal, user_for_principal, workspace_writer, ActorQueueRequest,
-    AgentAccessSnapshot, AgentHistoryForkAccess, AgentPermission, AgentPermissions, Error,
-    PrincipalId, QueueTarget, Result, SessionBinding, SessionStore,
+    stable_user_principal, user_for_principal, workspace_writer, AgentAccessSnapshot,
+    AgentHistoryForkAccess, AgentPermission, AgentPermissions, Error, PrincipalId, Result,
+    SessionBinding, SessionStore,
 };
 use aw_tools::execution_ref::{AgentRef, ExecutionRef, ExecutionSegment};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -279,7 +279,7 @@ fn validate_host_request_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_execution_site(value: &str) -> Result<()> {
+pub(crate) fn validate_execution_site(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
         || !value.is_ascii()
@@ -320,16 +320,6 @@ fn agent_create_fingerprint(
     hash.update(b"aw-host-agent-create-v1\0");
     hash.update(encoded);
     Ok(format!("{:x}", hash.finalize()))
-}
-
-fn initial_task_request_id(host_request_id: &str, session_id: &str) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"aw-host-agent-create-initial-task-v1\0");
-    for part in [host_request_id.as_bytes(), session_id.as_bytes()] {
-        hash.update((part.len() as u64).to_be_bytes());
-        hash.update(part);
-    }
-    format!("hq_{:x}", hash.finalize())
 }
 
 fn agent_create_preparation_in(
@@ -966,9 +956,9 @@ impl SessionStore {
             };
 
             let ids = resources::mint_session_candidate_ids()?;
-            let queue_request_id = initial_task_request_id(request_id, &ids.session);
-            let custody =
-                actor_queue::mint_prepared_queue_custody(&ids.session, &queue_request_id, task)?;
+            let initial_task =
+                InitialTask::mint(request_id, &ids.session, task, &context.execution_site)?;
+            let custody = initial_task.custody();
             let operation = ConstructionOperation::AgentCreate;
             let preparation = AgentCreatePreparation {
                 operation,
@@ -988,11 +978,7 @@ impl SessionStore {
                     branch: ids.branch,
                     sandbox: None,
                 },
-                task: Some(InitialTask {
-                    queue_request_id,
-                    payload_ref: custody.payload_ref.clone(),
-                    payload_sha256: custody.payload_sha256.clone(),
-                }),
+                task: Some(initial_task),
                 sources: None,
                 capture_boundary: None,
                 restore_boundary: None,
@@ -1222,7 +1208,7 @@ impl SessionStore {
                 }
             }
 
-            if let Some((_, _, preparation, custody)) = &prepared_task {
+            if let Some((_, _, preparation, _)) = &prepared_task {
                 let ids = preparation.candidate.agent_ids()?;
                 if session.id != ids.session || branch.id != ids.branch {
                     return Err(Error::Conflict(
@@ -1230,24 +1216,9 @@ impl SessionStore {
                     ));
                 }
                 let owner = stable_user_principal(&selected_project.identity)?;
-                let writer =
-                    workspace_writer::require_workspace_writer_for_session(&tx, &session.id)?;
-                actor_queue::publish_prepared_queue_in(
-                    &tx,
-                    &owner,
-                    ActorQueueRequest {
-                        request_id: preparation.initial_task()?.queue_request_id.clone(),
-                        session_id: session.id.clone(),
-                        branch_id: branch.id.clone(),
-                        recipient_site: context.execution_site.clone(),
-                        sender: "host:create".into(),
-                        message_id: 1,
-                        writer_epoch: writer.writer_epoch,
-                        target: QueueTarget::Auto,
-                        priority: 0,
-                    },
-                    custody,
-                )?;
+                preparation
+                    .initial_task()?
+                    .publish_in(&tx, &owner, &session.id, &branch.id)?;
             }
 
             let canonical = db(tx.query_row(
