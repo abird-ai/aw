@@ -14,6 +14,7 @@ pub mod completion;
 pub mod control;
 pub mod conversation;
 pub mod error;
+pub mod event_handler;
 pub mod event_type;
 pub mod extension;
 /// One typed nonblocking Next/Defer hook service; no alternate Agent engine.
@@ -55,6 +56,9 @@ pub use conversation::{
     usage_for, Conversation, InvocationRecord, Message, Outcome, Role, Turn, UsageSummary,
 };
 pub use error::{Error, Result};
+pub use event_handler::{
+    EventHandlerDescriptor, EventHandlerKey, EventHandlerRegistry, EventHandlerRegistryReader,
+};
 pub use event_type::{
     EventKey, EventPayload, EventSchemaRef, EventTypeDescriptor, EventTypeRegistry,
     EventTypeRegistryReader,

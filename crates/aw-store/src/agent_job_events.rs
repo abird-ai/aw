@@ -1795,7 +1795,9 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE event_custom_turn_counts;
+                "DROP TABLE event_handler_receipts_current;
+                 DROP TABLE event_handler_cursors_current;
+                 DROP TABLE event_custom_turn_counts;
                  DROP TABLE agent_event_input_audience;
                  DROP TABLE event_causal_attention;
                  DROP INDEX runs_event_input_delivery;
@@ -1824,11 +1826,12 @@ mod tests {
         crate::migrate_event_inputs(&mut connection).unwrap();
         crate::migrate_event_disclosure_causal(&mut connection).unwrap();
         crate::migrate_custom_events(&mut connection).unwrap();
+        crate::migrate_event_handlers(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            51
+            52
         );
         for source in [&root, &turn_ref] {
             assert_eq!(

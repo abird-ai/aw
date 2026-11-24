@@ -7,6 +7,46 @@
 use crate::{publication, Error, Result};
 use std::sync::Arc;
 
+pub(crate) const MAX_REGISTRATION_COMPONENT_BYTES: usize = 48;
+
+pub(crate) fn validate_extension_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_REGISTRATION_COMPONENT_BYTES
+        || !value.is_ascii()
+        || !value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+    {
+        return Err(Error::Config(
+            "ExtensionId requires a lowercase bounded slug".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_local_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_REGISTRATION_COMPONENT_BYTES
+        || !value.is_ascii()
+        || !value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        return Err(Error::Config(
+            "local registration ID requires a lowercase bounded slug".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct StagedRegistry<T> {
     publisher: publication::Publisher<T>,
     readers: publication::ReaderFactory<T>,

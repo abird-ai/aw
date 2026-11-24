@@ -367,9 +367,26 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       **1/1** proves relative subscription + real Turn publication/readback + cross-Project denial, and the
       existing v51 combined Event lifecycle remains green. Zero-test filtered historical subagent commands
       are not counted as evidence.
-      **Next:** add EventHandler as EventScan's third consumer with separate definition/activation and
-      at-least-once receipt/ACK ownership; do not reuse EventInput and do not add a second Event queue.
-      Wider selector placement and explicit v36 delivery_cutover_rev remain subsequent slices.
+      **v52 EventHandler third consumer landed locally:** EventHandlerRegistry is the second typed leaf on
+      the same staged-registry core and owns inert definitions only; registration creates no cursor/authority.
+      Store activation persists one authority/StoreScope/placement-bound cursor plus at most one deterministic
+      in-flight receipt keyed by activation generation + Event.id, with no payload/output/product-state copy.
+      `now|earliest_available` baselines reuse the shared logical retention floor. Poll is EventScan's third
+      consumer: proven skips may advance only before a receipt, Unknown holds, structural placement loss
+      lags, while service-authority loss blocks. A receipt replays the same immutable Event until explicit ACK;
+      ACK re-runs exact source + DisclosureManifest authorization before deleting the receipt/advancing the
+      cursor. Suspend preserves cursor/receipt but stops delivery/pinning; compatible activation resumes the
+      same generation; lag requires explicit rebaseline/new generation. Handler callback/product state and
+      external-effect idempotency stay host-owned; no EventInput/Agent rev/causal budget or second Event
+      queue exists. Shared selector hashing/public Event projection/earliest-retained-floor mechanics were
+      reused rather than cloned. Focused Handler registry **1/1**, real receipt lifecycle **1/1**, EventScan
+      **1/1**, projection **1/1**, EventType **1/1**, combined Event migration/lifecycle **1/1** and strict
+      affected Clippy/check are green; migration now reaches v52.
+      **Next:** sealed Phase-2 step 12 — same-store cross-Domain selector completeness under the authoritative
+      Domain-placement universe, with hidden Domains excluded from affinity and explicit stale/failure rather
+      than partial results for any authorized matching Domain outside the one Event store. No merged/global
+      cursor. Then land the explicit v36 delivery_cutover_rev source-owner transaction as the final legacy
+      delivery cutover.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

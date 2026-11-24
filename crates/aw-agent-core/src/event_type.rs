@@ -3,7 +3,10 @@
 //! EventTypeRegistry owns definition/schema identity only. It owns no Event
 //! instances, history, grants, subscriptions or delivery authority.
 
-use crate::{registry::StagedRegistry, Error, Result};
+use crate::{
+    registry::{self, StagedRegistry},
+    Error, Result,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     any::TypeId,
@@ -13,7 +16,6 @@ use std::{
 };
 
 const MAX_EVENT_TYPES: usize = 1024;
-const MAX_EVENT_COMPONENT_BYTES: usize = 48;
 
 pub trait EventPayload: Serialize + DeserializeOwned + Send + Sync + 'static {}
 impl<T> EventPayload for T where T: Serialize + DeserializeOwned + Send + Sync + 'static {}
@@ -117,25 +119,6 @@ struct EventTypeSnapshot {
     entries: BTreeMap<(String, String), EventTypeEntry>,
 }
 
-fn validate_extension_id(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > MAX_EVENT_COMPONENT_BYTES
-        || !value.is_ascii()
-        || !value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_lowercase())
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
-        })
-    {
-        return Err(Error::Config(
-            "EventType ExtensionId requires a lowercase bounded slug".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn encode_extension_id(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -148,28 +131,9 @@ fn encode_extension_id(value: &str) -> String {
     out
 }
 
-fn validate_local_id(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > MAX_EVENT_COMPONENT_BYTES
-        || !value.is_ascii()
-        || !value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_lowercase())
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-        })
-    {
-        return Err(Error::Config(
-            "EventType local ID requires a lowercase bounded slug".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn wire_event(extension: &str, id: &str) -> Result<String> {
-    validate_extension_id(extension)?;
-    validate_local_id(id)?;
+    registry::validate_extension_id(extension)?;
+    registry::validate_local_id(id)?;
     let extension = encode_extension_id(extension);
     let event = format!("#{extension}_{id}");
     if event.len() > 64 {

@@ -22,10 +22,10 @@ complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v4
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
 exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery,
 v50 disclosure/causal execution closure, the v51 one-leaf EventTypeRegistry + custom Event publication
-owner, and the model-facing `events_publish` / `events_subscribe` adapter over those exact owners are now
-implemented locally. Materialized/provider audience expansion remains Unknown until its provider-held
-principal fence exists; wider Principal/Domain selectors, EventHandler delivery and the v36 delivery cutover
-remain later Phase-2 work.
+owner, the model-facing `events_publish` / `events_subscribe` adapter, and v52 EventHandler
+definition/activation/receipt ownership are now implemented locally. Materialized/provider audience expansion
+remains Unknown until its provider-held principal fence exists; same-store cross-Domain selector completeness
+and the v36 delivery cutover remain later Phase-2 work.
 Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
 evidence and are not claimed green.**
 
@@ -42,10 +42,10 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 The local Phase-1/2 implementation line remains unpublished. Phase-1 completion is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 began at
 `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and currently runs
-through `bd18dcd2dbbcd77641d9da8a437710754fbab38a` (`Propagate Event disclosure and causality`), with the
-intermediate private EventScan/source/read/wake/Project/subscription/EventInput checkpoints preserved in
-Git history. This checkpoint adds the v51 final EventType leaf and custom publication owner. The local
-`origin/main` tracking ref is stale and is not publication truth.
+through `a0549147f2c2bee2791dcca5760b3057deea21d3` (`Expose model Event tools`), with the
+intermediate private EventScan/source/read/wake/Project/subscription/EventInput/disclosure/custom-publication
+checkpoints preserved in Git history. This checkpoint adds the v52 EventHandler definition + durable
+at-least-once receipt owner. The local `origin/main` tracking ref is stale and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -863,12 +863,79 @@ Repository fmt, full workspace all-target compilation, strict root+adapter+Store
 are green. The attempted historical subagent long-test filters execute zero tests in the current harness
 and are **not** counted as evidence; their changed visible-tool expectations are compile-checked instead.
 
-No EventHandler consumer or v36 delivery cutover is implemented. `delivery_cutover_rev` remains NULL and
-legacy pending delivery/ACK ownership is unchanged.
+Schema **v52** adds EventHandler as EventScan's third consumer without turning the Handler registry into a
+runtime queue. `EventHandlerRegistry` is the second real leaf on the same private staged-registry core used
+by EventType. It owns only inert typed native definitions: stable Extension/local ID, bounded declared
+pattern, schema version, exact registration revision and the concrete in-process implementation type.
+Registration creates no Store cursor, pins no retention and grants no Event authority. The lock-free
+`EventHandlerRegistryReader` revalidates the exact registration before returning a descriptor or typed
+implementation; unrelated Handler definitions do not stale a handle, while exact removal/re-registration
+does. The common Extension/local-ID validation moved into the existing private registry core rather than
+being duplicated between leaves. Canonical EventPattern syntax remains Store-owned and is validated when a
+trusted host actually activates the inert definition.
 
-**Next Phase-2 slice:** add EventHandler as EventScan's third consumer, with definition/activation kept
-separate and an independent at-least-once receipt/ACK owner—no EventInput reuse and no second Event queue.
-Keep wider selector placement and explicit v36 `delivery_cutover_rev` cutover as later slices.
+The durable owner is deliberately smaller than an extension runtime. `event_handler_cursors_current` owns
+only one StoreScope/placement-bound activation per `(extension,handler)`: schema/registration identity,
+normalized pattern hash, activation generation, `active|suspended|lagged`, explicit service principal +
+opaque authenticated authority ref/generation, private baseline/scan position and lag reason.
+`event_handler_receipts_current` owns **one** deterministic in-flight receipt for that ordered consumer:
+activation generation + Event.id + Event Store position. It never copies Event payload/data, Handler output
+or product state. Handler/product read models and external-effect idempotency remain outside AW.
+
+Activation is explicit and separate from definition registration. `start=now` baselines at the current safe
+Event tail; `earliest_available` starts immediately before the oldest Event still promised by the existing
+seven-day-or-newest-65,536 logical retention floor. A compatible suspended reinstall resumes the retained
+cursor/receipt and keeps activation generation; an updated compatible executable registration may advance
+only its registration revision. A lagged Handler never silently resumes through ordinary activate:
+`events_handler_rebaseline` is the explicit recovery operation and mints a fresh activation generation/
+baseline. StoreScope or structural placement mismatch likewise transitions active/suspended state to
+`lagged`; service-principal authority loss is instead retryable blocking, so authority restoration can
+resume without pretending the resource moved.
+
+`events_handler_poll` is the lower bounded host-scheduler seam and creates no worker/backoff loop. With no
+receipt, EventScan may privately advance proven nonmatches/denials; Unknown holds progress. On a visible
+authorized candidate AW persists one deterministic `ehr_...` receipt and returns the existing public-safe
+Event projection. Re-poll before ACK reloads immutable Event truth and returns the **same receipt/Event**.
+No cursor advances past that candidate. `events_handler_ack` revalidates the exact current definition,
+activation, service binding, structural placement, source visibility and DisclosureManifest closure by
+running the same EventScan candidate again; only then does one transaction delete the receipt and advance
+the cursor to that Event position. Repeating the immediately committed ACK is idempotent through the
+persisted last-acked receipt. A stale placement lags instead of ACKing; an unavailable/revoked service or
+deeper authority leaves progress unchanged.
+
+This is intentionally not EventInput delivery: no recipient Agent, no Agent rev, no causal-delivery budget
+and no copied pending Event queue. It also does not fabricate the future `ExtensionContext` callback inside
+Store. A trusted native/product host obtains the typed implementation from EventHandlerRegistry, polls one
+authorized delivery, performs its own idempotent/product work using immutable `Event.id` as provenance, and
+ACKs only an accepted result. That preserves at-least-once semantics and keeps uncertain external-effect
+receipts where they belong.
+
+The same cut narrows two shared third-consumer mechanics instead of duplicating them: Event selector hashing
+now lives in EventScan, the public-safe Event projection is reused from Event read, and
+`event_retention::earliest_available_after` derives from the same logical retention-floor calculation used
+for expiration. No generic cursor manager or Jobs+Events traversal was added.
+
+Focused v52 evidence remains compact: Handler staged-registry **1/1** proves typed implementation retrieval,
+unrelated-definition stability, invalid-stage revision neutrality, exact removal staleness and
+re-registration renewal. The real Store Handler lifecycle regression **1/1** publishes retained Events,
+activates from earliest available, proves the same deterministic receipt/Event replays until ACK, proves ACK
+and immediate ACK replay idempotency, delivers a second Event, suspends without losing its unacked receipt,
+resumes the compatible activation at the same generation, and proves an explicitly lagged cursor stays
+lagged until rebaseline increments generation. EventScan **1/1**, projection **1/1**, EventType **1/1** and
+the existing combined Event lifecycle/migration regression **1/1** remain green; migration now exercises
+v44→...→v52. Repository fmt, full workspace all-target check, strict affected all-target Clippy and
+scoped diff-check are green. The historical broad Store result remains
+**226 green / 4 stale downgrade-fixture reds** and was not rerun.
+
+No same-store broad cross-Domain selector or v36 delivery cutover is implemented.
+`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+
+**Next Phase-2 slice:** implement sealed step 12: one-store v1 cross-Domain selector completeness using only
+the host's authoritative Domain-placement universe. Hidden Domains must not perturb caller affinity; a
+currently authorized matching Domain that cannot be proven in the same Event store must fail/stale rather
+than return a partial merged world. Keep exact per-source authorization and no merged/global Event cursor.
+After that, perform the explicit v36 `delivery_cutover_rev` source-owner transaction as the final Phase-2
+legacy-delivery cutover.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

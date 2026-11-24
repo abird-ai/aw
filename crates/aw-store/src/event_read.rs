@@ -20,7 +20,7 @@ use aw_agent_core::EventSchemaRef;
 use aw_tools::event_subject::EventPattern;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+
 use std::collections::HashMap;
 
 const MAX_VISIBLE_EVENTS: usize = 256;
@@ -142,7 +142,7 @@ impl SessionStore {
         let pattern = EventPattern::parse_absolute(subject)
             .map_err(|_| Error::Denied("invalid Event subject pattern"))?;
         let placement = EventSelectorPlacement::from_pattern(&pattern)?;
-        let selector_sha256 = selector_hash(pattern.as_str());
+        let selector_sha256 = event_scan::selector_hash(pattern.as_str());
 
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
@@ -438,7 +438,7 @@ fn cursor_row(connection: &Connection, cursor: &str) -> Result<Option<CursorRow>
     .transpose()
 }
 
-fn project_event(candidate: &EventCandidate, envelope: EventEnvelope) -> EventReadEvent {
+pub(crate) fn project_event(candidate: &EventCandidate, envelope: EventEnvelope) -> EventReadEvent {
     EventReadEvent {
         id: candidate.event_id.clone(),
         subject: candidate.subject.clone(),
@@ -450,14 +450,6 @@ fn project_event(candidate: &EventCandidate, envelope: EventEnvelope) -> EventRe
         causal_hop: envelope.causal_hop,
         schema: envelope.schema,
     }
-}
-
-fn selector_hash(subject: &str) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"aw-event-selector-v1\0");
-    hash.update((subject.len() as u64).to_be_bytes());
-    hash.update(subject.as_bytes());
-    hash.finalize().into()
 }
 
 fn cleanup_expired_cursors(connection: &Connection, actor: &PrincipalId, at: i64) -> Result<()> {

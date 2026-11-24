@@ -12,8 +12,17 @@ use crate::{
 };
 use aw_tools::event_subject::EventPattern;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest as _, Sha256};
 
 pub(crate) const MAX_EVENT_SCAN_ROWS: usize = 4096;
+
+pub(crate) fn selector_hash(subject: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-event-selector-v1\0");
+    hash.update((subject.len() as u64).to_be_bytes());
+    hash.update(subject.as_bytes());
+    hash.finalize().into()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EventAuthorization<Evidence> {
