@@ -145,6 +145,39 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     );
     assert_eq!(std::fs::read(f.root.join(".git/index")).unwrap(), index);
 
+    // A schema-1 descriptor from the clean-only implementation is still
+    // executable/inspectable under the new registry, with its original pin.
+    let mut legacy = driver
+        .plan_capture(&binding, "cp_legacy", "op_legacy")
+        .unwrap();
+    let d = &mut legacy.descriptor;
+    d.recovery_schema = 1;
+    d.fields
+        .retain(|field| !matches!(field.name.as_str(), "tree" | "status"));
+    {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"aw-git-capture-v1\0");
+        let mut part = |bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        };
+        part(d.prepare_id.as_bytes());
+        for field in &d.fields {
+            part(field.name.as_bytes());
+            part(field.value.as_bytes());
+        }
+        d.prepared_identity = format!("{:x}", hash.finalize());
+    }
+    assert!(reader.resolve(&legacy.descriptor.pin().unwrap()).is_ok());
+    let legacy_anchor = driver.execute_capture(&legacy).unwrap();
+    assert_eq!(legacy_anchor.anchor_schema, 1);
+    assert_eq!(legacy_anchor.captured_commit, anchor.captured_commit);
+    driver.revalidate_capture(&legacy, &legacy_anchor).unwrap();
+    assert!(
+        matches!(driver.inspect_capture(&legacy).unwrap(), RecoveryInspection::Completed { result, .. } if result == legacy_anchor)
+    );
+
     // New runtime registry, same durable identity; no re-execution.
     let restarted = SourceDriverRegistry::new();
     let handle = GitSourceDriver::new(&f.git)
@@ -203,7 +236,7 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
     ));
     assert!(driver
         .plan_capture(&binding, "cp_dirty", "op_dirty")
-        .is_err());
+        .is_ok());
     assert!(f
         .run(&["for-each-ref", "refs/aw/checkpoints/cp_stale"])
         .stdout
@@ -227,9 +260,11 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
         "--cacheinfo",
         &format!("160000,{},nested", anchor.captured_commit),
     ]);
+    // A staged-only gitlink whose worktree path is absent is a deletion
+    // in the final tree, just like a staged regular file removed afterwards.
     assert!(driver
         .plan_capture(&binding, "cp_gitlink", "op_gitlink")
-        .is_err());
+        .is_ok());
     f.run(&["update-index", "--force-remove", "nested"]);
     f.write(".git/objects/info/alternates", b"\n");
     assert!(driver
@@ -268,6 +303,248 @@ fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
         driver.inspect_capture(&collision).unwrap(),
         RecoveryInspection::Unknown
     ));
+}
+
+#[cfg(feature = "source-driver")]
+#[test]
+fn prepared_git_capture_preserves_final_dirty_tree_and_exact_gitlinks() {
+    use aw_agent_core::{
+        CheckpointPolicy, PreparedSourceOperation, RecoveryInspection, SourceAccess, SourceName,
+    };
+    use aw_git::source_driver::GitSourceDriver;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let f = Fixture::new();
+    let module = Fixture::new();
+    f.run(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        module.root.to_str().unwrap(),
+        "nested",
+    ]);
+    f.write(".gitignore", b"ignored*\n");
+    f.write(".gitattributes", b"*.txt text eol=lf\n");
+    f.write("deleted", b"delete me");
+    f.write("dir/old", b"old child");
+    symlink("a.txt", f.root.join("tracked-link")).unwrap();
+    f.run(&["add", "."]);
+    f.run(&["commit", "-m", "base with gitlink", "--no-gpg-sign"]);
+    let base = String::from_utf8(f.run(&["rev-parse", "HEAD"]).stdout).unwrap();
+    let base = base.trim();
+    let old_gitlink = String::from_utf8(f.run(&["rev-parse", "HEAD:nested"]).stdout).unwrap();
+
+    let driver = GitSourceDriver::new(&f.git).unwrap();
+    let binding = driver
+        .binding(
+            &f.root,
+            SourceName::new("code").unwrap(),
+            SourceAccess::ReadWrite,
+            CheckpointPolicy::Required,
+        )
+        .unwrap();
+
+    f.write("a.txt", b"staged\n");
+    f.run(&["add", "a.txt"]);
+    f.write("a.txt", b"working\r\n");
+    std::fs::remove_file(f.root.join("deleted")).unwrap();
+    std::fs::remove_dir_all(f.root.join("dir")).unwrap();
+    f.write("dir", b"replacement file");
+    f.write("ignored-untracked", b"must not enter snapshot");
+    f.write("ignored-staged", b"first staged bytes");
+    f.run(&["add", "-f", "ignored-staged"]);
+    f.write("ignored-staged", b"final tracked bytes");
+    f.write("new\nfile", b"untracked regular bytes\0");
+    f.write("script", b"#!/bin/sh\n");
+    std::fs::set_permissions(
+        f.root.join("script"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::remove_file(f.root.join("tracked-link")).unwrap();
+    symlink("deleted", f.root.join("tracked-link")).unwrap();
+    symlink(&module.root, f.root.join("untracked-link")).unwrap();
+
+    // Dirty nested repositories are refused, not traversed into the parent tree.
+    f.write("nested/a.txt", b"dirty nested\n");
+    assert!(driver
+        .plan_capture(&binding, "cp_nested_dirty", "op_nested_dirty")
+        .is_err());
+    let nested = |args: &[&str]| {
+        let out = f
+            .cmd()
+            .current_dir(f.root.join("nested"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "nested git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    nested(&["add", "a.txt"]);
+    nested(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@aw.invalid",
+        "commit",
+        "-m",
+        "new nested HEAD",
+        "--no-gpg-sign",
+    ]);
+    let nested_head = String::from_utf8(nested(&["rev-parse", "HEAD"])).unwrap();
+
+    let index = std::fs::read(f.root.join(".git/index")).unwrap();
+    let objects = f.run(&["count-objects", "-v"]).stdout;
+    let prepared = driver
+        .plan_capture(&binding, "cp_dirty_tree", "op_dirty_tree")
+        .unwrap();
+    assert_eq!(f.run(&["count-objects", "-v"]).stdout, objects);
+    assert!(f
+        .run(&["for-each-ref", "refs/aw/checkpoints/cp_dirty_tree"])
+        .stdout
+        .is_empty());
+    assert_eq!(std::fs::read(f.root.join(".git/index")).unwrap(), index);
+    assert!(matches!(
+        driver.inspect_capture(&prepared).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+
+    let anchor = driver.execute_capture(&prepared).unwrap();
+    assert!(anchor.is_dirty());
+    assert_eq!(anchor.base_commit, base);
+    assert_eq!(
+        f.run(&["rev-parse", "HEAD"]).stdout,
+        format!("{base}\n").as_bytes()
+    );
+    assert_eq!(
+        f.run(&["symbolic-ref", "HEAD"]).stdout,
+        b"refs/heads/main\n"
+    );
+    assert_eq!(std::fs::read(f.root.join(".git/index")).unwrap(), index);
+    let contents = |path: &str| {
+        f.run(&["show", &format!("{}:{path}", anchor.captured_commit)])
+            .stdout
+    };
+    assert_eq!(contents("a.txt"), b"working\n");
+    assert_eq!(contents("dir"), b"replacement file");
+    assert_eq!(contents("ignored-staged"), b"final tracked bytes");
+    assert_eq!(contents("new\nfile"), b"untracked regular bytes\0");
+    assert_eq!(contents("tracked-link"), b"deleted");
+    let tree = f
+        .run(&["ls-tree", "-r", "-z", &anchor.captured_commit])
+        .stdout;
+    let paths: Vec<_> = tree
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.splitn(2, |b| *b == b'\t').nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            b".gitattributes".as_slice(),
+            b".gitignore",
+            b".gitmodules",
+            b"a.txt",
+            b"dir",
+            b"ignored-staged",
+            b"nested",
+            b"new\nfile",
+            b"script",
+            b"tracked-link",
+        ]
+    );
+    assert!(tree
+        .split(|b| *b == 0)
+        .any(|entry| entry.starts_with(b"100755 blob ") && entry.ends_with(b"\tscript")));
+    assert!(tree
+        .split(|b| *b == 0)
+        .any(|entry| entry.starts_with(b"120000 blob ") && entry.ends_with(b"\ttracked-link")));
+    assert_eq!(
+        f.run(&["rev-parse", &format!("{}:nested", anchor.captured_commit)])
+            .stdout,
+        nested_head.as_bytes()
+    );
+    driver.revalidate_capture(&prepared, &anchor).unwrap();
+
+    let stale = driver
+        .plan_capture(&binding, "cp_stale_dirty", "op_stale_dirty")
+        .unwrap();
+    // Same status, different content must fail the observation fence.
+    f.write("a.txt", b"changed\r\n");
+    assert!(driver.execute_capture(&stale).is_err());
+    assert!(driver.revalidate_capture(&prepared, &anchor).is_err());
+    let descriptor: PreparedSourceOperation =
+        serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+    let restarted = GitSourceDriver::new(&f.git).unwrap();
+    match restarted.inspect_capture(&descriptor).unwrap() {
+        RecoveryInspection::Completed { result, .. } => assert_eq!(result, anchor),
+        other => panic!("expected retained dirty capture, got {other:?}"),
+    }
+
+    // An unrelated commit with the very same tree and parent is not this
+    // Prepared operation, even if the private ref is redirected to it.
+    let tree_oid = String::from_utf8(
+        f.run(&["rev-parse", &format!("{}^{{tree}}", anchor.captured_commit)])
+            .stdout,
+    )
+    .unwrap();
+    let other = String::from_utf8(
+        f.run(&[
+            "commit-tree",
+            tree_oid.trim(),
+            "-p",
+            base,
+            "-m",
+            "not this capture",
+            "--no-gpg-sign",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    f.run(&["update-ref", &anchor.retention_ref(), other.trim()]);
+    assert!(matches!(
+        restarted.inspect_capture(&descriptor).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    f.run(&[
+        "update-ref",
+        &anchor.retention_ref(),
+        &anchor.captured_commit,
+    ]);
+
+    // An uninitialized empty gitlink retains the index OID, without fetching
+    // or copying a nested repository's files into the superproject.
+    f.run(&["submodule", "deinit", "-f", "--", "nested"]);
+    let uninitialized = driver
+        .plan_capture(&binding, "cp_uninitialized", "op_uninitialized")
+        .unwrap();
+    let uninitialized = driver.execute_capture(&uninitialized).unwrap();
+    assert_eq!(
+        f.run(&[
+            "rev-parse",
+            &format!("{}:nested", uninitialized.captured_commit)
+        ])
+        .stdout,
+        old_gitlink.as_bytes()
+    );
+
+    // A live synthetic retention ref protects both trees after the user
+    // moves HEAD and ordinary Git GC prunes unretained objects.
+    f.run(&["reset", "--hard", "HEAD^"]);
+    f.run(&["reflog", "expire", "--expire=now", "--all"]);
+    f.run(&["gc", "--prune=now"]);
+    restarted.verify_anchor(&f.root, &anchor).unwrap();
+    assert_eq!(contents("a.txt"), b"working\n");
+    assert_eq!(
+        f.run(&["rev-parse", &format!("{}^", anchor.captured_commit)])
+            .stdout,
+        format!("{base}\n").as_bytes()
+    );
 }
 
 #[test]

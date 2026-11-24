@@ -1,7 +1,11 @@
 //! Built-in Git SourceDriver. Blocking, trusted-host operations; never a tool
 //! grant. The caller owns durable Prepared custody and the source mutation
-//! barrier through publication. This slice captures committed clean sources;
-//! dirty trees and submodules fail closed until their exact semantics land.
+//! barrier through publication. Dirty captures use two private-index trees;
+//! the original checkout, HEAD and index are never rewritten.
+
+mod tree;
+
+use tree::{PrivateIndexes, Snapshot};
 
 use crate::{valid_object_id, Error as GitError, Repository};
 use aw_agent_core::{
@@ -12,11 +16,14 @@ use aw_agent_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 const BINDING_SCHEMA: u32 = 1;
-const ANCHOR_SCHEMA: u32 = 1;
-const RECOVERY_SCHEMA: u32 = 1;
+const ANCHOR_SCHEMA: u32 = 2;
+const RECOVERY_SCHEMA: u32 = 2;
 
 fn key() -> DriverKey {
     DriverKey {
@@ -25,10 +32,10 @@ fn key() -> DriverKey {
     }
 }
 
-fn schema(version: u32) -> SchemaSupport {
+fn schema(current: u32) -> SchemaSupport {
     SchemaSupport {
-        compatible_from: version,
-        current: version,
+        compatible_from: 1,
+        current,
     }
 }
 
@@ -186,10 +193,14 @@ impl GitSourceAnchor {
         self.name.validate()?;
         validate_source_ref(&self.source_ref)?;
         validate_checkpoint_id(&self.checkpoint_id)?;
-        if self.driver != key() || self.anchor_schema != ANCHOR_SCHEMA {
+        if self.driver != key() || !schema(ANCHOR_SCHEMA).supports(self.anchor_schema) {
             return Err(Error::Denied("incompatible Git SourceAnchor"));
         }
-        if !is_oid(&self.base_commit) || self.captured_commit != self.base_commit {
+        if !is_oid(&self.base_commit)
+            || !is_oid(&self.captured_commit)
+            || self.captured_commit.len() != self.base_commit.len()
+            || (self.anchor_schema == 1 && self.captured_commit != self.base_commit)
+        {
             return Err(Error::Denied("unsupported Git anchor identity"));
         }
         Ok(())
@@ -198,17 +209,28 @@ impl GitSourceAnchor {
     pub fn retention_ref(&self) -> String {
         retention_ref(&self.checkpoint_id, &self.name)
     }
+
+    pub fn is_dirty(&self) -> bool {
+        self.captured_commit != self.base_commit
+    }
+}
+
+struct CaptureObservation {
+    tree: String,
+    status: String,
 }
 
 struct CapturePlan {
     binding: SourceBinding,
     checkpoint_id: String,
     base: String,
+    // Schema 1 was clean HEAD only; its descriptor encoding remains exact.
+    observation: Option<CaptureObservation>,
 }
 
 impl CapturePlan {
     fn fields(&self) -> Result<Vec<RecoveryField>> {
-        use RecoveryFieldKind::{Id, Reference, Version};
+        use RecoveryFieldKind::{Digest, Id, Reference, Version};
         let binding = &self.binding;
         let access = match binding.access {
             SourceAccess::ReadOnly => "ro",
@@ -218,7 +240,7 @@ impl CapturePlan {
             CheckpointPolicy::Required => "required",
             CheckpointPolicy::Ephemeral => "ephemeral",
         };
-        [
+        let mut fields = [
             ("checkpoint", Id, self.checkpoint_id.as_str()),
             ("name", Id, binding.name.as_str()),
             ("source", Reference, binding.source_ref.as_str()),
@@ -233,13 +255,24 @@ impl CapturePlan {
         ]
         .into_iter()
         .map(|(name, kind, value)| RecoveryField::new(name, kind, value))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+        if let Some(observation) = &self.observation {
+            fields.push(RecoveryField::new("tree", Digest, &observation.tree)?);
+            fields.push(RecoveryField::new("status", Digest, &observation.status)?);
+        }
+        Ok(fields)
     }
 
     fn prepare(&self, prepare_id: &str) -> Result<PreparedSourceOperation> {
         let fields = self.fields()?;
         let mut hash = Sha256::new();
-        hash.update(b"aw-git-capture-v1\0");
+        let version = if self.observation.is_some() {
+            hash.update(b"aw-git-capture-v2\0");
+            RECOVERY_SCHEMA
+        } else {
+            hash.update(b"aw-git-capture-v1\0");
+            1
+        };
         hash_part(&mut hash, prepare_id.as_bytes());
         for field in &fields {
             hash_part(&mut hash, field.name.as_bytes());
@@ -249,7 +282,7 @@ impl CapturePlan {
             SourceOperationKind::Capture,
             RecoveryDescriptor::new(
                 key(),
-                RECOVERY_SCHEMA,
+                version,
                 prepare_id,
                 format!("{:x}", hash.finalize()),
                 fields,
@@ -262,7 +295,7 @@ impl CapturePlan {
         let descriptor = &prepared.descriptor;
         if prepared.operation != SourceOperationKind::Capture
             || descriptor.driver != key()
-            || descriptor.recovery_schema != RECOVERY_SCHEMA
+            || !schema(RECOVERY_SCHEMA).supports(descriptor.recovery_schema)
         {
             return Err(Error::Denied("incompatible Git capture descriptor"));
         }
@@ -298,10 +331,24 @@ impl CapturePlan {
         if !is_oid(&base) {
             return Err(Error::Storage("invalid Git capture commit"));
         }
+        let observation = if descriptor.recovery_schema == 1 {
+            None
+        } else {
+            let tree = field("tree")?;
+            let status = field("status")?;
+            if !is_digest(tree) || !is_digest(status) {
+                return Err(Error::Storage("invalid Git capture observation"));
+            }
+            Some(CaptureObservation {
+                tree: tree.into(),
+                status: status.into(),
+            })
+        };
         let plan = Self {
             binding,
             checkpoint_id,
             base,
+            observation,
         };
         // One canonical descriptor encoding; reject extra/changed fields,
         // kinds and prepared identity instead of interpreting another schema.
@@ -313,17 +360,37 @@ impl CapturePlan {
         Ok(plan)
     }
 
-    fn anchor(&self) -> GitSourceAnchor {
+    fn check_observation(&self, snapshot: &Snapshot) -> Result<()> {
+        let expected = self
+            .observation
+            .as_ref()
+            .ok_or(Error::Storage("Git tree observation unavailable"))?;
+        if snapshot.base != self.base
+            || snapshot.tree.fingerprint() != expected.tree
+            || snapshot.status != expected.status
+        {
+            return Err(Error::Conflict(
+                "Git source changed after capture preparation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn anchor(&self, captured_commit: String) -> GitSourceAnchor {
         GitSourceAnchor {
             driver: key(),
-            anchor_schema: ANCHOR_SCHEMA,
+            anchor_schema: if self.observation.is_some() {
+                ANCHOR_SCHEMA
+            } else {
+                1
+            },
             source_ref: self.binding.source_ref.clone(),
             name: self.binding.name.clone(),
             access: self.binding.access,
             checkpoint_policy: self.binding.checkpoint_policy,
             checkpoint_id: self.checkpoint_id.clone(),
             base_commit: self.base.clone(),
-            captured_commit: self.base.clone(),
+            captured_commit,
         }
     }
 }
@@ -331,28 +398,61 @@ impl CapturePlan {
 // Disable replacement objects for exact content identity. Existing Repository
 // runner owns all other subprocess containment, bounded IO and config policy.
 fn run(repo: &Repository, args: &[&str]) -> Result<Vec<u8>> {
-    let mut command = Vec::with_capacity(args.len() + 1);
-    command.push("--no-replace-objects");
+    run_os(
+        repo,
+        &args.iter().map(OsString::from).collect::<Vec<_>>(),
+        None,
+        None,
+    )
+}
+
+fn run_os(
+    repo: &Repository,
+    args: &[OsString],
+    input: Option<&[u8]>,
+    index: Option<&Path>,
+) -> Result<Vec<u8>> {
+    repo.validate_directories().map_err(git_error)?;
+    let mut command = vec![OsString::from("--no-replace-objects")];
+    if index.is_some() {
+        // A private index must not create sharedindex or sparse-index state
+        // next to the real index, or inherit sparse checkout semantics.
+        command.extend(
+            [
+                "-c",
+                "core.splitIndex=false",
+                "-c",
+                "core.sparseCheckout=false",
+                "-c",
+                "index.sparse=false",
+            ]
+            .map(OsString::from),
+        );
+    }
     command.extend_from_slice(args);
-    repo.run(&command, None, false).map_err(git_error)
+    crate::process::run(
+        &repo.git,
+        &repo.root,
+        &command,
+        input,
+        repo.timeout,
+        false,
+        index,
+    )
+    .map_err(git_error)
 }
 
 fn head(repo: &Repository) -> Result<String> {
     let output = run(repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    let value = std::str::from_utf8(&output)
-        .ok()
-        .and_then(|s| s.strip_suffix('\n'))
-        .filter(|s| is_oid(s))
-        .ok_or(Error::Storage("invalid Git HEAD"))?;
-    Ok(value.to_owned())
+    tree::object_id(&output)
 }
 
-fn clean_head(repo: &Repository) -> Result<String> {
+// Schema-1 capture recovery retains its original clean-only admission rules.
+fn legacy_clean_head(repo: &Repository) -> Result<String> {
     repo.guard_managed_checkout().map_err(git_error)?;
     let base = head(repo)?;
-    // Do not run nested Git status/filters until gitlink semantics land.
-    // Check both committed and indexed trees so ignore-submodules cannot
-    // conceal a staged gitlink add/delete.
+    // Schema 1 never admitted gitlinks. Keep its recovery semantics distinct
+    // from schema 2 rather than widening an already-prepared observation.
     let tree = run(repo, &["ls-tree", "-r", "-z", &base])?;
     if tree
         .split(|b| *b == 0)
@@ -427,7 +527,7 @@ fn retained_commit(repo: &Repository, reference: &str) -> Result<Option<String>>
     ))
 }
 
-fn verify_retained(repo: &Repository, anchor: &GitSourceAnchor) -> Result<()> {
+fn verify_retained(repo: &Repository, anchor: &GitSourceAnchor) -> Result<Option<String>> {
     anchor.validate()?;
     repo.guard_local_content().map_err(git_error)?;
     if repository_stamps(repo)?.0 != anchor.source_ref
@@ -438,7 +538,74 @@ fn verify_retained(repo: &Repository, anchor: &GitSourceAnchor) -> Result<()> {
             "Git anchor retention is unavailable or changed",
         ));
     }
-    verify_commit_tree(repo, &anchor.captured_commit)
+    verify_commit_tree(repo, &anchor.captured_commit)?;
+    if anchor.is_dirty() {
+        verify_commit_tree(repo, &anchor.base_commit)?;
+        Ok(Some(synthetic_identity(repo, anchor)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn synthetic_payload(tree: &str, base: &str, identity: &str) -> String {
+    format!("tree {tree}\nparent {base}\nauthor AW Checkpoint <checkpoint@aw.invalid> 0 +0000\ncommitter AW Checkpoint <checkpoint@aw.invalid> 0 +0000\n\nAW capture {identity}\n")
+}
+
+fn write_synthetic(repo: &Repository, tree: &str, base: &str, identity: &str) -> Result<String> {
+    let payload = synthetic_payload(tree, base, identity);
+    let args = ["hash-object", "-t", "commit", "-w", "--stdin"].map(OsString::from);
+    tree::object_id(&run_os(repo, &args, Some(payload.as_bytes()), None)?)
+}
+
+fn tree_oid(repo: &Repository, commit: &str) -> Result<String> {
+    tree::object_id(&run(
+        repo,
+        &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+    )?)
+}
+
+fn synthetic_identity(repo: &Repository, anchor: &GitSourceAnchor) -> Result<String> {
+    let payload = run(repo, &["cat-file", "commit", &anchor.captured_commit])?;
+    let stamp = std::str::from_utf8(&payload)
+        .ok()
+        .and_then(|text| text.strip_suffix('\n'))
+        .and_then(|text| text.rsplit_once("\nAW capture "))
+        .map(|(_, stamp)| stamp)
+        .filter(|stamp| is_digest(stamp))
+        .ok_or(Error::Storage("invalid Git synthetic commit identity"))?;
+    let tree = tree_oid(repo, &anchor.captured_commit)?;
+    if tree == tree_oid(repo, &anchor.base_commit)?
+        || payload != synthetic_payload(&tree, &anchor.base_commit, stamp).as_bytes()
+    {
+        return Err(Error::Conflict(
+            "Git synthetic commit differs from capture contract",
+        ));
+    }
+    Ok(stamp.to_owned())
+}
+
+fn verify_prepared_anchor(
+    repo: &Repository,
+    plan: &CapturePlan,
+    prepared: &PreparedSourceOperation,
+    anchor: &GitSourceAnchor,
+) -> Result<()> {
+    if plan.anchor(anchor.captured_commit.clone()) != *anchor {
+        return Err(Error::Conflict("Git anchor differs from prepared capture"));
+    }
+    let synthetic = verify_retained(repo, anchor)?;
+    if let Some(observation) = &plan.observation {
+        if tree::committed_tree(repo, &anchor.captured_commit)?.fingerprint() != observation.tree
+            || synthetic
+                .as_deref()
+                .is_some_and(|stamp| stamp != prepared.descriptor.prepared_identity)
+        {
+            return Err(Error::Conflict(
+                "Git retained tree differs from prepared capture",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_commit_tree(repo: &Repository, commit: &str) -> Result<()> {
@@ -553,12 +720,16 @@ impl GitSourceDriver {
                 "Git retention identity already exists; inspect its operation",
             ));
         }
-        let base = clean_head(&repo)?;
-        verify_commit_tree(&repo, &base)?;
+        let snapshot = Snapshot::read(&repo, false)?;
+        verify_commit_tree(&repo, &snapshot.base)?;
         CapturePlan {
             binding: binding.clone(),
             checkpoint_id: checkpoint_id.into(),
-            base,
+            base: snapshot.base,
+            observation: Some(CaptureObservation {
+                tree: snapshot.tree.fingerprint(),
+                status: snapshot.status,
+            }),
         }
         .prepare(prepare_id)
     }
@@ -568,20 +739,52 @@ impl GitSourceDriver {
     pub fn execute_capture(&self, prepared: &PreparedSourceOperation) -> Result<GitSourceAnchor> {
         let plan = CapturePlan::decode(prepared)?;
         let repo = self.binding_repository(&plan.binding)?;
-        let anchor = plan.anchor();
-        let reference = anchor.retention_ref();
+        let reference = retention_ref(&plan.checkpoint_id, &plan.binding.name);
         if retained_commit(&repo, &reference)?.is_some() {
             return Err(Error::Conflict(
                 "Git capture already has retention; inspect the Prepared operation",
             ));
         }
-        if clean_head(&repo)? != plan.base {
-            return Err(Error::Conflict(
-                "Git source changed after capture preparation",
-            ));
-        }
-        verify_commit_tree(&repo, &plan.base)?;
-        // The only external effect in the clean path: create, never overwrite.
+        let captured = if plan.observation.is_some() {
+            let before = Snapshot::read(&repo, false)?;
+            plan.check_observation(&before)?;
+            verify_commit_tree(&repo, &plan.base)?;
+            if before.clean() {
+                plan.base.clone()
+            } else {
+                drop(before);
+                let indexes =
+                    PrivateIndexes::create(&repo, &prepared.descriptor.prepared_identity)?;
+                let first = Snapshot::read(&repo, true)?;
+                plan.check_observation(&first)?;
+                let first_tree = first.write_tree(&repo, &indexes.index(1))?;
+                drop(first);
+                let second = Snapshot::read(&repo, true)?;
+                plan.check_observation(&second)?;
+                let second_tree = second.write_tree(&repo, &indexes.index(2))?;
+                if first_tree != second_tree {
+                    return Err(Error::Conflict(
+                        "Git private-index capture changed between passes",
+                    ));
+                }
+                write_synthetic(
+                    &repo,
+                    &first_tree,
+                    &plan.base,
+                    &prepared.descriptor.prepared_identity,
+                )?
+            }
+        } else {
+            if legacy_clean_head(&repo)? != plan.base {
+                return Err(Error::Conflict(
+                    "Git source changed after capture preparation",
+                ));
+            }
+            verify_commit_tree(&repo, &plan.base)?;
+            plan.base.clone()
+        };
+        let anchor = plan.anchor(captured);
+        // Create only. Failed or lost ref publication is inspected, not retried.
         let absent = "0".repeat(plan.base.len());
         run(
             &repo,
@@ -591,14 +794,14 @@ impl GitSourceDriver {
                 "update-ref",
                 "--no-deref",
                 &reference,
-                &plan.base,
+                &anchor.captured_commit,
                 &absent,
             ],
         )
         .map_err(|_| {
             Error::Conflict("Git retention outcome uncertain; inspect the Prepared operation")
         })?;
-        verify_retained(&repo, &anchor)?;
+        verify_prepared_anchor(&repo, &plan, prepared, &anchor)?;
         Ok(anchor)
     }
 
@@ -610,14 +813,20 @@ impl GitSourceDriver {
         prepared: &PreparedSourceOperation,
     ) -> Result<RecoveryInspection<GitSourceAnchor>> {
         let plan = CapturePlan::decode(prepared)?;
-        let anchor = plan.anchor();
-        if self
-            .binding_repository(&plan.binding)
-            .and_then(|repo| verify_retained(&repo, &anchor))
-            .is_err()
-        {
+        let recovered = (|| {
+            let repo = self.binding_repository(&plan.binding)?;
+            let captured = retained_commit(
+                &repo,
+                &retention_ref(&plan.checkpoint_id, &plan.binding.name),
+            )?
+            .ok_or(Error::Conflict("Git retention reference unavailable"))?;
+            let anchor = plan.anchor(captured);
+            verify_prepared_anchor(&repo, &plan, prepared, &anchor)?;
+            Ok::<_, Error>(anchor)
+        })();
+        let Ok(anchor) = recovered else {
             return Ok(RecoveryInspection::Unknown);
-        }
+        };
         // The commit OID is immutable content evidence, NOT an immutable
         // lease on the ref. The AW owner must pin retention and hold its
         // source mutation/cleanup barrier through the publication transaction.
@@ -636,19 +845,18 @@ impl GitSourceDriver {
         anchor: &GitSourceAnchor,
     ) -> Result<()> {
         let plan = CapturePlan::decode(prepared)?;
-        if plan.anchor() != *anchor {
-            return Err(Error::Conflict("Git anchor differs from prepared capture"));
-        }
         let repo = self.binding_repository(&plan.binding)?;
-        if clean_head(&repo)? != plan.base {
+        if plan.observation.is_some() {
+            plan.check_observation(&Snapshot::read(&repo, false)?)?;
+        } else if legacy_clean_head(&repo)? != plan.base {
             return Err(Error::Conflict("Git source changed after capture"));
         }
-        verify_retained(&repo, anchor)
+        verify_prepared_anchor(&repo, &plan, prepared, anchor)
     }
 
     /// Read-only retention validation independent of the current HEAD. A
     /// different authorized checkout may access the same object database.
     pub fn verify_anchor(&self, repository: &Path, anchor: &GitSourceAnchor) -> Result<()> {
-        verify_retained(&self.repository(repository)?, anchor)
+        verify_retained(&self.repository(repository)?, anchor).map(|_| ())
     }
 }

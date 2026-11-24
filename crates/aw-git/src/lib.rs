@@ -740,7 +740,15 @@ impl Repository {
     }
     fn run_os(&self, args: &[OsString], input: Option<&[u8]>, allow_one: bool) -> Result<Vec<u8>> {
         self.validate_directories()?;
-        process::run(&self.git, &self.root, args, input, self.timeout, allow_one)
+        process::run(
+            &self.git,
+            &self.root,
+            args,
+            input,
+            self.timeout,
+            allow_one,
+            None,
+        )
     }
 }
 fn valid_object_id(value: &str) -> bool {

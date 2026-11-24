@@ -27,8 +27,8 @@ v50 disclosure/causal execution closure, v51 EventTypeRegistry + custom Event pu
 v53 same-store cross-Domain Event-universe completeness, and v54 serialized v36 delivery cutover +
 compatibility provenance are implemented locally. Phase 3 is now UNDERWAY with the first final
 SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary and v55 named
-SourceBinding persistence/restart compatibility plus the built-in Git clean capture/retention driver
-implemented locally.
+SourceBinding persistence/restart compatibility plus built-in Git clean/dirty capture, private retention
+and explicit gitlink semantics implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1130,42 +1130,59 @@ and scoped diff-check are green.
 The first concrete built-in Git SourceDriver is available through `aw-git/source-driver`. The default
 Git review library remains Agent-independent; trusted hosts explicitly register the concrete
 `GitSourceDriver` in the existing add-only leaf with an absolute trusted Git executable. Stable key
-`builtin/git` has independent binding/anchor/recovery schema 1. No new registry or ambient driver
-installation. The driver's SourceRef identifies the local common/object directories; its materialization
+`builtin/git` retains binding schema 1 and supports anchor/recovery schemas 1–2. No new registry or
+ambient driver installation. The driver's SourceRef identifies the local common/object directories; its materialization
 pins the exact worktree/admin directory plus canonical path. The shared platform DirectoryIdentity
 exposes its existing local filesystem identity, not a cross-machine resource ID or authority.
 Unexpected directory replacement, alternate object databases, executable filters and partial clone
 are refused. No network, ambient Git config, hooks or replacement objects enter capture.
 
-The first capture path is committed clean HEAD only. Read-only planning emits the exact shared
-`PreparedSourceOperation` with a bounded canonical recovery descriptor, candidate checkpoint/source
-identity, original binding and exact base commit. The host must durably retain that descriptor and hold
-its live source barrier before calling execute. Execute revalidates exact checkout/HEAD/clean index,
-then creates one private `refs/aw/checkpoints/<checkpoint>/<source>` retention ref by absent-old CAS,
-never moving the real HEAD/index or overwriting an existing ref. Gitlinks, hidden index entries and
-dirty sources currently fail closed. The typed GitSourceAnchor carries exact base/captured commit
-identity and source/access/checkpoint metadata. Read-only validation checks the retained commit's
-snapshot object closure without walking unrelated history.
+Read-only capture planning emits the shared `PreparedSourceOperation` with a bounded canonical
+recovery descriptor, candidate checkpoint/source identity, original binding and exact base commit.
+Schema 2 additionally binds a Git-normalized flat tree fingerprint and real index/untracked observation.
+The host must durably retain the descriptor and hold its live source barrier before execute.
 
-Inspection reopens only the exact prepared binding and observes that operation's private ref and
-commit closure. Absent, changed or damaged retention is Unknown, never automatic replay or cleanup.
+The same bounded tree observation serves planning, capture and revalidation. It uses committed HEAD
+plus tracked index paths, applies final working-tree contents/deletions and includes nonignored
+untracked regular files. Tracked symlinks remain tree entries; untracked symlinks/reparse paths are
+not traversed. Executable conversion filters, partial clones, hidden/conflicted index entries and
+untracked nested repositories fail closed. Git performs normalized blob hashing in bounded batches.
+Initialized submodules must themselves be clean and contribute only their exact HEAD gitlink;
+uninitialized empty submodules preserve the indexed gitlink. Missing paths are deletions. No nested
+object retention or fetch is implied. Unsupported native symlink representations fail closed.
+
+Execute revalidates the Prepared observation before effects. A final tree equal to HEAD retains the
+base commit. Dirty capture builds two independent private indexes seeded from HEAD, writes their exact
+observed trees, and requires matching tree/status fingerprints. A deterministic synthetic commit binds
+the exact prepared identity, captured tree and original base parent. The original HEAD, branch and
+real index remain untouched. Both cases create one private
+`refs/aw/checkpoints/<checkpoint>/<source>` ref by absent-old CAS, never overwriting an existing ref.
+The typed GitSourceAnchor carries exact base/captured commit identity and source/access/checkpoint
+metadata. Read-only retention validation checks snapshot-local object closure, including the dirty
+base, without walking unrelated history.
+
+Inspection reopens only the exact prepared binding and validates the operation's private ref,
+commit closure, and (for schema 2) captured tree and synthetic preparation identity. Absent,
+changed or damaged retention is Unknown, never automatic replay or cleanup. An interrupted capture
+may leave unreachable objects or operation-private index residue for future reconciliation.
 Completed returns immutable Git content evidence; the ref is not a live fence or authority. The
 future Store constructor still owns durable retention and must hold AW source/cleanup barriers
-through publication, including final source/HEAD revalidation. No public checkpoint, restore,
-retirement or effectful Store constructor is introduced here. Clean capture keeps the schema-1
-semantics; any future wider artifact semantics must declare honest compatibility.
+through publication, including final source/HEAD revalidation. Schema-1 clean-only recovery remains
+compatible and preserves its original admission and anchor semantics. No public checkpoint, restore,
+retirement or effectful Store constructor is introduced here.
 
-The grouped real Git regression and full `aw-git --features source-driver` suite **30/30** prove
-registry resolution across restart, effect-free preparation, preserved HEAD/index, private retention
-after fixture branch reset/GC, missing-object/retention/collision recovery, stale capture refusal,
-directory replacement and fail-closed filter/alternate/gitlink/index flags. Full workspace all-target
-check, strict `aw-git --features source-driver` and platform-crate all-target Clippy on L5, repository
-fmt and scoped diff-check are green. No Windows-native runtime qualification is claimed.
+The grouped real Git regressions and full `aw-git --features source-driver` suite **31/31** prove
+clean and dirty retention/restart, legacy schema-1 recovery, effect-free planning, final tracked and
+nonignored untracked contents, preserved HEAD/index, explicit initialized/uninitialized gitlinks,
+dirty submodule refusal, same-status content-change fencing, synthetic-commit identity and retention
+after fixture branch reset/GC. Strict Git feature Clippy, default-feature-independent Git all-target
+check, full workspace all-target check, repository fmt and scoped diff-check are green on L5.
+No Windows-native runtime qualification is claimed.
 
-**Next Phase-3 slice:** extend this exact Git driver with dirty private-index capture and explicit
-gitlink semantics; then isolated restore with original base HEAD, SourceAnchor/Checkpoint persistence,
-multi-source recovery and shared Prepared publication. Source realization, quiescent binding mutation,
-SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema stays v55.
+**Next Phase-3 slice:** isolated Git restore with original base HEAD and exact captured final tree,
+then SourceAnchor/Checkpoint persistence, multi-source recovery and shared Prepared publication.
+Source realization, quiescent binding mutation, SandboxGrant/Vault and checkpoint RPC effects remain
+pending. Store schema stays v55.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

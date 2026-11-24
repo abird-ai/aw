@@ -21,6 +21,7 @@ pub(crate) fn run(
     input: Option<&[u8]>,
     timeout: Duration,
     allow_one: bool,
+    index: Option<&Path>,
 ) -> Result<Vec<u8>> {
     let mut command = Command::new(git);
     let git_parent = git
@@ -60,6 +61,9 @@ pub(crate) fn run(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
     aw_platform::configure_child_group(&mut command);
     let mut child = ChildGuard(command.spawn()?);
     let overflow = Arc::new(AtomicBool::new(false));
