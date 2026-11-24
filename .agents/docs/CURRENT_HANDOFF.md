@@ -48,8 +48,9 @@ metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
 unpublished capture/restore candidate reconciliation, shared custom initial history
 ACL construction, captured-source restore initial-task custody/publication,
 task-only baseline restore/recovery, concrete fenced Git checkpoint capture/restore/
-retention reconciliation, managed closed-Sandbox retirement and effectful versioned
-baseline restore host consumers are implemented locally.
+retention reconciliation, managed closed-Sandbox retirement, effectful versioned
+baseline restore host consumers, and v59 Agent VaultGrant references with the final
+staged VaultProvider leaf and concrete local signing broker are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2230,16 +2231,55 @@ Git repository **32/32**, strict affected all-target/all-feature Clippy, workspa
 all-target/all-feature check and scoped fmt/diff passed. Production authority
 provisioning and arbitrary scratch cleanup remain explicitly open.
 
+v59 owns named Agent VaultGrant references only in `agent_vault_grants_current`.
+Final `VaultProviderRegistry` uses the existing staged publication and typed native
+implementation custody; registration advertises projection kinds, not authority.
+Agent Manage + current independent provider attach guard + exact Agent rev govern
+attach/replace. One Agent rev advance mints a unique grant generation; no-op is
+idempotent, null removes even after close. Actor stable identity, existing access
+generation, exact entry/projection/scope, provider authority generation and original
+Store restore scope are checked; no secret bytes or key locator in Agent metadata.
+Metadata lists are bounded and redacted, require independent binding-metadata authority,
+and do not assert provider availability from saved evidence. No implicit Vault grant
+copy on shared Sandbox, history/ACL inheritance or checkpoint restore.
+Concrete `SigningVaultProvider` uses the existing SecretStore implementation under a
+provider-owned private root, registered Broker projection and explicitly provisioned
+dedicated signing keys. `with_vault_broker` is a trusted local synchronous consumer
+boundary, not model dispatch: the real provider read guard and original Store writer
+transaction span exact grant/actor/entry/scope/admission validation and the bounded
+domain-separated HMAC operation. No raw secret read API, arbitrary target or Process
+projection. Rotation/revocation govern future use without Agent fanout; provider
+restart requires new independent authorization (fresh authority identity). Provider
+configuration/key lifecycle and root maintenance remain host-owned, not backed up or
+restored with Agent grants; failed key deletion does not undo factual withdrawal.
+Grouped real SecretStore regression covers populated v58->59 migration, signing,
+registered definition/subject checks, independent attach authority, ACL broadening,
+Store reopen, provider rotation/restart, non-inheritance, held admission and closed
+cleanup. Four existing source-owner migration fixtures now simulate v59 downgrade
+correctly and check the current schema constant. Final focused Vault **1/1**,
+checkpoint **4/4**, construction receipt **1/1**, Sandbox **4/4**, Host **16/16**,
+strict affected all-target/all-feature Clippy, workspace all-target/all-feature
+check and scoped fmt/diff passed. The one broad default-feature Store lib run
+was **235/244** before the
+four v58 assertion corrections; all four now pass in the focused rerun. Five
+unchanged legacy fixture failures remain: Agent shell invokes the disabled legacy
+Job Event subscription; v38 principal downgrade drops referenced tables; v35
+remote-start downgrade leaves agent_state_current; v34 remote-view downgrade
+leaves policy_admission_current; remote-view reconnect asserts obsolete v35.
+The new migration adds no domain-principal dependency and changes none of those
+owners. Full suite not claimed green or rerun on the corrected tree; parent build
+was not rerun. Do not repair unrelated owners as part of this checkpoint.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer a production authority owner or Vault with an actual safe
-consumer and original Process/broker admission fence; do not add speculative
-admission or a standalone definition registry without a consumer.
+While blocked, prefer independent production authority or a real Process projection
+through the original Process/Sandbox/tool admission owners; do not open held routes.
 Independent host approval provisioning, other effectful baseline materialization,
 incomplete-effect reconciliation, multi-source policy, general unpublished partial/
 scratch cleanup and production cleanup composition/physical authority, final-source
-removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.
-Store schema v58.
+removal/effectful mutation, Vault Process broker/socket/file/env integration, persistent
+provider configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault
+host RPCs remain pending. Store schema v59.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

@@ -37,6 +37,7 @@ pub mod runtime;
 pub mod sandbox_driver;
 pub mod source_driver;
 pub mod tool;
+pub mod vault_provider;
 
 pub use accounts::{
     AccountDescriptor, AccountOwner, BillingOwner, CredentialCustody, InvocationIdentity,
@@ -103,6 +104,11 @@ pub use tool::{
     ExecutionOwnershipLease, ExecutionOwnershipScope, Tool, ToolCall, ToolContext, ToolEffect,
     ToolFuture, ToolOutput, ToolParallelism, ToolPolicy, ToolPolicyLifecycle, ToolRecord,
     ToolRegistry, ToolRevisionPolicy, ToolSource, ToolSpec, ToolStatus,
+};
+
+pub use vault_provider::{
+    VaultEntryRef, VaultProjection, VaultProviderDescriptor, VaultProviderHandle,
+    VaultProviderRegistry, VaultProviderRegistryReader,
 };
 
 /// Revalidate the complete provider-bound context after trusted extensions.

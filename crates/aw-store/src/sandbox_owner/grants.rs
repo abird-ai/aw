@@ -607,7 +607,8 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP TABLE agent_sandbox_grants_current;
+                    "DROP TABLE agent_vault_grants_current;
+                 DROP TABLE agent_sandbox_grants_current;
                  UPDATE store_meta SET value='57' WHERE key='schema_epoch';
                  UPDATE schema_meta SET schema_epoch=57,activation_epoch=57 WHERE singleton=1;
                  UPDATE migration_lease SET current_epoch=57 WHERE singleton=1;
@@ -693,9 +694,9 @@ mod tests {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
             assert_eq!(
-                tx.pragma_query_value(None, "user_version", |row| row.get::<_, u64>(0))
+                tx.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                     .unwrap(),
-                58
+                crate::LATEST_SCHEMA_VERSION
             );
             source_bindings::insert(&tx, &sandbox, &sources).unwrap();
             tx.execute(

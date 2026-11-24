@@ -88,6 +88,8 @@ mod subagents;
 #[cfg(feature = "pipelines")]
 mod teams;
 mod types;
+mod vault_grants;
+mod vault_signing;
 mod workspace_replica;
 mod workspace_writer;
 pub use actor_admission::{
@@ -237,6 +239,10 @@ pub use subagents::*;
 #[cfg(feature = "pipelines")]
 pub use teams::*;
 pub use types::*;
+pub use vault_grants::{
+    VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus, VaultGrantSummary, VaultGrantTarget,
+};
+pub use vault_signing::SigningVaultProvider;
 pub use workspace_replica::*;
 pub use workspace_writer::{WorkspaceWriterEventInfo, WorkspaceWriterInfo};
 
@@ -324,8 +330,9 @@ pub const CHECKPOINT_SCHEMA: &str = include_str!("../migrations/056_checkpoints.
 pub const CONSTRUCTION_RECEIPT_SCHEMA: &str =
     include_str!("../migrations/057_construction_receipts.sql");
 pub const SANDBOX_GRANT_SCHEMA: &str = include_str!("../migrations/058_sandbox_grants.sql");
+pub const VAULT_GRANT_SCHEMA: &str = include_str!("../migrations/059_vault_grants.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 58;
+const LATEST_SCHEMA_VERSION: i64 = 59;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -3038,6 +3045,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current == 57 {
         migrate_source_schema(c, 58, "sandbox-grants", SANDBOX_GRANT_SCHEMA)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 58 {
+        migrate_source_schema(c, 59, "vault-grants", VAULT_GRANT_SCHEMA)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {

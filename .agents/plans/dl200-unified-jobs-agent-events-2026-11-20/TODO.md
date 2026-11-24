@@ -903,15 +903,33 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       already-absent refs. Host **16/16**, Git **32/32**, strict affected Clippy,
       workspace all-target/all-feature check and scoped fmt/diff passed. No schema
       change, source admission remains held.
+      **v59 Vault references + actual broker consumer landed:** final staged typed
+      VaultProvider leaf, named Agent grants, exact provider projection/entry/scope,
+      actor stable identity/access generation and original Store scope. Manage plus
+      independent live provider attach authority and Agent CAS; one rev advance,
+      idempotent no-op and null cleanup even closed. Bounded redacted metadata,
+      no raw secret/target/key locator, no ACL/history/Sandbox inheritance. Concrete
+      registered SigningVaultProvider uses existing encrypted SecretStore under its
+      provider-owned root. Real live provider guard and Store writer transaction
+      fence bounded domain-separated HMAC; no secret-read/model/Process route.
+      Rotation/revoke/restart cannot silently reactivate old grant or fanout Agent
+      writes. Grouped real migration/broker regression covers independent attach,
+      actor/generation/rotation/restart, non-inheritance and held/closed boundaries.
+      Final focused Vault **1/1**, checkpoint **4/4**, construction **1/1**,
+      Sandbox **4/4**, Host **16/16**, strict affected all-target/all-feature
+      Clippy, workspace check and scoped fmt/diff passed. Broad Store lib **235/244** before
+      four obsolete v58 assertion corrections (all four passed on rerun); five
+      unchanged legacy Event/ACL/remote fixtures still fail, not claimed green.
+      See CURRENT_HANDOFF for exact failures and limits; no unrelated repair.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
-      production authority or Vault with an actual safe consumer and original
-      Process/broker admission fence; no speculative definition-only registry.
+      production authority or real Process Vault projection with original admission.
       Production approval provisioning, complete Job/Process containment/dispatch,
       incomplete-effect reconciliation, multi-source policy, other baseline effects,
-      remaining partial/scratch cleanup, physical authority/production cleanup
-      composition, final-source removal/effectful mutation, Vault and host RPCs
-      remain. Schema v58.
+      remaining partial/scratch cleanup, physical authority/production cleanup,
+      final-source removal/effectful mutation, Vault Process broker/socket/file/env,
+      persistent provider configuration, protected metadata and host RPCs remain.
+      Schema v59.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -1016,4 +1034,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery, evidence-fenced atomic checkpoint publication/replay, receipt-bound non-destructive restore preparation/inspection, atomic held Agent/Sandbox restore publication, v58 independent SandboxGrant evidence/source preflight, typed SandboxDriver/fenced host source-effect handoff, original PipeProcess source-aware host composition, direct ToolStarted/ToolFinished-linked custody/recovery, pinned native single-source route/deferred post-journal settlement, concrete Git materialization resolution, root-free native registration, live native source approval, explicit Actor host selection, quiescent metadata-only binding mutation, checkpoint retirement/retained-anchor reconciliation and source-bearing Sandbox logical close/retained-layout fencing and trusted closed-Sandbox materialization reconciliation and exact managed Git restore-materialization release/original Applied restore provenance and metadata-only fresh baseline restore/empty Auto capture and unpublished capture/restore candidate reconciliation and shared custom initial history ACL construction and captured-source restore initial-task custody/publication and task-only baseline restore/recovery and fenced Git checkpoint capture/restore/retention reconciliation, managed closed-Sandbox retirement and effectful versioned baseline restore host composition are live; remaining work is original source-aware Actor/Turn admission, production approval provisioning, complete source-aware Job/Process dispatch and containment, incomplete original-effect reconciliation, final-source removal/effectful structural mutation, remaining partial/scratch and production candidate/retention cleanup, effectful fresh baseline materialization, concrete provider fences, full contextual replay/preflight ordering, Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery, evidence-fenced atomic checkpoint publication/replay, receipt-bound non-destructive restore preparation/inspection, atomic held Agent/Sandbox restore publication, v58 independent SandboxGrant evidence/source preflight, typed SandboxDriver/fenced host source-effect handoff, original PipeProcess source-aware host composition, direct ToolStarted/ToolFinished-linked custody/recovery, pinned native single-source route/deferred post-journal settlement, concrete Git materialization resolution, root-free native registration, live native source approval, explicit Actor host selection, quiescent metadata-only binding mutation, checkpoint retirement/retained-anchor reconciliation and source-bearing Sandbox logical close/retained-layout fencing and trusted closed-Sandbox materialization reconciliation and exact managed Git restore-materialization release/original Applied restore provenance and metadata-only fresh baseline restore/empty Auto capture and unpublished capture/restore candidate reconciliation and shared custom initial history ACL construction and captured-source restore initial-task custody/publication and task-only baseline restore/recovery and fenced Git checkpoint capture/restore/retention reconciliation, managed closed-Sandbox retirement, effectful versioned baseline restore host composition, v59 Agent VaultGrant references and staged VaultProvider leaf with actual local signing broker are live; remaining work is original source-aware Actor/Turn admission, production approval provisioning, complete source-aware Job/Process dispatch and containment, incomplete original-effect reconciliation, final-source removal/effectful structural mutation, remaining partial/scratch and production candidate/retention cleanup, effectful fresh baseline materialization, concrete provider fences, full contextual replay/preflight ordering, Vault and host RPCs.

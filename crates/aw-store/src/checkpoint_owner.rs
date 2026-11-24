@@ -647,7 +647,8 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP TABLE agent_sandbox_grants_current;
+                    "DROP TABLE agent_vault_grants_current;
+                 DROP TABLE agent_sandbox_grants_current;
                  DROP INDEX construction_legacy_actor;
                  DROP INDEX construction_source_prepare_id;
                  DROP INDEX construction_receipt_replay;
@@ -679,7 +680,7 @@ mod tests {
             assert_eq!(
                 conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                     .unwrap(),
-                58
+                crate::LATEST_SCHEMA_VERSION
             );
             assert_eq!(
                 conn.query_row("SELECT count(*) FROM checkpoints", [], |row| row

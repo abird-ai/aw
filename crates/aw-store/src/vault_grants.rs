@@ -1,0 +1,451 @@
+//! Agent-owned Vault references. Provider authority and secret custody
+//! remain external; persisted evidence never authorizes a projection.
+use crate::{
+    agent_owner::{self, AgentKey, AgentPermission},
+    db,
+    store_scope::StoreScope,
+    user_for_principal, workspace_writer, Error, Result, SessionStore, StoreMode,
+};
+use aw_agent_core::{
+    PrincipalId, SourceName, VaultEntryRef, VaultProjection, VaultProviderRegistryReader,
+};
+use rusqlite::{params, Connection, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+
+const MAX_GRANTS: usize = 128;
+
+fn opaque(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+    {
+        return Err(Error::Config(
+            "invalid opaque Vault authority or scope identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Exact independently authorized subject and logical entry/projection.
+/// Scope is a provider-owned non-secret identifier, not an arbitrary target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultGrantTarget {
+    pub agent_ref: String,
+    pub name: SourceName,
+    pub entry: VaultEntryRef,
+    pub projection: VaultProjection,
+    pub scope: String,
+    pub actor: PrincipalId,
+}
+
+impl VaultGrantTarget {
+    fn validate(&self) -> Result<()> {
+        crate::label(&self.agent_ref, 2048)?;
+        self.name.validate()?;
+        self.entry.validate()?;
+        opaque(&self.scope)
+    }
+}
+
+/// Evidence supplied by a trusted provider's live authority owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultGrantPolicy {
+    pub target: VaultGrantTarget,
+    pub authority_ref: String,
+    pub authority_generation: u64,
+    actor_user_id: String,
+    store_id: String,
+    restore_generation: u64,
+}
+
+impl VaultGrantPolicy {
+    fn validate(&self) -> Result<()> {
+        self.target.validate()?;
+        opaque(&self.authority_ref)?;
+        crate::stable_user_principal(&self.actor_user_id)?;
+        if self.authority_generation == 0
+            || self.authority_generation > i64::MAX as u64
+            || self.restore_generation == 0
+            || self.store_id.is_empty()
+        {
+            return Err(Error::Conflict("invalid Vault authority generation"));
+        }
+        Ok(())
+    }
+
+    fn require_scope(&self, c: &Connection) -> Result<()> {
+        let scope = StoreScope::load(c)?;
+        if self.store_id != scope.id().as_str()
+            || self.restore_generation != scope.restore_generation()
+            || user_for_principal(c, &self.target.actor)?.as_deref() != Some(&self.actor_user_id)
+        {
+            return Err(Error::Denied(
+                "Vault authority subject or Store scope changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Trusted provider guard, held through the actual Store commit or broker
+/// operation. It must exclude withdrawal/rotation for this exact decision.
+/// A copy of durable policy evidence alone is not an implementation.
+pub trait VaultGrantAuthority {
+    fn policy(&self) -> &VaultGrantPolicy;
+    fn authorize_attach(&self, manager: &PrincipalId, manager_user_id: &str) -> Result<()>;
+    fn authorize_use(&self) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultGrantStatus {
+    RevalidationRequired,
+    Stale,
+}
+
+/// Deliberately redacted metadata. No provider, entry or authority locator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultGrantSummary {
+    pub name: SourceName,
+    pub projection: VaultProjection,
+    pub grant_rev: u64,
+    pub status: VaultGrantStatus,
+}
+
+#[derive(PartialEq, Eq)]
+struct Grant {
+    policy: VaultGrantPolicy,
+    rev: u64,
+    access_generation: [u8; 32],
+}
+
+fn projection_name(kind: VaultProjection) -> &'static str {
+    match kind {
+        VaultProjection::Broker => "broker",
+        VaultProjection::Socket => "socket",
+        VaultProjection::File => "file",
+        VaultProjection::Env => "env",
+    }
+}
+
+fn projection(value: &str) -> Result<VaultProjection> {
+    match value {
+        "broker" => Ok(VaultProjection::Broker),
+        "socket" => Ok(VaultProjection::Socket),
+        "file" => Ok(VaultProjection::File),
+        "env" => Ok(VaultProjection::Env),
+        _ => Err(Error::Storage("invalid durable Vault projection")),
+    }
+}
+
+fn exact_key(c: &Connection, reference: &str) -> Result<(String, String)> {
+    let (session, branch) = agent_owner::key_for_ref(c, reference)?;
+    if agent_owner::canonical_ref(c, AgentKey::new(&session, &branch))? != reference {
+        return Err(Error::Denied("Vault requires an exact canonical Agent"));
+    }
+    Ok((session, branch))
+}
+
+fn grant_in(
+    c: &Connection,
+    key: AgentKey<'_>,
+    reference: &str,
+    name: &SourceName,
+) -> Result<Option<Grant>> {
+    let mut query = db(c.prepare_cached(
+        "SELECT grant_rev,provider_id,entry_ref,projection,scope,authority_ref,
+                authority_generation,actor_principal,actor_user_id,access_generation,
+                store_id,restore_generation
+         FROM agent_vault_grants_current WHERE session_id=?1 AND branch_id=?2 AND name=?3",
+    ))?;
+    let mut rows = db(query.query(params![key.session, key.branch, name.as_str()]))?;
+    let Some(row) = db(rows.next())? else {
+        return Ok(None);
+    };
+    let grant = Grant {
+        rev: db(row.get(0))?,
+        policy: VaultGrantPolicy {
+            target: VaultGrantTarget {
+                agent_ref: reference.to_owned(),
+                name: name.clone(),
+                entry: VaultEntryRef {
+                    provider: crate::decode(&db(row.get::<_, String>(1))?)?,
+                    entry: db(row.get(2))?,
+                },
+                projection: projection(&db(row.get::<_, String>(3))?)?,
+                scope: db(row.get(4))?,
+                actor: PrincipalId::new(db(row.get::<_, String>(7))?)?,
+            },
+            authority_ref: db(row.get(5))?,
+            authority_generation: db(row.get(6))?,
+            actor_user_id: db(row.get(8))?,
+            store_id: db(row.get(10))?,
+            restore_generation: db(row.get(11))?,
+        },
+        access_generation: db(row.get(9))?,
+    };
+    grant.policy.validate()?;
+    if grant.rev == 0 {
+        return Err(Error::Storage("invalid durable Vault grant revision"));
+    }
+    Ok(Some(grant))
+}
+
+impl Grant {
+    fn require_current(&self, c: &Connection, key: AgentKey<'_>) -> Result<()> {
+        self.policy.require_scope(c)?;
+        let current = agent_owner::authorize_permission(
+            c,
+            &self.policy.target.actor,
+            key,
+            AgentPermission::Submit,
+        )?;
+        if current.access_generation != self.access_generation {
+            return Err(Error::Denied("Vault grant access generation changed"));
+        }
+        Ok(())
+    }
+}
+
+impl SessionStore {
+    /// Bind trusted provider policy to the original Store and actor identity.
+    /// This observes identity; it issues no authority and persists nothing.
+    pub fn vault_policy(
+        &self,
+        target: VaultGrantTarget,
+        authority_ref: String,
+        authority_generation: u64,
+    ) -> Result<VaultGrantPolicy> {
+        let c = self.connection()?;
+        exact_key(&c, &target.agent_ref)?;
+        let scope = StoreScope::load(&c)?;
+        let actor_user_id = user_for_principal(&c, &target.actor)?
+            .ok_or(Error::Denied("Vault actor unavailable"))?;
+        let policy = VaultGrantPolicy {
+            target,
+            authority_ref,
+            authority_generation,
+            actor_user_id,
+            store_id: scope.id().as_str().to_owned(),
+            restore_generation: scope.restore_generation(),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Agent Manage plus the independent live provider attach decision.
+    /// Null removes future authority even for closing/closed Agents.
+    /// The Agent revision mints grant generations, so remove/re-add cannot
+    /// revive a previous grant without keeping separate tombstone rows.
+    pub fn agent_vault_set(
+        &self,
+        manager: &PrincipalId,
+        reference: &str,
+        name: &SourceName,
+        expected_rev: u64,
+        authority: Option<(&VaultProviderRegistryReader, &dyn VaultGrantAuthority)>,
+    ) -> Result<u64> {
+        if self.inner.mode != StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "Vault binding requires the exclusive Store owner",
+            ));
+        }
+        name.validate()?;
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (session, branch) = exact_key(&tx, reference)?;
+        let key = AgentKey::new(&session, &branch);
+        agent_owner::authorize_permission(&tx, manager, key, AgentPermission::Manage)?;
+        let before = agent_owner::revision(&tx, key)?;
+        if before != expected_rev {
+            return Err(Error::Conflict("stale Agent revision"));
+        }
+        workspace_writer::require_workspace_writer_for_session(&tx, &session)?;
+        let current = grant_in(&tx, key, reference, name)?;
+        if current.as_ref().is_some_and(|grant| grant.rev > before) {
+            return Err(Error::Storage(
+                "Vault grant revision exceeds Agent revision",
+            ));
+        }
+        let next = before
+            .checked_add(1)
+            .filter(|v| *v <= i64::MAX as u64)
+            .ok_or(Error::Limit("Agent revision exhausted"))?;
+        if let Some((registry, authority)) = authority {
+            if agent_owner::lifecycle(&tx, key)?.0 != "open" {
+                return Err(Error::Denied("Vault attach requires an open Agent"));
+            }
+            let policy = authority.policy();
+            policy.validate()?;
+            policy.require_scope(&tx)?;
+            registry.require_projection(&policy.target.entry, policy.target.projection)?;
+            if policy.target.agent_ref != reference || &policy.target.name != name {
+                return Err(Error::Denied("Vault approval belongs to another binding"));
+            }
+            let manager_user = user_for_principal(&tx, manager)?
+                .ok_or(Error::Denied("Vault manager unavailable"))?;
+            authority.authorize_attach(manager, &manager_user)?;
+            let access = agent_owner::authorize_permission(
+                &tx,
+                &policy.target.actor,
+                key,
+                AgentPermission::Submit,
+            )?;
+            let generation = access.access_generation;
+            if current
+                .as_ref()
+                .is_some_and(|g| g.policy == *policy && g.access_generation == generation)
+            {
+                return Ok(before);
+            }
+            if current.is_none() {
+                let count: usize = db(tx.query_row(
+                    "SELECT count(*) FROM agent_vault_grants_current WHERE session_id=?1 AND branch_id=?2",
+                    params![session, branch], |row| row.get(0)))?;
+                if count >= MAX_GRANTS {
+                    return Err(Error::Limit("too many Agent Vault grants"));
+                }
+            }
+            let target = &policy.target;
+            db(tx.execute(
+                "INSERT INTO agent_vault_grants_current(session_id,branch_id,name,grant_rev,
+                  provider_id,entry_ref,projection,scope,authority_ref,authority_generation,
+                  actor_principal,actor_user_id,access_generation,store_id,restore_generation)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                 ON CONFLICT(session_id,branch_id,name) DO UPDATE SET
+                  grant_rev=excluded.grant_rev,provider_id=excluded.provider_id,entry_ref=excluded.entry_ref,
+                  projection=excluded.projection,scope=excluded.scope,authority_ref=excluded.authority_ref,
+                  authority_generation=excluded.authority_generation,actor_principal=excluded.actor_principal,
+                  actor_user_id=excluded.actor_user_id,access_generation=excluded.access_generation,
+                  store_id=excluded.store_id,restore_generation=excluded.restore_generation",
+                params![session, branch, name.as_str(), next, crate::json(&target.entry.provider)?,
+                    target.entry.entry, projection_name(target.projection), target.scope,
+                    policy.authority_ref, policy.authority_generation, target.actor.as_str(),
+                    policy.actor_user_id, generation, policy.store_id, policy.restore_generation],
+            ))?;
+        } else {
+            if current.is_none() {
+                return Ok(before);
+            }
+            db(tx.execute("DELETE FROM agent_vault_grants_current WHERE session_id=?1 AND branch_id=?2 AND name=?3",
+                params![session, branch, name.as_str()]))?;
+        }
+        agent_owner::changed(&tx, key)?;
+        // Audit presentation contains only the logical binding and factual rev.
+        crate::audit(
+            &tx,
+            &session,
+            manager,
+            "agent.vault.changed",
+            serde_json::json!({
+                "branch_id":branch, "name":name.as_str(), "rev":next, "active":authority.is_some()
+            }),
+        )?;
+        db(tx.commit())?;
+        Ok(next)
+    }
+
+    /// Trusted metadata boundary; authorize_metadata independently
+    /// authorizes this manager's complete Agent binding metadata and returns
+    /// its live guard. Acquire external authority before the Store transaction
+    /// (no protected disclosure or effects in that callback). Even then, this
+    /// lower view redacts provider identities.
+    pub fn agent_vault_list<F>(
+        &self,
+        manager: &PrincipalId,
+        reference: &str,
+        authorize_metadata: impl FnOnce(&PrincipalId, &str) -> Result<F>,
+    ) -> Result<Vec<VaultGrantSummary>> {
+        let fence = authorize_metadata(manager, reference)?;
+        let mut c = self.connection()?;
+        let tx = db(c.transaction())?;
+        let (session, branch) = exact_key(&tx, reference)?;
+        let key = AgentKey::new(&session, &branch);
+        agent_owner::authorize_permission(&tx, manager, key, AgentPermission::Manage)?;
+        let names = {
+            let mut q = db(tx.prepare_cached(
+                "SELECT name FROM agent_vault_grants_current
+                WHERE session_id=?1 AND branch_id=?2 ORDER BY name LIMIT ?3",
+            ))?;
+            let rows = db(
+                q.query_map(params![session, branch, MAX_GRANTS + 1], |row| {
+                    row.get::<_, String>(0)
+                }),
+            )?;
+            db(rows.collect::<rusqlite::Result<Vec<_>>>())?
+        };
+        if names.len() > MAX_GRANTS {
+            return Err(Error::Limit("Vault binding list bound exceeded"));
+        }
+        let open = agent_owner::lifecycle(&tx, key)?.0 == "open";
+        let mut result = Vec::with_capacity(names.len());
+        for name in names {
+            let name = SourceName::new(name)?;
+            let grant = grant_in(&tx, key, reference, &name)?
+                .ok_or(Error::Storage("Vault binding disappeared"))?;
+            let status = if open {
+                match grant.require_current(&tx, key) {
+                    Ok(()) => VaultGrantStatus::RevalidationRequired,
+                    Err(Error::Denied(_) | Error::Conflict(_)) => VaultGrantStatus::Stale,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                VaultGrantStatus::Stale
+            };
+            result.push(VaultGrantSummary {
+                name,
+                projection: grant.policy.target.projection,
+                grant_rev: grant.rev,
+                status,
+            });
+        }
+        db(tx.commit())?;
+        drop(fence);
+        Ok(result)
+    }
+
+    /// One synchronous local broker operation. The provider guard stays live
+    /// and the original Store writer transaction excludes ACL/grant changes
+    /// through use. No network wait, Process spawn, model call or durable
+    /// external mutation belongs in this callback. Source-bearing admission
+    /// remains held, and the operation is never exposed as a generic tool.
+    pub fn with_vault_broker<R>(
+        &self,
+        actor: &PrincipalId,
+        registry: &VaultProviderRegistryReader,
+        authority: &impl VaultGrantAuthority,
+        expected_grant_rev: u64,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        if self.inner.mode != StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "Vault broker requires the exclusive Store owner",
+            ));
+        }
+        let policy = authority.policy();
+        let target = &policy.target;
+        registry.require_projection(&target.entry, target.projection)?;
+        if &target.actor != actor || target.projection != VaultProjection::Broker {
+            return Err(Error::Denied(
+                "Vault broker differs from authorized actor/projection",
+            ));
+        }
+        let mut c = self.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (session, branch) = exact_key(&tx, &target.agent_ref)?;
+        let key = AgentKey::new(&session, &branch);
+        agent_owner::require_future_admission(&tx, key)?;
+        workspace_writer::require_workspace_writer_for_session(&tx, &session)?;
+        let grant = grant_in(&tx, key, &target.agent_ref, &target.name)?
+            .filter(|grant| grant.rev == expected_grant_rev && grant.policy == *policy)
+            .ok_or(Error::Denied("Vault broker grant unavailable or changed"))?;
+        grant.require_current(&tx, key)?;
+        authority.authorize_use()?;
+        let result = operation()?;
+        db(tx.commit())?;
+        Ok(result)
+    }
+}
