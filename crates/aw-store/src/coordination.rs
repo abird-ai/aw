@@ -578,6 +578,92 @@ pub(crate) fn acquire_source_leases_in(
         .collect()
 }
 
+/// Reclaim an exact operation's complete hazard set for inspection only.
+/// Never turn an absent/released claim into a new lease, or steal an active
+/// barrier. A restore-generation change requires separate reconciliation.
+pub(crate) fn recover_source_leases_in(
+    tx: &Transaction<'_>,
+    process: &ProcessIdentity,
+    scopes: &[String],
+    prepare_id: &str,
+) -> Result<Vec<LocalCoordinationLease>> {
+    if process.heartbeat_ttl_micros.is_some() || scopes.is_empty() {
+        return Err(Error::Denied(
+            "source recovery requires an exclusive owner and a nonempty set",
+        ));
+    }
+    let at = now();
+    admit_scope_leases_in(tx, process, at)?;
+    let count: usize = db(tx.query_row(
+        "SELECT count(*) FROM local_coordination_leases
+         WHERE scope_kind='execution' AND scope_key GLOB 'source-mutation:*'
+           AND run_id=?1 AND state IN ('active','hazard')",
+        [prepare_id],
+        |row| row.get(0),
+    ))?;
+    if count != scopes.len() {
+        return Err(Error::Conflict(
+            "source recovery claim set is incomplete or changed",
+        ));
+    }
+    let mut reclaim = db(tx.prepare_cached(
+        "UPDATE local_coordination_leases
+         SET holder_process_id=?1,generation=generation+1,state='active',updated_at=?2
+         WHERE scope_kind='execution' AND scope_key=?3 AND run_id=?4
+           AND store_generation=?5 AND state='hazard' AND expires_at=?6
+           AND generation<9223372036854775807
+           AND holder_process_id IN (
+               SELECT process_id FROM local_process_incarnations
+               WHERE process_kind='owner_lock' AND store_generation=?5
+                 AND (state<>'active' OR process_id=?1)
+           )
+         RETURNING generation",
+    ))?;
+    let mut leases = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        validate_scope(scope)?;
+        if !scope.starts_with(SOURCE_MUTATION_SCOPE_PREFIX) {
+            return Err(Error::Config("invalid source recovery scope".into()));
+        }
+        let generation = db(reclaim
+            .query_row(
+                params![
+                    process.process_id,
+                    at,
+                    scope,
+                    prepare_id,
+                    process.store_generation,
+                    i64::MAX
+                ],
+                |row| row.get(0),
+            )
+            .optional())?
+        .ok_or(Error::Conflict(
+            "exact source hazard is unavailable for recovery",
+        ))?;
+        event(
+            tx,
+            Some(process),
+            "lease.source_recovered",
+            Some("execution"),
+            Some(scope),
+            Some(generation),
+            serde_json::json!({"run_id":prepare_id}),
+        )?;
+        leases.push(LocalCoordinationLease {
+            kind: LocalLeaseKind::Execution,
+            scope_key: scope.clone(),
+            holder_process_id: process.process_id.clone(),
+            store_generation: process.store_generation,
+            generation,
+            state: "active".into(),
+            run_id: Some(prepare_id.to_owned()),
+            expires_at: i64::MAX,
+        });
+    }
+    Ok(leases)
+}
+
 /// Read and write admission use the same scopes. The caller holds the
 /// publication transaction; absent/released scopes need no extra lease row.
 pub(crate) fn require_unleased_sources_in(tx: &Transaction<'_>, scopes: &[String]) -> Result<()> {

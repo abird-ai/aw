@@ -13,7 +13,9 @@ use aw_agent_core::{
     SourceAnchor, SourceCoverage, SourceDriverRegistryReader, SourceName, SourceSet,
     SourceSetLimit, HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
-pub use capture::{CheckpointCaptureSelection, PreparedCheckpointCapture};
+pub use capture::{
+    CheckpointCaptureSelection, InspectedCheckpointCapture, PreparedCheckpointCapture,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

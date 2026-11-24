@@ -61,7 +61,7 @@ pub(crate) enum PreparationState {
 }
 
 impl PreparationState {
-    fn unresolved(self) -> bool {
+    pub(crate) fn unresolved(self) -> bool {
         matches!(self, Self::Prepared | Self::Unknown)
     }
 }

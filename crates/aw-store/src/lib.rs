@@ -138,7 +138,7 @@ use aw_agent_core::{
 };
 pub use checkpoint_owner::{
     CheckpointCaptureSelection, CheckpointLifecycle, CheckpointSnapshot, CheckpointSourceSummary,
-    PreparedCheckpointCapture,
+    InspectedCheckpointCapture, PreparedCheckpointCapture,
 };
 pub use context::{
     ApplyContext, ApplyMode, ContextApplied, ContextJournal, ContextNode, ContextPlan,

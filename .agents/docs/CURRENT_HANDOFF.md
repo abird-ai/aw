@@ -30,8 +30,8 @@ SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary an
 SourceBinding persistence/restart compatibility, built-in Git clean/dirty capture/private retention,
 explicit gitlink semantics, isolated Prepared restore, v56 immutable Checkpoint/SourceSet
 persistence with trusted history-only replay, v57 indexed construction receipt/source
-recovery custody, Store-local complete-set source mutation barriers and receipt-bound
-checkpoint capture preparation are implemented locally.
+recovery custody, Store-local complete-set source mutation barriers, receipt-bound
+checkpoint capture preparation and exact restart inspection/recovery are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1347,8 +1347,35 @@ Checkpoint owner **1/1**, source barrier **1/1**, construction receipt **1/1**, 
 **2/2**, task-bearing Agent constructor **1/1**, strict Store all-target Clippy, full workspace
 all-target check, repository fmt and scoped diff-check are green.
 
-**Next Phase-3 slice:** inspect the exact Prepared operation and its claims after restart, then
-implement driver-evidence revalidation and the shared atomic publication constructor. Source
+The same capture token now supports read-only inspection for fresh and recovered operations.
+Trusted recovery locates the original unresolved receipt by authenticated caller/request identity,
+checks current Agent view and exact compatible binding/recovery schemas, and atomically reclaims
+only that receipt's complete source hazard set. Existing execution lease generations advance
+under the exclusive owner; live, missing, released, foreign or prior-restore-generation claims
+cannot be substituted. Recovery does not re-admit the old set under a lowered new-operation
+limit. There is no new operation claim, replanning, automatic execution or generic hazard release.
+
+The trusted inspector receives the complete original binding/descriptor set and compatible registry
+reader outside SQLite under the live barrier. Only a complete ordered set of matching completed
+anchors and validated evidence returns InspectedCheckpointCapture. Current receipt, disclosure
+and barrier are rechecked after inspection. Partial, NotStarted, Unknown, mismatched or failed
+inspection preserves whole-set Unknown custody. The non-cloneable inspected token exposes
+anchors and evidence identities, not execution or publication authority. A stale current source/
+history boundary may be inspected with independent source authority, but fails Store-side
+revalidation; a saved external fence handle is never a live provider fence.
+
+The grouped capture-owner regressions **2/2** exercise exact original descriptor inspection
+after a real disk owner restart, missing drivers, live barrier exclusion, lost/partial fixture
+effects, recovery without a second Prepared claim, stale placement, wrong anchor and NotStarted
+refusal, and current view revocation. Test-only source-bearing Agent association is removed
+before restart and reinstated only for boundary qualification; the production realization gate
+is unchanged. No public checkpoint publication or automatic cleanup is introduced.
+Source barrier **1/1**, construction receipt **1/1**, checkpoint owner **1/1**, affected
+coordination **1/1**, strict Store all-target Clippy, full workspace all-target check,
+repository fmt and scoped diff-check are green.
+
+**Next Phase-3 slice:** connect inspected exact results to driver-evidence revalidation and
+atomic checkpoint publication, then reuse the shared construction path for restore. Source
 realization, writer/effect participation, candidate/retention reconciliation, quiescent binding
 mutation, SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v57.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart

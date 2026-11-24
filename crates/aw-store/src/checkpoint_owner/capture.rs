@@ -252,6 +252,9 @@ fn fingerprint(
     Ok(format!("{:x}", hash.finalize()))
 }
 
+mod recovery;
+pub use recovery::InspectedCheckpointCapture;
+
 /// Trusted, live Prepared checkpoint capture. No Clone, no implicit release.
 /// Driver effects still require independently held source authority. No
 /// source-bearing publication is exposed until its final authority/driver
@@ -287,10 +290,7 @@ impl PreparedCheckpointCapture<'_> {
             .expect("constructed with capture boundary")
     }
 
-    /// Current Store authority, exact history and source revisions, receipt
-    /// and barrier must all still agree. The eventual publication path must
-    /// call this inside its own final transaction, not trust a saved check.
-    fn require_current_in(&self, tx: &Transaction<'_>) -> Result<()> {
+    fn require_receipt_in(&self, tx: &Transaction<'_>) -> Result<()> {
         self.barrier.require_held_in(tx)?;
         self.receipt.require_actor(tx, &self.actor)?;
         let current = construction_receipt::lookup_in(
@@ -302,6 +302,14 @@ impl PreparedCheckpointCapture<'_> {
         if current.as_ref() != Some(&self.receipt) {
             return Err(Error::Conflict("checkpoint capture receipt changed"));
         }
+        Ok(())
+    }
+
+    /// Current Store authority, exact history and source revisions, receipt
+    /// and barrier must all still agree. The eventual publication path must
+    /// call this inside its own final transaction, not trust a saved check.
+    fn require_current_in(&self, tx: &Transaction<'_>) -> Result<()> {
+        self.require_receipt_in(tx)?;
         let boundary = self.boundary();
         let registry = self.store.inner.source_drivers.reader()?;
         let observed = observe_in(
@@ -847,6 +855,11 @@ mod tests {
         let boundary = prepared.boundary().clone();
         prepared.mark_unknown().unwrap();
         assert!(store
+            .checkpoint_inspect_capture(&viewer, "host:capture", |_, _, _| {
+                panic!("revoked view must not disclose recovery descriptors")
+            })
+            .is_err());
+        assert!(store
             .acquire_source_mutation_barrier(&set, "retry")
             .is_err());
         {
@@ -878,5 +891,259 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn capture_recovery_reclaims_original_hazards_without_replaying() {
+        use aw_agent_core::{
+            ExternalEvidence, RecoveryInspection, SourceAccess, SourceAnchor, SourceBinding,
+        };
+
+        let temp = PrivateTemp(std::env::temp_dir().join(id("aw-capture-recovery").unwrap()));
+        let actor = PrincipalId::new("internal:fixture:capture-recovery").unwrap();
+        let driver = DriverKey::builtin("fixture-git").unwrap();
+        let schema = SchemaSupport::new(1, 1).unwrap();
+        let registry = SourceDriverRegistry::new();
+        registry
+            .register(
+                driver.clone(),
+                SourceDriverSchemas {
+                    binding: schema,
+                    anchor: schema,
+                    recovery: schema,
+                },
+                (),
+            )
+            .unwrap();
+        let limit = SourceSetLimit::new(2).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
+        let layout = crate::SessionBinding {
+            working_directory: PathBuf::from("/tmp"),
+            tool_root: PathBuf::from("/tmp"),
+            system_prompt: "system".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "model".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let (session, branch) = store
+            .create(&actor, "capture recovery", layout.clone())
+            .unwrap();
+        let origin = AgentKey::new(&session.id, &branch.id);
+        let reference = agent_owner::canonical_ref(&store.connection().unwrap(), origin).unwrap();
+        let original = store
+            .agent_get(&actor, &reference)
+            .unwrap()
+            .sandbox_ref
+            .unwrap();
+        let project = reference.rsplit_once("/a:").unwrap().0;
+        let bindings = ["code", "data"].map(|name| SourceBinding {
+            name: SourceName::new(name).unwrap(),
+            driver: driver.clone(),
+            binding_schema: 1,
+            source_ref: format!("fixture-source:{name}"),
+            materialization: format!("fixture-materialization:{name}"),
+            access: SourceAccess::ReadWrite,
+            checkpoint_policy: CheckpointPolicy::Required,
+        });
+        let sandbox = store
+            .sandbox_create_fresh_with_sources(&actor, project, &layout, &bindings)
+            .unwrap()
+            .canonical_ref;
+        // Source-bearing Agent realization is intentionally closed. This
+        // test-only association exercises the lower capture boundary.
+        let bind_fixture = |store: &SessionStore, target: &str| {
+            store.connection().unwrap().execute(
+                "UPDATE agent_state_current SET sandbox_id=?1 WHERE session_id=?2 AND branch_id=?3",
+                params![target, session.id, branch.id],
+            ).unwrap();
+        };
+        bind_fixture(&store, &sandbox);
+        let prepared = store
+            .checkpoint_prepare_capture(
+                &actor,
+                &reference,
+                CheckpointCaptureSelection::Auto,
+                None,
+                "host:recover",
+                plan_fixture,
+            )
+            .unwrap();
+        let receipt = prepared.receipt.clone();
+        let candidate = prepared.checkpoint_id().to_owned();
+        let set = prepared.boundary().mutation_set().unwrap();
+        let original_owner = store.process_identity().unwrap().unwrap().process_id;
+        assert!(store
+            .checkpoint_inspect_capture(&actor, "host:recover", |_, _, _| {
+                panic!("a live Prepared token cannot be stolen")
+            })
+            .is_err());
+        // Model an effect whose response was lost. The test driver inspects
+        // these exact operation-owned files, never creates them on retry.
+        let marker = |name: &str| temp.0.join(format!("fixture-effect-{name}"));
+        let write_effect = |source: &NamedPreparedSource| {
+            std::fs::write(
+                marker(source.name.as_str()),
+                &source.prepared.descriptor.prepared_identity,
+            )
+            .unwrap();
+        };
+        write_effect(&prepared.sources().sources[0]);
+        drop(prepared);
+        // Keep the real source rows and receipt, but remove the test-only
+        // association before reopen (production startup must still deny
+        // source-bearing Agent realization). Reinstall the fixture below.
+        bind_fixture(&store, &original);
+        drop(store);
+
+        let store = SessionStore::open(&temp.0).unwrap();
+        assert!(store
+            .checkpoint_inspect_capture(&actor, "host:recover", |_, _, _| {
+                panic!("unavailable recovery schema must refuse before inspection")
+            })
+            .is_err());
+        drop(store);
+        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+
+        let inspect = |registry: &SourceDriverRegistryReader,
+                       observed: &[VersionedSourceBinding],
+                       sources: &PreparedSourceSet| {
+            assert_eq!(sources, receipt.sources.as_ref().unwrap());
+            assert_eq!(
+                observed,
+                receipt
+                    .capture_boundary
+                    .as_ref()
+                    .unwrap()
+                    .bindings
+                    .as_slice()
+            );
+            assert_eq!(sources.prepare_id, candidate);
+            observed
+                .iter()
+                .zip(&sources.sources)
+                .map(|(binding, source)| {
+                    registry.resolve(&source.prepared.descriptor.pin()?)?;
+                    let Ok(version) = std::fs::read_to_string(marker(source.name.as_str())) else {
+                        return Ok(RecoveryInspection::Unknown);
+                    };
+                    assert_eq!(version, source.prepared.descriptor.prepared_identity);
+                    let binding = &binding.binding;
+                    RecoveryInspection::completed(
+                        SourceAnchor {
+                            name: binding.name.clone(),
+                            driver: binding.driver.clone(),
+                            anchor_schema: 1,
+                            source_ref: binding.source_ref.clone(),
+                            access: binding.access,
+                            checkpoint_policy: binding.checkpoint_policy,
+                            identity: version.clone(),
+                            retention: format!("fixture-retention:{version}"),
+                            fields: Vec::new(),
+                        },
+                        ExternalEvidence::immutable("fixture_version", version)?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        // All claims survive restart, but an incomplete inspection cannot
+        // publish or release even its successfully inspected member.
+        assert!(store
+            .checkpoint_inspect_capture(&actor, "host:recover", inspect)
+            .is_err());
+        {
+            let connection = store.connection().unwrap();
+            let current = construction_receipt::lookup_in(
+                &connection,
+                receipt.operation,
+                &receipt.scope,
+                &receipt.request_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(current.state, PreparationState::Unknown);
+            assert_eq!(current.sources, receipt.sources);
+            assert_eq!(current.capture_boundary, receipt.capture_boundary);
+            let count: usize = connection
+                .query_row(
+                    "SELECT count(*) FROM local_coordination_leases WHERE scope_kind='execution'
+                 AND run_id=?1 AND state='hazard' AND holder_process_id<>?2 AND generation>1",
+                    params![candidate, original_owner],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "another")
+            .is_err());
+        // A completed original effect becomes observable later. Inspection
+        // still uses the original descriptor, with no new Prepared claim.
+        write_effect(&receipt.sources.as_ref().unwrap().sources[1]);
+        let inspected = store
+            .checkpoint_inspect_capture(&actor, "host:recover", inspect)
+            .unwrap();
+        assert_eq!(inspected.checkpoint_id(), candidate);
+        assert_eq!(inspected.source_set().anchors.len(), 2);
+        assert_eq!(inspected.evidence().len(), 2);
+        assert!(
+            inspected.revalidate().is_err(),
+            "stale association cannot be published"
+        );
+        bind_fixture(&store, &sandbox);
+        inspected.revalidate().unwrap();
+        assert!(store
+            .checkpoint_inspect_capture(&actor, "host:recover", |_, _, _| {
+                panic!("live inspection barrier cannot be stolen")
+            })
+            .is_err());
+        inspected.mark_unknown().unwrap();
+        assert!(
+            store
+                .checkpoint_inspect_capture(&actor, "host:recover", |_, _, _| {
+                    Ok(vec![
+                        RecoveryInspection::NotStarted,
+                        RecoveryInspection::NotStarted,
+                    ])
+                })
+                .is_err(),
+            "NotStarted is not permission to repeat effects"
+        );
+        assert!(
+            store
+                .checkpoint_inspect_capture(
+                    &actor,
+                    "host:recover",
+                    |registry, bindings, sources| {
+                        let mut results = inspect(registry, bindings, sources)?;
+                        results.swap(0, 1);
+                        Ok(results)
+                    }
+                )
+                .is_err(),
+            "wrong named anchor results cannot become publishable"
+        );
+        assert!(store
+            .checkpoint_create_history_only(&actor, &reference, None, "host:recover")
+            .is_err());
+        {
+            let connection = store.connection().unwrap();
+            let count: usize = connection
+                .query_row(
+                    "SELECT count(*) FROM audit WHERE action='construction.preparation'
+                 AND json_extract(data_json,'$.request_id')='host:recover'
+                 AND json_extract(data_json,'$.state')='prepared'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            let count: usize = connection
+                .query_row("SELECT count(*) FROM checkpoints", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "still-hazard")
+            .is_err());
     }
 }

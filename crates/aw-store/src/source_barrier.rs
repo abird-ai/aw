@@ -193,6 +193,30 @@ impl SessionStore {
             leases,
         })
     }
+
+    /// Private receipt-owner recovery. The original named set may exceed a
+    /// newly lowered admission limit; inspection creates no new source effect.
+    pub(crate) fn recover_source_mutation_barrier_in(
+        &self,
+        tx: &Transaction<'_>,
+        set: &SourceMutationSet,
+        prepare_id: &str,
+    ) -> Result<SourceMutationBarrier<'_>> {
+        if self.inner.mode != StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "source recovery requires the exclusive Store owner",
+            ));
+        }
+        let process = self.coordinated_process()?;
+        let store_scope = StoreScope::load(tx)?;
+        let leases = coordination::recover_source_leases_in(tx, &process, &set.scopes, prepare_id)?;
+        Ok(SourceMutationBarrier {
+            store: self,
+            store_scope,
+            process,
+            leases,
+        })
+    }
 }
 
 #[cfg(test)]
