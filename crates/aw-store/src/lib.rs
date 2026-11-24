@@ -130,7 +130,7 @@ pub use authority_replica::{
 use aw_agent_core::{
     AuxiliaryInput, AuxiliaryJournal, AuxiliaryResult, Conversation, Error, HistoryState,
     InvocationContext, InvocationIdentity, InvocationPurpose, JournalFuture, Outcome, PrincipalId,
-    Result, Role,
+    Result, Role, SourceDriverRegistry, SourceSetLimit,
 };
 pub use context::{
     ApplyContext, ApplyMode, ContextApplied, ContextJournal, ContextNode, ContextPlan,
@@ -196,7 +196,9 @@ pub use reviews::*;
 #[cfg(feature = "routing")]
 pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-pub use sandbox_owner::{SandboxLifecycle, SandboxSnapshot};
+pub use sandbox_owner::{
+    SandboxLifecycle, SandboxSnapshot, SourceBindingCompatibility, SourceBindingSummary,
+};
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
 pub use secret_custody_inventory::ActiveSecretCustodyInventory;
@@ -300,8 +302,9 @@ pub const EVENT_UNIVERSE_PLACEMENT_SCHEMA: &str =
     include_str!("../migrations/053_event_universe_placement.sql");
 pub const EVENT_DELIVERY_CUTOVER_SCHEMA: &str =
     include_str!("../migrations/054_event_delivery_cutover.sql");
+pub const SOURCE_BINDING_SCHEMA: &str = include_str!("../migrations/055_source_bindings.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 54;
+const LATEST_SCHEMA_VERSION: i64 = 55;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -340,6 +343,8 @@ pub(crate) struct Inner {
     /// Ephemeral local wake accelerator for committed DL-200 Events.
     /// Durable truth and missed-wake recovery remain in the Event projection.
     event_wake: tokio::sync::watch::Sender<u64>,
+    source_drivers: SourceDriverRegistry,
+    source_limit: SourceSetLimit,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -1174,6 +1179,19 @@ impl SessionStore {
     /// to other users. An advisory lock excludes a second aw owner. Not a defense
     /// against malicious same-UID code, network filesystems or a hostile OS.
     pub fn open(directory: &Path) -> Result<Self> {
+        Self::open_with_sources(
+            directory,
+            SourceDriverRegistry::default(),
+            SourceSetLimit::default(),
+        )
+    }
+
+    /// Open with the trusted host's installed SourceDriver definitions and source bound.
+    pub fn open_with_sources(
+        directory: &Path,
+        source_drivers: SourceDriverRegistry,
+        source_limit: SourceSetLimit,
+    ) -> Result<Self> {
         if !aw_platform::secure_private_files_supported() {
             return Err(Error::Config(
                 "persistent store requires platform-verified owner-only private files".into(),
@@ -1198,6 +1216,7 @@ impl SessionStore {
         validate_private_sqlite_sidecars(&directory)?;
         let mut conn = db(Connection::open(directory.join("sessions.sqlite3")))?;
         initialize(&mut conn)?;
+        sandbox_owner::source_bindings::revalidate(&mut conn, &source_drivers)?;
         let process = coordination::register_owner_process(&mut conn)?;
         let out = Self {
             inner: Arc::new(Inner {
@@ -1210,6 +1229,8 @@ impl SessionStore {
                 heartbeat_stop: None,
                 heartbeat_thread: None,
                 event_wake: tokio::sync::watch::channel(0).0,
+                source_drivers,
+                source_limit,
             }),
         };
         out.recover()?;
@@ -1277,14 +1298,29 @@ impl SessionStore {
                 heartbeat_stop: Some(heartbeat_stop),
                 heartbeat_thread: Some(heartbeat_thread),
                 event_wake: tokio::sync::watch::channel(0).0,
+                // Direct hosts currently install no source drivers. Compatibility
+                // remains fail-closed, but metadata stays readable.
+                source_drivers: SourceDriverRegistry::default(),
+                source_limit: SourceSetLimit::default(),
             }),
         };
+        {
+            let mut connection = out.connection()?;
+            sandbox_owner::source_bindings::revalidate(&mut connection, &out.inner.source_drivers)?;
+        }
         out.recover()?;
         Ok(out)
     }
 
     /// In-memory backend for real SQLite tests; no process lock or disk guarantees.
     pub fn in_memory() -> Result<Self> {
+        Self::in_memory_with_sources(SourceDriverRegistry::default(), SourceSetLimit::default())
+    }
+
+    pub fn in_memory_with_sources(
+        source_drivers: SourceDriverRegistry,
+        source_limit: SourceSetLimit,
+    ) -> Result<Self> {
         let mut c = db(Connection::open_in_memory())?;
         initialize(&mut c)?;
         Ok(Self {
@@ -1298,6 +1334,8 @@ impl SessionStore {
                 heartbeat_stop: None,
                 heartbeat_thread: None,
                 event_wake: tokio::sync::watch::channel(0).0,
+                source_drivers,
+                source_limit,
             }),
         })
     }
@@ -1322,6 +1360,8 @@ impl SessionStore {
                 heartbeat_stop: None,
                 heartbeat_thread: None,
                 event_wake: tokio::sync::watch::channel(0).0,
+                source_drivers: SourceDriverRegistry::default(),
+                source_limit: SourceSetLimit::default(),
             }),
         })
     }
@@ -2546,6 +2586,7 @@ impl SessionStore {
                 previous_live_generation,
                 source_generation,
             )?;
+            sandbox_owner::source_bindings::revalidate(&mut staged, &self.inner.source_drivers)?;
             let check: String = db(staged.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
             let fk: i64 = db(staged.query_row(
                 "SELECT count(*) FROM pragma_foreign_key_check",
@@ -2937,6 +2978,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current == 53 {
         migrate_event_delivery_cutover(c)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 54 {
+        migrate_source_bindings(c)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {
@@ -3416,6 +3461,52 @@ fn migrate_event_projection(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 44))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_source_bindings(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='source-bindings',generation=generation+1,
+             target_epoch=55,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(SOURCE_BINDING_SCHEMA))?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "SourceBinding migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='55' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=55,activation_epoch=55,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=55,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 55))?;
     db(tx.commit())?;
     Ok(())
 }

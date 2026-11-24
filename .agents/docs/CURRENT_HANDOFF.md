@@ -26,7 +26,8 @@ v50 disclosure/causal execution closure, v51 EventTypeRegistry + custom Event pu
 `events_publish` / `events_subscribe` adapter, v52 EventHandler definition/activation/receipt ownership,
 v53 same-store cross-Domain Event-universe completeness, and v54 serialized v36 delivery cutover +
 compatibility provenance are implemented locally. Phase 3 is now UNDERWAY with the first final
-SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary implemented locally.
+SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary and v55 named
+SourceBinding persistence/restart compatibility implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1090,12 +1091,46 @@ implementation retrieval, stable durable schema resolution across an unrelated l
 unsupported recovery-schema rejection, the 128 effective / 1024 absolute SourceSet bounds, and the
 opaque-fence/Completed recovery vocabulary. Repository fmt, full workspace all-target check, strict `aw-agent-core` Clippy and scoped diff-check are green.
 
-**Next Phase-3 slice:** add the actual named SourceBinding owner under logical Sandbox plus Store-open
-SourceDriver dependency validation against this exact registry leaf. Persist DriverKey and
-`binding_schema` beside each binding; enforce the effective SourceSet limit before any driver preparation.
-Do not start Git capture/Checkpoint tables until live binding identity/schema degradation behavior is
-durable and restart-safe. Do not contract v36 Event compatibility tables; Phase 7 owns removal after
-cross-version drain/restart evidence.
+Schema **v55** extends the existing logical Sandbox owner with
+`sandbox_source_bindings_current`, keyed by exact Sandbox + validated SourceName. Each row retains
+stable DriverKey + binding_schema, non-secret source identity/materialization locator, access,
+checkpoint policy and binding revision. Existing Sandboxes migrate with an empty SourceSet, not an
+inferred repository. The shared core `SourceBinding` validates names, driver/schema and bounded
+opaque identities; checkpoint policy defaults to required. Project-authorized Sandbox snapshots expose
+only bounded binding metadata, not protected source identities/locators.
+
+The trusted Rust-only `sandbox_create_fresh_with_sources` uses the existing Sandbox constructor and
+one transaction for the complete pre-existing materialized SourceSet. It checks the Store's effective
+host bound, duplicate names, full binding shape and exact installed schemas before publication. It
+does not call a driver, grant source authority or serve as an effectful capture/restore constructor.
+The default bound is 128 and the host may only lower it through Store configuration; existing rows
+remain readable if policy is lowered. Decoding rejects an overfilled set above the absolute 1024
+ceiling. No general source-set replacement/removal or host RPC is promoted yet.
+
+Exclusive Store open, trusted-local direct startup (currently empty installed registry), and staged
+SQLite backup restore revalidate live bindings through the exact SourceDriver registry before
+serving. Per-binding `compatible|recovery_required` is a durable diagnostic, not authority.
+Missing/incompatible pins retain the exact binding, identity, schema and revisions; reinstalling
+compatible definitions revalidates without rewriting binding truth. Only changed diagnostics are
+written. No fallback driver, replay, cleanup or registry removal is introduced. Until source
+realization and lifecycle support land, both explicit and legacy layout-only Agent selection refuse
+source-bearing Sandboxes (no implicit empty replacement); source-bearing close also refuses.
+Unexpected persisted Agent/source-bearing Sandbox associations fail closed on open. Existing Agent
+Sandbox bindings remain immutable.
+
+The grouped real Sandbox-owner regression **2/2** covers v40 layout/close compatibility and v54→v55
+disk migration, atomic named-set admission, protected metadata, missing/incompatible restart,
+compatible reinstall with different runtime registration revisions, direct-open degradation, staged
+backup restore revalidation, lowered host limit, absolute corruption ceiling and no source-bearing
+Agent admission/close. The existing SourceDriver leaf regression **1/1** remains green.
+Full workspace all-target check, strict `aw-agent-core + aw-store` all-target Clippy, repository fmt
+and scoped diff-check are green.
+
+**Next Phase-3 slice:** implement the mandatory Git SourceDriver; then clean/dirty capture and private
+retention, SourceAnchor/Checkpoint persistence, multi-source recovery and the shared Prepared
+publication constructor. Source realization, quiescent binding mutation, SandboxGrant/Vault and
+checkpoint effects remain pending. Do not contract v36 Event compatibility tables; Phase 7 owns
+removal after cross-version drain/restart evidence.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

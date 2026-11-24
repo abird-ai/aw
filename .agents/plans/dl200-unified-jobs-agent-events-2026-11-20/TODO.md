@@ -437,10 +437,20 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       constructor must hold the live provider fence through AW commit. Host effective SourceSet limit
       defaults to 128 and may only be lowered; absolute safety ceiling remains 1024. Focused SourceDriver
       **1/1** + repository fmt, full workspace all-target check, strict aw-agent-core Clippy and scoped diff-check are green.
-      **Next:** persist named SourceBindings under logical Sandbox with DriverKey + binding_schema and
-      store-open compatibility/degraded-state validation against this exact registry leaf; enforce SourceSet
-      cardinality before preparation. Then add Git capture/anchors/checkpoint storage and the shared
-      Prepared publication constructor in later Phase-3 slices.
+      **v55 binding/restart owner landed locally:** `sandbox_source_bindings_current` retains exact
+      named SourceBinding identity, DriverKey + binding_schema, access, checkpoint policy and binding_rev;
+      v54 migration seeds empty SourceSets. Trusted fresh Sandbox publication atomically admits the
+      complete already-materialized set under the effective host limit, with absolute bounded decoding.
+      Owner/direct startup and staged SQLite backup restore resolve every live binding through the
+      installed registry; incompatible/missing pins retain their exact rows with durable recovery_required
+      diagnostics, and compatible reinstall revalidates without advancing revisions. Snapshot metadata
+      omits protected source/locator values. Agent selection and source-bearing close fail closed until
+      realization/lifecycle support; no implicit replacement, rebind or external effect.
+      Grouped Sandbox owner **2/2** and SourceDriver **1/1** are green. Full workspace all-target
+      check, strict affected-crate all-target Clippy, repository fmt and scoped diff-check are green.
+      **Next:** mandatory Git SourceDriver, clean/dirty anchors/private retention, then Checkpoint
+      persistence, multi-source recovery and shared Prepared publication. Source realization,
+      quiescent binding mutation, SandboxGrant/Vault and host RPCs remain pending.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -545,4 +555,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary and first staged SourceDriver leaf are live; remaining work is named SourceBinding/Checkpoint persistence, store-open dependency pinning/degraded state, Git capture/restore, shared Prepared recovery constructor, immutable/held-through-commit external publication evidence and publication-transaction authority fencing.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf and v55 named binding persistence/startup compatibility are live; remaining work is Git capture/restore, SourceAnchor/Checkpoint and unresolved recovery dependency pinning, source realization/quiescent mutation, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, SandboxGrant/Vault and host RPCs.

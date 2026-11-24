@@ -20,6 +20,7 @@ pub const DEFAULT_MAX_SOURCES_PER_SANDBOX: usize = 128;
 pub const HARD_MAX_SOURCES_PER_SANDBOX: usize = 1024;
 const MAX_SOURCE_DRIVERS: usize = 1024;
 const MAX_SOURCE_NAME_BYTES: usize = 64;
+const MAX_SOURCE_BINDING_IDENTITY_BYTES: usize = 2048;
 const MAX_PREPARE_ID_BYTES: usize = 128;
 const MAX_RECOVERY_FIELDS: usize = 32;
 const MAX_RECOVERY_FIELD_NAME_BYTES: usize = 48;
@@ -209,11 +210,55 @@ pub enum SourceAccess {
     ReadWrite,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointPolicy {
+    #[default]
     Required,
     Ephemeral,
+}
+
+/// A named, already-materialized source. References are non-secret driver-issued
+/// identities/locators, never credential URLs or authority to use the source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBinding {
+    pub name: SourceName,
+    pub driver: DriverKey,
+    pub binding_schema: u32,
+    pub source_ref: String,
+    pub materialization: String,
+    pub access: SourceAccess,
+    #[serde(default)]
+    pub checkpoint_policy: CheckpointPolicy,
+}
+
+impl SourceBinding {
+    pub fn pin(&self) -> Result<DriverSchemaPin> {
+        DriverSchemaPin::new(
+            self.driver.clone(),
+            DriverArtifact::Binding,
+            self.binding_schema,
+        )
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.name.validate()?;
+        self.pin()?;
+        for value in [&self.source_ref, &self.materialization] {
+            validate_identity(
+                value,
+                MAX_SOURCE_BINDING_IDENTITY_BYTES,
+                "source binding identity",
+            )?;
+            if value.contains("://") {
+                return Err(Error::Config(
+                    "source binding requires an opaque reference, not a URL".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

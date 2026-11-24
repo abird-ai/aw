@@ -1,19 +1,23 @@
-//! DL-200 Phase-1 logical Sandbox owner.
+//! DL-200 logical Sandbox owner.
 //!
-//! A Sandbox owns only durable Project-scoped mutable execution *identity and
-//! layout* here. It does not own Process lifetime, SourceBindings, Vault
+//! A Sandbox owns durable Project-scoped mutable execution identity, layout
+//! and named SourceBindings. It does not own Process lifetime, Vault
 //! credentials, mount/network/device policy, or Agent ACLs.
 
 use crate::{
     db, durability, id, now, session_in, user_for_principal, workspace_writer, Error, PrincipalId,
     Result, SessionBinding, SessionStore,
 };
+use aw_agent_core::{SourceBinding, SourceSetLimit};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 const MAX_SANDBOX_LIST: usize = 256;
+
+pub(crate) mod source_bindings;
+pub use source_bindings::{SourceBindingCompatibility, SourceBindingSummary};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +47,8 @@ pub struct SandboxSnapshot {
     pub working_directory: PathBuf,
     pub tool_root: PathBuf,
     pub layout_digest: String,
+    #[serde(default)]
+    pub sources: Vec<SourceBindingSummary>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -245,9 +251,18 @@ fn snapshot_row(connection: &Connection, canonical_ref: &str) -> Result<SandboxS
         working_directory: PathBuf::from(row.7),
         tool_root: PathBuf::from(row.8),
         layout_digest: row.9,
+        sources: Vec::new(),
         created_at: row.10,
         updated_at: row.11,
     })
+}
+
+fn snapshot_with_sources(connection: &Connection, canonical_ref: &str) -> Result<SandboxSnapshot> {
+    let mut snapshot = snapshot_row(connection, canonical_ref)?;
+    if source_bindings::available(connection)? {
+        snapshot.sources = source_bindings::summaries(connection, canonical_ref)?;
+    }
+    Ok(snapshot)
 }
 
 fn insert_sandbox(
@@ -330,6 +345,12 @@ fn ensure_layout(
         )
         .optional())?;
     if let Some(existing) = existing {
+        // Do not fall back to an empty Sandbox for a source-bearing layout.
+        if source_bindings::has_sources(connection, &existing)? {
+            return Err(Error::Denied(
+                "source-bearing Agent Sandbox realization is unavailable",
+            ));
+        }
         return Ok(existing);
     }
     let any: bool = db(connection.query_row(
@@ -391,6 +412,11 @@ fn bind_auto(
         agent_project_and_layout(connection, session, branch)?;
     if let Some(current) = current {
         let sandbox = snapshot_row(connection, &current)?;
+        if source_bindings::has_sources(connection, &current)? {
+            return Err(Error::Denied(
+                "source-bearing Agent Sandbox realization is unavailable",
+            ));
+        }
         if sandbox.project_ref != project.canonical()
             || sandbox.layout_digest != layout.digest
             || sandbox.working_directory.to_str() != Some(layout.working_directory.as_str())
@@ -473,6 +499,11 @@ pub(crate) fn preflight_initial_selection(
         ));
     }
     let sandbox = snapshot_row(connection, &key.canonical())?;
+    if source_bindings::has_sources(connection, &sandbox.canonical_ref)? {
+        return Err(Error::Denied(
+            "source-bearing Agent Sandbox realization is unavailable",
+        ));
+    }
     let expected = layout(binding)?;
     if sandbox.lifecycle != SandboxLifecycle::Open
         || sandbox.layout_digest != expected.digest
@@ -537,7 +568,7 @@ impl SessionStore {
         let key = parse_sandbox_ref(canonical_ref)?;
         let connection = self.connection()?;
         authorize_project(&connection, actor, &key.project, false)?;
-        snapshot_row(&connection, &key.canonical())
+        snapshot_with_sources(&connection, &key.canonical())
     }
 
     pub fn sandbox_list(
@@ -583,7 +614,7 @@ impl SessionStore {
         let references = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
         references
             .iter()
-            .map(|reference| snapshot_row(&connection, reference))
+            .map(|reference| snapshot_with_sources(&connection, reference))
             .collect()
     }
 
@@ -596,6 +627,29 @@ impl SessionStore {
         project_ref: &str,
         binding: &SessionBinding,
     ) -> Result<SandboxSnapshot> {
+        self.sandbox_create_fresh_with_sources(actor, project_ref, binding, &[])
+    }
+
+    pub fn source_set_limit(&self) -> SourceSetLimit {
+        self.inner.source_limit
+    }
+
+    /// Trusted host publication of a fresh logical Sandbox with an already
+    /// materialized SourceSet. The trusted caller supplies authorized,
+    /// non-secret references. No driver effect, grant, capture or restore:
+    /// effectful constructors must use the future durable Prepared path.
+    pub fn sandbox_create_fresh_with_sources(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        binding: &SessionBinding,
+        sources: &[SourceBinding],
+    ) -> Result<SandboxSnapshot> {
+        source_bindings::validate_set(
+            self.source_set_limit(),
+            &self.inner.source_drivers,
+            sources,
+        )?;
         let project = parse_project_ref(project_ref)?;
         let layout = layout(binding)?;
         let mut connection = self.connection()?;
@@ -603,8 +657,10 @@ impl SessionStore {
         authorize_project(&tx, actor, &project, true)?;
         let handle = id("sbx")?;
         let canonical = insert_sandbox(&tx, &project, &handle, None, &layout, Some(actor))?;
+        source_bindings::insert(&tx, &canonical, sources)?;
+        let snapshot = snapshot_with_sources(&tx, &canonical)?;
         db(tx.commit())?;
-        snapshot_row(&connection, &canonical)
+        Ok(snapshot)
     }
 
     pub fn sandbox_close(
@@ -623,7 +679,14 @@ impl SessionStore {
         }
         if current.lifecycle == SandboxLifecycle::Closed {
             db(tx.commit())?;
-            return snapshot_row(&connection, &key.canonical());
+            return snapshot_with_sources(&connection, &key.canonical());
+        }
+        // Retain live dependencies until the source lifecycle/cleanup contract
+        // is implemented; closing must not drop a required driver dependency.
+        if source_bindings::has_sources(&tx, &current.canonical_ref)? {
+            return Err(Error::Conflict(
+                "source-bearing Sandbox close requires SourceDriver lifecycle support",
+            ));
         }
         let live_agents: u64 = db(tx.query_row(
             "SELECT count(*) FROM agent_state_current
@@ -656,7 +719,7 @@ impl SessionStore {
             serde_json::json!({"sandbox_ref":key.canonical(),"rev":current.rev + 1}),
         )?;
         db(tx.commit())?;
-        snapshot_row(&connection, &key.canonical())
+        snapshot_with_sources(&connection, &key.canonical())
     }
 }
 
@@ -675,6 +738,288 @@ mod tests {
             model_hint: "model".into(),
             destination_fingerprint: "0".repeat(64),
         }
+    }
+
+    #[test]
+    fn source_bindings_survive_migration_and_incompatible_restart() {
+        use aw_agent_core::{
+            CheckpointPolicy, DriverKey, SchemaSupport, SourceAccess, SourceDriverRegistry,
+            SourceDriverSchemas, SourceName,
+        };
+        use SourceBindingCompatibility::{Compatible, RecoveryRequired};
+
+        struct PrivateTemp(PathBuf);
+        impl Drop for PrivateTemp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = PrivateTemp(std::env::temp_dir().join(id("aw-source-test").unwrap()));
+        let actor = PrincipalId::new("internal:fixture:source-binding").unwrap();
+        let store = SessionStore::open(&temp.0).unwrap();
+        let (root, branch) = store.create(&actor, "root", binding("/tmp")).unwrap();
+        let root = store.agent_binding(&actor, &root.id, &branch.id).unwrap();
+        let project = format!(
+            "/d:{}/i:{}/p:{}",
+            root.domain_handle, root.identity_handle, root.project_handle
+        );
+        let root_ref = format!("{project}/a:{}", root.agent_handle);
+        let root_sandbox = store
+            .agent_get(&actor, &root_ref)
+            .unwrap()
+            .sandbox_ref
+            .unwrap();
+        drop(store);
+
+        // Exercise a real v54 disk restart, not merely the migration SQL in isolation.
+        {
+            let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE sandbox_source_bindings_current;
+                 UPDATE store_meta SET value='54' WHERE key='schema_epoch';
+                 UPDATE schema_meta SET schema_epoch=54,activation_epoch=54 WHERE singleton=1;
+                 UPDATE migration_lease SET current_epoch=54 WHERE singleton=1;
+                 PRAGMA user_version=54;",
+                )
+                .unwrap();
+        }
+        let git = DriverKey::builtin("fixture-git").unwrap();
+        let data = DriverKey::extension("fixture", "data").unwrap();
+        let schemas = |from, current| SourceDriverSchemas {
+            binding: SchemaSupport::new(from, current).unwrap(),
+            anchor: SchemaSupport::new(1, 1).unwrap(),
+            recovery: SchemaSupport::new(1, 1).unwrap(),
+        };
+        let registry = SourceDriverRegistry::new();
+        registry.register(git.clone(), schemas(1, 1), ()).unwrap();
+        registry.register(data.clone(), schemas(1, 1), ()).unwrap();
+        let limit = SourceSetLimit::new(2).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        assert!(store
+            .sandbox_get(&actor, &root_sandbox)
+            .unwrap()
+            .sources
+            .is_empty());
+        assert_eq!(
+            store
+                .connection()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            55
+        );
+
+        let sources = [
+            SourceBinding {
+                name: SourceName::new("code").unwrap(),
+                driver: git.clone(),
+                binding_schema: 1,
+                source_ref: "repo-1".into(),
+                materialization: "/private/materialization-1".into(),
+                access: SourceAccess::ReadWrite,
+                checkpoint_policy: CheckpointPolicy::Required,
+            },
+            SourceBinding {
+                name: SourceName::new("cache").unwrap(),
+                driver: data.clone(),
+                binding_schema: 1,
+                source_ref: "dataset-1".into(),
+                materialization: "object-1".into(),
+                access: SourceAccess::ReadOnly,
+                checkpoint_policy: CheckpointPolicy::Ephemeral,
+            },
+        ];
+        let path = binding("/var/tmp");
+        let create = |sources: &[SourceBinding]| {
+            store.sandbox_create_fresh_with_sources(&actor, &project, &path, sources)
+        };
+        assert!(matches!(
+            create(&[sources[0].clone(), sources[1].clone(), sources[0].clone()]),
+            Err(Error::Limit(_))
+        ));
+        assert!(matches!(
+            create(&[sources[0].clone(), sources[0].clone()]),
+            Err(Error::Conflict(_))
+        ));
+        let mut invalid = sources[0].clone();
+        invalid.name = serde_json::from_str("\"Invalid\"").unwrap();
+        assert!(create(&[invalid]).is_err());
+        let mut invalid = sources[0].clone();
+        invalid.binding_schema = 2;
+        assert!(matches!(create(&[invalid]), Err(Error::Denied(_))));
+        assert_eq!(
+            store
+                .sandbox_list(&actor, &project, None, 16)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let created = create(&sources).unwrap();
+        assert_eq!(created.sources.len(), 2);
+        assert!(created
+            .sources
+            .iter()
+            .all(|source| source.compatibility == Compatible && source.binding_rev == 1));
+        assert_eq!(created.sources[0].name.as_str(), "cache");
+        assert_eq!(created.sources[0].access, SourceAccess::ReadOnly);
+        assert_eq!(
+            created.sources[0].checkpoint_policy,
+            CheckpointPolicy::Ephemeral
+        );
+        assert!(!serde_json::to_string(&created)
+            .unwrap()
+            .contains("private/materialization"));
+        assert!(matches!(
+            preflight_initial_selection(
+                &store.connection().unwrap(),
+                &actor,
+                &root.domain_handle,
+                &root.identity_handle,
+                &root.project_handle,
+                &path,
+                Some(&created.canonical_ref)
+            ),
+            Err(Error::Denied(_))
+        ));
+        assert!(matches!(
+            store.create(&actor, "same layout", path.clone()),
+            Err(Error::Denied(_))
+        ));
+        assert_eq!(
+            store
+                .sandbox_list(&actor, &project, None, 16)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(store);
+
+        // A present but incompatible driver and a missing driver are both
+        // recovery-required. Their pins, source identities, revisions and layout stay intact.
+        let registry = SourceDriverRegistry::new();
+        registry.register(git.clone(), schemas(2, 2), ()).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        let degraded = store.sandbox_get(&actor, &created.canonical_ref).unwrap();
+        let mut expected = created.clone();
+        for source in &mut expected.sources {
+            source.compatibility = RecoveryRequired;
+        }
+        assert_eq!(degraded, expected);
+        {
+            let connection = store.connection().unwrap();
+            let persisted: (String, String, u32, String) = connection
+                .query_row(
+                    "SELECT source_ref,materialization,binding_schema,compatibility
+                 FROM sandbox_source_bindings_current WHERE sandbox_id=?1 AND source_name='code'",
+                    [&created.canonical_ref],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                persisted,
+                (
+                    sources[0].source_ref.clone(),
+                    sources[0].materialization.clone(),
+                    1,
+                    "recovery_required".into()
+                )
+            );
+        }
+        assert!(matches!(
+            store.sandbox_close(&actor, &created.canonical_ref, None),
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            preflight_initial_selection(
+                &store.connection().unwrap(),
+                &actor,
+                &root.domain_handle,
+                &root.identity_handle,
+                &root.project_handle,
+                &path,
+                Some(&created.canonical_ref)
+            ),
+            Err(Error::Denied(_))
+        ));
+        assert_eq!(
+            store.agent_get(&actor, &root_ref).unwrap().sandbox_ref,
+            Some(root_sandbox)
+        );
+        let backup = temp.0.join("degraded.sqlite3");
+        store.backup(&backup).unwrap();
+        drop(store);
+
+        // Different registration order/revisions, explicitly compatible binding schema.
+        let registry = SourceDriverRegistry::new();
+        registry.register(data, schemas(1, 1), ()).unwrap();
+        registry.register(git, schemas(1, 2), ()).unwrap();
+        let store = SessionStore::open_with_sources(
+            &temp.0,
+            registry.clone(),
+            SourceSetLimit::new(1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.sandbox_get(&actor, &created.canonical_ref).unwrap(),
+            created
+        );
+        assert!(matches!(
+            store.sandbox_create_fresh_with_sources(&actor, &project, &path, &sources),
+            Err(Error::Limit(_))
+        ));
+
+        // Restoring a disk backup must also revalidate against this host's
+        // registry before the restored database is published.
+        store.restore_backup(&backup).unwrap();
+        assert_eq!(
+            store.sandbox_get(&actor, &created.canonical_ref).unwrap(),
+            created
+        );
+
+        #[cfg(target_os = "linux")]
+        let store = {
+            drop(store);
+            let direct =
+                SessionStore::open_trusted_local_direct(&temp.0, Default::default()).unwrap();
+            assert_eq!(
+                direct.sandbox_get(&actor, &created.canonical_ref).unwrap(),
+                expected
+            );
+            drop(direct);
+            let owner = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
+            assert_eq!(
+                owner.sandbox_get(&actor, &created.canonical_ref).unwrap(),
+                created
+            );
+            owner
+        };
+
+        // The hard bound is checked before decoding more than 1024 rows,
+        // even for externally damaged/overfilled durable state.
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1023)
+                 INSERT INTO sandbox_source_bindings_current
+                 SELECT sandbox_id,'extra-'||x,driver_key,binding_schema,source_ref,materialization,
+                        access,checkpoint_policy,binding_rev,compatibility
+                 FROM sandbox_source_bindings_current,n WHERE sandbox_id=?1 AND source_name='code'",
+                    [&created.canonical_ref],
+                )
+                .unwrap();
+            assert!(matches!(
+                snapshot_with_sources(&connection, &created.canonical_ref),
+                Err(Error::Limit(_))
+            ));
+        }
+        drop(store);
+        assert!(matches!(
+            SessionStore::open_with_sources(&temp.0, registry, limit),
+            Err(Error::Limit(_))
+        ));
     }
 
     #[test]

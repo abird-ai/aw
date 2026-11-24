@@ -1,0 +1,276 @@
+//! Durable named bindings within the logical Sandbox owner.
+use crate::{db, Error, Result};
+use aw_agent_core::{
+    validate_source_set_hard_limit, CheckpointPolicy, DriverKey, SourceAccess, SourceBinding,
+    SourceDriverRegistry, SourceDriverRegistryReader, SourceName, SourceSetLimit,
+    HARD_MAX_SOURCES_PER_SANDBOX,
+};
+use rusqlite::{params, Connection, Row, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceBindingCompatibility {
+    Compatible,
+    RecoveryRequired,
+}
+
+impl SourceBindingCompatibility {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "compatible" => Ok(Self::Compatible),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            _ => Err(Error::Storage("invalid SourceBinding compatibility")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+/// Project-authorized metadata only; opaque source identities and materialization
+/// locators require their own source disclosure authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBindingSummary {
+    pub name: SourceName,
+    pub driver: DriverKey,
+    pub binding_schema: u32,
+    pub access: SourceAccess,
+    pub checkpoint_policy: CheckpointPolicy,
+    pub binding_rev: u64,
+    pub compatibility: SourceBindingCompatibility,
+}
+
+struct StoredBinding {
+    binding: SourceBinding,
+    binding_rev: u64,
+    compatibility: SourceBindingCompatibility,
+}
+
+impl StoredBinding {
+    fn decode(row: &Row<'_>) -> Result<Self> {
+        let name = SourceName::new(db(row.get::<_, String>(0))?)?;
+        let driver: DriverKey = serde_json::from_str(&db(row.get::<_, String>(1))?)
+            .map_err(|_| Error::Storage("invalid durable SourceDriver key"))?;
+        let access = match db(row.get::<_, String>(5))?.as_str() {
+            "ro" => SourceAccess::ReadOnly,
+            "rw" => SourceAccess::ReadWrite,
+            _ => return Err(Error::Storage("invalid durable SourceBinding access")),
+        };
+        let checkpoint_policy = match db(row.get::<_, String>(6))?.as_str() {
+            "required" => CheckpointPolicy::Required,
+            "ephemeral" => CheckpointPolicy::Ephemeral,
+            _ => return Err(Error::Storage("invalid durable checkpoint policy")),
+        };
+        let binding = SourceBinding {
+            name,
+            driver,
+            binding_schema: db(row.get(2))?,
+            source_ref: db(row.get(3))?,
+            materialization: db(row.get(4))?,
+            access,
+            checkpoint_policy,
+        };
+        binding.validate()?;
+        let binding_rev = db(row.get::<_, u64>(7))?;
+        if binding_rev == 0 {
+            return Err(Error::Storage("invalid durable SourceBinding revision"));
+        }
+        Ok(Self {
+            binding,
+            binding_rev,
+            compatibility: SourceBindingCompatibility::parse(&db(row.get::<_, String>(8))?)?,
+        })
+    }
+
+    fn summary(self) -> SourceBindingSummary {
+        SourceBindingSummary {
+            name: self.binding.name,
+            driver: self.binding.driver,
+            binding_schema: self.binding.binding_schema,
+            access: self.binding.access,
+            checkpoint_policy: self.binding.checkpoint_policy,
+            binding_rev: self.binding_rev,
+            compatibility: self.compatibility,
+        }
+    }
+}
+
+pub(super) fn available(connection: &Connection) -> Result<bool> {
+    let version: i64 = db(connection.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+    Ok(version >= 55)
+}
+
+pub(super) fn has_sources(connection: &Connection, sandbox: &str) -> Result<bool> {
+    if !available(connection)? {
+        return Ok(false);
+    }
+    db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sandbox_source_bindings_current WHERE sandbox_id=?1)",
+        [sandbox],
+        |row| row.get(0),
+    ))
+}
+
+fn bindings_in(connection: &Connection, sandbox: &str) -> Result<Vec<StoredBinding>> {
+    let mut query = db(connection.prepare(
+        "SELECT source_name,driver_key,binding_schema,source_ref,materialization,
+                access,checkpoint_policy,binding_rev,compatibility
+         FROM sandbox_source_bindings_current WHERE sandbox_id=?1
+         ORDER BY source_name LIMIT ?2",
+    ))?;
+    let mut rows = db(query.query(params![sandbox, HARD_MAX_SOURCES_PER_SANDBOX + 1]))?;
+    let mut bindings = Vec::new();
+    while let Some(row) = db(rows.next())? {
+        validate_source_set_hard_limit(bindings.len() + 1)?;
+        bindings.push(StoredBinding::decode(row)?);
+    }
+    Ok(bindings)
+}
+
+pub(super) fn summaries(
+    connection: &Connection,
+    sandbox: &str,
+) -> Result<Vec<SourceBindingSummary>> {
+    Ok(bindings_in(connection, sandbox)?
+        .into_iter()
+        .map(StoredBinding::summary)
+        .collect())
+}
+
+fn compatibility(
+    registry: &SourceDriverRegistryReader,
+    binding: &SourceBinding,
+) -> Result<SourceBindingCompatibility> {
+    match registry.resolve(&binding.pin()?) {
+        Ok(_) => Ok(SourceBindingCompatibility::Compatible),
+        Err(Error::Denied(_)) => Ok(SourceBindingCompatibility::RecoveryRequired),
+        Err(error) => Err(error),
+    }
+}
+
+/// Complete-set admission before any driver work or publication.
+pub(super) fn validate_set(
+    limit: SourceSetLimit,
+    registry: &SourceDriverRegistry,
+    bindings: &[SourceBinding],
+) -> Result<()> {
+    limit.admit(bindings.len())?;
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    let registry = registry.reader()?;
+    let mut names = BTreeSet::new();
+    for binding in bindings {
+        binding.validate()?;
+        if !names.insert(binding.name.as_str()) {
+            return Err(Error::Conflict("duplicate SourceBinding name"));
+        }
+        registry.resolve(&binding.pin()?)?;
+    }
+    Ok(())
+}
+
+/// Called only inside the initial Sandbox publication transaction, after
+/// complete-set admission. No external effect or source grant is implied.
+pub(super) fn insert(
+    connection: &Connection,
+    sandbox: &str,
+    bindings: &[SourceBinding],
+) -> Result<()> {
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    let mut insert = db(connection.prepare(
+        "INSERT INTO sandbox_source_bindings_current(
+             sandbox_id,source_name,driver_key,binding_schema,source_ref,materialization,
+             access,checkpoint_policy,binding_rev,compatibility
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,'compatible')",
+    ))?;
+    for binding in bindings {
+        let driver = serde_json::to_string(&binding.driver)
+            .map_err(|_| Error::Storage("cannot encode SourceDriver key"))?;
+        let access = match binding.access {
+            SourceAccess::ReadOnly => "ro",
+            SourceAccess::ReadWrite => "rw",
+        };
+        let policy = match binding.checkpoint_policy {
+            CheckpointPolicy::Required => "required",
+            CheckpointPolicy::Ephemeral => "ephemeral",
+        };
+        db(insert.execute(params![
+            sandbox,
+            binding.name.as_str(),
+            driver,
+            binding.binding_schema,
+            binding.source_ref,
+            binding.materialization,
+            access,
+            policy,
+        ]))?;
+    }
+    Ok(())
+}
+
+/// Reconcile compatibility, not source state. No driver effect is executed.
+/// A compatible registration is not authority to materialize or execute.
+pub(crate) fn revalidate(
+    connection: &mut Connection,
+    registry: &SourceDriverRegistry,
+) -> Result<()> {
+    let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let any: bool = db(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sandbox_source_bindings_current)",
+        [],
+        |row| row.get(0),
+    ))?;
+    if !any {
+        return db(tx.commit());
+    }
+    let registry = registry.reader()?;
+    // Until realization exists, no Agent can be bound to a source-bearing Sandbox.
+    // Reject unexpected persisted combinations rather than allowing layout-only execution.
+    let bound: bool = db(tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_state_current a
+             JOIN sandbox_source_bindings_current b ON b.sandbox_id=a.sandbox_id
+         )",
+        [],
+        |row| row.get(0),
+    ))?;
+    if bound {
+        return Err(Error::Denied(
+            "source-bearing Agent Sandbox realization is unavailable",
+        ));
+    }
+    {
+        // One bounded Sandbox at a time; no global materialization/descriptor allocation.
+        let mut query = db(tx.prepare(
+            "SELECT s.sandbox_id FROM sandboxes_current s
+             WHERE s.lifecycle='open' AND EXISTS(
+                 SELECT 1 FROM sandbox_source_bindings_current b WHERE b.sandbox_id=s.sandbox_id
+             ) ORDER BY s.sandbox_id",
+        ))?;
+        let mut rows = db(query.query([]))?;
+        while let Some(row) = db(rows.next())? {
+            let sandbox: String = db(row.get(0))?;
+            for stored in bindings_in(&tx, &sandbox)? {
+                let next = compatibility(&registry, &stored.binding)?;
+                if next != stored.compatibility {
+                    db(tx.execute(
+                        "UPDATE sandbox_source_bindings_current SET compatibility=?1
+                         WHERE sandbox_id=?2 AND source_name=?3",
+                        params![next.as_str(), sandbox, stored.binding.name.as_str()],
+                    ))?;
+                }
+            }
+        }
+    }
+    db(tx.commit())
+}
