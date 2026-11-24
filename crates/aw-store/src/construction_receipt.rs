@@ -602,8 +602,13 @@ pub(crate) fn claim_in(
         ));
     }
     receipt.admit(registry, limit)?;
+    // Leave room for terminal result/diagnostic metadata. Never persist a
+    // new claim whose exact receipt cannot be decoded after restart.
+    if crate::json(receipt)?.len() > MAX_RECEIPT_BYTES - 16384 {
+        return Err(Error::Limit("construction receipt exceeds encoded bound"));
+    }
     if let Some(boundary) = &receipt.restore_boundary {
-        let set = boundary.retained_sources_in(tx, receipt)?;
+        let set = boundary.materialization_sources_in(tx, receipt)?;
         let reader = registry.reader()?;
         for anchor in &set.anchors {
             reader.resolve(&anchor.pin()?)?;
@@ -1196,7 +1201,7 @@ pub(crate) fn visit_unresolved_sources(
         let restore_set = receipt
             .restore_boundary
             .as_ref()
-            .map(|boundary| boundary.retained_sources_in(connection, &receipt))
+            .map(|boundary| boundary.materialization_sources_in(connection, &receipt))
             .transpose()?;
         for (index, source) in sources.sources.iter().enumerate() {
             let mut status = compatibility(registry, &source.prepared.descriptor.pin()?)?;

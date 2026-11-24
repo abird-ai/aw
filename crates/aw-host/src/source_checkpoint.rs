@@ -8,8 +8,9 @@ use aw_agent_core::{
 };
 use aw_git::source_driver::{GitRestoreLocation, GitSourceAnchor, GitSourceDriver};
 use aw_store::{
-    CheckpointRestoreRequest, CheckpointRestoreResult, InspectedCheckpointRestore, SandboxSnapshot,
-    SessionBinding, SessionStore, VersionedSourceBinding,
+    CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
+    InspectedCheckpointRestore, SandboxSnapshot, SessionBinding, SessionStore,
+    VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -237,7 +238,8 @@ impl<'a> GitCheckpointRestoreHost<'a> {
     /// and independent approval are not consulted on replay. The host selects
     /// an inert layout and authorizes the complete named set before Git reads
     /// or effects; the returned live guard spans the actual Store commit.
-    /// Empty/baseline and non-Git SourceSets require their own host route.
+    /// Baseline versions are selected explicitly by restore_versioned_baseline.
+    /// Non-Git SourceSets require their own host route.
     pub fn restore<F: GitRestoreFence>(
         &self,
         actor: &PrincipalId,
@@ -247,19 +249,67 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         select_layout: impl FnOnce() -> Result<SessionBinding>,
         authorize: impl FnOnce(&SessionBinding, &SourceSet) -> Result<F>,
     ) -> Result<CheckpointRestoreResult> {
+        self.restore_selected(
+            actor,
+            request,
+            request_id,
+            execution_site,
+            || Ok((select_layout()?, None)),
+            authorize,
+        )
+    }
+
+    /// Restore history into a fresh, independently selected versioned
+    /// destination baseline. Selection is read-only and occurs only for new
+    /// work. The host owns retention of every chosen version and current
+    /// destination policy; this never captures or alters the checkpoint.
+    pub fn restore_versioned_baseline<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        request_id: &str,
+        execution_site: &str,
+        select: impl FnOnce() -> Result<(SessionBinding, SourceSet)>,
+        authorize: impl FnOnce(&SessionBinding, &SourceSet) -> Result<F>,
+    ) -> Result<CheckpointRestoreResult> {
+        self.restore_selected(
+            actor,
+            request,
+            request_id,
+            execution_site,
+            || {
+                let (layout, sources) = select()?;
+                Ok((layout, Some(sources)))
+            },
+            authorize,
+        )
+    }
+
+    fn restore_selected<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        request_id: &str,
+        execution_site: &str,
+        select: impl FnOnce() -> Result<(SessionBinding, Option<SourceSet>)>,
+        authorize: impl FnOnce(&SessionBinding, &SourceSet) -> Result<F>,
+    ) -> Result<CheckpointRestoreResult> {
         if let Some(result) = self
             .store
             .checkpoint_replay_restore(actor, request, request_id)?
         {
             return Ok(result);
         }
-        let layout = select_layout()?;
+        let (layout, baseline) = select()?;
         let driver = self.store.source_driver(self.driver)?;
         let mut fence = None;
-        let prepared = self.store.checkpoint_prepare_restore(
+        let prepared = self.store.checkpoint_prepare_restore_with_layout(
             actor,
             request,
-            &layout,
+            CheckpointRestoreLayout {
+                binding: &layout,
+                baseline,
+            },
             request_id,
             execution_site,
             |prepare_id, _, anchors| {
@@ -595,6 +645,10 @@ mod tests {
             access: AgentHistoryForkAccess::Private,
             task: None,
         };
+        let history_request = request.clone();
+        let empty_auto = store
+            .checkpoint_create_empty_auto(&actor, &reference, None, "fixture:empty-auto")
+            .unwrap();
         // Use the ordinary lower owners to create and capture the source
         // Agent. No synthetic binding or receipt insertion in the fixture.
         let source = store
@@ -651,6 +705,12 @@ mod tests {
                     .collect()
             })
             .unwrap();
+        // Fixture destination policy independently selects these already
+        // retained versions. No effectful baseline selection or new capture.
+        let baseline = SourceSet {
+            coverage: aw_agent_core::SourceCoverage::Selected,
+            anchors: captured.source_set().anchors.clone(),
+        };
         let checkpoint = captured
             .publish::<std::convert::Infallible>(|_, _, prepared, sources, evidence| {
                 prepared
@@ -832,6 +892,141 @@ mod tests {
         })
         .unwrap();
 
+        // A fresh baseline is independent of the checkpoint's historical
+        // sources. Required current baseline versions are valid for None,
+        // not empty Auto; captured checkpoints may never substitute them.
+        let baseline_root = root.join("versioned-baseline");
+        private_dir(&baseline_root);
+        let auto_request = CheckpointRestoreRequest {
+            checkpoint: empty_auto.id,
+            ..history_request.clone()
+        };
+        for invalid in [&request, &auto_request] {
+            assert!(host
+                .restore_versioned_baseline::<Fence<'_>>(
+                    &actor,
+                    invalid,
+                    "fixture:invalid-baseline",
+                    "local",
+                    || Ok((layout(&baseline_root), baseline.clone())),
+                    |_, _| panic!("invalid baseline reached driver authorization")
+                )
+                .is_err());
+        }
+        assert!(!baseline_root.join("code").exists());
+
+        let baseline_request = CheckpointRestoreRequest {
+            task: Some("baseline initial task".into()),
+            ..history_request
+        };
+        fail_publication();
+        assert!(host
+            .restore_versioned_baseline(
+                &actor,
+                &baseline_request,
+                "fixture:versioned-baseline",
+                "local",
+                || Ok((layout(&baseline_root), baseline.clone())),
+                |_, _| Ok(fence(locations(&baseline_root), 3)),
+            )
+            .is_err());
+        assert_eq!(
+            fs::read(baseline_root.join("code/tracked")).unwrap(),
+            b"code"
+        );
+        assert!(store
+            .checkpoint_delete(&actor, &baseline_request.checkpoint)
+            .is_err());
+        assert!(host
+            .restore_versioned_baseline::<Fence<'_>>(
+                &actor,
+                &baseline_request,
+                "fixture:versioned-baseline",
+                "local",
+                || panic!("unresolved baseline selected another version"),
+                |_, _| panic!("unresolved baseline authorized again")
+            )
+            .is_err());
+        drop(store);
+        clear_failure();
+        let missing = SessionStore::open(&state).unwrap();
+        assert!(GitCheckpointRestoreHost::new(&missing, &driver)
+            .resume::<Fence<'_>>(
+                &actor,
+                "fixture:versioned-baseline",
+                &layout(&baseline_root),
+                |_, _, _| panic!("missing driver authorized baseline recovery")
+            )
+            .is_err());
+        drop(missing);
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        let versioned = host
+            .resume(
+                &actor,
+                "fixture:versioned-baseline",
+                &layout(&baseline_root),
+                |_, sources, _| {
+                    assert_eq!(sources, &baseline);
+                    Ok(fence(locations(&baseline_root), 4))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            versioned.source_coverage,
+            aw_agent_core::SourceCoverage::None
+        );
+        assert_eq!(versioned.agent.admission, AgentAdmission::Held);
+        assert!(store
+            .checkpoint_get_metadata(&actor, &baseline_request.checkpoint)
+            .unwrap()
+            .sources
+            .is_empty());
+        assert_eq!(
+            host.restore_versioned_baseline::<Fence<'_>>(
+                &actor,
+                &baseline_request,
+                "fixture:versioned-baseline",
+                "local",
+                || panic!("Applied baseline selected new versions"),
+                |_, _| panic!("Applied baseline authorized again")
+            )
+            .unwrap(),
+            versioned
+        );
+
+        // Empty Auto accepts only independently selected ephemeral versions.
+        // Reuse the ordinary Prepared cleanup, including task-free receipts.
+        let ephemeral_root = root.join("ephemeral-baseline");
+        private_dir(&ephemeral_root);
+        let mut ephemeral = baseline.clone();
+        for anchor in &mut ephemeral.anchors {
+            anchor.checkpoint_policy = CheckpointPolicy::Ephemeral;
+        }
+        fail_publication();
+        assert!(host
+            .restore_versioned_baseline(
+                &actor,
+                &auto_request,
+                "fixture:ephemeral-baseline",
+                "local",
+                || Ok((layout(&ephemeral_root), ephemeral)),
+                |_, _| Ok(fence(locations(&ephemeral_root), 4))
+            )
+            .is_err());
+        clear_failure();
+        assert!(ephemeral_root.join("data/tracked").is_file());
+        host.abandon(&actor, "fixture:ephemeral-baseline", |_, _| {
+            Ok(fence(locations(&ephemeral_root), 4))
+        })
+        .unwrap();
+        assert!(fs::read_dir(&ephemeral_root).unwrap().next().is_none());
+        assert!(store
+            .checkpoint_get_metadata(&actor, &auto_request.checkpoint)
+            .unwrap()
+            .sources
+            .is_empty());
+
         // Retire the published layout through its original Agent, queue and
         // Sandbox owners. The checkpoint need not retain its anchor rows.
         let sandbox = restored.agent.sandbox_ref.as_deref().unwrap();
@@ -879,14 +1074,14 @@ mod tests {
         }
         assert!(host
             .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
-                Ok(fence(locations(&other), 3))
+                Ok(fence(locations(&other), 4))
             })
             .is_err());
         let foreign = destination.join("unrelated");
         fs::write(&foreign, b"keep").unwrap();
         assert!(host
             .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
-                Ok(fence(locations(&destination), 3))
+                Ok(fence(locations(&destination), 4))
             })
             .is_err());
         assert_eq!(fs::read(&foreign).unwrap(), b"keep");
@@ -900,7 +1095,7 @@ mod tests {
         fs::write(&modified, b"user work").unwrap();
         assert!(host
             .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
-                Ok(fence(locations(&destination), 3))
+                Ok(fence(locations(&destination), 4))
             })
             .is_err());
         assert!(!destination.join("code").exists());
@@ -920,7 +1115,7 @@ mod tests {
         fs::write(&modified, b"data").unwrap();
         let released = host
             .reconcile_closed_sandbox(&actor, sandbox, |_, _, _| {
-                Ok(fence(locations(&destination), 3))
+                Ok(fence(locations(&destination), 4))
             })
             .unwrap();
         assert!(released.sources.is_empty());
@@ -942,6 +1137,8 @@ mod tests {
         assert!(store
             .activate(&actor, agent.session_id(), agent.branch_id())
             .is_err());
+        assert!(baseline_root.join("code/tracked").is_file());
+        assert!(baseline_root.join("data/tracked").is_file());
         assert!(authority.try_write().is_ok());
         for (name, head) in ["code", "data"].into_iter().zip(original_heads) {
             let repo = source_root.join(name);

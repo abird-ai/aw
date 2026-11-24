@@ -47,8 +47,9 @@ managed Git restore-materialization release with original Applied restore proven
 metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
 unpublished capture/restore candidate reconciliation, shared custom initial history
 ACL construction, captured-source restore initial-task custody/publication,
-task-only baseline restore/recovery, concrete fenced Git checkpoint restore
-and managed closed-Sandbox retirement host consumers are implemented locally.
+task-only baseline restore/recovery, concrete fenced Git checkpoint restore,
+managed closed-Sandbox retirement and effectful versioned baseline restore host
+consumers are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2179,11 +2180,35 @@ fmt/diff passed. Production physical/provider fences remain supplied
 by the embedding authority owner; arbitrary layouts, changed bindings, mixed
 drivers and general partial/scratch cleanup are not promoted.
 
+Effectful versioned baseline restoration now uses the original Prepared restore
+constructor, source barrier, encrypted initial-task custody and atomic publication.
+`CheckpointRestoreLayout` distinguishes independently selected retained destination
+versions from the historical checkpoint SourceSet. The original receipt stores the
+exact baseline anchors once as operation inputs, not checkpoint history or a second
+source owner. Explicit None accepts required or ephemeral versions; empty Auto
+accepts only ephemeral versions. Neither can substitute captured sources. Bounds,
+canonical names and registered schemas are checked before driver preparation;
+startup compatibility and recovery use the original materialization inputs.
+`GitCheckpointRestoreHost::restore_versioned_baseline` shares the existing replay-first,
+fenced execution/inspection/publication path; resume and abandon need no new route.
+The public result preserves original history coverage, the checkpoint remains empty,
+and source-bearing admission stays held. A new claim must fit the existing receipt
+encoding bound with room for its terminal outcome. No migration or new ledger.
+The grouped Host regression uses independently selected already-retained dirty Git
+versions; checks captured-source/empty-Auto refusal, failed publication with task,
+history retention, missing-driver restart, exact resume and replay, and task-free
+ephemeral Auto abandonment. Host **16/16**, checkpoint owner **4/4**, construction
+receipt **1/1**, strict affected all-target/all-feature Clippy, workspace
+all-target/all-feature check and scoped fmt/diff passed.
+Production baseline selection and retention authority
+remain the embedding host's responsibility; creating a new version/snapshot or
+unversioned baseline assets is not implemented by this slice.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, prefer independent production authority/cleanup composition or
-effectful baseline Prepared custody; do not add speculative admission layers.
-Independent host approval provisioning, effectful baseline materialization,
+While blocked, prefer independent authority/cleanup composition or Vault owner work
+with an actual consumer; do not add speculative admission layers.
+Independent host approval provisioning, other effectful baseline materialization,
 incomplete-effect reconciliation, multi-source policy, general unpublished partial/
 scratch cleanup and production cleanup composition/physical authority, final-source
 removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.

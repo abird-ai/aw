@@ -44,6 +44,15 @@ pub struct CheckpointRestoreResult {
     pub source_coverage: SourceCoverage,
 }
 
+/// Trusted layout selection for a Prepared restore. A nonempty, explicitly
+/// selected baseline contains independently retained destination versions,
+/// not anchors of the checkpoint being restored. None selects that
+/// checkpoint's exact captured sources. No external effect during selection.
+pub struct CheckpointRestoreLayout<'a> {
+    pub binding: &'a SessionBinding,
+    pub baseline: Option<SourceSet>,
+}
+
 fn fingerprint<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
     let mut hash = Sha256::new();
     hash.update(domain);
@@ -82,6 +91,10 @@ pub(crate) struct RestoreBoundary {
     // Existing taskless/captured-source receipt encodings are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     baseline_digest: Option<String>,
+    // Effectful current-baseline selection has no checkpoint-source owner.
+    // Its original immutable version/retention inputs belong to this receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_sources: Option<SourceSet>,
 }
 
 impl RestoreBoundary {
@@ -145,6 +158,28 @@ impl RestoreBoundary {
         {
             return Err(Error::Conflict("invalid checkpoint restore boundary"));
         }
+        if let Some(baseline) = &self.baseline_sources {
+            require_versioned_baseline(self.coverage, baseline)?;
+            if self.baseline_digest.is_some()
+                || self.source_set_digest
+                    != source_set_digest(&SourceSet {
+                        coverage: self.coverage,
+                        anchors: Vec::new(),
+                    })?
+            {
+                return Err(Error::Conflict(
+                    "baseline cannot replace captured checkpoint sources",
+                ));
+            }
+            return match sources {
+                Some(sources) if sources.prepare_id == candidate.prepare_id() => {
+                    require_matching_sources(baseline, sources)
+                }
+                _ => Err(Error::Conflict(
+                    "versioned baseline requires Prepared source custody",
+                )),
+            };
+        }
         match sources {
             Some(sources)
                 if self.coverage != SourceCoverage::None
@@ -169,9 +204,11 @@ impl RestoreBoundary {
         }
     }
 
-    /// Resolve the exact retained immutable owner. Retired rows can still
-    /// carry recovery dependencies, but never authorize fresh publication.
-    pub(crate) fn retained_sources_in(
+    /// Resolve the exact immutable materialization inputs. Captured sources
+    /// belong to the checkpoint; independently selected baseline versions
+    /// belong to the original operation receipt. Retired history is never
+    /// authority to publish a new Agent.
+    pub(crate) fn materialization_sources_in(
         &self,
         connection: &Connection,
         receipt: &ConstructionPreparation,
@@ -192,6 +229,17 @@ impl RestoreBoundary {
         if source_set_digest(&set)? != self.source_set_digest {
             return Err(Error::Storage("restore checkpoint source set changed"));
         }
+        let set = if let Some(baseline) = &self.baseline_sources {
+            if !set.anchors.is_empty() {
+                return Err(Error::Storage(
+                    "baseline restore has captured checkpoint sources",
+                ));
+            }
+            require_versioned_baseline(self.coverage, baseline)?;
+            baseline.clone()
+        } else {
+            set
+        };
         match &receipt.sources {
             Some(prepared) if !set.anchors.is_empty() => require_matching_sources(&set, prepared)?,
             None if set.anchors.is_empty()
@@ -205,6 +253,32 @@ impl RestoreBoundary {
         }
         Ok(set)
     }
+}
+
+fn require_versioned_baseline(coverage: SourceCoverage, baseline: &SourceSet) -> Result<()> {
+    // Selected here describes the explicitly chosen destination inputs,
+    // never the source checkpoint's coverage.
+    if coverage == SourceCoverage::Selected
+        || baseline.coverage != SourceCoverage::Selected
+        || baseline
+            .anchors
+            .windows(2)
+            .any(|pair| pair[0].name.as_str() >= pair[1].name.as_str())
+    {
+        return Err(Error::Conflict("invalid versioned baseline selection"));
+    }
+    baseline.validate()?;
+    if coverage == SourceCoverage::AutoAllRequired
+        && baseline
+            .anchors
+            .iter()
+            .any(|anchor| anchor.checkpoint_policy != aw_agent_core::CheckpointPolicy::Ephemeral)
+    {
+        return Err(Error::Conflict(
+            "empty Auto restore admits only current ephemeral sources",
+        ));
+    }
+    Ok(())
 }
 
 fn require_matching_sources(set: &SourceSet, prepared: &PreparedSourceSet) -> Result<()> {
@@ -232,6 +306,15 @@ struct RestoreObservation {
     boundary: RestoreBoundary,
     sources: SourceSet,
     history: history_owner::ResolvedHistorySource,
+}
+
+impl RestoreObservation {
+    fn materialization_sources(&self) -> &SourceSet {
+        self.boundary
+            .baseline_sources
+            .as_ref()
+            .unwrap_or(&self.sources)
+    }
 }
 
 fn observe_in(
@@ -308,6 +391,7 @@ fn observe_in(
         access: request.access.clone(),
         binding_digest: binding_digest.to_owned(),
         baseline_digest: None,
+        baseline_sources: None,
     };
     Ok(RestoreObservation {
         session: row.session,
@@ -316,6 +400,36 @@ fn observe_in(
         sources,
         history: source,
     })
+}
+
+fn observe_prepared_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    request: &CheckpointRestoreRequest,
+    layout_digest: &str,
+    limit: SourceSetLimit,
+    registry: &SourceDriverRegistryReader,
+    baseline: Option<&SourceSet>,
+) -> Result<RestoreObservation> {
+    let mut observed = observe_in(connection, actor, request, layout_digest, limit, registry)?;
+    if let Some(baseline) = baseline {
+        if !observed.sources.anchors.is_empty() {
+            return Err(Error::Conflict(
+                "captured sources cannot be replaced by a fresh baseline",
+            ));
+        }
+        limit.admit(baseline.anchors.len())?;
+        require_versioned_baseline(observed.boundary.coverage, baseline)?;
+        for anchor in &baseline.anchors {
+            registry.resolve(&anchor.pin()?)?;
+        }
+        observed.boundary.baseline_sources = Some(baseline.clone());
+    } else if observed.sources.anchors.is_empty() {
+        return Err(Error::Conflict(
+            "empty checkpoint requires fresh baseline restore",
+        ));
+    }
+    Ok(observed)
 }
 
 fn require_new_request(
@@ -394,6 +508,8 @@ impl<'a> PreparedCheckpointRestore<'a> {
         }
     }
 
+    /// Exact materialization inputs, whether captured checkpoint sources
+    /// or the independently selected versions of a fresh baseline.
     pub fn anchors(&self) -> &SourceSet {
         &self.anchors
     }
@@ -438,16 +554,17 @@ impl<'a> PreparedCheckpointRestore<'a> {
         registry: &SourceDriverRegistryReader,
     ) -> Result<history_owner::ResolvedHistorySource> {
         let boundary = self.boundary();
-        let observed = observe_in(
+        let observed = observe_prepared_in(
             tx,
             &self.actor,
             &boundary.request(),
             &binding_digest(binding)?,
             self.store.inner.source_limit,
             registry,
+            boundary.baseline_sources.as_ref(),
         )?;
         if observed.boundary != *boundary
-            || observed.sources != self.anchors
+            || observed.materialization_sources() != &self.anchors
             || self.receipt.origin() != AgentKey::new(&observed.session, &observed.branch)
         {
             return Err(Error::Conflict("checkpoint restore boundary changed"));
@@ -760,7 +877,7 @@ fn inspection_sources_in(
         actor,
         &parse_project_ref(&boundary.destination_project)?,
     )?;
-    let anchors = boundary.retained_sources_in(tx, receipt)?;
+    let anchors = boundary.materialization_sources_in(tx, receipt)?;
     for (anchor, source) in anchors.anchors.iter().zip(
         &receipt
             .sources
@@ -1221,7 +1338,34 @@ impl SessionStore {
         execution_site: &str,
         plan: impl FnOnce(&str, &str, &SourceSet) -> Result<PreparedSourceSet>,
     ) -> Result<PreparedCheckpointRestore<'_>> {
+        self.checkpoint_prepare_restore_with_layout(
+            actor,
+            request,
+            CheckpointRestoreLayout {
+                binding,
+                baseline: None,
+            },
+            request_id,
+            execution_site,
+            plan,
+        )
+    }
+
+    /// The same Prepared constructor for captured sources or independently
+    /// selected immutable destination baseline versions. A host must retain
+    /// those versions independently and authorize their materialization.
+    /// No baseline source is added to the historical checkpoint.
+    pub fn checkpoint_prepare_restore_with_layout(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        mut layout: CheckpointRestoreLayout<'_>,
+        request_id: &str,
+        execution_site: &str,
+        plan: impl FnOnce(&str, &str, &SourceSet) -> Result<PreparedSourceSet>,
+    ) -> Result<PreparedCheckpointRestore<'_>> {
         let fingerprint = restore_fingerprint(request, request_id)?;
+        let binding = layout.binding;
         if self.inner.mode != crate::StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "checkpoint restore requires the exclusive persistent Store owner",
@@ -1234,26 +1378,29 @@ impl SessionStore {
             let creator = user_for_principal(&tx, actor)?
                 .ok_or(Error::Denied("checkpoint restore caller unavailable"))?;
             require_new_request(&tx, &creator, request_id, &fingerprint)?;
+            if let Some(baseline) = &mut layout.baseline {
+                limit.admit(baseline.anchors.len())?;
+                baseline
+                    .anchors
+                    .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+            }
             let registry = self.inner.source_drivers.reader()?;
-            let observed = observe_in(
+            let observed = observe_prepared_in(
                 &tx,
                 actor,
                 request,
                 &binding_digest(binding)?,
                 limit,
                 &registry,
+                layout.baseline.as_ref(),
             )?;
-            if observed.sources.anchors.is_empty() {
-                return Err(Error::Conflict(
-                    "empty checkpoint requires fresh baseline restore",
-                ));
-            }
             sandbox_owner::require_fresh_layout_in(
                 &tx,
                 &observed.boundary.destination_project,
                 binding,
             )?;
-            SourceMutationSet::from_anchors(&observed.sources.anchors)?.require_unleased_in(&tx)?;
+            SourceMutationSet::from_anchors(&observed.materialization_sources().anchors)?
+                .require_unleased_in(&tx)?;
             let store_scope = StoreScope::load(&tx)?;
             db(tx.commit())?;
             (creator, observed, store_scope)
@@ -1265,12 +1412,13 @@ impl SessionStore {
             .map(|payload| InitialTask::mint(request_id, &ids.session, payload, execution_site))
             .transpose()?;
         let sandbox = format!("{}/s:{}", observed.boundary.destination_project, id("sbx")?);
-        let mut sources = plan(&ids.session, &sandbox, &observed.sources)?;
+        let anchors = observed.materialization_sources().clone();
+        let mut sources = plan(&ids.session, &sandbox, &anchors)?;
         sources.admit(limit)?;
         sources
             .sources
             .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        require_matching_sources(&observed.sources, &sources)?;
+        require_matching_sources(&anchors, &sources)?;
         let candidate = ConstructionCandidate::Agent {
             session: ids.session,
             root: ids.root,
@@ -1278,7 +1426,7 @@ impl SessionStore {
             sandbox: Some(sandbox),
         };
         observed.boundary.validate(&candidate, Some(&sources))?;
-        let set = SourceMutationSet::from_anchors(&observed.sources.anchors)?;
+        let set = SourceMutationSet::from_anchors(&anchors.anchors)?;
         let receipt = ConstructionPreparation {
             operation: ConstructionOperation::CheckpointRestore,
             scope: creator.clone(),
@@ -1307,16 +1455,17 @@ impl SessionStore {
         receipt.require_actor(&tx, actor)?;
         require_new_request(&tx, &receipt.creator, request_id, &receipt.fingerprint)?;
         let registry = self.inner.source_drivers.reader()?;
-        let current = observe_in(
+        let current = observe_prepared_in(
             &tx,
             actor,
             request,
             &binding_digest(binding)?,
             limit,
             &registry,
+            layout.baseline.as_ref(),
         )?;
         if receipt.restore_boundary.as_ref() != Some(&current.boundary)
-            || observed.sources != current.sources
+            || &anchors != current.materialization_sources()
             || receipt.origin() != AgentKey::new(&current.session, &current.branch)
         {
             return Err(Error::Conflict(
@@ -1336,7 +1485,7 @@ impl SessionStore {
             store: self,
             actor: actor.clone(),
             receipt,
-            anchors: observed.sources,
+            anchors,
             barrier,
         };
         if let (Some(task), Some(payload)) = (&restore.receipt.task, request.task.as_deref()) {

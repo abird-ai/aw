@@ -19,8 +19,8 @@ pub use capture::{
     CheckpointCaptureSelection, InspectedCheckpointCapture, PreparedCheckpointCapture,
 };
 pub use restore::{
-    CheckpointRestoreRequest, CheckpointRestoreResult, InspectedCheckpointRestore,
-    PreparedCheckpointRestore,
+    CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
+    InspectedCheckpointRestore, PreparedCheckpointRestore,
 };
 pub(crate) use retirement::RETENTION_CLEANUP_PREFIX;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
