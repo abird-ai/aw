@@ -23,7 +23,7 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Trusted lower source-bearing restore request. The destination layout is
+/// Trusted lower checkpoint restore request. The destination layout is
 /// independently selected by the host. Initial task and custom access will
 /// use the common Agent constructor; neither is accepted by this seam yet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ impl RestoreBoundary {
     pub(crate) fn validate(
         &self,
         candidate: &ConstructionCandidate,
-        sources: &PreparedSourceSet,
+        sources: Option<&PreparedSourceSet>,
     ) -> Result<()> {
         for value in [&self.checkpoint, &self.history_base_id, &self.history_head] {
             label(value, 128)?;
@@ -115,15 +115,32 @@ impl RestoreBoundary {
         };
         if project.canonical() != sandbox_project
             || self.destination_writer_epoch == 0
-            || self.coverage == SourceCoverage::None
             || !valid_digest(&self.source_set_digest)
             || !valid_digest(&self.binding_digest)
-            || sources.operation != SourceOperationKind::Restore
-            || sources.prepare_id != candidate.prepare_id()
         {
             return Err(Error::Conflict("invalid checkpoint restore boundary"));
         }
-        Ok(())
+        match sources {
+            Some(sources)
+                if self.coverage != SourceCoverage::None
+                    && sources.operation == SourceOperationKind::Restore
+                    && sources.prepare_id == candidate.prepare_id() =>
+            {
+                Ok(())
+            }
+            None if self.coverage != SourceCoverage::Selected
+                && self.source_set_digest
+                    == source_set_digest(&SourceSet {
+                        coverage: self.coverage,
+                        anchors: Vec::new(),
+                    })? =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Conflict(
+                "restore source custody differs from checkpoint coverage",
+            )),
+        }
     }
 
     /// Resolve the exact retained immutable owner. Retired rows can still
@@ -241,11 +258,6 @@ fn observe_in(
 
     let (sources, _) = sources_in(connection, &request.checkpoint, snapshot.source_coverage)?;
     sources.admit(limit)?;
-    if sources.anchors.is_empty() {
-        return Err(Error::Conflict(
-            "history-only checkpoint requires fresh baseline restore",
-        ));
-    }
     for anchor in &sources.anchors {
         registry.resolve(&anchor.pin()?)?;
     }
@@ -597,40 +609,15 @@ impl InspectedCheckpointRestore<'_> {
                 proofs,
                 |tx| {
                     let history = restore.require_current_boundary_in(tx, binding, &registry)?;
-                    let boundary = restore.boundary();
-                    let project = parse_project_ref(&boundary.destination_project)?;
-                    let fresh = sandbox_owner::publish_fresh_in(
+                    publish_restored_agent_in(
                         tx,
+                        restore.store,
                         &restore.actor,
-                        restore.sandbox_ref(),
+                        &restore.receipt,
+                        &history,
                         binding,
                         &self.bindings,
-                        &restore.store.inner.source_drivers,
-                        restore.store.inner.source_limit,
-                    )?;
-                    let (session, branch) =
-                        history_owner::create_agent_from_resolved_history_with_ids_in(
-                            tx,
-                            &restore.actor,
-                            &history,
-                            &boundary.title,
-                            binding,
-                            boundary.access,
-                            &stable_user_principal(&project.identity)?,
-                            &project.project,
-                            restore.receipt.candidate.agent_ids()?,
-                            Some(&fresh),
-                        )?;
-                    let reference =
-                        agent_owner::canonical_ref(tx, AgentKey::new(&session.id, &branch.id))?;
-                    let agent = snapshot_in(tx, &restore.actor, &reference)?;
-                    Ok((
-                        reference,
-                        CheckpointRestoreResult {
-                            agent,
-                            source_coverage: boundary.coverage,
-                        },
-                    ))
+                    )
                 },
             )
         })();
@@ -642,6 +629,61 @@ impl InspectedCheckpointRestore<'_> {
             }
         }
     }
+}
+
+/// The same ordinary exact-history constructor and fresh Sandbox owner
+/// publish both captured-source and current-baseline restores.
+fn publish_restored_agent_in(
+    tx: &Transaction<'_>,
+    store: &SessionStore,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    history: &history_owner::ResolvedHistorySource,
+    binding: &SessionBinding,
+    sources: &[SourceBinding],
+) -> Result<(String, CheckpointRestoreResult)> {
+    let boundary = receipt
+        .restore_boundary
+        .as_ref()
+        .ok_or(Error::Storage("restore publication lost its boundary"))?;
+    let ConstructionCandidate::Agent {
+        sandbox: Some(sandbox),
+        ..
+    } = &receipt.candidate
+    else {
+        return Err(Error::Storage("restore publication lost its fresh Sandbox"));
+    };
+    let project = parse_project_ref(&boundary.destination_project)?;
+    let fresh = sandbox_owner::publish_fresh_in(
+        tx,
+        actor,
+        sandbox,
+        binding,
+        sources,
+        &store.inner.source_drivers,
+        store.inner.source_limit,
+    )?;
+    let (session, branch) = history_owner::create_agent_from_resolved_history_with_ids_in(
+        tx,
+        actor,
+        history,
+        &boundary.title,
+        binding,
+        boundary.access,
+        &stable_user_principal(&project.identity)?,
+        &project.project,
+        receipt.candidate.agent_ids()?,
+        Some(&fresh),
+    )?;
+    let reference = agent_owner::canonical_ref(tx, AgentKey::new(&session.id, &branch.id))?;
+    let agent = snapshot_in(tx, actor, &reference)?;
+    Ok((
+        reference,
+        CheckpointRestoreResult {
+            agent,
+            source_coverage: boundary.coverage,
+        },
+    ))
 }
 
 fn inspection_sources_in(
@@ -683,6 +725,72 @@ fn inspection_sources_in(
     Ok(anchors)
 }
 
+fn restore_fingerprint(request: &CheckpointRestoreRequest, request_id: &str) -> Result<String> {
+    label(&request.checkpoint, 128)?;
+    label(request_id, 256)?;
+    if let Some(project) = &request.project {
+        label(project, 2048)?;
+    }
+    if let Some(title) = &request.title {
+        label(title, 160)?;
+    }
+    fingerprint(b"aw-checkpoint-restore-v1\0", request)
+}
+
+fn replay_restore_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    creator: &str,
+    request_id: &str,
+    fingerprint: &str,
+) -> Result<Option<CheckpointRestoreResult>> {
+    let Some(receipt) = construction_receipt::lookup_in(
+        connection,
+        ConstructionOperation::CheckpointRestore,
+        creator,
+        request_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    if receipt.fingerprint != fingerprint {
+        return Err(Error::Denied(
+            "checkpoint restore request identity reused with different semantics",
+        ));
+    }
+    if receipt.state != PreparationState::Applied {
+        return Err(Error::Conflict(
+            "checkpoint restore is non-retryable; inspect original receipt",
+        ));
+    }
+    let reference = receipt
+        .result_ref
+        .as_deref()
+        .ok_or(Error::Storage("applied restore lost its Agent identity"))?;
+    let agent = match snapshot_in(connection, actor, reference) {
+        Err(Error::Denied(_)) => {
+            return Err(Error::Denied(
+                "prior invocation is non-retryable; result unavailable",
+            ))
+        }
+        result => result?,
+    };
+    let boundary = receipt
+        .restore_boundary
+        .as_ref()
+        .ok_or(Error::Storage("applied restore lost its source coverage"))?;
+    let ConstructionCandidate::Agent { sandbox, .. } = &receipt.candidate else {
+        return Err(Error::Storage("applied restore lost its candidate"));
+    };
+    if &agent.sandbox_ref != sandbox {
+        return Err(Error::Storage("restored Agent Sandbox identity changed"));
+    }
+    Ok(Some(CheckpointRestoreResult {
+        agent,
+        source_coverage: boundary.coverage,
+    }))
+}
+
 impl SessionStore {
     /// Lookup the original restore invocation before contextual resolution
     /// or current effect admission. Only current destination Agent view
@@ -693,66 +801,117 @@ impl SessionStore {
         request: &CheckpointRestoreRequest,
         request_id: &str,
     ) -> Result<Option<CheckpointRestoreResult>> {
-        label(&request.checkpoint, 128)?;
-        label(request_id, 256)?;
-        if let Some(project) = &request.project {
-            label(project, 2048)?;
-        }
-        if let Some(title) = &request.title {
-            label(title, 160)?;
-        }
-        let fingerprint = fingerprint(b"aw-checkpoint-restore-v1\0", request)?;
+        let fingerprint = restore_fingerprint(request, request_id)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction())?;
         let creator = user_for_principal(&tx, actor)?
             .ok_or(Error::Denied("checkpoint restore caller unavailable"))?;
-        let Some(receipt) = construction_receipt::lookup_in(
-            &tx,
-            ConstructionOperation::CheckpointRestore,
-            &creator,
-            request_id,
-        )?
-        else {
-            return Ok(None);
-        };
-        if receipt.fingerprint != fingerprint {
-            return Err(Error::Denied(
-                "checkpoint restore request identity reused with different semantics",
-            ));
-        }
-        if receipt.state != PreparationState::Applied {
-            return Err(Error::Conflict(
-                "checkpoint restore is non-retryable; inspect original receipt",
-            ));
-        }
-        let reference = receipt
-            .result_ref
-            .as_deref()
-            .ok_or(Error::Storage("applied restore lost its Agent identity"))?;
-        let agent = match snapshot_in(&tx, actor, reference) {
-            Err(Error::Denied(_)) => {
-                return Err(Error::Denied(
-                    "prior invocation is non-retryable; result unavailable",
-                ))
-            }
-            result => result?,
-        };
-        let boundary = receipt
-            .restore_boundary
-            .as_ref()
-            .ok_or(Error::Storage("applied restore lost its source coverage"))?;
-        let ConstructionCandidate::Agent { sandbox, .. } = &receipt.candidate else {
-            return Err(Error::Storage("applied restore lost its candidate"));
-        };
-        if &agent.sandbox_ref != sandbox {
-            return Err(Error::Storage("restored Agent Sandbox identity changed"));
-        }
-        let result = CheckpointRestoreResult {
-            agent,
-            source_coverage: boundary.coverage,
-        };
+        let result = replay_restore_in(&tx, actor, &creator, request_id, &fingerprint)?;
         db(tx.commit())?;
-        Ok(Some(result))
+        Ok(result)
+    }
+
+    /// Metadata-only restore of history with no captured source anchors.
+    /// The trusted host independently chooses and authorizes a *fresh*
+    /// destination Project baseline, including any already-materialized
+    /// sources and external isolation fences held through this commit.
+    /// No source materialization, driver effect or inherited credentials.
+    /// A source-bearing baseline remains held; effectful baseline creation
+    /// needs its original Prepared owner, not this atomic publication seam.
+    pub fn checkpoint_restore_baseline(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        binding: &SessionBinding,
+        baseline_sources: &[SourceBinding],
+        request_id: &str,
+    ) -> Result<CheckpointRestoreResult> {
+        let fingerprint = restore_fingerprint(request, request_id)?;
+        if self.inner.mode != crate::StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "checkpoint restore requires the exclusive Store owner",
+            ));
+        }
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let creator = user_for_principal(&tx, actor)?
+            .ok_or(Error::Denied("checkpoint restore caller unavailable"))?;
+        if let Some(result) = replay_restore_in(&tx, actor, &creator, request_id, &fingerprint)? {
+            db(tx.commit())?;
+            return Ok(result);
+        }
+        let registry = self.inner.source_drivers.reader()?;
+        let observed = observe_in(
+            &tx,
+            actor,
+            request,
+            &binding_digest(binding)?,
+            self.inner.source_limit,
+            &registry,
+        )?;
+        if !observed.sources.anchors.is_empty() {
+            return Err(Error::Conflict(
+                "captured sources require exact Prepared restore",
+            ));
+        }
+        // Auto restores exactly its captured required set. Only current
+        // ephemeral policy may supplement an empty automatic capture.
+        if observed.sources.coverage == SourceCoverage::AutoAllRequired
+            && baseline_sources.iter().any(|source| {
+                source.checkpoint_policy != aw_agent_core::CheckpointPolicy::Ephemeral
+            })
+        {
+            return Err(Error::Conflict(
+                "empty Auto restore admits only current ephemeral sources",
+            ));
+        }
+        sandbox_owner::require_fresh_layout_in(
+            &tx,
+            &observed.boundary.destination_project,
+            binding,
+        )?;
+        SourceMutationSet::from_bindings(baseline_sources)?.require_unleased_in(&tx)?;
+        let ids = resources::mint_session_candidate_ids()?;
+        let sandbox = format!("{}/s:{}", observed.boundary.destination_project, id("sbx")?);
+        let candidate = ConstructionCandidate::Agent {
+            session: ids.session,
+            root: ids.root,
+            branch: ids.branch,
+            sandbox: Some(sandbox),
+        };
+        require_candidate_absent(&tx, &candidate)?;
+        observed.boundary.validate(&candidate, None)?;
+        let mut receipt = ConstructionPreparation {
+            operation: ConstructionOperation::CheckpointRestore,
+            scope: creator.clone(),
+            creator,
+            parent_session_id: observed.session,
+            parent_branch_id: observed.branch,
+            request_id: request_id.to_owned(),
+            fingerprint,
+            // Only the final Applied receipt is persisted.
+            state: PreparationState::Applied,
+            candidate,
+            task: None,
+            sources: None,
+            capture_boundary: None,
+            restore_boundary: Some(observed.boundary),
+            result_ref: None,
+            note: None,
+        };
+        let (reference, result) = publish_restored_agent_in(
+            &tx,
+            self,
+            actor,
+            &receipt,
+            &observed.history,
+            binding,
+            baseline_sources,
+        )?;
+        receipt.result_ref = Some(reference);
+        construction_receipt::record_atomic_restore_in(&tx, actor, &receipt)?;
+        db(tx.commit())?;
+        Ok(result)
     }
 
     /// Trusted read-only planning followed by an atomic Prepared claim and
@@ -768,20 +927,12 @@ impl SessionStore {
         request_id: &str,
         plan: impl FnOnce(&str, &str, &SourceSet) -> Result<PreparedSourceSet>,
     ) -> Result<PreparedCheckpointRestore<'_>> {
-        label(&request.checkpoint, 128)?;
-        label(request_id, 256)?;
-        if let Some(project) = &request.project {
-            label(project, 2048)?;
-        }
-        if let Some(title) = &request.title {
-            label(title, 160)?;
-        }
+        let fingerprint = restore_fingerprint(request, request_id)?;
         if self.inner.mode != crate::StoreMode::OwnerLock {
             return Err(Error::Denied(
                 "checkpoint restore requires the exclusive persistent Store owner",
             ));
         }
-        let fingerprint = fingerprint(b"aw-checkpoint-restore-v1\0", request)?;
         let limit = self.inner.source_limit;
         let (creator, observed, store_scope) = {
             let mut connection = self.connection()?;
@@ -798,6 +949,11 @@ impl SessionStore {
                 limit,
                 &registry,
             )?;
+            if observed.sources.anchors.is_empty() {
+                return Err(Error::Conflict(
+                    "empty checkpoint requires fresh baseline restore",
+                ));
+            }
             sandbox_owner::require_fresh_layout_in(
                 &tx,
                 &observed.boundary.destination_project,
@@ -822,7 +978,7 @@ impl SessionStore {
             branch: ids.branch,
             sandbox: Some(sandbox),
         };
-        observed.boundary.validate(&candidate, &sources)?;
+        observed.boundary.validate(&candidate, Some(&sources))?;
         let set = SourceMutationSet::from_anchors(&observed.sources.anchors)?;
         let receipt = ConstructionPreparation {
             operation: ConstructionOperation::CheckpointRestore,
@@ -1115,8 +1271,29 @@ mod tests {
             })
             .await
             .unwrap();
+        let empty_auto = store
+            .checkpoint_create_empty_auto(&actor, &reference, None, "host:empty-auto")
+            .unwrap();
+        assert_eq!(empty_auto.source_coverage, SourceCoverage::AutoAllRequired);
+        assert_eq!(empty_auto.history_base_id, base.id);
+        assert!(empty_auto.sources.is_empty());
         handle.finish(finish(2)).await.unwrap();
         drop(handle);
+        assert_eq!(
+            store
+                .checkpoint_replay_capture(
+                    &actor,
+                    &reference,
+                    super::super::CheckpointCaptureSelection::Auto,
+                    None,
+                    "host:empty-auto",
+                )
+                .unwrap(),
+            Some(empty_auto.clone())
+        );
+        assert!(store
+            .checkpoint_create_history_only(&actor, &reference, None, "host:empty-auto")
+            .is_err());
         let current = store
             .checkpoint_create_history_only(&actor, &reference, None, "host:later")
             .unwrap();
@@ -1165,7 +1342,215 @@ mod tests {
             )
             .is_err());
         let mut history_only = request.clone();
-        history_only.checkpoint = current.id;
+        history_only.checkpoint = current.id.clone();
+        let baseline_root = temp.0.join("fresh-baseline");
+        std::fs::create_dir(&baseline_root).unwrap();
+        let baseline_layout = SessionBinding {
+            tool_root: baseline_root.clone(),
+            working_directory: baseline_root,
+            ..layout.clone()
+        };
+        // Only history with an empty captured set can use this atomic path.
+        // View alone cannot restore, and a known original root isn't fresh.
+        assert!(store
+            .checkpoint_restore_baseline(
+                &viewer,
+                &history_only,
+                &baseline_layout,
+                &[],
+                "host:baseline-denied",
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &request,
+                &baseline_layout,
+                &[],
+                "host:captured-refusal",
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &history_only,
+                &session.binding,
+                &[],
+                "host:old-layout",
+            )
+            .is_err());
+        let restored_history = store
+            .checkpoint_restore_baseline(
+                &actor,
+                &history_only,
+                &baseline_layout,
+                &[],
+                "host:history-baseline",
+            )
+            .unwrap();
+        assert_eq!(restored_history.source_coverage, SourceCoverage::None);
+        assert_ne!(
+            restored_history.agent.sandbox_ref.as_deref(),
+            Some(original_sandbox.as_str())
+        );
+        assert_eq!(
+            restored_history.agent.admission,
+            crate::AgentAdmission::Open
+        );
+        let history_sandbox = restored_history.agent.sandbox_ref.as_deref().unwrap();
+        assert!(store
+            .sandbox_get(&actor, history_sandbox)
+            .unwrap()
+            .sources
+            .is_empty());
+        let (history_session, history_branch) = agent_owner::key_for_ref(
+            &store.connection().unwrap(),
+            &restored_history.agent.canonical_ref,
+        )
+        .unwrap();
+        let history_view = store
+            .read_agent_branch_view(&actor, &history_session, &history_branch)
+            .unwrap();
+        assert_eq!(history_view.history.turns.len(), 2);
+        assert_eq!(history_view.session.binding, baseline_layout);
+        // An empty Auto selection preserves its original earlier prefix.
+        // Fresh policy may supply ephemeral, never uncaptured required, sources.
+        let auto_root = temp.0.join("auto-baseline");
+        std::fs::create_dir(&auto_root).unwrap();
+        let auto_layout = SessionBinding {
+            tool_root: auto_root.clone(),
+            working_directory: auto_root,
+            ..layout.clone()
+        };
+        let auto_request = CheckpointRestoreRequest {
+            checkpoint: empty_auto.id.clone(),
+            ..request.clone()
+        };
+        let mut baseline_source = SourceBinding {
+            name: SourceName::new("cache").unwrap(),
+            driver: driver.clone(),
+            binding_schema: 1,
+            source_ref: "fixture:baseline-cache".into(),
+            materialization: "fixture:current-cache".into(),
+            access: SourceAccess::ReadOnly,
+            checkpoint_policy: CheckpointPolicy::Required,
+        };
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &auto_request,
+                &auto_layout,
+                std::slice::from_ref(&baseline_source),
+                "host:auto-required",
+            )
+            .is_err());
+        baseline_source.checkpoint_policy = CheckpointPolicy::Ephemeral;
+        let baseline_set =
+            SourceMutationSet::from_bindings(std::slice::from_ref(&baseline_source)).unwrap();
+        let held = store
+            .acquire_source_mutation_barrier(&baseline_set, "fixture:baseline-busy")
+            .unwrap();
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &auto_request,
+                &auto_layout,
+                std::slice::from_ref(&baseline_source),
+                "host:auto-baseline",
+            )
+            .is_err());
+        held.settle(crate::SourceMutationOutcome::Settled).unwrap();
+        let restored_auto = store
+            .checkpoint_restore_baseline(
+                &actor,
+                &auto_request,
+                &auto_layout,
+                std::slice::from_ref(&baseline_source),
+                "host:auto-baseline",
+            )
+            .unwrap();
+        assert_eq!(
+            restored_auto.source_coverage,
+            SourceCoverage::AutoAllRequired
+        );
+        assert_eq!(restored_auto.agent.admission, crate::AgentAdmission::Held);
+        let auto_sandbox = restored_auto.agent.sandbox_ref.as_deref().unwrap();
+        assert_eq!(
+            store
+                .sandbox_get(&actor, auto_sandbox)
+                .unwrap()
+                .sources
+                .len(),
+            1
+        );
+        let (auto_session, auto_branch) = agent_owner::key_for_ref(
+            &store.connection().unwrap(),
+            &restored_auto.agent.canonical_ref,
+        )
+        .unwrap();
+        let auto_view = store
+            .read_agent_branch_view(&actor, &auto_session, &auto_branch)
+            .unwrap();
+        assert_eq!(auto_view.history.turns.len(), 1);
+        assert_eq!(auto_view.history.turns[0].prompt, "turn 1");
+        assert!(store.activate(&actor, &auto_session, &auto_branch).is_err());
+        assert!(store
+            .checkpoint_create_empty_auto(
+                &actor,
+                &restored_auto.agent.canonical_ref,
+                None,
+                "host:ephemeral-only",
+            )
+            .unwrap()
+            .sources
+            .is_empty());
+        // Replay requires neither a live checkpoint nor a new valid layout.
+        store.checkpoint_delete(&actor, &empty_auto.id).unwrap();
+        store.checkpoint_delete(&actor, &current.id).unwrap();
+        let invalid_layout = SessionBinding {
+            tool_root: PathBuf::new(),
+            ..layout.clone()
+        };
+        assert_eq!(
+            store
+                .checkpoint_restore_baseline(
+                    &actor,
+                    &auto_request,
+                    &invalid_layout,
+                    &[],
+                    "host:auto-baseline",
+                )
+                .unwrap(),
+            restored_auto
+        );
+        assert_eq!(
+            store
+                .checkpoint_replay_restore(&actor, &history_only, "host:history-baseline")
+                .unwrap(),
+            Some(restored_history.clone())
+        );
+        let changed_request = CheckpointRestoreRequest {
+            title: Some("changed".into()),
+            ..auto_request.clone()
+        };
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &changed_request,
+                &auto_layout,
+                &[],
+                "host:auto-baseline",
+            )
+            .is_err());
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &auto_request,
+                &auto_layout,
+                &[],
+                "host:retired-auto",
+            )
+            .is_err());
         assert!(store
             .checkpoint_prepare_restore(
                 &actor,
@@ -1281,6 +1666,18 @@ mod tests {
         // Reopen without the driver; the exact retained anchor/recovery pins
         // survive and block inspection before any source data is dispatched.
         let store = SessionStore::open(&temp.0).unwrap();
+        assert_eq!(
+            store
+                .checkpoint_replay_restore(&actor, &auto_request, "host:auto-baseline")
+                .unwrap(),
+            Some(restored_auto)
+        );
+        assert_eq!(
+            store
+                .checkpoint_replay_restore(&actor, &history_only, "host:history-baseline")
+                .unwrap(),
+            Some(restored_history)
+        );
         assert!(store
             .checkpoint_inspect_restore(&actor, "host:restore", |_, _, _| panic!(
                 "missing driver must fail closed"

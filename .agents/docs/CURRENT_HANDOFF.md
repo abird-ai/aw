@@ -42,7 +42,8 @@ root-free native-only tool registration, live native source approval, explicit A
 activation selection, quiescent metadata-only source binding mutation, checkpoint
 retirement/retained-anchor reconciliation, source-bearing Sandbox logical close and
 exact closed-Sandbox materialization reconciliation with proven retained-layout release,
-and managed Git restore-materialization release with original Applied restore provenance
+managed Git restore-materialization release with original Applied restore provenance,
+and metadata-only fresh baseline restore with explicit None/empty Auto coverage
 are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
@@ -1937,13 +1938,51 @@ physically removed. Git repository **32/32**, checkpoint/capture/restore **4/4**
 Sandbox **4/4**, construction receipt/barrier **1/1 each**; strict Git/Store
 all-target Clippy, workspace all-target check, fmt and scoped diff-check green.
 
+History-only and empty Auto capture now share the existing immutable checkpoint
+publication owner. checkpoint_create_empty_auto verifies the current effective open
+Sandbox has no required bindings, anchors latest committed history even during an
+unresolved Turn, preserves AutoAllRequired coverage and uses the same Auto request
+fingerprint/replay as source-bearing capture. No source effects, no fallback if any
+required binding exists. Explicit None keeps its original replay namespace semantics.
+
+checkpoint_restore_baseline restores the exact retained immutable history with the
+ordinary fresh Agent/Sandbox constructor and current Project/history Derive/Share/
+audience checks. The host explicitly selects and independently authorizes a fresh
+destination layout and any already-materialized current baseline sources, holding
+physical/provider authority through publication. None may select current destination
+baseline sources; empty Auto may include only current ephemeral sources. No captured
+source set is ever silently replaced by baseline state. Complete incoming source
+scopes must be unleased, source-bearing baseline remains held, source-free baseline
+uses ordinary admission. Isolated restore checks exact known open cwd/tool-root
+paths across the Store as well as closed retained paths; physical alias/ancestor and
+cross-Store isolation stay host-owned. External materialization or other effectful
+baseline creation still requires original Prepared custody; no host policy provisioning,
+external driver calls, task or custom ACL is added.
+
+Both restore paths reuse publish_restored_agent_in, the original exact-history lower
+constructor and candidate result validation. The metadata-only case records one
+Applied construction receipt atomically with its resources and no fictitious Prepared
+or empty recovery descriptors. Original literal request fingerprint and replay lookup
+are shared with captured-source restore; replay returns the current authorized
+destination Agent and original coverage, even after checkpoint retirement, missing
+drivers or invalid new layout selection. No new receipt ledger or migration.
+Existing grouped checkpoint/restore regressions exercise empty Auto at the latest
+committed prefix, actual capture/replay identity, captured-source fallback refusal,
+View-only and existing layout refusal, current ephemeral baseline under held admission,
+required baseline refusal for Auto, incoming barrier, exact history and retired/restart
+replay. Required source capture never silently becomes empty Auto. Checkpoint/capture/
+restore **4/4**, Sandbox **4/4**, receipt/barrier **1/1 each**, real Host source
+effects **2/2**; strict Store all-target Clippy, workspace all-target check, fmt and
+scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, implement the independent history-only/empty Auto baseline constructor,
-or exact unpublished candidate cleanup. Independent host approval provisioning,
-incomplete-effect reconciliation, multi-source policy, custom ACL/task, production
-cleanup composition and physical authority, final-source removal/effectful mutation,
-Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
+While blocked, exact unpublished candidate cleanup/reconciliation or shared task/custom
+ACL constructor integration remain independent. Independent host approval provisioning,
+effectful fresh baseline materialization, incomplete-effect reconciliation, multi-source
+policy, production cleanup composition and physical authority, final-source removal/
+effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.
+Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

@@ -22,8 +22,8 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The source-bearing selection. The ordinary history-only constructor is
-/// separate; an empty automatic set requires that history-only path.
+/// Automatic or explicitly named source selection. An empty Auto set
+/// uses the common history-only publication path with Auto coverage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode", content = "names")]
 pub enum CheckpointCaptureSelection {
@@ -143,6 +143,36 @@ impl CaptureBoundary {
     }
 }
 
+fn capture_sandbox_in(connection: &Connection, origin: AgentKey<'_>) -> Result<(String, u64)> {
+    db(connection.query_row(
+        "SELECT s.sandbox_id,s.rev FROM agent_state_current a
+         JOIN sandboxes_current s ON s.sandbox_id=a.sandbox_id
+         JOIN workspaces w ON w.workspace_id=a.project_handle
+         WHERE a.session_id=?1 AND a.branch_id=?2
+           AND a.lifecycle='open' AND s.lifecycle='open' AND w.archived_at IS NULL
+           AND a.domain_handle=s.domain_handle AND a.identity_handle=s.identity_handle
+           AND a.project_handle=s.project_handle",
+        params![origin.session, origin.branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))
+}
+
+pub(super) fn require_empty_auto_in(connection: &Connection, origin: AgentKey<'_>) -> Result<()> {
+    let (sandbox, _) = capture_sandbox_in(connection, origin)?;
+    let required: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sandbox_source_bindings_current
+         WHERE sandbox_id=?1 AND checkpoint_policy='required')",
+        [&sandbox],
+        |row| row.get(0),
+    ))?;
+    if required {
+        return Err(Error::Conflict(
+            "automatic checkpoint requires captured sources",
+        ));
+    }
+    Ok(())
+}
+
 fn observe_in(
     connection: &Connection,
     actor: &PrincipalId,
@@ -155,17 +185,7 @@ fn observe_in(
     let access =
         agent_owner::authorize_permission(connection, actor, origin, AgentPermission::View)?;
     let agent_ref = agent_owner::canonical_ref(connection, origin)?;
-    let (sandbox_ref, sandbox_rev): (String, u64) = db(connection.query_row(
-        "SELECT s.sandbox_id,s.rev FROM agent_state_current a
-         JOIN sandboxes_current s ON s.sandbox_id=a.sandbox_id
-         JOIN workspaces w ON w.workspace_id=a.project_handle
-         WHERE a.session_id=?1 AND a.branch_id=?2
-           AND a.lifecycle='open' AND s.lifecycle='open' AND w.archived_at IS NULL
-           AND a.domain_handle=s.domain_handle AND a.identity_handle=s.identity_handle
-           AND a.project_handle=s.project_handle",
-        params![origin.session, origin.branch],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ))?;
+    let (sandbox_ref, sandbox_rev) = capture_sandbox_in(connection, origin)?;
     crate::sandbox_owner::require_layout_quiescent_in(
         connection,
         &sandbox_ref,
@@ -175,7 +195,7 @@ fn observe_in(
         source_bindings::select_in(connection, &sandbox_ref, selection.names(), limit, registry)?;
     if bindings.is_empty() {
         return Err(Error::Conflict(
-            "automatic selection has no required sources; use history-only capture",
+            "automatic selection has no required sources; use empty Auto capture",
         ));
     }
     let history = history_owner::seal_in(connection, origin.session, origin.branch)?;
@@ -213,7 +233,7 @@ fn require_new_request(connection: &Connection, creator: &str, request_id: &str)
     Ok(())
 }
 
-fn fingerprint(
+pub(super) fn fingerprint(
     reference: &str,
     selection: &CheckpointCaptureSelection,
     note: Option<&str>,
@@ -674,6 +694,10 @@ mod tests {
         let settled = store
             .checkpoint_create_history_only(&actor, &reference, None, "host:history")
             .unwrap();
+
+        assert!(store
+            .checkpoint_create_empty_auto(&actor, &reference, None, "host:not-empty-auto",)
+            .is_err());
 
         // Named selection may include ephemeral sources, but not absent
         // names. Planning outside SQLite permits a concurrent logical edit;

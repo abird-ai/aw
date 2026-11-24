@@ -462,12 +462,56 @@ impl SessionStore {
         note: Option<&str>,
         request_id: &str,
     ) -> Result<CheckpointSnapshot> {
+        self.checkpoint_create_without_sources(
+            actor,
+            reference,
+            note,
+            request_id,
+            SourceCoverage::None,
+        )
+    }
+
+    /// Trusted lower Auto capture when the effective Sandbox has no required
+    /// sources. Preserve Auto coverage and the ordinary Auto replay identity.
+    /// Never fall back to history-only when any required binding exists.
+    pub fn checkpoint_create_empty_auto(
+        &self,
+        actor: &PrincipalId,
+        reference: &str,
+        note: Option<&str>,
+        request_id: &str,
+    ) -> Result<CheckpointSnapshot> {
+        self.checkpoint_create_without_sources(
+            actor,
+            reference,
+            note,
+            request_id,
+            SourceCoverage::AutoAllRequired,
+        )
+    }
+
+    fn checkpoint_create_without_sources(
+        &self,
+        actor: &PrincipalId,
+        reference: &str,
+        note: Option<&str>,
+        request_id: &str,
+        coverage: SourceCoverage,
+    ) -> Result<CheckpointSnapshot> {
         label(request_id, 256)?;
         label(reference, 2048)?;
         if let Some(note) = note {
             label(note, 2048)?;
         }
-        let fingerprint = fingerprint(reference, note)?;
+        let fingerprint = match coverage {
+            SourceCoverage::None => fingerprint(reference, note)?,
+            SourceCoverage::AutoAllRequired => {
+                capture::fingerprint(reference, &CheckpointCaptureSelection::Auto, note)?
+            }
+            SourceCoverage::Selected => {
+                return Err(Error::Config("selected checkpoint cannot be empty".into()))
+            }
+        };
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let creator = user_for_principal(&tx, actor)?
@@ -479,6 +523,9 @@ impl SessionStore {
         let (session, branch) = agent_owner::key_for_ref(&tx, reference)?;
         let source = AgentKey::new(&session, &branch);
         agent_owner::authorize_permission(&tx, actor, source, AgentPermission::View)?;
+        if coverage == SourceCoverage::AutoAllRequired {
+            capture::require_empty_auto_in(&tx, source)?;
+        }
         let history = history_owner::seal_latest_committed_in(&tx, &session, &branch)?;
         let checkpoint = id("cp")?;
         let registry = self.inner.source_drivers.reader()?;
@@ -492,7 +539,7 @@ impl SessionStore {
                 source,
                 history_base_id: &history.id,
                 sources: &SourceSet {
-                    coverage: SourceCoverage::None,
+                    coverage,
                     anchors: Vec::new(),
                 },
                 note,

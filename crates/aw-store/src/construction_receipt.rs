@@ -263,12 +263,7 @@ impl ConstructionPreparation {
                     "restore boundary belongs to checkpoint restoration",
                 ));
             }
-            boundary.validate(
-                &self.candidate,
-                self.sources
-                    .as_ref()
-                    .ok_or(Error::Storage("restore descriptors missing"))?,
-            )?;
+            boundary.validate(&self.candidate, self.sources.as_ref())?;
         }
         if let Some(sources) = &self.sources {
             sources.validate()?;
@@ -290,7 +285,12 @@ impl ConstructionPreparation {
                     "prepared source set does not belong to construction candidate",
                 ));
             }
-        } else if self.operation != ConstructionOperation::AgentCreate || self.task.is_none() {
+        } else if !((self.operation == ConstructionOperation::AgentCreate && self.task.is_some())
+            || (self.operation == ConstructionOperation::CheckpointRestore
+                && self.state == PreparationState::Applied
+                && self.restore_boundary.is_some()
+                && self.task.is_none()))
+        {
             return Err(Error::Storage(
                 "external construction receipt has no custody",
             ));
@@ -592,6 +592,104 @@ pub(crate) fn transition_in(
     Ok(next)
 }
 
+fn require_published_candidate_in(
+    tx: &Transaction<'_>,
+    receipt: &ConstructionPreparation,
+    result_ref: &str,
+) -> Result<()> {
+    // The resource constructor must have published the operation-owned
+    // candidate, not an existing or substituted resource.
+    let candidate_ref = match &receipt.candidate {
+        ConstructionCandidate::Checkpoint { checkpoint } => {
+            let published: bool = db(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id=?1
+                    AND created_by=?2 AND request_id=?3 AND request_fingerprint=?4)",
+                params![
+                    checkpoint,
+                    receipt.creator,
+                    receipt.request_id,
+                    receipt.fingerprint
+                ],
+                |row| row.get(0),
+            ))?;
+            if !published {
+                return Err(Error::Conflict(
+                    "prepared checkpoint candidate was not published",
+                ));
+            }
+            checkpoint.clone()
+        }
+        ConstructionCandidate::Agent {
+            session,
+            branch,
+            sandbox,
+            ..
+        } => {
+            let actual_sandbox: Option<String> = db(tx.query_row(
+                "SELECT sandbox_id FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+                params![session, branch],
+                |row| row.get(0),
+            ))?;
+            if &actual_sandbox != sandbox {
+                return Err(Error::Conflict(
+                    "prepared Agent Sandbox differs from publication",
+                ));
+            }
+            agent_owner::canonical_ref(tx, AgentKey::new(session, branch))?
+        }
+        ConstructionCandidate::Sandbox { sandbox } => {
+            let published: bool = db(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?1 AND lifecycle='open')",
+                [sandbox], |row| row.get(0),
+            ))?;
+            if !published {
+                return Err(Error::Conflict(
+                    "prepared Sandbox candidate was not published",
+                ));
+            }
+            sandbox.clone()
+        }
+    };
+    if result_ref != candidate_ref {
+        return Err(Error::Conflict(
+            "publication result differs from prepared candidate",
+        ));
+    }
+    Ok(())
+}
+
+/// A metadata-only restore has no external effects to prepare or recover.
+/// Publish its original replay identity in the resource transaction.
+pub(crate) fn record_atomic_restore_in(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+) -> Result<()> {
+    if receipt.operation != ConstructionOperation::CheckpointRestore
+        || receipt.state != PreparationState::Applied
+        || receipt.sources.is_some()
+        || receipt.task.is_some()
+    {
+        return Err(Error::Conflict(
+            "atomic restore receipt requires no external custody",
+        ));
+    }
+    receipt.require_actor(tx, actor)?;
+    receipt.validate()?;
+    if lookup_in(tx, receipt.operation, &receipt.scope, &receipt.request_id)?.is_some() {
+        return Err(Error::Conflict("construction request already claimed"));
+    }
+    require_published_candidate_in(
+        tx,
+        receipt,
+        receipt
+            .result_ref
+            .as_deref()
+            .ok_or(Error::Storage("atomic restore result missing"))?,
+    )?;
+    append_in(tx, actor, receipt)
+}
+
 /// The common source-bearing publication boundary. Resource owners supply
 /// their exact in-transaction authority revalidation and publication using
 /// their existing lower constructors. All external guards are owned here
@@ -622,64 +720,7 @@ pub(crate) fn publish_sources<F: SourcePublicationFence, T>(
     let current = current_unresolved_in(&tx, actor, expected)?;
     barrier.require_preparation_in(&tx, &sources.prepare_id)?;
     let (result_ref, result) = publish(&tx)?;
-    // The resource constructor must have published the operation-owned
-    // candidate, not an existing or substituted resource.
-    let candidate_ref = match &current.candidate {
-        ConstructionCandidate::Checkpoint { checkpoint } => {
-            let published: bool = db(tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id=?1
-                    AND created_by=?2 AND request_id=?3 AND request_fingerprint=?4)",
-                params![
-                    checkpoint,
-                    current.creator,
-                    current.request_id,
-                    current.fingerprint
-                ],
-                |row| row.get(0),
-            ))?;
-            if !published {
-                return Err(Error::Conflict(
-                    "prepared checkpoint candidate was not published",
-                ));
-            }
-            checkpoint.clone()
-        }
-        ConstructionCandidate::Agent {
-            session,
-            branch,
-            sandbox,
-            ..
-        } => {
-            let actual_sandbox: Option<String> = db(tx.query_row(
-                "SELECT sandbox_id FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
-                params![session, branch],
-                |row| row.get(0),
-            ))?;
-            if &actual_sandbox != sandbox {
-                return Err(Error::Conflict(
-                    "prepared Agent Sandbox differs from publication",
-                ));
-            }
-            agent_owner::canonical_ref(&tx, AgentKey::new(session, branch))?
-        }
-        ConstructionCandidate::Sandbox { sandbox } => {
-            let published: bool = db(tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id=?1 AND lifecycle='open')",
-                [sandbox], |row| row.get(0),
-            ))?;
-            if !published {
-                return Err(Error::Conflict(
-                    "prepared Sandbox candidate was not published",
-                ));
-            }
-            sandbox.clone()
-        }
-    };
-    if result_ref != candidate_ref {
-        return Err(Error::Conflict(
-            "publication result differs from prepared candidate",
-        ));
-    }
+    require_published_candidate_in(&tx, &current, &result_ref)?;
     let applied = ConstructionPreparation {
         state: PreparationState::Applied,
         result_ref: Some(result_ref),

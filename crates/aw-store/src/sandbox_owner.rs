@@ -369,22 +369,16 @@ pub(crate) fn require_fresh_layout_in(
     project_ref: &str,
     binding: &SessionBinding,
 ) -> Result<()> {
-    let project = parse_project_ref(project_ref)?;
+    parse_project_ref(project_ref)?;
     let layout = layout(binding)?;
     require_no_retained_layout_in(connection, &layout.tool_root, &layout.working_directory)?;
+    // An isolated restore may not silently share a known open root,
+    // even through a different cwd or Project.
     let exists: bool = db(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sandboxes_current
-         WHERE domain_handle=?1 AND identity_handle=?2 AND project_handle=?3
-           AND lifecycle='open' AND layout_digest=?4
-           AND working_directory=?5 AND tool_root=?6)",
-        params![
-            project.domain,
-            project.identity,
-            project.project,
-            layout.digest,
-            layout.working_directory,
-            layout.tool_root
-        ],
+         WHERE lifecycle='open'
+           AND (tool_root IN (?1,?2) OR working_directory IN (?1,?2)))",
+        params![layout.tool_root, layout.working_directory],
         |row| row.get(0),
     ))?;
     if exists {
