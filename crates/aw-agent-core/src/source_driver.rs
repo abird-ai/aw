@@ -212,6 +212,31 @@ pub enum SourceAccess {
     ReadWrite,
 }
 
+impl SourceAccess {
+    /// Intersection of independently granted maxima. Absence of a grant
+    /// is represented by None, never by ReadOnly.
+    #[inline]
+    pub const fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ReadWrite, Self::ReadWrite) => Self::ReadWrite,
+            _ => Self::ReadOnly,
+        }
+    }
+
+    #[inline]
+    pub const fn permits(self, requested: Self) -> bool {
+        matches!(self, Self::ReadWrite) || matches!(requested, Self::ReadOnly)
+    }
+}
+
+/// Explicit named ceiling, independent of the materialized binding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedSourceAccess {
+    pub name: SourceName,
+    pub access: SourceAccess,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointPolicy {

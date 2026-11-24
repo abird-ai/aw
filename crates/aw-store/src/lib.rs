@@ -208,7 +208,9 @@ pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
-    SandboxLifecycle, SandboxSnapshot, SourceBindingCompatibility, SourceBindingSummary,
+    EffectiveSourceBinding, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
+    SandboxLifecycle, SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant,
+    SourceBindingCompatibility, SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
@@ -319,8 +321,9 @@ pub const SOURCE_BINDING_SCHEMA: &str = include_str!("../migrations/055_source_b
 pub const CHECKPOINT_SCHEMA: &str = include_str!("../migrations/056_checkpoints.sql");
 pub const CONSTRUCTION_RECEIPT_SCHEMA: &str =
     include_str!("../migrations/057_construction_receipts.sql");
+pub const SANDBOX_GRANT_SCHEMA: &str = include_str!("../migrations/058_sandbox_grants.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 57;
+const LATEST_SCHEMA_VERSION: i64 = 58;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -3022,6 +3025,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current == 56 {
         migrate_source_schema(c, 57, "construction-receipts", CONSTRUCTION_RECEIPT_SCHEMA)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 57 {
+        migrate_source_schema(c, 58, "sandbox-grants", SANDBOX_GRANT_SCHEMA)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {

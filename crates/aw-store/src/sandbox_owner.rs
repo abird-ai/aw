@@ -16,6 +16,11 @@ use std::path::PathBuf;
 
 const MAX_SANDBOX_LIST: usize = 256;
 
+mod grants;
+pub use grants::{
+    EffectiveSourceBinding, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
+    SandboxPolicyEvidence, SandboxSourceGrant,
+};
 pub(crate) mod source_bindings;
 pub use source_bindings::{SourceBindingCompatibility, SourceBindingSummary};
 
@@ -943,7 +948,8 @@ mod tests {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection
                 .execute_batch(
-                    "DROP INDEX construction_legacy_actor;
+                    "DROP TABLE agent_sandbox_grants_current;
+                 DROP INDEX construction_legacy_actor;
                  DROP INDEX construction_source_prepare_id;
                  DROP INDEX construction_receipt_replay;
                  DROP TABLE checkpoint_sources;
@@ -979,7 +985,7 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            57
+            58
         );
 
         let sources = [

@@ -33,7 +33,8 @@ persistence with trusted history-only replay, v57 indexed construction receipt/s
 recovery custody, Store-local complete-set source mutation barriers, receipt-bound
 checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic
 checkpoint publication, receipt-bound non-destructive restore preparation/restart inspection
-and atomic held Agent + fresh source-bearing Sandbox restore publication are implemented locally.
+and atomic held Agent + fresh source-bearing Sandbox restore publication, plus v58 independent
+SandboxGrant evidence and source-access preflight, are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1481,10 +1482,46 @@ History **4/4**, receipt/barrier/task-bearing create **1/1 each**, Actor admissi
 Session view **6/6**, strict Store Clippy, workspace all-target check, fmt and scoped diff-check
 are green.
 
-**Next Phase-3 slice:** establish the source-aware SandboxGrant/realization admission and
-writer/effect participation for the now-published held Agents. History-only fresh baseline,
-custom ACL/task integration, candidate/retention reconciliation, quiescent binding mutation,
-Vault and checkpoint/Sandbox host RPCs remain pending. Store schema is v57.
+V58 adds agent_sandbox_grants_current, one durable evidence row per exact Agent/Sandbox
+binding. No grants are synthesized from existing Agents, source bindings, Project authority
+or restored history. The trusted host supplies independently authorized exact Agent,
+Sandbox, actor PrincipalId/stable user, policy ref/digest and authority ref/generation,
+plus named source ceilings pinned to DriverKey, SourceRef and binding revision. Issuance
+checks current Project writer authority, open placement, exact actor Submit/access
+generation and all compatible current binding pins. Revoke retains a monotonically
+increasing grant revision; stale CAS or source replacement cannot follow a name to
+another binding. Unchanged issuance is idempotent. Grant changes do not fan out Agent
+or Sandbox revisions and do not claim to revoke an existing Process.
+
+The lower trusted preflight checks current Agent/Project placement, actor/access
+generation, grant revision/state and independently supplied live host policy identity.
+Exact current binding schemas/identities must match the recorded and host-authorized
+pins. Effective source mode intersects binding maximum, persisted grant ceiling,
+current host source ceiling and current tool ceiling. Missing names grant no access.
+Core SourceAccess::intersect/permits and NamedSourceAccess are reusable; actual
+physical mount/network/device policy remains in its existing owner. SourceGrant
+preflight is a read-only observation, not a capability or durable authorization to
+execute. Direct exact actor ceiling only in this cut (group-backed host policy may
+authorize an exact actor; no group-wide grant expansion). Source-bearing Agents
+remain held, including after successful grant issuance/preflight. Actual host policy
+resolver, typed SandboxDriver realization and live effect/writer participation are
+required before enabling source-bearing runtime execution.
+
+Grouped grant regression **1/1** covers populated v57→v58 disk migration, absence
+of implicit grants, independent authority on a shared Sandbox, current actor/ACL
+generation, source/host/tool maxima, mismatched host subject and stale policy/source
+pin refusal, revision-neutral grant issue, revoke/reissue and missing/reinstalled
+driver restart. Test-only source insertion into held shared Sandboxes does not
+enable production structural mutation. Existing Sandbox owner **2/2**, checkpoint
+owner including capture/restore **4/4**, receipt/barrier/SourceDriver **1/1 each**,
+strict Core/Store all-target Clippy, workspace all-target check, fmt and scoped
+diff-check are green.
+
+**Next Phase-3 slice:** bind the trusted current host policy resolver and exact
+SandboxGrant observation to actual source-aware realization/effect admission and
+complete-set source mutation claims. History-only fresh baseline, custom ACL/task
+integration, candidate/retention reconciliation, quiescent binding mutation, Vault
+and checkpoint/Sandbox host RPCs remain pending. Store schema is v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 
