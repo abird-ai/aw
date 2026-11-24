@@ -32,7 +32,8 @@ explicit gitlink semantics, isolated Prepared restore, v56 immutable Checkpoint/
 persistence with trusted history-only replay, v57 indexed construction receipt/source
 recovery custody, Store-local complete-set source mutation barriers, receipt-bound
 checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic
-checkpoint publication are implemented locally.
+checkpoint publication, plus receipt-bound non-destructive restore preparation and exact
+restart inspection, are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1409,11 +1410,49 @@ and released complete-set leases. Checkpoint owner **1/1**, construction receipt
 source barrier **1/1**, task-bearing Agent create **1/1**, SourceDriver **1/1**, strict
 Core/Store all-target Clippy, workspace all-target check, fmt and scoped diff-check are green.
 
-**Next Phase-3 slice:** reuse the shared Prepared publication boundary for non-destructive
-restore, with exact checkpoint source/history authorization, fresh Agent and Sandbox candidates,
-and actual current source materialization/fence admission. Source realization, writer/effect
-participation, candidate/retention reconciliation, quiescent binding mutation, SandboxGrant/Vault
-and checkpoint RPC effects remain pending. Store schema is v57.
+Restore now has a trusted lower preparation/inspection path for source-bearing checkpoints.
+It resolves the original live checkpoint's exact retained HistoryBase (never the source
+Agent's newer head), uses the existing Derive/Share/HistoryGrant audience checks and
+destination Project writer authority, and requires independent host source/materialization
+authorization. Private and current inherited access use the ordinary history-fork rules;
+cross-Domain inherited ACLs fail closed. Custom initial ACLs, task custody and history-only
+baseline restoration remain pending. The existing exact-history constructor accepts the
+retention owner's resolved source; there is no restore-specific Agent constructor.
+
+The bounded immutable checkpoint SourceSet is referenced by ID and set digest, not copied into
+a second source owner. The same receipt retains the original request fingerprint, checkpoint
+history and coverage, destination Project/writer epoch, title/access, host binding digest,
+fresh Agent/root/branch/Sandbox IDs and complete per-source restore descriptors. The unresolved
+receipt is a retention dependency; retirement/cleanup must preserve the retained anchor rows
+until recovery completes. Additive receipt fields decode old v57 facts; startup resolves both
+anchor and recovery schemas. No migration.
+
+Read-only planning precedes one transaction rechecking current authority, exact checkpoint,
+destination writer/layout and absence of private candidates. Capture and restore reuse
+claim_sources_in, require_current_sources_in and mark_sources_unknown in the existing receipt/
+coordination owner. No external effect precedes Prepared + whole-set barrier commit. Restart
+inspection reclaims only the original hazards and inspects the original descriptors, never
+replans. Complete ordered binding results must preserve captured names, driver/source
+identities, access maxima and checkpoint policies; current compatible binding schema and
+evidence are checked. Partial, mismatched, failed or unknown inspection keeps whole-set
+Unknown custody. A retired checkpoint cannot pass final restore revalidation.
+
+The grouped restore disk regression **1/1** covers retained history after source advance,
+shared exact-history constructor in a rolled-back transaction, view-only denial, no empty
+source fallback, private fresh IDs, replay, changed layout, missing drivers, partial fixture
+effects, exact restart recovery and retirement refusal. No actual source-bearing Agent or
+Sandbox is published by this slice; the existing source-bearing realization gate remains
+closed. Concrete provider effect and fence integration is still separate.
+History owner **4/4**, capture owner **2/2**, checkpoint owner **1/1**, construction receipt
+**1/1**, source barrier **1/1**, task-bearing Agent create **1/1**, strict Store all-target
+Clippy, full workspace all-target check, fmt and scoped diff-check are green.
+
+**Next Phase-3 slice:** realize the fresh Sandbox/Agent under the ordinary source-bearing
+execution admission/authority gate, then use the existing fenced publication boundary to
+publish restored history, Sandbox, Agent, grants and optional initial input atomically.
+History-only fresh baseline, custom ACL/task integration, writer/effect participation,
+candidate/retention reconciliation, quiescent binding mutation, SandboxGrant/Vault and host
+RPCs remain pending. Store schema is v57.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

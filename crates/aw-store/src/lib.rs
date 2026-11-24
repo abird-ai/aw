@@ -137,8 +137,9 @@ use aw_agent_core::{
     Result, Role, SourceDriverRegistry, SourceSetLimit,
 };
 pub use checkpoint_owner::{
-    CheckpointCaptureSelection, CheckpointLifecycle, CheckpointSnapshot, CheckpointSourceSummary,
-    InspectedCheckpointCapture, PreparedCheckpointCapture,
+    CheckpointCaptureSelection, CheckpointLifecycle, CheckpointRestoreRequest, CheckpointSnapshot,
+    CheckpointSourceSummary, InspectedCheckpointCapture, InspectedCheckpointRestore,
+    PreparedCheckpointCapture, PreparedCheckpointRestore,
 };
 pub use context::{
     ApplyContext, ApplyMode, ContextApplied, ContextJournal, ContextNode, ContextPlan,

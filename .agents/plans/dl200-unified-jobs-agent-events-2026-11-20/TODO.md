@@ -562,8 +562,23 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       live guard lifetime, saved handle refusal, atomic rollback and exact replay. Checkpoint
       owner, receipt, barrier, task-bearing Agent create and SourceDriver **1/1 each**;
       strict Core/Store Clippy, workspace all-target check, fmt and scoped diff-check green.
-      **Next:** reuse shared Prepared publication for fresh Agent/Sandbox
-      restore. Source/destination admission, writer participation, candidate/retention cleanup,
+      **Receipt-bound restore preparation/inspection landed:** exact live checkpoint HistoryBase,
+      retained named SourceSet and current Derive/Share/HistoryGrant checks use the existing
+      history owner, current destination Project writer and fresh Agent/root/branch/Sandbox IDs.
+      Receipt references retained checkpoint anchors, pins exact source set/layout and original
+      literal request, preserves captured layout and complete restore descriptors; startup
+      resolves anchor/recovery schemas. Capture/restore share claim, exact receipt/barrier check,
+      Unknown settlement and existing hazard recovery. Planning is read-only; restart inspection
+      never replans/reexecutes. Complete matching bindings/evidence only; retired checkpoint
+      blocks publication. Grouped restore **1/1**, including source history advance, rollback
+      of the ordinary exact-history constructor, private candidate identity, partial effects
+      and restart. History owner **4/4**, capture owner **2/2**, checkpoint, receipt, barrier
+      and task-bearing Agent create **1/1 each**; strict Store Clippy, workspace all-target
+      check, fmt and scoped diff-check green. Source-bearing Agent realization/publication
+      remains closed; no migration.
+      **Next:** fresh Sandbox/Agent realization and source-bearing execution admission,
+      then shared fenced restore publication. History-only baseline, custom ACL/initial task,
+      writer participation, candidate/retention cleanup (unresolved restore retains anchors),
       quiescent mutation, SandboxGrant/Vault and host RPCs remain. Store schema is v57.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
@@ -669,4 +684,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic checkpoint publication/replay are live; remaining work is shared non-destructive restore construction, source realization/writer participation/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, full contextual replay/preflight ordering, SandboxGrant/Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery and evidence-fenced atomic checkpoint publication/replay and receipt-bound non-destructive restore preparation/inspection are live; remaining work is source-bearing restore realization and atomic publication, source realization/writer participation/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, full contextual replay/preflight ordering, SandboxGrant/Vault and host RPCs.

@@ -12,8 +12,7 @@ use crate::{
     sandbox_owner::source_bindings::{self, VersionedSourceBinding},
     session_in,
     store_scope::StoreScope,
-    user_for_principal, Error, Result, SessionStore, SourceMutationBarrier, SourceMutationOutcome,
-    SourceMutationSet,
+    user_for_principal, Error, Result, SessionStore, SourceMutationBarrier, SourceMutationSet,
 };
 use aw_agent_core::{
     validate_source_set_hard_limit, CheckpointPolicy, PreparedSourceSet, PrincipalId,
@@ -290,18 +289,12 @@ impl PreparedCheckpointCapture<'_> {
     }
 
     fn require_receipt_in(&self, tx: &Transaction<'_>) -> Result<()> {
-        self.barrier.require_held_in(tx)?;
-        self.receipt.require_actor(tx, &self.actor)?;
-        let current = construction_receipt::lookup_in(
+        construction_receipt::require_current_sources_in(
             tx,
-            self.receipt.operation,
-            &self.receipt.scope,
-            &self.receipt.request_id,
-        )?;
-        if current.as_ref() != Some(&self.receipt) {
-            return Err(Error::Conflict("checkpoint capture receipt changed"));
-        }
-        Ok(())
+            &self.actor,
+            &self.receipt,
+            &self.barrier,
+        )
     }
 
     /// Recheck the owner-specific boundary inside the publication transaction.
@@ -350,19 +343,12 @@ impl PreparedCheckpointCapture<'_> {
     /// hazards in the same commit. Current view revocation does not allow
     /// forgetting the receipt or freeing an unresolved effect.
     pub fn mark_unknown(self) -> Result<()> {
-        let mut connection = self.store.connection()?;
-        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        self.barrier
-            .settle_in(&tx, SourceMutationOutcome::Unknown)?;
-        construction_receipt::transition_in(
-            &tx,
+        construction_receipt::mark_sources_unknown(
+            self.store,
             &self.actor,
             &self.receipt,
-            PreparationState::Unknown,
-            None,
-            Some("source effect outcome requires inspection".into()),
-        )?;
-        db(tx.commit())
+            &self.barrier,
+        )
     }
 }
 
@@ -474,6 +460,7 @@ impl SessionStore {
             task: None,
             sources: Some(sources),
             capture_boundary: Some(boundary),
+            restore_boundary: None,
             result_ref: None,
             note: None,
         };
@@ -502,12 +489,8 @@ impl SessionStore {
                 "checkpoint capture boundary changed during planning",
             ));
         }
-        let barrier = self.acquire_source_mutation_barrier_in(
-            &tx,
-            &mutation_set,
-            receipt.candidate.prepare_id(),
-        )?;
-        construction_receipt::claim_in(&tx, actor, &self.inner.source_drivers, limit, &receipt)?;
+        let barrier =
+            construction_receipt::claim_sources_in(self, &tx, actor, &receipt, &mutation_set)?;
         db(tx.commit())?;
         Ok(PreparedCheckpointCapture {
             store: self,
@@ -1428,7 +1411,7 @@ mod tests {
         store
             .acquire_source_mutation_barrier(&set, "after-publication")
             .unwrap()
-            .settle(SourceMutationOutcome::Settled)
+            .settle(crate::SourceMutationOutcome::Settled)
             .unwrap();
     }
 }

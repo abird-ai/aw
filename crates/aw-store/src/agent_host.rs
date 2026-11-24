@@ -153,19 +153,19 @@ pub struct AgentCreateContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ProjectRef {
-    domain: String,
-    identity: String,
-    project: String,
+pub(crate) struct ProjectRef {
+    pub(crate) domain: String,
+    pub(crate) identity: String,
+    pub(crate) project: String,
 }
 
 impl ProjectRef {
-    fn canonical(&self) -> String {
+    pub(crate) fn canonical(&self) -> String {
         format!("/d:{}/i:{}/p:{}", self.domain, self.identity, self.project)
     }
 }
 
-fn parse_project_ref(value: &str) -> Result<ProjectRef> {
+pub(crate) fn parse_project_ref(value: &str) -> Result<ProjectRef> {
     let Some(body) = value.strip_prefix('/') else {
         return Err(Error::Denied("Project ref must be canonical"));
     };
@@ -473,7 +473,7 @@ fn validate_project_exists(connection: &Connection, project: &ProjectRef) -> Res
     Ok(())
 }
 
-fn authorize_project_create(
+pub(crate) fn authorize_project_create(
     connection: &Connection,
     actor: &PrincipalId,
     project: &ProjectRef,
@@ -958,6 +958,7 @@ impl SessionStore {
                 }),
                 sources: None,
                 capture_boundary: None,
+                restore_boundary: None,
                 result_ref: None,
                 note: None,
             };

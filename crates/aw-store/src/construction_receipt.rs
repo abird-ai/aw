@@ -165,6 +165,8 @@ pub(crate) struct ConstructionPreparation {
     pub(crate) sources: Option<PreparedSourceSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_boundary: Option<crate::checkpoint_owner::capture::CaptureBoundary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_boundary: Option<crate::checkpoint_owner::restore::RestoreBoundary>,
     pub(crate) result_ref: Option<String>,
     pub(crate) note: Option<String>,
 }
@@ -253,6 +255,19 @@ impl ConstructionPreparation {
                 self.sources
                     .as_ref()
                     .ok_or(Error::Storage("capture descriptors missing"))?,
+            )?;
+        }
+        if let Some(boundary) = &self.restore_boundary {
+            if self.operation != ConstructionOperation::CheckpointRestore {
+                return Err(Error::Storage(
+                    "restore boundary belongs to checkpoint restoration",
+                ));
+            }
+            boundary.validate(
+                &self.candidate,
+                self.sources
+                    .as_ref()
+                    .ok_or(Error::Storage("restore descriptors missing"))?,
             )?;
         }
         if let Some(sources) = &self.sources {
@@ -376,6 +391,7 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
             }),
             sources: None,
             capture_boundary: None,
+            restore_boundary: None,
             result_ref: legacy.result_ref,
             note: legacy.note,
         }
@@ -454,6 +470,13 @@ pub(crate) fn claim_in(
         ));
     }
     receipt.admit(registry, limit)?;
+    if let Some(boundary) = &receipt.restore_boundary {
+        let set = boundary.retained_sources_in(tx, receipt)?;
+        let reader = registry.reader()?;
+        for anchor in &set.anchors {
+            reader.resolve(&anchor.pin()?)?;
+        }
+    }
     if receipt.operation == ConstructionOperation::CheckpointCreate {
         let published: bool = db(tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE created_by=?1 AND request_id=?2)",
@@ -466,6 +489,55 @@ pub(crate) fn claim_in(
     }
     agent_owner::authorize_permission(tx, actor, receipt.origin(), AgentPermission::View)?;
     append_in(tx, actor, receipt)
+}
+
+pub(crate) fn claim_sources_in<'a>(
+    store: &'a SessionStore,
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    set: &crate::SourceMutationSet,
+) -> Result<SourceMutationBarrier<'a>> {
+    let barrier =
+        store.acquire_source_mutation_barrier_in(tx, set, receipt.candidate.prepare_id())?;
+    claim_in(
+        tx,
+        actor,
+        &store.inner.source_drivers,
+        store.inner.source_limit,
+        receipt,
+    )?;
+    Ok(barrier)
+}
+
+pub(crate) fn require_current_sources_in(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    barrier: &SourceMutationBarrier<'_>,
+) -> Result<()> {
+    current_unresolved_in(tx, actor, receipt)?;
+    barrier.require_preparation_in(tx, receipt.candidate.prepare_id())
+}
+
+pub(crate) fn mark_sources_unknown(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    barrier: &SourceMutationBarrier<'_>,
+) -> Result<()> {
+    let mut connection = store.connection()?;
+    let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    barrier.settle_in(&tx, SourceMutationOutcome::Unknown)?;
+    transition_in(
+        &tx,
+        actor,
+        receipt,
+        PreparationState::Unknown,
+        None,
+        Some("source effect outcome requires inspection".into()),
+    )?;
+    db(tx.commit())
 }
 
 fn current_unresolved_in(
@@ -660,6 +732,7 @@ pub(crate) fn visit_unresolved_sources(
             || claim.task != receipt.task
             || claim.sources != receipt.sources
             || claim.capture_boundary != receipt.capture_boundary
+            || claim.restore_boundary != receipt.restore_boundary
         {
             return Err(Error::Storage(
                 "prepared source receipt changed its recovery identity",
@@ -672,10 +745,22 @@ pub(crate) fn visit_unresolved_sources(
             .sources
             .as_ref()
             .ok_or(Error::Storage("source custody missing"))?;
+        let restore_set = receipt
+            .restore_boundary
+            .as_ref()
+            .map(|boundary| boundary.retained_sources_in(connection, &receipt))
+            .transpose()?;
         for (index, source) in sources.sources.iter().enumerate() {
             let mut status = compatibility(registry, &source.prepared.descriptor.pin()?)?;
             if let Some(boundary) = &receipt.capture_boundary {
                 if compatibility(registry, &boundary.bindings[index].binding.pin()?)?
+                    == SourceCompatibility::RecoveryRequired
+                {
+                    status = SourceCompatibility::RecoveryRequired;
+                }
+            }
+            if let Some(set) = &restore_set {
+                if compatibility(registry, &set.anchors[index].pin()?)?
                     == SourceCompatibility::RecoveryRequired
                 {
                     status = SourceCompatibility::RecoveryRequired;
@@ -857,6 +942,7 @@ mod tests {
             task: None,
             sources: Some(sources),
             capture_boundary: None,
+            restore_boundary: None,
             result_ref: None,
             note: None,
         };

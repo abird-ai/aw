@@ -53,7 +53,7 @@ pub(crate) enum DisclosureAuthorization {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ResolvedHistorySource {
+pub(crate) struct ResolvedHistorySource {
     session_id: String,
     branch_id: String,
     agent_ref: String,
@@ -1131,19 +1131,48 @@ fn resolve_canonical_history_source_in(
             ))
         }
     };
+    resolved_history_source_in(connection, source_agent, agent_ref, base)
+}
+
+fn resolved_history_source_in(
+    connection: &Connection,
+    source: agent_owner::AgentKey<'_>,
+    agent_ref: String,
+    base: HistoryBaseRef,
+) -> Result<ResolvedHistorySource> {
     let current_grant_id: Option<String> = db(connection.query_row(
         "SELECT history_grant_id FROM agent_state_current
          WHERE session_id=?1 AND branch_id=?2",
-        params![session_id, branch_id],
+        params![source.session, source.branch],
         |row| row.get(0),
     ))?;
     Ok(ResolvedHistorySource {
-        session_id,
-        branch_id,
+        session_id: source.session.to_owned(),
+        branch_id: source.branch.to_owned(),
         agent_ref,
         current_grant_id,
         base,
     })
+}
+
+/// Only a retention owner may supply a retained base ID, after verifying
+/// that it belongs to the source Agent's authorized immutable resource.
+/// Never reseal the Agent's current head for such a history source.
+pub(crate) fn resolve_retained_history_source_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source: agent_owner::AgentKey<'_>,
+    base_id: &str,
+) -> Result<ResolvedHistorySource> {
+    agent_owner::authorize_permission(
+        connection,
+        actor,
+        source,
+        agent_owner::AgentPermission::Derive,
+    )?;
+    let reference = agent_owner::canonical_ref(connection, source)?;
+    let base = base_row(connection, base_id)?;
+    resolved_history_source_in(connection, source, reference, base)
 }
 
 pub(crate) fn preflight_canonical_history_source_in(
@@ -1949,14 +1978,20 @@ pub(crate) fn prepare_disclosure_expansion(
     Ok(Some(grant_id))
 }
 
-fn attach_resolved_history_to_destination_in(
+type InheritedAcl = Vec<(String, String, agent_owner::AgentPermissions)>;
+
+struct ForkAudience {
+    inherited_acl: InheritedAcl,
+    audience: BTreeSet<(String, String)>,
+}
+
+fn fork_audience_in(
     connection: &Connection,
     actor: &PrincipalId,
     source: &ResolvedHistorySource,
-    destination_session: &str,
-    destination_branch: &str,
+    destination_owner: &str,
     access: AgentHistoryForkAccess,
-) -> Result<()> {
+) -> Result<ForkAudience> {
     let source_agent = agent_owner::AgentKey::new(&source.session_id, &source.branch_id);
     let (owner_kind, _owner_handle): (String, String) = db(connection.query_row(
         "SELECT owner_kind,owner_handle
@@ -1969,23 +2004,11 @@ fn attach_resolved_history_to_destination_in(
             "exact-history constructor currently requires a user-owned source Project",
         ));
     }
-    let (destination_owner_kind, destination_owner): (String, String) = db(connection.query_row(
-        "SELECT owner_kind,owner_handle
-             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
-        params![destination_session, destination_branch],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ))?;
-    if destination_owner_kind != "user" {
-        return Err(Error::Denied(
-            "exact-history destination currently requires a user-owned Project",
-        ));
-    }
-
     let inherited_acl = match access {
         AgentHistoryForkAccess::Private => Vec::new(),
         AgentHistoryForkAccess::Inherit => direct_acl_rows(connection, source_agent)?,
     };
-    let mut audience = BTreeSet::from([("user".to_owned(), destination_owner)]);
+    let mut audience = BTreeSet::from([("user".to_owned(), destination_owner.to_owned())]);
     for (kind, handle, permissions) in &inherited_acl {
         if permissions.view {
             audience.insert((kind.clone(), handle.clone()));
@@ -2001,6 +2024,37 @@ fn attach_resolved_history_to_destination_in(
             handle,
         )?;
     }
+
+    Ok(ForkAudience {
+        inherited_acl,
+        audience,
+    })
+}
+
+fn attach_resolved_history_to_destination_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source: &ResolvedHistorySource,
+    destination_session: &str,
+    destination_branch: &str,
+    access: AgentHistoryForkAccess,
+) -> Result<()> {
+    let (destination_owner_kind, destination_owner): (String, String) = db(connection.query_row(
+        "SELECT owner_kind,owner_handle
+             FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+        params![destination_session, destination_branch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    if destination_owner_kind != "user" {
+        return Err(Error::Denied(
+            "exact-history destination currently requires a user-owned Project",
+        ));
+    }
+
+    let ForkAudience {
+        inherited_acl,
+        audience,
+    } = fork_audience_in(connection, actor, source, &destination_owner, access)?;
 
     let destination_ref: String = db(connection.query_row(
         "SELECT '/d:' || domain_handle || '/i:' || identity_handle ||
@@ -2137,17 +2191,13 @@ pub(crate) fn create_agent_from_history_ref_in(
     )
 }
 
-fn create_agent_from_resolved_history_with_ids_in(
+fn authorize_fork_destination_in(
     connection: &Connection,
     actor: &PrincipalId,
     source: &ResolvedHistorySource,
-    title: &str,
-    binding: &SessionBinding,
-    access: AgentHistoryForkAccess,
     destination_owner: &PrincipalId,
     destination_workspace: &str,
-    ids: resources::SessionCandidateIds,
-) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+) -> Result<String> {
     let (source_owner, source_workspace): (String, Option<String>) = db(connection.query_row(
         "SELECT owner_user_id,workspace_id FROM sessions WHERE id=?1",
         [&source.session_id],
@@ -2167,6 +2217,48 @@ fn create_agent_from_resolved_history_with_ids_in(
             agent_owner::AgentPermission::Share,
         )?;
     }
+    Ok(destination_user)
+}
+
+/// Read-only authorization for the same exact-history constructor. Used
+/// before external preparation; final construction repeats current checks.
+pub(crate) fn preflight_resolved_history_in_project(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source: &ResolvedHistorySource,
+    access: AgentHistoryForkAccess,
+    destination_owner: &PrincipalId,
+    destination_workspace: &str,
+) -> Result<()> {
+    let destination_user = authorize_fork_destination_in(
+        connection,
+        actor,
+        source,
+        destination_owner,
+        destination_workspace,
+    )?;
+    fork_audience_in(connection, actor, source, &destination_user, access)?;
+    Ok(())
+}
+
+pub(crate) fn create_agent_from_resolved_history_with_ids_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    source: &ResolvedHistorySource,
+    title: &str,
+    binding: &SessionBinding,
+    access: AgentHistoryForkAccess,
+    destination_owner: &PrincipalId,
+    destination_workspace: &str,
+    ids: resources::SessionCandidateIds,
+) -> Result<(crate::SessionInfo, crate::BranchInfo)> {
+    authorize_fork_destination_in(
+        connection,
+        actor,
+        source,
+        destination_owner,
+        destination_workspace,
+    )?;
     let (destination_session, destination_branch) = resources::create_in_workspace_with_ids_tx(
         connection,
         destination_owner,

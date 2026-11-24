@@ -2,6 +2,7 @@
 //! HistoryBase and complete SourceSet; no materialization is performed here.
 
 pub(crate) mod capture;
+pub(crate) mod restore;
 use crate::{
     agent_owner::{self, AgentKey, AgentPermission},
     db, history_owner, id, label, now,
@@ -15,6 +16,9 @@ use aw_agent_core::{
 };
 pub use capture::{
     CheckpointCaptureSelection, InspectedCheckpointCapture, PreparedCheckpointCapture,
+};
+pub use restore::{
+    CheckpointRestoreRequest, InspectedCheckpointRestore, PreparedCheckpointRestore,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
