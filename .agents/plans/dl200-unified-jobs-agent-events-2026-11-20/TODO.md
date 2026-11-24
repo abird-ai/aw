@@ -665,11 +665,28 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Sandbox **4/4**, checkpoint/capture/restore **4/4**, barrier/receipt **1/1 each**;
       strict Core/Host/Adapter/Store Clippy, workspace all-target, minimal/no SQLite,
       fmt/diff-check green (minimal retains two existing CLI dead-code warnings).
-      **Next:** concrete SourceDriver materialization/policy resolver + original Actor
-      Service native route integration, complete Job/Process containment and dispatch
-      before opening held admission. Incomplete original effect reconciliation, multi-source
-      policy, history-only baseline, custom ACL/task, candidate/retention reconciliation,
-      quiescent mutation, Vault and host RPCs remain. Schema v58.
+      **Concrete Git native resolver + root-free host builder landed:** actual Store
+      registered typed Git driver verifies independently approved checkout path/physical
+      identity and original source/materialization stamps before realizing native capability.
+      Existing Repository pins survive until the narrowed capability pins the same root.
+      Git admin/common/pointer exclusions use platform CapabilitySet; host live policy
+      and private-artifact registry remain independent. Resolver runs on blocking worker;
+      final effect admission revalidates original Store boundary. SourceFilesystemRoute
+      configure uses the original registration/policy/parallelism/router/hook owners,
+      explicit canonical native-only selection, exact authority/limits, no ambient root
+      open or fallback, no shell/Jobs/control/remove. Optional Git source-effects feature.
+      Existing grouped native regression uses real Git when enabled; original restore
+      regression qualifies exact restored materialization and wrong root/identity/admin
+      mapping refusal. Held production admission stays closed. Git **32/32**, Host
+      **15/15** with Git and **15/15** without, native adapter **99/99**, router **3/3**,
+      Sandbox/checkpoint **4/4 each**; strict Git/Host/Adapter/Store Clippy, workspace
+      all-target, minimal/no Git or SQLite dependencies, fmt/diff-check green.
+      **Next:** connect the actual independent host policy/physical approval owner and
+      root-free builder to Actor Service activation, coordinate journal/context/queue
+      gates before promoting runtime paths. Complete Job/Process containment/dispatch,
+      incomplete original-effect reconciliation, multi-source policy, history-only baseline,
+      custom ACL/task, candidate/retention reconciliation, quiescent mutation, Vault and
+      host RPCs remain. Schema v58.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -774,4 +791,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery, evidence-fenced atomic checkpoint publication/replay, receipt-bound non-destructive restore preparation/inspection, atomic held Agent/Sandbox restore publication, v58 independent SandboxGrant evidence/source preflight, typed SandboxDriver/fenced host source-effect handoff, original PipeProcess source-aware host composition, direct ToolStarted/ToolFinished-linked custody/recovery and pinned native single-source route/deferred post-journal settlement are live; remaining work is concrete SourceDriver/host policy resolution and Actor Service installation, complete source-aware Job/Process dispatch and containment, incomplete original-effect reconciliation, quiescent mutation, candidate/retention cleanup, history-only baseline and custom ACL/task integration, concrete provider fences, full contextual replay/preflight ordering, Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery, evidence-fenced atomic checkpoint publication/replay, receipt-bound non-destructive restore preparation/inspection, atomic held Agent/Sandbox restore publication, v58 independent SandboxGrant evidence/source preflight, typed SandboxDriver/fenced host source-effect handoff, original PipeProcess source-aware host composition, direct ToolStarted/ToolFinished-linked custody/recovery, pinned native single-source route/deferred post-journal settlement, concrete Git materialization resolution and root-free native registration are live; remaining work is independent production host policy/physical approval and Actor Service installation, complete source-aware Job/Process dispatch and containment, incomplete original-effect reconciliation, quiescent mutation, candidate/retention cleanup, history-only baseline and custom ACL/task integration, concrete provider fences, full contextual replay/preflight ordering, Vault and host RPCs.

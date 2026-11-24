@@ -263,6 +263,19 @@ impl Repository {
     pub fn common_dir(&self) -> &Path {
         &self.common
     }
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// Physical identity of the retained checkout directory, not a grant.
+    pub fn root_identity(&self) -> Result<(u64, u64)> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(Error::Invalid("repository directory identity unavailable"))?;
+        Ok(identity.root.identity()?)
+    }
+
     pub fn git(&self) -> &Path {
         &self.git
     }

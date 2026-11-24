@@ -17,21 +17,79 @@ use aw_tools::{
 };
 use aw_tools_adapter::{
     native_filesystem::{
-        CapabilitySet, GrantIdentity, GrantSpec, PreparedGrant, PreparedNativeRequest,
-        PrivateArtifactRegistry,
+        CapabilitySet, ExclusionSpec, GrantIdentity, GrantSpec, PreparedGrant,
+        PreparedNativeRequest, PrivateArtifactRegistry,
     },
-    operation_router::{OperationRouter, OperationRouterSlot},
-    LocalToolLimits,
+    operation_router::OperationRouter,
+    LocalToolLimits, LocalToolOptions,
 };
 use std::{marker::PhantomData, path::Path, sync::Arc};
 
-/// Exact physical directory authorized by the original host/source resolver.
-/// The identity must be obtained from that authority (including live source
-/// materialization verification), not from untrusted model path strings.
+/// Pinned, already narrowed native directory capability. The trusted
+/// resolver independently authorizes the binding and physical root.
 pub struct ApprovedSourceDirectory {
-    pub binding: VersionedSourceBinding,
-    pub identity: GrantIdentity,
-    pub private_artifacts: Arc<PrivateArtifactRegistry>,
+    binding: VersionedSourceBinding,
+    identity: GrantIdentity,
+    access: SourceAccess,
+    capability: CapabilitySet,
+}
+
+impl ApprovedSourceDirectory {
+    /// Pin the actual directory while the host's source authority is live.
+    /// Exclusions narrow (never extend) the approved directory.
+    pub fn pin(
+        binding: VersionedSourceBinding,
+        identity: GrantIdentity,
+        access: SourceAccess,
+        private_artifacts: Arc<PrivateArtifactRegistry>,
+        exclusions: impl IntoIterator<Item = ExclusionSpec>,
+    ) -> Result<Self> {
+        if !identity.path.is_absolute()
+            || identity.path.parent().is_none()
+            || !identity.read
+            || !binding.binding.access.permits(access)
+            || (access == SourceAccess::ReadWrite && !identity.write)
+        {
+            return Err(Error::Denied(
+                "native source directory is not independently authorized",
+            ));
+        }
+        let grant = match access {
+            SourceAccess::ReadOnly => GrantSpec::read(&identity.path),
+            SourceAccess::ReadWrite => GrantSpec::read_write(&identity.path),
+        };
+        let capability = CapabilitySet::open_prepared_with_exclusions(
+            &identity.path,
+            [PreparedGrant::new(grant, private_artifacts)],
+            exclusions,
+        )
+        .map_err(|_| Error::Denied("authorized source directory could not be pinned"))?;
+        let actual = capability
+            .identities()
+            .map_err(|_| Error::Denied("source directory identity unavailable"))?;
+        let [actual] = actual.as_slice() else {
+            return Err(Error::Denied(
+                "native source capability has unexpected roots",
+            ));
+        };
+        if actual.path != identity.path
+            || actual.volume != identity.volume
+            || actual.object != identity.object
+            || !actual.read
+            || actual.write != (access == SourceAccess::ReadWrite)
+            || capability.base() != Path::new(&identity.path)
+        {
+            return Err(Error::Conflict(
+                "authorized source directory changed during preparation",
+            ));
+        }
+        Ok(Self {
+            binding,
+            identity,
+            access,
+            capability,
+        })
+    }
 }
 
 /// Concrete native realization for the initial single-directory Sandbox.
@@ -50,48 +108,18 @@ impl NativeFilesystemDriver {
                 "native source realization requires exactly one directory",
             ));
         };
-        let identity = directory.identity;
         if plan.sandbox.sources.len() != 1
             || source.binding != directory.binding
-            || identity.path != plan.sandbox.tool_root
-            || !identity.path.is_absolute()
-            || identity.path.parent().is_none()
-            || !identity.read
-            || (source.access == SourceAccess::ReadWrite && !identity.write)
+            || directory.identity.path != plan.sandbox.tool_root
+            || source.access != directory.access
         {
             return Err(Error::Denied(
                 "native source directory differs from the authorized Sandbox",
             ));
         }
-        let grant = match source.access {
-            SourceAccess::ReadOnly => GrantSpec::read(&identity.path),
-            SourceAccess::ReadWrite => GrantSpec::read_write(&identity.path),
-        };
-        let capability = CapabilitySet::open_prepared(
-            &identity.path,
-            [PreparedGrant::new(grant, directory.private_artifacts)],
-        )
-        .map_err(|_| Error::Denied("authorized source directory could not be pinned"))?;
-        let actual = capability
-            .identities()
-            .map_err(|_| Error::Denied("source directory identity unavailable"))?;
-        let [actual] = actual.as_slice() else {
-            return Err(Error::Denied(
-                "native source capability has unexpected roots",
-            ));
-        };
-        if actual.path != identity.path
-            || actual.volume != identity.volume
-            || actual.object != identity.object
-            || !actual.read
-            || actual.write != (source.access == SourceAccess::ReadWrite)
-            || capability.base() != Path::new(&identity.path)
-        {
-            return Err(Error::Conflict(
-                "authorized source directory changed during preparation",
-            ));
-        }
-        Ok(capability)
+        // No reopening a path after verification. The exact narrowed
+        // descriptor-backed capability moves into the original worker.
+        Ok(directory.capability)
     }
 }
 
@@ -112,7 +140,7 @@ pub struct SourceFilesystemRoute<A, F> {
     driver: SandboxDriverHandle<NativeFilesystemDriver>,
     tool_authority: WeakToolBindingAuthority,
     limits: LocalToolLimits,
-    resolve: F,
+    resolve: Arc<F>,
     _authority: PhantomData<fn() -> A>,
 }
 
@@ -138,27 +166,31 @@ where
             driver,
             tool_authority: tool_authority.downgrade(),
             limits: limits.validate_direct()?,
-            resolve,
+            resolve: Arc::new(resolve),
             _authority: PhantomData,
         })
     }
 
-    /// Install both halves on the existing host slot and Agent builder.
-    /// Does not grant tools, open held Agent admission, or enable shell/Jobs.
-    pub fn install(
+    /// Configure the exact native-only host selection, without opening
+    /// an ambient workspace root. Both schema registration and execution
+    /// share these limits. No source grant or held Agent admission is minted.
+    pub fn configure(
         self: Arc<Self>,
         builder: AgentBuilder,
-        slot: &OperationRouterSlot,
+        actor: aw_agent_core::PrincipalId,
+        options: &LocalToolOptions,
     ) -> Result<AgentBuilder> {
         if !self
             .tool_authority
             .belongs_to(&builder.tool_binding_authority())
+            || self.limits != options.limits
         {
             return Err(Error::Denied(
-                "source route belongs to another tool authority",
+                "source route belongs to another tool authority or limit selection",
             ));
         }
-        slot.install(self.clone())?;
+        let builder = aw_tools_adapter::configure_routed_native(builder, actor, options)?;
+        options.operation_router.install(self.clone())?;
         Ok(builder.shared_extension(self))
     }
 
@@ -201,10 +233,14 @@ where
         if ctx.cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let resolve = self.resolve.clone();
+        let resolve_context = ctx.clone();
         let NativeSourceAdmission {
             authority,
             directory,
-        } = (self.resolve)(&ctx, tool)?;
+        } = tokio::task::spawn_blocking(move || resolve(&resolve_context, tool))
+            .await
+            .map_err(|_| Error::Protocol("source materialization resolver failed"))??;
         let policy = authority.policy();
         if policy.agent_ref != self.agent.canonical_ref() {
             return Err(Error::Denied(

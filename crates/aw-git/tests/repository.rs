@@ -767,6 +767,38 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         .unwrap();
     assert!(restarted.execute_restore(&dirty_plan).is_err());
 
+    // The exact published binding can realize a mutable checkout after
+    // restore, but neither another root nor a repointed Git administration
+    // directory can inherit its identity.
+    let approved = aw_platform::DirectoryIdentity::open(&dirty_path).unwrap();
+    let physical = approved.identity().unwrap();
+    let verified = restarted
+        .verify_materialization(&restored_dirty, &dirty_path, physical)
+        .unwrap();
+    assert_eq!(verified.root(), dirty_path);
+    assert_eq!(verified.root_identity().unwrap(), physical);
+    assert!(restarted
+        .verify_materialization(&restored_dirty, &clean_path, physical)
+        .is_err());
+    let other = aw_platform::DirectoryIdentity::open(&clean_path)
+        .unwrap()
+        .identity()
+        .unwrap();
+    assert!(restarted
+        .verify_materialization(&restored_dirty, &dirty_path, other)
+        .is_err());
+    let pointer = std::fs::read(dirty_path.join(".git")).unwrap();
+    std::fs::write(
+        dirty_path.join(".git"),
+        std::fs::read(clean_path.join(".git")).unwrap(),
+    )
+    .unwrap();
+    assert!(restarted
+        .verify_materialization(&restored_dirty, &dirty_path, physical)
+        .is_err());
+    std::fs::write(dirty_path.join(".git"), pointer).unwrap();
+    drop(verified);
+
     // Recovery cannot mistake extra ignored content for a completed restore.
     std::fs::write(dirty_path.join("ignored-extra"), b"foreign content").unwrap();
     assert!(matches!(

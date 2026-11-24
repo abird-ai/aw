@@ -806,6 +806,39 @@ impl GitSourceDriver {
         Ok(repo)
     }
 
+    /// Verify a durable binding against an independently host-approved root.
+    /// Never discover a repository at a path selected by binding metadata
+    /// alone. The returned Repository retains the verified directory pins;
+    /// it does not confer filesystem or source authority.
+    pub fn verify_materialization(
+        &self,
+        binding: &SourceBinding,
+        approved_root: &Path,
+        approved_identity: (u64, u64),
+    ) -> Result<Repository> {
+        let (_, path) = materialization_parts(binding)?;
+        if path != approved_root {
+            return Err(Error::Denied(
+                "Git materialization differs from the approved directory",
+            ));
+        }
+        // Refuse a substituted directory before even querying Git there.
+        // Keep the original pin until the verified repository pins exist.
+        let approved = aw_platform::DirectoryIdentity::open(approved_root)?;
+        if approved.identity()? != approved_identity {
+            return Err(Error::Conflict("approved Git checkout directory changed"));
+        }
+        let repo = self.binding_repository(binding)?;
+        if repo.root_identity().map_err(git_error)? != approved_identity
+            || !approved.is_current(approved_root)?
+        {
+            return Err(Error::Conflict(
+                "Git checkout changed during materialization verification",
+            ));
+        }
+        Ok(repo)
+    }
+
     /// Read-only planning. Persist this exact descriptor in the existing
     /// operation receipt before executing. The checkpoint ID is owner-minted.
     pub fn plan_capture(

@@ -37,7 +37,8 @@ and atomic held Agent + fresh source-bearing Sandbox restore publication, plus v
 SandboxGrant evidence/source-access preflight, typed SandboxDriver/fenced source-effect
 handoff, original PipeProcess source-aware host composition and direct journal-linked
 source-effect custody/terminal recovery, and pinned native single-source filesystem route
-with deferred post-journal settlement are implemented locally.
+with deferred post-journal settlement, concrete registered Git materialization resolution
+and root-free native-only tool registration are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1675,19 +1676,64 @@ changed original arguments refusal, no fallback, original TurnJournal receipt an
 receipt hook, and missed hook followed by disk restart/release without reinspection.
 Dropping the Agent/route releases Store ownership. Held source-bearing Agent admission
 is still closed; the route is an explicit reusable host composition, not yet installed
-by the production Actor Service or a real Git/materialization policy resolver.
+by the production Actor Service. The concrete Git resolver is covered by the next slice below.
 Host **15/15**, native adapter **99/99**, router **3/3**, tool binding authority **6/6**,
 Sandbox **4/4**, checkpoint/capture/restore **4/4**, source barrier/receipt **1/1 each**.
 Strict Core/Host/Adapter/Store all-target Clippy, workspace all-target check, minimal
 build and normal dependency SQLite exclusion, fmt and scoped diff-check are green
 (minimal retains its two existing CLI dead-code warnings).
 
-**Next Phase-3 slice:** bind the concrete SourceDriver materialization/policy resolver
-and reviewed host native route into the original Actor Service, then qualify complete
-source-aware dispatch and Job/Process containment before opening admission. Incomplete
-original-effect reconciliation, multi-source policy, history-only baseline, custom ACL/task,
-candidate/retention reconciliation, quiescent binding mutation, Vault and checkpoint/
-Sandbox host RPCs remain pending. Store schema v58.
+GitSourceDriver::verify_materialization now checks an independently approved absolute
+checkout path and local directory identity before Git inspection. It reuses the original
+binding_repository/source+checkout stamps and returns the Repository's retained identity
+pins. A replaced directory or repointed Git administration mapping cannot inherit the
+original binding. Dirty mutable content is not mistaken for a restore fingerprint.
+The actual SourceDriver registered in SessionStore is looked up by typed handle; no
+duplicate registry, durable registry revision or new source grant.
+
+GitNativeSourceResolver composes the current independent host guard and physical approval
+with exact Store SandboxGrant preflight, selects one authorized compatible Git binding,
+and verifies its materialization. The original checkout pin stays live until the native
+CapabilitySet pins that exact directory in the requested effective mode; no launch-time
+pathname reopening. Native source realization excludes the checkout's .git pointer/
+directory and actual Git admin/common directories within the root, using existing
+capability exclusions. This is not a new Git process sandbox or a claim about arbitrary
+external writers/aliases. Independent physical policy and private-artifact registry still
+come from the trusted host, never from the persisted SandboxGrant alone. Source
+verification runs on a blocking worker, before the existing effect claim; final admission
+rechecks the exact selected binding/authority/layout as before.
+
+SourceFilesystemRoute::configure now uses configure_routed_native through the existing
+adapter registration/policy/parallelism owner and original router/hook. The selected
+canonical native tools have no ambient backend, even if the router is removed. No root
+open or private-artifact reconciliation during registration; no Jobs, shell, wake/control,
+legacy native shapes or remove without separate durable private-artifact admission.
+Explicit tool selection only, same builder authority and limits; no replacement of an
+occupied router slot. This is the reusable host builder seam for source-aware activation.
+The optional aw-host/git-source-effects feature is enabled by the product workspace
+feature; generic source-effects-only hosts do not need Git.
+
+Existing grouped native regression runs with the actual Git driver when enabled (and
+with the original generic fixture otherwise), real source read/write, .git exclusion,
+no ambient root during registration, original journal/receipt and restart settlement.
+The existing Git restore regression checks native realization of the exact restored
+binding and wrong root/physical identity/repointed .git refusal. No new production
+Actor Service admission is enabled: HostAgentActivation still requires the independent
+live host policy resolver and source-aware admission across activation/queue/journal/
+context. Do not loosen those gates merely because a configured native route exists.
+Git repository **32/32**, Host **15/15** with Git and **15/15** without Git,
+native adapter **99/99**, router **3/3**, Sandbox and checkpoint owners **4/4 each**.
+Strict Git/Host/Adapter/Store all-target Clippy, workspace all-target check, minimal
+build with no Git/SQLite normal dependencies, fmt/scoped diff-check green. Minimal
+retains the two existing CLI dead-code warnings.
+
+**Next Phase-3 slice:** connect the trusted host policy/physical approval owner and this
+root-free native builder to original Actor Service activation, coordinating the journal
+owner before promoting any source-bearing runtime path. Complete Job/Process containment
+and dispatch remain required for their corresponding authority. Incomplete-effect
+reconciliation, multi-source policy, history-only baseline, custom ACL/task, candidate/
+retention reconciliation, quiescent binding mutation, Vault and checkpoint/Sandbox host
+RPCs remain pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

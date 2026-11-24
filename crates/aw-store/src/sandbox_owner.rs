@@ -810,6 +810,15 @@ impl SessionStore {
         self.inner.source_limit
     }
 
+    /// Trusted host lookup in this Store's actual registered driver leaf.
+    /// Resolving an implementation is not source/disclosure authority.
+    pub fn source_driver<T: Send + Sync + 'static>(
+        &self,
+        handle: &aw_agent_core::SourceDriverHandle<T>,
+    ) -> Result<std::sync::Arc<T>> {
+        self.inner.source_drivers.reader()?.get(handle)
+    }
+
     /// Trusted host publication of a fresh logical Sandbox with an already
     /// materialized SourceSet. The trusted caller supplies authorized,
     /// non-secret references. No driver effect, grant, capture or restore:

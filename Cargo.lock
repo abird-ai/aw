@@ -403,6 +403,7 @@ name = "aw-host"
 version = "0.15.0"
 dependencies = [
  "aw-agent-core",
+ "aw-git",
  "aw-policy",
  "aw-session",
  "aw-store",

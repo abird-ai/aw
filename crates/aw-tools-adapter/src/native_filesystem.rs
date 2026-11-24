@@ -16,7 +16,7 @@ use aw_tools::filesystem::{
 use serde_json::Value;
 
 pub use aw_platform::scoped_fs::capability::{
-    CapabilitySet, GrantIdentity, GrantSpec, PreparedGrant,
+    CapabilitySet, ExclusionSpec, GrantIdentity, GrantSpec, PreparedGrant,
 };
 pub use aw_tools::filesystem::private_artifact::Registry as PrivateArtifactRegistry;
 

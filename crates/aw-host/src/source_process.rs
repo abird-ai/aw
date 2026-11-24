@@ -819,10 +819,11 @@ mod tests {
 
     #[tokio::test]
     async fn native_source_route_uses_pinned_capability_and_original_receipt() {
-        use crate::source_filesystem::{
-            ApprovedSourceDirectory, NativeFilesystemDriver, NativeSourceAdmission,
-            SourceFilesystemRoute,
-        };
+        #[cfg(not(feature = "git-source-effects"))]
+        use crate::source_filesystem::{ApprovedSourceDirectory, NativeSourceAdmission};
+        use crate::source_filesystem::{NativeFilesystemDriver, SourceFilesystemRoute};
+        #[cfg(feature = "git-source-effects")]
+        use crate::source_git::GitNativeSourceResolver;
         use aw_agent_core::{
             AgentExecutionBinding, Extension, HookContext, HookEvent, InvocationScope, ToolContext,
         };
@@ -847,19 +848,81 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
         let actor = PrincipalId::new("internal:fixture:native-source").unwrap();
         let registry = SourceDriverRegistry::new();
-        let source_driver = DriverKey::builtin("fixture-source").unwrap();
-        let schema = SchemaSupport::new(1, 1).unwrap();
-        registry
-            .register(
-                source_driver.clone(),
-                SourceDriverSchemas {
-                    binding: schema,
-                    anchor: schema,
-                    recovery: schema,
-                },
-                (),
-            )
-            .unwrap();
+        #[cfg(not(feature = "git-source-effects"))]
+        let binding = {
+            let source_driver = DriverKey::builtin("fixture-source").unwrap();
+            let schema = SchemaSupport::new(1, 1).unwrap();
+            registry
+                .register(
+                    source_driver.clone(),
+                    SourceDriverSchemas {
+                        binding: schema,
+                        anchor: schema,
+                        recovery: schema,
+                    },
+                    (),
+                )
+                .unwrap();
+            SourceBinding {
+                name: SourceName::new("code").unwrap(),
+                driver: source_driver,
+                binding_schema: 1,
+                source_ref: "fixture:directory".into(),
+                materialization: root.to_str().unwrap().into(),
+                access: SourceAccess::ReadWrite,
+                checkpoint_policy: CheckpointPolicy::Required,
+            }
+        };
+        #[cfg(feature = "git-source-effects")]
+        let (git_handle, binding) = {
+            let git = std::env::var_os("AW_GIT")
+                .map(PathBuf::from)
+                .or_else(|| option_env!("AW_DEFAULT_GIT").map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+            for args in [
+                &["init", "--initial-branch=main"][..],
+                &["add", "code"][..],
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-m",
+                    "fixture",
+                ][..],
+            ] {
+                let output = Command::new(&git)
+                    .current_dir(&root)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "fixture Git: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let handle = aw_git::source_driver::GitSourceDriver::new(git)
+                .unwrap()
+                .register(&registry)
+                .unwrap();
+            let driver = registry.reader().unwrap().get(&handle).unwrap();
+            let binding = driver
+                .binding(
+                    &root,
+                    SourceName::new("code").unwrap(),
+                    SourceAccess::ReadWrite,
+                    CheckpointPolicy::Required,
+                )
+                .unwrap();
+            (handle, binding)
+        };
         let limit = SourceSetLimit::new(1).unwrap();
         let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
         let layout = SessionBinding {
@@ -881,15 +944,6 @@ mod tests {
                  FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
                 params![session.id,branch.id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
             ).unwrap()
-        };
-        let binding = SourceBinding {
-            name: SourceName::new("code").unwrap(),
-            driver: source_driver,
-            binding_schema: 1,
-            source_ref: "fixture:directory".into(),
-            materialization: root.to_str().unwrap().into(),
-            access: SourceAccess::ReadWrite,
-            checkpoint_policy: CheckpointPolicy::Required,
         };
         let sandbox = store
             .sandbox_create_fresh_with_sources(
@@ -919,7 +973,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let records = [
+        let mut records = vec![
             (
                 "native:read",
                 FsTool::Read,
@@ -932,24 +986,34 @@ mod tests {
                 ToolEffect::Read,
                 serde_json::json!({"path":"escape"}),
             ),
-            (
-                "native:write",
-                FsTool::Write,
-                ToolEffect::Write,
-                serde_json::json!({"path":"code","content":"native changed"}),
-            ),
-        ]
-        .map(|(id, tool, effect, arguments)| ToolRecord {
-            call: ToolCall {
-                id: id.into(),
-                name: OperationId::Fs(tool).model_name().into(),
-                arguments,
-            },
-            effect,
-            execution_site: "local".into(),
-            status: ToolStatus::Running,
-            output: None,
-        });
+        ];
+        #[cfg(feature = "git-source-effects")]
+        records.push((
+            "native:git-private",
+            FsTool::Read,
+            ToolEffect::Read,
+            serde_json::json!({"path":".git/config"}),
+        ));
+        records.push((
+            "native:write",
+            FsTool::Write,
+            ToolEffect::Write,
+            serde_json::json!({"path":"code","content":"native changed"}),
+        ));
+        let records: Vec<_> = records
+            .into_iter()
+            .map(|(id, tool, effect, arguments)| ToolRecord {
+                call: ToolCall {
+                    id: id.into(),
+                    name: OperationId::Fs(tool).model_name().into(),
+                    arguments,
+                },
+                effect,
+                execution_site: "local".into(),
+                status: ToolStatus::Running,
+                output: None,
+            })
+            .collect();
         let mut assistant = Message::text(1025, Role::Assistant, "");
         assistant.tool_calls = records.iter().map(|r| r.call.clone()).collect();
         journal
@@ -1006,34 +1070,49 @@ mod tests {
             name: version.binding.name.clone(),
             access: SourceAccess::ReadWrite,
         }];
+        #[cfg(feature = "git-source-effects")]
+        let git_resolver = GitNativeSourceResolver::new(store.clone(), git_handle).unwrap();
         let resolve = {
             let host_lock = host_lock.clone();
-            move |_: &ToolContext, _: FsTool| {
-                Ok(NativeSourceAdmission {
-                    authority: HostGuard {
-                        _guard: host_lock.clone().try_read_owned().unwrap(),
-                        policy: policy.clone(),
-                        tools: tools.clone(),
-                    },
-                    directory: ApprovedSourceDirectory {
-                        binding: version.clone(),
-                        identity: pin.clone(),
-                        private_artifacts: private.clone(),
-                    },
-                })
+            move |ctx: &ToolContext, tool: FsTool| {
+                let authority = HostGuard {
+                    _guard: host_lock.clone().try_read_owned().unwrap(),
+                    policy: policy.clone(),
+                    tools: tools.clone(),
+                };
+                #[cfg(feature = "git-source-effects")]
+                {
+                    git_resolver.resolve(ctx, tool, authority, pin.clone(), private.clone())
+                }
+                #[cfg(not(feature = "git-source-effects"))]
+                {
+                    let _ = ctx;
+                    Ok(NativeSourceAdmission {
+                        authority,
+                        directory: ApprovedSourceDirectory::pin(
+                            version.clone(),
+                            pin.clone(),
+                            if tool.action() == aw_tools::filesystem::access::Action::Read {
+                                SourceAccess::ReadOnly
+                            } else {
+                                SourceAccess::ReadWrite
+                            },
+                            private.clone(),
+                            std::iter::empty(),
+                        )?,
+                    })
+                }
             }
         };
-        let mut options = LocalToolOptions::new(&root, ToolMode::Workspace);
+        // Explicitly no ambient root or private-artifact reconciliation:
+        // the root-free registration works before any source is realized.
+        let ambient = temp.0.join("unapproved-root");
+        let mut options = LocalToolOptions::new(&ambient, ToolMode::Workspace);
         options.selected_tools = vec!["read".into(), "write".into()];
-        let builder = crate::configure_local(
-            Agent::builder(
-                Arc::new(NoInference),
-                AgentOptions::new("fixture", "fixture"),
-            ),
-            actor.clone(),
-            &options,
-        )
-        .unwrap();
+        let builder = Agent::builder(
+            Arc::new(NoInference),
+            AgentOptions::new("fixture", "fixture"),
+        );
         let agent_binding =
             AgentExecutionBinding::from_trusted_host(&reference, &session.id, &branch.id).unwrap();
         let drivers = SandboxDriverRegistry::new();
@@ -1057,10 +1136,11 @@ mod tests {
         );
         let agent = route
             .clone()
-            .install(builder, &options.operation_router)
+            .configure(builder, actor.clone(), &options)
             .unwrap()
             .build()
             .unwrap();
+        assert!(!ambient.exists());
         let mut final_records = Vec::new();
         for mut record in records {
             let id = record.call.id.clone();
@@ -1102,6 +1182,10 @@ mod tests {
                 "native:read" => assert!(output.content.contains("initial") && !output.is_error),
                 "native:escape" => {
                     assert!(output.is_error && !output.content.contains("protected"))
+                }
+                #[cfg(feature = "git-source-effects")]
+                "native:git-private" => {
+                    assert!(output.is_error && !output.content.contains("repositoryformatversion"))
                 }
                 "native:write" => assert!(
                     !output.is_error

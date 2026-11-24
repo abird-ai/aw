@@ -282,6 +282,36 @@ fn compatibility_filesystem_tool(
     }
 }
 
+/// Schema/validation only. The original OperationRouter owns execution;
+/// an absent route cannot fall back to an ambient filesystem backend.
+struct RoutedNativeTool {
+    tool: aw_tools::filesystem::schema::Tool,
+    limits: LocalToolLimits,
+}
+
+impl Tool for RoutedNativeTool {
+    fn spec(&self) -> ToolSpec {
+        core_spec(self.tool, self.limits.schema)
+    }
+
+    fn validate(&self, arguments: &serde_json::Value) -> Result<()> {
+        if legacy_filesystem_request(self.tool, arguments) {
+            return Err(Error::Denied(
+                "source-aware native execution requires canonical arguments",
+            ));
+        }
+        canonical_request(self.tool, arguments, self.limits).map(|_| ())
+    }
+
+    fn execute<'a>(&'a self, _: ToolContext, _: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async {
+            Err(Error::Denied(
+                "native tool requires its installed host route",
+            ))
+        })
+    }
+}
+
 struct CanonicalFilesystemTool {
     root: Arc<aw_platform::scoped_fs::Root>,
     tool: aw_tools::filesystem::schema::Tool,
@@ -979,7 +1009,7 @@ pub fn configure(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<AgentBuilder> {
-    Ok(configure_inner(builder, actor, options, None)?.builder)
+    Ok(configure_inner(builder, actor, options, None, false)?.builder)
 }
 
 pub struct ConfiguredLocalTools {
@@ -996,7 +1026,7 @@ pub fn configure_with_runtime(
     actor: PrincipalId,
     options: &LocalToolOptions,
 ) -> Result<ConfiguredLocalTools> {
-    configure_inner(builder, actor, options, None)
+    configure_inner(builder, actor, options, None, false)
 }
 
 /// Apply metadata hooks and configured limits through the original AW Agent
@@ -1009,14 +1039,44 @@ pub fn configure_with_toolset(
 ) -> Result<AgentBuilder> {
     let mut configured = options.clone();
     configured.limits = options.limits.with_toolset(toolset);
-    Ok(configure_inner(builder, actor, &configured, Some(toolset))?.builder)
+    Ok(configure_inner(builder, actor, &configured, Some(toolset), false)?.builder)
 }
+/// Register only explicit canonical native tools through the existing
+/// router/policy owner, without opening or reconciling a workspace root.
+/// No shell, Job, control, or ambient fallback. Remove needs separate
+/// durable private-artifact admission before it can join this surface.
+pub fn configure_routed_native(
+    builder: AgentBuilder,
+    actor: PrincipalId,
+    options: &LocalToolOptions,
+) -> Result<AgentBuilder> {
+    Ok(configure_inner(builder, actor, options, None, true)?.builder)
+}
+
 fn configure_inner(
     mut builder: AgentBuilder,
     actor: PrincipalId,
     options: &LocalToolOptions,
     catalog: Option<&aw_tools::toolset::Toolset>,
+    routed_native: bool,
 ) -> Result<ConfiguredLocalTools> {
+    if routed_native
+        && (options.selected_tools.is_empty()
+            || options.process_input
+            || options.allow_agent_graph
+            || options.allow_wake
+            || builder.tool_policy_snapshot().has_grants()
+            || options.selected_tools.iter().any(|name| {
+                aw_tools::filesystem::schema::Tool::from_name(name).is_none_or(|tool| {
+                    tool == aw_tools::filesystem::schema::Tool::Remove
+                        || !options.mode.access().permits(tool.action())
+                })
+            }))
+    {
+        return Err(Error::Denied(
+            "routed native tools require an explicit native-only host selection",
+        ));
+    }
     if options.mode == ToolMode::Off {
         if options.selected_tools.is_empty() {
             return Ok(ConfiguredLocalTools {
@@ -1138,6 +1198,24 @@ fn configure_inner(
     builder = builder.tool_policy_lifecycle(Arc::new(ParallelismCeiling {
         ceiling: effective_concurrency.parallelism,
     }));
+    if routed_native {
+        let mut available = BTreeSet::new();
+        let mut offered = OfferContext {
+            selected: &selected,
+            available: &mut available,
+            policy: &mut policy,
+            actor: &actor,
+            router: &options.operation_router,
+            catalog,
+        };
+        for tool in active_tools {
+            builder = offer(builder, RoutedNativeTool { tool, limits }, &mut offered)?;
+        }
+        return Ok(ConfiguredLocalTools {
+            builder: builder.tool_policy(policy),
+            job_runtime: None,
+        });
+    }
     let root = Arc::new(private_artifacts::open_root(
         &options.root,
         options.private_state_dir.as_deref(),
