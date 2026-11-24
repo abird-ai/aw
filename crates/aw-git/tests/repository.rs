@@ -77,6 +77,199 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.parent);
     }
 }
+#[cfg(feature = "source-driver")]
+#[test]
+fn prepared_git_capture_retains_exact_clean_head_and_never_replays() {
+    use aw_agent_core::{
+        CheckpointPolicy, DriverKey, Error as SourceError, ExternalEvidence,
+        PreparedSourceOperation, RecoveryInspection, SourceAccess, SourceDriverRegistry,
+        SourceName,
+    };
+    use aw_git::source_driver::GitSourceDriver;
+
+    let f = Fixture::new();
+    let registry = SourceDriverRegistry::new();
+    let handle = GitSourceDriver::new(&f.git)
+        .unwrap()
+        .register(&registry)
+        .unwrap();
+    assert_eq!(handle.driver(), &DriverKey::builtin("git").unwrap());
+    let reader = registry.reader().unwrap();
+    let driver = reader.get(&handle).unwrap();
+    let binding = driver
+        .binding(
+            &f.root,
+            SourceName::new("code").unwrap(),
+            SourceAccess::ReadWrite,
+            CheckpointPolicy::Required,
+        )
+        .unwrap();
+    assert_eq!(
+        reader.resolve(&binding.pin().unwrap()).unwrap().driver,
+        binding.driver
+    );
+
+    f.write("a.txt", b"retained content\n");
+    f.run(&["add", "a.txt"]);
+    f.run(&["commit", "-m", "retained", "--no-gpg-sign"]);
+    let index = std::fs::read(f.root.join(".git/index")).unwrap();
+    let head = f.run(&["rev-parse", "HEAD"]).stdout;
+    let prepared = driver
+        .plan_capture(&binding, "cp_clean", "op_clean")
+        .unwrap();
+    let descriptor = serde_json::to_vec(&prepared).unwrap();
+    let private_ref = "refs/aw/checkpoints/cp_clean/code";
+    assert!(f.run(&["for-each-ref", private_ref]).stdout.is_empty());
+    assert_eq!(std::fs::read(f.root.join(".git/index")).unwrap(), index);
+    assert!(matches!(
+        driver.inspect_capture(&prepared).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+
+    let anchor = driver.execute_capture(&prepared).unwrap();
+    assert_eq!(anchor.retention_ref(), private_ref);
+    assert_eq!(
+        anchor.captured_commit.as_bytes(),
+        head.strip_suffix(b"\n").unwrap()
+    );
+    assert_eq!(anchor.captured_commit, anchor.base_commit);
+    assert_eq!(
+        reader.resolve(&anchor.pin().unwrap()).unwrap().driver,
+        binding.driver
+    );
+    driver.revalidate_capture(&prepared, &anchor).unwrap();
+    assert_eq!(f.run(&["rev-parse", "HEAD"]).stdout, head);
+    assert_eq!(
+        f.run(&["symbolic-ref", "HEAD"]).stdout,
+        b"refs/heads/main\n"
+    );
+    assert_eq!(std::fs::read(f.root.join(".git/index")).unwrap(), index);
+
+    // New runtime registry, same durable identity; no re-execution.
+    let restarted = SourceDriverRegistry::new();
+    let handle = GitSourceDriver::new(&f.git)
+        .unwrap()
+        .register(&restarted)
+        .unwrap();
+    let driver = restarted.reader().unwrap().get(&handle).unwrap();
+    let prepared: PreparedSourceOperation = serde_json::from_slice(&descriptor).unwrap();
+    match driver.inspect_capture(&prepared).unwrap() {
+        RecoveryInspection::Completed {
+            result,
+            evidence: ExternalEvidence::Immutable { .. },
+        } => {
+            assert_eq!(result, anchor);
+        }
+        result => panic!("expected exact retained capture, got {result:?}"),
+    }
+    assert!(driver.execute_capture(&prepared).is_err());
+
+    // A ref without its object closure is damage, not a completed capture.
+    let blob = String::from_utf8(f.run(&["rev-parse", "HEAD:a.txt"]).stdout).unwrap();
+    let blob = blob.trim();
+    let object = f
+        .root
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    let missing = f.parent.join("missing-blob");
+    std::fs::rename(&object, &missing).unwrap();
+    assert!(driver.verify_anchor(&f.root, &anchor).is_err());
+    assert!(matches!(
+        driver.inspect_capture(&prepared).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    std::fs::rename(&missing, &object).unwrap();
+
+    // A branch move and ordinary GC cannot discard a live clean anchor.
+    // Only this isolated fixture is reset, never the authoring repository.
+    f.run(&["reset", "--hard", "HEAD^"]);
+    f.run(&["reflog", "expire", "--expire=now", "--all"]);
+    f.run(&["gc", "--prune=now"]);
+    driver.verify_anchor(&f.root, &anchor).unwrap();
+    assert!(driver.revalidate_capture(&prepared, &anchor).is_err());
+    assert!(matches!(
+        driver.inspect_capture(&prepared).unwrap(),
+        RecoveryInspection::Completed { .. }
+    ));
+
+    let stale = driver
+        .plan_capture(&binding, "cp_stale", "op_stale")
+        .unwrap();
+    f.write("a.txt", b"dirty after plan\n");
+    assert!(matches!(
+        driver.execute_capture(&stale),
+        Err(SourceError::Conflict(_))
+    ));
+    assert!(driver
+        .plan_capture(&binding, "cp_dirty", "op_dirty")
+        .is_err());
+    assert!(f
+        .run(&["for-each-ref", "refs/aw/checkpoints/cp_stale"])
+        .stdout
+        .is_empty());
+    f.run(&["restore", "a.txt"]);
+
+    // Index flags cannot manufacture an apparently clean source.
+    f.run(&["update-index", "--assume-unchanged", "a.txt"]);
+    assert!(driver
+        .plan_capture(&binding, "cp_hidden", "op_hidden")
+        .is_err());
+    f.run(&["update-index", "--no-assume-unchanged", "a.txt"]);
+    f.run(&["config", "filter.unsafe.smudge", "false"]);
+    assert!(driver
+        .plan_capture(&binding, "cp_filter", "op_filter")
+        .is_err());
+    f.run(&["config", "--unset", "filter.unsafe.smudge"]);
+    f.run(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{},nested", anchor.captured_commit),
+    ]);
+    assert!(driver
+        .plan_capture(&binding, "cp_gitlink", "op_gitlink")
+        .is_err());
+    f.run(&["update-index", "--force-remove", "nested"]);
+    f.write(".git/objects/info/alternates", b"\n");
+    assert!(driver
+        .plan_capture(&binding, "cp_alternate", "op_alternate")
+        .is_err());
+    std::fs::remove_file(f.root.join(".git/objects/info/alternates")).unwrap();
+
+    let collision = driver
+        .plan_capture(&binding, "cp_collision", "op_collision")
+        .unwrap();
+    let wrong_ref = "refs/aw/checkpoints/cp_collision/code";
+    f.run(&["update-ref", wrong_ref, &anchor.captured_commit]);
+    assert!(driver.execute_capture(&collision).is_err());
+    assert!(matches!(
+        driver.inspect_capture(&collision).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert_eq!(f.run(&["rev-parse", wrong_ref]).stdout, head);
+
+    // Deleting the retention fact is uncertainty, not a fresh operation.
+    f.run(&["update-ref", "-d", private_ref]);
+    assert!(matches!(
+        driver.inspect_capture(&prepared).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(driver.verify_anchor(&f.root, &anchor).is_err());
+
+    // Same pathname, new checkout/object directory: do not adopt it.
+    std::fs::rename(&f.root, f.parent.join("original")).unwrap();
+    std::fs::create_dir(&f.root).unwrap();
+    f.run(&["init", "--initial-branch=main"]);
+    assert!(driver
+        .plan_capture(&binding, "cp_replaced", "op_replaced")
+        .is_err());
+    assert!(matches!(
+        driver.inspect_capture(&collision).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+}
+
 #[test]
 fn discover_clean_repo() {
     let f = Fixture::new();

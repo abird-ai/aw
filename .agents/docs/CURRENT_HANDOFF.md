@@ -27,7 +27,8 @@ v50 disclosure/causal execution closure, v51 EventTypeRegistry + custom Event pu
 v53 same-store cross-Domain Event-universe completeness, and v54 serialized v36 delivery cutover +
 compatibility provenance are implemented locally. Phase 3 is now UNDERWAY with the first final
 SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary and v55 named
-SourceBinding persistence/restart compatibility implemented locally.
+SourceBinding persistence/restart compatibility plus the built-in Git clean capture/retention driver
+implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1126,11 +1127,47 @@ Agent admission/close. The existing SourceDriver leaf regression **1/1** remains
 Full workspace all-target check, strict `aw-agent-core + aw-store` all-target Clippy, repository fmt
 and scoped diff-check are green.
 
-**Next Phase-3 slice:** implement the mandatory Git SourceDriver; then clean/dirty capture and private
-retention, SourceAnchor/Checkpoint persistence, multi-source recovery and the shared Prepared
-publication constructor. Source realization, quiescent binding mutation, SandboxGrant/Vault and
-checkpoint effects remain pending. Do not contract v36 Event compatibility tables; Phase 7 owns
-removal after cross-version drain/restart evidence.
+The first concrete built-in Git SourceDriver is available through `aw-git/source-driver`. The default
+Git review library remains Agent-independent; trusted hosts explicitly register the concrete
+`GitSourceDriver` in the existing add-only leaf with an absolute trusted Git executable. Stable key
+`builtin/git` has independent binding/anchor/recovery schema 1. No new registry or ambient driver
+installation. The driver's SourceRef identifies the local common/object directories; its materialization
+pins the exact worktree/admin directory plus canonical path. The shared platform DirectoryIdentity
+exposes its existing local filesystem identity, not a cross-machine resource ID or authority.
+Unexpected directory replacement, alternate object databases, executable filters and partial clone
+are refused. No network, ambient Git config, hooks or replacement objects enter capture.
+
+The first capture path is committed clean HEAD only. Read-only planning emits the exact shared
+`PreparedSourceOperation` with a bounded canonical recovery descriptor, candidate checkpoint/source
+identity, original binding and exact base commit. The host must durably retain that descriptor and hold
+its live source barrier before calling execute. Execute revalidates exact checkout/HEAD/clean index,
+then creates one private `refs/aw/checkpoints/<checkpoint>/<source>` retention ref by absent-old CAS,
+never moving the real HEAD/index or overwriting an existing ref. Gitlinks, hidden index entries and
+dirty sources currently fail closed. The typed GitSourceAnchor carries exact base/captured commit
+identity and source/access/checkpoint metadata. Read-only validation checks the retained commit's
+snapshot object closure without walking unrelated history.
+
+Inspection reopens only the exact prepared binding and observes that operation's private ref and
+commit closure. Absent, changed or damaged retention is Unknown, never automatic replay or cleanup.
+Completed returns immutable Git content evidence; the ref is not a live fence or authority. The
+future Store constructor still owns durable retention and must hold AW source/cleanup barriers
+through publication, including final source/HEAD revalidation. No public checkpoint, restore,
+retirement or effectful Store constructor is introduced here. Clean capture keeps the schema-1
+semantics; any future wider artifact semantics must declare honest compatibility.
+
+The grouped real Git regression and full `aw-git --features source-driver` suite **30/30** prove
+registry resolution across restart, effect-free preparation, preserved HEAD/index, private retention
+after fixture branch reset/GC, missing-object/retention/collision recovery, stale capture refusal,
+directory replacement and fail-closed filter/alternate/gitlink/index flags. Full workspace all-target
+check, strict `aw-git --features source-driver` and platform-crate all-target Clippy on L5, repository
+fmt and scoped diff-check are green. No Windows-native runtime qualification is claimed.
+
+**Next Phase-3 slice:** extend this exact Git driver with dirty private-index capture and explicit
+gitlink semantics; then isolated restore with original base HEAD, SourceAnchor/Checkpoint persistence,
+multi-source recovery and shared Prepared publication. Source realization, quiescent binding mutation,
+SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema stays v55.
+Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
+evidence.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

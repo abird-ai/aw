@@ -7,7 +7,12 @@ license = "MIT"
 publish = false
 description = "Bounded Git snapshots and reviewed index changes, independent of agents and renderers"
 
+[features]
+default = []
+source-driver = ["dep:aw-agent-core"]
+
 [dependencies]
+aw-agent-core = { version = "=0.15.0", path = "../aw-agent-core", optional = true }
 aw-platform = { version = "=0.15.0", path = "../aw-platform" }
 serde = { workspace = true }
 thiserror = { workspace = true }

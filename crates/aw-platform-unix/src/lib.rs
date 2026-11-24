@@ -74,11 +74,15 @@ impl DirectoryIdentity {
         Ok(Self(file))
     }
 
+    /// Local filesystem identity, not a cross-machine resource identifier.
+    pub fn identity(&self) -> io::Result<(u64, u64)> {
+        let meta = self.0.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
     pub fn is_current(&self, path: &Path) -> io::Result<bool> {
         let current = Self::open(path)?;
-        let original = self.0.metadata()?;
-        let current = current.0.metadata()?;
-        Ok(original.dev() == current.dev() && original.ino() == current.ino())
+        Ok(self.identity()? == current.identity()?)
     }
 }
 

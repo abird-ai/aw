@@ -64,22 +64,14 @@ impl DirectoryIdentity {
         Ok(Self(file))
     }
 
+    /// Local filesystem identity, not a cross-machine resource identifier.
+    pub fn identity(&self) -> io::Result<(u64, u64)> {
+        file_identity(&self.0)
+    }
+
     pub fn is_current(&self, path: &Path) -> io::Result<bool> {
-        fn identity(file: &File) -> io::Result<(u32, u64)> {
-            // SAFETY: the handle remains owned by file and info is writable.
-            unsafe {
-                let mut info = std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>();
-                if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) == 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok((
-                    info.dwVolumeSerialNumber,
-                    (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-                ))
-            }
-        }
         let current = Self::open(path)?;
-        Ok(identity(&self.0)? == identity(&current.0)?)
+        Ok(self.identity()? == current.identity()?)
     }
 }
 
@@ -106,22 +98,26 @@ impl FileIdentity {
     }
 
     pub fn identity(&self) -> io::Result<(u64, u64)> {
-        // SAFETY: self owns a valid handle and info is writable.
-        unsafe {
-            let mut info = std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>();
-            if GetFileInformationByHandle(self.0.as_raw_handle() as HANDLE, &mut info) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok((
-                u64::from(info.dwVolumeSerialNumber),
-                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-            ))
-        }
+        file_identity(&self.0)
     }
 
     pub fn is_current(&self, path: &Path) -> io::Result<bool> {
         let current = Self::open(path)?;
         Ok(self.identity()? == current.identity()?)
+    }
+}
+
+fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+    // SAFETY: file owns a valid handle and info is writable.
+    unsafe {
+        let mut info = std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>();
+        if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
     }
 }
 

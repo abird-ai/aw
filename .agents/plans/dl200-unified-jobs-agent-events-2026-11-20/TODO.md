@@ -448,9 +448,21 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       realization/lifecycle support; no implicit replacement, rebind or external effect.
       Grouped Sandbox owner **2/2** and SourceDriver **1/1** are green. Full workspace all-target
       check, strict affected-crate all-target Clippy, repository fmt and scoped diff-check are green.
-      **Next:** mandatory Git SourceDriver, clean/dirty anchors/private retention, then Checkpoint
-      persistence, multi-source recovery and shared Prepared publication. Source realization,
-      quiescent binding mutation, SandboxGrant/Vault and host RPCs remain pending.
+      **Git driver + clean retention landed locally:** concrete `aw-git/source-driver` registers
+      builtin/git (binding/anchor/recovery schema 1) in the existing leaf; the default Git library
+      stays Agent-independent. Exact local source/checkout identities and bounded effect-free
+      Prepared descriptors, clean committed HEAD capture with create-only private retention ref,
+      immutable content anchor and read-only exact recovery inspection. Missing/changed/damaged
+      retention is Unknown; no blind retry, HEAD/index mutation or cleanup. Filters, partial clones,
+      alternate object databases, hidden index entries and gitlinks/dirty inputs fail closed.
+      Object closure verification is snapshot-local; ref retention and live AW barriers remain the
+      future publication owner's responsibility. Real Git suite **30/30** including one grouped
+      clean retention/restart/GC failure-boundary regression. Workspace all-target check, strict
+      Git feature/platform Clippy on L5, fmt and scoped diff-check are green.
+      **Next:** dirty private-index capture and explicit gitlink semantics in this same driver,
+      isolated restore, then Checkpoint persistence, multi-source recovery and shared Prepared
+      publication. Source realization, quiescent binding mutation, SandboxGrant/Vault and host RPCs
+      remain pending. Store schema remains v55.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -555,4 +567,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf and v55 named binding persistence/startup compatibility are live; remaining work is Git capture/restore, SourceAnchor/Checkpoint and unresolved recovery dependency pinning, source realization/quiescent mutation, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, SandboxGrant/Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility and concrete Git clean capture/private retention/inspection are live; remaining work is dirty Git capture/gitlinks/restore, SourceAnchor/Checkpoint and unresolved recovery dependency pinning, source realization/quiescent mutation, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, SandboxGrant/Vault and host RPCs.

@@ -4,6 +4,8 @@
 mod parse;
 mod process;
 mod review;
+#[cfg(feature = "source-driver")]
+pub mod source_driver;
 
 pub use parse::{parse_branches, parse_status, parse_worktrees};
 pub use review::{parse_diff_lines, LineKind, ReviewComment, ReviewLine};

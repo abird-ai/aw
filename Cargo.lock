@@ -390,6 +390,7 @@ dependencies = [
 name = "aw-git"
 version = "0.15.0"
 dependencies = [
+ "aw-agent-core",
  "aw-platform",
  "serde",
  "serde_json",
