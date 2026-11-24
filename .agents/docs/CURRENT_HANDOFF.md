@@ -40,8 +40,9 @@ source-effect custody/terminal recovery, and pinned native single-source filesys
 with deferred post-journal settlement, concrete registered Git materialization resolution,
 root-free native-only tool registration, live native source approval, explicit Actor host
 activation selection, quiescent metadata-only source binding mutation, checkpoint
-retirement/retained-anchor reconciliation and source-bearing Sandbox logical close
-with retained-layout fencing are implemented locally.
+retirement/retained-anchor reconciliation, source-bearing Sandbox logical close and
+exact closed-Sandbox materialization reconciliation with proven retained-layout release
+are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1869,12 +1870,40 @@ checkpoint/capture/restore **4/4**, barrier and construction receipt **1/1 each*
 real Host source effects **2/2**; strict Store all-target Clippy, workspace all-target
 check, fmt and scoped diff-check green.
 
+Closed-Sandbox reconciliation now uses sandbox_reconcile_closed_sources with the
+original exact versioned bindings (including ephemeral sources) and immutable closed
+layout. Reuse the original Project-writer/Agent/run/hazard owners, compatible installed
+drivers and complete-set coordination claims; refuse open materialization sharing,
+open source-bearing exact-path sharing and open derived-child dependencies. Closed
+retained bindings are the cleanup intent, not a new ledger. Checkpoint and Sandbox
+cleanup share reconcile_retained_sources_in: claim or recover the original reserved
+hazard, never steal a live owner, never apply a lowered new-admission bound to cleanup.
+
+The trusted reconciler independently authorizes physical inspection/release and proves
+the entire original layout safe for reuse (not merely absence of a locator); any returned
+provider/physical guard is held through final Store commit. No default destructive driver
+action, shared backing reclamation, or inference of physical authority from metadata.
+Unknown or failed final publication retains the original complete set and claims.
+Successful release atomically deletes retained bindings, advances Sandbox rev once,
+records local release provenance and settles the barrier. A replay performs no inspection.
+Retained-path reservation ends only at that commit. The original historical source-bearing
+Session remains effect-inert via its indexed immutable Sandbox release fact, even after
+a freshly authorized Agent uses a clean recreated root. No Agent revision fanout.
+The grouped restore regression exercises open shared dependency refusal, complete-set
+exclusion, partial physical release, missing-driver restart, recovery under a lowered
+limit, idempotent settlement, and fresh clean layout vs historical Session admission.
+Only isolated fixture files are removed; concrete managed Git worktree cleanup and
+independent production physical/provider authorization remain to be integrated.
+Sandbox **4/4**, checkpoint/capture/restore **4/4**, barrier/construction receipt
+**1/1 each**, real Host source effects **2/2**; strict Store all-target Clippy,
+workspace all-target check, fmt and scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, implement exact closed-Sandbox materialization retention reconciliation
-under independent physical authority, keeping retained layouts fenced until proved
-release. Independent host approval provisioning, incomplete-effect reconciliation,
-multi-source policy, history-only baseline, custom ACL/task, candidate/retention cleanup,
+While blocked, implement exact managed Git restore-materialization cleanup/reconciliation
+using original restore ownership and safe physical verification, or the independent
+history-only baseline constructor. Independent host approval provisioning, incomplete-
+effect reconciliation, multi-source policy, custom ACL/task, candidate cleanup,
 final-source removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain
 pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart

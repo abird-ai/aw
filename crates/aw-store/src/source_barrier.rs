@@ -170,6 +170,7 @@ impl SessionStore {
     ) -> Result<SourceMutationBarrier<'_>> {
         if prepare_id.starts_with(crate::sandbox_owner::JOURNALED_SOURCE_EFFECT_PREFIX)
             || prepare_id.starts_with(crate::checkpoint_owner::RETENTION_CLEANUP_PREFIX)
+            || prepare_id.starts_with(crate::sandbox_owner::RETENTION_CLEANUP_PREFIX)
         {
             return Err(Error::Denied(
                 "reserved source claims require their original owner",
@@ -194,9 +195,30 @@ impl SessionStore {
         self.claim_source_mutation_barrier_in(tx, set, prepare_id)
     }
 
-    /// Retained cleanup is not a new materialization. Its original bounded
-    /// set may exceed a subsequently lowered host admission limit.
-    pub(crate) fn claim_source_mutation_barrier_in(
+    /// Retired owner rows already retain the exact cleanup intent. Claim
+    /// once, or recover the original hazard; never steal a live claim.
+    /// A lowered admission limit cannot strand an existing retained set.
+    pub(crate) fn reconcile_retained_sources_in(
+        &self,
+        tx: &Transaction<'_>,
+        set: &SourceMutationSet,
+        prepare_id: &str,
+    ) -> Result<SourceMutationBarrier<'_>> {
+        let unresolved: bool = db(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_coordination_leases
+             WHERE scope_kind='execution' AND scope_key GLOB 'source-mutation:*'
+               AND run_id=?1 AND state IN ('active','hazard'))",
+            [prepare_id],
+            |row| row.get(0),
+        ))?;
+        if unresolved {
+            self.recover_source_mutation_barrier_in(tx, set, prepare_id)
+        } else {
+            self.claim_source_mutation_barrier_in(tx, set, prepare_id)
+        }
+    }
+
+    fn claim_source_mutation_barrier_in(
         &self,
         tx: &Transaction<'_>,
         set: &SourceMutationSet,

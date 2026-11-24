@@ -10,7 +10,10 @@ use aw_agent_core::{
 };
 use rusqlite::{params, Connection, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+
+pub(crate) const RETENTION_CLEANUP_PREFIX: &str = "sandbox-retention:";
 
 use crate::source_compatibility::compatibility;
 pub use crate::source_compatibility::SourceCompatibility as SourceBindingCompatibility;
@@ -454,6 +457,180 @@ impl SessionStore {
         let result = super::snapshot_with_sources(&tx, &sandbox)?;
         db(tx.commit())?;
         Ok(result)
+    }
+}
+
+/// Resolve all original retained bindings, not a checkpoint selection or a
+/// current host limit. The closed row cannot be structurally mutated.
+fn closed_retained_in(
+    connection: &Connection,
+    sandbox: &str,
+) -> Result<(super::SandboxSnapshot, Vec<VersionedSourceBinding>)> {
+    let mut snapshot = super::snapshot_row(connection, sandbox)?;
+    if snapshot.lifecycle != super::SandboxLifecycle::Closed {
+        return Err(Error::Conflict(
+            "source retirement requires a closed Sandbox",
+        ));
+    }
+    let mut bindings = Vec::new();
+    for stored in bindings_in(connection, sandbox)? {
+        let version = VersionedSourceBinding {
+            binding: stored.binding.clone(),
+            binding_rev: stored.binding_rev,
+        };
+        snapshot.sources.push(stored.summary());
+        bindings.push(version);
+    }
+    Ok((snapshot, bindings))
+}
+
+fn require_unshared_materializations_in(
+    c: &Connection,
+    snapshot: &super::SandboxSnapshot,
+) -> Result<()> {
+    let root = snapshot
+        .tool_root
+        .to_str()
+        .ok_or(Error::Storage("invalid Sandbox tool root"))?;
+    let cwd = snapshot
+        .working_directory
+        .to_str()
+        .ok_or(Error::Storage("invalid Sandbox working directory"))?;
+    // Exact known mutable materializations and dependent open layouts.
+    // The source itself may be shared by isolated checkouts: never reclaim
+    // shared provider/object backing merely because one checkout closes.
+    let shared: bool = db(c.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sandbox_source_bindings_current owned
+             JOIN sandbox_source_bindings_current other
+               ON other.driver_key=owned.driver_key AND other.source_ref=owned.source_ref
+              AND other.materialization=owned.materialization
+             JOIN sandboxes_current s ON s.sandbox_id=other.sandbox_id
+             WHERE owned.sandbox_id=?1 AND s.lifecycle='open'
+         ) OR EXISTS(
+             SELECT 1 FROM sandboxes_current s
+             WHERE s.lifecycle='open' AND (
+                 s.parent_sandbox_id=?1 OR (
+                     (s.tool_root IN (?2,?3) OR s.working_directory IN (?2,?3))
+                     AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
+                                WHERE b.sandbox_id=s.sandbox_id)
+                 )
+             )
+         )",
+        params![snapshot.canonical_ref, root, cwd],
+        |row| row.get(0),
+    ))?;
+    if shared {
+        return Err(Error::Conflict(
+            "Sandbox materialization is still required by an open Sandbox",
+        ));
+    }
+    Ok(())
+}
+
+impl SessionStore {
+    /// Trusted closed-Sandbox physical reconciliation. Independently
+    /// authorize and inspect the exact original materializations and whole
+    /// layout, preserving all other live backing dependencies. Success
+    /// means proven release (including a prior release) AND a safe layout
+    /// for reuse, not just missing driver metadata. The returned guard
+    /// retains any external physical/provider fences through final commit.
+    /// Never infer authority from the closed row or remove shared backing.
+    pub fn sandbox_reconcile_closed_sources<F>(
+        &self,
+        actor: &PrincipalId,
+        sandbox_ref: &str,
+        reconcile: impl FnOnce(&super::SandboxSnapshot, &[VersionedSourceBinding]) -> Result<F>,
+    ) -> Result<super::SandboxSnapshot> {
+        if self.inner.mode != StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "Sandbox retention cleanup requires the exclusive Store owner",
+            ));
+        }
+        let key = super::parse_sandbox_ref(sandbox_ref)?;
+        let sandbox = key.canonical();
+        let prepare_id = format!(
+            "{RETENTION_CLEANUP_PREFIX}{:x}",
+            Sha256::digest(sandbox.as_bytes())
+        );
+        let (original, bindings, next_rev, barrier) = {
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            super::authorize_project(&tx, actor, &key.project, true)?;
+            let (original, bindings) = closed_retained_in(&tx, &sandbox)?;
+            if bindings.is_empty() {
+                return Ok(original);
+            }
+            let next_rev = original
+                .rev
+                .checked_add(1)
+                .filter(|r| *r <= i64::MAX as u64)
+                .ok_or(Error::Limit("Sandbox revision exhausted"))?;
+            super::require_close_quiescent_in(&tx, &original, true)?;
+            require_unshared_materializations_in(&tx, &original)?;
+            let registry = self.inner.source_drivers.reader()?;
+            for binding in &bindings {
+                registry.resolve(&binding.binding.pin()?)?;
+            }
+            let set = SourceMutationSet::from_binding_refs(bindings.iter().map(|b| &b.binding))?;
+            let barrier = self.reconcile_retained_sources_in(&tx, &set, &prepare_id)?;
+            db(tx.commit())?;
+            (original, bindings, next_rev, barrier)
+        };
+        let fence = match reconcile(&original, &bindings) {
+            Ok(fence) => fence,
+            Err(error) => {
+                barrier.settle(crate::SourceMutationOutcome::Unknown)?;
+                return Err(error);
+            }
+        };
+        let finish = (|| {
+            let mut connection = self.connection()?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            barrier.require_preparation_in(&tx, &prepare_id)?;
+            let (current, retained) = closed_retained_in(&tx, &sandbox)?;
+            if current != original || retained != bindings {
+                return Err(Error::Conflict("closed Sandbox retention changed"));
+            }
+            super::require_close_quiescent_in(&tx, &current, true)?;
+            require_unshared_materializations_in(&tx, &current)?;
+            // Factual release, not a new grant or effect. Retain the
+            // historical closed Sandbox/Agent identities and replay facts.
+            if db(tx.execute(
+                "DELETE FROM sandbox_source_bindings_current WHERE sandbox_id=?1",
+                [&sandbox],
+            ))? != bindings.len()
+            {
+                return Err(Error::Conflict("closed Sandbox source set changed"));
+            }
+            if db(tx.execute(
+                "UPDATE sandboxes_current SET rev=?1,updated_at=?2
+                 WHERE sandbox_id=?3 AND lifecycle='closed' AND rev=?4",
+                params![next_rev, now(), sandbox, original.rev],
+            ))? != 1
+            {
+                return Err(Error::Conflict("closed Sandbox revision changed"));
+            }
+            durability::commit_event(
+                &tx,
+                &durability::tx_id()?,
+                "sandbox.retention.released",
+                "sandbox",
+                &sandbox,
+                Some(actor),
+                serde_json::json!({"sync_scope":"local","aspect":"sources","rev":next_rev}),
+            )?;
+            barrier.settle_in(&tx, crate::SourceMutationOutcome::Settled)?;
+            let result = super::snapshot_with_sources(&tx, &sandbox)?;
+            db(tx.commit())?;
+            Ok(result)
+        })();
+        if finish.is_err() {
+            barrier.settle(crate::SourceMutationOutcome::Unknown)?;
+        }
+        // Keep the independent provider/physical fence through publication.
+        drop(fence);
+        finish
     }
 }
 

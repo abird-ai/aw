@@ -1665,7 +1665,7 @@ mod tests {
         }
         drop(store);
         // Closed dependencies are still validated on every owner restart.
-        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
         let revalidated = store.sandbox_get(&actor, &sandbox).unwrap();
         assert_eq!(revalidated.lifecycle, crate::SandboxLifecycle::Closed);
         assert_eq!(revalidated.rev, closed.rev);
@@ -1699,5 +1699,154 @@ mod tests {
             unused_alias
         );
         assert!(store.activate(&actor, &ids.session, &ids.branch).is_err());
+
+        // A separate open Sandbox retaining this exact materialization
+        // protects it even without an active Agent or source claim.
+        let original_bindings: Vec<_> = anchors
+            .anchors
+            .iter()
+            .map(|anchor| SourceBinding {
+                name: anchor.name.clone(),
+                driver: anchor.driver.clone(),
+                binding_schema: 1,
+                source_ref: anchor.source_ref.clone(),
+                materialization: std::fs::read_to_string(marker(anchor.name.as_str())).unwrap(),
+                access: anchor.access,
+                checkpoint_policy: anchor.checkpoint_policy,
+            })
+            .collect();
+        let other_layout = SessionBinding {
+            working_directory: temp.0.join("shared-materialization"),
+            tool_root: temp.0.join("shared-materialization"),
+            ..layout.clone()
+        };
+        let shared = store
+            .sandbox_create_fresh_with_sources(&actor, &project, &other_layout, &original_bindings)
+            .unwrap();
+        assert!(store
+            .sandbox_reconcile_closed_sources::<()>(&actor, &sandbox, |_, _| panic!(
+                "live materialization dependency must be retained"
+            ))
+            .is_err());
+        assert!(store
+            .sandbox_reconcile_closed_sources::<()>(&actor, &shared.canonical_ref, |_, _| panic!(
+                "open Sandbox must not release its sources"
+            ))
+            .is_err());
+        store
+            .sandbox_close(&actor, &shared.canonical_ref, None)
+            .unwrap();
+        let held = store
+            .acquire_source_mutation_barrier(&set, "fixture:busy-cleanup")
+            .unwrap();
+        assert!(store
+            .sandbox_reconcile_closed_sources::<()>(&actor, &sandbox, |_, _| panic!(
+                "busy source must not release"
+            ))
+            .is_err());
+        held.settle(crate::SourceMutationOutcome::Settled).unwrap();
+
+        let assert_retained =
+            |current: &crate::SandboxSnapshot, retained: &[crate::VersionedSourceBinding]| {
+                assert_eq!(current, &revalidated);
+                assert_eq!(retained.len(), original_bindings.len());
+                assert!(retained
+                    .iter()
+                    .zip(&original_bindings)
+                    .all(
+                        |(actual, original)| &actual.binding == original && actual.binding_rev == 1
+                    ));
+            };
+        // A real partial release in the isolated fixture leaves the
+        // original complete set and layout reserved, not a partial success.
+        assert!(store
+            .sandbox_reconcile_closed_sources::<()>(&actor, &sandbox, |current, retained| {
+                assert_retained(current, retained);
+                assert!(store
+                    .acquire_source_mutation_barrier(&set, "fixture:while-cleanup")
+                    .is_err());
+                assert!(store
+                    .create(&actor, "during cleanup", layout.clone())
+                    .is_err());
+                std::fs::remove_file(marker(retained[0].binding.name.as_str()))?;
+                Err(Error::Conflict("fixture interrupted physical retirement"))
+            })
+            .is_err());
+        assert_eq!(store.sandbox_get(&actor, &sandbox).unwrap(), revalidated);
+        assert!(store
+            .create(&actor, "after partial cleanup", layout.clone())
+            .is_err());
+        drop(store);
+
+        let missing = SessionStore::open(&temp.0).unwrap();
+        assert!(missing
+            .sandbox_reconcile_closed_sources::<()>(&actor, &sandbox, |_, _| panic!(
+                "missing driver must retain cleanup custody"
+            ))
+            .is_err());
+        assert!(missing
+            .acquire_source_mutation_barrier(&set, "fixture:restart-cleanup")
+            .is_err());
+        drop(missing);
+        // Lower the limit below the retained set. Recovery is not new
+        // admission and must still settle the original complete custody.
+        let store = SessionStore::open_with_sources(
+            &temp.0,
+            registry.clone(),
+            SourceSetLimit::new(1).unwrap(),
+        )
+        .unwrap();
+        let released = store
+            .sandbox_reconcile_closed_sources(&actor, &sandbox, |current, retained| {
+                assert_retained(current, retained);
+                for binding in retained {
+                    match std::fs::remove_file(marker(binding.binding.name.as_str())) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                // The entire fixture root is now empty and safely absent. It
+                // contains no shared backing. Never recursively remove it.
+                std::fs::remove_dir(&current.tool_root)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released.lifecycle, crate::SandboxLifecycle::Closed);
+        assert_eq!(released.rev, revalidated.rev + 1);
+        assert!(released.sources.is_empty());
+        assert_eq!(
+            store
+                .sandbox_reconcile_closed_sources::<()>(&actor, &sandbox, |_, _| panic!(
+                    "released materializations must not be reinspected"
+                ))
+                .unwrap(),
+            released
+        );
+        assert_eq!(
+            store.agent_get(&actor, &restored_ref).unwrap(),
+            closed_agent
+        );
+        assert!(store.activate(&actor, &ids.session, &ids.branch).is_err());
+        // The other retired owner still has its own retained dependency.
+        assert_eq!(
+            store
+                .sandbox_get(&actor, &shared.canonical_ref)
+                .unwrap()
+                .sources,
+            shared.sources
+        );
+        // An independently recreated clean root may now be used by a
+        // fresh Agent, never by the old closed source-bearing Session.
+        std::fs::create_dir(&layout.tool_root).unwrap();
+        let (fresh, fresh_branch) = store
+            .create(&actor, "clean new baseline", layout.clone())
+            .unwrap();
+        assert!(store.activate(&actor, &fresh.id, &fresh_branch.id).is_ok());
+        drop(store);
+        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        assert_eq!(store.sandbox_get(&actor, &sandbox).unwrap(), released);
+        assert!(store.activate(&actor, &ids.session, &ids.branch).is_err());
+        assert!(store.activate(&actor, &fresh.id, &fresh_branch.id).is_ok());
     }
 }

@@ -214,20 +214,7 @@ impl SessionStore {
                 registry.resolve(&anchor.pin()?)?;
             }
             let mutations = SourceMutationSet::from_anchors(&set.anchors)?;
-            let unresolved: bool = db(tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM local_coordination_leases
-                  WHERE scope_kind='execution' AND scope_key GLOB 'source-mutation:*'
-                    AND run_id=?1 AND state IN ('active','hazard'))",
-                [&prepare_id],
-                |row| row.get(0),
-            ))?;
-            // The retired anchor rows are already durable cleanup intent.
-            // Reclaim only the exact original hazard, never an active owner.
-            let barrier = if unresolved {
-                self.recover_source_mutation_barrier_in(&tx, &mutations, &prepare_id)?
-            } else {
-                self.claim_source_mutation_barrier_in(&tx, &mutations, &prepare_id)?
-            };
+            let barrier = self.reconcile_retained_sources_in(&tx, &mutations, &prepare_id)?;
             db(tx.commit())?;
             (set, barrier)
         };
