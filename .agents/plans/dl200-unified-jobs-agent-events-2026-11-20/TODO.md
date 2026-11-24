@@ -507,10 +507,23 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       SourceDriver **1/1**, strict affected-crate Clippy, workspace all-target check, fmt and
       scoped diff-check are green. Broader Agent-host **1/2**: unchanged legacy
       subscription fixture refuses at v54 cutover (not claimed green).
-      **Next:** multi-source mutation/publication barriers and shared Prepared inspection/recovery
-      and atomic publication; full contextual replay/preflight ordering, source realization,
-      candidate/retention cleanup, quiescent mutation, SandboxGrant/Vault and host RPCs remain.
-      Store schema is v57.
+      **Store-local source mutation barrier landed:** validated binding/anchor sets share
+      DriverKey + SourceRef scopes, deduplicated after the original source-count bound. Existing
+      coordination execution leases acquire the whole set atomically for the exclusive owner
+      incarnation and preparation identity (no timed renewal); active or hazard conflicts refuse,
+      independent sets proceed. Exact live token revalidation and settlement in the publication
+      transaction, rollback retains claims, Unknown/abandon/restart preserve hazards. Generic raw
+      lease APIs cannot bypass reserved source scopes. Existing fresh Sandbox source metadata
+      admission checks the same scopes transactionally. No new lease table, migration or driver
+      effect. Source-bearing Agent execution remains closed; cross-Store/external fences and
+      full runtime writer/structural mutation participation are not yet implemented.
+      Grouped source barrier **1/1**, affected coordination **3/3**, Sandbox **2/2**,
+      construction receipt **1/1**, strict Store Clippy, workspace all-target check, fmt and
+      scoped diff-check are green.
+      **Next:** exact SourceSet/history/authority observation and receipt-bound acquisition/
+      inspection/recovery with shared atomic publication. Full contextual replay/preflight
+      ordering, source realization, writer/effect participation, candidate/retention cleanup,
+      quiescent mutation, SandboxGrant/Vault and host RPCs remain. Store schema is v57.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -615,4 +628,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, plus v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution are live; remaining work is source realization/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, full contextual replay/preflight ordering, SandboxGrant/Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers are live; remaining work is exact SourceSet/history/authority selection and receipt-bound recovery, source realization/writer participation/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, full contextual replay/preflight ordering, SandboxGrant/Vault and host RPCs.

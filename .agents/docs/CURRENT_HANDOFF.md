@@ -29,8 +29,8 @@ compatibility provenance are implemented locally. Phase 3 is now UNDERWAY with t
 SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary and v55 named
 SourceBinding persistence/restart compatibility, built-in Git clean/dirty capture/private retention,
 explicit gitlink semantics, isolated Prepared restore, v56 immutable Checkpoint/SourceSet
-persistence with trusted history-only replay and v57 indexed construction receipt/source
-recovery custody are implemented locally.
+persistence with trusted history-only replay, v57 indexed construction receipt/source
+recovery custody and Store-local complete-set source mutation barriers are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1288,10 +1288,41 @@ scoped diff-check are green. The broader Agent-host test group is **1/2**: its u
 legacy nonempty Job Event subscription fixture is denied by the v54 cutover; this slice does not
 change that Event owner or claim the broader group green.
 
-**Next Phase-3 slice:** acquire and hold the multi-source mutation/publication barrier and implement
-the shared Prepared inspection/recovery and atomic publication constructor, using these exact
-receipts. Source realization, candidate/retention reconciliation, quiescent binding mutation,
-SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v57.
+The Store-local source mutation barrier reuses the existing local coordination execution-lease
+owner. The validated SourceMutationSet derives one stable scope per DriverKey + SourceRef,
+deduplicating names/worktrees/artifact schemas of the same source without weakening the original
+named-set bound. The same scope derivation accepts binding or anchor sets. The exclusive persistent
+Store owner acquires the complete set in one transaction, under its operation-owned preparation ID.
+Source claims last for the owner incarnation (no timed renewal); acquisition refuses both active
+claims and hazards. Unrelated source sets may proceed. No new lease table, registry or migration.
+The ordinary timed coordination admission and source-set acquisition share the same lower lease
+mechanism and source acquisition reaps/checks the owner once for the whole set.
+
+The non-cloneable host-only barrier checks exact StoreScope/process/lease generation and preparation
+identity. Transactional settlement can release all scopes in the final AW publication commit;
+rollback retains all claims. Explicit Unknown preserves hazards; dropping an unsettled token
+never releases it, and an owner restart converts abandoned active claims into hazards. The raw
+generic write/execution lease and hazard-resolution APIs cannot acquire, renew, settle or release
+reserved source scopes. The existing fresh Sandbox source metadata publication checks the same
+scopes inside its transaction. No driver effects, source grants or model/RPC admission are added.
+
+This is a Store-local coordination primitive, not proof that arbitrary filesystem writers or
+another Store are fenced. Source-bearing Agent execution stays closed until its Process/effect
+admission and structural Sandbox mutation share this barrier; cross-Store/external authority
+needs the reviewed driver/provider fence. Exact SourceSet selection, binding revision/history
+fencing, receipt-bound acquisition and recovery of abandoned claims must be integrated into the
+shared constructor. An unresolved barrier is intentionally not recoverable by a generic lease
+release; the recovery owner must inspect the exact operation first.
+
+Grouped source-barrier disk regression **1/1**, affected coordination regressions **3/3**,
+Sandbox owner **2/2**, construction receipt **1/1**, strict Store all-target Clippy, full workspace
+all-target check, repository fmt and scoped diff-check are green. Unchanged Git/Phase-2 suites
+were not repeated.
+
+**Next Phase-3 slice:** integrate the live barrier and exact SourceSet/history/authority observation
+with the existing Prepared receipt, implement inspection/recovery and atomic publication. Source
+realization, writer/effect participation, candidate/retention reconciliation, quiescent binding
+mutation, SandboxGrant/Vault and checkpoint RPC effects remain pending. Store schema is v57.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

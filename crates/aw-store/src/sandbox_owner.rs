@@ -650,11 +650,13 @@ impl SessionStore {
             &self.inner.source_drivers,
             sources,
         )?;
+        let mutation_set = crate::SourceMutationSet::from_bindings(sources)?;
         let project = parse_project_ref(project_ref)?;
         let layout = layout(binding)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         authorize_project(&tx, actor, &project, true)?;
+        mutation_set.require_unleased_in(&tx)?;
         let handle = id("sbx")?;
         let canonical = insert_sandbox(&tx, &project, &handle, None, &layout, Some(actor))?;
         source_bindings::insert(&tx, &canonical, sources)?;

@@ -81,6 +81,7 @@ mod schedules;
 mod secret_custody_inventory;
 mod secret_store;
 mod session_participation;
+mod source_barrier;
 mod source_compatibility;
 mod store_scope;
 mod subagents;
@@ -211,6 +212,7 @@ pub use session_participation::{
     SessionParticipationAction, SessionParticipationEvidence, SessionParticipationPermissions,
 };
 use sha2::{Digest, Sha256};
+pub use source_barrier::{SourceMutationBarrier, SourceMutationOutcome, SourceMutationSet};
 pub use source_compatibility::SourceCompatibility;
 use std::{
     collections::{BTreeMap, BTreeSet},

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const MAX_SCOPE_BYTES: usize = 512;
+pub(crate) const SOURCE_MUTATION_SCOPE_PREFIX: &str = "source-mutation:";
 const MIN_LEASE_MICROS: i64 = 10_000;
 const MAX_LEASE_MICROS: i64 = 6 * 60 * 60 * 1_000_000;
 
@@ -82,6 +83,18 @@ fn validate_scope(scope_key: &str) -> Result<()> {
     {
         return Err(Error::Config(
             "local coordination scope must be a bounded printable key".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Source claims use the existing execution lease owner, but cannot be
+// renewed, settled or reconciled via the raw host lease APIs.
+fn validate_general_scope(scope_key: &str) -> Result<()> {
+    validate_scope(scope_key)?;
+    if scope_key.starts_with(SOURCE_MUTATION_SCOPE_PREFIX) {
+        return Err(Error::Denied(
+            "source mutation scope requires its typed owner barrier",
         ));
     }
     Ok(())
@@ -379,9 +392,22 @@ fn acquire_scope_lease_in(
     run_id: Option<&str>,
     ttl: Duration,
 ) -> Result<LocalCoordinationLease> {
-    validate_scope(scope_key)?;
+    validate_general_scope(scope_key)?;
     let ttl = duration_micros(ttl)?;
     let at = now();
+    admit_scope_leases_in(c, process, at)?;
+    acquire_scope_lease_at_in(
+        c,
+        process,
+        kind,
+        scope_key,
+        run_id,
+        at,
+        at.saturating_add(ttl),
+    )
+}
+
+fn admit_scope_leases_in(c: &Connection, process: &ProcessIdentity, at: i64) -> Result<()> {
     reap_stale_in(c, at)?;
     validate_process_in(c, process, at)?;
     let maintenance: bool = db(c.query_row(
@@ -394,6 +420,18 @@ fn acquire_scope_lease_in(
             "store maintenance lease is active; local write/effect admission is fenced",
         ));
     }
+    Ok(())
+}
+
+fn acquire_scope_lease_at_in(
+    c: &Connection,
+    process: &ProcessIdentity,
+    kind: LocalLeaseKind,
+    scope_key: &str,
+    run_id: Option<&str>,
+    at: i64,
+    expires_at: i64,
+) -> Result<LocalCoordinationLease> {
     let existing: Option<(String, String, u64, u64, Option<String>, i64)> = db(c
         .query_row(
             "SELECT holder_process_id,state,store_generation,generation,run_id,expires_at
@@ -419,7 +457,6 @@ fn acquire_scope_lease_in(
                 && existing_run.as_deref() == run_id
                 && expires > at =>
         {
-            let expires_at = at.saturating_add(ttl);
             let changed = db(c.execute(
                 "UPDATE local_coordination_leases SET expires_at=?1,updated_at=?2
                  WHERE scope_kind=?3 AND scope_key=?4 AND holder_process_id=?5
@@ -465,7 +502,6 @@ fn acquire_scope_lease_in(
             .ok_or(Error::Limit("local lease generation exhausted"))?,
         None => 1,
     };
-    let expires_at = at.saturating_add(ttl);
     db(c.execute(
         "INSERT INTO local_coordination_leases(
             scope_kind,scope_key,holder_process_id,store_generation,generation,state,run_id,expires_at,updated_at)
@@ -508,6 +544,110 @@ fn acquire_scope_lease_in(
         run_id: run_id.map(str::to_owned),
         expires_at,
     })
+}
+
+/// A Store-local source fence is an owner-lifetime execution claim, not a
+/// timed write lease. Death/restore fences the process and preserves a hazard.
+pub(crate) fn acquire_source_leases_in(
+    tx: &Transaction<'_>,
+    process: &ProcessIdentity,
+    scopes: &[String],
+    prepare_id: &str,
+) -> Result<Vec<LocalCoordinationLease>> {
+    if process.heartbeat_ttl_micros.is_some() {
+        return Err(Error::Denied(
+            "source mutation barrier requires the exclusive Store owner",
+        ));
+    }
+    let at = now();
+    admit_scope_leases_in(tx, process, at)?;
+    require_unleased_sources_in(tx, scopes)?;
+    scopes
+        .iter()
+        .map(|scope| {
+            acquire_scope_lease_at_in(
+                tx,
+                process,
+                LocalLeaseKind::Execution,
+                scope,
+                Some(prepare_id),
+                at,
+                i64::MAX,
+            )
+        })
+        .collect()
+}
+
+/// Read and write admission use the same scopes. The caller holds the
+/// publication transaction; absent/released scopes need no extra lease row.
+pub(crate) fn require_unleased_sources_in(tx: &Transaction<'_>, scopes: &[String]) -> Result<()> {
+    let mut query = db(tx.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM local_coordination_leases
+         WHERE scope_kind='execution' AND scope_key=?1 AND state IN ('active','hazard'))",
+    ))?;
+    for scope in scopes {
+        validate_scope(scope)?;
+        if !scope.starts_with(SOURCE_MUTATION_SCOPE_PREFIX) {
+            return Err(Error::Config("invalid source mutation scope".into()));
+        }
+        if db(query.query_row([scope], |row| row.get::<_, bool>(0)))? {
+            return Err(Error::Conflict(
+                "source mutation is active or requires reconciliation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn require_source_leases_in(
+    tx: &Transaction<'_>,
+    process: &ProcessIdentity,
+    leases: &[LocalCoordinationLease],
+) -> Result<()> {
+    validate_process(tx, process)?;
+    let mut query = db(tx.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM local_coordination_leases
+         WHERE scope_kind='execution' AND scope_key=?1 AND holder_process_id=?2
+           AND store_generation=?3 AND generation=?4 AND run_id=?5
+           AND state='active' AND expires_at=?6)",
+    ))?;
+    for lease in leases {
+        if lease.kind != LocalLeaseKind::Execution
+            || !lease.scope_key.starts_with(SOURCE_MUTATION_SCOPE_PREFIX)
+            || lease.holder_process_id != process.process_id
+            || lease.store_generation != process.store_generation
+            || lease.expires_at != i64::MAX
+            || !db(query.query_row(
+                params![
+                    lease.scope_key,
+                    process.process_id,
+                    process.store_generation,
+                    lease.generation,
+                    lease.run_id,
+                    i64::MAX,
+                ],
+                |row| row.get::<_, bool>(0),
+            ))?
+        {
+            return Err(Error::Conflict("source mutation barrier is no longer held"));
+        }
+    }
+    Ok(())
+}
+
+/// Settle the whole set in the same transaction as the owning operation.
+/// A failed transaction keeps all claims; Unknown preserves all hazards.
+pub(crate) fn settle_source_leases_in(
+    tx: &Transaction<'_>,
+    process: &ProcessIdentity,
+    leases: &[LocalCoordinationLease],
+    uncertain_external_effect: bool,
+) -> Result<()> {
+    require_source_leases_in(tx, process, leases)?;
+    for lease in leases {
+        settle_scope_lease_in(tx, process, lease, uncertain_external_effect)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn acquire_scope_lease(
@@ -602,6 +742,7 @@ pub(crate) fn settle_scope_lease(
     lease: &LocalCoordinationLease,
     uncertain_external_effect: bool,
 ) -> Result<()> {
+    validate_general_scope(&lease.scope_key)?;
     let tx = begin_coordination(c)?;
     settle_scope_lease_in(&tx, process, lease, uncertain_external_effect)?;
     db(tx.commit())?;
@@ -614,6 +755,7 @@ pub(crate) fn settle_execution_scope_in(
     scope_key: &str,
     run_id: &str,
 ) -> Result<()> {
+    validate_general_scope(scope_key)?;
     let row: Option<(u64, i64)> = db(c
         .query_row(
             "SELECT generation,expires_at FROM local_coordination_leases
@@ -700,7 +842,7 @@ pub(crate) fn resolve_execution_hazard(
     expected_generation: u64,
     note: &str,
 ) -> Result<()> {
-    validate_scope(scope_key)?;
+    validate_general_scope(scope_key)?;
     if note.trim().is_empty() || note.len() > 2048 || note.chars().any(char::is_control) {
         return Err(Error::Config(
             "hazard reconciliation note must be bounded printable text".into(),
