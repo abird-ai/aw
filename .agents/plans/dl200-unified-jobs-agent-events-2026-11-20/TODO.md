@@ -632,9 +632,24 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Host **14/14**, PipeProcess **27/27**, Sandbox **4/4**, strict Host/Adapter/Store
       Clippy, workspace all-target check, minimal check/no SQLite dependency, fmt/diff-check
       green (minimal retains two existing CLI dead-code warnings).
-      **Next:** exact original durable effect intent/terminal linkage and recovery;
-      reviewed concrete containment and runtime tool/Job dispatch integration before
-      opening held admission. History-only baseline, custom ACL/task, candidate/retention
+      **Direct journal-linked source custody landed:** exact active original ToolStarted
+      (Turn/call/source/effect/site/actor/writer epoch) identifies one source effect.
+      ProcessToolAuthority supplies the live binding; tool origins cannot use the generic
+      Host ID namespace. One immutable local commit-log custody fact plus existing
+      source barrier commit before launch; exact named modes and versioned-binding digest,
+      no duplicated ToolRecord or Process lifecycle. Original intent cannot relaunch.
+      Matching ToolFinished and factual quiescence/no-start are required for release;
+      release fact references original terminal and commits with barrier/rev settlement.
+      Missing terminal/uncertainty preserves hazards. Terminal-linked recovery reclaims
+      exact set under current disclosure/Project writer and compatible drivers, not a
+      new grant/effect; released replay performs no inspection/write. Existing host
+      regression uses real TurnJournal and real Process, including duplicate start,
+      missing terminal, unproven quiescence, restart and idempotent release.
+      Host **14/14**, Sandbox **4/4**, checkpoint/capture/restore **4/4**, barrier/receipt
+      **1/1 each**, strict Host/Store Clippy, workspace all-target check, fmt/diff-check green.
+      **Next:** reviewed concrete containment and original runtime tool/Job dispatch/
+      receipt integration before opening held admission. Incomplete original effect
+      reconciliation, history-only baseline, custom ACL/task, candidate/retention
       reconciliation, quiescent mutation, Vault and host RPCs remain. Schema v58.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
@@ -740,4 +755,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery, evidence-fenced atomic checkpoint publication/replay, receipt-bound non-destructive restore preparation/inspection, atomic held Agent/Sandbox restore publication, v58 independent SandboxGrant evidence/source preflight, typed SandboxDriver/fenced host source-effect handoff and original PipeProcess source-aware host composition are live; remaining work is exact original effect intent/terminal linkage and recovery, concrete containment and source-bearing runtime dispatch integration, quiescent mutation, candidate/retention cleanup, history-only baseline and custom ACL/task integration, concrete provider fences, full contextual replay/preflight ordering, Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility, Git clean/dirty capture/private retention/inspection/gitlinks and isolated Prepared restore, v56 immutable checkpoint/source storage and trusted history-only replay, v57 indexed construction receipt/Prepared source custody and unresolved dependency resolution, plus Store-local complete-set source mutation barriers, receipt-bound checkpoint capture preparation, exact restart inspection/recovery, evidence-fenced atomic checkpoint publication/replay, receipt-bound non-destructive restore preparation/inspection, atomic held Agent/Sandbox restore publication, v58 independent SandboxGrant evidence/source preflight, typed SandboxDriver/fenced host source-effect handoff, original PipeProcess source-aware host composition and direct ToolStarted/ToolFinished-linked custody/recovery are live; remaining work is incomplete original-effect reconciliation, concrete containment and source-bearing runtime tool/Job dispatch integration, quiescent mutation, candidate/retention cleanup, history-only baseline and custom ACL/task integration, concrete provider fences, full contextual replay/preflight ordering, Vault and host RPCs.

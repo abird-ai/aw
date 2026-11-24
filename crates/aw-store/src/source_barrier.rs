@@ -168,6 +168,11 @@ impl SessionStore {
         set: &SourceMutationSet,
         prepare_id: &str,
     ) -> Result<SourceMutationBarrier<'_>> {
+        if prepare_id.starts_with(crate::sandbox_owner::JOURNALED_SOURCE_EFFECT_PREFIX) {
+            return Err(Error::Denied(
+                "journaled source effects require original tool custody",
+            ));
+        }
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let barrier = self.acquire_source_mutation_barrier_in(&tx, set, prepare_id)?;

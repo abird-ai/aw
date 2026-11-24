@@ -1,0 +1,553 @@
+//! Link source custody to one original direct ToolStarted/ToolFinished pair.
+//! The journal owns the effect; the commit log records only custody/release.
+use super::{SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest};
+use crate::{
+    agent_owner::{self, AgentKey, AgentPermission},
+    db, durability, label,
+    store_scope::StoreScope,
+    EffectiveSourceBinding, Error, Result, SessionStore,
+};
+use aw_agent_core::{
+    tool::ToolBindingSnapshot, DriverKey, InvocationIdentity, JournalEntry, NamedSourceAccess,
+    PrincipalId, SourceAccess, SourceSetLimit, ToolEffect, ToolRecord, ToolSourceEvidence,
+    ToolStatus,
+};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub(crate) const EFFECT_PREFIX: &str = "source-tool:";
+const ENTITY: &str = "source_effect";
+const CLAIMED: &str = "source.effect.claimed";
+const RELEASED: &str = "source.effect.released";
+
+/// Original journal identity, not a capability or a new attempt ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Intent {
+    pub(super) agent_ref: String,
+    pub(super) turn_id: u64,
+    pub(super) call_id: String,
+    pub(super) run_id: String,
+    pub(super) started_seq: u64,
+    pub(super) actor: PrincipalId,
+}
+
+impl Intent {
+    pub(super) fn effect_id(&self) -> String {
+        format!("{EFFECT_PREFIX}{}", self.started_seq)
+    }
+}
+
+struct Observation {
+    intent: Intent,
+    record: ToolRecord,
+    source: ToolSourceEvidence,
+    terminal: Option<(u64, ToolRecord)>,
+    active: bool,
+    writer_epoch: u64,
+}
+
+fn observe(c: &Connection, agent_ref: &str, turn_id: u64, call_id: &str) -> Result<Observation> {
+    label(agent_ref, 2048)?;
+    label(call_id, 128)?;
+    if turn_id == 0 {
+        return Err(Error::Config(
+            "source effect requires an original Turn".into(),
+        ));
+    }
+    let (session, branch) = agent_owner::key_for_ref(c, agent_ref)?;
+    let (run_id, identity, active, writer_epoch): (String, String, bool, u64) = db(c
+        .query_row(
+            "SELECT r.id,r.identity_json,r.status='running' AND b.active_run IS r.id,
+                    r.produced_from_writer_epoch
+         FROM runs r JOIN branches b ON b.session_id=r.session_id AND b.id=r.branch_id
+         WHERE r.session_id=?1 AND r.branch_id=?2 AND r.turn_id=?3",
+            params![session, branch, turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional())?
+    .ok_or(Error::Denied("original source effect Turn unavailable"))?;
+    let mut query = db(c.prepare_cached(
+        "SELECT seq,kind,payload FROM run_events
+         WHERE run_id=?1 AND kind IN ('tool_started','tool_finished','tool_denied')
+           AND json_extract(payload,'$.record.call.id')=?2 ORDER BY seq LIMIT 3",
+    ))?;
+    let mut rows = db(query.query(params![run_id, call_id]))?;
+    let start = db(rows.next())?.ok_or(Error::Conflict("original ToolStarted is missing"))?;
+    let started_seq: u64 = db(start.get(0))?;
+    let kind: String = db(start.get(1))?;
+    let JournalEntry::ToolStarted {
+        record,
+        source: Some(source),
+    } = crate::decode::<JournalEntry>(&db(start.get::<_, String>(2))?)?
+    else {
+        return Err(Error::Conflict(
+            "original ToolStarted lacks exact source provenance",
+        ));
+    };
+    record.call.validate_envelope()?;
+    source.validate()?;
+    if kind != "tool_started"
+        || record.call.id != call_id
+        || record.status != ToolStatus::Running
+        || record.output.is_some()
+        || !matches!(
+            record.effect,
+            ToolEffect::Read | ToolEffect::Write | ToolEffect::Process
+        )
+    {
+        return Err(Error::Conflict("invalid original source effect intent"));
+    }
+    let terminal = if let Some(row) = db(rows.next())? {
+        let seq: u64 = db(row.get(0))?;
+        let kind: String = db(row.get(1))?;
+        let JournalEntry::ToolFinished { record: finished } =
+            crate::decode::<JournalEntry>(&db(row.get::<_, String>(2))?)?
+        else {
+            return Err(Error::Conflict(
+                "original source effect journal is ambiguous",
+            ));
+        };
+        if kind != "tool_finished"
+            || seq <= started_seq
+            || finished.call != record.call
+            || finished.effect != record.effect
+            || finished.execution_site != record.execution_site
+            || matches!(finished.status, ToolStatus::Running | ToolStatus::Denied)
+            || db(rows.next())?.is_some()
+        {
+            return Err(Error::Conflict(
+                "original ToolFinished does not match its unique intent",
+            ));
+        }
+        Some((seq, finished))
+    } else {
+        None
+    };
+    // The original authority segment at start, not the current Agent ACL.
+    // An explicitly present segment without actor evidence is insufficient.
+    let segment: Option<String> = db(c
+        .query_row(
+            "SELECT payload FROM run_events WHERE run_id=?1 AND seq<?2
+           AND kind='authority_segment_started' ORDER BY seq DESC LIMIT 1",
+            params![run_id, started_seq],
+            |row| row.get(0),
+        )
+        .optional())?;
+    let actor = if let Some(segment) = segment {
+        let JournalEntry::AuthoritySegmentStarted { segment } = crate::decode(&segment)? else {
+            return Err(Error::Storage("invalid original AuthoritySegment"));
+        };
+        segment.validate()?;
+        segment
+            .evidence
+            .ok_or(Error::Denied(
+                "original authority segment actor unavailable",
+            ))?
+            .actor
+    } else {
+        crate::decode::<InvocationIdentity>(&identity)?.actor
+    };
+    Ok(Observation {
+        intent: Intent {
+            agent_ref: agent_ref.to_owned(),
+            turn_id,
+            call_id: call_id.to_owned(),
+            run_id,
+            started_seq,
+            actor,
+        },
+        record,
+        source,
+        terminal,
+        active,
+        writer_epoch,
+    })
+}
+
+pub(super) fn admit_in(
+    tx: &Transaction<'_>,
+    request: &SandboxEffectRequest,
+    turn_id: u64,
+    call_id: &str,
+    binding: &ToolBindingSnapshot,
+) -> Result<Intent> {
+    let observed = observe(tx, &request.agent_ref, turn_id, call_id)?;
+    if !observed.active
+        || observed.terminal.is_some()
+        || observed.intent.actor != request.actor
+        || observed.record.call.name != binding.name
+        || observed.record.effect != binding.effect
+        || observed.record.execution_site != binding.execution_site
+        || observed.source != ToolSourceEvidence::from_source(&binding.source)
+        || (binding.effect == ToolEffect::Read
+            && request
+                .sources
+                .iter()
+                .any(|source| source.access == SourceAccess::ReadWrite))
+    {
+        return Err(Error::Denied(
+            "source effect differs from its active original tool intent",
+        ));
+    }
+    let (session, _) = agent_owner::key_for_ref(tx, &request.agent_ref)?;
+    crate::workspace_writer::verify_writer_epoch_for_session(tx, &session, observed.writer_epoch)?;
+    if claim_in(tx, &observed.intent.effect_id())?.is_some() {
+        return Err(Error::Conflict(
+            "original source effect was already claimed; never relaunch",
+        ));
+    }
+    Ok(observed.intent)
+}
+
+/// One immutable custody link. Retain the named modes and digest of the
+/// complete versioned bindings, not a second copy of source state or ToolRecord.
+/// The original barrier prevents participating structural mutation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Claim {
+    intent: Intent,
+    sandbox_ref: String,
+    store_generation: u64,
+    driver: DriverKey,
+    sources: Vec<NamedSourceAccess>,
+    bindings_digest: [u8; 32],
+}
+
+fn bindings_digest(sources: &[EffectiveSourceBinding]) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-source-effect-bindings-v1\0");
+    for source in sources {
+        let encoded = crate::json(&(&source.binding, source.access))?;
+        hash.update((encoded.len() as u64).to_be_bytes());
+        hash.update(encoded.as_bytes());
+    }
+    Ok(hash.finalize().into())
+}
+
+fn fact_in<T: serde::de::DeserializeOwned>(
+    c: &Connection,
+    effect_id: &str,
+    kind: &str,
+) -> Result<Option<T>> {
+    let mut query = db(c.prepare_cached(
+        "SELECT store_id,payload_json FROM commit_log
+         WHERE entity_type='source_effect' AND entity_id=?1 AND kind=?2 LIMIT 2",
+    ))?;
+    let mut rows = db(query.query(params![effect_id, kind]))?;
+    let Some(row) = db(rows.next())? else {
+        return Ok(None);
+    };
+    if db(row.get::<_, String>(0))? != StoreScope::load(c)?.id().as_str() {
+        return Err(Error::Conflict("source effect belongs to another Store"));
+    }
+    let encoded: String = db(row.get(1))?;
+    if db(rows.next())?.is_some() {
+        return Err(Error::Storage("duplicate source effect custody fact"));
+    }
+    #[derive(Deserialize)]
+    struct Payload<T> {
+        sync_scope: String,
+        fact: T,
+    }
+    let payload: Payload<T> = crate::decode(&encoded)?;
+    if payload.sync_scope != "local" {
+        return Err(Error::Storage("source effect custody must be local"));
+    }
+    Ok(Some(payload.fact))
+}
+
+fn claim_in(c: &Connection, effect_id: &str) -> Result<Option<Claim>> {
+    let claim: Option<Claim> = fact_in(c, effect_id, CLAIMED)?;
+    if let Some(claim) = &claim {
+        if claim.intent.effect_id() != effect_id {
+            return Err(Error::Storage("source effect custody identity changed"));
+        }
+    }
+    Ok(claim)
+}
+
+fn append_fact(
+    tx: &Transaction<'_>,
+    effect_id: &str,
+    kind: &str,
+    actor: &PrincipalId,
+    fact: &impl Serialize,
+) -> Result<()> {
+    durability::commit_event(
+        tx,
+        &durability::tx_id()?,
+        kind,
+        ENTITY,
+        effect_id,
+        Some(actor),
+        serde_json::json!({"sync_scope":"local","fact":fact}),
+    )
+}
+
+pub(super) fn claim_effect_in(
+    tx: &Transaction<'_>,
+    intent: &Intent,
+    plan: &SandboxEffectPlan,
+    scope: &StoreScope,
+) -> Result<()> {
+    if plan.effect_id != intent.effect_id()
+        || plan.grant.agent_ref != intent.agent_ref
+        || plan.grant.actor != intent.actor
+        || claim_in(tx, &plan.effect_id)?.is_some()
+    {
+        return Err(Error::Conflict("original source effect custody changed"));
+    }
+    let claim = Claim {
+        intent: intent.clone(),
+        sandbox_ref: plan.grant.sandbox_ref.clone(),
+        store_generation: scope.restore_generation(),
+        driver: plan.driver.driver.clone(),
+        sources: plan
+            .grant
+            .sources
+            .iter()
+            .map(|source| NamedSourceAccess {
+                name: source.binding.binding.name.clone(),
+                access: source.access,
+            })
+            .collect(),
+        bindings_digest: bindings_digest(&plan.grant.sources)?,
+    };
+    append_fact(tx, &plan.effect_id, CLAIMED, &intent.actor, &claim)
+}
+
+fn require_claim(c: &Connection, intent: &Intent) -> Result<Claim> {
+    let claim = claim_in(c, &intent.effect_id())?
+        .ok_or(Error::Conflict("original tool has no source custody"))?;
+    if claim.intent != *intent
+        || claim.store_generation != StoreScope::load(c)?.restore_generation()
+    {
+        return Err(Error::Conflict("source effect custody boundary changed"));
+    }
+    Ok(claim)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Release {
+    terminal_seq: u64,
+    outcome: SandboxEffectOutcome,
+}
+
+pub(super) fn release_in(
+    tx: &Transaction<'_>,
+    intent: &Intent,
+    actor: &PrincipalId,
+    outcome: SandboxEffectOutcome,
+) -> Result<()> {
+    require_claim(tx, intent)?;
+    let observed = observe(tx, &intent.agent_ref, intent.turn_id, &intent.call_id)?;
+    if observed.intent != *intent {
+        return Err(Error::Conflict("original source effect intent changed"));
+    }
+    let (terminal_seq, record) = observed.terminal.ok_or(Error::Conflict(
+        "original ToolFinished is required before releasing source custody",
+    ))?;
+    if outcome == SandboxEffectOutcome::Unknown
+        || (outcome == SandboxEffectOutcome::NotStarted && record.status == ToolStatus::Succeeded)
+        || fact_in::<Release>(tx, &intent.effect_id(), RELEASED)?.is_some()
+    {
+        return Err(Error::Conflict(
+            "invalid or already settled source custody release",
+        ));
+    }
+    append_fact(
+        tx,
+        &intent.effect_id(),
+        RELEASED,
+        actor,
+        &Release {
+            terminal_seq,
+            outcome,
+        },
+    )
+}
+
+/// Read-only recovery input. The original journal is authoritative for
+/// intent/terminal; a terminal ToolRecord alone is not physical quiescence.
+pub struct SandboxToolRecovery {
+    pub effect_id: String,
+    pub agent_ref: String,
+    pub sandbox_ref: String,
+    pub actor: PrincipalId,
+    pub driver: DriverKey,
+    pub started_seq: u64,
+    pub terminal_seq: u64,
+    pub original: ToolRecord,
+    pub terminal: ToolRecord,
+    pub source: ToolSourceEvidence,
+    pub sources: Vec<EffectiveSourceBinding>,
+}
+
+fn authorize_recovery_in(
+    tx: &Transaction<'_>,
+    manager: &PrincipalId,
+    agent_ref: &str,
+    turn_id: u64,
+    call_id: &str,
+) -> Result<(Observation, Claim)> {
+    let (session, branch) = agent_owner::key_for_ref(tx, agent_ref)?;
+    let key = AgentKey::new(&session, &branch);
+    agent_owner::authorize_permission(tx, manager, key, AgentPermission::View)?;
+    let observed = observe(tx, agent_ref, turn_id, call_id)?;
+    let claim = require_claim(tx, &observed.intent)?;
+    let project = super::super::parse_sandbox_ref(&claim.sandbox_ref)?.project;
+    super::super::authorize_project(tx, manager, &project, true)?;
+    let current: Option<String> = db(tx.query_row(
+        "SELECT sandbox_id FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+        params![session, branch],
+        |row| row.get(0),
+    ))?;
+    if current.as_deref() != Some(&claim.sandbox_ref) {
+        return Err(Error::Conflict("source effect Sandbox identity changed"));
+    }
+    Ok((observed, claim))
+}
+
+fn recovery_sources_in(
+    store: &SessionStore,
+    tx: &Transaction<'_>,
+    claim: &Claim,
+) -> Result<Vec<EffectiveSourceBinding>> {
+    // Recovery does not create a new effect; a subsequently lowered
+    // host bound must not prevent inspecting the original admitted set.
+    SourceSetLimit::default().admit(claim.sources.len())?;
+    if claim.sources.is_empty()
+        || claim
+            .sources
+            .windows(2)
+            .any(|p| p[0].name.as_str() >= p[1].name.as_str())
+    {
+        return Err(Error::Storage("invalid original source effect selection"));
+    }
+    let names = claim
+        .sources
+        .iter()
+        .map(|source| source.name.clone())
+        .collect::<Vec<_>>();
+    let bindings = super::super::source_bindings::select_in(
+        tx,
+        &claim.sandbox_ref,
+        Some(&names),
+        SourceSetLimit::default(),
+        &store.inner.source_drivers.reader()?,
+    )?;
+    let sources = bindings
+        .into_iter()
+        .zip(&claim.sources)
+        .map(|(binding, mode)| {
+            if binding.binding.name != mode.name || !binding.binding.access.permits(mode.access) {
+                return Err(Error::Conflict("original source effect binding changed"));
+            }
+            Ok(EffectiveSourceBinding {
+                binding,
+                access: mode.access,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if bindings_digest(&sources)? != claim.bindings_digest {
+        return Err(Error::Conflict(
+            "original source effect binding set changed",
+        ));
+    }
+    claim.driver.validate()?;
+    Ok(sources)
+}
+
+impl SessionStore {
+    /// Recover only original journal-linked source custody. The trusted
+    /// inspector independently authorizes source disclosure and proves
+    /// factual quiescence/no-start for the original effect. Never launch,
+    /// replan or mint a terminal receipt here. Missing original terminals
+    /// remain fenced for their own journal/reconciliation owner.
+    pub fn sandbox_recover_tool_source_effect(
+        &self,
+        manager: &PrincipalId,
+        agent_ref: &str,
+        turn_id: u64,
+        call_id: &str,
+        inspect: impl FnOnce(&SandboxToolRecovery) -> Result<SandboxEffectOutcome>,
+    ) -> Result<SandboxEffectOutcome> {
+        if self.inner.mode != crate::StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "source effect recovery requires the exclusive Store owner",
+            ));
+        }
+        let (lease, recovery) = {
+            let mut connection = self.connection()?;
+            let tx =
+                db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+            let (observed, claim) =
+                authorize_recovery_in(&tx, manager, agent_ref, turn_id, call_id)?;
+            let intent = observed.intent;
+            let (terminal_seq, terminal) = observed.terminal.ok_or(Error::Conflict(
+                "original ToolFinished is required for terminal-linked recovery",
+            ))?;
+            if let Some(release) = fact_in::<Release>(&tx, &intent.effect_id(), RELEASED)? {
+                if release.terminal_seq != terminal_seq
+                    || release.outcome == SandboxEffectOutcome::Unknown
+                {
+                    return Err(Error::Storage(
+                        "source custody release differs from original terminal",
+                    ));
+                }
+                return Ok(release.outcome);
+            }
+            let sources = recovery_sources_in(self, &tx, &claim)?;
+            let recovery = SandboxToolRecovery {
+                effect_id: intent.effect_id(),
+                agent_ref: intent.agent_ref.clone(),
+                sandbox_ref: claim.sandbox_ref,
+                actor: intent.actor.clone(),
+                driver: claim.driver,
+                started_seq: intent.started_seq,
+                terminal_seq,
+                original: observed.record,
+                terminal,
+                source: observed.source,
+                sources,
+            };
+            let set = crate::SourceMutationSet::from_binding_refs(
+                recovery
+                    .sources
+                    .iter()
+                    .map(|source| &source.binding.binding),
+            )?;
+            let barrier =
+                self.recover_source_mutation_barrier_in(&tx, &set, &recovery.effect_id)?;
+            db(tx.commit())?;
+            (
+                super::SandboxEffectLease {
+                    store: self,
+                    barrier,
+                    actor: manager.clone(),
+                    sandbox: recovery.sandbox_ref.clone(),
+                    effect_id: recovery.effect_id.clone(),
+                    intent: Some(intent),
+                    write_capable: recovery
+                        .sources
+                        .iter()
+                        .any(|source| source.access == SourceAccess::ReadWrite),
+                },
+                recovery,
+            )
+        };
+        match inspect(&recovery) {
+            Ok(outcome) => {
+                lease.settle(outcome)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                lease.settle(SandboxEffectOutcome::Unknown)?;
+                Err(error)
+            }
+        }
+    }
+}

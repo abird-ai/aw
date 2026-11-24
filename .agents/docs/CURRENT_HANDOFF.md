@@ -35,7 +35,8 @@ checkpoint capture preparation, exact restart inspection/recovery and evidence-f
 checkpoint publication, receipt-bound non-destructive restore preparation/restart inspection
 and atomic held Agent + fresh source-bearing Sandbox restore publication, plus v58 independent
 SandboxGrant evidence/source-access preflight, typed SandboxDriver/fenced source-effect
-handoff and original PipeProcess source-aware host composition are implemented locally.
+handoff, original PipeProcess source-aware host composition and direct journal-linked
+source-effect custody/terminal recovery are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1595,11 +1596,51 @@ workspace all-target check, minimal build and fmt/diff-check are green. Minimal
 normal dependency tree excludes aw-store/rusqlite; minimal check retains the
 two existing CLI dead-code warnings (configured_agent_options/local_provider_account).
 
-**Next Phase-3 slice:** connect exact original durable effect intent/terminal custody
-and recovery to the source-effect claim, then wire reviewed concrete containment
-and the original tool/Job dispatch paths before opening held admission. History-only
-baseline, custom ACL/task, exact candidate/retention reconciliation, quiescent binding
-mutation, Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
+Direct journaled tool source effects now use SandboxEffectOrigin::Tool {turn_id,call_id}
+and the original live ToolBindingSnapshot. Admission resolves the exact active original
+ToolStarted on the authoritative Agent/Turn, verifies unique intent/no terminal,
+initiating actor (original AuthoritySegment or ordinary run identity), source/effect/site,
+current grant and admitted writer epoch. The source claim ID derives from that immutable
+run_events sequence. ProcessToolAuthority supplies its exact original tool binding and
+cannot use an unlinked Host origin. Generic trusted non-tool host operations retain
+their existing seam; the journal-linked ID namespace is excluded from raw barriers.
+
+The existing immutable commit_log owner records one local source custody fact atomically
+with complete-set lease acquisition, keyed by the original ToolStarted. It retains
+canonical named effective modes and one exact versioned-binding set digest, Sandbox/
+Store-generation/driver identity and the original journal pointer. No argument/output
+or materialization copy, new table, execution ledger, or runtime authority is introduced.
+An already claimed original intent cannot launch again even after source scopes release.
+The existing original ToolFinished is the logical receipt authority. Known source release
+requires that unique matching terminal, independently proved physical quiescence/no-start,
+and the live exact barrier; release provenance references the terminal sequence and commits
+with lease release and the existing Sandbox rev advance. A missing/mismatched terminal
+leaves Unknown, rather than creating a synthetic receipt.
+
+Trusted terminal-linked recovery checks current View/Project writer, original immutable
+claim/terminal and Store generation, exact complete binding set and compatible SourceDriver
+schemas. It reclaims only the original hazards, inspects outside SQLite, and settles via
+the same source owner. No current tool/SandboxGrant reissue is required for factual
+settlement; the trusted inspector separately authorizes inspection and proves quiescence.
+Unknown preserves hazards. Released custody returns the prior disposition without
+reinspecting, rerunning or advancing Sandbox rev. Incomplete original tool receipts still
+need their original journal/reconciliation owner; this does not fabricate a ProcessTerminal,
+infer physical quiescence from ToolFinished, or yet support multiple Job nodes per tool.
+
+The existing grouped host regression now uses real TurnJournal begin/Assistant/ToolStarted/
+ToolFinished/finish and real fixture Processes. It covers missing intent, duplicate prepared
+launch, reserved identity, no-start terminal, missing terminal refusal, actual receipt,
+unproven physical settlement, missing driver restart and exact recovered release/replay.
+Only the test associates an admitted source-free Turn with a held source-bearing Sandbox.
+Host **14/14**, Sandbox owner **4/4**, checkpoint/capture/restore **4/4**, source barrier
+and construction receipt **1/1 each**, strict Host/Store all-target Clippy, workspace
+all-target check, fmt and scoped diff-check are green.
+
+**Next Phase-3 slice:** connect the reviewed concrete containment and original runtime
+tool/Job dispatch and receipt owners to source-aware admission, preserving the held gate
+until complete; original incomplete-effect reconciliation remains separate. History-only
+baseline, custom ACL/task, candidate/retention reconciliation, quiescent binding mutation,
+Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

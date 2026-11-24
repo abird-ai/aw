@@ -77,6 +77,10 @@ impl<A: SandboxEffectAuthority> SandboxEffectAuthority for ProcessToolAuthority<
         self.source.tool_ceiling()
     }
 
+    fn tool_binding(&self) -> Option<&aw_agent_core::tool::ToolBindingSnapshot> {
+        Some(self.tool.evidence.binding())
+    }
+
     fn with_admission<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
         // Both preflight and the final Store commit use the existing tool
         // publication fence. Never hold its synchronous lock across await.
@@ -202,13 +206,15 @@ mod tests {
     use super::*;
     use aw_agent_core::{
         provider::{CompletionFuture, DeltaSink, Provider},
-        Agent, AgentOptions, CheckpointPolicy, DriverKey, Message, PrincipalId,
+        AccountOwner, Agent, AgentOptions, BillingOwner, CheckpointPolicy, CredentialCustody,
+        DriverKey, InvocationIdentity, JournalEntry, Message, Outcome, PrincipalId, Role,
         SandboxDriverRegistry, SchemaSupport, SourceAccess, SourceBinding, SourceDriverRegistry,
-        SourceDriverSchemas, SourceName, SourceSetLimit, ToolSource,
+        SourceDriverSchemas, SourceName, SourceSetLimit, ToolCall, ToolOutput, ToolRecord,
+        ToolSource, ToolSourceEvidence, ToolStatus, Turn, TurnJournal, TurnStart,
     };
     use aw_store::{
-        SandboxEffectPlan, SandboxEffectRequest, SandboxPolicyEvidence, SandboxSourceGrant,
-        SessionBinding, SessionStore, SourceMutationOutcome, SourceMutationSet,
+        SandboxEffectOrigin, SandboxEffectPlan, SandboxEffectRequest, SandboxPolicyEvidence,
+        SandboxSourceGrant, SessionBinding, SessionStore, SourceMutationOutcome, SourceMutationSet,
         VersionedSourceBinding,
     };
     use aw_tools_adapter::{LocalToolOptions, ToolMode};
@@ -307,6 +313,41 @@ mod tests {
             .expect("real Process regression requires host-approved bash")
     }
 
+    fn record(id: &str, status: ToolStatus, output: Option<ToolOutput>) -> ToolRecord {
+        ToolRecord {
+            call: ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"printf changed > code; printf done"}"#
+                    .parse()
+                    .unwrap(),
+            },
+            effect: ToolEffect::Process,
+            execution_site: "local".into(),
+            status,
+            output,
+        }
+    }
+
+    async fn finish_tool(
+        journal: &impl TurnJournal,
+        id: &str,
+        status: ToolStatus,
+        output: ToolOutput,
+    ) -> ToolRecord {
+        let record = record(id, status, Some(output));
+        journal
+            .append(
+                1,
+                JournalEntry::ToolFinished {
+                    record: record.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        record
+    }
+
     #[tokio::test]
     async fn source_process_handoff_uses_original_spawn_and_tool_authority() {
         let nonce = std::time::SystemTime::now()
@@ -378,8 +419,58 @@ mod tests {
                 std::slice::from_ref(&binding),
             )
             .unwrap();
-        // Test-only source-bearing association. The production Agent
-        // realization gate remains held, including after this lower effect.
+        // Exercise the original journal owner with an admitted source-free
+        // Turn, then install the held source association only in this fixture.
+        // No production path bypasses held Agent admission.
+        let identity = InvocationIdentity {
+            actor: actor.clone(),
+            account_id: "fixture".into(),
+            account_owner: AccountOwner::User(actor.clone()),
+            payer: BillingOwner::User(actor.clone()),
+            credential_custody: CredentialCustody::UserDevice("fixture".into()),
+            credential_version: None,
+            inference_executor: "local".into(),
+            model: "fixture".into(),
+            grant_revision: 1,
+        };
+        let (_, journal) = store.activate(&actor, &session.id, &branch.id).unwrap();
+        journal
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "source effect fixture".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        let calls = [
+            "host:stale",
+            "host:cancelled",
+            "host:missing",
+            "host:write",
+            "host:unproven",
+        ];
+        let mut assistant = Message::text(1025, Role::Assistant, "");
+        assistant.tool_calls = calls
+            .iter()
+            .map(|id| record(id, ToolStatus::Running, None).call)
+            .collect();
+        journal
+            .append(1, JournalEntry::Assistant { message: assistant })
+            .await
+            .unwrap();
+        for id in calls {
+            journal
+                .append(
+                    1,
+                    JournalEntry::ToolStarted {
+                        record: record(id, ToolStatus::Running, None),
+                        source: Some(ToolSourceEvidence::trusted_host()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut final_records = Vec::new();
         {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection.execute(
@@ -454,7 +545,10 @@ mod tests {
                 SandboxEffectRequest {
                     actor: actor.clone(),
                     agent_ref: reference.clone(),
-                    effect_id: effect_id.into(),
+                    origin: SandboxEffectOrigin::Tool {
+                        turn_id: 1,
+                        call_id: effect_id.into(),
+                    },
                     sources: tools.clone(),
                 },
                 &reader,
@@ -474,7 +568,7 @@ mod tests {
             )
         };
         let deadline = || Instant::now() + Duration::from_secs(5);
-        let agent_before = store.agent_get(&actor, &reference).unwrap();
+        assert!(prepare("host:absent", capture(), false).is_err());
 
         let stale = prepare("host:stale", capture(), false).unwrap();
         agent
@@ -487,6 +581,15 @@ mod tests {
         );
         assert_eq!(std::fs::read(&code).unwrap(), b"initial");
         assert!(policy_lock.try_write().is_ok());
+        final_records.push(
+            finish_tool(
+                &journal,
+                "host:stale",
+                ToolStatus::Failed,
+                ToolOutput::error("revoked before launch"),
+            )
+            .await,
+        );
         store
             .acquire_source_mutation_barrier(&set, "host:after-stale")
             .unwrap()
@@ -511,6 +614,15 @@ mod tests {
                 panic!("definite no-spawn returned a Process")
             };
             assert!(matches!(failure, PipeLaunchFailure::NotStarted(_)));
+            final_records.push(
+                finish_tool(
+                    &journal,
+                    id,
+                    ToolStatus::Failed,
+                    ToolOutput::error("definite no-spawn"),
+                )
+                .await,
+            );
             assert_eq!(
                 source.settle_after_recorded_failure(&failure).unwrap(),
                 SandboxEffectOutcome::NotStarted
@@ -525,11 +637,21 @@ mod tests {
         );
 
         let prepared = prepare("host:write", capture(), false).unwrap();
+        let effect_id = prepared.plan().effect_id.clone();
+        assert!(store
+            .acquire_source_mutation_barrier(&set, &effect_id)
+            .is_err());
+        let duplicate = prepare("host:write", capture(), false).unwrap();
         let SourceProcessStart { launch, source } =
             start_source_process(prepared, deadline(), CancellationToken::new())
                 .await
                 .unwrap();
         let process = launch.unwrap();
+        assert!(
+            start_source_process(duplicate, deadline(), CancellationToken::new())
+                .await
+                .is_err()
+        );
         assert!(policy_lock.try_write().is_ok());
         assert!(store
             .acquire_source_mutation_barrier(&set, "host:running")
@@ -547,6 +669,16 @@ mod tests {
             .revoke_registered_source_tool(&actor, "bash", &ToolSource::trusted_host())
             .unwrap();
         source.wait_until_not_live().await;
+        final_records.push(
+            finish_tool(
+                &journal,
+                "host:write",
+                ToolStatus::Succeeded,
+                ToolOutput::text("done"),
+            )
+            .await,
+        );
+        let agent_before = store.agent_get(&actor, &reference).unwrap();
         // The fixture's fixed command contains only shell builtins and
         // cannot create descendants. This is not a containment proof for
         // arbitrary shell commands.
@@ -564,35 +696,115 @@ mod tests {
             sandbox.rev + 1
         );
         assert_eq!(store.agent_get(&actor, &reference).unwrap(), agent_before);
+        assert_eq!(
+            store
+                .sandbox_recover_tool_source_effect(
+                    &actor,
+                    &reference,
+                    1,
+                    "host:write",
+                    |_| panic!("released custody must not inspect or execute")
+                )
+                .unwrap(),
+            SandboxEffectOutcome::Settled
+        );
         assert!(store.activate(&actor, &session.id, &branch.id).is_err());
 
         agent
             .permit_registered_host_tool(actor.clone(), "bash")
             .unwrap();
         let prepared = prepare("host:unproven", capture(), false).unwrap();
+        let unresolved_id = prepared.plan().effect_id.clone();
         let SourceProcessStart { launch, source } =
             start_source_process(prepared, deadline(), CancellationToken::new())
                 .await
                 .unwrap();
-        let process = launch.unwrap();
-        let receipt = process
+        let receipt = launch
+            .unwrap()
             .wait(std::future::pending(), Duration::from_secs(5))
             .await;
         assert_eq!(receipt.terminal.exit, ProcessExit::Code(0));
+        // Even a known physical terminal cannot release source custody
+        // before the matching immutable original tool receipt exists.
         assert!(source
-            .settle_after_recorded_terminal(&receipt.terminal, |_| Err(Error::Conflict(
-                "fixture cannot prove source quiescence"
-            )))
+            .settle_after_recorded_terminal(&receipt.terminal, |_| Ok(()))
             .is_err());
         assert!(store
             .acquire_source_mutation_barrier(&set, "host:unknown")
             .is_err());
+        assert!(store
+            .sandbox_recover_tool_source_effect(&actor, &reference, 1, "host:unproven", |_| panic!(
+                "missing original terminal cannot release or inspect"
+            ))
+            .is_err());
+        assert!(prepare("host:unproven", capture(), false).is_err());
+        final_records.push(
+            finish_tool(
+                &journal,
+                "host:unproven",
+                ToolStatus::Succeeded,
+                ToolOutput::text("done"),
+            )
+            .await,
+        );
+
+        // A durable logical receipt alone still cannot prove quiescence.
+        assert!(store
+            .sandbox_recover_tool_source_effect(
+                &actor,
+                &reference,
+                1,
+                "host:unproven",
+                |recovery| {
+                    assert_eq!(recovery.effect_id, unresolved_id);
+                    assert_eq!(recovery.original.call, recovery.terminal.call);
+                    Err(Error::Conflict(
+                        "fixture cannot prove source quiescence yet",
+                    ))
+                }
+            )
+            .is_err());
+        journal
+            .append(
+                1,
+                JournalEntry::Assistant {
+                    message: Message::text(1026, Role::Assistant, "fixture complete"),
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .finish(Turn {
+                id: 1,
+                prompt: "source effect fixture".into(),
+                answer: "fixture complete".into(),
+                model: identity.model,
+                profile: identity.account_id,
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(actor.clone()),
+                tool_records: final_records,
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+        drop(journal);
         drop(store);
 
-        let reopened = SessionStore::open_with_sources(&temp.0, drivers, limit).unwrap();
+        let reopened = SessionStore::open(&temp.0).unwrap();
         assert!(reopened
             .acquire_source_mutation_barrier(&set, "host:restart")
             .is_err());
+        assert!(reopened
+            .sandbox_recover_tool_source_effect(&actor, &reference, 1, "host:unproven", |_| panic!(
+                "missing SourceDriver cannot inspect"
+            ))
+            .is_err());
+        drop(reopened);
+        let reopened = SessionStore::open_with_sources(&temp.0, drivers, limit).unwrap();
         assert_eq!(
             reopened
                 .sandbox_get(&actor, &sandbox.canonical_ref)
@@ -600,6 +812,57 @@ mod tests {
                 .rev,
             sandbox.rev + 1
         );
+        assert_eq!(
+            reopened
+                .sandbox_recover_tool_source_effect(
+                    &actor,
+                    &reference,
+                    1,
+                    "host:unproven",
+                    |recovery| {
+                        assert_eq!(recovery.effect_id, unresolved_id);
+                        assert_eq!(recovery.actor, actor);
+                        assert_eq!(&recovery.driver, &handle.descriptor().driver);
+                        assert_eq!(recovery.original.call.id, "host:unproven");
+                        assert_eq!(recovery.terminal.status, ToolStatus::Succeeded);
+                        assert_eq!(recovery.sources.len(), 1);
+                        assert_eq!(
+                            recovery.sources[0].binding.binding.materialization,
+                            code.to_str().unwrap()
+                        );
+                        assert!(reopened
+                            .acquire_source_mutation_barrier(&set, "host:recovering")
+                            .is_err());
+                        Ok(SandboxEffectOutcome::Settled)
+                    }
+                )
+                .unwrap(),
+            SandboxEffectOutcome::Settled
+        );
+        assert_eq!(
+            reopened
+                .sandbox_recover_tool_source_effect(
+                    &actor,
+                    &reference,
+                    1,
+                    "host:unproven",
+                    |_| panic!("released custody cannot replay inspection")
+                )
+                .unwrap(),
+            SandboxEffectOutcome::Settled
+        );
+        assert_eq!(
+            reopened
+                .sandbox_get(&actor, &sandbox.canonical_ref)
+                .unwrap()
+                .rev,
+            sandbox.rev + 2
+        );
+        reopened
+            .acquire_source_mutation_barrier(&set, "host:after-recovery")
+            .unwrap()
+            .settle(SourceMutationOutcome::Settled)
+            .unwrap();
         assert!(reopened.activate(&actor, &session.id, &branch.id).is_err());
     }
 }

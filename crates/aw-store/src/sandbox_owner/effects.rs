@@ -8,12 +8,17 @@ use crate::{
     db, durability, label, now, store_scope::StoreScope, workspace_writer, Error, Result,
     SessionStore, SourceMutationBarrier, SourceMutationOutcome, SourceMutationSet, StoreMode,
 };
+use aw_agent_core::tool::ToolBindingSnapshot;
 use aw_agent_core::{
     NamedSourceAccess, PrincipalId, SandboxDriverDescriptor, SandboxDriverHandle,
     SandboxDriverRegistryReader, SourceAccess,
 };
 use rusqlite::{params, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::future::Future;
+
+pub(crate) mod journal;
+pub use journal::SandboxToolRecovery;
 
 /// A live decision of the trusted policy/tool authority owner. Implementors
 /// must guarantee these exact decisions through launch handoff until dropped.
@@ -21,6 +26,12 @@ use std::future::Future;
 pub trait SandboxEffectAuthority {
     fn policy(&self) -> &SandboxGrantPolicy;
     fn tool_ceiling(&self) -> &[NamedSourceAccess];
+
+    /// Exact live tool binding for an original journaled tool effect.
+    /// Non-tool trusted host operations have no such binding.
+    fn tool_binding(&self) -> Option<&ToolBindingSnapshot> {
+        None
+    }
 
     /// Compose the original synchronous authority owner's final admission
     /// fence with the Store commit. A live external guard remains owned by
@@ -31,14 +42,22 @@ pub trait SandboxEffectAuthority {
     }
 }
 
-/// Trusted host effect request, not a model selector. The existing effect
-/// owner supplies its unique, durably owned operation identity. This seam
-/// cannot admit a new Agent Turn or bypass its held execution admission.
+/// Direct tools use their original journal identity. A separate trusted
+/// host operation may supply its own owned ID, but cannot claim a tool
+/// binding or use the reserved journal-linked effect namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxEffectOrigin {
+    Host(String),
+    Tool { turn_id: u64, call_id: String },
+}
+
+/// Trusted host effect request, not a model selector. This seam does not
+/// admit a new Agent Turn or open its held execution admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxEffectRequest {
     pub actor: PrincipalId,
     pub agent_ref: String,
-    pub effect_id: String,
+    pub origin: SandboxEffectOrigin,
     /// Complete source set the capability may expose, including reads.
     pub sources: Vec<NamedSourceAccess>,
 }
@@ -46,14 +65,26 @@ pub struct SandboxEffectRequest {
 impl SandboxEffectRequest {
     fn canonicalize(&mut self, store: &SessionStore) -> Result<()> {
         label(&self.agent_ref, 2048)?;
-        if self.effect_id.is_empty()
-            || self.effect_id.len() > 128
-            || !self
-                .effect_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-:".contains(&b))
-        {
-            return Err(Error::Config("invalid source effect identity".into()));
+        match &self.origin {
+            SandboxEffectOrigin::Host(id) => {
+                if id.is_empty()
+                    || id.len() > 128
+                    || id.starts_with(journal::EFFECT_PREFIX)
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-:".contains(&b))
+                {
+                    return Err(Error::Config("invalid host source effect identity".into()));
+                }
+            }
+            SandboxEffectOrigin::Tool { turn_id, call_id } => {
+                label(call_id, 128)?;
+                if *turn_id == 0 {
+                    return Err(Error::Config(
+                        "source effect requires an original Turn".into(),
+                    ));
+                }
+            }
         }
         store.source_set_limit().admit(self.sources.len())?;
         for source in &self.sources {
@@ -92,6 +123,7 @@ struct Boundary {
     plan: SandboxEffectPlan,
     writer: workspace_writer::WorkspaceWriterInfo,
     store_scope: StoreScope,
+    intent: Option<journal::Intent>,
 }
 
 impl Boundary {
@@ -113,7 +145,20 @@ fn observe_in(
     driver: &SandboxDriverDescriptor,
     policy: &SandboxGrantPolicy,
     tool_ceiling: &[NamedSourceAccess],
+    tool_binding: Option<&ToolBindingSnapshot>,
 ) -> Result<Boundary> {
+    let (effect_id, intent) = match (&request.origin, tool_binding) {
+        (SandboxEffectOrigin::Host(id), None) => (id.clone(), None),
+        (SandboxEffectOrigin::Tool { turn_id, call_id }, Some(binding)) => {
+            let intent = journal::admit_in(tx, request, *turn_id, call_id, binding)?;
+            (intent.effect_id(), Some(intent))
+        }
+        _ => {
+            return Err(Error::Denied(
+                "tool source effects require their original journal intent",
+            ))
+        }
+    };
     let mut grant = store.sandbox_grant_preflight_in(
         tx,
         &request.actor,
@@ -154,10 +199,11 @@ fn observe_in(
             sandbox,
             grant,
             driver: driver.clone(),
-            effect_id: request.effect_id.clone(),
+            effect_id,
         },
         writer,
         store_scope: StoreScope::load(tx)?,
+        intent,
     })
 }
 
@@ -220,6 +266,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
         let barrier = authority.with_admission(|| {
             let policy = authority.policy();
             let tool_ceiling = authority.tool_ceiling();
+            let tool_binding = authority.tool_binding();
             let mut connection = store.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let current = observe_in(
@@ -229,6 +276,7 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
                 &boundary.plan.driver,
                 policy,
                 tool_ceiling,
+                tool_binding,
             )?;
             if current != boundary {
                 return Err(Error::Conflict(
@@ -237,7 +285,10 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
             }
             let set = current.mutation_set()?;
             let barrier =
-                store.acquire_source_mutation_barrier_in(&tx, &set, &request.effect_id)?;
+                store.acquire_source_mutation_barrier_in(&tx, &set, &current.plan.effect_id)?;
+            if let Some(intent) = &current.intent {
+                journal::claim_effect_in(&tx, intent, &current.plan, &current.store_scope)?;
+            }
             db(tx.commit())?;
             Ok(barrier)
         })?;
@@ -252,7 +303,8 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
             barrier,
             actor: request.actor,
             sandbox: boundary.plan.grant.sandbox_ref,
-            effect_id: request.effect_id,
+            effect_id: boundary.plan.effect_id,
+            intent: boundary.intent,
             write_capable,
         };
         let result = start(prepared, authority).await;
@@ -262,7 +314,8 @@ impl<'a, P, A: SandboxEffectAuthority> PreparedSandboxEffect<'a, P, A> {
 
 /// Factual source-effect settlement, supplied by the original effect owner.
 /// Settled includes unsuccessful effects that may have changed sources.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SandboxEffectOutcome {
     NotStarted,
     Settled,
@@ -278,6 +331,7 @@ pub struct SandboxEffectLease<'a> {
     actor: PrincipalId,
     sandbox: String,
     effect_id: String,
+    intent: Option<journal::Intent>,
     write_capable: bool,
 }
 
@@ -288,6 +342,20 @@ impl SandboxEffectLease<'_> {
     pub fn settle(self, outcome: SandboxEffectOutcome) -> Result<()> {
         let mut connection = self.store.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        // A missing/mismatched original terminal must never release the
+        // source claims, even when the live effect owner has finished.
+        if let Some(intent) = &self.intent {
+            if outcome != SandboxEffectOutcome::Unknown {
+                if let Err(error) = journal::release_in(&tx, intent, &self.actor, outcome) {
+                    // Roll back any partial publication before marking the
+                    // exact original claims Unknown in their own transaction.
+                    db(tx.rollback())?;
+                    drop(connection);
+                    self.barrier.settle(SourceMutationOutcome::Unknown)?;
+                    return Err(error);
+                }
+            }
+        }
         if outcome == SandboxEffectOutcome::Settled && self.write_capable {
             let changed = db(tx.execute(
                 "UPDATE sandboxes_current SET rev=rev+1,updated_at=?1
@@ -355,6 +423,7 @@ impl SessionStore {
         let boundary = authority.with_admission(|| {
             let policy = authority.policy();
             let tool_ceiling = authority.tool_ceiling();
+            let tool_binding = authority.tool_binding();
             let mut connection = self.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let boundary = observe_in(
@@ -364,6 +433,7 @@ impl SessionStore {
                 driver.descriptor(),
                 policy,
                 tool_ceiling,
+                tool_binding,
             )?;
             boundary.mutation_set()?.require_unleased_in(&tx)?;
             db(tx.commit())?;
@@ -568,7 +638,7 @@ mod tests {
         let request = |effect_id: &str| SandboxEffectRequest {
             actor: actor.clone(),
             agent_ref: reference.clone(),
-            effect_id: effect_id.into(),
+            origin: SandboxEffectOrigin::Host(effect_id.into()),
             sources: requested.clone(),
         };
         let policy_lock = RwLock::new(());
