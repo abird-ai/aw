@@ -212,7 +212,7 @@ pub(crate) fn select_in(
 }
 
 /// Complete-set admission before any driver work or publication.
-pub(super) fn validate_set(
+pub(crate) fn validate_set(
     limit: SourceSetLimit,
     registry: &SourceDriverRegistry,
     bindings: &[SourceBinding],

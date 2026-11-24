@@ -396,6 +396,8 @@ pub(crate) struct FreshSandbox {
     reference: String,
 }
 
+pub(crate) use source_bindings::validate_set as validate_source_bindings;
+
 pub(crate) fn publish_fresh_in(
     tx: &Transaction<'_>,
     actor: &PrincipalId,

@@ -45,8 +45,8 @@ exact closed-Sandbox materialization reconciliation with proven retained-layout 
 managed Git restore-materialization release with original Applied restore provenance,
 metadata-only fresh baseline restore with explicit None/empty Auto coverage, and
 unpublished capture/restore candidate reconciliation, shared custom initial history
-ACL construction and captured-source restore initial-task custody/publication are
-implemented locally.
+ACL construction, captured-source restore initial-task custody/publication and
+task-only baseline restore/recovery are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2079,11 +2079,49 @@ queue restart integration **1/1**; strict Store all-target Clippy, workspace
 all-target check, fmt and scoped diff-check green. The first queue unit filter
 matched zero tests and is not counted.
 
+Task-only baseline restore now admits optional initial input for None and empty Auto
+using the original InitialTask, queue custody and construction receipt. The baseline
+API takes an explicit trusted execution_site (same as captured-source preparation).
+No-task restore still performs one metadata-only Applied transaction, with unchanged
+receipt encoding and replay fingerprint. Task-bearing baseline pins the original
+canonical source-set selection digest and destination binding/history boundary,
+without copying opaque materialization locators into a second owner. Existing
+compatible-driver/source-set/fresh-layout and unleased preflight checks run before
+the local task write and again at publication. Baseline sources are independently
+authorized, already materialized, and not operation-owned effects.
+
+The existing exclusive Store owner and connection guard serialize the bounded local
+encrypted write, final transaction and explicit recovery/abandonment. No new lock,
+source lease, empty barrier, or long-lived external callback in that critical section.
+Open the existing vault (initialization before claiming task custody); Prepared
+commits before ciphertext write. Shared PreparedQueueCustody methods reuse the
+original AEAD/identity/digest checks on an already-open SecretStore, avoiding
+connection reentry. Missing master with original prepared baseline custody refuses
+vault regeneration. Unresolved task-only restores retain their exact checkpoint
+history root and block retirement even without SourceDriver dependencies.
+
+checkpoint_resume_baseline inspects original task ciphertext, exact indexed
+Prepared/current receipt and candidate, current authority and independently
+authorized original layout/source selection. It never rewrites missing ciphertext
+or performs external materialization. Publish the fresh Sandbox/Agent/history/ACL/
+Pending queue/Applied atomically. Failed publication retains Unknown; ambiguous
+commit never overwrites an Applied fact. Applied replay before current context
+returns the existing result. checkpoint_abandon_baseline removes only the private
+original task, never baseline files or an Applied input, and atomically rejects
+the original receipt. Source-free baseline admits ordinary execution; any sources
+keep admission held. Existing grouped restore regression covers rollback after
+queue insertion, task-only retention, abandonment and unchanged baseline files,
+source-free pending input, held empty Auto with restart resume and exact selection
+refusal, terminal replay and no fictitious source claims. Final focused gates:
+checkpoint/capture/restore **4/4**, construction receipt **1/1**, task create **1/1**,
+Sandbox **4/4**, SecretStore **6/6**, queue restart/missing master **2/2**; strict
+Store all-target Clippy, workspace all-target check, fmt and scoped diff-check green.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
-While blocked, complete task-only baseline restore custody/recovery using the
-existing task and construction owners; do not misuse empty source barriers.
-Independent host approval provisioning, effectful baseline materialization,
+While blocked, prefer an independent remaining production host/restore composition
+or effectful baseline Prepared custody boundary; do not add speculative admission
+layers. Independent host approval provisioning, effectful baseline materialization,
 incomplete-effect reconciliation, multi-source policy, general unpublished partial/
 scratch cleanup and production cleanup composition/physical authority, final-source
 removal/effectful mutation, Vault and checkpoint/Sandbox host RPCs remain pending.

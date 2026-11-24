@@ -535,31 +535,25 @@ pub(crate) fn next_message_id_in(
         .ok_or(Error::Limit("Actor queue sender sequence exhausted"))
 }
 
-impl SessionStore {
-    pub(crate) fn write_prepared_queue_custody(
-        &self,
-        prepared: &PreparedQueueCustody,
-        payload: &str,
-    ) -> Result<()> {
+impl PreparedQueueCustody {
+    // Also used by task-only construction while holding the original
+    // Store connection across the bounded local encrypted write.
+    pub(crate) fn write(&self, vault: &impl SecretStore, payload: &str) -> Result<()> {
         if payload.is_empty()
             || payload.len() > MAX_BODY
             || payload.contains('\0')
-            || hash_payload(payload.as_bytes()) != prepared.payload_sha256
+            || hash_payload(payload.as_bytes()) != self.payload_sha256
         {
             return Err(Error::Denied(
                 "prepared queue payload differs from its immutable digest",
             ));
         }
-        self.local_secret_store()?
-            .put(&prepared.payload_ref, payload.as_bytes())
+        vault.put(&self.payload_ref, payload.as_bytes())
     }
 
-    pub(crate) fn verify_prepared_queue_custody(
-        &self,
-        prepared: &PreparedQueueCustody,
-    ) -> Result<()> {
-        let bytes = self.local_secret_store()?.get(&prepared.payload_ref)?;
-        if hash_payload(bytes.as_slice()) != prepared.payload_sha256 {
+    pub(crate) fn verify(&self, vault: &impl SecretStore) -> Result<()> {
+        let bytes = vault.get(&self.payload_ref)?;
+        if hash_payload(bytes.as_slice()) != self.payload_sha256 {
             return Err(Error::Denied(
                 "prepared queue custody digest no longer matches",
             ));
@@ -567,11 +561,32 @@ impl SessionStore {
         Ok(())
     }
 
+    pub(crate) fn discard(&self, vault: &impl SecretStore) -> Result<()> {
+        vault.delete(&self.payload_ref)
+    }
+}
+
+impl SessionStore {
+    pub(crate) fn write_prepared_queue_custody(
+        &self,
+        prepared: &PreparedQueueCustody,
+        payload: &str,
+    ) -> Result<()> {
+        prepared.write(&self.local_secret_store()?, payload)
+    }
+
+    pub(crate) fn verify_prepared_queue_custody(
+        &self,
+        prepared: &PreparedQueueCustody,
+    ) -> Result<()> {
+        prepared.verify(&self.local_secret_store()?)
+    }
+
     pub(crate) fn discard_prepared_queue_custody(
         &self,
         prepared: &PreparedQueueCustody,
     ) -> Result<()> {
-        self.local_secret_store()?.delete(&prepared.payload_ref)
+        prepared.discard(&self.local_secret_store()?)
     }
 
     /// Persist encrypted custody BEFORE an immutable Pending fact. Only an

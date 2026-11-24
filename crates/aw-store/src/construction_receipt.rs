@@ -355,13 +355,17 @@ impl ConstructionPreparation {
             }
             if self.operation == ConstructionOperation::CheckpointRestore
                 && (task.execution_site.is_none()
-                    || self.sources.is_none()
+                    || (self.sources.is_none()
+                        && !self
+                            .restore_boundary
+                            .as_ref()
+                            .is_some_and(|boundary| boundary.has_baseline_selection()))
                     || task.payload_ref.len() != 68
                     || !task.payload_ref.starts_with("sec_")
                     || !task.payload_ref[4..].bytes().all(|b| b.is_ascii_hexdigit()))
             {
                 return Err(Error::Storage(
-                    "restore task requires exact prepared source custody",
+                    "restore task requires exact prepared custody",
                 ));
             }
         }
@@ -384,6 +388,9 @@ impl ConstructionPreparation {
                 ));
             }
             boundary.validate(&self.candidate, self.sources.as_ref())?;
+            if boundary.has_baseline_selection() && self.task.is_none() {
+                return Err(Error::Storage("prepared baseline lost task custody"));
+            }
         }
         if let Some(sources) = &self.sources {
             sources.validate()?;
@@ -407,9 +414,13 @@ impl ConstructionPreparation {
             }
         } else if !((self.operation == ConstructionOperation::AgentCreate && self.task.is_some())
             || (self.operation == ConstructionOperation::CheckpointRestore
-                && self.state == PreparationState::Applied
                 && self.restore_boundary.is_some()
-                && self.task.is_none()))
+                && ((self.state == PreparationState::Applied && self.task.is_none())
+                    || (self.task.is_some()
+                        && self
+                            .restore_boundary
+                            .as_ref()
+                            .is_some_and(|boundary| boundary.has_baseline_selection())))))
         {
             return Err(Error::Storage(
                 "external construction receipt has no custody",
@@ -682,6 +693,73 @@ fn current_unresolved_in(
     Ok(current)
 }
 
+/// Exact initial task-only restore claim. The existing replay index
+/// finds the original Prepared fact without a new operation owner.
+pub(crate) fn require_task_baseline_claim_in(
+    connection: &Connection,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+) -> Result<()> {
+    receipt.require_actor(connection, actor)?;
+    if receipt.operation != ConstructionOperation::CheckpointRestore
+        || receipt.sources.is_some()
+        || receipt.task.is_none()
+        || !receipt
+            .restore_boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.has_baseline_selection())
+    {
+        return Err(Error::Conflict("not a task-only baseline receipt"));
+    }
+    let mut query = db(connection.prepare_cached(
+        "SELECT session_id,action,actor,data_json,created_at FROM audit
+         WHERE action IN ('agent.create.preparation','construction.preparation')
+           AND COALESCE(json_extract(data_json,'$.scope'),session_id||'/'||json_extract(data_json,'$.parent_branch_id'))=?1
+           AND COALESCE(json_extract(data_json,'$.operation'),'agent_create')='checkpoint_restore'
+           AND json_extract(data_json,'$.request_id')=?2
+           AND json_extract(data_json,'$.state')='prepared'
+         LIMIT 2",
+    ))?;
+    let mut rows = db(query.query(params![receipt.scope, receipt.request_id]))?;
+    let claim = decode_receipt(
+        connection,
+        db(rows.next())?.ok_or(Error::Storage(
+            "original task-only baseline claim unavailable",
+        ))?,
+    )?;
+    if db(rows.next())?.is_some() || current_claim_in(connection, &claim)? != *receipt {
+        return Err(Error::Storage("original task-only baseline claim changed"));
+    }
+    Ok(())
+}
+
+/// Keep the immutable history root alive while a task-only restore is
+/// unresolved, even though there are no captured-source dependencies.
+pub(crate) fn require_no_unresolved_task_restore_in(
+    connection: &Connection,
+    checkpoint: &str,
+) -> Result<()> {
+    let mut query = db(connection.prepare_cached(
+        "SELECT session_id,action,actor,data_json,created_at FROM audit
+         WHERE action='construction.preparation'
+           AND json_extract(data_json,'$.operation')='checkpoint_restore'
+           AND json_extract(data_json,'$.state')='prepared'
+           AND json_type(data_json,'$.task')='object'
+           AND json_type(data_json,'$.restore_boundary.baseline_digest')='text'
+           AND json_extract(data_json,'$.restore_boundary.checkpoint')=?1",
+    ))?;
+    let mut rows = db(query.query([checkpoint]))?;
+    while let Some(row) = db(rows.next())? {
+        let claim = decode_receipt(connection, row)?;
+        if current_claim_in(connection, &claim)?.state.unresolved() {
+            return Err(Error::Conflict(
+                "checkpoint has an unresolved task-only restore",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate the original indexed Prepared fact, not just the latest
 /// receipt. Cleanup never adopts a replacement descriptor.
 pub(crate) fn is_reconciled_in(
@@ -712,7 +790,7 @@ fn require_original_source_claim_in(
         connection,
         db(rows.next())?.ok_or(Error::Storage("original source claim unavailable"))?,
     )?;
-    if db(rows.next())?.is_some() || current_source_claim_in(connection, &claim)? != *receipt {
+    if db(rows.next())?.is_some() || current_claim_in(connection, &claim)? != *receipt {
         return Err(Error::Storage("original source claim changed"));
     }
     Ok(())
@@ -887,6 +965,28 @@ fn require_published_candidate_in(
     Ok(())
 }
 
+/// Publish the task-only candidate's factual result in the same
+/// transaction as its original Pending input. The Store connection owner
+/// serializes its local vault effect and recovery; no source lease.
+pub(crate) fn publish_task_baseline_in(
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    result_ref: String,
+) -> Result<()> {
+    require_task_baseline_claim_in(tx, actor, receipt)?;
+    require_published_candidate_in(tx, receipt, &result_ref)?;
+    transition_in(
+        tx,
+        actor,
+        receipt,
+        PreparationState::Applied,
+        Some(result_ref),
+        None,
+    )?;
+    Ok(())
+}
+
 /// A metadata-only restore has no external effects to prepare or recover.
 /// Publish its original replay identity in the resource transaction.
 pub(crate) fn record_atomic_restore_in(
@@ -968,7 +1068,7 @@ pub(crate) fn publish_sources<F: SourcePublicationFence, T>(
 
 /// Re-read the same immutable initial source claim through its indexed
 /// current receipt, not a second provenance copy.
-fn current_source_claim_in(
+fn current_claim_in(
     connection: &Connection,
     claim: &ConstructionPreparation,
 ) -> Result<ConstructionPreparation> {
@@ -1023,7 +1123,7 @@ pub(crate) fn restored_sources_for_sandbox_in(
             "ambiguous original Sandbox restore preparation",
         ));
     }
-    let receipt = current_source_claim_in(connection, &claim)?;
+    let receipt = current_claim_in(connection, &claim)?;
     let ConstructionCandidate::Agent {
         session,
         branch,
@@ -1085,7 +1185,7 @@ pub(crate) fn visit_unresolved_sources(
     let mut rows = db(query.query([]))?;
     while let Some(row) = db(rows.next())? {
         let claim = decode_receipt(connection, row)?;
-        let receipt = current_source_claim_in(connection, &claim)?;
+        let receipt = current_claim_in(connection, &claim)?;
         if !receipt.state.unresolved() {
             continue;
         }

@@ -78,9 +78,27 @@ pub(crate) struct RestoreBoundary {
     title: String,
     access: AgentHistoryForkAccess,
     binding_digest: String,
+    // Only task-only Prepared baselines need a durable selection digest.
+    // Existing taskless/captured-source receipt encodings are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_digest: Option<String>,
 }
 
 impl RestoreBoundary {
+    pub(crate) fn has_baseline_selection(&self) -> bool {
+        self.baseline_digest.is_some()
+    }
+
+    fn request(&self) -> CheckpointRestoreRequest {
+        CheckpointRestoreRequest {
+            checkpoint: self.checkpoint.clone(),
+            project: Some(self.destination_project.clone()),
+            title: Some(self.title.clone()),
+            access: self.access.clone(),
+            task: None,
+        }
+    }
+
     pub(crate) fn checkpoint(&self) -> &str {
         &self.checkpoint
     }
@@ -120,12 +138,17 @@ impl RestoreBoundary {
             || self.destination_writer_epoch == 0
             || !valid_digest(&self.source_set_digest)
             || !valid_digest(&self.binding_digest)
+            || self
+                .baseline_digest
+                .as_deref()
+                .is_some_and(|digest| !valid_digest(digest))
         {
             return Err(Error::Conflict("invalid checkpoint restore boundary"));
         }
         match sources {
             Some(sources)
                 if self.coverage != SourceCoverage::None
+                    && self.baseline_digest.is_none()
                     && sources.operation == SourceOperationKind::Restore
                     && sources.prepare_id == candidate.prepare_id() =>
             {
@@ -166,14 +189,20 @@ impl RestoreBoundary {
             ));
         }
         let (set, _) = sources_in(connection, &self.checkpoint, self.coverage)?;
-        if set.anchors.is_empty() || source_set_digest(&set)? != self.source_set_digest {
+        if source_set_digest(&set)? != self.source_set_digest {
             return Err(Error::Storage("restore checkpoint source set changed"));
         }
-        let prepared = receipt
-            .sources
-            .as_ref()
-            .ok_or(Error::Storage("restore descriptors missing"))?;
-        require_matching_sources(&set, prepared)?;
+        match &receipt.sources {
+            Some(prepared) if !set.anchors.is_empty() => require_matching_sources(&set, prepared)?,
+            None if set.anchors.is_empty()
+                && self.has_baseline_selection()
+                && receipt.task.is_some() => {}
+            _ => {
+                return Err(Error::Storage(
+                    "restore descriptors differ from retained sources",
+                ))
+            }
+        }
         Ok(set)
     }
 }
@@ -278,6 +307,7 @@ fn observe_in(
         title: title.to_owned(),
         access: request.access.clone(),
         binding_digest: binding_digest.to_owned(),
+        baseline_digest: None,
     };
     Ok(RestoreObservation {
         session: row.session,
@@ -411,15 +441,7 @@ impl<'a> PreparedCheckpointRestore<'a> {
         let observed = observe_in(
             tx,
             &self.actor,
-            &CheckpointRestoreRequest {
-                checkpoint: boundary.checkpoint.clone(),
-                project: Some(boundary.destination_project.clone()),
-                title: Some(boundary.title.clone()),
-                access: boundary.access.clone(),
-                // History/source revalidation uses the immutable boundary;
-                // task identity belongs to the separate receipt field.
-                task: None,
-            },
+            &boundary.request(),
             &binding_digest(binding)?,
             self.store.inner.source_limit,
             registry,
@@ -835,6 +857,156 @@ fn replay_restore_in(
     }))
 }
 
+fn require_baseline_owner(store: &SessionStore) -> Result<()> {
+    if store.inner.mode != crate::StoreMode::OwnerLock {
+        return Err(Error::Denied(
+            "checkpoint restore requires the exclusive Store owner",
+        ));
+    }
+    Ok(())
+}
+
+fn baseline_digest(sources: &[SourceBinding]) -> Result<String> {
+    let mut ordered: Vec<_> = sources.iter().collect();
+    ordered.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    fingerprint(b"aw-restore-baseline-v1\0", &ordered)
+}
+
+fn observe_baseline_in(
+    store: &SessionStore,
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    request: &CheckpointRestoreRequest,
+    binding: &SessionBinding,
+    sources: &[SourceBinding],
+) -> Result<RestoreObservation> {
+    let registry = store.inner.source_drivers.reader()?;
+    let observed = observe_in(
+        tx,
+        actor,
+        request,
+        &binding_digest(binding)?,
+        store.inner.source_limit,
+        &registry,
+    )?;
+    if !observed.sources.anchors.is_empty() {
+        return Err(Error::Conflict(
+            "captured sources require exact Prepared restore",
+        ));
+    }
+    if observed.sources.coverage == SourceCoverage::AutoAllRequired
+        && sources
+            .iter()
+            .any(|source| source.checkpoint_policy != aw_agent_core::CheckpointPolicy::Ephemeral)
+    {
+        return Err(Error::Conflict(
+            "empty Auto restore admits only current ephemeral sources",
+        ));
+    }
+    sandbox_owner::validate_source_bindings(
+        store.inner.source_limit,
+        &store.inner.source_drivers,
+        sources,
+    )?;
+    sandbox_owner::require_fresh_layout_in(tx, &observed.boundary.destination_project, binding)?;
+    SourceMutationSet::from_bindings(sources)?.require_unleased_in(tx)?;
+    Ok(observed)
+}
+
+fn task_baseline_receipt(
+    connection: &Connection,
+    actor: &PrincipalId,
+    request_id: &str,
+) -> Result<ConstructionPreparation> {
+    label(request_id, 256)?;
+    let creator = user_for_principal(connection, actor)?
+        .ok_or(Error::Denied("checkpoint restore caller unavailable"))?;
+    let receipt = construction_receipt::lookup_in(
+        connection,
+        ConstructionOperation::CheckpointRestore,
+        &creator,
+        request_id,
+    )?
+    .ok_or(Error::Denied("task-only baseline receipt unavailable"))?;
+    construction_receipt::require_task_baseline_claim_in(connection, actor, &receipt)?;
+    Ok(receipt)
+}
+
+fn publish_task_baseline(
+    store: &SessionStore,
+    connection: &mut Connection,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    binding: &SessionBinding,
+    sources: &[SourceBinding],
+    vault: &impl crate::SecretStore,
+) -> Result<CheckpointRestoreResult> {
+    let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    construction_receipt::require_task_baseline_claim_in(&tx, actor, receipt)?;
+    if !receipt.state.unresolved() {
+        return Err(Error::Conflict("task-only baseline is not unresolved"));
+    }
+    require_candidate_absent(&tx, &receipt.candidate)?;
+    let boundary = receipt
+        .restore_boundary
+        .as_ref()
+        .ok_or(Error::Storage("baseline restore lost its boundary"))?;
+    let mut observed =
+        observe_baseline_in(store, &tx, actor, &boundary.request(), binding, sources)?;
+    observed.boundary.baseline_digest = Some(baseline_digest(sources)?);
+    if observed.boundary != *boundary
+        || receipt.origin() != AgentKey::new(&observed.session, &observed.branch)
+    {
+        return Err(Error::Conflict(
+            "original baseline restore boundary changed",
+        ));
+    }
+    receipt.initial_task()?.custody().verify(vault)?;
+    let (reference, result) = publish_restored_agent_in(
+        &tx,
+        store,
+        actor,
+        receipt,
+        &observed.history,
+        binding,
+        sources,
+    )?;
+    construction_receipt::publish_task_baseline_in(&tx, actor, receipt, reference)?;
+    db(tx.commit())?;
+    Ok(result)
+}
+
+fn settle_task_baseline_error<T>(
+    connection: &mut Connection,
+    actor: &PrincipalId,
+    receipt: &ConstructionPreparation,
+    result: Result<T>,
+) -> Result<T> {
+    if result.is_err() {
+        // A failed commit can be ambiguous. Never delete custody or
+        // overwrite a factual Applied result merely from a returned error.
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let current = construction_receipt::lookup_in(
+            &tx,
+            receipt.operation,
+            &receipt.scope,
+            &receipt.request_id,
+        )?;
+        if current.as_ref() == Some(receipt) && receipt.state.unresolved() {
+            construction_receipt::transition_in(
+                &tx,
+                actor,
+                receipt,
+                PreparationState::Unknown,
+                None,
+                Some("baseline task outcome requires inspection".into()),
+            )?;
+        }
+        db(tx.commit())?;
+    }
+    result
+}
+
 impl SessionStore {
     /// Lookup the original restore invocation before contextual resolution
     /// or current effect admission. Only current destination Agent view
@@ -855,13 +1027,11 @@ impl SessionStore {
         Ok(result)
     }
 
-    /// Metadata-only restore of history with no captured source anchors.
-    /// The trusted host independently chooses and authorizes a *fresh*
-    /// destination Project baseline, including any already-materialized
-    /// sources and external isolation fences held through this commit.
-    /// No source materialization, driver effect or inherited credentials.
-    /// A source-bearing baseline remains held; effectful baseline creation
-    /// needs its original Prepared owner, not this atomic publication seam.
+    /// Restore history into an independently authorized fresh baseline.
+    /// Baseline bindings are already materialized, never operation-owned
+    /// effects. An optional initial task uses ordinary encrypted custody.
+    /// The trusted host keeps the complete physical baseline authority
+    /// through publication, including on explicit recovery.
     pub fn checkpoint_restore_baseline(
         &self,
         actor: &PrincipalId,
@@ -869,13 +1039,10 @@ impl SessionStore {
         binding: &SessionBinding,
         baseline_sources: &[SourceBinding],
         request_id: &str,
+        execution_site: &str,
     ) -> Result<CheckpointRestoreResult> {
         let fingerprint = restore_fingerprint(request, request_id)?;
-        if self.inner.mode != crate::StoreMode::OwnerLock {
-            return Err(Error::Denied(
-                "checkpoint restore requires the exclusive Store owner",
-            ));
-        }
+        require_baseline_owner(self)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let creator = user_for_principal(&tx, actor)?
@@ -884,41 +1051,17 @@ impl SessionStore {
             db(tx.commit())?;
             return Ok(result);
         }
-        if request.task.is_some() {
-            return Err(Error::Denied("initial task requires Prepared source restore; baseline task custody is not available"));
-        }
-        let registry = self.inner.source_drivers.reader()?;
-        let observed = observe_in(
-            &tx,
-            actor,
-            request,
-            &binding_digest(binding)?,
-            self.inner.source_limit,
-            &registry,
-        )?;
-        if !observed.sources.anchors.is_empty() {
-            return Err(Error::Conflict(
-                "captured sources require exact Prepared restore",
-            ));
-        }
-        // Auto restores exactly its captured required set. Only current
-        // ephemeral policy may supplement an empty automatic capture.
-        if observed.sources.coverage == SourceCoverage::AutoAllRequired
-            && baseline_sources.iter().any(|source| {
-                source.checkpoint_policy != aw_agent_core::CheckpointPolicy::Ephemeral
-            })
-        {
-            return Err(Error::Conflict(
-                "empty Auto restore admits only current ephemeral sources",
-            ));
-        }
-        sandbox_owner::require_fresh_layout_in(
-            &tx,
-            &observed.boundary.destination_project,
-            binding,
-        )?;
-        SourceMutationSet::from_bindings(baseline_sources)?.require_unleased_in(&tx)?;
+        let mut observed =
+            observe_baseline_in(self, &tx, actor, request, binding, baseline_sources)?;
         let ids = resources::mint_session_candidate_ids()?;
+        let task = request
+            .task
+            .as_deref()
+            .map(|payload| InitialTask::mint(request_id, &ids.session, payload, execution_site))
+            .transpose()?;
+        if task.is_some() {
+            observed.boundary.baseline_digest = Some(baseline_digest(baseline_sources)?);
+        }
         let sandbox = format!("{}/s:{}", observed.boundary.destination_project, id("sbx")?);
         let candidate = ConstructionCandidate::Agent {
             session: ids.session,
@@ -936,16 +1079,46 @@ impl SessionStore {
             parent_branch_id: observed.branch,
             request_id: request_id.to_owned(),
             fingerprint,
-            // Only the final Applied receipt is persisted.
-            state: PreparationState::Applied,
+            state: if task.is_some() {
+                PreparationState::Prepared
+            } else {
+                PreparationState::Applied
+            },
             candidate,
-            task: None,
+            task,
             sources: None,
             capture_boundary: None,
             restore_boundary: Some(observed.boundary),
             result_ref: None,
             note: None,
         };
+        if let Some(payload) = request.task.as_deref() {
+            let custody = receipt.initial_task()?.custody();
+            // Initialize/open the original vault before recording custody.
+            // Retain the same Store connection guard through the bounded
+            // local I/O and publication; no other recovery can steal it.
+            let vault = self.local_secret_store_in(&tx)?;
+            construction_receipt::claim_in(
+                &tx,
+                actor,
+                &self.inner.source_drivers,
+                self.inner.source_limit,
+                &receipt,
+            )?;
+            db(tx.commit())?;
+            let result = custody.write(&vault, payload).and_then(|()| {
+                publish_task_baseline(
+                    self,
+                    &mut connection,
+                    actor,
+                    &receipt,
+                    binding,
+                    baseline_sources,
+                    &vault,
+                )
+            });
+            return settle_task_baseline_error(&mut connection, actor, &receipt, result);
+        }
         let (reference, result) = publish_restored_agent_in(
             &tx,
             self,
@@ -959,6 +1132,79 @@ impl SessionStore {
         construction_receipt::record_atomic_restore_in(&tx, actor, &receipt)?;
         db(tx.commit())?;
         Ok(result)
+    }
+
+    /// Inspect the original encrypted input and publish the exact
+    /// previously chosen baseline under current independent authority.
+    /// Never rewrite missing ciphertext, rematerialize, or replan.
+    pub fn checkpoint_resume_baseline(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        binding: &SessionBinding,
+        baseline_sources: &[SourceBinding],
+    ) -> Result<CheckpointRestoreResult> {
+        require_baseline_owner(self)?;
+        let mut connection = self.connection()?;
+        let receipt = task_baseline_receipt(&connection, actor, request_id)?;
+        if receipt.state == PreparationState::Applied {
+            return replay_restore_in(
+                &connection,
+                actor,
+                &receipt.creator,
+                request_id,
+                &receipt.fingerprint,
+            )?
+            .ok_or(Error::Storage("applied baseline receipt disappeared"));
+        }
+        if !receipt.state.unresolved() {
+            return Err(Error::Conflict("task-only baseline already rejected"));
+        }
+        let result = self.local_secret_store_in(&connection).and_then(|vault| {
+            publish_task_baseline(
+                self,
+                &mut connection,
+                actor,
+                &receipt,
+                binding,
+                baseline_sources,
+                &vault,
+            )
+        });
+        settle_task_baseline_error(&mut connection, actor, &receipt, result)
+    }
+
+    /// Discard only this unpublished operation's initial encrypted task.
+    /// No baseline materialization was owned by this operation. Never
+    /// delete an Applied queue item or reopen a Rejected request.
+    pub fn checkpoint_abandon_baseline(&self, actor: &PrincipalId, request_id: &str) -> Result<()> {
+        require_baseline_owner(self)?;
+        let mut connection = self.connection()?;
+        let receipt = task_baseline_receipt(&connection, actor, request_id)?;
+        if receipt.state == PreparationState::Applied {
+            return Err(Error::Conflict("published baseline cannot be abandoned"));
+        }
+        receipt.candidate.require_absent_in(&connection)?;
+        if receipt.state == PreparationState::Rejected {
+            return Ok(());
+        }
+        let result = (|| {
+            let vault = self.local_secret_store_in(&connection)?;
+            receipt.initial_task()?.custody().discard(&vault)?;
+            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            construction_receipt::require_task_baseline_claim_in(&tx, actor, &receipt)?;
+            receipt.candidate.require_absent_in(&tx)?;
+            construction_receipt::transition_in(
+                &tx,
+                actor,
+                &receipt,
+                PreparationState::Rejected,
+                None,
+                Some("unpublished baseline task reconciled".into()),
+            )?;
+            db(tx.commit())
+        })();
+        settle_task_baseline_error(&mut connection, actor, &receipt, result)
     }
 
     /// Trusted read-only planning followed by an atomic Prepared claim and
@@ -1496,6 +1742,7 @@ mod tests {
                 &baseline_layout,
                 &[],
                 "host:baseline-denied",
+                "local",
             )
             .is_err());
         assert!(store
@@ -1505,6 +1752,7 @@ mod tests {
                 &baseline_layout,
                 &[],
                 "host:captured-refusal",
+                "local",
             )
             .is_err());
         assert!(store
@@ -1514,20 +1762,157 @@ mod tests {
                 &session.binding,
                 &[],
                 "host:old-layout",
+                "local",
             )
             .is_err());
+        let task_text = "fixture: baseline initial input";
         let task_baseline = CheckpointRestoreRequest {
-            task: Some("unsupported baseline initial task".into()),
+            task: Some(task_text.into()),
             ..history_only.clone()
         };
+        let abandoned_root = temp.0.join("abandoned-baseline");
+        std::fs::create_dir(&abandoned_root).unwrap();
+        let abandoned_layout = SessionBinding {
+            working_directory: abandoned_root.clone(),
+            tool_root: abandoned_root.clone(),
+            ..layout.clone()
+        };
+        let existing_file = abandoned_root.join("pre-existing");
+        std::fs::write(&existing_file, b"keep").unwrap();
+        // Fail the final receipt, after ordinary queue insertion. This
+        // fixture also serves the empty Auto recovery below.
+        let fail_publication = |store: &SessionStore| {
+            store
+                .connection()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fixture_fail_task_baseline BEFORE INSERT ON audit
+                 WHEN NEW.action='construction.preparation'
+                   AND json_extract(NEW.data_json,'$.operation')='checkpoint_restore'
+                   AND json_extract(NEW.data_json,'$.state')='applied'
+                 BEGIN SELECT RAISE(ABORT,'fixture baseline failure'); END;",
+                )
+                .unwrap();
+        };
+        let clear_failure = |store: &SessionStore| {
+            store
+                .connection()
+                .unwrap()
+                .execute_batch("DROP TRIGGER fixture_fail_task_baseline")
+                .unwrap();
+        };
+        fail_publication(&store);
         assert!(store
             .checkpoint_restore_baseline(
                 &actor,
                 &task_baseline,
-                &baseline_layout,
+                &abandoned_layout,
                 &[],
-                "host:baseline-task",
+                "host:abandoned-baseline",
+                "local",
             )
+            .is_err());
+        clear_failure(&store);
+        let abandoned = task_baseline_receipt(
+            &store.connection().unwrap(),
+            &actor,
+            "host:abandoned-baseline",
+        )
+        .unwrap();
+        assert_eq!(abandoned.state, PreparationState::Unknown);
+        assert!(abandoned.sources.is_none());
+        let abandoned_task = abandoned.initial_task().unwrap();
+        store
+            .verify_prepared_queue_custody(&abandoned_task.custody())
+            .unwrap();
+        assert!(store.checkpoint_delete(&actor, &current.id).is_err());
+        {
+            let connection = store.connection().unwrap();
+            abandoned.candidate.require_absent_in(&connection).unwrap();
+            assert!(
+                crate::actor_queue::events(&connection, abandoned.candidate.prepare_id())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM local_coordination_leases WHERE run_id=?1",
+                        [abandoned.candidate.prepare_id()],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(store
+            .checkpoint_abandon_baseline(&viewer, "host:abandoned-baseline")
+            .is_err());
+        store
+            .checkpoint_abandon_baseline(&actor, "host:abandoned-baseline")
+            .unwrap();
+        store
+            .checkpoint_abandon_baseline(&actor, "host:abandoned-baseline")
+            .unwrap();
+        assert!(store
+            .verify_prepared_queue_custody(&abandoned_task.custody())
+            .is_err());
+        assert_eq!(std::fs::read(&existing_file).unwrap(), b"keep");
+        assert!(store
+            .checkpoint_restore_baseline(
+                &actor,
+                &task_baseline,
+                &abandoned_layout,
+                &[],
+                "host:abandoned-baseline",
+                "local",
+            )
+            .is_err());
+
+        // Source-free task-only restore uses ordinary execution admission.
+        let task_root = temp.0.join("task-baseline");
+        std::fs::create_dir(&task_root).unwrap();
+        let task_layout = SessionBinding {
+            working_directory: task_root.clone(),
+            tool_root: task_root,
+            ..layout.clone()
+        };
+        let task_restored = store
+            .checkpoint_restore_baseline(
+                &actor,
+                &task_baseline,
+                &task_layout,
+                &[],
+                "host:task-baseline",
+                "fixture:baseline-site",
+            )
+            .unwrap();
+        assert_eq!(task_restored.agent.admission, crate::AgentAdmission::Open);
+        let (task_session, task_branch) = agent_owner::key_for_ref(
+            &store.connection().unwrap(),
+            &task_restored.agent.canonical_ref,
+        )
+        .unwrap();
+        let task_queue = store.actor_queue_list(&actor, &task_session).unwrap();
+        assert_eq!(task_queue.len(), 1);
+        assert_eq!(task_queue[0].state, crate::QueueState::Pending);
+        assert_eq!(
+            task_queue[0].request.recipient_site,
+            "fixture:baseline-site"
+        );
+        assert_eq!(task_queue[0].request.branch_id, task_branch);
+        assert_eq!(
+            crate::SecretStore::get(
+                &store.local_secret_store().unwrap(),
+                &task_queue[0].payload_ref
+            )
+            .unwrap()
+            .as_slice(),
+            task_text.as_bytes()
+        );
+        assert!(store.activate(&actor, &task_session, &task_branch).is_ok());
+        assert!(store
+            .checkpoint_abandon_baseline(&actor, "host:task-baseline")
             .is_err());
         let restored_history = store
             .checkpoint_restore_baseline(
@@ -1536,6 +1921,7 @@ mod tests {
                 &baseline_layout,
                 &[],
                 "host:history-baseline",
+                "local",
             )
             .unwrap();
         assert_eq!(restored_history.source_coverage, SourceCoverage::None);
@@ -1626,6 +2012,7 @@ mod tests {
         };
         let auto_request = CheckpointRestoreRequest {
             checkpoint: empty_auto.id.clone(),
+            task: Some("fixture: empty Auto task".into()),
             ..request.clone()
         };
         let mut baseline_source = SourceBinding {
@@ -1644,6 +2031,7 @@ mod tests {
                 &auto_layout,
                 std::slice::from_ref(&baseline_source),
                 "host:auto-required",
+                "local",
             )
             .is_err());
         baseline_source.checkpoint_policy = CheckpointPolicy::Ephemeral;
@@ -1659,18 +2047,58 @@ mod tests {
                 &auto_layout,
                 std::slice::from_ref(&baseline_source),
                 "host:auto-baseline",
+                "local",
             )
             .is_err());
         held.settle(crate::SourceMutationOutcome::Settled).unwrap();
-        let restored_auto = store
+        fail_publication(&store);
+        assert!(store
             .checkpoint_restore_baseline(
                 &actor,
                 &auto_request,
                 &auto_layout,
                 std::slice::from_ref(&baseline_source),
                 "host:auto-baseline",
+                "fixture:auto-site",
+            )
+            .is_err());
+        clear_failure(&store);
+        let original_auto =
+            task_baseline_receipt(&store.connection().unwrap(), &actor, "host:auto-baseline")
+                .unwrap();
+        assert_eq!(original_auto.state, PreparationState::Unknown);
+        let auto_task = original_auto.initial_task().unwrap().clone();
+        assert!(store.checkpoint_delete(&actor, &empty_auto.id).is_err());
+        drop(store);
+        let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
+        assert!(store
+            .checkpoint_resume_baseline(&actor, "host:auto-baseline", &auto_layout, &[],)
+            .is_err());
+        let restored_auto = store
+            .checkpoint_resume_baseline(
+                &actor,
+                "host:auto-baseline",
+                &auto_layout,
+                std::slice::from_ref(&baseline_source),
             )
             .unwrap();
+        let auto_pending = store
+            .actor_queue_list(&actor, original_auto.candidate.prepare_id())
+            .unwrap();
+        assert_eq!(auto_pending.len(), 1);
+        assert_eq!(auto_pending[0].request.recipient_site, "fixture:auto-site");
+        assert_eq!(auto_pending[0].payload_ref, auto_task.payload_ref);
+        assert_eq!(auto_pending[0].state, crate::QueueState::Pending);
+        assert!(store
+            .actor_queue_claim_next(
+                &actor,
+                original_auto.candidate.prepare_id(),
+                &auto_pending[0].request.branch_id,
+                "fixture:auto-site",
+                "fixture",
+                auto_pending[0].request.writer_epoch,
+            )
+            .is_err());
         assert_eq!(
             restored_auto.source_coverage,
             SourceCoverage::AutoAllRequired
@@ -1709,6 +2137,24 @@ mod tests {
         // Replay requires neither a live checkpoint nor a new valid layout.
         store.checkpoint_delete(&actor, &empty_auto.id).unwrap();
         store.checkpoint_delete(&actor, &current.id).unwrap();
+        assert_eq!(
+            store
+                .checkpoint_resume_baseline(&actor, "host:auto-baseline", &baseline_layout, &[])
+                .unwrap(),
+            restored_auto
+        );
+        assert_eq!(
+            store
+                .checkpoint_replay_restore(&actor, &task_baseline, "host:task-baseline")
+                .unwrap(),
+            Some(task_restored)
+        );
+        assert_eq!(
+            store
+                .actor_queue_list(&actor, original_auto.candidate.prepare_id())
+                .unwrap(),
+            auto_pending
+        );
         let invalid_layout = SessionBinding {
             tool_root: PathBuf::new(),
             ..layout.clone()
@@ -1721,6 +2167,7 @@ mod tests {
                     &invalid_layout,
                     &[],
                     "host:auto-baseline",
+                    "local",
                 )
                 .unwrap(),
             restored_auto
@@ -1742,6 +2189,7 @@ mod tests {
                 &auto_layout,
                 &[],
                 "host:auto-baseline",
+                "local",
             )
             .is_err());
         assert!(store
@@ -1751,6 +2199,7 @@ mod tests {
                 &auto_layout,
                 &[],
                 "host:retired-auto",
+                "local",
             )
             .is_err());
         assert!(store

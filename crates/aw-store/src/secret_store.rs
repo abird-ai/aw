@@ -375,6 +375,22 @@ impl SessionStore {
         let directory = self.directory().ok_or(Error::Denied(
             "persistent state directory required for local SecretStore",
         ))?;
+        if directory.join("secrets/master.key").exists() {
+            return LocalSecretStore::open(directory);
+        }
+        let connection = self.connection()?;
+        self.local_secret_store_in(&connection)
+    }
+
+    /// Open under an already-owned connection. Never reacquire it during
+    /// task-only construction or recovery.
+    pub(crate) fn local_secret_store_in(
+        &self,
+        c: &rusqlite::Connection,
+    ) -> Result<LocalSecretStore> {
+        let directory = self.directory().ok_or(Error::Denied(
+            "persistent state directory required for local SecretStore",
+        ))?;
         // AW-P6-10L: SQLite VACUUM snapshots DO NOT contain the separate
         // owner-only encrypted SecretStore master key or write-once blobs.
         // If a restored SQLite v33 archive has EVER recorded local encrypted
@@ -382,11 +398,14 @@ impl SessionStore {
         // when none was restored. This bounded SQL check is needed only on
         // the missing-master recovery path; normal vault access is unchanged.
         if !directory.join("secrets/master.key").exists() {
-            let c = self.connection()?;
             let referenced: bool = db(c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM audit
                                WHERE action IN ('actor.queue','extension.secret','extension.secret.custody')
                                LIMIT 1)
+                     OR EXISTS(SELECT 1 FROM audit WHERE action='construction.preparation'
+                               AND json_extract(data_json,'$.state')='prepared'
+                               AND json_type(data_json,'$.task')='object'
+                               AND json_type(data_json,'$.restore_boundary.baseline_digest')='text')
                      OR EXISTS(SELECT 1 FROM provider_secret_versions LIMIT 1)
                      OR EXISTS(SELECT 1 FROM provider_accounts WHERE secret_ref IS NOT NULL LIMIT 1)
                      OR EXISTS(SELECT 1 FROM oidc_provider_secret_versions LIMIT 1)

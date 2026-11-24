@@ -28,6 +28,7 @@ fn require_no_restore(c: &Connection, store: &SessionStore, checkpoint: &str) ->
     // An unresolved restore retains the original immutable checkpoint and
     // history base. Do not retire its last durable history root or discard
     // anchor descriptors while the original operation still needs them.
+    construction_receipt::require_no_unresolved_task_restore_in(c, checkpoint)?;
     let registry = store.inner.source_drivers.reader()?;
     construction_receipt::visit_unresolved_sources(c, &registry, |receipt, _, _| {
         if receipt
