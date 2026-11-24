@@ -3,6 +3,7 @@
 //! barrier through publication. Dirty captures use two private-index trees;
 //! the original checkout, HEAD and index are never rewritten.
 
+mod restore;
 mod tree;
 
 use tree::{PrivateIndexes, Snapshot};
@@ -23,7 +24,8 @@ use std::{
 
 const BINDING_SCHEMA: u32 = 1;
 const ANCHOR_SCHEMA: u32 = 2;
-const RECOVERY_SCHEMA: u32 = 2;
+const CAPTURE_RECOVERY_SCHEMA: u32 = 2;
+const RESTORE_RECOVERY_SCHEMA: u32 = 3;
 
 fn key() -> DriverKey {
     DriverKey {
@@ -104,6 +106,71 @@ fn materialization_parts(binding: &SourceBinding) -> Result<(&str, &Path)> {
 fn hash_part(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
+}
+
+fn prepare_operation(
+    operation: SourceOperationKind,
+    version: u32,
+    domain: &[u8],
+    prepare_id: &str,
+    fields: Vec<RecoveryField>,
+) -> Result<PreparedSourceOperation> {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash_part(&mut hash, prepare_id.as_bytes());
+    for field in &fields {
+        hash_part(&mut hash, field.name.as_bytes());
+        hash_part(&mut hash, field.value.as_bytes());
+    }
+    PreparedSourceOperation::new(
+        operation,
+        RecoveryDescriptor::new(
+            key(),
+            version,
+            prepare_id,
+            format!("{:x}", hash.finalize()),
+            fields,
+        )?,
+    )
+}
+
+fn descriptor_field<'a>(descriptor: &'a RecoveryDescriptor, name: &str) -> Result<&'a str> {
+    descriptor
+        .fields
+        .iter()
+        .find(|field| field.name == name)
+        .map(|field| field.value.as_str())
+        .ok_or(Error::Storage("missing Git recovery descriptor field"))
+}
+
+fn access_name(access: SourceAccess) -> &'static str {
+    match access {
+        SourceAccess::ReadOnly => "ro",
+        SourceAccess::ReadWrite => "rw",
+    }
+}
+
+fn policy_name(policy: CheckpointPolicy) -> &'static str {
+    match policy {
+        CheckpointPolicy::Required => "required",
+        CheckpointPolicy::Ephemeral => "ephemeral",
+    }
+}
+
+fn parse_access(value: &str) -> Result<SourceAccess> {
+    match value {
+        "ro" => Ok(SourceAccess::ReadOnly),
+        "rw" => Ok(SourceAccess::ReadWrite),
+        _ => Err(Error::Storage("invalid Git recovery access")),
+    }
+}
+
+fn parse_policy(value: &str) -> Result<CheckpointPolicy> {
+    match value {
+        "required" => Ok(CheckpointPolicy::Required),
+        "ephemeral" => Ok(CheckpointPolicy::Ephemeral),
+        _ => Err(Error::Storage("invalid Git recovery policy")),
+    }
 }
 
 // Local directory identities are observations, not authority or live leases.
@@ -232,14 +299,8 @@ impl CapturePlan {
     fn fields(&self) -> Result<Vec<RecoveryField>> {
         use RecoveryFieldKind::{Digest, Id, Reference, Version};
         let binding = &self.binding;
-        let access = match binding.access {
-            SourceAccess::ReadOnly => "ro",
-            SourceAccess::ReadWrite => "rw",
-        };
-        let policy = match binding.checkpoint_policy {
-            CheckpointPolicy::Required => "required",
-            CheckpointPolicy::Ephemeral => "ephemeral",
-        };
+        let access = access_name(binding.access);
+        let policy = policy_name(binding.checkpoint_policy);
         let mut fields = [
             ("checkpoint", Id, self.checkpoint_id.as_str()),
             ("name", Id, binding.name.as_str()),
@@ -264,29 +325,17 @@ impl CapturePlan {
     }
 
     fn prepare(&self, prepare_id: &str) -> Result<PreparedSourceOperation> {
-        let fields = self.fields()?;
-        let mut hash = Sha256::new();
-        let version = if self.observation.is_some() {
-            hash.update(b"aw-git-capture-v2\0");
-            RECOVERY_SCHEMA
+        let (version, domain): (u32, &[u8]) = if self.observation.is_some() {
+            (CAPTURE_RECOVERY_SCHEMA, b"aw-git-capture-v2\0")
         } else {
-            hash.update(b"aw-git-capture-v1\0");
-            1
+            (1, b"aw-git-capture-v1\0")
         };
-        hash_part(&mut hash, prepare_id.as_bytes());
-        for field in &fields {
-            hash_part(&mut hash, field.name.as_bytes());
-            hash_part(&mut hash, field.value.as_bytes());
-        }
-        PreparedSourceOperation::new(
+        prepare_operation(
             SourceOperationKind::Capture,
-            RecoveryDescriptor::new(
-                key(),
-                version,
-                prepare_id,
-                format!("{:x}", hash.finalize()),
-                fields,
-            )?,
+            version,
+            domain,
+            prepare_id,
+            self.fields()?,
         )
     }
 
@@ -295,34 +344,19 @@ impl CapturePlan {
         let descriptor = &prepared.descriptor;
         if prepared.operation != SourceOperationKind::Capture
             || descriptor.driver != key()
-            || !schema(RECOVERY_SCHEMA).supports(descriptor.recovery_schema)
+            || !schema(CAPTURE_RECOVERY_SCHEMA).supports(descriptor.recovery_schema)
         {
             return Err(Error::Denied("incompatible Git capture descriptor"));
         }
-        let field = |name| {
-            descriptor
-                .fields
-                .iter()
-                .find(|field| field.name == name)
-                .map(|field| field.value.as_str())
-                .ok_or(Error::Storage("missing Git capture descriptor field"))
-        };
+        let field = |name| descriptor_field(descriptor, name);
         let binding = SourceBinding {
             name: SourceName::new(field("name")?)?,
             driver: key(),
             binding_schema: BINDING_SCHEMA,
             source_ref: field("source")?.into(),
             materialization: field("materialization")?.into(),
-            access: match field("access")? {
-                "ro" => SourceAccess::ReadOnly,
-                "rw" => SourceAccess::ReadWrite,
-                _ => return Err(Error::Storage("invalid Git capture access")),
-            },
-            checkpoint_policy: match field("checkpoint_policy")? {
-                "required" => CheckpointPolicy::Required,
-                "ephemeral" => CheckpointPolicy::Ephemeral,
-                _ => return Err(Error::Storage("invalid Git capture policy")),
-            },
+            access: parse_access(field("access")?)?,
+            checkpoint_policy: parse_policy(field("checkpoint_policy")?)?,
         };
         materialization_parts(&binding)?;
         let checkpoint_id = field("checkpoint")?.to_owned();
@@ -628,6 +662,31 @@ fn verify_commit_tree(repo: &Repository, commit: &str) -> Result<()> {
     Ok(())
 }
 
+fn binding_for_repo(
+    repo: &Repository,
+    name: SourceName,
+    access: SourceAccess,
+    checkpoint_policy: CheckpointPolicy,
+) -> Result<SourceBinding> {
+    repo.guard_managed_checkout().map_err(git_error)?;
+    let (source_ref, stamp) = repository_stamps(repo)?;
+    let path = repo
+        .root()
+        .to_str()
+        .ok_or(Error::Denied("Git binding requires a UTF-8 path"))?;
+    let binding = SourceBinding {
+        name,
+        driver: key(),
+        binding_schema: BINDING_SCHEMA,
+        source_ref,
+        materialization: format!("{stamp}:{path}"),
+        access,
+        checkpoint_policy,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
 /// Concrete built-in registration. The host chooses an absolute trusted Git
 /// executable and authorized repositories; registry publication grants nothing.
 pub struct GitSourceDriver {
@@ -655,7 +714,7 @@ impl GitSourceDriver {
             SourceDriverSchemas {
                 binding: schema(BINDING_SCHEMA),
                 anchor: schema(ANCHOR_SCHEMA),
-                recovery: schema(RECOVERY_SCHEMA),
+                recovery: schema(RESTORE_RECOVERY_SCHEMA),
             },
             self,
         )
@@ -672,24 +731,7 @@ impl GitSourceDriver {
         access: SourceAccess,
         checkpoint_policy: CheckpointPolicy,
     ) -> Result<SourceBinding> {
-        let repo = self.repository(path)?;
-        repo.guard_managed_checkout().map_err(git_error)?;
-        let (source_ref, stamp) = repository_stamps(&repo)?;
-        let path = repo
-            .root()
-            .to_str()
-            .ok_or(Error::Denied("Git binding requires a UTF-8 path"))?;
-        let binding = SourceBinding {
-            name,
-            driver: key(),
-            binding_schema: BINDING_SCHEMA,
-            source_ref,
-            materialization: format!("{stamp}:{path}"),
-            access,
-            checkpoint_policy,
-        };
-        binding.validate()?;
-        Ok(binding)
+        binding_for_repo(&self.repository(path)?, name, access, checkpoint_policy)
     }
 
     fn binding_repository(&self, binding: &SourceBinding) -> Result<Repository> {

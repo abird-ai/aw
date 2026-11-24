@@ -547,6 +547,326 @@ fn prepared_git_capture_preserves_final_dirty_tree_and_exact_gitlinks() {
     );
 }
 
+#[cfg(feature = "source-driver")]
+#[test]
+fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head() {
+    use aw_agent_core::{
+        CheckpointPolicy, ExternalEvidence, PreparedSourceOperation, RecoveryInspection,
+        SourceAccess, SourceDriverRegistry, SourceName,
+    };
+    use aw_git::source_driver::GitSourceDriver;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let f = Fixture::new();
+    let base_link = String::from_utf8(f.run(&["rev-parse", "HEAD"]).stdout).unwrap();
+    let base_link = base_link.trim();
+    f.write(".gitignore", b"ignored*\n");
+    f.write(".gitattributes", b"*.txt text eol=lf\n");
+    f.write("remove.txt", b"remove\n");
+    f.write("replace/child", b"child");
+    symlink("a.txt", f.root.join("base-link")).unwrap();
+    f.run(&["add", "."]);
+    f.run(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{base_link},nested"),
+    ]);
+    std::fs::create_dir(f.root.join("nested")).unwrap();
+    f.run(&["commit", "-m", "base", "--no-gpg-sign"]);
+    let base = String::from_utf8(f.run(&["rev-parse", "HEAD"]).stdout).unwrap();
+    let base = base.trim();
+    let registry = SourceDriverRegistry::new();
+    let handle = GitSourceDriver::new(&f.git)
+        .unwrap()
+        .register(&registry)
+        .unwrap();
+    let reader = registry.reader().unwrap();
+    let driver = reader.get(&handle).unwrap();
+    let source = driver
+        .binding(
+            &f.root,
+            SourceName::new("code").unwrap(),
+            SourceAccess::ReadOnly,
+            CheckpointPolicy::Ephemeral,
+        )
+        .unwrap();
+    let clean = driver
+        .plan_capture(&source, "cp_restore_clean", "op_capture_clean")
+        .unwrap();
+    let clean = driver.execute_capture(&clean).unwrap();
+    assert!(!clean.is_dirty());
+
+    f.write("a.txt", b"staged\n");
+    f.run(&["add", "a.txt"]);
+    f.write("a.txt", b"final\r\n");
+    std::fs::remove_file(f.root.join("remove.txt")).unwrap();
+    std::fs::remove_dir_all(f.root.join("replace")).unwrap();
+    f.write("replace", b"regular file");
+    f.write("ignored-retained", b"staged ignored file");
+    f.run(&["add", "-f", "ignored-retained"]);
+    f.write("ignored-retained", b"final ignored file");
+    f.write("ignored-excluded", b"must not restore");
+    symlink("missing-target", f.root.join("added-link")).unwrap();
+    f.run(&["add", "added-link"]);
+    symlink("outside", f.root.join("excluded-link")).unwrap();
+    f.write("new\nfile", b"new bytes\0");
+    f.write("script", b"#!/bin/sh\n");
+    std::fs::set_permissions(
+        f.root.join("script"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let dirty = driver
+        .plan_capture(&source, "cp_restore_dirty", "op_capture_dirty")
+        .unwrap();
+    let dirty = driver.execute_capture(&dirty).unwrap();
+    assert!(dirty.is_dirty());
+
+    // Move the live source on. Neither restore is tied to its current HEAD.
+    f.run(&["reset", "--hard", "HEAD^"]);
+    f.write("a.txt", b"unrelated current source\n");
+    let original_head = f.run(&["rev-parse", "HEAD"]).stdout;
+    let original_index = std::fs::read(f.root.join(".git/index")).unwrap();
+    let original_worktrees = f.run(&["worktree", "list", "--porcelain", "-z"]).stdout;
+    let destinations = f.parent.join("restores");
+    aw_platform::ensure_private_dir(&destinations).unwrap();
+    let clean_path = destinations.join("clean");
+    let dirty_path = destinations.join("dirty");
+    assert!(driver
+        .plan_restore(&f.root, &clean, &f.root.join("inside"), "op_overlap")
+        .is_err());
+    let clean_plan = driver
+        .plan_restore(&f.root, &clean, &clean_path, "op_restore_clean")
+        .unwrap();
+    let dirty_plan = driver
+        .plan_restore(&f.root, &dirty, &dirty_path, "op_restore_dirty")
+        .unwrap();
+    assert_eq!(dirty_plan.descriptor.recovery_schema, 3);
+    assert!(reader
+        .resolve(&dirty_plan.descriptor.pin().unwrap())
+        .is_ok());
+    assert_eq!(
+        f.run(&["worktree", "list", "--porcelain", "-z"]).stdout,
+        original_worktrees
+    );
+    assert!(!clean_path.exists() && !dirty_path.exists());
+    assert!(matches!(
+        driver.inspect_restore(&dirty_plan).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+
+    let restored_clean = driver.execute_restore(&clean_plan).unwrap();
+    let restored_dirty = driver.execute_restore(&dirty_plan).unwrap();
+    assert_eq!(restored_dirty.source_ref, source.source_ref);
+    assert_ne!(restored_dirty.materialization, source.materialization);
+    assert_ne!(
+        restored_dirty.materialization,
+        restored_clean.materialization
+    );
+    assert_eq!(restored_dirty.name, source.name);
+    assert_eq!(restored_dirty.access, SourceAccess::ReadOnly);
+    assert_eq!(
+        restored_dirty.checkpoint_policy,
+        CheckpointPolicy::Ephemeral
+    );
+
+    let child_git = |path: &std::path::Path, args: &[&str]| {
+        let output = f.cmd().current_dir(path).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    for path in [&clean_path, &dirty_path] {
+        assert_eq!(
+            child_git(path, &["rev-parse", "HEAD"]),
+            format!("{base}\n").as_bytes()
+        );
+        assert!(child_git(path, &["diff", "--cached", "--name-only"]).is_empty());
+        assert!(std::fs::read_dir(path.join("nested"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(!path.join("nested/.git").exists());
+    }
+    assert_eq!(
+        std::fs::read(clean_path.join("a.txt")).unwrap(),
+        b"one\ntwo\n"
+    );
+    assert!(child_git(&clean_path, &["status", "--porcelain", "-z"]).is_empty());
+    assert_eq!(std::fs::read(dirty_path.join("a.txt")).unwrap(), b"final\n");
+    assert!(!dirty_path.join("remove.txt").exists());
+    assert_eq!(
+        std::fs::read(dirty_path.join("replace")).unwrap(),
+        b"regular file"
+    );
+    assert_eq!(
+        std::fs::read(dirty_path.join("ignored-retained")).unwrap(),
+        b"final ignored file"
+    );
+    assert_eq!(
+        std::fs::read(dirty_path.join("new\nfile")).unwrap(),
+        b"new bytes\0"
+    );
+    assert_eq!(
+        std::fs::read_link(dirty_path.join("added-link")).unwrap(),
+        std::path::Path::new("missing-target")
+    );
+    assert_eq!(
+        std::fs::read_link(dirty_path.join("base-link")).unwrap(),
+        std::path::Path::new("a.txt")
+    );
+    assert_eq!(
+        std::fs::metadata(dirty_path.join("script"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o100,
+        0o100
+    );
+    assert!(!dirty_path.join("ignored-excluded").exists());
+    assert!(!dirty_path.join("excluded-link").is_symlink());
+    let status = child_git(&dirty_path, &["status", "--porcelain", "-z"]);
+    assert!(status.windows(7).any(|b| b == b" M a.tx"));
+    assert!(status.windows(6).any(|b| b == b"?? new"));
+
+    // Exact Prepared descriptor and observed result survive a new driver.
+    let dirty_plan: PreparedSourceOperation =
+        serde_json::from_slice(&serde_json::to_vec(&dirty_plan).unwrap()).unwrap();
+    let restarted = GitSourceDriver::new(&f.git).unwrap();
+    match restarted.inspect_restore(&dirty_plan).unwrap() {
+        RecoveryInspection::Completed {
+            result,
+            evidence: ExternalEvidence::HeldFence { handle, .. },
+        } => {
+            assert_eq!(result, restored_dirty);
+            assert_eq!(handle, dirty_plan.descriptor.prepared_identity);
+        }
+        other => panic!("expected exact observed restore, got {other:?}"),
+    }
+    restarted
+        .revalidate_restore(&dirty_plan, &restored_dirty)
+        .unwrap();
+    restarted
+        .revalidate_restore(&clean_plan, &restored_clean)
+        .unwrap();
+    assert!(restarted.execute_restore(&dirty_plan).is_err());
+
+    // Recovery cannot mistake extra ignored content for a completed restore.
+    std::fs::write(dirty_path.join("ignored-extra"), b"foreign content").unwrap();
+    assert!(matches!(
+        restarted.inspect_restore(&dirty_plan).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(restarted
+        .revalidate_restore(&dirty_plan, &restored_dirty)
+        .is_err());
+    std::fs::remove_file(dirty_path.join("ignored-extra")).unwrap();
+    child_git(&dirty_path, &["read-tree", &dirty.captured_commit]);
+    assert!(matches!(
+        restarted.inspect_restore(&dirty_plan).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    child_git(&dirty_path, &["read-tree", base]);
+    f.run(&["worktree", "unlock", dirty_path.to_str().unwrap()]);
+    f.run(&[
+        "worktree",
+        "lock",
+        "--reason",
+        "another-operation",
+        dirty_path.to_str().unwrap(),
+    ]);
+    assert!(matches!(
+        restarted.inspect_restore(&dirty_plan).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(restarted.execute_restore(&dirty_plan).is_err());
+
+    // A crash after registration, before index/checkout, remains Unknown.
+    let partial_path = destinations.join("partial");
+    let partial = driver
+        .plan_restore(&f.root, &dirty, &partial_path, "op_restore_partial")
+        .unwrap();
+    f.run(&[
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "--lock",
+        "--reason",
+        &format!("aw-restore-v1:{}", partial.descriptor.prepared_identity),
+        partial_path.to_str().unwrap(),
+        base,
+    ]);
+    assert!(matches!(
+        restarted.inspect_restore(&partial).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(restarted.execute_restore(&partial).is_err());
+    assert_eq!(std::fs::read_dir(&partial_path).unwrap().count(), 1);
+
+    // Existing destination, or a substituted private parent, is not reusable.
+    assert!(driver
+        .plan_restore(&f.root, &dirty, &dirty_path, "op_existing")
+        .is_err());
+    let parent = f.parent.join("replace-parent");
+    aw_platform::ensure_private_dir(&parent).unwrap();
+    let stale_path = parent.join("target");
+    let stale = driver
+        .plan_restore(&f.root, &clean, &stale_path, "op_stale_parent")
+        .unwrap();
+    std::fs::rename(&parent, f.parent.join("old-parent")).unwrap();
+    aw_platform::ensure_private_dir(&parent).unwrap();
+    assert!(restarted.execute_restore(&stale).is_err());
+    assert!(!stale_path.exists());
+
+    // A changed gitlink cannot be represented by an empty directory with the
+    // base index. Refuse it before creating any new worktree.
+    let link_source = destinations.join("link-source");
+    let link_plan = driver
+        .plan_restore(&f.root, &clean, &link_source, "op_link_source")
+        .unwrap();
+    driver.execute_restore(&link_plan).unwrap();
+    child_git(
+        &link_source,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{},nested", dirty.captured_commit),
+        ],
+    );
+    let link_binding = driver
+        .binding(
+            &link_source,
+            SourceName::new("code").unwrap(),
+            SourceAccess::ReadWrite,
+            CheckpointPolicy::Required,
+        )
+        .unwrap();
+    let changed = driver
+        .plan_capture(&link_binding, "cp_changed_link", "op_changed_link")
+        .unwrap();
+    let changed = driver.execute_capture(&changed).unwrap();
+    let missing = destinations.join("requires-nested");
+    assert!(driver
+        .plan_restore(&f.root, &changed, &missing, "op_missing_nested")
+        .is_err());
+    assert!(!missing.exists());
+
+    assert_eq!(f.run(&["rev-parse", "HEAD"]).stdout, original_head);
+    assert_eq!(
+        std::fs::read(f.root.join(".git/index")).unwrap(),
+        original_index
+    );
+    assert_eq!(
+        std::fs::read(f.root.join("a.txt")).unwrap(),
+        b"unrelated current source\n"
+    );
+}
+
 #[test]
 fn discover_clean_repo() {
     let f = Fixture::new();

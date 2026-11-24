@@ -306,100 +306,7 @@ impl Snapshot {
         hash_part(&mut status, &untracked);
         let status = format!("{:x}", status.finalize());
 
-        let mut paths: BTreeSet<RepoPath> =
-            base_tree.0.keys().chain(index.0.keys()).cloned().collect();
-        for record in records(&untracked)? {
-            let nested = record.ends_with(b"/");
-            let path = RepoPath::new(record.strip_suffix(b"/").unwrap_or(record).to_vec())
-                .map_err(git_error)?;
-            if nested
-                && !base_tree
-                    .0
-                    .get(&path)
-                    .into_iter()
-                    .chain(index.0.get(&path))
-                    .any(|entry| entry.mode == Mode::Gitlink)
-            {
-                return Err(Error::Denied(
-                    "untracked nested Git repository is not a regular-file source",
-                ));
-            }
-            paths.insert(path);
-        }
-
-        let filemode = config_bool(repo, "core.filemode", true)?;
-        let symlinks = config_bool(repo, "core.symlinks", true)?;
-        let mut tree = Tree::default();
-        let mut regular = Vec::new();
-        let mut raw = Vec::new();
-        for path in paths {
-            let original = index.0.get(&path).or_else(|| base_tree.0.get(&path));
-            let tracked = original.is_some();
-            let Some((full, meta)) = path_metadata(repo.root(), &path)? else {
-                continue; // tracked deletion
-            };
-            if link_like(&full, &meta)? {
-                if !tracked {
-                    continue; // untracked links are never captured or followed
-                }
-                if !meta.file_type().is_symlink() {
-                    return Err(Error::Denied("tracked reparse point is not a Git symlink"));
-                }
-                #[cfg(not(unix))]
-                return Err(Error::Denied(
-                    "native Git symlink capture is unavailable on this platform",
-                ));
-                #[cfg(unix)]
-                {
-                    let target = fs::read_link(&full)?;
-                    tree.insert(
-                        path,
-                        Mode::Symlink,
-                        hash_bytes(repo, target.as_os_str().as_encoded_bytes(), write)?,
-                    )?;
-                }
-            } else if meta.is_file() {
-                let original_mode = original.map(|entry| entry.mode);
-                if !symlinks && original_mode == Some(Mode::Symlink) {
-                    raw.push((path, Mode::Symlink));
-                } else {
-                    let mode = if filemode {
-                        if executable(&meta) {
-                            Mode::Executable
-                        } else {
-                            Mode::File
-                        }
-                    } else {
-                        original_mode
-                            .filter(|mode| mode.regular())
-                            .unwrap_or(Mode::File)
-                    };
-                    regular.push((path, mode));
-                }
-            } else if meta.is_dir() {
-                let known_link = base_tree
-                    .0
-                    .get(&path)
-                    .into_iter()
-                    .chain(index.0.get(&path))
-                    .any(|entry| entry.mode == Mode::Gitlink);
-                if known_link {
-                    if let Some(oid) = gitlink(repo, &full, index.0.get(&path), depth)? {
-                        if oid.len() != base.len() {
-                            return Err(Error::Denied(
-                                "Gitlink object format differs from its superproject",
-                            ));
-                        }
-                        tree.insert(path, Mode::Gitlink, oid)?;
-                    }
-                }
-                // Ordinary directories are represented by their file entries.
-            } else if tracked {
-                return Err(Error::Denied("unsupported tracked Git worktree file type"));
-            }
-        }
-        hash_regular(repo, regular, write, false, &mut tree)?;
-        hash_regular(repo, raw, write, true, &mut tree)?;
+        let tree = observe_tree(repo, &base_tree, &index, &untracked, write, depth, false)?;
         if head(repo)? != base {
             return Err(Error::Conflict("Git HEAD changed during capture"));
         }
@@ -449,6 +356,195 @@ impl Snapshot {
         }
         Ok(tree)
     }
+}
+
+// Restore supplies the captured tree as the tracked-path context, not as the
+// actual index. This verifies even captured symlinks or ignored files which
+// become untracked relative to the original base.
+fn observe_tree(
+    repo: &Repository,
+    base_tree: &Tree,
+    index: &Tree,
+    untracked: &[u8],
+    write: bool,
+    depth: usize,
+    strict: bool,
+) -> Result<Tree> {
+    let mut paths: BTreeSet<RepoPath> = base_tree.0.keys().chain(index.0.keys()).cloned().collect();
+    for record in records(untracked)? {
+        let nested = record.ends_with(b"/");
+        let path = RepoPath::new(record.strip_suffix(b"/").unwrap_or(record).to_vec())
+            .map_err(git_error)?;
+        if nested
+            && !base_tree
+                .0
+                .get(&path)
+                .into_iter()
+                .chain(index.0.get(&path))
+                .any(|entry| entry.mode == Mode::Gitlink)
+        {
+            return Err(Error::Denied(
+                "untracked nested Git repository is not a regular-file source",
+            ));
+        }
+        paths.insert(path);
+    }
+
+    let filemode = config_bool(repo, "core.filemode", true)?;
+    let symlinks = config_bool(repo, "core.symlinks", true)?;
+    let mut tree = Tree::default();
+    let mut regular = Vec::new();
+    let mut raw = Vec::new();
+    for path in paths {
+        let original = index.0.get(&path).or_else(|| base_tree.0.get(&path));
+        let tracked = original.is_some();
+        let Some((full, meta)) = path_metadata(repo.root(), &path)? else {
+            continue; // tracked deletion
+        };
+        if link_like(&full, &meta)? {
+            if !tracked {
+                if strict {
+                    return Err(Error::Conflict("unexpected link in restored Git worktree"));
+                }
+                continue; // untracked links are never captured or followed
+            }
+            if !meta.file_type().is_symlink() {
+                return Err(Error::Denied("tracked reparse point is not a Git symlink"));
+            }
+            #[cfg(not(unix))]
+            return Err(Error::Denied(
+                "native Git symlink capture is unavailable on this platform",
+            ));
+            #[cfg(unix)]
+            {
+                let target = fs::read_link(&full)?;
+                tree.insert(
+                    path,
+                    Mode::Symlink,
+                    hash_bytes(repo, target.as_os_str().as_encoded_bytes(), write)?,
+                )?;
+            }
+        } else if meta.is_file() {
+            let original_mode = original.map(|entry| entry.mode);
+            if !symlinks && original_mode == Some(Mode::Symlink) {
+                raw.push((path, Mode::Symlink));
+            } else {
+                let mode = if filemode {
+                    if executable(&meta) {
+                        Mode::Executable
+                    } else {
+                        Mode::File
+                    }
+                } else {
+                    original_mode
+                        .filter(|mode| mode.regular())
+                        .unwrap_or(Mode::File)
+                };
+                regular.push((path, mode));
+            }
+        } else if meta.is_dir() {
+            let known_link = base_tree
+                .0
+                .get(&path)
+                .into_iter()
+                .chain(index.0.get(&path))
+                .any(|entry| entry.mode == Mode::Gitlink);
+            if known_link {
+                if let Some(oid) = gitlink(repo, &full, index.0.get(&path), depth)? {
+                    if original.is_some_and(|entry| entry.oid.len() != oid.len()) {
+                        return Err(Error::Denied(
+                            "Gitlink object format differs from its superproject",
+                        ));
+                    }
+                    tree.insert(path, Mode::Gitlink, oid)?;
+                }
+            }
+            // Ordinary directories are represented by their file entries.
+        } else if tracked || strict {
+            return Err(Error::Denied("unsupported Git worktree file type"));
+        }
+    }
+    hash_regular(repo, regular, write, false, &mut tree)?;
+    hash_regular(repo, raw, write, true, &mut tree)?;
+    Ok(tree)
+}
+
+/// A restore preserves the base index. Therefore a new or changed gitlink
+/// cannot be materialized as an empty directory: doing so would silently use
+/// the old OID. Such links require separately authorized nested material.
+pub(super) fn check_restore_gitlinks(base: &Tree, captured: &Tree) -> Result<()> {
+    for (path, entry) in &captured.0 {
+        if entry.mode == Mode::Gitlink && base.0.get(path) != Some(entry) {
+            return Err(Error::Denied(
+                "Git restore requires separate materialization for changed or added gitlinks",
+            ));
+        }
+    }
+    // Replacing a base gitlink with a directory of ordinary files is also
+    // ambiguous to Git's base-index untracked enumeration.
+    for (path, entry) in &base.0 {
+        if entry.mode != Mode::Gitlink || captured.0.contains_key(path) {
+            continue;
+        }
+        let mut prefix = path.bytes().to_vec();
+        prefix.push(b'/');
+        if captured
+            .0
+            .range(path.clone()..)
+            .take_while(|(candidate, _)| candidate.bytes().starts_with(path.bytes()))
+            .any(|(candidate, _)| candidate.bytes().starts_with(&prefix))
+        {
+            return Err(Error::Denied(
+                "Git restore cannot replace a base gitlink with a directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn verify_restored(repo: &Repository, base: &Tree, captured: &Tree) -> Result<()> {
+    repo.guard_managed_checkout().map_err(git_error)?;
+    if &real_index(repo)? != base {
+        return Err(Error::Conflict("restored Git index differs from base"));
+    }
+    check_restore_gitlinks(base, captured)?;
+    // Check gitlinks directly: the base index hides their contents from
+    // ls-files --others. Never adopt an externally initialized submodule.
+    for (path, entry) in &base.0 {
+        if entry.mode != Mode::Gitlink {
+            continue;
+        }
+        match (captured.0.get(path), path_metadata(repo.root(), path)?) {
+            (Some(expected), Some((full, meta))) if expected.mode == Mode::Gitlink => {
+                if !meta.is_dir()
+                    || link_like(&full, &meta)?
+                    || fs::read_dir(full)?.next().transpose()?.is_some()
+                {
+                    return Err(Error::Conflict(
+                        "restored Gitlink is not an empty uninitialized directory",
+                    ));
+                }
+            }
+            (Some(expected), _) if expected.mode != Mode::Gitlink => {}
+            (None, None) => {}
+            _ => {
+                return Err(Error::Conflict(
+                    "restored Gitlink differs from captured tree",
+                ))
+            }
+        }
+    }
+    // No ignore rules here: an unpublished restore must not adopt additional
+    // ignored files, links or special files under the new destination.
+    let untracked = run(repo, &["ls-files", "--others", "-z"])?;
+    let actual = observe_tree(repo, base, captured, &untracked, false, 0, true)?;
+    if &actual != captured {
+        return Err(Error::Conflict(
+            "restored Git worktree differs from captured tree",
+        ));
+    }
+    repo.validate_binding().map_err(git_error)?;
+    Ok(())
 }
 
 fn index_line(input: &mut Vec<u8>, mode: &str, oid: &str, path: &RepoPath) {

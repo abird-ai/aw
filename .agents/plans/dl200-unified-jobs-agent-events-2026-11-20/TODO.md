@@ -449,7 +449,7 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Grouped Sandbox owner **2/2** and SourceDriver **1/1** are green. Full workspace all-target
       check, strict affected-crate all-target Clippy, repository fmt and scoped diff-check are green.
       **Git clean/dirty capture and retention landed locally:** concrete `aw-git/source-driver`
-      registers builtin/git (binding schema 1, anchor/recovery schemas 1–2) in the existing leaf;
+      registers builtin/git (binding schema 1, anchor 1–2, recovery 1–3) in the existing leaf;
       the default Git library stays Agent-independent. Shared bounded tree observation and read-only
       Prepared planning bind exact source/checkout/base, Git-normalized tree and index/untracked
       fingerprints. Two independent private indexes seeded from HEAD produce the same dirty tree;
@@ -462,12 +462,23 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       changed or damaged retention is Unknown; no blind retry, original HEAD/index mutation or
       retention cleanup. Snapshot-local object closure and synthetic identity are verified; ref
       retention and live AW barriers remain the future publication owner's responsibility.
-      Real Git suite **31/31**, grouped clean/dirty retention, restart, legacy schema and gitlink
-      failure boundaries. Workspace all-target check, strict Git feature Clippy, default-feature
-      check, repository fmt and scoped diff-check are green on L5.
-      **Next:** isolated Git restore preserving original base HEAD, then Checkpoint persistence,
-      multi-source recovery and shared Prepared publication. Source realization, quiescent binding
-      mutation, SandboxGrant/Vault and host RPCs remain pending. Store schema remains v55.
+      **Isolated Prepared Git restore landed locally:** recovery schema 3 binds exact retained anchor,
+      origin checkout, absent private destination and parent identity. The fresh linked worktree
+      remains detached at original base HEAD with its real index based on that commit. Dirty content
+      is materialized through a private index; synthetic HEAD is never exposed. Shared tree observation
+      verifies captured contents including formerly tracked additions, independent of base index.
+      Unchanged gitlinks are empty/uninitialized; new/changed gitlinks and ambiguous directory
+      replacements fail closed before materialization. No submodule fetch/initialization. Recovery
+      requires exact operation-marked registration and complete matching materialization; absence,
+      partial or changed effects are Unknown, no automatic retry or removal. HeldFence is identity
+      only; the future Store owner must hold the live local source/destination barrier through commit.
+      Real Git suite **32/32**, grouped capture/restore, retention, restart, legacy schema and failure
+      boundaries. Workspace all-target check, strict Git feature Clippy, default-feature check,
+      repository fmt and scoped diff-check are green on L5.
+      **Next:** SourceAnchor/Checkpoint/SourceSet persistence and restart dependency pinning, then
+      multi-source recovery and shared Prepared publication. Source realization, candidate/retention
+      cleanup, quiescent binding mutation, SandboxGrant/Vault and host RPCs remain pending.
+      Store schema remains v55.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -572,4 +583,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility and concrete Git clean/dirty capture/private retention/inspection/gitlinks are live; remaining work is isolated Git restore, SourceAnchor/Checkpoint and unresolved recovery dependency pinning, source realization/quiescent mutation, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, SandboxGrant/Vault and host RPCs.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary, staged SourceDriver leaf, v55 named binding persistence/startup compatibility and concrete Git clean/dirty capture/private retention/inspection/gitlinks plus isolated Prepared restore are live; remaining work is SourceAnchor/Checkpoint and unresolved recovery dependency pinning, source realization/quiescent mutation, candidate/retention cleanup, shared Prepared recovery constructor, immutable/held-through-commit external evidence and publication-transaction authority fencing, SandboxGrant/Vault and host RPCs.
