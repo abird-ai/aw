@@ -34,6 +34,7 @@ pub mod reviewer;
 pub mod routing;
 /// Session-bound orchestration service; the original Agent and journal stay authoritative.
 pub mod runtime;
+pub mod source_driver;
 pub mod tool;
 
 pub use accounts::{
@@ -82,6 +83,14 @@ pub use retry::{
 pub use reviewer::{ReviewExecutor, ReviewInput, ReviewJournal, ReviewResult};
 #[cfg(feature = "routing")]
 pub use routing::{RoutingExecutor, RoutingInput, RoutingJournal, RoutingResult};
+pub use source_driver::{
+    validate_source_set_hard_limit, CheckpointPolicy, DriverArtifact, DriverKey, DriverNamespace,
+    DriverSchemaPin, ExternalEvidence, PreparedSourceOperation, RecoveryDescriptor, RecoveryField,
+    RecoveryFieldKind, RecoveryInspection, SchemaSupport, SourceAccess, SourceDriverDescriptor,
+    SourceDriverHandle, SourceDriverRegistry, SourceDriverRegistryReader, SourceDriverSchemas,
+    SourceName, SourceOperationKind, SourceSetLimit, DEFAULT_MAX_SOURCES_PER_SANDBOX,
+    HARD_MAX_SOURCES_PER_SANDBOX,
+};
 pub use tool::{
     ExecutionOwnershipLease, ExecutionOwnershipScope, Tool, ToolCall, ToolContext, ToolEffect,
     ToolFuture, ToolOutput, ToolParallelism, ToolPolicy, ToolPolicyLifecycle, ToolRecord,

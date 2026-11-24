@@ -24,10 +24,11 @@ exact-Project wildcard placement, v48 durable subscription state, v49 replay-saf
 v50 disclosure/causal execution closure, v51 EventTypeRegistry + custom Event publication, the model-facing
 `events_publish` / `events_subscribe` adapter, v52 EventHandler definition/activation/receipt ownership,
 v53 same-store cross-Domain Event-universe completeness, and v54 serialized v36 delivery cutover +
-compatibility provenance are implemented locally. Materialized/provider audience expansion remains Unknown
-until its provider-held principal fence exists, but it no longer blocks Phase-2 completion. Real-Bubblewrap
-worker-retirement and Windows-native Process qualification remain explicitly deferred evidence and are not
-claimed green.**
+compatibility provenance are implemented locally. Phase 3 is now UNDERWAY with the first final
+SourceDriver leaf plus durable DriverKey/Prepared/ExternalEvidence vocabulary implemented locally.
+Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
+it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
+qualification remain explicitly deferred evidence and are not claimed green.**
 
 Verified publication truth:
 
@@ -1051,10 +1052,49 @@ regression **1/1** remains green. Repository fmt, full workspace all-target chec
 `aw-tools + aw-store + aw-cli` Clippy and scoped diff-check are green. Zero-test generic name filters are
 not counted as evidence.
 
-**Phase 2 is COMPLETE locally. Next implementation slice:** begin sealed **Phase 3** with one durable
-DriverKey and shared Prepared/ExternalEvidence contracts for bounded SourceSet capture/restore, checkpoint
-constructors and driver recovery. Do not contract the v36 compatibility tables yet; Phase 7 owns removal
-after cross-version drain/restart evidence.
+**Phase 3 first prerequisite is now implemented locally.** `aw-agent-core::source_driver` owns the
+first final SourceDriver registry leaf from day one and reuses the same private staged-registry publication
+core as EventType/EventHandler. Durable `DriverKey` is only stable built-in/Extension namespace + local
+driver ID; it contains no runtime generation or artifact version. `DriverSchemaPin` stores the artifact
+kind (`binding|anchor|recovery`) and that artifact's adjacent schema version separately. Exact native
+`SourceDriverHandle<T>` validity pins one registration revision/type/schema snapshot, while durable
+`SourceDriverRegistryReader::resolve` looks up only stable DriverKey + artifact schema so unrelated leaf
+publications cannot stale persisted source state.
+
+The leaf is intentionally add-only in this first cut. SourceDriver removal/replacement is **not** exposed
+until Store owns the complete set of live SourceBindings, live Checkpoint SourceAnchors and unresolved
+Prepared/Unknown RecoveryDescriptors. That prevents an API caller from supplying an incomplete dependency
+list and bypassing the durable pinning invariant. Later compatible replacement will mutate this exact leaf,
+not migrate to another registry.
+
+The shared source/recovery vocabulary also lands here without creating a recovery coordinator:
+- `SourceName` enforces v1 `[a-z][a-z0-9_-]{0,63}`;
+- `SourceAccess = read_only|read_write` and `CheckpointPolicy = required|ephemeral`;
+- `SourceSetLimit` defaults to 128 and host configuration may only lower that effective limit;
+- a separate absolute validator enforces the 1024-source corruption/safety ceiling;
+- `RecoveryDescriptor` stores stable DriverKey + recovery schema + prepare ID + immutable prepared-source
+  identity + at most 32 typed recovery fields (`id|digest|version|reference|opaque_handle`);
+- `PreparedSourceOperation` shares that exact descriptor for Capture and Restore;
+- `RecoveryInspection<T>` is exactly `NotStarted | Completed { result, evidence } | Unknown`;
+- `ExternalEvidence` is either immutable/non-revocable identity evidence or a durable **opaque** provider
+  fence handle. A held-fence handle is explicitly documented as not being publication authority by itself;
+  the later lower constructor must still hold the live provider fence valid through the complete AW commit.
+There is no generic credential/value blob, bearer-token field, driver-key database or second driver catalog.
+
+All serde-backed durable values expose explicit `validate()` paths so Store-open/recovery can fail closed on
+decoded state rather than trusting constructors. SourceDriver schema support is declared separately for
+binding/anchor/recovery as `compatible_from..=current`; durable resolution rejects missing/incompatible
+artifact schemas. The focused SourceDriver regression **1/1** proves staged publication, exact typed
+implementation retrieval, stable durable schema resolution across an unrelated leaf publication,
+unsupported recovery-schema rejection, the 128 effective / 1024 absolute SourceSet bounds, and the
+opaque-fence/Completed recovery vocabulary. Repository fmt, full workspace all-target check, strict `aw-agent-core` Clippy and scoped diff-check are green.
+
+**Next Phase-3 slice:** add the actual named SourceBinding owner under logical Sandbox plus Store-open
+SourceDriver dependency validation against this exact registry leaf. Persist DriverKey and
+`binding_schema` beside each binding; enforce the effective SourceSet limit before any driver preparation.
+Do not start Git capture/Checkpoint tables until live binding identity/schema degradation behavior is
+durable and restart-safe. Do not contract v36 Event compatibility tables; Phase 7 owns removal after
+cross-version drain/restart evidence.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

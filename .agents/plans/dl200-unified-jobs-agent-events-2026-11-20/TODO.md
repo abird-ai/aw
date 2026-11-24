@@ -422,8 +422,25 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       **Next:** begin sealed Phase 3 — one durable DriverKey plus shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery. Legacy cutover
       contraction remains Phase 7 after cross-version drain/restart proof.
-- [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
+- [~] **Phase 3 UNDERWAY** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
+      **first SourceDriver leaf/prerequisite landed locally:** `aw-agent-core::source_driver` reuses the
+      Phase-2 private staged-registry core; durable `DriverKey` is stable built-in/Extension namespace +
+      local ID only, while `DriverSchemaPin` keeps binding/anchor/recovery schema adjacent and independent
+      of runtime registry generation. Exact typed handles pin registration revision/type; durable resolve
+      uses DriverKey + artifact schema and survives unrelated leaf publication. The leaf is deliberately
+      add-only until Store can prove the complete live binding/anchor/unresolved-recovery dependency set;
+      no caller-supplied incomplete pin list can authorize replacement/removal. Shared validated vocabulary
+      now includes SourceName/access/checkpoint policy, symmetric Capture/Restore Prepared descriptors,
+      `NotStarted|Completed(evidence)|Unknown` inspection, typed non-secret recovery fields and immutable
+      vs opaque-held-fence ExternalEvidence. Opaque fence handle is not publication authority; later
+      constructor must hold the live provider fence through AW commit. Host effective SourceSet limit
+      defaults to 128 and may only be lowered; absolute safety ceiling remains 1024. Focused SourceDriver
+      **1/1** + repository fmt, full workspace all-target check, strict aw-agent-core Clippy and scoped diff-check are green.
+      **Next:** persist named SourceBindings under logical Sandbox with DriverKey + binding_schema and
+      store-open compatibility/degraded-state validation against this exact registry leaf; enforce SourceSet
+      cardinality before preparation. Then add Git capture/anchors/checkpoint storage and the shared
+      Prepared publication constructor in later Phase-3 slices.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;
@@ -528,4 +545,4 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
 - [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
-- [ ] Phase 3: bounded/non-secret symmetric capture/restore Prepared recovery descriptors + exact driver-schema pinning across store-open/restart + immutable/held-through-commit external publication evidence + publication-transaction authority fencing.
+- [~] Phase 3: durable DriverKey + artifact-schema/recovery vocabulary and first staged SourceDriver leaf are live; remaining work is named SourceBinding/Checkpoint persistence, store-open dependency pinning/degraded state, Git capture/restore, shared Prepared recovery constructor, immutable/held-through-commit external publication evidence and publication-transaction authority fencing.
