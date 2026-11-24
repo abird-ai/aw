@@ -1,5 +1,9 @@
 # AW + dotlink + DL-200 R6 / Phase-3 full comprehensive handoff — 2026-11-24
 
+> Historical snapshot. Superseded for current onboarding by [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md)
+> and [AW-DL200-PHASE3-NEXT-AGENT-2026-11-24-LATE.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-24-LATE.md) at implementation checkpoint 0bf9bf6.
+> The original text below is retained as dated provenance.
+
 > Canonical onboarding handoff after AW/AGENTS.md.
 >
 > Current signed implementation checkpoint:

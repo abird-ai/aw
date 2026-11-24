@@ -1,5 +1,9 @@
 # AW DL-200 Phase-3 — copy-ready next-agent prompt — 2026-11-24
 
+> Historical snapshot. Superseded for current onboarding by [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md)
+> and [AW-DL200-PHASE3-NEXT-AGENT-2026-11-24-LATE.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-24-LATE.md) at implementation checkpoint 0bf9bf6.
+> The original text below is retained as dated provenance.
+
 Copy/paste the block below into the next implementation chat.
 
 Use dotlink---l5 as the only source-authoring connector.
