@@ -36,7 +36,8 @@ checkpoint publication, receipt-bound non-destructive restore preparation/restar
 and atomic held Agent + fresh source-bearing Sandbox restore publication, plus v58 independent
 SandboxGrant evidence/source-access preflight, typed SandboxDriver/fenced source-effect
 handoff, original PipeProcess source-aware host composition and direct journal-linked
-source-effect custody/terminal recovery are implemented locally.
+source-effect custody/terminal recovery, and pinned native single-source filesystem route
+with deferred post-journal settlement are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -1636,11 +1637,57 @@ Host **14/14**, Sandbox owner **4/4**, checkpoint/capture/restore **4/4**, sourc
 and construction receipt **1/1 each**, strict Host/Store all-target Clippy, workspace
 all-target check, fmt and scoped diff-check are green.
 
-**Next Phase-3 slice:** connect the reviewed concrete containment and original runtime
-tool/Job dispatch and receipt owners to source-aware admission, preserving the held gate
-until complete; original incomplete-effect reconciliation remains separate. History-only
-baseline, custom ACL/task, candidate/retention reconciliation, quiescent binding mutation,
-Vault and checkpoint/Sandbox host RPCs remain pending. Store schema v58.
+The direct native filesystem integration now uses PreparedNativeRequest, the original
+canonical parser/limits/executor/result projection shared with the ordinary rooted tool
+adapter. No second filesystem engine or compatibility fallback on source-aware calls.
+NativeFilesystemDriver pins the independently authorized exact source directory via the
+existing platform CapabilitySet/PreparedGrant owner, compares the physical root identity,
+and restricts the capability to the effective read/write mode and original tool root.
+Initial admission is one directory and exactly one source in the Sandbox; multiple or
+overlapping source layouts need a reviewed complete physical policy. Source materialization
+verification and independent physical authority remain with the trusted host resolver, not
+caller-supplied model paths. No arbitrary shell/remote containment promotion.
+
+SourceFilesystemRoute installs explicitly through the original OperationRouterSlot and
+Agent ToolResult hook; exact Agent/Session/branch, direct host tool, original actor/source/
+effect/site, ToolBindingAuthority and Actor Envelope checks are reused. It refuses Graph/
+Process/control/legacy native arguments rather than falling back to the ambient executor.
+Installation refuses another tool authority or an occupied router slot. A weak registry
+authority reference breaks the route→registry→slot ownership cycle; invocation upgrades
+only while the effect is live. Native and Process share SourceToolAuthority. Tool origin
+now carries the full original ToolCall so the actual arguments are compared against the
+immutable ToolStarted; they are not copied into durable source custody. The source barrier
+and current authority commit precede the original blocking worker; its pinned directory
+and live source-policy guard stay with the worker even when the awaiter is dropped.
+
+Actual tool return precedes ToolFinished. defer_until_tool_finished persists one compact
+positive source quiescence/no-start disposition in the existing local custody facts, keeping
+the complete barrier hazardous until the matching original receipt commits. ToolResult
+settles that exact claim using the original actor and no new effect authority. Restart
+manager recovery consumes recorded proof without another inspection or launch. Reclaim,
+release fact, optional Sandbox rev and complete lease release share one transaction for
+recorded proof; failure rolls all back. Unknown still requires original inspection.
+No pending in-memory completion map, additional table, duplicate tool receipt, or second
+execution lifecycle. The callback does not infer quiescence from a logical result.
+
+Grouped native host regression exercises real pinned read/write, symlink escape denial,
+changed original arguments refusal, no fallback, original TurnJournal receipt and post-
+receipt hook, and missed hook followed by disk restart/release without reinspection.
+Dropping the Agent/route releases Store ownership. Held source-bearing Agent admission
+is still closed; the route is an explicit reusable host composition, not yet installed
+by the production Actor Service or a real Git/materialization policy resolver.
+Host **15/15**, native adapter **99/99**, router **3/3**, tool binding authority **6/6**,
+Sandbox **4/4**, checkpoint/capture/restore **4/4**, source barrier/receipt **1/1 each**.
+Strict Core/Host/Adapter/Store all-target Clippy, workspace all-target check, minimal
+build and normal dependency SQLite exclusion, fmt and scoped diff-check are green
+(minimal retains its two existing CLI dead-code warnings).
+
+**Next Phase-3 slice:** bind the concrete SourceDriver materialization/policy resolver
+and reviewed host native route into the original Actor Service, then qualify complete
+source-aware dispatch and Job/Process containment before opening admission. Incomplete
+original-effect reconciliation, multi-source policy, history-only baseline, custom ACL/task,
+candidate/retention reconciliation, quiescent binding mutation, Vault and checkpoint/
+Sandbox host RPCs remain pending. Store schema v58.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

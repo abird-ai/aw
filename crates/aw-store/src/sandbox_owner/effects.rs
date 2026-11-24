@@ -2,7 +2,8 @@
 //! capability; the existing effect owner starts and settles it. No Process
 //! ownership, runtime dispatch or admission-state changes live here.
 use super::{
-    parse_sandbox_ref, snapshot_row, SandboxGrantObservation, SandboxGrantPolicy, SandboxSnapshot,
+    parse_sandbox_ref, snapshot_with_sources, SandboxGrantObservation, SandboxGrantPolicy,
+    SandboxSnapshot,
 };
 use crate::{
     db, durability, label, now, store_scope::StoreScope, workspace_writer, Error, Result,
@@ -11,7 +12,7 @@ use crate::{
 use aw_agent_core::tool::ToolBindingSnapshot;
 use aw_agent_core::{
     NamedSourceAccess, PrincipalId, SandboxDriverDescriptor, SandboxDriverHandle,
-    SandboxDriverRegistryReader, SourceAccess,
+    SandboxDriverRegistryReader, SourceAccess, ToolCall,
 };
 use rusqlite::{params, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -45,15 +46,15 @@ pub trait SandboxEffectAuthority {
 /// Direct tools use their original journal identity. A separate trusted
 /// host operation may supply its own owned ID, but cannot claim a tool
 /// binding or use the reserved journal-linked effect namespace.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SandboxEffectOrigin {
     Host(String),
-    Tool { turn_id: u64, call_id: String },
+    Tool { turn_id: u64, call: ToolCall },
 }
 
 /// Trusted host effect request, not a model selector. This seam does not
 /// admit a new Agent Turn or open its held execution admission.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SandboxEffectRequest {
     pub actor: PrincipalId,
     pub agent_ref: String,
@@ -77,8 +78,8 @@ impl SandboxEffectRequest {
                     return Err(Error::Config("invalid host source effect identity".into()));
                 }
             }
-            SandboxEffectOrigin::Tool { turn_id, call_id } => {
-                label(call_id, 128)?;
+            SandboxEffectOrigin::Tool { turn_id, call } => {
+                call.validate_envelope()?;
                 if *turn_id == 0 {
                     return Err(Error::Config(
                         "source effect requires an original Turn".into(),
@@ -149,8 +150,8 @@ fn observe_in(
 ) -> Result<Boundary> {
     let (effect_id, intent) = match (&request.origin, tool_binding) {
         (SandboxEffectOrigin::Host(id), None) => (id.clone(), None),
-        (SandboxEffectOrigin::Tool { turn_id, call_id }, Some(binding)) => {
-            let intent = journal::admit_in(tx, request, *turn_id, call_id, binding)?;
+        (SandboxEffectOrigin::Tool { turn_id, call }, Some(binding)) => {
+            let intent = journal::admit_in(tx, request, *turn_id, call, binding)?;
             (intent.effect_id(), Some(intent))
         }
         _ => {
@@ -191,7 +192,7 @@ fn observe_in(
         selected.push(source);
     }
     grant.sources = selected;
-    let sandbox = snapshot_row(tx, &grant.sandbox_ref)?;
+    let sandbox = snapshot_with_sources(tx, &grant.sandbox_ref)?;
     let project = parse_sandbox_ref(&grant.sandbox_ref)?.project;
     let writer = workspace_writer::require_workspace_writer(tx, &project.project)?;
     Ok(Boundary {
@@ -336,24 +337,46 @@ pub struct SandboxEffectLease<'a> {
 }
 
 impl SandboxEffectLease<'_> {
+    /// The original tool returns before the Agent writes ToolFinished.
+    /// Keep a positive, trusted physical settlement fact with the exact
+    /// claims; the original receipt owner can release them after its commit.
+    /// Unknown carries no positive proof and remains an ordinary hazard.
+    pub fn defer_until_tool_finished(self, outcome: SandboxEffectOutcome) -> Result<()> {
+        if outcome == SandboxEffectOutcome::Unknown {
+            return self.settle(outcome);
+        }
+        let intent = self.intent.as_ref().ok_or(Error::Conflict(
+            "deferred source settlement requires an original tool intent",
+        ))?;
+        let mut connection = self.store.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        journal::record_quiescence_in(&tx, intent, outcome)?;
+        self.barrier
+            .settle_in(&tx, SourceMutationOutcome::Unknown)?;
+        db(tx.commit())
+    }
+
     /// No current grant check here: revocation governs new effects, not
     /// factual settlement. Unknown preserves all source hazards. A known
     /// settled write-capable effect advances Sandbox rev once with release.
     pub fn settle(self, outcome: SandboxEffectOutcome) -> Result<()> {
         let mut connection = self.store.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        // A missing/mismatched original terminal must never release the
-        // source claims, even when the live effect owner has finished.
+        match self.settle_in(&tx, outcome) {
+            Ok(()) => db(tx.commit()),
+            Err(error) => {
+                db(tx.rollback())?;
+                drop(connection);
+                self.barrier.settle(SourceMutationOutcome::Unknown)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn settle_in(&self, tx: &Transaction<'_>, outcome: SandboxEffectOutcome) -> Result<()> {
         if let Some(intent) = &self.intent {
             if outcome != SandboxEffectOutcome::Unknown {
-                if let Err(error) = journal::release_in(&tx, intent, &self.actor, outcome) {
-                    // Roll back any partial publication before marking the
-                    // exact original claims Unknown in their own transaction.
-                    db(tx.rollback())?;
-                    drop(connection);
-                    self.barrier.settle(SourceMutationOutcome::Unknown)?;
-                    return Err(error);
-                }
+                journal::release_in(tx, intent, &self.actor, outcome)?;
             }
         }
         if outcome == SandboxEffectOutcome::Settled && self.write_capable {
@@ -368,7 +391,7 @@ impl SandboxEffectLease<'_> {
                 ));
             }
             durability::commit_event(
-                &tx,
+                tx,
                 &durability::tx_id()?,
                 "sandbox.sources.changed",
                 "sandbox",
@@ -378,14 +401,13 @@ impl SandboxEffectLease<'_> {
             )?;
         }
         self.barrier.settle_in(
-            &tx,
+            tx,
             if outcome == SandboxEffectOutcome::Unknown {
                 SourceMutationOutcome::Unknown
             } else {
                 SourceMutationOutcome::Settled
             },
-        )?;
-        db(tx.commit())
+        )
     }
 }
 

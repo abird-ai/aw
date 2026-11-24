@@ -1,12 +1,9 @@
 //! SQLite-backed host composition of a prepared source effect and the
 //! original shared Process runtime. No second Process, Job or policy owner.
-use crate::AuthenticatedToolGrantEvidence;
-use aw_agent_core::{
-    tool::ToolBindingAuthority, CancellationToken, Error, NamedSourceAccess, Result, ToolEffect,
-};
+use crate::source_authority::{LiveSourceTool, SourceToolAuthority};
+use aw_agent_core::{CancellationToken, Error, Result, ToolEffect};
 use aw_store::{
     PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLease, SandboxEffectOutcome,
-    SandboxGrantPolicy,
 };
 use aw_tools::{
     execution_stop::StopEvidence,
@@ -15,84 +12,8 @@ use aw_tools::{
 use aw_tools_adapter::process::{PipeLaunchFailure, PipeProcess, PreparedPipeLaunch};
 use tokio::time::Instant;
 
-#[derive(Clone)]
-struct LiveProcessTool {
-    authority: ToolBindingAuthority,
-    evidence: AuthenticatedToolGrantEvidence,
-}
-
-impl LiveProcessTool {
-    fn is_live(&self) -> bool {
-        self.evidence.revalidate(&self.authority).is_ok()
-    }
-
-    async fn wait_until_not_live(&self) {
-        self.authority
-            .wait_until_not_live(&self.evidence.actor, self.evidence.binding())
-            .await
-    }
-}
-
-/// Combine the independent live host source-policy guard with the original
-/// ToolBindingAuthority. No tool grant is minted or broadened here. The
-/// original host supplies source ceilings and an exact Process tool binding
-/// scoped to this Sandbox, rather than a model-selected capability.
-pub struct ProcessToolAuthority<A> {
-    source: A,
-    tool: LiveProcessTool,
-}
-
-impl<A: SandboxEffectAuthority> ProcessToolAuthority<A> {
-    pub fn new(
-        source: A,
-        authority: ToolBindingAuthority,
-        evidence: AuthenticatedToolGrantEvidence,
-    ) -> Result<Self> {
-        let policy = source.policy();
-        if evidence.actor != policy.actor
-            || evidence.resource_scope != policy.sandbox_ref
-            || evidence.binding().effect != ToolEffect::Process
-        {
-            return Err(Error::Denied(
-                "Process tool authority does not cover the exact Sandbox actor",
-            ));
-        }
-        evidence.revalidate(&authority)?;
-        Ok(Self {
-            source,
-            tool: LiveProcessTool {
-                authority,
-                evidence,
-            },
-        })
-    }
-}
-
-impl<A: SandboxEffectAuthority> SandboxEffectAuthority for ProcessToolAuthority<A> {
-    fn policy(&self) -> &SandboxGrantPolicy {
-        self.source.policy()
-    }
-
-    fn tool_ceiling(&self) -> &[NamedSourceAccess] {
-        self.source.tool_ceiling()
-    }
-
-    fn tool_binding(&self) -> Option<&aw_agent_core::tool::ToolBindingSnapshot> {
-        Some(self.tool.evidence.binding())
-    }
-
-    fn with_admission<T>(&self, admit: impl FnOnce() -> Result<T>) -> Result<T> {
-        // Both preflight and the final Store commit use the existing tool
-        // publication fence. Never hold its synchronous lock across await.
-        self.source.with_admission(|| {
-            self.tool.authority.with_revalidated_binding(
-                &self.tool.evidence.actor,
-                self.tool.evidence.binding(),
-                admit,
-            )
-        })
-    }
-}
+/// Existing Process consumers use the same source/tool authority composition.
+pub type ProcessToolAuthority<A> = SourceToolAuthority<A>;
 
 /// The original Process or its factual launch failure, with common source
 /// custody. Keep the actual result by value; no allocation or second
@@ -108,7 +29,7 @@ pub struct SourceProcessStart<'a> {
 #[must_use = "settle using the original recorded Process terminal and source quiescence"]
 pub struct SourceProcessLease<'a> {
     source: SandboxEffectLease<'a>,
-    tool: LiveProcessTool,
+    tool: LiveSourceTool,
 }
 
 impl SourceProcessLease<'_> {
@@ -176,6 +97,15 @@ where
     P: Send + 'static,
     A: SandboxEffectAuthority + Send + 'static,
 {
+    if prepared
+        .authority()
+        .tool_binding()
+        .is_none_or(|binding| binding.effect != ToolEffect::Process)
+    {
+        return Err(Error::Denied(
+            "source Process requires an original Process tool",
+        ));
+    }
     let tool = prepared.authority().tool.clone();
     let check_tool = tool.clone();
     let signal_tool = tool.clone();
@@ -204,18 +134,20 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::AuthenticatedToolGrantEvidence;
     use aw_agent_core::{
         provider::{CompletionFuture, DeltaSink, Provider},
         AccountOwner, Agent, AgentOptions, BillingOwner, CheckpointPolicy, CredentialCustody,
-        DriverKey, InvocationIdentity, JournalEntry, Message, Outcome, PrincipalId, Role,
-        SandboxDriverRegistry, SchemaSupport, SourceAccess, SourceBinding, SourceDriverRegistry,
-        SourceDriverSchemas, SourceName, SourceSetLimit, ToolCall, ToolOutput, ToolRecord,
-        ToolSource, ToolSourceEvidence, ToolStatus, Turn, TurnJournal, TurnStart,
+        DriverKey, InvocationIdentity, JournalEntry, Message, NamedSourceAccess, Outcome,
+        PrincipalId, Role, SandboxDriverRegistry, SchemaSupport, SourceAccess, SourceBinding,
+        SourceDriverRegistry, SourceDriverSchemas, SourceName, SourceSetLimit, ToolCall,
+        ToolOutput, ToolRecord, ToolSource, ToolSourceEvidence, ToolStatus, Turn, TurnJournal,
+        TurnStart,
     };
     use aw_store::{
-        SandboxEffectOrigin, SandboxEffectPlan, SandboxEffectRequest, SandboxPolicyEvidence,
-        SandboxSourceGrant, SessionBinding, SessionStore, SourceMutationOutcome, SourceMutationSet,
-        VersionedSourceBinding,
+        SandboxEffectOrigin, SandboxEffectPlan, SandboxEffectRequest, SandboxGrantPolicy,
+        SandboxPolicyEvidence, SandboxSourceGrant, SessionBinding, SessionStore,
+        SourceMutationOutcome, SourceMutationSet, VersionedSourceBinding,
     };
     use aw_tools_adapter::{LocalToolOptions, ToolMode};
     use rusqlite::{params, Connection};
@@ -547,7 +479,7 @@ mod tests {
                     agent_ref: reference.clone(),
                     origin: SandboxEffectOrigin::Tool {
                         turn_id: 1,
-                        call_id: effect_id.into(),
+                        call: record(effect_id, ToolStatus::Running, None).call,
                     },
                     sources: tools.clone(),
                 },
@@ -864,5 +796,440 @@ mod tests {
             .settle(SourceMutationOutcome::Settled)
             .unwrap();
         assert!(reopened.activate(&actor, &session.id, &branch.id).is_err());
+    }
+
+    // Original route receives an existing Tool. The source-aware route must
+    // never invoke an ambient-root fallback, including on a denied path.
+    struct NoFallback;
+    impl aw_agent_core::Tool for NoFallback {
+        fn spec(&self) -> aw_agent_core::ToolSpec {
+            panic!("unexpected ambient tool")
+        }
+        fn validate(&self, _: &serde_json::Value) -> Result<()> {
+            panic!("unexpected ambient validation")
+        }
+        fn execute<'a>(
+            &'a self,
+            _: aw_agent_core::ToolContext,
+            _: &'a serde_json::Value,
+        ) -> aw_agent_core::ToolFuture<'a> {
+            panic!("unexpected ambient execution")
+        }
+    }
+
+    #[tokio::test]
+    async fn native_source_route_uses_pinned_capability_and_original_receipt() {
+        use crate::source_filesystem::{
+            ApprovedSourceDirectory, NativeFilesystemDriver, NativeSourceAdmission,
+            SourceFilesystemRoute,
+        };
+        use aw_agent_core::{
+            AgentExecutionBinding, Extension, HookContext, HookEvent, InvocationScope, ToolContext,
+        };
+        use aw_tools::{filesystem::schema::Tool as FsTool, OperationId};
+        use aw_tools_adapter::{
+            native_filesystem::{CapabilitySet, GrantSpec, PrivateArtifactRegistry},
+            operation_router::OperationRouter,
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = Temp(
+            std::env::temp_dir().join(format!("aw-source-native-{}-{nonce}", std::process::id())),
+        );
+        let root = temp.0.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("code"), "initial").unwrap();
+        let outside = temp.0.join("outside");
+        std::fs::write(&outside, "protected").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        let actor = PrincipalId::new("internal:fixture:native-source").unwrap();
+        let registry = SourceDriverRegistry::new();
+        let source_driver = DriverKey::builtin("fixture-source").unwrap();
+        let schema = SchemaSupport::new(1, 1).unwrap();
+        registry
+            .register(
+                source_driver.clone(),
+                SourceDriverSchemas {
+                    binding: schema,
+                    anchor: schema,
+                    recovery: schema,
+                },
+                (),
+            )
+            .unwrap();
+        let limit = SourceSetLimit::new(1).unwrap();
+        let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
+        let layout = SessionBinding {
+            working_directory: root.clone(),
+            tool_root: root.clone(),
+            system_prompt: "fixture".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "fixture".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let (session, branch) = store
+            .create(&actor, "native source", layout.clone())
+            .unwrap();
+        let (reference, project, user): (String, String, String) = {
+            let c = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+            c.query_row(
+                "SELECT '/d:'||domain_handle||'/i:'||identity_handle||'/p:'||project_handle||'/a:'||agent_handle,
+                        '/d:'||domain_handle||'/i:'||identity_handle||'/p:'||project_handle,owner_handle
+                 FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
+                params![session.id,branch.id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).unwrap()
+        };
+        let binding = SourceBinding {
+            name: SourceName::new("code").unwrap(),
+            driver: source_driver,
+            binding_schema: 1,
+            source_ref: "fixture:directory".into(),
+            materialization: root.to_str().unwrap().into(),
+            access: SourceAccess::ReadWrite,
+            checkpoint_policy: CheckpointPolicy::Required,
+        };
+        let sandbox = store
+            .sandbox_create_fresh_with_sources(
+                &actor,
+                &project,
+                &layout,
+                std::slice::from_ref(&binding),
+            )
+            .unwrap();
+        let identity = InvocationIdentity {
+            actor: actor.clone(),
+            account_id: "fixture".into(),
+            account_owner: AccountOwner::User(actor.clone()),
+            payer: BillingOwner::User(actor.clone()),
+            credential_custody: CredentialCustody::UserDevice("fixture".into()),
+            credential_version: None,
+            inference_executor: "local".into(),
+            model: "fixture".into(),
+            grant_revision: 1,
+        };
+        let (_, journal) = store.activate(&actor, &session.id, &branch.id).unwrap();
+        journal
+            .begin(TurnStart {
+                turn_id: 1,
+                prompt: "native source fixture".into(),
+                identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        let records = [
+            (
+                "native:read",
+                FsTool::Read,
+                ToolEffect::Read,
+                serde_json::json!({"path":"code"}),
+            ),
+            (
+                "native:escape",
+                FsTool::Read,
+                ToolEffect::Read,
+                serde_json::json!({"path":"escape"}),
+            ),
+            (
+                "native:write",
+                FsTool::Write,
+                ToolEffect::Write,
+                serde_json::json!({"path":"code","content":"native changed"}),
+            ),
+        ]
+        .map(|(id, tool, effect, arguments)| ToolRecord {
+            call: ToolCall {
+                id: id.into(),
+                name: OperationId::Fs(tool).model_name().into(),
+                arguments,
+            },
+            effect,
+            execution_site: "local".into(),
+            status: ToolStatus::Running,
+            output: None,
+        });
+        let mut assistant = Message::text(1025, Role::Assistant, "");
+        assistant.tool_calls = records.iter().map(|r| r.call.clone()).collect();
+        journal
+            .append(1, JournalEntry::Assistant { message: assistant })
+            .await
+            .unwrap();
+        for record in &records {
+            journal
+                .append(
+                    1,
+                    JournalEntry::ToolStarted {
+                        record: record.clone(),
+                        source: Some(ToolSourceEvidence::trusted_host()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // Fixture-only association after ordinary journal admission.
+        {
+            let c = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
+            c.execute("UPDATE agent_state_current SET sandbox_id=?1,admission='held' WHERE session_id=?2 AND branch_id=?3",
+                params![sandbox.canonical_ref, session.id, branch.id]).unwrap();
+        }
+        let version = VersionedSourceBinding {
+            binding: binding.clone(),
+            binding_rev: 1,
+        };
+        let policy = SandboxGrantPolicy {
+            agent_ref: reference.clone(),
+            sandbox_ref: sandbox.canonical_ref.clone(),
+            actor: actor.clone(),
+            actor_user_id: user,
+            evidence: SandboxPolicyEvidence {
+                policy_ref: "host:fixture-native".into(),
+                policy_digest: [5; 32],
+                authority_ref: "host:fixture-native-authority".into(),
+                authority_generation: 1,
+            },
+            sources: vec![SandboxSourceGrant::from_binding(
+                &version,
+                SourceAccess::ReadWrite,
+            )],
+        };
+        store
+            .sandbox_grant_set(&actor, &reference, 0, Some(&policy))
+            .unwrap();
+        let set = SourceMutationSet::from_bindings(&[binding]).unwrap();
+        let approved = CapabilitySet::open(&root, [GrantSpec::read_write(&root)]).unwrap();
+        let pin = approved.identities().unwrap().pop().unwrap();
+        let private = PrivateArtifactRegistry::memory();
+        let host_lock = Arc::new(RwLock::new(()));
+        let tools = vec![NamedSourceAccess {
+            name: version.binding.name.clone(),
+            access: SourceAccess::ReadWrite,
+        }];
+        let resolve = {
+            let host_lock = host_lock.clone();
+            move |_: &ToolContext, _: FsTool| {
+                Ok(NativeSourceAdmission {
+                    authority: HostGuard {
+                        _guard: host_lock.clone().try_read_owned().unwrap(),
+                        policy: policy.clone(),
+                        tools: tools.clone(),
+                    },
+                    directory: ApprovedSourceDirectory {
+                        binding: version.clone(),
+                        identity: pin.clone(),
+                        private_artifacts: private.clone(),
+                    },
+                })
+            }
+        };
+        let mut options = LocalToolOptions::new(&root, ToolMode::Workspace);
+        options.selected_tools = vec!["read".into(), "write".into()];
+        let builder = crate::configure_local(
+            Agent::builder(
+                Arc::new(NoInference),
+                AgentOptions::new("fixture", "fixture"),
+            ),
+            actor.clone(),
+            &options,
+        )
+        .unwrap();
+        let agent_binding =
+            AgentExecutionBinding::from_trusted_host(&reference, &session.id, &branch.id).unwrap();
+        let drivers = SandboxDriverRegistry::new();
+        let handle = drivers
+            .register(
+                DriverKey::builtin("native-filesystem").unwrap(),
+                NativeFilesystemDriver,
+            )
+            .unwrap();
+        let route = Arc::new(
+            SourceFilesystemRoute::new(
+                store.clone(),
+                agent_binding.clone(),
+                drivers,
+                handle,
+                builder.tool_binding_authority(),
+                options.limits,
+                resolve,
+            )
+            .unwrap(),
+        );
+        let agent = route
+            .clone()
+            .install(builder, &options.operation_router)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut final_records = Vec::new();
+        for mut record in records {
+            let id = record.call.id.clone();
+            let ctx = ToolContext {
+                actor: actor.clone(),
+                turn_id: 1,
+                call_id: id.clone(),
+                source: ToolSource::trusted_host(),
+                effect: record.effect.clone(),
+                execution_site: "local".into(),
+                cancellation: CancellationToken::new(),
+                result_budget_bytes: options.limits.result_bytes,
+                identity: identity.clone(),
+                scope: Some(InvocationScope {
+                    session_id: session.id.clone(),
+                    branch_id: branch.id.clone(),
+                }),
+                execution_owner: Some(agent_binding.clone()),
+                execution_scope: None,
+                live_step_gate: None,
+            };
+            let op = OperationId::from_model_name(&record.call.name).unwrap();
+            if id == "native:read" {
+                assert!(route
+                    .execute(
+                        op,
+                        ctx.clone(),
+                        &serde_json::json!({"path":"escape"}),
+                        Arc::new(NoFallback)
+                    )
+                    .await
+                    .is_err());
+            }
+            let output = route
+                .execute(op, ctx, &record.call.arguments, Arc::new(NoFallback))
+                .await
+                .unwrap();
+            match id.as_str() {
+                "native:read" => assert!(output.content.contains("initial") && !output.is_error),
+                "native:escape" => {
+                    assert!(output.is_error && !output.content.contains("protected"))
+                }
+                "native:write" => assert!(
+                    !output.is_error
+                        && std::fs::read(root.join("code")).unwrap() == b"native changed"
+                ),
+                _ => unreachable!(),
+            }
+            assert!(host_lock.try_write().is_ok());
+            assert!(store
+                .acquire_source_mutation_barrier(&set, "host:before-receipt")
+                .is_err());
+            assert!(store
+                .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, &id)
+                .is_err());
+            record.status = if output.is_error {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Succeeded
+            };
+            record.output = Some(output.clone());
+            journal
+                .append(
+                    1,
+                    JournalEntry::ToolFinished {
+                        record: record.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            if id != "native:write" {
+                // Real original post-journal hook; no extra execution or
+                // model-visible result projection.
+                route
+                    .on_hook(
+                        HookContext {
+                            turn_id: 1,
+                            continuation: None,
+                            profile: "fixture",
+                            model: "fixture",
+                            identity: &identity,
+                        },
+                        HookEvent::ToolResult {
+                            call: record.call.clone(),
+                            receipt: output.clone(),
+                            visible: output,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .acquire_source_mutation_barrier(&set, "host:after-receipt")
+                    .unwrap()
+                    .settle(SourceMutationOutcome::Settled)
+                    .unwrap();
+            }
+            final_records.push(record);
+        }
+        // Source write physically finished and original ToolFinished
+        // committed; simulate loss of the post-receipt callback.
+        assert_eq!(
+            store
+                .sandbox_get(&actor, &sandbox.canonical_ref)
+                .unwrap()
+                .rev,
+            sandbox.rev
+        );
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "host:missed-hook")
+            .is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
+        journal
+            .append(
+                1,
+                JournalEntry::Assistant {
+                    message: Message::text(1026, Role::Assistant, "fixture complete"),
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .finish(Turn {
+                id: 1,
+                prompt: "native source fixture".into(),
+                answer: "fixture complete".into(),
+                model: identity.model,
+                profile: identity.account_id,
+                outcome: Outcome::Completed,
+                meta: None,
+                error: None,
+                actor: Some(actor.clone()),
+                tool_records: final_records,
+                invocations: Vec::new(),
+                context_messages: Vec::new(),
+                needs_reconciliation: false,
+            })
+            .await
+            .unwrap();
+        drop(agent);
+        drop(options);
+        drop(route);
+        drop(journal);
+        drop(store);
+        let store = SessionStore::open_with_sources(&temp.0, registry, limit).unwrap();
+        assert_eq!(
+            store
+                .sandbox_recover_tool_source_effect(
+                    &actor,
+                    &reference,
+                    1,
+                    "native:write",
+                    |_| panic!("recorded quiescence needs no external reinspection"),
+                )
+                .unwrap(),
+            SandboxEffectOutcome::Settled
+        );
+        assert_eq!(
+            store
+                .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, "native:write")
+                .unwrap(),
+            Some(SandboxEffectOutcome::Settled)
+        );
+        assert_eq!(
+            store
+                .sandbox_get(&actor, &sandbox.canonical_ref)
+                .unwrap()
+                .rev,
+            sandbox.rev + 1
+        );
+        assert!(store.activate(&actor, &session.id, &branch.id).is_err());
     }
 }

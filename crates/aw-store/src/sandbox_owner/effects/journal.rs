@@ -20,6 +20,7 @@ pub(crate) const EFFECT_PREFIX: &str = "source-tool:";
 const ENTITY: &str = "source_effect";
 const CLAIMED: &str = "source.effect.claimed";
 const RELEASED: &str = "source.effect.released";
+const QUIESCENT: &str = "source.effect.quiescent";
 
 /// Original journal identity, not a capability or a new attempt ID.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,13 +171,14 @@ pub(super) fn admit_in(
     tx: &Transaction<'_>,
     request: &SandboxEffectRequest,
     turn_id: u64,
-    call_id: &str,
+    call: &aw_agent_core::ToolCall,
     binding: &ToolBindingSnapshot,
 ) -> Result<Intent> {
-    let observed = observe(tx, &request.agent_ref, turn_id, call_id)?;
+    let observed = observe(tx, &request.agent_ref, turn_id, &call.id)?;
     if !observed.active
         || observed.terminal.is_some()
         || observed.intent.actor != request.actor
+        || &observed.record.call != call
         || observed.record.call.name != binding.name
         || observed.record.effect != binding.effect
         || observed.record.execution_site != binding.execution_site
@@ -336,6 +338,25 @@ struct Release {
     outcome: SandboxEffectOutcome,
 }
 
+/// Positive physical settlement, separate from the logical ToolFinished.
+/// No copy of ProcessTerminal, tool output or mutable operation state.
+pub(super) fn record_quiescence_in(
+    tx: &Transaction<'_>,
+    intent: &Intent,
+    outcome: SandboxEffectOutcome,
+) -> Result<()> {
+    require_claim(tx, intent)?;
+    if outcome == SandboxEffectOutcome::Unknown
+        || fact_in::<SandboxEffectOutcome>(tx, &intent.effect_id(), QUIESCENT)?.is_some()
+        || fact_in::<Release>(tx, &intent.effect_id(), RELEASED)?.is_some()
+    {
+        return Err(Error::Conflict(
+            "source effect already settled or not proven quiescent",
+        ));
+    }
+    append_fact(tx, &intent.effect_id(), QUIESCENT, &intent.actor, &outcome)
+}
+
 pub(super) fn release_in(
     tx: &Transaction<'_>,
     intent: &Intent,
@@ -351,6 +372,8 @@ pub(super) fn release_in(
         "original ToolFinished is required before releasing source custody",
     ))?;
     if outcome == SandboxEffectOutcome::Unknown
+        || fact_in::<SandboxEffectOutcome>(tx, &intent.effect_id(), QUIESCENT)?
+            .is_some_and(|prior| prior != outcome)
         || (outcome == SandboxEffectOutcome::NotStarted && record.status == ToolStatus::Succeeded)
         || fact_in::<Release>(tx, &intent.effect_id(), RELEASED)?.is_some()
     {
@@ -400,15 +423,24 @@ fn authorize_recovery_in(
     let claim = require_claim(tx, &observed.intent)?;
     let project = super::super::parse_sandbox_ref(&claim.sandbox_ref)?.project;
     super::super::authorize_project(tx, manager, &project, true)?;
+    require_current_sandbox_in(tx, key, &claim)?;
+    Ok((observed, claim))
+}
+
+fn require_current_sandbox_in(
+    tx: &Transaction<'_>,
+    key: AgentKey<'_>,
+    claim: &Claim,
+) -> Result<()> {
     let current: Option<String> = db(tx.query_row(
         "SELECT sandbox_id FROM agent_state_current WHERE session_id=?1 AND branch_id=?2",
-        params![session, branch],
+        params![key.session, key.branch],
         |row| row.get(0),
     ))?;
     if current.as_deref() != Some(&claim.sandbox_ref) {
         return Err(Error::Conflict("source effect Sandbox identity changed"));
     }
-    Ok((observed, claim))
+    Ok(())
 }
 
 fn recovery_sources_in(
@@ -461,7 +493,103 @@ fn recovery_sources_in(
     Ok(sources)
 }
 
+fn released_in(
+    tx: &Transaction<'_>,
+    observed: &Observation,
+) -> Result<Option<SandboxEffectOutcome>> {
+    let terminal_seq = observed
+        .terminal
+        .as_ref()
+        .ok_or(Error::Conflict(
+            "original ToolFinished is required for terminal-linked recovery",
+        ))?
+        .0;
+    let Some(release) = fact_in::<Release>(tx, &observed.intent.effect_id(), RELEASED)? else {
+        return Ok(None);
+    };
+    if release.terminal_seq != terminal_seq || release.outcome == SandboxEffectOutcome::Unknown {
+        return Err(Error::Storage(
+            "source custody release differs from original terminal",
+        ));
+    }
+    Ok(Some(release.outcome))
+}
+
+fn reclaim_in<'a>(
+    store: &'a SessionStore,
+    tx: &Transaction<'_>,
+    actor: &PrincipalId,
+    intent: Intent,
+    claim: &Claim,
+    sources: &[EffectiveSourceBinding],
+) -> Result<super::SandboxEffectLease<'a>> {
+    let effect_id = intent.effect_id();
+    let set = crate::SourceMutationSet::from_binding_refs(
+        sources.iter().map(|source| &source.binding.binding),
+    )?;
+    let barrier = store.recover_source_mutation_barrier_in(tx, &set, &effect_id)?;
+    Ok(super::SandboxEffectLease {
+        store,
+        barrier,
+        actor: actor.clone(),
+        sandbox: claim.sandbox_ref.clone(),
+        effect_id,
+        intent: Some(intent),
+        write_capable: sources
+            .iter()
+            .any(|source| source.access == SourceAccess::ReadWrite),
+    })
+}
+
 impl SessionStore {
+    /// Original ToolResult callback, after the original journal commit.
+    /// Trusted host only: no source disclosure or new grant. If a tool did
+    /// not use source custody or never recorded positive physical settlement,
+    /// do not infer it from its output. Current revocation does not erase
+    /// an already attempted effect. Recovery reuses the exact saved proof.
+    pub fn sandbox_settle_recorded_tool_source_effect(
+        &self,
+        actor: &PrincipalId,
+        agent_ref: &str,
+        turn_id: u64,
+        call_id: &str,
+    ) -> Result<Option<SandboxEffectOutcome>> {
+        if self.inner.mode != crate::StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "source effect settlement requires the exclusive Store owner",
+            ));
+        }
+        let mut connection = self.connection()?;
+        let tx =
+            db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+        let observed = observe(&tx, agent_ref, turn_id, call_id)?;
+        if &observed.intent.actor != actor {
+            return Err(Error::Denied("original source effect actor differs"));
+        }
+        let Some(_) = claim_in(&tx, &observed.intent.effect_id())? else {
+            return Ok(None);
+        };
+        let claim = require_claim(&tx, &observed.intent)?;
+        if let Some(outcome) = released_in(&tx, &observed)? {
+            return Ok(Some(outcome));
+        }
+        let Some(outcome) =
+            fact_in::<SandboxEffectOutcome>(&tx, &observed.intent.effect_id(), QUIESCENT)?
+        else {
+            return Ok(None);
+        };
+        if outcome == SandboxEffectOutcome::Unknown {
+            return Err(Error::Storage("invalid source quiescence fact"));
+        }
+        let (session, branch) = agent_owner::key_for_ref(&tx, agent_ref)?;
+        require_current_sandbox_in(&tx, AgentKey::new(&session, &branch), &claim)?;
+        let sources = recovery_sources_in(self, &tx, &claim)?;
+        let lease = reclaim_in(self, &tx, actor, observed.intent, &claim, &sources)?;
+        lease.settle_in(&tx, outcome)?;
+        db(tx.commit())?;
+        Ok(Some(outcome))
+    }
+
     /// Recover only original journal-linked source custody. The trusted
     /// inspector independently authorizes source disclosure and proves
     /// factual quiescence/no-start for the original effect. Never launch,
@@ -486,26 +614,30 @@ impl SessionStore {
                 db(connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
             let (observed, claim) =
                 authorize_recovery_in(&tx, manager, agent_ref, turn_id, call_id)?;
+            if let Some(outcome) = released_in(&tx, &observed)? {
+                return Ok(outcome);
+            }
+            let recorded =
+                fact_in::<SandboxEffectOutcome>(&tx, &observed.intent.effect_id(), QUIESCENT)?;
             let intent = observed.intent;
             let (terminal_seq, terminal) = observed.terminal.ok_or(Error::Conflict(
                 "original ToolFinished is required for terminal-linked recovery",
             ))?;
-            if let Some(release) = fact_in::<Release>(&tx, &intent.effect_id(), RELEASED)? {
-                if release.terminal_seq != terminal_seq
-                    || release.outcome == SandboxEffectOutcome::Unknown
-                {
-                    return Err(Error::Storage(
-                        "source custody release differs from original terminal",
-                    ));
-                }
-                return Ok(release.outcome);
-            }
             let sources = recovery_sources_in(self, &tx, &claim)?;
+            let lease = reclaim_in(self, &tx, manager, intent.clone(), &claim, &sources)?;
+            if let Some(outcome) = recorded {
+                if outcome == SandboxEffectOutcome::Unknown {
+                    return Err(Error::Storage("invalid source quiescence fact"));
+                }
+                lease.settle_in(&tx, outcome)?;
+                db(tx.commit())?;
+                return Ok(outcome);
+            }
             let recovery = SandboxToolRecovery {
                 effect_id: intent.effect_id(),
-                agent_ref: intent.agent_ref.clone(),
+                agent_ref: intent.agent_ref,
                 sandbox_ref: claim.sandbox_ref,
-                actor: intent.actor.clone(),
+                actor: intent.actor,
                 driver: claim.driver,
                 started_seq: intent.started_seq,
                 terminal_seq,
@@ -514,30 +646,8 @@ impl SessionStore {
                 source: observed.source,
                 sources,
             };
-            let set = crate::SourceMutationSet::from_binding_refs(
-                recovery
-                    .sources
-                    .iter()
-                    .map(|source| &source.binding.binding),
-            )?;
-            let barrier =
-                self.recover_source_mutation_barrier_in(&tx, &set, &recovery.effect_id)?;
             db(tx.commit())?;
-            (
-                super::SandboxEffectLease {
-                    store: self,
-                    barrier,
-                    actor: manager.clone(),
-                    sandbox: recovery.sandbox_ref.clone(),
-                    effect_id: recovery.effect_id.clone(),
-                    intent: Some(intent),
-                    write_capable: recovery
-                        .sources
-                        .iter()
-                        .any(|source| source.access == SourceAccess::ReadWrite),
-                },
-                recovery,
-            )
+            (lease, recovery)
         };
         match inspect(&recovery) {
             Ok(outcome) => {

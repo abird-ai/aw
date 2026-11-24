@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, RwLock,
+        Arc, RwLock, Weak,
     },
     time::Duration,
 };
@@ -941,6 +941,27 @@ struct ToolBindingAuthorityInner {
 pub struct ToolBindingAuthority {
     inner: Arc<ToolBindingAuthorityInner>,
 }
+
+/// Registration-owned adapters must not retain their own registry through
+/// an authority cycle. Upgrade only for the lifetime of an invocation.
+#[derive(Clone)]
+pub struct WeakToolBindingAuthority {
+    inner: Weak<ToolBindingAuthorityInner>,
+}
+
+impl WeakToolBindingAuthority {
+    pub fn belongs_to(&self, authority: &ToolBindingAuthority) -> bool {
+        std::ptr::eq(self.inner.as_ptr(), Arc::as_ptr(&authority.inner))
+    }
+
+    pub fn upgrade(&self) -> Result<ToolBindingAuthority> {
+        self.inner
+            .upgrade()
+            .map(|inner| ToolBindingAuthority { inner })
+            .ok_or(Error::Denied("original tool authority owner is gone"))
+    }
+}
+
 impl Default for ToolBindingAuthority {
     fn default() -> Self {
         let (changes, _) = tokio::sync::watch::channel(0u64);
@@ -953,6 +974,12 @@ impl Default for ToolBindingAuthority {
     }
 }
 impl ToolBindingAuthority {
+    pub fn downgrade(&self) -> WeakToolBindingAuthority {
+        WeakToolBindingAuthority {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub(crate) fn publish(&self, registry: &ToolRegistry, policy: &ToolPolicy) -> Result<()> {
         let mut view = self
             .inner

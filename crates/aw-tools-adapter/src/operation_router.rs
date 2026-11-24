@@ -408,6 +408,19 @@ impl std::fmt::Debug for OperationRouterSlot {
 }
 
 impl OperationRouterSlot {
+    /// Install without silently replacing an existing host policy router.
+    pub fn install(&self, router: Arc<dyn OperationRouter>) -> Result<()> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| Error::Protocol("operation router slot poisoned"))?;
+        if guard.is_some() {
+            return Err(Error::Conflict("operation router already installed"));
+        }
+        *guard = Some(router);
+        Ok(())
+    }
+
     pub fn replace(&self, router: Arc<dyn OperationRouter>) -> Result<()> {
         let mut guard = self
             .inner

@@ -28,6 +28,7 @@ mod text_class;
 
 pub mod browse;
 pub mod media_port;
+pub mod native_filesystem;
 pub mod process;
 mod shell;
 
@@ -320,31 +321,19 @@ impl Tool for CanonicalFilesystemTool {
             return self.compatibility.execute(ctx, arguments);
         }
         Box::pin(async move {
-            let request = canonical_request(self.tool, arguments, self.limits)?;
-            let result_bytes = ctx.result_budget(self.limits.result_bytes)?;
-            let direct_limits = canonical_direct_limits(self.limits, result_bytes, &request);
+            let prepared = native_filesystem::PreparedNativeRequest::from_canonical(
+                self.tool,
+                arguments,
+                self.limits,
+                &ctx,
+            )?;
             let root = self.root.clone();
-            let cancellation = ctx.cancellation.clone();
-            let result = aw_tools::asynchronous::run_blocking(move || {
-                aw_tools::filesystem::direct::execute(
-                    root.as_ref(),
-                    request,
-                    direct_limits,
-                    &|| cancellation.is_cancelled(),
-                )
+            let cancellation = ctx.cancellation;
+            aw_tools::asynchronous::run_blocking(move || {
+                prepared.execute(root.as_ref(), &|| cancellation.is_cancelled())
             })
             .await
-            .map_err(|_| {
-                Error::Protocol("canonical filesystem worker failed; inspect workspace")
-            })?;
-            let projected = match result {
-                Ok(output) => canonical_direct_output(output, result_bytes),
-                Err(error) => Err(canonical_direct_error(error)),
-            };
-            tool_failure(
-                projected,
-                self.tool.action() != aw_tools::filesystem::access::Action::Read,
-            )
+            .map_err(|_| Error::Protocol("canonical filesystem worker failed; inspect workspace"))?
         })
     }
 }
