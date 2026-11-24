@@ -1,15 +1,18 @@
 //! SQLite-backed host composition of a prepared source effect and the
 //! original shared Process runtime. No second Process, Job or policy owner.
 use crate::source_authority::{LiveSourceTool, SourceToolAuthority};
-use aw_agent_core::{CancellationToken, Error, Result, ToolEffect};
+use aw_agent_core::{CancellationToken, Error, Result};
 use aw_store::{
-    PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLease, SandboxEffectOutcome,
+    PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch, SandboxEffectLease,
+    SandboxEffectOutcome,
 };
 use aw_tools::{
     execution_stop::StopEvidence,
     filesystem::runner::{ProcessExit, ProcessTerminal},
 };
-use aw_tools_adapter::process::{PipeLaunchFailure, PipeProcess, PreparedPipeLaunch};
+use aw_tools_adapter::process::{
+    PipeLaunchFailure, PipeProcess, PreparedPipeLaunch, ProcessReceipt,
+};
 use tokio::time::Instant;
 
 /// Existing Process consumers use the same source/tool authority composition.
@@ -44,10 +47,7 @@ impl SourceProcessLease {
         self,
         failure: &PipeLaunchFailure,
     ) -> Result<SandboxEffectOutcome> {
-        let outcome = match failure {
-            PipeLaunchFailure::NotStarted(_) => SandboxEffectOutcome::NotStarted,
-            PipeLaunchFailure::Unknown(_) => SandboxEffectOutcome::Unknown,
-        };
+        let outcome = launch_outcome(failure);
         self.source.settle(outcome)?;
         Ok(outcome)
     }
@@ -62,25 +62,185 @@ impl SourceProcessLease {
         terminal: &ProcessTerminal,
         prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()>,
     ) -> Result<SandboxEffectOutcome> {
-        if terminal.exit == ProcessExit::Unknown
-            || !terminal
-                .stop
-                .is_some_and(|stop| stop.evidence != StopEvidence::Unknown)
-        {
-            self.source.settle(SandboxEffectOutcome::Unknown)?;
-            return Ok(SandboxEffectOutcome::Unknown);
-        }
-        match prove_quiescent(terminal) {
-            Ok(()) => {
-                self.source.settle(SandboxEffectOutcome::Settled)?;
-                Ok(SandboxEffectOutcome::Settled)
-            }
-            Err(error) => {
-                self.source.settle(SandboxEffectOutcome::Unknown)?;
-                Err(error)
-            }
+        let outcome = terminal_outcome(terminal, prove_quiescent);
+        self.source.settle(
+            outcome
+                .as_ref()
+                .copied()
+                .unwrap_or(SandboxEffectOutcome::Unknown),
+        )?;
+        outcome
+    }
+}
+
+fn launch_outcome(failure: &PipeLaunchFailure) -> SandboxEffectOutcome {
+    match failure {
+        PipeLaunchFailure::NotStarted(_) => SandboxEffectOutcome::NotStarted,
+        PipeLaunchFailure::Unknown(_) => SandboxEffectOutcome::Unknown,
+    }
+}
+
+fn terminal_outcome(
+    terminal: &ProcessTerminal,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()>,
+) -> Result<SandboxEffectOutcome> {
+    if terminal.exit == ProcessExit::Unknown
+        || !terminal
+            .stop
+            .is_some_and(|stop| stop.evidence != StopEvidence::Unknown)
+    {
+        return Ok(SandboxEffectOutcome::Unknown);
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_quiescent(terminal)))
+        .map_err(|_| Error::Protocol("source quiescence proof panicked; inspect before retry"))??;
+    Ok(SandboxEffectOutcome::Settled)
+}
+
+#[derive(Clone)]
+struct SourceProcessControl {
+    tool: LiveSourceTool,
+    cancellation: CancellationToken,
+    abandoned: Option<CancellationToken>,
+}
+
+impl SourceProcessControl {
+    fn probe(&self) -> impl Fn() -> bool + Send + 'static {
+        let cancellation = self.cancellation.clone();
+        let abandoned = self.abandoned.clone();
+        move || {
+            cancellation.is_cancelled()
+                || abandoned
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
         }
     }
+
+    async fn cancelled(&self) {
+        tokio::select! {
+            _ = self.cancellation.cancelled() => {},
+            _ = self.tool.wait_until_not_live() => {},
+            _ = async {
+                match &self.abandoned {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {},
+        }
+    }
+}
+
+async fn spawn_source_process<P, A>(
+    launch: PreparedPipeLaunch<P>,
+    authority: ProcessToolAuthority<A>,
+    boundary: SandboxEffectLaunch,
+    deadline: Instant,
+    control: &SourceProcessControl,
+) -> std::result::Result<PipeProcess, PipeLaunchFailure>
+where
+    P: Send + 'static,
+    A: SandboxEffectAuthority + Send + 'static,
+{
+    let check = control.probe();
+    let signal = control.clone();
+    PipeProcess::spawn_prepared_fenced_until(
+        launch.with_custody(authority),
+        deadline,
+        // ToolBinding is checked under its actual synchronous launch fence.
+        // Do not reenter its read lock from the final cancellation probe.
+        check,
+        async move { signal.cancelled().await },
+        move |spawn, (_, authority)| {
+            let _ = boundary.with_source_authority(authority, || {
+                spawn.spawn();
+                Ok(())
+            });
+        },
+    )
+    .await
+}
+
+/// Factual original Process result and independent, deferred source
+/// settlement. A failed proof write must not erase the OS result.
+#[must_use = "record the original Process result and check source quiescence"]
+pub struct SourceProcessCompletion {
+    pub receipt: std::result::Result<ProcessReceipt, PipeLaunchFailure>,
+    pub quiescence: Result<SandboxEffectOutcome>,
+}
+
+struct CancelAwaiter(CancellationToken);
+impl Drop for CancelAwaiter {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Trusted finite, noninteractive Process execution. The actual Process
+/// owner holds source custody through wait/stop/reap and records physical
+/// quiescence before returning a result to the original journal owner.
+/// Losing the awaiter cancels only this execution, not its parent Turn,
+/// and does not abort its settlement task. The reviewed driver must prove
+/// permanent source quiescence; a negative Unix group scan is insufficient.
+/// No new Job, replay or source-bearing admission is introduced.
+pub async fn run_source_process<P, A>(
+    prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
+    deadline: Instant,
+    cancellation: CancellationToken,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()> + Send + 'static,
+) -> Result<SourceProcessCompletion>
+where
+    P: Send + 'static,
+    A: SandboxEffectAuthority + Send + 'static,
+{
+    let abandoned = CancellationToken::new();
+    let control = SourceProcessControl {
+        tool: prepared.authority().tool.clone(),
+        cancellation,
+        abandoned: Some(abandoned.clone()),
+    };
+    let _awaiter = CancelAwaiter(abandoned);
+    let (launch, authority, boundary, source) = prepared.admit_with_launch_authority()?;
+    tokio::spawn(async move {
+        let receipt =
+            match spawn_source_process(launch, authority, boundary, deadline, &control).await {
+                Ok(mut process) => {
+                    process.close_stdin();
+                    Ok(process
+                        .wait(
+                            control.cancelled(),
+                            deadline.saturating_duration_since(Instant::now()),
+                        )
+                        .await)
+                }
+                Err(failure) => Err(failure),
+            };
+        let terminal = receipt
+            .as_ref()
+            .map(|receipt| receipt.terminal)
+            .map_err(launch_outcome);
+        let quiescence = tokio::task::spawn_blocking(move || {
+            let outcome = match terminal {
+                Ok(terminal) => terminal_outcome(&terminal, prove_quiescent),
+                Err(outcome) => Ok(outcome),
+            };
+            source.defer_until_tool_finished(
+                outcome
+                    .as_ref()
+                    .copied()
+                    .unwrap_or(SandboxEffectOutcome::Unknown),
+            )?;
+            outcome
+        })
+        .await
+        .unwrap_or(Err(Error::Protocol(
+            "source Process settlement worker failed; inspect before retry",
+        )));
+        SourceProcessCompletion {
+            receipt,
+            quiescence,
+        }
+    })
+    .await
+    .map_err(|_| Error::Protocol("source Process owner failed; inspect before retry"))
 }
 
 /// Consume a registered driver's prepared launch through the original
@@ -97,34 +257,14 @@ where
     P: Send + 'static,
     A: SandboxEffectAuthority + Send + 'static,
 {
-    if prepared
-        .authority()
-        .tool_binding()
-        .is_none_or(|binding| binding.effect != ToolEffect::Process)
-    {
-        return Err(Error::Denied(
-            "source Process requires an original Process tool",
-        ));
-    }
     let tool = prepared.authority().tool.clone();
-    let check_tool = tool.clone();
-    let signal_tool = tool.clone();
-    let check_cancel = cancellation.clone();
-    let (launch, source) = prepared
-        .start_with_authority(move |launch, authority| {
-            PipeProcess::spawn_prepared_until(
-                launch.with_custody(authority),
-                deadline,
-                move || check_cancel.is_cancelled() || !check_tool.is_live(),
-                async move {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => {},
-                        _ = signal_tool.wait_until_not_live() => {},
-                    }
-                },
-            )
-        })
-        .await?;
+    let control = SourceProcessControl {
+        tool: tool.clone(),
+        cancellation,
+        abandoned: None,
+    };
+    let (launch, authority, boundary, source) = prepared.admit_with_launch_authority()?;
+    let launch = spawn_source_process(launch, authority, boundary, deadline, &control).await;
     Ok(SourceProcessStart {
         launch,
         source: SourceProcessLease { source, tool },
@@ -148,8 +288,12 @@ where
     S: aw_store::SecretStore + 'static,
 {
     let tool = prepared.authority().tool.clone();
-    let signal_tool = tool.clone();
-    let check_cancel = cancellation.clone();
+    let control = SourceProcessControl {
+        tool: tool.clone(),
+        cancellation,
+        abandoned: None,
+    };
+    let check = control.probe();
     let (launch, source) = prepared
         .start_with_launch_authority(move |launch, authority, boundary| {
             PipeProcess::spawn_prepared_fenced_until(
@@ -157,13 +301,8 @@ where
                 deadline,
                 // The final synchronous fence itself owns the ToolBinding read
                 // guard. Do not re-enter that guard from the cancellation probe.
-                move || check_cancel.is_cancelled(),
-                async move {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => {},
-                        _ = signal_tool.wait_until_not_live() => {},
-                    }
-                },
+                check,
+                async move { control.cancelled().await },
                 move |mut spawn, (_, authority)| {
                     // Only the actual registered provider and current original
                     // intent may project this value. A refusal leaves the
@@ -212,8 +351,8 @@ mod tests {
         AccountOwner, Agent, AgentOptions, BillingOwner, CheckpointPolicy, CredentialCustody,
         DriverKey, InvocationIdentity, JournalEntry, Message, NamedSourceAccess, PrincipalId, Role,
         SandboxDriverRegistry, SchemaSupport, SourceAccess, SourceBinding, SourceDriverRegistry,
-        SourceDriverSchemas, SourceName, SourceSetLimit, ToolCall, ToolOutput, ToolRecord,
-        ToolSource, ToolSourceEvidence, ToolStatus, Turn, TurnJournal, TurnStart,
+        SourceDriverSchemas, SourceName, SourceSetLimit, ToolCall, ToolEffect, ToolOutput,
+        ToolRecord, ToolSource, ToolSourceEvidence, ToolStatus, Turn, TurnJournal, TurnStart,
     };
     use aw_store::{
         SandboxEffectOrigin, SandboxEffectPlan, SandboxEffectRequest, SandboxGrantPolicy,
@@ -278,6 +417,10 @@ mod tests {
     fn fixture_command(id: &str) -> &'static str {
         if id.starts_with("host:vault-") {
             r#"[[ "$AW_VAULT_SIGNING_PROOF" =~ ^[0-9a-f]{64}$ ]] || exit 21; printf changed > code; printf done"#
+        } else if id == "host:interrupted" {
+            // Fixed single-child workload: shell builtins only. The marker
+            // proves actual execution before the result awaiter disappears.
+            "printf entered > entered; while :; do :; done"
         } else {
             "printf changed > code; printf done"
         }
@@ -452,6 +595,7 @@ mod tests {
             .unwrap();
         let calls = [
             "host:stale",
+            "host:stale-source",
             "host:cancelled",
             "host:missing",
             "host:vault-stale",
@@ -611,6 +755,43 @@ mod tests {
             .permit_registered_host_tool(actor.clone(), "bash")
             .unwrap();
 
+        // Revoke and regrant *after* original admission, before the actual
+        // spawn lane. The old decision must not follow the new generation.
+        let stale_source = prepare("host:stale-source", capture(), false).unwrap();
+        let control = SourceProcessControl {
+            tool: stale_source.authority().tool.clone(),
+            cancellation: CancellationToken::new(),
+            abandoned: None,
+        };
+        let (launch, authority, boundary, source) =
+            stale_source.admit_with_launch_authority().unwrap();
+        let revoked = store
+            .sandbox_grant_set(&actor, &reference, 1, None)
+            .unwrap();
+        store
+            .sandbox_grant_set(&actor, &reference, revoked.revision, Some(&policy))
+            .unwrap();
+        let Err(failure) =
+            spawn_source_process(launch, authority, boundary, deadline(), &control).await
+        else {
+            panic!("stale admitted source grant spawned a Process")
+        };
+        assert!(matches!(
+            failure,
+            PipeLaunchFailure::NotStarted(Error::Denied(_))
+        ));
+        assert_eq!(std::fs::read(&code).unwrap(), b"initial");
+        final_records.push(
+            finish_tool(
+                &journal,
+                "host:stale-source",
+                ToolStatus::Failed,
+                ToolOutput::error("source grant changed before spawn"),
+            )
+            .await,
+        );
+        source.settle(SandboxEffectOutcome::NotStarted).unwrap();
+
         let cancel = CancellationToken::new();
         cancel.cancel();
         for (id, missing, cancellation) in [
@@ -618,14 +799,19 @@ mod tests {
             ("host:missing", true, CancellationToken::new()),
         ] {
             let prepared = prepare(id, capture(), missing).unwrap();
-            let SourceProcessStart { launch, source } =
-                start_source_process(prepared, deadline(), cancellation)
-                    .await
-                    .unwrap();
-            let Err(failure) = launch else {
-                panic!("definite no-spawn returned a Process")
-            };
-            assert!(matches!(failure, PipeLaunchFailure::NotStarted(_)));
+            let completion = run_source_process(prepared, deadline(), cancellation, |_| {
+                panic!("no-spawn must not inspect a terminal")
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                completion.receipt,
+                Err(PipeLaunchFailure::NotStarted(_))
+            ));
+            assert_eq!(
+                completion.quiescence.unwrap(),
+                SandboxEffectOutcome::NotStarted
+            );
             final_records.push(
                 finish_tool(
                     &journal,
@@ -636,8 +822,10 @@ mod tests {
                 .await,
             );
             assert_eq!(
-                source.settle_after_recorded_failure(&failure).unwrap(),
-                SandboxEffectOutcome::NotStarted
+                store
+                    .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, id)
+                    .unwrap(),
+                Some(SandboxEffectOutcome::NotStarted)
             );
         }
         assert_eq!(
@@ -854,20 +1042,18 @@ mod tests {
             .unwrap();
         let prepared = prepare("host:unproven", capture(), false).unwrap();
         let unresolved_id = prepared.plan().effect_id.clone();
-        let SourceProcessStart { launch, source } =
-            start_source_process(prepared, deadline(), CancellationToken::new())
-                .await
-                .unwrap();
-        let receipt = launch
-            .unwrap()
-            .wait(std::future::pending(), Duration::from_secs(5))
-            .await;
+        let completion = run_source_process(prepared, deadline(), CancellationToken::new(), |_| {
+            Err(Error::Conflict(
+                "fixture cannot prove source quiescence yet",
+            ))
+        })
+        .await
+        .unwrap();
+        // Physical process truth survives failure to prove source quiescence.
+        let receipt = completion.receipt.unwrap();
         assert_eq!(receipt.terminal.exit, ProcessExit::Code(0));
-        // Even a known physical terminal cannot release source custody
-        // before the matching immutable original tool receipt exists.
-        assert!(source
-            .settle_after_recorded_terminal(&receipt.terminal, |_| Ok(()))
-            .is_err());
+        assert_eq!(receipt.output.stdout.head, b"done");
+        assert!(completion.quiescence.is_err());
         assert!(store
             .acquire_source_mutation_barrier(&set, "host:unknown")
             .is_err());
@@ -927,21 +1113,58 @@ mod tests {
             SandboxEffectOutcome::Settled
         );
 
-        // Loss after a real Process terminal but before ToolFinished.
-        // Drop the original owner without finishing the Run; startup
-        // must reconstruct the Interrupted projection from its journal.
+        // Loss of the awaiter while the real finite Process is running.
+        // Its original owner requests cancellation, waits/reaps, and
+        // records physical proof independently of the lost result.
         let prepared = prepare("host:interrupted", capture(), false).unwrap();
-        let unresolved_id = prepared.plan().effect_id.clone();
-        let SourceProcessStart { launch, source } =
-            start_source_process(prepared, deadline(), CancellationToken::new())
-                .await
-                .unwrap();
-        let receipt = launch
-            .unwrap()
-            .wait(std::future::pending(), Duration::from_secs(5))
-            .await;
-        assert_eq!(receipt.terminal.exit, ProcessExit::Code(0));
-        drop(source);
+        let interrupted_id = prepared.plan().effect_id.clone();
+        let parent_cancel = CancellationToken::new();
+        let mut pending = Box::pin(run_source_process(
+            prepared,
+            deadline(),
+            parent_cancel.clone(),
+            |terminal| {
+                // The trusted fixture command contains no child creation.
+                assert_eq!(
+                    terminal.stop_reason(),
+                    Some(aw_tools::execution_stop::StopReason::Cancelled)
+                );
+                Ok(())
+            },
+        ));
+        let entered = source_root.join("entered");
+        tokio::select! {
+            _ = &mut pending => panic!("finite Process returned before result loss"),
+            ready = tokio::time::timeout(Duration::from_secs(3), async {
+                while !entered.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => ready.unwrap(),
+        }
+        drop(pending);
+        assert!(!parent_cancel.is_cancelled());
+        // Wait for the worker's original durable physical fact, not a
+        // guessed delay or new process observation. Its Store owner
+        // must stay live until this proof commits.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let done: bool = Connection::open(temp.0.join("sessions.sqlite3"))
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM commit_log
+                         WHERE entity_type='source_effect' AND entity_id=?1 AND kind='source.effect.quiescent')",
+                        [&interrupted_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(store
             .sandbox_recover_tool_source_effect(
                 &actor,
@@ -976,23 +1199,8 @@ mod tests {
                 .rev,
             sandbox.rev + 3
         );
-        // No physical proof from the original reconstructed Interrupted
-        // record itself. Unknown inspection keeps all original hazards.
-        assert_eq!(
-            reopened
-                .sandbox_recover_tool_source_effect(
-                    &actor,
-                    &reference,
-                    1,
-                    "host:interrupted",
-                    |recovery| {
-                        assert_eq!(recovery.terminal.status, ToolStatus::Interrupted);
-                        Ok(SandboxEffectOutcome::Unknown)
-                    }
-                )
-                .unwrap(),
-            SandboxEffectOutcome::Unknown
-        );
+        // Source claims stay fenced until the original Run closure is
+        // paired with the worker's recorded physical fact.
         assert!(reopened
             .acquire_source_mutation_barrier(&set, "host:unknown-after-restart")
             .is_err());
@@ -1021,27 +1229,7 @@ mod tests {
                     &reference,
                     1,
                     "host:interrupted",
-                    |recovery| {
-                        assert_eq!(recovery.effect_id, unresolved_id);
-                        assert_eq!(recovery.actor, actor);
-                        assert_eq!(&recovery.driver, &handle.descriptor().driver);
-                        assert_eq!(recovery.original.call.id, "host:interrupted");
-                        assert_eq!(recovery.terminal.status, ToolStatus::Interrupted);
-                        assert!(recovery.terminal.output.is_none());
-                        assert!(matches!(
-                            &recovery.terminal_ref,
-                            aw_store::SandboxToolTerminalRef::InterruptedTurn(_)
-                        ));
-                        assert_eq!(recovery.sources.len(), 1);
-                        assert_eq!(
-                            recovery.sources[0].binding.binding.materialization,
-                            code.to_str().unwrap()
-                        );
-                        assert!(reopened
-                            .acquire_source_mutation_barrier(&set, "host:recovering")
-                            .is_err());
-                        Ok(SandboxEffectOutcome::Settled)
-                    }
+                    |_| panic!("recorded Process quiescence needs no external reinspection")
                 )
                 .unwrap(),
             SandboxEffectOutcome::Settled

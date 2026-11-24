@@ -279,6 +279,16 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
         self,
         start: impl FnOnce(P, A, SandboxEffectLaunch) -> F,
     ) -> Result<(R, SandboxEffectLease)> {
+        let (prepared, authority, boundary, lease) = self.admit_with_launch_authority()?;
+        let result = start(prepared, authority, boundary).await;
+        Ok((result, lease))
+    }
+
+    /// Transfer both the one-shot launch boundary and original settlement
+    /// custody to the actual Process owner, without borrowing the submitter.
+    pub fn admit_with_launch_authority(
+        self,
+    ) -> Result<(P, A, SandboxEffectLaunch, SandboxEffectLease)> {
         if self.boundary.intent.is_none()
             || self
                 .authority
@@ -296,8 +306,7 @@ impl<P, A: SandboxEffectAuthority> PreparedSandboxEffect<'_, P, A> {
             boundary,
             pin: lease.barrier.launch_pin(),
         };
-        let result = start(prepared, authority, launch).await;
-        Ok((result, lease))
+        Ok((prepared, authority, launch, lease))
     }
 
     fn admit(self) -> Result<(P, A, SandboxEffectLease, SandboxEffectRequest, Boundary)> {
@@ -367,6 +376,17 @@ pub struct SandboxEffectLaunch {
 }
 
 impl SandboxEffectLaunch {
+    /// Final ordinary Process launch. Hold the live source/tool decision
+    /// and original Store exclusion through OS spawn and scope attachment.
+    /// The synchronous callback must not perform unrelated writes or await.
+    pub fn with_source_authority<R>(
+        self,
+        source: &impl SandboxEffectAuthority,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        self.with_launch_in(source, |_| operation())
+    }
+
     /// Trusted provider-specific projection. Hold the actual source/tool
     /// authority and provider guard across the read-only Store transaction
     /// and synchronous final spawn. No writes, async work or second effect
@@ -385,6 +405,23 @@ impl SandboxEffectLaunch {
                 "Vault projection differs from original Process actor",
             ));
         }
+        self.with_launch_in(source, |tx| {
+            crate::vault_grants::require_projection_in(
+                tx,
+                registry,
+                vault,
+                expected_grant_rev,
+                aw_agent_core::VaultProjection::Env,
+            )?;
+            operation()
+        })
+    }
+
+    fn with_launch_in<R>(
+        self,
+        source: &impl SandboxEffectAuthority,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<R>,
+    ) -> Result<R> {
         source.with_admission(|| {
             let mut connection = self.store.connection()?;
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
@@ -402,16 +439,9 @@ impl SandboxEffectLaunch {
                 return Err(Error::Conflict("original Process launch boundary changed"));
             }
             self.pin.require_held_in(&tx)?;
-            crate::vault_grants::require_projection_in(
-                &tx,
-                registry,
-                vault,
-                expected_grant_rev,
-                aw_agent_core::VaultProjection::Env,
-            )?;
             // No commit or fallible settlement after an OS spawn: this
             // transaction only excludes writers while the effect is launched.
-            operation()
+            operation(&tx)
         })
     }
 

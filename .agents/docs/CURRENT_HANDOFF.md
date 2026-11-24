@@ -52,7 +52,7 @@ retention reconciliation, managed closed-Sandbox retirement, effectful versioned
 baseline restore host consumers, and v59 Agent VaultGrant references with the final
 staged VaultProvider leaf, concrete local signing broker, fenced Process proof
 projection, interrupted source-effect custody recovery and worker-owned native
-source quiescence are implemented locally.
+and finite Process quiescence are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2357,6 +2357,33 @@ not arbitrary Process containment, crash-time
 private artifact cleanup or automatic whole-Run hazard acknowledgement. The source
 bearing association remains fixture-only. Shared barrier/result API no longer needs
 borrow lifetimes, allowing other trusted workers to retain the real owner.
+
+Ordinary source Process launch now uses the same actual OS spawn/attachment
+fence as the Vault projection. `SandboxEffectLaunch::with_source_authority`
+reuses the exact original intent, binding/grant/writer observations, complete lease
+pin and live ToolBinding/source authority transaction; Vault adds its independent
+projection check inside that same boundary. Revoke/regrant after initial claim
+cannot authorize the old launch. `admit_with_launch_authority` transfers the
+original launch and settlement custody to the real worker. `run_source_process`
+is a trusted finite noninteractive consumer of the same PipeProcess owner:
+its local result-await cancellation token does not cancel the parent Turn, and
+loss of the awaiter cannot abort the original wait/stop/reap and proof settlement.
+Return the factual Process receipt (or definite/uncertain launch refusal) separately
+from the source proof result. Positive proof is recorded before ordinary ToolFinished
+release; no receipt is fabricated if the result is lost. Proof refusal/panic leaves
+Unknown custody. A known exit/group scan alone is not proof; the reviewed driver
+must independently establish permanent source quiescence. Existing interactive and
+Vault start APIs still return explicit custody, not automatic terminal settlement.
+Grouped Process regression exercises grant revoke/regrant between claim and spawn,
+no-start proof settlement, actual successful terminal with refused source proof,
+and dropped awaiter after a real fixed single-child workload enters; it observes
+cancellation and durable quiescence, reopens the interrupted Run and reuses the
+proof without rewriting history or acknowledging broader hazards. Sandbox **4/4**,
+Vault **1/1**, Host **16/16**, strict affected all-target/all-feature Clippy,
+workspace all-target/all-feature check and scoped fmt/diff passed. Earlier broad
+Store failures remain recorded, not rerun. No schema, second Process/Job owner
+or source-bearing admission change. Runtime loss and failed
+proof commit still require reconciliation; production containment remains separate.
 
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
