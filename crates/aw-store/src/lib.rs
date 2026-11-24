@@ -37,6 +37,7 @@ mod coordination;
 pub mod durability;
 mod event_authority;
 mod event_causal;
+mod event_cutover;
 mod event_handler;
 mod event_input;
 mod event_placement;
@@ -144,6 +145,7 @@ pub use durability::{
     SemanticMaterializationPolicy, SemanticMaterializationPolicyResult, SemanticMaterializeResult,
     SemanticMaterializedFact, SemanticSyncApply, SemanticSyncBatch,
 };
+pub use event_cutover::LegacyEventInputWake;
 pub use event_handler::{
     EventHandlerAck, EventHandlerActivation, EventHandlerAuthority, EventHandlerDelivery,
     EventHandlerPoll, EventHandlerStart, EventHandlerState,
@@ -296,8 +298,10 @@ pub const CUSTOM_EVENT_SCHEMA: &str = include_str!("../migrations/051_custom_eve
 pub const EVENT_HANDLER_SCHEMA: &str = include_str!("../migrations/052_event_handlers.sql");
 pub const EVENT_UNIVERSE_PLACEMENT_SCHEMA: &str =
     include_str!("../migrations/053_event_universe_placement.sql");
+pub const EVENT_DELIVERY_CUTOVER_SCHEMA: &str =
+    include_str!("../migrations/054_event_delivery_cutover.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 53;
+const LATEST_SCHEMA_VERSION: i64 = 54;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -2931,6 +2935,10 @@ fn initialize(c: &mut Connection) -> Result<()> {
         migrate_event_universe_placement(c)?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 53 {
+        migrate_event_delivery_cutover(c)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {
         job_exposure::normalize_agent_exposures(c)?;
     }
@@ -3408,6 +3416,53 @@ fn migrate_event_projection(c: &mut Connection) -> Result<()> {
         [now()],
     ))?;
     db(tx.pragma_update(None, "user_version", 44))?;
+    db(tx.commit())?;
+    Ok(())
+}
+
+fn migrate_event_delivery_cutover(c: &mut Connection) -> Result<()> {
+    let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let lease_changed = db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id='event-delivery-cutover',generation=generation+1,
+             target_epoch=54,lease_expires_at=?1,updated_at=?2
+         WHERE singleton=1 AND holder_client_id IS NULL",
+        params![now().saturating_add(60_000_000), now()],
+    ))?;
+    if lease_changed != 1 {
+        return Err(Error::Conflict(
+            "another migration lease is active; schema upgrade is excluded",
+        ));
+    }
+    db(tx.execute_batch(EVENT_DELIVERY_CUTOVER_SCHEMA))?;
+    event_cutover::cutover_all_in(&tx)?;
+    let violations: i64 = db(tx.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check",
+        [],
+        |row| row.get(0),
+    ))?;
+    if violations != 0 {
+        return Err(Error::Storage(
+            "Event delivery cutover migration foreign-key check failed; old transaction retained",
+        ));
+    }
+    db(tx.execute(
+        "UPDATE store_meta SET value='54' WHERE key='schema_epoch'",
+        [],
+    ))?;
+    db(tx.execute(
+        "UPDATE schema_meta
+         SET schema_epoch=54,activation_epoch=54,migration_phase='ready',updated_at=?1
+         WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.execute(
+        "UPDATE migration_lease
+         SET holder_client_id=NULL,generation=generation+1,current_epoch=54,target_epoch=NULL,
+             lease_expires_at=NULL,updated_at=?1 WHERE singleton=1",
+        [now()],
+    ))?;
+    db(tx.pragma_update(None, "user_version", 54))?;
     db(tx.commit())?;
     Ok(())
 }

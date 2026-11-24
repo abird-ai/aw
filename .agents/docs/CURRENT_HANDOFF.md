@@ -15,19 +15,19 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Current authoritative snapshot — 2026-11-23
+## Current authoritative snapshot — 2026-11-24
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
-complete and published. Phase 1 is COMPLETE locally. Phase 2 is UNDERWAY: the v44 Event projection,
+complete and published. Phase 1 is COMPLETE locally. Phase 2 is COMPLETE locally: v44 Event projection,
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
 exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery,
-v50 disclosure/causal execution closure, the v51 one-leaf EventTypeRegistry + custom Event publication
-owner, the model-facing `events_publish` / `events_subscribe` adapter, v52 EventHandler
-definition/activation/receipt ownership, and v53 same-store cross-Domain Event-universe completeness are now
-implemented locally. Materialized/provider audience expansion remains Unknown until its provider-held
-principal fence exists; the explicit v36 delivery cutover is the remaining Phase-2 Event slice.
-Real-Bubblewrap worker-retirement and Windows-native Process qualification remain explicitly deferred
-evidence and are not claimed green.**
+v50 disclosure/causal execution closure, v51 EventTypeRegistry + custom Event publication, the model-facing
+`events_publish` / `events_subscribe` adapter, v52 EventHandler definition/activation/receipt ownership,
+v53 same-store cross-Domain Event-universe completeness, and v54 serialized v36 delivery cutover +
+compatibility provenance are implemented locally. Materialized/provider audience expansion remains Unknown
+until its provider-held principal fence exists, but it no longer blocks Phase-2 completion. Real-Bubblewrap
+worker-retirement and Windows-native Process qualification remain explicitly deferred evidence and are not
+claimed green.**
 
 Verified publication truth:
 
@@ -42,10 +42,11 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 The local Phase-1/2 implementation line remains unpublished. Phase-1 completion is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 began at
 `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and currently runs
-through `53490a6d19d542c98416a6f3a67f085b4ffc73ed` (`Own durable EventHandler receipts`), with the
+through `8fc29093037a8e6540cdfd0da4294a4db58512d2` (`Prove same-store Event universes`), with the
 intermediate private EventScan/source/read/wake/Project/subscription/EventInput/disclosure/custom-publication/
-model-tool checkpoints preserved in Git history. This checkpoint adds v53 same-store cross-Domain Event
-universe completeness. The local `origin/main` tracking ref is stale and is not publication truth.
+model-tool/Handler checkpoints preserved in Git history. This checkpoint adds v54 final Event delivery
+cutover and closes Phase 2 locally. The local `origin/main` tracking ref is stale and is not publication
+truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -986,14 +987,74 @@ regression **1/1**, Handler lifecycle **1/1**, combined Event migration/lifecycl
 contextualization **1/1**, real model router **1/1**, repository fmt, full workspace all-target check,
 strict affected Clippy and scoped diff-check are green.
 
-The only remaining Phase-2 Event slice is the explicit v36 legacy-delivery cutover.
-`delivery_cutover_rev` remains NULL and legacy pending delivery/ACK ownership is unchanged.
+Schema **v54** closes sealed Phase-2 step 13 and the Event phase. The schema-owner migration runs one
+SQLite-serialized compatibility transaction over every remaining v36 `agent_job_event_sources` row. For
+each source it first proves the legacy `SourceEventBook.next_event_revision` equals the generic
+`event_sources_current.next_event_rev`, then atomically writes
+`delivery_cutover_rev = current next_event_rev`. That revision is the first DL-200 delivery-owned revision:
+all names below it remain legacy-only; the whole revision at/above it is DL-200-only. Because the write,
+subscription translation, pending bridge and legacy-pending drain share one transaction, crash either leaves
+the old v53 owner intact or publishes the complete cutover. Restart reads the durable cutover; it never
+guesses ownership.
 
-**Next Phase-2 slice:** perform sealed step 13 as one source-owner serialized transaction:
-set `delivery_cutover_rev = current next_event_rev`, preserve whole-revision ownership across the boundary,
-install post-cutover DL-200 subscription state, fence legacy new delivery admission, and bridge only genuinely
-pending pre-cutover deliveries with deterministic identity/conservative compatibility disclosure provenance.
-Crash/restart must reread the cutover and no source revision may be owned by both delivery paths.
+Legacy source rules translate to **exact Event subjects**, not another broad event bus. Their tiny
+`event_legacy_subscription_compat` sidecar retains source/name, legacy generation, effective scheduling mode,
+cutover revision and the original wake creator/authority. A collision with an already-active ordinary DL-200
+subscription does not overwrite that subscription: `shadow_existing=1` preserves its creator, generation,
+baseline and progress, while one candidate performs the normal admission and then an explicit legacy-shadow
+admission under the old wake authority. A non-shadow translated row is just the normal subscription owner
+with compatibility identity attached. New non-empty legacy `jobs_subscribe` admission is fenced after
+cutover; empty cleanup remains harmless.
+
+Only genuinely pending pre-cutover deliveries bridge. Existing dual-written Event envelopes are reused when
+present; otherwise v54 writes one deterministic immutable compatibility Event fact for the exact
+source/revision/name. The EventInput owner remains the only admission linearization point. Legacy delivery
+identity is deterministic over source + revision + recipient + legacy generation + effective mode, so
+same-revision result/settled rules with the same effective queue mode coalesce exactly once independent of
+legacy pending JSON order. `event_legacy_input_compat` stores only the scheduling/provenance sidecar; the
+typed EventInput remains the factual Agent input and the old pending JSON is cleared after successful bridge.
+
+Already-accepted legacy `qi_...` Inputs are never re-minted. Migration identifies the existing factual
+ActorQueue/Input pair and adds only `legacy_event_input_compat` disclosure provenance keyed by that exact
+Input ID. The frozen historical ceiling is deliberately conservative: only the factual recipient actor can
+be proven from the accepted Input without replaying a second ACL policy engine. If the legacy queue's
+`job-event:<sha256(source_ref)>` sender can be matched uniquely to a canonical source, the manifest also
+retains the normal `agent_source` authority root. A later reader/fork outside the frozen actor is therefore
+allowed only when that reconstructed source root independently reauthorizes current `view/share`; without
+source reconstruction the old Input remains hard-frozen. A viewer merely present in the current ACL at
+cutover is explicitly **not** inferred as historical disclosure. The sidecar is pulled into descendant
+history manifests through the existing run/ancestry owner; no accepted Input identity or history fact is
+rewritten.
+
+Post-cutover source lifecycle keeps the old JSON only as frozen compatibility evidence. `commit_source`
+no longer calls `SourceEventBook::commit`, custom publication no longer advances its revision, and no new
+legacy pending row is produced. The generic source counter alone advances. A source first created on schema
+v54 is born with `delivery_cutover_rev=1`, so a resource created after migration cannot reopen legacy
+delivery accidentally.
+
+The runtime bridge remains worker-free. The existing factual source-transition `deliver_source_events`
+wake point drives only translated compatibility subjects through normal `event_subscription_deliver`.
+Accepted compatibility EventInputs are then projected into existing ActorQueue custody under their exact
+`edi_...` delivery ID. `run_once` binds that immutable EventInput into the next Turn before the ordinary
+queue ACK, so causal/provenance ownership stays with EventInput. Live-owner registration and later source
+wakes reconcile any compatibility EventInput that has no factual `runs.event_input_delivery_id`; existing
+queue custody is idempotent, making a crash between EventInput commit and queue projection recoverable without
+a new worker or queue.
+
+Focused v54 evidence stays grouped: `v54_cutover_bridges_pending_once_and_fences_legacy_delivery_owner`
+**1/1** proves exact cutover rev, pending result+settled coalescing, pending-order independence, existing
+generic-subscription shadowing, unchanged accepted `qi_...` identity, conservative non-declassification of
+a later ACL viewer, frozen legacy book, post-cutover system/custom revision ownership, legacy subscribe
+fencing and fresh-source cutover-at-1. The combined attached-Turn/Event migration regression **1/1** now runs
+its legacy phase explicitly under epoch 53 and migrates v44→...→v54. Existing Agent Jobs group-authority
+regression **1/1** remains green. Repository fmt, full workspace all-target check, strict
+`aw-tools + aw-store + aw-cli` Clippy and scoped diff-check are green. Zero-test generic name filters are
+not counted as evidence.
+
+**Phase 2 is COMPLETE locally. Next implementation slice:** begin sealed **Phase 3** with one durable
+DriverKey and shared Prepared/ExternalEvidence contracts for bounded SourceSet capture/restore, checkpoint
+constructors and driver recovery. Do not contract the v36 compatibility tables yet; Phase 7 owns removal
+after cross-version drain/restart evidence.
 
 Current focused evidence for the final Phase-1 cut: the existing Store host state-shell regression now
 also exercises a real group ACL grant through `agent_access_set_ref`, and the existing strict headless

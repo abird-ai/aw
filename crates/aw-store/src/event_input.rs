@@ -36,6 +36,77 @@ pub(crate) fn admit_subscription_candidate(
     preliminary_source: &EventSourceEvidence,
     preliminary_envelope: &EventEnvelope,
 ) -> Result<EventInputAdmission> {
+    admit_subscription_candidate_inner(
+        connection,
+        expected,
+        candidate,
+        preliminary_source,
+        preliminary_envelope,
+        LegacyAdmission::Automatic,
+    )
+}
+
+pub(crate) fn admit_legacy_shadow_candidate(
+    connection: &Connection,
+    expected: &StoredSubscription,
+    candidate: &EventCandidate,
+    preliminary_source: &EventSourceEvidence,
+    preliminary_envelope: &EventEnvelope,
+) -> Result<EventInputAdmission> {
+    admit_subscription_candidate_inner(
+        connection,
+        expected,
+        candidate,
+        preliminary_source,
+        preliminary_envelope,
+        LegacyAdmission::Forced {
+            allow_pre_cutover: false,
+        },
+    )
+}
+
+pub(crate) fn admit_legacy_bridge_candidate(
+    connection: &Connection,
+    expected: &StoredSubscription,
+    candidate: &EventCandidate,
+    preliminary_source: &EventSourceEvidence,
+    preliminary_envelope: &EventEnvelope,
+) -> Result<EventInputAdmission> {
+    admit_subscription_candidate_inner(
+        connection,
+        expected,
+        candidate,
+        preliminary_source,
+        preliminary_envelope,
+        LegacyAdmission::Forced {
+            allow_pre_cutover: true,
+        },
+    )
+}
+
+pub(crate) fn has_legacy_shadow(
+    connection: &Connection,
+    recipient_ref: &str,
+    subject: &str,
+) -> Result<bool> {
+    Ok(legacy_compat(connection, recipient_ref, subject)?
+        .is_some_and(|compat| compat.shadow_existing))
+}
+
+#[derive(Clone, Copy)]
+enum LegacyAdmission {
+    Automatic,
+    Forced { allow_pre_cutover: bool },
+}
+
+fn admit_subscription_candidate_inner(
+    connection: &Connection,
+    expected: &StoredSubscription,
+    candidate: &EventCandidate,
+    preliminary_source: &EventSourceEvidence,
+    preliminary_envelope: &EventEnvelope,
+    legacy_admission: LegacyAdmission,
+) -> Result<EventInputAdmission> {
     let Some(current) = event_subscription::subscription_row(
         connection,
         &expected.recipient_ref,
@@ -69,7 +140,56 @@ pub(crate) fn admit_subscription_candidate(
         return Ok(EventInputAdmission::PlacementStale);
     }
 
-    let creator = PrincipalId::new(current.created_by.clone())?;
+    let legacy = legacy_compat(connection, &current.recipient_ref, &current.subject)?;
+    let (use_legacy, allow_pre_cutover_legacy) = match legacy_admission {
+        LegacyAdmission::Automatic => (
+            legacy
+                .as_ref()
+                .is_some_and(|compat| !compat.shadow_existing),
+            false,
+        ),
+        LegacyAdmission::Forced { allow_pre_cutover } => {
+            if legacy.is_none() {
+                return Err(Error::Storage(
+                    "forced legacy Event admission has no compatibility sidecar",
+                ));
+            }
+            (true, allow_pre_cutover)
+        }
+    };
+    let creator_ref = if use_legacy {
+        &legacy
+            .as_ref()
+            .expect("legacy admission requires compatibility state")
+            .legacy_created_by
+    } else {
+        &current.created_by
+    };
+    let creator = PrincipalId::new(creator_ref.clone())?;
+
+    if use_legacy {
+        let legacy = legacy
+            .as_ref()
+            .expect("legacy admission requires compatibility state");
+        let wake = match crate::agent_job_events::wake_admission_in(
+            connection,
+            &legacy.legacy_authority_ref,
+        ) {
+            Ok(Some(wake)) => wake,
+            Ok(None) | Err(Error::Denied(_)) => return Ok(EventInputAdmission::ProvenDenied),
+            Err(Error::Conflict(_)) => return Ok(EventInputAdmission::AuthorizationUnavailable),
+            Err(other) => return Err(other),
+        };
+        if wake.recipient_ref != current.recipient_ref
+            || wake.actor != creator.as_str()
+            || wake.authority_ref != legacy.legacy_authority_ref
+        {
+            return Err(Error::Storage(
+                "legacy Event compatibility wake authority identity changed",
+            ));
+        }
+    }
+
     match event_placement::snapshot(connection, &creator, &placement) {
         Ok(Some(_)) => {}
         Ok(None) => return Ok(EventInputAdmission::PlacementStale),
@@ -127,16 +247,77 @@ pub(crate) fn admit_subscription_candidate(
     if source_evidence.agent_ref == current.recipient_ref {
         return Ok(EventInputAdmission::ProvenDenied);
     }
-    if source_evidence != *preliminary_source {
+    let compare_preliminary = !use_legacy
+        || legacy
+            .as_ref()
+            .is_some_and(|compat| !compat.shadow_existing);
+    if compare_preliminary && source_evidence != *preliminary_source {
         return Ok(EventInputAdmission::AuthorizationUnavailable);
     }
     let source_agent_ref = source_evidence.agent_ref;
     let source_access = source_evidence.access;
 
-    let envelope = event_authority::candidate_envelope(candidate)?;
-    if envelope != *preliminary_envelope {
+    let preliminary_current = event_authority::candidate_envelope(candidate)?;
+    if preliminary_current != *preliminary_envelope {
         return Ok(EventInputAdmission::AuthorizationUnavailable);
     }
+
+    if use_legacy {
+        let legacy = legacy
+            .as_ref()
+            .expect("legacy admission requires compatibility state");
+        let concrete = aw_tools::event_subject::EventSubject::parse(&candidate.subject)
+            .map_err(|_| Error::Storage("legacy Event compatibility subject is invalid"))?;
+        if candidate.source.reference != legacy.source_ref
+            || concrete.event_name() != legacy.event_name
+        {
+            return Err(Error::Storage(
+                "legacy Event compatibility subscription escaped its exact rule",
+            ));
+        }
+        if candidate.event_rev < legacy.cutover_rev && !allow_pre_cutover_legacy {
+            return Ok(EventInputAdmission::ProvenDenied);
+        }
+    }
+
+    let storage_candidate = if use_legacy {
+        let legacy = legacy
+            .as_ref()
+            .expect("legacy admission requires compatibility state");
+        canonical_legacy_candidate(
+            connection,
+            &legacy.source_ref,
+            candidate.event_rev,
+            &current.recipient_ref,
+            legacy.legacy_generation,
+            &legacy.mode,
+        )?
+        .ok_or(Error::Storage(
+            "legacy Event compatibility revision has no canonical projected Event",
+        ))?
+    } else {
+        candidate.clone()
+    };
+    let candidate = &storage_candidate;
+    let storage_source = match event_authority::source_visibility(
+        connection,
+        &creator,
+        &placement,
+        &candidate.source,
+        &mut source_cache,
+    )? {
+        EventAuthorization::Allow(evidence) => evidence,
+        EventAuthorization::Deny => return Ok(EventInputAdmission::ProvenDenied),
+        EventAuthorization::Unknown => return Ok(EventInputAdmission::AuthorizationUnavailable),
+    };
+    if storage_source.agent_ref != source_agent_ref || storage_source.access != source_access {
+        return Ok(EventInputAdmission::AuthorizationUnavailable);
+    }
+    let envelope = match event_authority::candidate_authority(connection, &creator, candidate)? {
+        EventAuthorization::Allow(envelope) => envelope,
+        EventAuthorization::Deny => return Ok(EventInputAdmission::ProvenDenied),
+        EventAuthorization::Unknown => return Ok(EventInputAdmission::AuthorizationUnavailable),
+    };
     let audience = match crate::history_owner::authorize_event_delivery(
         connection,
         &creator,
@@ -152,20 +333,59 @@ pub(crate) fn admit_subscription_candidate(
             return Ok(EventInputAdmission::AuthorizationUnavailable)
         }
     };
-
     let retained_manifest = crate::history_owner::event_input_manifest(
         connection,
         &source_agent_ref,
         envelope.disclosure_manifest.as_deref(),
     )?;
 
-    let delivery_id = delivery_id(
-        &current.recipient_ref,
-        &current.subject,
-        current.generation,
-        &candidate.event_id,
-    );
+    let delivery_id = if use_legacy {
+        let legacy = legacy
+            .as_ref()
+            .expect("legacy admission requires compatibility state");
+        legacy_delivery_id(
+            &legacy.source_ref,
+            candidate.event_rev,
+            &current.recipient_ref,
+            legacy.legacy_generation,
+            &legacy.mode,
+        )
+    } else {
+        delivery_id(
+            &current.recipient_ref,
+            &current.subject,
+            current.generation,
+            &candidate.event_id,
+        )
+    };
     if let Some(existing) = existing_delivery(connection, &delivery_id)? {
+        if use_legacy {
+            let legacy = legacy
+                .as_ref()
+                .expect("legacy admission requires compatibility state");
+            let compatible: bool = db(connection.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM event_legacy_input_compat
+                      WHERE delivery_id=?1 AND source_ref=?2 AND event_rev=?3
+                        AND recipient_ref=?4 AND legacy_generation=?5 AND mode=?6
+                 )",
+                params![
+                    delivery_id,
+                    legacy.source_ref,
+                    candidate.event_rev,
+                    current.recipient_ref,
+                    legacy.legacy_generation,
+                    legacy.mode,
+                ],
+                |row| row.get(0),
+            ))?;
+            if !compatible {
+                return Err(Error::Storage(
+                    "legacy Event compatibility delivery identity collision",
+                ));
+            }
+            return Ok(EventInputAdmission::Deduplicated { delivery_id });
+        }
         if existing.0 != current.recipient_ref
             || existing.1 != current.subject
             || existing.2 != current.generation
@@ -265,7 +485,7 @@ pub(crate) fn admit_subscription_candidate(
             causal_root,
             envelope.causal_hop,
             data_json,
-            current.created_by,
+            creator.as_str(),
             source_access.access_generation.as_slice(),
             recipient_access.access_generation.as_slice(),
             now(),
@@ -273,6 +493,25 @@ pub(crate) fn admit_subscription_candidate(
             schema_json,
         ],
     ))?;
+    if use_legacy {
+        let legacy = legacy
+            .as_ref()
+            .expect("legacy admission requires compatibility state");
+        db(connection.execute(
+            "INSERT INTO event_legacy_input_compat(
+                 delivery_id,source_ref,event_rev,recipient_ref,legacy_generation,mode,created_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                delivery_id,
+                legacy.source_ref,
+                candidate.event_rev,
+                current.recipient_ref,
+                legacy.legacy_generation,
+                legacy.mode,
+                now(),
+            ],
+        ))?;
+    }
     for (ordinal, (principal_kind, principal_handle)) in audience.iter().enumerate() {
         db(connection.execute(
             "INSERT INTO agent_event_input_audience(
@@ -288,6 +527,106 @@ pub(crate) fn admit_subscription_candidate(
     }
     agent_owner::changed(connection, recipient)?;
     Ok(EventInputAdmission::Accepted { delivery_id })
+}
+
+#[derive(Clone, Debug)]
+struct LegacySubscriptionCompat {
+    source_ref: String,
+    event_name: String,
+    legacy_generation: u64,
+    mode: String,
+    cutover_rev: u64,
+    shadow_existing: bool,
+    legacy_created_by: String,
+    legacy_authority_ref: String,
+}
+
+fn canonical_legacy_candidate(
+    connection: &Connection,
+    source_ref: &str,
+    event_rev: u64,
+    recipient_ref: &str,
+    legacy_generation: u64,
+    mode: &str,
+) -> Result<Option<EventCandidate>> {
+    let mut query = db(connection.prepare(
+        "SELECT event_name
+         FROM event_legacy_subscription_compat
+         WHERE source_ref=?1 AND recipient_ref=?2
+           AND legacy_generation=?3 AND mode=?4
+         ORDER BY CASE event_name
+             WHEN 'result' THEN 0
+             WHEN 'settled' THEN 1
+             WHEN 'attention' THEN 2
+             ELSE 3
+         END,event_name",
+    ))?;
+    let rows = db(query.query_map(
+        params![source_ref, recipient_ref, legacy_generation, mode],
+        |row| row.get::<_, String>(0),
+    ))?;
+    for event_name in rows {
+        let event_name = db(event_name)?;
+        if let Some(candidate) = crate::event_scan::candidate_by_source_revision_name(
+            connection,
+            source_ref,
+            event_rev,
+            &event_name,
+        )? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn legacy_compat(
+    connection: &Connection,
+    recipient_ref: &str,
+    subject: &str,
+) -> Result<Option<LegacySubscriptionCompat>> {
+    db(connection
+        .query_row(
+            "SELECT source_ref,event_name,legacy_generation,mode,cutover_rev,
+                    shadow_existing,legacy_created_by,legacy_authority_ref
+             FROM event_legacy_subscription_compat
+             WHERE recipient_ref=?1 AND subject=?2",
+            params![recipient_ref, subject],
+            |row| {
+                Ok(LegacySubscriptionCompat {
+                    source_ref: row.get(0)?,
+                    event_name: row.get(1)?,
+                    legacy_generation: row.get(2)?,
+                    mode: row.get(3)?,
+                    cutover_rev: row.get(4)?,
+                    shadow_existing: row.get::<_, i64>(5)? != 0,
+                    legacy_created_by: row.get(6)?,
+                    legacy_authority_ref: row.get(7)?,
+                })
+            },
+        )
+        .optional())
+}
+
+fn legacy_delivery_id(
+    source_ref: &str,
+    event_rev: u64,
+    recipient_ref: &str,
+    legacy_generation: u64,
+    mode: &str,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"aw-legacy-event-delivery-v1\0");
+    for part in [
+        source_ref.as_bytes(),
+        recipient_ref.as_bytes(),
+        mode.as_bytes(),
+    ] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    hash.update(event_rev.to_be_bytes());
+    hash.update(legacy_generation.to_be_bytes());
+    format!("edi_{:x}", hash.finalize())
 }
 
 fn delivery_id(recipient_ref: &str, subject: &str, generation: u64, event_id: &str) -> String {

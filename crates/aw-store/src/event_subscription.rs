@@ -436,6 +436,11 @@ impl SessionStore {
             return Ok(run);
         }
 
+        let legacy_shadow = event_input::has_legacy_shadow(
+            &tx,
+            &subscription.recipient_ref,
+            &subscription.subject,
+        )?;
         let fence = EventScanFence::capture(&tx)?;
         let mut position = start;
         let mut examined = 0usize;
@@ -476,40 +481,48 @@ impl SessionStore {
                         source_evidence,
                         candidate_evidence,
                     } = *candidate;
-                    match event_input::admit_subscription_candidate(
+                    let primary = event_input::admit_subscription_candidate(
                         &tx,
                         &subscription,
                         &event,
                         &source_evidence,
                         &candidate_evidence,
-                    )? {
-                        event_input::EventInputAdmission::Accepted { delivery_id } => {
-                            run.accepted += 1;
-                            run.ready_inputs.push(delivery_id);
-                            terminal += 1;
-                            position = event.position;
-                        }
-                        event_input::EventInputAdmission::Deduplicated { delivery_id } => {
-                            run.deduplicated += 1;
-                            run.ready_inputs.push(delivery_id);
-                            terminal += 1;
-                            position = event.position;
-                        }
-                        event_input::EventInputAdmission::ProvenDenied => {
-                            run.skipped += 1;
-                            terminal += 1;
-                            position = event.position;
-                        }
-                        event_input::EventInputAdmission::AuthorizationUnavailable => {
+                    )?;
+                    match record_admission(&mut run, primary) {
+                        AdmissionProgress::Terminal => {}
+                        AdmissionProgress::Blocked => {
                             run.blocked = true;
                             break;
                         }
-                        event_input::EventInputAdmission::PlacementStale => {
+                        AdmissionProgress::Stale => {
                             lag_subscription_in(&tx, &subscription, "placement_stale")?;
                             run.lagged = true;
                             break;
                         }
                     }
+                    if legacy_shadow {
+                        let shadow = event_input::admit_legacy_shadow_candidate(
+                            &tx,
+                            &subscription,
+                            &event,
+                            &source_evidence,
+                            &candidate_evidence,
+                        )?;
+                        match record_admission(&mut run, shadow) {
+                            AdmissionProgress::Terminal => {}
+                            AdmissionProgress::Blocked => {
+                                run.blocked = true;
+                                break;
+                            }
+                            AdmissionProgress::Stale => {
+                                lag_subscription_in(&tx, &subscription, "placement_stale")?;
+                                run.lagged = true;
+                                break;
+                            }
+                        }
+                    }
+                    terminal += 1;
+                    position = event.position;
                 }
                 EventScanResult::ProvenSkip {
                     through,
@@ -541,6 +554,36 @@ impl SessionStore {
         run.through = position.get();
         db(tx.commit())?;
         Ok(run)
+    }
+}
+
+enum AdmissionProgress {
+    Terminal,
+    Blocked,
+    Stale,
+}
+
+fn record_admission(
+    run: &mut EventSubscriptionDeliveryRun,
+    admission: event_input::EventInputAdmission,
+) -> AdmissionProgress {
+    match admission {
+        event_input::EventInputAdmission::Accepted { delivery_id } => {
+            run.accepted += 1;
+            run.ready_inputs.push(delivery_id);
+            AdmissionProgress::Terminal
+        }
+        event_input::EventInputAdmission::Deduplicated { delivery_id } => {
+            run.deduplicated += 1;
+            run.ready_inputs.push(delivery_id);
+            AdmissionProgress::Terminal
+        }
+        event_input::EventInputAdmission::ProvenDenied => {
+            run.skipped += 1;
+            AdmissionProgress::Terminal
+        }
+        event_input::EventInputAdmission::AuthorizationUnavailable => AdmissionProgress::Blocked,
+        event_input::EventInputAdmission::PlacementStale => AdmissionProgress::Stale,
     }
 }
 

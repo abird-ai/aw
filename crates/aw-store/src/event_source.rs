@@ -10,7 +10,7 @@ use crate::{
 };
 use aw_agent_core::EventSchemaRef;
 use aw_tools::{event_subject::EventSubject, job_event::SourceEventBook};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest as _, Sha256};
 
 const STORE_SCHEMA_VERSION: i64 = 45;
@@ -310,6 +310,77 @@ pub(crate) fn emit_system_events(
     Ok(Some(event_rev))
 }
 
+pub(crate) fn legacy_delivery_admission_open(
+    connection: &Connection,
+    source_ref: &str,
+) -> Result<bool> {
+    let version: i64 = db(connection.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+    if version >= 54 {
+        return Ok(false);
+    }
+    Ok(delivery_cutover_revision(connection, source_ref)?.is_none())
+}
+
+pub(crate) fn delivery_cutover_revision(
+    connection: &Connection,
+    source_ref: &str,
+) -> Result<Option<u64>> {
+    db(connection
+        .query_row(
+            "SELECT delivery_cutover_rev
+             FROM event_sources_current WHERE source_ref=?1",
+            [source_ref],
+            |row| row.get(0),
+        )
+        .optional())
+    .map(|row| row.flatten())
+}
+
+pub(crate) fn cutover_delivery_in(
+    connection: &Connection,
+    source_ref: &str,
+    expected_next_event_rev: u64,
+) -> Result<u64> {
+    let current: Option<(u64, Option<u64>)> = db(connection
+        .query_row(
+            "SELECT next_event_rev,delivery_cutover_rev
+             FROM event_sources_current WHERE source_ref=?1",
+            [source_ref],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional())?;
+    let Some((next_event_rev, cutover)) = current else {
+        return Err(Error::Storage(
+            "legacy Event source has no DL-200 source revision owner",
+        ));
+    };
+    if next_event_rev != expected_next_event_rev {
+        return Err(Error::Storage(
+            "legacy and DL-200 Event source revisions diverged before cutover",
+        ));
+    }
+    if let Some(cutover) = cutover {
+        if cutover != next_event_rev {
+            return Err(Error::Storage(
+                "stored Event delivery cutover is inconsistent",
+            ));
+        }
+        return Ok(cutover);
+    }
+    let changed = db(connection.execute(
+        "UPDATE event_sources_current
+         SET delivery_cutover_rev=?1,updated_at=?2
+         WHERE source_ref=?3 AND next_event_rev=?1 AND delivery_cutover_rev IS NULL",
+        params![next_event_rev, now(), source_ref],
+    ))?;
+    if changed != 1 {
+        return Err(Error::Conflict(
+            "Event delivery cutover changed concurrently",
+        ));
+    }
+    Ok(next_event_rev)
+}
+
 fn schema_active(connection: &Connection) -> Result<bool> {
     let version: i64 = db(connection.pragma_query_value(None, "user_version", |row| row.get(0)))?;
     Ok(version >= STORE_SCHEMA_VERSION)
@@ -322,11 +393,13 @@ fn reserve_revision(
 ) -> Result<u64> {
     EventSubject::from_resource_ref(source_ref, "changed")
         .map_err(|_| Error::Storage("Event source ref is not canonical"))?;
+    let version: i64 = db(connection.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+    let born_cutover = (version >= 54).then_some(1u64);
     db(connection.execute(
         "INSERT OR IGNORE INTO event_sources_current(
              source_ref,next_event_rev,delivery_cutover_rev,updated_at
-         ) VALUES(?1,1,NULL,?2)",
-        params![source_ref, now()],
+         ) VALUES(?1,1,?2,?3)",
+        params![source_ref, born_cutover, now()],
     ))?;
     let current: u64 = db(connection.query_row(
         "SELECT next_event_rev FROM event_sources_current WHERE source_ref=?1",

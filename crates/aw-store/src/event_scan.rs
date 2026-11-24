@@ -316,6 +316,71 @@ where
     }
 }
 
+pub(crate) fn candidate_by_source_revision_name(
+    connection: &Connection,
+    source_ref: &str,
+    event_rev: u64,
+    event_name: &str,
+) -> Result<Option<EventCandidate>> {
+    let mut query = db(connection.prepare(
+        "SELECT
+             commit_position,event_id,subject,source_ref,source_kind,
+             domain_handle,identity_handle,project_handle,sandbox_handle,agent_handle,
+             turn_handle,job_handle,node_coordinate,event_rev
+         FROM event_projection_index
+         WHERE source_ref=?1 AND event_rev=?2 AND event_name=?3
+         ORDER BY commit_position LIMIT 2",
+    ))?;
+    let rows = db(
+        query.query_map(params![source_ref, event_rev, event_name], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<u32>>(12)?,
+                row.get::<_, u64>(13)?,
+            ))
+        }),
+    )?;
+    let rows = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    if rows.len() != 1 {
+        return Err(Error::Storage(
+            "legacy Event bridge found duplicate projected source revision/name",
+        ));
+    }
+    let indexed = IndexedEvent {
+        position: StorePos::new(row.0),
+        event_id: row.1.clone(),
+        subject: row.2.clone(),
+        source: EventSource {
+            reference: row.3.clone(),
+            kind: EventSourceKind::parse(&row.4)?,
+            domain: row.5.clone(),
+            identity: row.6.clone(),
+            project: row.7.clone(),
+            sandbox: row.8.clone(),
+            agent: row.9.clone(),
+            turn: row.10.clone(),
+            job: row.11.clone(),
+            node: row.12,
+        },
+        event_rev: row.13,
+    };
+    load_candidate(connection, indexed).map(Some)
+}
+
 fn check_fence<Placement>(
     connection: &Connection,
     fence: &EventScanFence,

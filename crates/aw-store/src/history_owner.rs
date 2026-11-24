@@ -388,7 +388,62 @@ fn dependency_manifest(connection: &Connection, head: &str) -> Result<String> {
     for inherited in inherited {
         manifest = union_manifests(connection, &manifest, &inherited)?;
     }
+
+    let mut query = db(connection.prepare(
+        "WITH RECURSIVE ancestry(id,parent_id) AS (
+             SELECT id,parent_id FROM nodes WHERE id=?1
+             UNION ALL
+             SELECT n.id,n.parent_id FROM nodes n
+             JOIN ancestry a ON a.parent_id=n.id
+         )
+         SELECT DISTINCT c.manifest_digest
+         FROM ancestry a
+         JOIN runs r ON r.prompt_node=a.id
+         JOIN legacy_event_input_compat c
+           ON c.session_id=r.session_id
+          AND c.branch_id=r.branch_id
+          AND c.turn_id=r.turn_id
+         ORDER BY c.manifest_digest
+         LIMIT ?2",
+    ))?;
+    let rows = db(
+        query.query_map(params![head, (MAX_MANIFEST_INPUTS + 1) as i64], |row| {
+            row.get::<_, String>(0)
+        }),
+    )?;
+    let legacy = db(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+    if legacy.len() > MAX_MANIFEST_INPUTS {
+        return Err(Error::Limit(
+            "legacy Event Input disclosure manifest bound exceeded",
+        ));
+    }
+    for legacy in legacy {
+        manifest = union_manifests(connection, &manifest, &legacy)?;
+    }
     Ok(manifest)
+}
+
+pub(crate) fn legacy_protected_input_manifest(
+    connection: &Connection,
+    input_request_id: &str,
+    source_agent_ref: Option<&str>,
+) -> Result<String> {
+    let evidence = json(&serde_json::json!({"input_request_id":input_request_id}))?;
+    let root = authority_root(connection, "legacy_protected", input_request_id, &evidence)?;
+    let protected = manifest_from_entries(
+        connection,
+        &BTreeSet::from([ManifestEntry {
+            kind: "authority_root",
+            reference: root,
+        }]),
+    )?;
+    match source_agent_ref {
+        Some(source_agent_ref) => {
+            let source = event_input_manifest(connection, source_agent_ref, None)?;
+            union_manifests(connection, &protected, &source)
+        }
+        None => Ok(protected),
+    }
 }
 
 pub(crate) fn event_input_manifest(
@@ -1325,7 +1380,9 @@ fn validate_manifest_expansion(
     principal_kind: &str,
     principal_handle: &str,
 ) -> Result<()> {
-    for (_root, kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)? {
+    let roots = manifest_authority_roots(connection, manifest)?;
+    let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
+    for (_root, kind, stable_key, _evidence) in roots {
         match kind.as_str() {
             "agent_source" => validate_agent_source_expansion(
                 connection,
@@ -1346,6 +1403,19 @@ fn validate_manifest_expansion(
                     "materialized external history cannot expand audience without source share authority",
                 ));
             }
+            "legacy_protected" => {
+                if !legacy_protected_principal(
+                    connection,
+                    &stable_key,
+                    principal_kind,
+                    principal_handle,
+                )? && !has_source_root
+                {
+                    return Err(Error::Denied(
+                        "legacy protected Event input cannot expand without reconstructed source authority",
+                    ));
+                }
+            }
             _ => {
                 return Err(Error::Denied(
                     "history disclosure authority root has no reviewed share contract",
@@ -1354,6 +1424,59 @@ fn validate_manifest_expansion(
         }
     }
     Ok(())
+}
+
+fn legacy_protected_principal(
+    connection: &Connection,
+    input_request_id: &str,
+    principal_kind: &str,
+    principal_handle: &str,
+) -> Result<bool> {
+    if !matches!(principal_kind, "user" | "group") {
+        return Ok(false);
+    }
+    db(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM legacy_event_input_compat_audience
+              WHERE input_request_id=?1
+                AND principal_kind=?2
+                AND principal_handle=?3
+         )",
+        params![input_request_id, principal_kind, principal_handle],
+        |row| row.get(0),
+    ))
+}
+
+fn legacy_protected_reader(
+    connection: &Connection,
+    actor: &PrincipalId,
+    input_request_id: &str,
+) -> Result<bool> {
+    let Some(user) = user_for_principal(connection, actor)? else {
+        return Ok(false);
+    };
+    db(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM legacy_event_input_compat_audience a
+             WHERE a.input_request_id=?1
+               AND (
+                   (a.principal_kind='user' AND a.principal_handle=?2)
+                   OR (
+                       a.principal_kind='group'
+                       AND EXISTS(
+                           SELECT 1 FROM principal_group_members g
+                            WHERE g.domain_id=a.domain_handle
+                              AND g.group_handle=a.principal_handle
+                              AND g.member_handle=?2
+                              AND g.state='active'
+                       )
+                   )
+               )
+         )",
+        params![input_request_id, user],
+        |row| row.get(0),
+    ))
 }
 
 fn materialized_policy_state(
@@ -1402,7 +1525,9 @@ pub(crate) fn authorize_event_manifest_reader(
     let Some(user) = user_for_principal(connection, actor)? else {
         return Ok(DisclosureAuthorization::Deny);
     };
-    for (_root, kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)? {
+    let roots = manifest_authority_roots(connection, manifest)?;
+    let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
+    for (_root, kind, stable_key, _evidence) in roots {
         match kind.as_str() {
             "agent_source" => match agent_owner::key_for_ref_optional(connection, &stable_key)? {
                 Some((session, branch)) => match agent_owner::authorize_permission(
@@ -1429,6 +1554,11 @@ pub(crate) fn authorize_event_manifest_reader(
                     ))?
                 {
                     return Ok(decision);
+                }
+            }
+            "legacy_protected" => {
+                if !legacy_protected_reader(connection, actor, &stable_key)? && !has_source_root {
+                    return Ok(DisclosureAuthorization::Deny);
                 }
             }
             "materialized_policy" => {
@@ -1501,8 +1631,9 @@ pub(crate) fn authorize_event_delivery(
     }
 
     if let Some(manifest) = manifest {
-        for (_root, kind, stable_key, _evidence) in manifest_authority_roots(connection, manifest)?
-        {
+        let roots = manifest_authority_roots(connection, manifest)?;
+        let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
+        for (_root, kind, stable_key, _evidence) in roots {
             match kind.as_str() {
                 "agent_source" => {
                     for (principal_kind, principal_handle) in &recipient_audience {
@@ -1531,6 +1662,20 @@ pub(crate) fn authorize_event_delivery(
                             ))?
                         {
                             return Ok(decision);
+                        }
+                    }
+                }
+                "legacy_protected" => {
+                    if !has_source_root {
+                        for (principal_kind, principal_handle) in &recipient_audience {
+                            if !legacy_protected_principal(
+                                connection,
+                                &stable_key,
+                                principal_kind,
+                                principal_handle,
+                            )? {
+                                return Ok(DisclosureAuthorization::Deny);
+                            }
                         }
                     }
                 }
@@ -1584,7 +1729,9 @@ fn validate_fork_manifest_for_principal(
         BTreeSet::new()
     };
 
-    for (root, kind, stable_key, _evidence) in manifest_authority_roots(connection, new_manifest)? {
+    let roots = manifest_authority_roots(connection, new_manifest)?;
+    let has_source_root = roots.iter().any(|(_, kind, _, _)| kind == "agent_source");
+    for (root, kind, stable_key, _evidence) in roots {
         match kind.as_str() {
             "agent_source" => validate_agent_source_expansion(
                 connection,
@@ -1600,6 +1747,19 @@ fn validate_fork_manifest_for_principal(
                 return Err(Error::Denied(
                     "materialized external history cannot be forked without source share authority",
                 ));
+            }
+            "legacy_protected" => {
+                if !legacy_protected_principal(
+                    connection,
+                    &stable_key,
+                    principal_kind,
+                    principal_handle,
+                )? && !has_source_root
+                {
+                    return Err(Error::Denied(
+                        "legacy protected Event input cannot expand without reconstructed source authority",
+                    ));
+                }
             }
             "legacy_session" if prior_roots.contains(&root) => {}
             "legacy_session" => validate_legacy_session_expansion(

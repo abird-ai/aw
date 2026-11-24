@@ -162,6 +162,9 @@ pub(crate) fn advance_legacy_revision_without_delivery_in(
     source_ref: &str,
     expected_revision: u64,
 ) -> Result<()> {
+    if crate::event_source::delivery_cutover_revision(c, source_ref)?.is_some() {
+        return Ok(());
+    }
     let encoded: Option<String> = db(c
         .query_row(
             "SELECT event_book_json FROM agent_job_event_sources WHERE source_ref=?1",
@@ -373,11 +376,16 @@ fn commit_source(
         }
     }
 
-    let legacy_revision = if let Some(state) = state.as_mut() {
-        let deliveries = state.book.commit(&source, events).map_err(Error::Storage)?;
-        let revision = state.book.current_event_revision();
-        state.pending.extend(deliveries);
-        Some(revision)
+    let cutover = crate::event_source::delivery_cutover_revision(c, &source)?;
+    let legacy_revision = if cutover.is_none() {
+        if let Some(state) = state.as_mut() {
+            let deliveries = state.book.commit(&source, events).map_err(Error::Storage)?;
+            let revision = state.book.current_event_revision();
+            state.pending.extend(deliveries);
+            Some(revision)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -460,6 +468,62 @@ pub(crate) fn commit_agent_settled_in(
     )
 }
 
+pub(crate) fn wake_admission_in(
+    connection: &rusqlite::Connection,
+    authority_ref: &str,
+) -> Result<Option<AgentJobWakeAdmission>> {
+    if authority_ref.is_empty()
+        || authority_ref.len() > 256
+        || !authority_ref.is_ascii()
+        || authority_ref.chars().any(char::is_control)
+    {
+        return Err(Error::Denied("invalid Agent Job wake admission identity"));
+    }
+    let mut receipt = db(connection
+        .query_row(
+            "SELECT recipient_ref,actor,authority_ref,session_id,membership_epoch,
+                    audience_epoch,is_owner,tool_name,source_kind,source_id,source_epoch,
+                    execution_site,is_visible,registry_revision,authority_revision,effect
+             FROM agent_job_wake_admissions WHERE authority_ref=?1",
+            [authority_ref],
+            |row| {
+                Ok(AgentJobWakeAdmission {
+                    recipient_ref: row.get(0)?,
+                    actor: row.get(1)?,
+                    authority_ref: row.get(2)?,
+                    session_id: row.get(3)?,
+                    membership_epoch: row.get(4)?,
+                    audience_epoch: row.get(5)?,
+                    owner: row.get::<_, i64>(6)? != 0,
+                    access_generation: [0; 32],
+                    tool_name: row.get(7)?,
+                    source_kind: row.get(8)?,
+                    source_id: row.get(9)?,
+                    source_epoch: row.get(10)?,
+                    execution_site: row.get(11)?,
+                    visible: row.get::<_, i64>(12)? != 0,
+                    registry_revision: row.get(13)?,
+                    authority_revision: row.get(14)?,
+                    effect: row.get(15)?,
+                })
+            },
+        )
+        .optional())?;
+    if let Some(receipt) = &mut receipt {
+        let actor = PrincipalId::new(receipt.actor.clone())?;
+        let (session, branch) = agent_owner::key_for_ref(connection, &receipt.recipient_ref)?;
+        let access = agent_owner::authorize_access(
+            connection,
+            &actor,
+            agent_owner::AgentKey::new(&session, &branch),
+            SessionParticipationAction::Control,
+        )?;
+        receipt.access_generation = access.access_generation;
+        receipt.validate()?;
+    }
+    Ok(receipt)
+}
+
 impl SessionStore {
     pub fn store_agent_job_wake_admission(&self, receipt: AgentJobWakeAdmission) -> Result<()> {
         receipt.validate()?;
@@ -535,57 +599,8 @@ impl SessionStore {
         &self,
         authority_ref: &str,
     ) -> Result<Option<AgentJobWakeAdmission>> {
-        if authority_ref.is_empty()
-            || authority_ref.len() > 256
-            || !authority_ref.is_ascii()
-            || authority_ref.chars().any(char::is_control)
-        {
-            return Err(Error::Denied("invalid Agent Job wake admission identity"));
-        }
         let connection = self.connection()?;
-        let mut receipt = db(connection
-            .query_row(
-                "SELECT recipient_ref,actor,authority_ref,session_id,membership_epoch,
-                        audience_epoch,is_owner,tool_name,source_kind,source_id,source_epoch,
-                        execution_site,is_visible,registry_revision,authority_revision,effect
-                 FROM agent_job_wake_admissions WHERE authority_ref=?1",
-                [authority_ref],
-                |row| {
-                    Ok(AgentJobWakeAdmission {
-                        recipient_ref: row.get(0)?,
-                        actor: row.get(1)?,
-                        authority_ref: row.get(2)?,
-                        session_id: row.get(3)?,
-                        membership_epoch: row.get(4)?,
-                        audience_epoch: row.get(5)?,
-                        owner: row.get::<_, i64>(6)? != 0,
-                        access_generation: [0; 32],
-                        tool_name: row.get(7)?,
-                        source_kind: row.get(8)?,
-                        source_id: row.get(9)?,
-                        source_epoch: row.get(10)?,
-                        execution_site: row.get(11)?,
-                        visible: row.get::<_, i64>(12)? != 0,
-                        registry_revision: row.get(13)?,
-                        authority_revision: row.get(14)?,
-                        effect: row.get(15)?,
-                    })
-                },
-            )
-            .optional())?;
-        if let Some(receipt) = &mut receipt {
-            let actor = PrincipalId::new(receipt.actor.clone())?;
-            let (session, branch) = agent_owner::key_for_ref(&connection, &receipt.recipient_ref)?;
-            let access = agent_owner::authorize_access(
-                &connection,
-                &actor,
-                agent_owner::AgentKey::new(&session, &branch),
-                SessionParticipationAction::Control,
-            )?;
-            receipt.access_generation = access.access_generation;
-            receipt.validate()?;
-        }
-        Ok(receipt)
+        wake_admission_in(&connection, authority_ref)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -634,6 +649,12 @@ impl SessionStore {
             }
         }
         let source = source_ref(&binding, turn);
+        if !crate::event_source::legacy_delivery_admission_open(&tx, &source)? && !rules.is_empty()
+        {
+            return Err(Error::Denied(
+                "legacy Job Event subscription admission is closed after DL-200 cutover",
+            ));
+        }
         let existing = row(&tx, &source)?;
         if existing.is_none() && rules.is_empty() {
             db(tx.commit())?;
@@ -774,6 +795,7 @@ mod tests {
     };
     use aw_store_api::SessionBinding;
     use aw_tools::job_event::{EventRule, JobWakeMode};
+    use sha2::{Digest as _, Sha256};
     use std::{path::PathBuf, sync::Arc};
 
     struct UnusedProvider;
@@ -808,6 +830,26 @@ mod tests {
     #[tokio::test]
     async fn attached_turn_commits_root_and_exact_turn_events_until_exact_ack() {
         let store = SessionStore::in_memory().unwrap();
+        {
+            // This regression intentionally exercises the pre-v54 legacy owner
+            // before verifying the v44 -> ... -> v54 migration at the end.
+            // Keep the current-schema tables present but run legacy admission
+            // under the exact prior schema epoch.
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE store_meta SET value='53' WHERE key='schema_epoch';
+                     UPDATE schema_meta
+                        SET schema_epoch=53,activation_epoch=53,migration_phase='ready'
+                        WHERE singleton=1;
+                     UPDATE migration_lease
+                        SET holder_client_id=NULL,current_epoch=53,target_epoch=NULL,
+                            lease_expires_at=NULL
+                        WHERE singleton=1;
+                     PRAGMA user_version=53;",
+                )
+                .unwrap();
+        }
         let agent = Agent::builder(
             Arc::new(UnusedProvider),
             AgentOptions::new("fixture", "model"),
@@ -1795,7 +1837,11 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE event_handler_receipts_current;
+                "DROP TABLE legacy_event_input_compat_audience;
+                 DROP TABLE legacy_event_input_compat;
+                 DROP TABLE event_legacy_input_compat;
+                 DROP TABLE event_legacy_subscription_compat;
+                 DROP TABLE event_handler_receipts_current;
                  DROP TABLE event_handler_cursors_current;
                  DROP TABLE event_custom_turn_counts;
                  DROP TABLE agent_event_input_audience;
@@ -1828,17 +1874,23 @@ mod tests {
         crate::migrate_custom_events(&mut connection).unwrap();
         crate::migrate_event_handlers(&mut connection).unwrap();
         crate::migrate_event_universe_placement(&mut connection).unwrap();
+        crate::migrate_event_delivery_cutover(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            53
+            54
         );
         for source in [&root, &turn_ref] {
             assert_eq!(
                 crate::event_source::next_event_revision(&connection, source).unwrap(),
                 2,
                 "v44 -> v45 migration must recover the first unissued source revision"
+            );
+            assert_eq!(
+                crate::event_source::delivery_cutover_revision(&connection, source).unwrap(),
+                Some(2),
+                "v54 must persist the exact first revision owned by DL-200 delivery"
             );
         }
         assert_eq!(
@@ -1848,6 +1900,570 @@ mod tests {
                 .unwrap(),
             commit_count,
             "source-state migration must not rewrite immutable Event history"
+        );
+    }
+
+    #[test]
+    fn v54_cutover_bridges_pending_once_and_fences_legacy_delivery_owner() {
+        let store = SessionStore::in_memory().unwrap();
+        let actor = PrincipalId::new("local").unwrap();
+        let (source_session, source_branch) =
+            store.create(&actor, "cutover source", binding()).unwrap();
+        let (recipient_session, recipient_branch) = store
+            .create(&actor, "cutover recipient", binding())
+            .unwrap();
+
+        let (source_ref, recipient_ref) = {
+            let connection = store.connection().unwrap();
+            let source =
+                agent_binding_in(&connection, &actor, &source_session.id, &source_branch.id)
+                    .unwrap();
+            let recipient = agent_binding_in(
+                &connection,
+                &actor,
+                &recipient_session.id,
+                &recipient_branch.id,
+            )
+            .unwrap();
+            (canonical(&source), canonical(&recipient))
+        };
+        assert_ne!(source_ref, recipient_ref);
+
+        let access = store
+            .authorize_agent_access(
+                &actor,
+                &recipient_session.id,
+                &recipient_branch.id,
+                SessionParticipationAction::Control,
+            )
+            .unwrap();
+        let authority = "jwa_cutover_fixture";
+        store
+            .store_agent_job_wake_admission(AgentJobWakeAdmission {
+                recipient_ref: recipient_ref.clone(),
+                actor: actor.as_str().to_owned(),
+                authority_ref: authority.into(),
+                session_id: recipient_session.id.clone(),
+                membership_epoch: access.grant_revision,
+                audience_epoch: access.acl_revision,
+                owner: access.owner,
+                access_generation: access.access_generation,
+                tool_name: "jobs_subscribe".into(),
+                source_kind: "host".into(),
+                source_id: "cutover-fixture".into(),
+                source_epoch: 1,
+                execution_site: "local".into(),
+                visible: false,
+                registry_revision: None,
+                authority_revision: 1,
+                effect: "control".into(),
+            })
+            .unwrap();
+
+        let legacy_viewer = PrincipalId::new("internal:fixture:cutover-viewer").unwrap();
+        let (legacy_viewer_ref, legacy_viewer_handle) = {
+            let connection = store.connection().unwrap();
+            let handle = crate::ensure_user_for_principal(&connection, &legacy_viewer).unwrap();
+            let domain = recipient_ref
+                .strip_prefix("/d:")
+                .and_then(|value| value.split('/').next())
+                .expect("canonical recipient has Domain");
+            (format!("/d:{domain}/i:{handle}"), handle)
+        };
+        let recipient_revision = store
+            .agent_public_revision(&actor, &recipient_session.id, &recipient_branch.id)
+            .unwrap();
+        store
+            .agent_access_set(
+                &actor,
+                &recipient_session.id,
+                &recipient_branch.id,
+                &legacy_viewer_ref,
+                Some(crate::AgentPermissions {
+                    view: true,
+                    ..Default::default()
+                }),
+                recipient_revision,
+            )
+            .unwrap();
+        let access = store
+            .authorize_agent_access(
+                &actor,
+                &recipient_session.id,
+                &recipient_branch.id,
+                SessionParticipationAction::Control,
+            )
+            .unwrap();
+        store
+            .store_agent_job_wake_admission(AgentJobWakeAdmission {
+                recipient_ref: recipient_ref.clone(),
+                actor: actor.as_str().to_owned(),
+                authority_ref: authority.into(),
+                session_id: recipient_session.id.clone(),
+                membership_epoch: access.grant_revision,
+                audience_epoch: access.acl_revision,
+                owner: access.owner,
+                access_generation: access.access_generation,
+                tool_name: "jobs_subscribe".into(),
+                source_kind: "host".into(),
+                source_id: "cutover-fixture".into(),
+                source_epoch: 1,
+                execution_site: "local".into(),
+                visible: false,
+                registry_revision: None,
+                authority_revision: 1,
+                effect: "control".into(),
+            })
+            .unwrap();
+
+        // Recreate an exact v53 pre-cutover store boundary in this focused test.
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE legacy_event_input_compat_audience;
+                     DROP TABLE legacy_event_input_compat;
+                     DROP TABLE event_legacy_input_compat;
+                     DROP TABLE event_legacy_subscription_compat;
+                     UPDATE store_meta SET value='53' WHERE key='schema_epoch';
+                     UPDATE schema_meta
+                        SET schema_epoch=53,activation_epoch=53,migration_phase='ready'
+                        WHERE singleton=1;
+                     UPDATE migration_lease
+                        SET holder_client_id=NULL,current_epoch=53,target_epoch=NULL,
+                            lease_expires_at=NULL
+                        WHERE singleton=1;
+                     PRAGMA user_version=53;",
+                )
+                .unwrap();
+        }
+
+        let rules = EventRuleSet::new([
+            EventRule::new(JobEventKind::Result, JobWakeMode::Queue),
+            EventRule::new(JobEventKind::Settled, JobWakeMode::Auto),
+        ])
+        .unwrap();
+        let (_, update) = store
+            .replace_agent_job_subscription(
+                &actor,
+                &source_session.id,
+                &source_branch.id,
+                None,
+                None,
+                &recipient_ref,
+                authority,
+                rules,
+                8,
+            )
+            .unwrap();
+        assert_eq!(update.generation, 1);
+
+        {
+            let mut connection = store.connection().unwrap();
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let source =
+                agent_binding_in(&tx, &actor, &source_session.id, &source_branch.id).unwrap();
+            commit_source(
+                &tx,
+                &source,
+                None,
+                &[JobEventKind::Result, JobEventKind::Settled],
+                None,
+                false,
+                &actor,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let pending = store
+            .pending_agent_job_events(&actor, &source_session.id, &source_branch.id)
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].event_rev, 1);
+        assert_eq!(pending[1].event_rev, 1);
+        {
+            let mut reversed = pending.clone();
+            reversed.reverse();
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE agent_job_event_sources
+                     SET pending_deliveries_json=?1
+                     WHERE source_ref=?2",
+                    params![serde_json::to_string(&reversed).unwrap(), &source_ref],
+                )
+                .unwrap();
+        }
+
+        // A generic DL-200 exact-result subscription already exists independently
+        // at cutover. Re-enable once so its generation differs from the legacy
+        // Job rule; v54 must preserve both semantics on the same scanner row.
+        let result_subject =
+            aw_tools::event_subject::EventSubject::from_resource_ref(&source_ref, "result")
+                .unwrap()
+                .into_string();
+        let generic_first = store
+            .events_subscribe(&actor, &result_subject, &recipient_ref, true)
+            .unwrap();
+        assert_eq!(generic_first.generation, Some(1));
+        store
+            .events_subscribe(&actor, &result_subject, &recipient_ref, false)
+            .unwrap();
+        let generic_second = store
+            .events_subscribe(&actor, &result_subject, &recipient_ref, true)
+            .unwrap();
+        assert_eq!(generic_second.generation, Some(2));
+
+        // Seed one factual already-accepted legacy qi_* Input. Migration must
+        // attach disclosure compatibility without replacing this identity.
+        let queue_id = {
+            let mut hash = Sha256::new();
+            hash.update(b"aw-job-event-continuation-v1\0");
+            for part in [
+                source_ref.as_bytes(),
+                &1u64.to_be_bytes(),
+                recipient_ref.as_bytes(),
+                &1u64.to_be_bytes(),
+                JobWakeMode::Queue.as_str().as_bytes(),
+            ] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part);
+            }
+            format!("jc_{:x}", hash.finalize())
+        };
+        let input_id = crate::queued_input_request_id(&recipient_session.id, &queue_id);
+        let payload = format!("job event source={} rev=1", source_ref);
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let writer_epoch = {
+            let connection = store.connection().unwrap();
+            crate::workspace_writer::workspace_writer_for_session(
+                &connection,
+                &recipient_session.id,
+            )
+            .unwrap()
+            .writer_epoch
+        };
+        let queue_fact = crate::ActorQueueFact {
+            request: crate::ActorQueueRequest {
+                request_id: queue_id.clone(),
+                session_id: recipient_session.id.clone(),
+                branch_id: recipient_branch.id.clone(),
+                recipient_site: "local".into(),
+                sender: format!("job-event:{:x}", Sha256::digest(source_ref.as_bytes())),
+                message_id: 1,
+                writer_epoch,
+                target: crate::QueueTarget::Auto,
+                priority: 0,
+            },
+            state: crate::QueueState::Accepted,
+            revision: 2,
+            payload_sha256: payload_sha256.clone(),
+            payload_ref: "sec_cutover_fixture".into(),
+            claim: Some(crate::QueueClaim {
+                recipient_actor: actor.as_str().to_owned(),
+                message_id: 1,
+                turn_id: 1,
+                writer_epoch,
+                owner_process_id: None,
+                owner_store_generation: None,
+            }),
+            note: None,
+        };
+        let input_fact = crate::ActorInputFact {
+            admission: crate::ActorInputAdmission {
+                request_id: input_id.clone(),
+                session_id: recipient_session.id.clone(),
+                branch_id: recipient_branch.id.clone(),
+                branch_head: recipient_branch.head.clone(),
+                branch_revision: recipient_branch.revision,
+                writer_epoch,
+                turn_id: 1,
+                sender: actor.as_str().to_owned(),
+                target: actor.as_str().to_owned(),
+                message_id: 1,
+                payload_sha256,
+                priority: 0,
+                participant: None,
+            },
+            state: crate::InputAdmissionState::Accepted,
+            note: None,
+        };
+        {
+            let connection = store.connection().unwrap();
+            audit(
+                &connection,
+                &recipient_session.id,
+                &actor,
+                "actor.queue",
+                serde_json::to_value(&queue_fact).unwrap(),
+            )
+            .unwrap();
+            audit(
+                &connection,
+                &recipient_session.id,
+                &actor,
+                "actor.input",
+                serde_json::to_value(&input_fact).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let mut connection = store.connection().unwrap();
+        crate::migrate_event_delivery_cutover(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            54
+        );
+        assert_eq!(
+            crate::event_source::delivery_cutover_revision(&connection, &source_ref).unwrap(),
+            Some(2)
+        );
+        assert!(
+            !crate::event_source::legacy_delivery_admission_open(&connection, &source_ref).unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM event_legacy_subscription_compat
+                     WHERE source_ref=?1 AND recipient_ref=?2",
+                    params![&source_ref, &recipient_ref],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT shadow_existing FROM event_legacy_subscription_compat
+                     WHERE recipient_ref=?1 AND subject=?2",
+                    params![&recipient_ref, &result_subject],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "pre-existing generic exact subscription must retain its own generation/creator"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM agent_event_inputs
+                     WHERE recipient_ref=?1",
+                    [&recipient_ref],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1,
+            "same-revision result+settled with effective queue mode bridge once"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT i.subject
+                     FROM agent_event_inputs i
+                     JOIN event_legacy_input_compat c ON c.delivery_id=i.delivery_id
+                     WHERE c.source_ref=?1 AND c.event_rev=1",
+                    [&source_ref],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            aw_tools::event_subject::EventSubject::from_resource_ref(&source_ref, "result")
+                .unwrap()
+                .into_string(),
+            "legacy coalescing must choose one canonical Event independent of pending order"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_agent_ref FROM legacy_event_input_compat
+                     WHERE input_request_id=?1",
+                    [&input_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .as_deref(),
+            Some(source_ref.as_str())
+        );
+        let legacy_audience = {
+            let mut query = connection
+                .prepare(
+                    "SELECT principal_kind,principal_handle
+                     FROM legacy_event_input_compat_audience
+                     WHERE input_request_id=?1
+                     ORDER BY principal_kind,principal_handle",
+                )
+                .unwrap();
+            query
+                .query_map([&input_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(legacy_audience.len(), 1);
+        assert!(
+            !legacy_audience
+                .iter()
+                .any(|(kind, handle)| kind == "user" && handle == &legacy_viewer_handle),
+            "a viewer granted after the factual legacy Input cannot be inferred as historical audience"
+        );
+        drop(connection);
+
+        assert!(store
+            .pending_agent_job_events(&actor, &source_session.id, &source_branch.id)
+            .unwrap()
+            .is_empty());
+
+        // Revision 2 is DL-200-owned only. The frozen legacy book stays at 1
+        // while both translated exact subscriptions coalesce the revision once.
+        {
+            let mut connection = store.connection().unwrap();
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let source =
+                agent_binding_in(&tx, &actor, &source_session.id, &source_branch.id).unwrap();
+            commit_source(
+                &tx,
+                &source,
+                None,
+                &[JobEventKind::Result, JobEventKind::Settled],
+                Some(1),
+                true,
+                &actor,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let settled_subject =
+            aw_tools::event_subject::EventSubject::from_resource_ref(&source_ref, "settled")
+                .unwrap()
+                .into_string();
+        let settled_run = store
+            .event_subscription_deliver(&recipient_ref, &settled_subject, 16)
+            .unwrap();
+        assert_eq!(settled_run.accepted, 1);
+        let result_run = store
+            .event_subscription_deliver(&recipient_ref, &result_subject, 16)
+            .unwrap();
+        assert_eq!(result_run.accepted, 1);
+        assert_eq!(result_run.deduplicated, 1);
+        assert_eq!(result_run.ready_inputs.len(), 2);
+        {
+            let connection = store.connection().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT i.subject
+                         FROM agent_event_inputs i
+                         JOIN event_legacy_input_compat c ON c.delivery_id=i.delivery_id
+                         WHERE c.source_ref=?1 AND c.event_rev=2",
+                        [&source_ref],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                result_subject,
+                "post-cutover coalescing must remain canonical even when settled scans first"
+            );
+        }
+
+        let frozen_revision = {
+            let connection = store.connection().unwrap();
+            let encoded: String = connection
+                .query_row(
+                    "SELECT event_book_json FROM agent_job_event_sources
+                     WHERE source_ref=?1",
+                    [&source_ref],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let book: SourceEventBook = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(book.current_event_revision(), 1);
+            assert_eq!(
+                crate::event_source::next_event_revision(&connection, &source_ref).unwrap(),
+                3
+            );
+            book.current_event_revision()
+        };
+        assert_eq!(frozen_revision, 1);
+        assert!(store
+            .pending_agent_job_events(&actor, &source_session.id, &source_branch.id)
+            .unwrap()
+            .is_empty());
+
+        store
+            .events_publish(
+                &actor,
+                &source_ref,
+                "#after_cutover",
+                Some(&serde_json::json!({"cutover":true})),
+            )
+            .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            let encoded: String = connection
+                .query_row(
+                    "SELECT event_book_json FROM agent_job_event_sources
+                     WHERE source_ref=?1",
+                    [&source_ref],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let book: SourceEventBook = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(book.current_event_revision(), 1);
+            assert_eq!(
+                crate::event_source::next_event_revision(&connection, &source_ref).unwrap(),
+                4
+            );
+            assert_eq!(
+                crate::event_source::delivery_cutover_revision(&connection, &source_ref).unwrap(),
+                Some(2)
+            );
+        }
+
+        assert!(store
+            .replace_agent_job_subscription(
+                &actor,
+                &source_session.id,
+                &source_branch.id,
+                None,
+                None,
+                &recipient_ref,
+                authority,
+                EventRuleSet::new([EventRule::new(JobEventKind::Result, JobWakeMode::Queue,)])
+                    .unwrap(),
+                8,
+            )
+            .is_err());
+
+        // A source born after v54 is DL-200-owned from revision 1 even though it
+        // never participated in the migration.
+        let (fresh_session, fresh_branch) = store
+            .create(&actor, "post-cutover source", binding())
+            .unwrap();
+        let fresh_ref = {
+            let connection = store.connection().unwrap();
+            let fresh =
+                agent_binding_in(&connection, &actor, &fresh_session.id, &fresh_branch.id).unwrap();
+            canonical(&fresh)
+        };
+        store
+            .events_publish(
+                &actor,
+                &fresh_ref,
+                "#born_dl200",
+                Some(&serde_json::json!({"fresh":true})),
+            )
+            .unwrap();
+        let connection = store.connection().unwrap();
+        assert_eq!(
+            crate::event_source::delivery_cutover_revision(&connection, &fresh_ref).unwrap(),
+            Some(1)
         );
     }
 }

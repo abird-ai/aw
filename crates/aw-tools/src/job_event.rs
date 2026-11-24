@@ -139,6 +139,14 @@ pub struct SubscriptionUpdate {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceEventSubscription {
+    pub recipient_ref: String,
+    pub recipient_authority_ref: String,
+    pub generation: u64,
+    pub rules: EventRuleSet,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Subscription {
@@ -210,6 +218,17 @@ impl SourceEventBook {
 
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.len()
+    }
+
+    pub fn subscriptions(&self) -> impl ExactSizeIterator<Item = SourceEventSubscription> + '_ {
+        self.subscriptions
+            .iter()
+            .map(|(recipient_ref, subscription)| SourceEventSubscription {
+                recipient_ref: recipient_ref.clone(),
+                recipient_authority_ref: subscription.recipient_authority_ref.clone(),
+                generation: subscription.generation,
+                rules: subscription.rules.clone(),
+            })
     }
 
     pub fn replace(

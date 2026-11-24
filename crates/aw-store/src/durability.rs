@@ -364,19 +364,40 @@ pub(crate) fn commit_event_position(
     actor: Option<&PrincipalId>,
     payload: serde_json::Value,
 ) -> Result<StorePos> {
+    let event = id("ev")?;
+    commit_event_position_with_id(c, &event, tx, kind, entity_type, entity_id, actor, payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_event_position_with_id(
+    c: &Connection,
+    event: &str,
+    tx: &str,
+    kind: &str,
+    entity_type: &str,
+    entity_id: &str,
+    actor: Option<&PrincipalId>,
+    payload: serde_json::Value,
+) -> Result<StorePos> {
+    if event.is_empty()
+        || event.len() > 160
+        || !event.is_ascii()
+        || event.chars().any(char::is_control)
+    {
+        return Err(Error::Storage("invalid immutable commit Event identity"));
+    }
     if c.is_autocommit() && crate::event_projection::is_event_payload(&payload) {
         return Err(Error::Storage(
             "DL-200 Event commit requires an existing Store transaction",
         ));
     }
     let store = StoreId::load(c)?;
-    let event = id("ev")?;
-    db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![&event,store.as_str(),tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
+    db(c.execute("INSERT INTO commit_log(event_id,store_id,tx_id,kind,entity_type,entity_id,actor,schema_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![event,store.as_str(),tx,kind,entity_type,entity_id,actor.map(PrincipalId::as_str),COMMIT_EVENT_SCHEMA_VERSION,json(&payload)?,now()]))?;
     let position = StorePos::from_insert_rowid(c.last_insert_rowid())?;
     crate::job_exposure::project_commit_event(c, kind, entity_type, entity_id, &payload, position)?;
     crate::event_projection::project_commit_event(
         c,
-        &event,
+        event,
         COMMIT_EVENT_SCHEMA_VERSION,
         &payload,
         position,

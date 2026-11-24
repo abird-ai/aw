@@ -21,10 +21,10 @@ use aw_store::{
     ActorControlFact, ActorControlState, ActorInputAdmission, ActorInputFact, ActorNoticeFact,
     ActorNoticeRequest, ActorNoticeState, ActorNoticeView, ActorQueueFact, ActorQueueRequest,
     ActorQueueView, AuthoritySteerFact, AuthoritySteerRequest, AuthoritySteerState, CustodySweep,
-    InputAdmissionState, ModelAgentPauseFact, ModelAgentPauseRequest, ModelProcessAction,
-    ModelProcessFact, ModelProcessRequest, ModelProcessState, ModelQueueDispositionKind,
-    ModelQueueDispositionRequest, ParticipantInputAdmission, QueueTarget,
-    SessionParticipationAction, SessionStore,
+    InputAdmissionState, LegacyEventInputWake, ModelAgentPauseFact, ModelAgentPauseRequest,
+    ModelProcessAction, ModelProcessFact, ModelProcessRequest, ModelProcessState,
+    ModelQueueDispositionKind, ModelQueueDispositionRequest, ParticipantInputAdmission,
+    QueueTarget, SessionParticipationAction, SessionStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2032,6 +2032,60 @@ impl Service {
         Ok((&fact).into())
     }
 
+    pub fn admit_event_input(&self, wake: &LegacyEventInputWake) -> Result<(ActorQueueView, bool)> {
+        if wake.mode != "queue"
+            || wake.delivery_id.len() != 68
+            || !wake.delivery_id.starts_with("edi_")
+            || !wake.delivery_id[4..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Denied(
+                "legacy-compatible EventInput requires one queue-mode delivery identity",
+            ));
+        }
+        self.verify_rpc_state()?;
+        let payload = format!(
+            "job event source={} rev={}",
+            wake.source_ref, wake.event_rev
+        );
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        if let Ok(existing) =
+            self.store
+                .actor_queue_fact(&self.owner, &self.session, &wake.delivery_id)
+        {
+            if existing.request.branch_id != self.branch
+                || existing.payload_sha256 != payload_sha256
+            {
+                return Err(Error::Denied(
+                    "EventInput queue identity reused with changed semantics",
+                ));
+            }
+            return Ok(((&existing).into(), false));
+        }
+
+        let sender = format!(
+            "event-input:{:x}",
+            Sha256::digest(wake.source_ref.as_bytes())
+        );
+        let fact = self.store.actor_queue_enqueue_minted(
+            &self.owner,
+            ActorQueueRequest {
+                request_id: wake.delivery_id.clone(),
+                session_id: self.session.clone(),
+                branch_id: self.branch.clone(),
+                recipient_site: self.site.clone(),
+                sender,
+                message_id: 0,
+                writer_epoch: self.epoch.get(),
+                target: QueueTarget::Auto,
+                priority: 0,
+            },
+            &payload,
+        )?;
+        Ok(((&fact).into(), true))
+    }
+
     pub fn admit_job_event(
         &self,
         delivery: &aw_tools::job_event::JobEventDelivery,
@@ -2767,7 +2821,15 @@ impl Service {
                     receipt.turn_id,
                 )?;
             }
-            self.submit_inner(
+            let event_input = fact
+                .request
+                .request_id
+                .starts_with("edi_")
+                .then_some(fact.request.request_id.as_str());
+            if let Some(delivery_id) = event_input {
+                agent.bind_event_input(delivery_id)?;
+            }
+            let admitted = self.submit_inner(
                 agent,
                 queued_input_request_id(&self.session, &fact.request.request_id),
                 ActorMessage {
@@ -2782,7 +2844,13 @@ impl Service {
                     content_type: aw_agent_kernel::message::ContentType::Text,
                 },
                 true,
-            )
+            );
+            if admitted.is_err() {
+                if let Some(delivery_id) = event_input {
+                    let _ = agent.clear_event_input(delivery_id);
+                }
+            }
+            admitted
         });
         let result = accepted.and_then(|_| self.store.actor_queue_ack(&self.owner, fact));
         let mut state = self

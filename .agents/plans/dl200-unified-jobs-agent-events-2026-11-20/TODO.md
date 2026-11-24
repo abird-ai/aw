@@ -226,7 +226,7 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       public fresh/derived `sandbox.create` remain Phase 3; View/Extension enrichment and Phase-4 Jobs
       traversal remain in their sealed later phases. No Phase-2 source was started in this checkpoint.
       Defer reachability/flatten acceleration until a real consumer requires it.
-- [~] **Phase 2 UNDERWAY** — v44 lands the scan prerequisite first: one canonical
+- [x] **Phase 2 COMPLETE locally** — v44 lands the scan prerequisite first: one canonical
       `aw-tools::event_subject` grammar, one rebuildable parsed `event_projection_index`, and one
       StoreScope-bound contiguous `event_projection_state` watermark over immutable `commit_log`.
       Literal handle `.` encodes as uppercase `%2E`; malformed hierarchy/escaping fails closed.
@@ -400,10 +400,28 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       authorized remote fixture stales/lags all three. EventSubject **2/2**, cross-Domain grouped **1/1**,
       Handler lifecycle **1/1**, combined migration/lifecycle **1/1**, model contextualizer **1/1**, model
       router **1/1**, affected all-target check and strict Clippy are green; migration now reaches v53.
-      **Next:** sealed Phase-2 step 13, the explicit v36 `delivery_cutover_rev = current next_event_rev`
-      source-owner transaction. Whole revisions must belong to exactly one delivery owner, legacy new
-      admission is fenced atomically, genuinely pending pre-cutover deliveries bridge once with deterministic
-      identity/conservative disclosure sidecars, and restart must reread the cutover rather than guess.
+      **v54 final Event delivery cutover landed locally / Phase 2 complete:** one schema-owner IMMEDIATE
+      transaction proves each legacy SourceEventBook next revision equals `event_sources_current.next_event_rev`,
+      writes `delivery_cutover_rev = current next_event_rev`, translates exact result/settled/attention rules,
+      bridges only genuinely pending pre-cutover rows through the normal typed EventInput owner, clears old
+      pending JSON and fences all later non-empty legacy subscription admission. Whole revisions stay on one
+      owner. Same-revision same-effective-mode legacy names coalesce under deterministic
+      source/revision/recipient/generation/mode identity; existing ordinary exact DL-200 subscriptions are
+      preserved via a `shadow_existing` compatibility overlay rather than overwritten. Already-accepted
+      legacy `qi_...` Inputs keep their exact factual identity and receive only an immutable
+      `legacy_protected` disclosure sidecar. Its frozen ceiling contains only the factual recipient actor;
+      a later ACL viewer is not inferred as historical audience. Where the legacy sender hash uniquely
+      reconstructs the source Agent, the normal `agent_source` root is retained so future view/share can
+      explicitly reauthorize expansion; otherwise the fact stays hard-frozen. New v54 sources are born with
+      cutover rev 1. Runtime reconciliation is worker-free: existing source-transition wake points drive only
+      translated compatibility subjects, accepted EventInputs project into existing ActorQueue custody under
+      their exact `edi_...` ID, and live-owner registration/restart reprojects any unconsumed compatibility
+      Input with no factual run binding. Focused cutover **1/1**, combined v44→...→v54 migration/lifecycle
+      **1/1**, Agent Jobs group-authority **1/1**, affected all-target check and strict Clippy are green; generic
+      zero-test name filters are not counted.
+      **Next:** begin sealed Phase 3 — one durable DriverKey plus shared Prepared/ExternalEvidence contracts
+      for bounded SourceSet capture/restore, checkpoint constructors and driver recovery. Legacy cutover
+      contraction remains Phase 7 after cross-version drain/restart proof.
 - [ ] **Phase 3** — one durable DriverKey and shared Prepared/ExternalEvidence contracts
       for bounded SourceSet capture/restore, checkpoint constructors and driver recovery.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
@@ -509,5 +527,5 @@ the grouped phase gates in `IMPLEMENTATION.md` instead.
       activation + exact indexed lookup, scalable live-authority-rechecked DisclosureManifest, and
       StoreScope-bound/gap-safe/path-reauthorized high-water `jobs_list` cursor pages with swap
       catch-up and race-free revision waits.
-- [ ] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
+- [x] Phase 2: gap-free Event projection progress, authority-scoped EventStore affinity, same-store Event→Agent Input transaction boundary, source-first candidate-oblivious retryable auth-unavailable with external authority fence semantics, exact source-owner delivery cutover rev + legacy accepted-input provenance sidecars, subscription/admission race linearization and explicit cross-store refusal/rebaseline.
 - [ ] Phase 3: bounded/non-secret symmetric capture/restore Prepared recovery descriptors + exact driver-schema pinning across store-open/restart + immutable/held-through-commit external publication evidence + publication-transaction authority fencing.

@@ -361,17 +361,19 @@ impl Router {
                 "live Agent owner registration needs an Agent root ref",
             ));
         }
+        let canonical = resolved.agent_ref().canonical();
         self.owners
             .lock()
             .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?
             .insert(
-                resolved.agent_ref().canonical(),
+                canonical.clone(),
                 LiveOwner {
                     owner,
                     wake,
                     wake_authority,
                 },
             );
+        self.reconcile_legacy_event_inputs(&canonical, true)?;
         Ok(())
     }
 
@@ -405,14 +407,57 @@ impl Router {
             return Ok(false);
         }
         owners.insert(
-            canonical,
+            canonical.clone(),
             LiveOwner {
                 owner,
                 wake,
                 wake_authority,
             },
         );
+        drop(owners);
+        self.reconcile_legacy_event_inputs(&canonical, true)?;
         Ok(true)
+    }
+
+    fn live_owner_optional(&self, canonical_agent_ref: &str) -> Result<Option<LiveOwner>> {
+        Ok(self
+            .owners
+            .lock()
+            .map_err(|_| Error::Storage("Agent jobs owner registry poisoned"))?
+            .get(canonical_agent_ref)
+            .cloned())
+    }
+
+    fn reconcile_legacy_event_inputs(
+        &self,
+        canonical_agent_ref: &str,
+        signal: bool,
+    ) -> Result<usize> {
+        let Some(live) = self.live_owner_optional(canonical_agent_ref)? else {
+            return Ok(0);
+        };
+        let inputs = self
+            .store
+            .legacy_event_inputs_for_recipient(canonical_agent_ref, 32)?;
+        let mut pending = 0usize;
+        for input in inputs {
+            match live.owner.admit_event_input(&input) {
+                Ok((view, _)) if view.state == aw_store::QueueState::Pending => {
+                    pending += 1;
+                }
+                Ok(_) => {}
+                Err(Error::Limit(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        if signal {
+            if let Some(wake) = live.wake.as_ref() {
+                for _ in 0..pending {
+                    wake.wake()?;
+                }
+            }
+        }
+        Ok(pending)
     }
 
     pub fn clear_live_owner(&self, canonical_agent_ref: &str) -> Result<()> {
@@ -2104,6 +2149,11 @@ impl AgentJobRouter for Router {
                 ));
             }
             let binding = self.binding_for_agent_ref(resolved.agent_ref())?;
+            // Restart/recovery seam: accepted compatibility EventInputs are
+            // durable before ActorQueue projection. Reconcile the current live
+            // Agent on every factual source wake without inventing a worker.
+            self.reconcile_legacy_event_inputs(canonical_agent_ref, true)?;
+
             let pending = self.store.pending_agent_job_events(
                 &self.actor,
                 &binding.session_id,
@@ -2121,6 +2171,25 @@ impl AgentJobRouter for Router {
                     }
                     Err(error) => return Err(error),
                 }
+            }
+
+            // Post-cutover v36 rules are exact DL-200 subscriptions. Drive only
+            // those compatibility subjects from this existing source-transition
+            // wake point; generic Event subscriptions keep their normal lower
+            // scheduler seam.
+            let targets = self.store.legacy_event_delivery_targets_for_agent(
+                &binding.session_id,
+                &binding.branch_id,
+                4096,
+            )?;
+            for (recipient_ref, subject) in targets {
+                let _ = self
+                    .store
+                    .event_subscription_deliver(&recipient_ref, &subject, 16)?;
+                // EventInput is the durable fact. ActorQueue is only Agent input
+                // custody, projected after admission and reconstructible after a
+                // crash from unconsumed compatibility inputs.
+                self.reconcile_legacy_event_inputs(&recipient_ref, true)?;
             }
             self.publish_revision(&binding)?;
             Ok(())
