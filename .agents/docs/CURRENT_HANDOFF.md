@@ -1,13 +1,14 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md](AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md).
+[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-PHASE1-NEXT-AGENT-2026-11-23.md](AW-DL200-PHASE1-NEXT-AGENT-2026-11-23.md).
+[AW-DL200-PHASE3-NEXT-AGENT-2026-11-24.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-24.md).
 
-Previous R6 comprehensive handoff remains historical design/implementation provenance:
-[AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md).
+Previous Phase-1/R6 comprehensive handoffs remain historical design/implementation provenance:
+- [AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md](AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md)
+- [AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md)
 
 Normative R6 design:
 - [README](../plans/dl200-unified-jobs-agent-events-2026-11-20/README.md)
@@ -40,14 +41,14 @@ release/0.17                    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17
 dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
 
-The local Phase-1/2 implementation line remains unpublished. Phase-1 completion is
+The local Phase-1/2/3 implementation line remains unpublished. Phase-1 completion is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 began at
-`14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and currently runs
-through `8fc29093037a8e6540cdfd0da4294a4db58512d2` (`Prove same-store Event universes`), with the
+`14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and closes at
+`e0c6bb3184bf87fc1bb2186ddc7f5ffb97a39c96` (`Cut over Event delivery ownership`). Phase 3 starts at
+`184ea6b05643c49d34a7f3bfdbfed86f26753162` (`Establish SourceDriver recovery contracts`). The
 intermediate private EventScan/source/read/wake/Project/subscription/EventInput/disclosure/custom-publication/
-model-tool/Handler checkpoints preserved in Git history. This checkpoint adds v54 final Event delivery
-cutover and closes Phase 2 locally. The local `origin/main` tracking ref is stale and is not publication
-truth.
+model-tool/Handler/universe checkpoints remain in Git history. The local `origin/main` tracking ref is stale
+and is not publication truth.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
