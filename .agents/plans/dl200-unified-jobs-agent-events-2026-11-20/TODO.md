@@ -1017,11 +1017,25 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       and scoped fmt/diff passed. Physical alias/writer/mount exclusion is
       independently host-owned; effectful final removal still pending. Frozen lower
       mount convergence remains untouched.
+      **Named multi-source native realization landed:** one live approval/guard and
+      canonical bounded root set with per-root artifact owner, original whole-root
+      single-source encoding retained. Disjoint direct named children, no parent
+      capability; exact physical pins and current source grants checked by original
+      driver/route. Git resolver verifies each checkout and excludes administration
+      across the selected roots. Reads narrow to RO; mutation requires writable
+      source and preserves RO ceilings. Original journal effect claims every exposed
+      root. Grouped native regression covers mixed RO/RW, unapproved sibling/parent,
+      Git exclusions, per-root barriers, worker ownership and interrupted recovery;
+      non-Git native variant exercises same primitives. Unreleased host API unified
+      around the set. Final non-Git native **1/1**, Host **16/16**, strict Host
+      Clippy for both feature variants, workspace check and scoped fmt/diff passed.
+      No schema/new executor/admission or lower mount changes. General Process
+      containment and independent host provisioning still pending.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production approval provisioning, complete Job/Process containment/dispatch,
-      broader Run-hazard reconciliation, multi-source policy, other baseline effects,
+      broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
       effectful final-source removal/structural mutation, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.

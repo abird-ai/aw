@@ -4,12 +4,12 @@ use crate::{source_authority::SourceToolAuthority, AuthenticatedToolGrantEvidenc
 use aw_agent_core::{
     tool::{ToolBindingAuthority, WeakToolBindingAuthority},
     AgentBuilder, AgentExecutionBinding, Error, Extension, HookContext, HookEvent, HookFuture,
-    NamedSourceAccess, Result, SandboxDriverHandle, SandboxDriverRegistry, SourceAccess, Tool,
-    ToolContext, ToolEffect, ToolFuture,
+    NamedSourceAccess, Result, SandboxDriverHandle, SandboxDriverRegistry, SourceAccess,
+    SourceName, Tool, ToolContext, ToolEffect, ToolFuture,
 };
 use aw_store::{
-    SandboxEffectAuthority, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
-    SandboxEffectRequest, SessionStore, VersionedSourceBinding,
+    EffectiveSourceBinding, SandboxEffectAuthority, SandboxEffectOrigin, SandboxEffectOutcome,
+    SandboxEffectPlan, SandboxEffectRequest, SessionStore,
 };
 use aw_tools::{
     filesystem::{access::Action, schema::Tool as FsTool},
@@ -25,109 +25,157 @@ use aw_tools_adapter::{
 };
 use std::{marker::PhantomData, path::Path, sync::Arc};
 
-/// Pinned, already narrowed native directory capability. The trusted
-/// resolver independently authorizes the binding and physical root.
-pub struct ApprovedSourceDirectory {
-    binding: VersionedSourceBinding,
-    identity: GrantIdentity,
-    access: SourceAccess,
+/// An exact physical directory observation and the corresponding named
+/// source mode. Neither this value nor its binding is a live authority.
+#[derive(Clone)]
+pub struct NativeSourceRoot {
+    pub source: EffectiveSourceBinding,
+    pub physical: GrantIdentity,
+    pub private_artifacts: Arc<PrivateArtifactRegistry>,
+}
+
+// Initial native layouts use either one whole root or disjoint direct
+// named children. The base is only a relative-path coordinate for the
+// latter, never a grant. The host must exclude physical aliases/mounts.
+pub(crate) fn require_named_root(
+    base: &Path,
+    name: &SourceName,
+    path: &Path,
+    count: usize,
+) -> Result<()> {
+    if !base.is_absolute()
+        || base.parent().is_none()
+        || !(count == 1 && path == base || path == base.join(name.as_str()))
+    {
+        return Err(Error::Denied(
+            "native source must use its exact named directory",
+        ));
+    }
+    Ok(())
+}
+
+/// One narrowed, descriptor-backed capability over the complete source
+/// set exposed to this effect. Retain the actual authority separately.
+pub struct ApprovedSourceLayout {
+    sources: Vec<EffectiveSourceBinding>,
+    root_granted: bool,
     capability: CapabilitySet,
 }
 
-impl ApprovedSourceDirectory {
-    /// Pin the actual directory while the host's source authority is live.
-    /// Exclusions narrow (never extend) the approved directory.
+impl ApprovedSourceLayout {
+    /// Pin only the independently approved roots at the selected modes.
+    /// The existing backend rejects duplicate physical directory objects.
     pub fn pin(
-        binding: VersionedSourceBinding,
-        identity: GrantIdentity,
-        access: SourceAccess,
-        private_artifacts: Arc<PrivateArtifactRegistry>,
+        base: &Path,
+        mut roots: Vec<NativeSourceRoot>,
         exclusions: impl IntoIterator<Item = ExclusionSpec>,
     ) -> Result<Self> {
-        if !identity.path.is_absolute()
-            || identity.path.parent().is_none()
-            || !identity.read
-            || !binding.binding.access.permits(access)
-            || (access == SourceAccess::ReadWrite && !identity.write)
+        aw_agent_core::validate_source_set_hard_limit(roots.len())?;
+        roots.sort_unstable_by(|a, b| {
+            a.source
+                .binding
+                .binding
+                .name
+                .as_str()
+                .cmp(b.source.binding.binding.name.as_str())
+        });
+        if roots.is_empty()
+            || roots.windows(2).any(|pair| {
+                pair[0].source.binding.binding.name == pair[1].source.binding.binding.name
+            })
         {
             return Err(Error::Denied(
-                "native source directory is not independently authorized",
+                "native source layout requires unique named roots",
             ));
         }
-        let grant = match access {
-            SourceAccess::ReadOnly => GrantSpec::read(&identity.path),
-            SourceAccess::ReadWrite => GrantSpec::read_write(&identity.path),
-        };
+        for root in &roots {
+            let binding = &root.source.binding;
+            binding.binding.validate()?;
+            require_named_root(
+                base,
+                &binding.binding.name,
+                &root.physical.path,
+                roots.len(),
+            )?;
+            if binding.binding_rev == 0
+                || !root.physical.read
+                || !binding.binding.access.permits(root.source.access)
+                || (root.source.access == SourceAccess::ReadWrite && !root.physical.write)
+            {
+                return Err(Error::Denied(
+                    "native source directory exceeds independent approval",
+                ));
+            }
+        }
         let capability = CapabilitySet::open_prepared_with_exclusions(
-            &identity.path,
-            [PreparedGrant::new(grant, private_artifacts)],
+            base,
+            roots.iter().map(|root| {
+                let grant = match root.source.access {
+                    SourceAccess::ReadOnly => GrantSpec::read(&root.physical.path),
+                    SourceAccess::ReadWrite => GrantSpec::read_write(&root.physical.path),
+                };
+                PreparedGrant::new(grant, root.private_artifacts.clone())
+            }),
             exclusions,
         )
-        .map_err(|_| Error::Denied("authorized source directory could not be pinned"))?;
+        .map_err(|_| Error::Denied("authorized native layout could not be pinned"))?;
         let actual = capability
             .identities()
-            .map_err(|_| Error::Denied("source directory identity unavailable"))?;
-        let [actual] = actual.as_slice() else {
-            return Err(Error::Denied(
-                "native source capability has unexpected roots",
-            ));
-        };
-        if actual.path != identity.path
-            || actual.volume != identity.volume
-            || actual.object != identity.object
-            || !actual.read
-            || actual.write != (access == SourceAccess::ReadWrite)
-            || capability.base() != Path::new(&identity.path)
-        {
+            .map_err(|_| Error::Denied("native layout identity unavailable"))?;
+        if capability.base() != base || actual.len() != roots.len() {
             return Err(Error::Conflict(
-                "authorized source directory changed during preparation",
+                "native source layout changed during preparation",
             ));
         }
+        // Both lists have the same order: canonical name, hence canonical
+        // sibling path (or one base root). No path-derived authority.
+        for (actual, root) in actual.iter().zip(&roots) {
+            if actual.path != root.physical.path
+                || actual.volume != root.physical.volume
+                || actual.object != root.physical.object
+                || !actual.read
+                || actual.write != (root.source.access == SourceAccess::ReadWrite)
+            {
+                return Err(Error::Conflict(
+                    "authorized source directory changed during preparation",
+                ));
+            }
+        }
+        let root_granted = roots[0].physical.path == base;
         Ok(Self {
-            binding,
-            identity,
-            access,
+            sources: roots.into_iter().map(|root| root.source).collect(),
+            root_granted,
             capability,
         })
     }
 }
 
-/// Concrete native realization for the initial single-directory Sandbox.
-/// Multi-source layouts and overlapping roots require an explicit complete
-/// physical policy; never approximate them using the whole workspace.
+/// The existing native executor realizes exactly the admitted named roots,
+/// not an ambient parent or another Process.
 pub struct NativeFilesystemDriver;
 
 impl NativeFilesystemDriver {
     fn prepare(
         &self,
         plan: &SandboxEffectPlan,
-        directory: ApprovedSourceDirectory,
+        layout: ApprovedSourceLayout,
     ) -> Result<CapabilitySet> {
-        let [source] = plan.grant.sources.as_slice() else {
-            return Err(Error::Denied(
-                "native source realization requires exactly one directory",
-            ));
-        };
-        if plan.sandbox.sources.len() != 1
-            || source.binding != directory.binding
-            || directory.identity.path != plan.sandbox.tool_root
-            || source.access != directory.access
+        if layout.sources != plan.grant.sources
+            || layout.capability.base() != plan.sandbox.tool_root
+            || (layout.root_granted && plan.sandbox.sources.len() != 1)
         {
             return Err(Error::Denied(
-                "native source directory differs from the authorized Sandbox",
+                "native source layout differs from authorized Sandbox",
             ));
         }
-        // No reopening a path after verification. The exact narrowed
-        // descriptor-backed capability moves into the original worker.
-        Ok(directory.capability)
+        Ok(layout.capability)
     }
 }
 
-/// A live source-policy decision from the existing trusted host resolver.
-/// Driver preparation additionally checks the exact selected binding and pin.
+/// A live policy decision and the exact narrowed capability it authorizes.
 pub struct NativeSourceAdmission<A> {
     pub authority: A,
-    pub directory: ApprovedSourceDirectory,
+    pub layout: ApprovedSourceLayout,
 }
 
 /// Explicit Agent-bound native route. The same object observes the original
@@ -235,12 +283,10 @@ where
         }
         let resolve = self.resolve.clone();
         let resolve_context = ctx.clone();
-        let NativeSourceAdmission {
-            authority,
-            directory,
-        } = tokio::task::spawn_blocking(move || resolve(&resolve_context, tool))
-            .await
-            .map_err(|_| Error::Protocol("source materialization resolver failed"))??;
+        let NativeSourceAdmission { authority, layout } =
+            tokio::task::spawn_blocking(move || resolve(&resolve_context, tool))
+                .await
+                .map_err(|_| Error::Protocol("source materialization resolver failed"))??;
         let policy = authority.policy();
         if policy.agent_ref != self.agent.canonical_ref() {
             return Err(Error::Denied(
@@ -275,10 +321,14 @@ where
                     arguments: arguments.clone(),
                 },
             },
-            sources: vec![NamedSourceAccess {
-                name: directory.binding.binding.name.clone(),
-                access,
-            }],
+            sources: layout
+                .sources
+                .iter()
+                .map(|source| NamedSourceAccess {
+                    name: source.binding.binding.name.clone(),
+                    access: source.access,
+                })
+                .collect(),
         };
         let cancellation = ctx.cancellation.clone();
         let authority =
@@ -289,7 +339,7 @@ where
             &reader,
             &self.driver,
             |_| Ok(authority),
-            |driver, plan, _| Ok((driver.prepare(plan, directory)?, request)),
+            |driver, plan, _| Ok((driver.prepare(plan, layout)?, request)),
         )?;
         let live = prepared.authority().tool.clone();
         let ((capability, request), authority, lease) = prepared.admit_with_authority()?;

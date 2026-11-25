@@ -54,7 +54,8 @@ staged VaultProvider leaf, concrete local signing broker, fenced Process proof
 projection, interrupted source-effect custody recovery and worker-owned native
 and finite Process quiescence, marked Git private-index scratch reconciliation,
 exact-subset unpublished Git restore abandonment and verified metadata-only final
-source detachment are implemented locally.
+source detachment, and independently approved multi-source native filesystem
+realization are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2462,12 +2463,44 @@ Store failures remain recorded, not rerun. This is only the already-source-free
 layout case; actual materialization removal/replacement still requires Prepared physical effects. Lower
 017 mount/Bubblewrap convergence remains frozen and untouched.
 
+Multi-source native filesystem realization extends the original live approval,
+registered NativeFilesystemDriver and SourceFilesystemRoute rather than creating
+another policy/execution owner. NativeSourceApprovalSpec now carries the exact
+relative-path base and bounded named NativeSourceDirectorySpec set (including each
+root's original private-artifact registry). One read guard owns the full canonical
+approval and actual pins; revoke waits for the admitted worker. Original whole-root
+single-source physical/policy encoding is retained; disjoint named direct children
+use a framed whole-set digest. No parent/ambient capability for child layouts.
+NativeSourceRoot is a reusable physical observation plus effective binding, not
+an authority. ApprovedSourceLayout pins the exact narrowed set through the original
+CapabilitySet backend, checks canonical root and object identity, rejects duplicates,
+and is compared against the complete actual effect grant and Sandbox layout before
+admission. Whole-root grants remain forbidden on a multi-binding Sandbox. Git resolver
+checks current Store policy and exact named binding set before inspecting each approved
+checkout, retains all repository pins until capability construction, and excludes Git
+administration across the selected roots (rejects roots overlapping administration).
+Read effects narrow all roots to RO; mutating effects expose only the permitted modes,
+require at least one writable source, and claim every exposed source including RO roots.
+No arbitrary nested/root mapping, implicit ambient parent access, lower mount changes,
+new source-bearing admission or new persistence. Physical alias/mount/external writer
+exclusion remains independent host authority. Updated the unreleased host approval
+constructor and resolver to the common set form; no parallel single-root executor.
+Grouped existing native regression uses actual sibling Git checkouts (generic native
+variant without Git), verifies mixed RO/RW ceilings, denial of parent/unapproved sibling,
+Git administration and escaped path, per-root source barriers and dropped-await worker
+settlement/recovery through original Turn. Final non-Git native **1/1**, Host
+**16/16**, strict Host all-target Clippy with all features and source-effects-only,
+workspace all-target/all-feature check and scoped fmt/diff passed. Earlier broad
+Store failures remain recorded, not rerun. Existing single-root physical encoding
+remains compatible; general multi-source Process containment and host provisioning
+still open.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
 physical recovery proof acquisition through existing owners; do not open held routes. Independent
 host approval provisioning, other effectful baseline materialization, broader Run-hazard
-reconciliation, multi-source policy, unmarked/ambiguous scratch and non-exact partial
+reconciliation, general multi-source Process policy, unmarked/ambiguous scratch and non-exact partial
 checkout cleanup, production cleanup composition/physical authority, effectful
 final-source removal/structural mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host

@@ -1308,9 +1308,11 @@ mod tests {
 
     #[tokio::test]
     async fn native_source_route_uses_pinned_capability_and_original_receipt() {
-        use crate::source_approval::{NativeSourceApproval, NativeSourceApprovalSpec};
+        use crate::source_approval::{
+            NativeSourceApproval, NativeSourceApprovalSpec, NativeSourceDirectorySpec,
+        };
         #[cfg(not(feature = "git-source-effects"))]
-        use crate::source_filesystem::{ApprovedSourceDirectory, NativeSourceAdmission};
+        use crate::source_filesystem::{ApprovedSourceLayout, NativeSourceAdmission};
         use crate::source_filesystem::{NativeFilesystemDriver, SourceFilesystemRoute};
         #[cfg(feature = "git-source-effects")]
         use crate::source_git::GitNativeSourceHost;
@@ -1378,17 +1380,23 @@ mod tests {
         let temp = Temp(
             std::env::temp_dir().join(format!("aw-source-native-{}-{nonce}", std::process::id())),
         );
-        let root = temp.0.join("source");
-        std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let base = temp.0.join("source");
+        std::fs::create_dir_all(base.join("code")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let root = base.join("code");
+        let data = base.join("data");
+        std::fs::create_dir(&data).unwrap();
         std::fs::write(root.join("code"), "initial").unwrap();
+        std::fs::write(data.join("code"), "read-only data").unwrap();
+        std::fs::create_dir(base.join("unapproved")).unwrap();
+        std::fs::write(base.join("unapproved/code"), "unapproved secret").unwrap();
         let outside = temp.0.join("outside");
         std::fs::write(&outside, "protected").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
         let actor = PrincipalId::new("internal:fixture:native-source").unwrap();
         let registry = SourceDriverRegistry::new();
         #[cfg(not(feature = "git-source-effects"))]
-        let binding = {
+        let bindings = {
             let source_driver = DriverKey::builtin("fixture-source").unwrap();
             let schema = SchemaSupport::new(1, 1).unwrap();
             registry
@@ -1402,71 +1410,75 @@ mod tests {
                     (),
                 )
                 .unwrap();
-            SourceBinding {
-                name: SourceName::new("code").unwrap(),
-                driver: source_driver,
+            [("code", &root), ("data", &data)].map(|(name, path)| SourceBinding {
+                name: SourceName::new(name).unwrap(),
+                driver: source_driver.clone(),
                 binding_schema: 1,
-                source_ref: "fixture:directory".into(),
-                materialization: root.to_str().unwrap().into(),
+                source_ref: format!("fixture:directory:{name}"),
+                materialization: path.to_str().unwrap().into(),
                 access: SourceAccess::ReadWrite,
                 checkpoint_policy: CheckpointPolicy::Required,
-            }
+            })
         };
         #[cfg(feature = "git-source-effects")]
-        let (git_handle, binding) = {
+        let (git_handle, bindings) = {
             let git = std::env::var_os("AW_GIT")
                 .map(PathBuf::from)
                 .or_else(|| option_env!("AW_DEFAULT_GIT").map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
-            for args in [
-                &["init", "--initial-branch=main"][..],
-                &["add", "code"][..],
-                &[
-                    "-c",
-                    "user.name=Fixture",
-                    "-c",
-                    "user.email=fixture@example.invalid",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "commit",
-                    "--no-gpg-sign",
-                    "-m",
-                    "fixture",
-                ][..],
-            ] {
-                let output = Command::new(&git)
-                    .current_dir(&root)
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "fixture Git: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+            for directory in [&root, &data] {
+                for args in [
+                    &["init", "--initial-branch=main"][..],
+                    &["add", "code"][..],
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "commit",
+                        "--no-gpg-sign",
+                        "-m",
+                        "fixture",
+                    ][..],
+                ] {
+                    let output = Command::new(&git)
+                        .current_dir(directory)
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .args(args)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "fixture Git: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
             }
             let handle = aw_git::source_driver::GitSourceDriver::new(git)
                 .unwrap()
                 .register(&registry)
                 .unwrap();
             let driver = registry.reader().unwrap().get(&handle).unwrap();
-            let binding = driver
-                .binding(
-                    &root,
-                    SourceName::new("code").unwrap(),
-                    SourceAccess::ReadWrite,
-                    CheckpointPolicy::Required,
-                )
-                .unwrap();
-            (handle, binding)
+            let bindings = [("code", &root), ("data", &data)].map(|(name, path)| {
+                driver
+                    .binding(
+                        path,
+                        SourceName::new(name).unwrap(),
+                        SourceAccess::ReadWrite,
+                        CheckpointPolicy::Required,
+                    )
+                    .unwrap()
+            });
+            (handle, bindings)
         };
-        let limit = SourceSetLimit::new(1).unwrap();
+        let limit = SourceSetLimit::new(2).unwrap();
         let store = SessionStore::open_with_sources(&temp.0, registry.clone(), limit).unwrap();
         let layout = SessionBinding {
-            working_directory: root.clone(),
-            tool_root: root.clone(),
+            working_directory: base.clone(),
+            tool_root: base.clone(),
             system_prompt: "fixture".into(),
             profile_hint: "fixture".into(),
             model_hint: "fixture".into(),
@@ -1485,12 +1497,7 @@ mod tests {
             ).unwrap()
         };
         let sandbox = store
-            .sandbox_create_fresh_with_sources(
-                &actor,
-                &project,
-                &layout,
-                std::slice::from_ref(&binding),
-            )
+            .sandbox_create_fresh_with_sources(&actor, &project, &layout, &bindings)
             .unwrap();
         let identity = InvocationIdentity {
             actor: actor.clone(),
@@ -1517,34 +1524,63 @@ mod tests {
                 "native:read",
                 FsTool::Read,
                 ToolEffect::Read,
-                serde_json::json!({"path":"code"}),
+                serde_json::json!({"path":"code/code"}),
+            ),
+            (
+                "native:data-read",
+                FsTool::Read,
+                ToolEffect::Read,
+                serde_json::json!({"path":"data/code"}),
+            ),
+            (
+                "native:unapproved",
+                FsTool::Read,
+                ToolEffect::Read,
+                serde_json::json!({"path":"unapproved/code"}),
             ),
             (
                 "native:escape",
                 FsTool::Read,
                 ToolEffect::Read,
-                serde_json::json!({"path":"escape"}),
+                serde_json::json!({"path":"code/escape"}),
+            ),
+            (
+                "native:parent",
+                FsTool::Read,
+                ToolEffect::Read,
+                serde_json::json!({"path":"."}),
             ),
         ];
         #[cfg(feature = "git-source-effects")]
-        records.push((
-            "native:git-private",
-            FsTool::Read,
-            ToolEffect::Read,
-            serde_json::json!({"path":".git/config"}),
-        ));
+        for (id, path) in [
+            ("native:git-private", "code/.git/config"),
+            ("native:data-private", "data/.git/config"),
+        ] {
+            records.push((
+                id,
+                FsTool::Read,
+                ToolEffect::Read,
+                serde_json::json!({"path":path}),
+            ));
+        }
         records.extend([
+            (
+                "native:data-write",
+                FsTool::Write,
+                ToolEffect::Write,
+                serde_json::json!({"path":"data/code","content":"must not write"}),
+            ),
             (
                 "native:write",
                 FsTool::Write,
                 ToolEffect::Write,
-                serde_json::json!({"path":"code","content":"native changed"}),
+                serde_json::json!({"path":"code/code","content":"native changed"}),
             ),
             (
                 "native:detached",
                 FsTool::Write,
                 ToolEffect::Write,
-                serde_json::json!({"path":"code","content":"detached changed"}),
+                serde_json::json!({"path":"code/code","content":"detached changed"}),
             ),
         ]);
         let records: Vec<_> = records
@@ -1594,16 +1630,32 @@ mod tests {
                 policy_ref: "host:fixture-native".into(),
                 authority_ref: "host:fixture-native-authority".into(),
                 authority_generation: 1,
-                source: VersionedSourceBinding {
-                    binding: binding.clone(),
-                    binding_rev: 1,
-                },
-                directory: GrantSpec::read_write(&root),
+                base: base.clone(),
+                // Reverse input order deliberately; the policy uses canonical
+                // name order and retains each original artifact owner.
+                directories: vec![
+                    NativeSourceDirectorySpec {
+                        source: VersionedSourceBinding {
+                            binding: bindings[1].clone(),
+                            binding_rev: 1,
+                        },
+                        directory: GrantSpec::read(&data),
+                        private_artifacts: PrivateArtifactRegistry::memory(),
+                    },
+                    NativeSourceDirectorySpec {
+                        source: VersionedSourceBinding {
+                            binding: bindings[0].clone(),
+                            binding_rev: 1,
+                        },
+                        directory: GrantSpec::read_write(&root),
+                        private_artifacts: PrivateArtifactRegistry::open(artifacts.clone())
+                            .unwrap(),
+                    },
+                ],
             },
-            PrivateArtifactRegistry::open(artifacts.clone()).unwrap(),
         )
         .unwrap();
-        let set = SourceMutationSet::from_bindings(&[binding]).unwrap();
+        let set = SourceMutationSet::from_bindings(&bindings).unwrap();
         let agent_binding =
             AgentExecutionBinding::from_trusted_host(&reference, &session.id, &branch.id).unwrap();
         // Physical approval and Agent access alone cannot mint a Store grant.
@@ -1693,21 +1745,15 @@ mod tests {
             let approval = approval.clone();
             move |_: &ToolContext, tool: FsTool| {
                 let authority = approval.read()?;
-                let directory = ApprovedSourceDirectory::pin(
-                    authority.source().clone(),
-                    authority.physical().clone(),
-                    if tool.action() == aw_tools::filesystem::access::Action::Read {
-                        SourceAccess::ReadOnly
-                    } else {
-                        SourceAccess::ReadWrite
-                    },
-                    authority.private_artifacts(),
-                    std::iter::empty(),
-                )?;
-                Ok(NativeSourceAdmission {
-                    authority,
-                    directory,
-                })
+                let mut roots = authority.roots().to_vec();
+                if tool.action() == aw_tools::filesystem::access::Action::Read {
+                    for root in &mut roots {
+                        root.source.access = SourceAccess::ReadOnly;
+                    }
+                }
+                let layout =
+                    ApprovedSourceLayout::pin(authority.base(), roots, std::iter::empty())?;
+                Ok(NativeSourceAdmission { authority, layout })
             }
         };
         let route = Arc::new(
@@ -1756,7 +1802,7 @@ mod tests {
                     .execute(
                         op,
                         ctx.clone(),
-                        &serde_json::json!({"path":"escape"}),
+                        &serde_json::json!({"path":"code/escape"}),
                         Arc::new(NoFallback)
                     )
                     .await
@@ -1770,7 +1816,7 @@ mod tests {
                         .sandbox_get(&actor, &sandbox.canonical_ref)
                         .unwrap()
                         .rev,
-                    sandbox.rev
+                    sandbox.rev + 1
                 );
                 assert_eq!(
                     store
@@ -1799,9 +1845,15 @@ mod tests {
                 }
                 drop(pending);
                 assert_eq!(std::fs::read(root.join("code")).unwrap(), b"native changed");
-                assert!(store
-                    .acquire_source_mutation_barrier(&set, "host:detached-active")
-                    .is_err());
+                // Every exposed root is claimed, including the read-only
+                // data source while the writable code worker is detached.
+                for binding in &bindings {
+                    let source =
+                        SourceMutationSet::from_bindings(std::slice::from_ref(binding)).unwrap();
+                    assert!(store
+                        .acquire_source_mutation_barrier(&source, "host:detached-active")
+                        .is_err());
+                }
                 let revoke = approval.revoke();
                 tokio::pin!(revoke);
                 tokio::select! {
@@ -1838,11 +1890,21 @@ mod tests {
                 .unwrap();
             match id.as_str() {
                 "native:read" => assert!(output.content.contains("initial") && !output.is_error),
+                "native:data-read" => {
+                    assert!(output.content.contains("read-only data") && !output.is_error)
+                }
                 "native:escape" => {
                     assert!(output.is_error && !output.content.contains("protected"))
                 }
+                "native:unapproved" | "native:parent" => {
+                    assert!(output.is_error && !output.content.contains("unapproved secret"))
+                }
+                "native:data-write" => {
+                    assert!(output.is_error);
+                    assert_eq!(std::fs::read(data.join("code")).unwrap(), b"read-only data");
+                }
                 #[cfg(feature = "git-source-effects")]
-                "native:git-private" => {
+                "native:git-private" | "native:data-private" => {
                     assert!(output.is_error && !output.content.contains("repositoryformatversion"))
                 }
                 "native:write" => assert!(
@@ -1852,9 +1914,13 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(approval.read().is_ok());
-            assert!(store
-                .acquire_source_mutation_barrier(&set, "host:before-receipt")
-                .is_err());
+            for binding in &bindings {
+                let source =
+                    SourceMutationSet::from_bindings(std::slice::from_ref(binding)).unwrap();
+                assert!(store
+                    .acquire_source_mutation_barrier(&source, "host:before-receipt")
+                    .is_err());
+            }
             assert!(store
                 .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, &id)
                 .is_err());
@@ -1908,7 +1974,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 1
+            sandbox.rev + 2
         );
         assert_eq!(std::fs::read(&outside).unwrap(), b"protected");
         assert!(approval.read().is_err());
@@ -1969,7 +2035,7 @@ mod tests {
                 .sandbox_get(&actor, &sandbox.canonical_ref)
                 .unwrap()
                 .rev,
-            sandbox.rev + 2
+            sandbox.rev + 3
         );
         assert!(store.activate(&actor, &session.id, &branch.id).is_err());
     }

@@ -4,7 +4,7 @@
 use crate::{
     source_approval::{NativeSourceApproval, NativeSourceApprovalGuard},
     source_filesystem::{
-        ApprovedSourceDirectory, NativeFilesystemDriver, NativeSourceAdmission,
+        ApprovedSourceLayout, NativeFilesystemDriver, NativeSourceAdmission, NativeSourceRoot,
         SourceFilesystemRoute,
     },
 };
@@ -18,11 +18,8 @@ use aw_store::{
     VersionedSourceBinding,
 };
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
-use aw_tools_adapter::{
-    native_filesystem::{ExclusionSpec, GrantIdentity, PrivateArtifactRegistry},
-    LocalToolOptions,
-};
-use std::sync::Arc;
+use aw_tools_adapter::{native_filesystem::ExclusionSpec, LocalToolOptions};
+use std::{path::Path, sync::Arc};
 
 /// Trusted metadata-only final detach, using the original Sandbox source
 /// mutation owner. The host independently authorizes the exact old source
@@ -77,14 +74,14 @@ impl GitNativeSourceResolver {
     /// worker with an independently resolved live host policy guard and
     /// physical directory approval. The exact Store grant is checked
     /// before inspecting protected Git materialization metadata.
-    pub fn resolve<A: SandboxEffectAuthority>(
+    pub fn resolve(
         &self,
         ctx: &ToolContext,
         tool: FsTool,
-        authority: A,
-        physical: GrantIdentity,
-        private_artifacts: Arc<PrivateArtifactRegistry>,
-    ) -> Result<NativeSourceAdmission<A>> {
+        authority: &impl SandboxEffectAuthority,
+        base: &Path,
+        roots: &[NativeSourceRoot],
+    ) -> Result<ApprovedSourceLayout> {
         let policy = authority.policy();
         if ctx
             .execution_owner
@@ -97,70 +94,85 @@ impl GitNativeSourceResolver {
                 "Git native authority belongs to another invocation",
             ));
         }
-        let access = if tool.action() == Action::Read {
-            SourceAccess::ReadOnly
-        } else {
-            SourceAccess::ReadWrite
-        };
-        if !physical.read || (access == SourceAccess::ReadWrite && !physical.write) {
-            return Err(Error::Denied(
-                "Git native access exceeds physical host approval",
-            ));
-        }
+        let write = tool.action() != Action::Read;
         let observation = self.store.sandbox_grant_preflight(
             &ctx.actor,
             &policy.agent_ref,
             policy,
             authority.tool_ceiling(),
         )?;
-        let [source] = observation.sources.as_slice() else {
+        if observation.sources.len() != roots.len() || roots.is_empty() {
             return Err(Error::Denied(
-                "Git native realization requires one authorized source",
-            ));
-        };
-        if &source.binding.binding.driver != self.driver.driver() || !source.access.permits(access)
-        {
-            return Err(Error::Denied(
-                "Git source identity or access is not authorized",
+                "Git native approval requires its complete named source set",
             ));
         }
+        if write
+            && !observation
+                .sources
+                .iter()
+                .any(|source| source.access == SourceAccess::ReadWrite)
+        {
+            return Err(Error::Denied("Git native mutation has no writable source"));
+        }
         let driver = self.store.source_driver(&self.driver)?;
-        let repo = driver.verify_materialization(
-            &source.binding.binding,
-            &physical.path,
-            (physical.volume, physical.object),
-        )?;
-
-        // Native file operations do not own Git's private retention refs or
-        // shared administration directories. A worktree's .git pointer is
-        // excluded too. Reuse the platform's existing exclusion mechanism.
-        let exclusions = [
-            repo.root().join(".git"),
-            repo.git_dir().to_owned(),
-            repo.common_dir().to_owned(),
-        ]
-        .into_iter()
-        .filter(|path| path.starts_with(repo.root()))
-        .map(ExclusionSpec::read_write);
-        let directory = ApprovedSourceDirectory::pin(
-            source.binding.clone(),
-            physical,
-            access,
-            private_artifacts,
-            exclusions,
-        )?;
-        // Retain the original checkout pin until the capability has pinned
-        // that exact physical object. No pathname reopening during launch.
-        drop(repo);
-        Ok(NativeSourceAdmission {
-            authority,
-            directory,
-        })
+        let mut selected = Vec::with_capacity(roots.len());
+        let mut repos = Vec::with_capacity(roots.len());
+        let mut exclusions = Vec::new();
+        for (mut source, root) in observation.sources.into_iter().zip(roots) {
+            if source.binding != root.source.binding
+                || &source.binding.binding.driver != self.driver.driver()
+            {
+                return Err(Error::Denied(
+                    "Git source identity differs from independent approval",
+                ));
+            }
+            if !write {
+                source.access = SourceAccess::ReadOnly;
+            }
+            let physical = &root.physical;
+            let repo = driver.verify_materialization(
+                &source.binding.binding,
+                &physical.path,
+                (physical.volume, physical.object),
+            )?;
+            // All approved roots must exclude Git administration, even
+            // when linked worktrees share backing with another checkout.
+            for admin in [
+                repo.root().join(".git"),
+                repo.git_dir().to_owned(),
+                repo.common_dir().to_owned(),
+            ] {
+                if roots
+                    .iter()
+                    .any(|root| root.physical.path.starts_with(&admin))
+                {
+                    return Err(Error::Denied(
+                        "native source root overlaps Git administration",
+                    ));
+                }
+                if roots
+                    .iter()
+                    .any(|root| admin.starts_with(&root.physical.path))
+                {
+                    exclusions.push(ExclusionSpec::read_write(admin));
+                }
+            }
+            repos.push(repo);
+            selected.push(NativeSourceRoot {
+                source,
+                physical: physical.clone(),
+                private_artifacts: root.private_artifacts.clone(),
+            });
+        }
+        let layout = ApprovedSourceLayout::pin(base, selected, exclusions)?;
+        // Retain every checkout pin through actual capability preparation.
+        drop(repos);
+        Ok(layout)
     }
 }
 
-/// Explicit native-only host composition for one independently approved Git
-/// source. All runtime instances use the same live approval, not a copy of
+/// Explicit native-only host composition for independently approved named
+/// Git sources. All runtime instances use the same live approval, not a copy of
 /// the durable grant. No automatic approval, activation or policy registry.
 #[derive(Clone)]
 pub struct GitNativeSourceHost {
@@ -181,15 +193,15 @@ impl GitNativeSourceHost {
         let resolver = GitNativeSourceResolver::new(approval.store().clone(), git.clone())?;
         {
             let guard = approval.read()?;
-            let physical = guard.physical();
-            approval
-                .store()
-                .source_driver(&git)?
-                .verify_materialization(
-                    &guard.source().binding,
+            let driver = approval.store().source_driver(&git)?;
+            for root in guard.roots() {
+                let physical = &root.physical;
+                driver.verify_materialization(
+                    &root.source.binding.binding,
                     &physical.path,
                     (physical.volume, physical.object),
                 )?;
+            }
         }
         Ok(Self {
             approval,
@@ -221,17 +233,14 @@ impl GitNativeSourceHost {
         tools: &LocalToolOptions,
     ) -> Result<()> {
         let observed = self.approval.preflight(store, actor, agent)?;
-        let [source] = observed.sources.as_slice() else {
-            return Err(Error::Denied(
-                "Git native host requires one approved source",
-            ));
-        };
+        let writable = observed
+            .sources
+            .iter()
+            .any(|source| source.access == SourceAccess::ReadWrite);
         if tools.selected_tools.is_empty()
             || tools.selected_tools.iter().any(|name| {
                 FsTool::from_name(name).is_none_or(|tool| {
-                    tool == FsTool::Remove
-                        || (tool.action() != Action::Read
-                            && source.access != SourceAccess::ReadWrite)
+                    tool == FsTool::Remove || (tool.action() != Action::Read && !writable)
                 })
             })
         {
@@ -253,9 +262,13 @@ impl GitNativeSourceHost {
                 "Git native approval belongs to another Agent binding",
             ));
         }
-        let physical = guard.physical().clone();
-        let private = guard.private_artifacts();
-        self.resolver.resolve(ctx, tool, guard, physical, private)
+        let layout = self
+            .resolver
+            .resolve(ctx, tool, &guard, guard.base(), guard.roots())?;
+        Ok(NativeSourceAdmission {
+            authority: guard,
+            layout,
+        })
     }
 
     /// Construct the actual root-free tool route on the original builder.
