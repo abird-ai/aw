@@ -32,8 +32,10 @@ use aw_tools_adapter::{
     },
     LocalToolOptions,
 };
+use serde::Deserialize;
 use std::{
     collections::BTreeSet,
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -82,6 +84,35 @@ pub struct GitSourceApprovalDirectory {
     pub location: GitSourceLocation,
     pub binding_rev: u64,
     pub access: SourceAccess,
+}
+
+const MAX_APPROVAL_CONFIG_BYTES: usize = 1024 * 1024;
+
+/// Host-owned configuration, never a serialized durable SandboxGrant.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredGitApproval {
+    version: u16,
+    store_directory: PathBuf,
+    store_generation: u64,
+    manager: PrincipalId,
+    actor: PrincipalId,
+    agent_ref: String,
+    sandbox_ref: String,
+    sandbox_rev: u64,
+    policy_ref: String,
+    base: PathBuf,
+    directories: Vec<ConfiguredGitDirectory>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredGitDirectory {
+    name: SourceName,
+    repository: PathBuf,
+    repository_identity: (u64, u64),
+    binding_rev: u64,
+    access: SourceAccess,
 }
 
 // A complete verified repository set. Git administration is protected even
@@ -136,6 +167,86 @@ impl GitNativeSourceResolver {
         Ok(Self { store, driver })
     }
 
+    /// Explicit trusted-host activation of `root/git-native.json`. The
+    /// same existing private root owns the source artifact namespaces.
+    /// The caller must independently protect that root, its ancestors and
+    /// the selected physical layout against other writers/mount aliases.
+    /// No ambient discovery, implicit grant, recovery or Agent activation.
+    /// Each activation issues a fresh live authority; revoke the old owner
+    /// before changing configuration or reactivating. Editing the file alone
+    /// does not withdraw a live decision.
+    pub fn provision_configured_approval(
+        &self,
+        manager: &PrincipalId,
+        root: &Path,
+    ) -> Result<NativeSourceApproval> {
+        if !aw_platform::secure_private_files_supported()
+            || !root.is_absolute()
+            || root.canonicalize()? != root
+        {
+            return Err(Error::Denied(
+                "configured Git approval requires canonical private host state",
+            ));
+        }
+        aw_platform::validate_private_dir(root)?;
+        let file = aw_platform::open_private_existing(&root.join("git-native.json"), false)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_APPROVAL_CONFIG_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_APPROVAL_CONFIG_BYTES {
+            return Err(Error::Limit("Git approval configuration exceeds 1 MiB"));
+        }
+        let config: ConfiguredGitApproval = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Config("invalid Git native approval configuration".into()))?;
+        let process = self.store.local_process_info()?;
+        let store_directory = self.store.directory().ok_or(Error::Denied(
+            "configured Git approval requires a durable Store",
+        ))?;
+        if config.version != 1
+            || &config.manager != manager
+            || process.process_kind != "owner_lock"
+            || process.state != "active"
+            || process.store_generation != config.store_generation
+            || store_directory.canonicalize()? != config.store_directory
+        {
+            return Err(Error::Denied(
+                "configured Git approval differs from its host manager or Store",
+            ));
+        }
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|_| Error::Storage("Git approval authority randomness unavailable"))?;
+        let authority_ref = format!("host:git-native:{}", u128::from_be_bytes(nonce));
+        let spec = NativeSourceApprovalSpec {
+            agent_ref: config.agent_ref,
+            actor: config.actor,
+            policy_ref: config.policy_ref,
+            authority_ref,
+            authority_generation: 1,
+            base: config.base,
+            directories: config
+                .directories
+                .into_iter()
+                .map(|directory| GitSourceApprovalDirectory {
+                    location: GitSourceLocation {
+                        name: directory.name,
+                        repository: directory.repository,
+                        repository_identity: directory.repository_identity,
+                    },
+                    binding_rev: directory.binding_rev,
+                    access: directory.access,
+                })
+                .collect(),
+        };
+        self.provision_approval_in(
+            manager,
+            config.sandbox_rev,
+            Some(&config.sandbox_ref),
+            spec,
+            root,
+        )
+    }
+
     /// Provision a live native approval from explicit, independently
     /// authorized physical sources. The trusted host transfers its
     /// approval decision to the returned owner (withdraw with revoke);
@@ -147,12 +258,21 @@ impl GitNativeSourceResolver {
         &self,
         manager: &PrincipalId,
         expected_sandbox_rev: u64,
+        spec: NativeSourceApprovalSpec<GitSourceApprovalDirectory>,
+        state_root: &Path,
+    ) -> Result<NativeSourceApproval> {
+        self.provision_approval_in(manager, expected_sandbox_rev, None, spec, state_root)
+    }
+
+    fn provision_approval_in(
+        &self,
+        manager: &PrincipalId,
+        expected_sandbox_rev: u64,
+        expected_sandbox: Option<&str>,
         mut spec: NativeSourceApprovalSpec<GitSourceApprovalDirectory>,
         state_root: &Path,
     ) -> Result<NativeSourceApproval> {
-        self.store
-            .source_set_limit()
-            .admit(spec.directories.len())?;
+        spec.validate(&self.store)?;
         spec.directories
             .sort_unstable_by(|a, b| a.location.name.as_str().cmp(b.location.name.as_str()));
         let names = spec
@@ -167,7 +287,8 @@ impl GitNativeSourceResolver {
             expected_sandbox_rev,
             &names,
         )?;
-        if sandbox.tool_root != spec.base
+        if expected_sandbox.is_some_and(|expected| expected != sandbox.canonical_ref)
+            || sandbox.tool_root != spec.base
             || (spec.directories.len() == 1
                 && spec.directories[0].location.repository == spec.base
                 && sandbox.sources.len() != 1)
@@ -175,6 +296,12 @@ impl GitNativeSourceResolver {
             return Err(Error::Denied(
                 "native source approval differs from Sandbox layout",
             ));
+        }
+        if expected_sandbox.is_some() {
+            // Config and artifact state must not be inside the layout, even
+            // a sibling outside this independently selected grant. Check only
+            // after the original manager/actor/Store selection is authorized.
+            validate_source_artifact_state(state_root, [spec.base.as_path()])?;
         }
         let driver = self.store.source_driver(&self.driver)?;
         let mut repos = Vec::with_capacity(sources.len());

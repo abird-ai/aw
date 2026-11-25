@@ -11,7 +11,7 @@ description = "Thin reusable host composition: policy, Agent and original tool e
 default = []
 sessions = ["dep:aw-session"]
 source-effects = ["dep:aw-store", "dep:tokio", "dep:serde_json"]
-git-source-effects = ["source-effects", "dep:aw-git"]
+git-source-effects = ["source-effects", "dep:aw-git", "dep:aw-platform", "dep:getrandom", "dep:serde"]
 
 [dependencies]
 aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }
@@ -21,6 +21,9 @@ aw-tools = { path = "../aw-tools", version = "=0.15.0" }
 aw-session = { path = "../aw-session", version = "=0.15.0", optional = true }
 sha2 = "=0.10.9"
 serde_json = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+getrandom = { version = "=0.3.4", optional = true }
+aw-platform = { path = "../aw-platform", version = "=0.15.0", optional = true }
 aw-store = { path = "../aw-store", version = "=0.15.0", optional = true }
 aw-git = { path = "../aw-git", version = "=0.15.0", optional = true, features = ["source-driver"] }
 tokio = { version = "=1.48.0", default-features = false, features = ["time", "macros", "rt"], optional = true }

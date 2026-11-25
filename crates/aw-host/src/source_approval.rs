@@ -32,6 +32,28 @@ pub struct NativeSourceApprovalSpec<D = NativeSourceDirectorySpec> {
     pub directories: Vec<D>,
 }
 
+impl<D> NativeSourceApprovalSpec<D> {
+    pub(crate) fn validate(&self, store: &SessionStore) -> Result<()> {
+        store.source_set_limit().admit(self.directories.len())?;
+        if self.directories.is_empty()
+            || self.authority_generation == 0
+            || self.authority_generation > i64::MAX as u64
+            || [&self.policy_ref, &self.authority_ref]
+                .iter()
+                .any(|reference| {
+                    reference.is_empty()
+                        || reference.len() > 512
+                        || reference.contains("://")
+                        || reference.chars().any(char::is_whitespace)
+                        || reference.chars().any(char::is_control)
+                })
+        {
+            return Err(Error::Denied("invalid independent native source approval"));
+        }
+        Ok(())
+    }
+}
+
 pub struct NativeSourceDirectorySpec {
     pub source: VersionedSourceBinding,
     pub directory: GrantSpec,
@@ -113,22 +135,7 @@ impl NativeSourceApproval {
     /// or private-artifact reconciliation; one original artifact owner
     /// per directory. The trusted host must exclude physical aliases.
     pub fn pin(store: SessionStore, mut spec: NativeSourceApprovalSpec) -> Result<Self> {
-        store.source_set_limit().admit(spec.directories.len())?;
-        if spec.directories.is_empty()
-            || spec.authority_generation == 0
-            || spec.authority_generation > i64::MAX as u64
-            || [&spec.policy_ref, &spec.authority_ref]
-                .iter()
-                .any(|reference| {
-                    reference.is_empty()
-                        || reference.len() > 512
-                        || reference.contains("://")
-                        || reference.chars().any(char::is_whitespace)
-                        || reference.chars().any(char::is_control)
-                })
-        {
-            return Err(Error::Denied("invalid independent native source approval"));
-        }
+        spec.validate(&store)?;
         let agent = store.agent_get(&spec.actor, &spec.agent_ref)?;
         if agent.canonical_ref != spec.agent_ref
             || agent.lifecycle != AgentLifecycle::Open

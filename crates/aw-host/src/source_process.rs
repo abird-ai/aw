@@ -1806,8 +1806,71 @@ mod tests {
                 assert_eq!(std::fs::read_dir(&bad_state).unwrap().count(), 0);
                 std::fs::remove_dir(&bad_state).unwrap();
             }
+            // Explicit host configuration is the independent selection, not
+            // a serialization of the Store grant or an ambient repository.
+            // Exercise the same real native route with the configured owner.
+            use std::io::Write;
+            let process = store.local_process_info().unwrap();
+            let config = serde_json::json!({
+                "version": 1,
+                "store_directory": store.directory().unwrap().canonicalize().unwrap(),
+                "store_generation": process.store_generation,
+                "manager": actor,
+                "actor": actor,
+                "agent_ref": reference,
+                "sandbox_ref": sandbox.canonical_ref,
+                "sandbox_rev": sandbox.rev,
+                "policy_ref": "host:fixture-configured-native",
+                "base": base,
+                "directories": spec().directories.into_iter().map(|directory| serde_json::json!({
+                    "name": directory.location.name,
+                    "repository": directory.location.repository,
+                    "repository_identity": directory.location.repository_identity,
+                    "binding_rev": directory.binding_rev,
+                    "access": directory.access,
+                })).collect::<Vec<_>>(),
+            });
+            let path = artifact_state.join("git-native.json");
+            assert!(resolver
+                .provision_configured_approval(&actor, &artifact_state)
+                .is_err());
+            let mut file = aw_platform::open_private_new(&path).unwrap();
+            file.write_all(&serde_json::to_vec(&config).unwrap())
+                .unwrap();
+            drop(file);
+            // Missing/invalid policy, wrong Store generation or exact
+            // Sandbox selection, and aliased config files fail before any
+            // durable artifact namespace is provisioned.
+            for (field, value) in [
+                (
+                    "store_generation",
+                    serde_json::json!(process.store_generation + 1),
+                ),
+                ("sandbox_ref", serde_json::json!("different-sandbox")),
+                ("unknown", serde_json::json!(true)),
+            ] {
+                let mut wrong = config.clone();
+                wrong[field] = value;
+                std::fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+                assert!(resolver
+                    .provision_configured_approval(&actor, &artifact_state)
+                    .is_err());
+                assert_eq!(std::fs::read_dir(&artifact_state).unwrap().count(), 1);
+            }
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let alias = artifact_state.join("config-alias");
+            std::fs::hard_link(&path, &alias).unwrap();
+            assert!(resolver
+                .provision_configured_approval(&actor, &artifact_state)
+                .is_err());
+            std::fs::remove_file(alias).unwrap();
+            let wrong_manager = PrincipalId::new("internal:fixture:wrong-manager").unwrap();
+            assert!(resolver
+                .provision_configured_approval(&wrong_manager, &artifact_state)
+                .is_err());
+            assert_eq!(std::fs::read_dir(&artifact_state).unwrap().count(), 1);
             resolver
-                .provision_approval(&actor, sandbox.rev, spec(), &artifact_state)
+                .provision_configured_approval(&actor, &artifact_state)
                 .unwrap()
         };
         #[cfg(not(feature = "git-source-effects"))]
@@ -1888,6 +1951,20 @@ mod tests {
                 .access,
             SourceAccess::ReadWrite
         );
+        #[cfg(feature = "git-source-effects")]
+        {
+            // A newly loaded decision cannot silently inherit a previous
+            // durable grant even for the same unchanged trusted policy.
+            let reloaded = resolver
+                .provision_configured_approval(&actor, &artifact_state)
+                .unwrap();
+            assert_ne!(
+                reloaded.read().unwrap().policy().evidence.authority_ref,
+                approval.read().unwrap().policy().evidence.authority_ref,
+            );
+            assert!(reloaded.preflight(&store, &actor, &agent_binding).is_err());
+            assert!(reloaded.revoke().await);
+        }
         assert!(approval
             .preflight(&SessionStore::in_memory().unwrap(), &actor, &agent_binding)
             .is_err());

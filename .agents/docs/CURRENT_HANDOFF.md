@@ -18,7 +18,67 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: source-aware single-link native capabilities
+## Latest local implementation delta — 2026-11-25: configured Git native source authority
+
+Parent: `3d2fd314cbaf8cccb6bdd0c69ab7d39cd6c9b559` (source-aware single-link
+native capabilities). Parent signature verified. The original Agent/Turn
+journal owners and resource CLI remain concurrently occupied; source-bearing
+admission remains held.
+
+- `GitNativeSourceResolver::provision_configured_approval(manager, root)`
+  consumes explicit trusted-host configuration from `root/git-native.json`.
+  The canonical existing owner-private root also owns the original durable
+  artifact namespaces; the existing platform private-file open rejects aliases
+  and unsafe file permissions. Bounded v1 JSON (1 MiB; existing source-set
+  limit; unknown fields denied). The configuration is never an Agent input,
+  automatically discovered file, or serialization of a durable grant.
+- Config fields: `version` (1), `store_directory` (canonical),
+  `store_generation` (current `local_process_info().store_generation`),
+  `manager`, `actor`, `agent_ref`, `sandbox_ref`, `sandbox_rev`, `policy_ref`,
+  `base`, `directories`. Each directory specifies `name`, `repository`
+  (canonical), `repository_identity` (volume/object pair), `binding_rev`,
+  `access` (existing SourceAccess encoding). These are independently selected
+  host facts; no ambient repository discovery. Requires the actual active
+  exclusive Store owner and exact manager. The original Store authorization
+  and exact Sandbox selection occur before Git probes. Config and artifact
+  state must lie outside the entire layout, including unselected siblings.
+  Existing complete-set materialization and artifact-state checks still apply.
+- Reuses the original approval provisioning, typed registered Git driver,
+  private artifact owner, and `NativeSourceApprovalSpec` validation. A fresh
+  random authority ref with generation 1 on each activation prevents reuse of
+  previous persisted grant evidence; publication is the existing explicit
+  revision CAS. The returned approval composes directly with
+  `GitNativeSourceHost::new` and its original native route. No second registry,
+  Store schema, recovery route or model-facing policy knob. Revoke the old
+  owner before changing policy/reactivating; editing the file is not a live
+  revocation. The caller must independently exclude external writers and
+  mount/ancestor aliases and protect the config/state root. File permissions,
+  observed identities and configured policy are not tenant isolation.
+- The existing grouped real Git native-route regression now uses configured
+  approval for actual effects. Rejects missing/aliased/unknown-field config,
+  wrong manager, Store generation or Sandbox before namespace provisioning;
+  confirms explicit grant publication, fresh authority on reactivation and
+  unchanged original receipt, read/write/alias/recovery/revocation semantics.
+  No automatic product startup selection or source-aware admission promotion.
+
+Validation on L5, installed Rust 1.95.0: focused configured native regression
+**1/1**, source Process/Git native **2/2**, non-Git native **1/1**, strict Host
+all-target/all-feature Clippy, full product all-target/all-feature check,
+durable-only lib check (existing dead-code warning), scoped fmt/diff passed.
+Feature-scoped direct dependencies reuse the existing locked platform,
+serde and getrandom versions. Shared builds include concurrently owned
+changes; the signed commit contains only owned paths. Pinned Nix 1.98.1,
+Windows/macOS/Bubblewrap and unchanged broad suites not rerun. Store v60,
+Git recovery v4; no publication.
+
+Next: exact live source-aware Actor/Turn admission when original journal
+owners are available; resource CLI composition remains occupied. Otherwise
+choose a substantial independent production authority consumer, not another
+configuration wrapper or repeated provisioning check. Physical containment
+and remaining source Process/Job/Vault/public surface remain held pending
+actual authority and original owner participation.
+
+## Previous local implementation delta — 2026-11-25: source-aware single-link native capabilities
 
 Parent: `9121572780b24e3c4fd382016e6914d818b5d183` (trusted native-shell
 startup containment). Parent signature verified. Original Agent/Turn journal

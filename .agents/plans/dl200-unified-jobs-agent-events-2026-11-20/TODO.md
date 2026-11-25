@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: source-aware single-link native filesystem capabilities (this local checkpoint; signed parent `9121572780b24e3c4fd382016e6914d818b5d183`, trusted native-shell startup containment). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: configured Git native source authority (this local checkpoint; signed parent `3d2fd314cbaf8cccb6bdd0c69ab7d39cd6c9b559`, source-aware single-link native capabilities). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1309,6 +1309,17 @@ Current implementation: source-aware single-link native filesystem capabilities 
       Clippy, full product check and scoped fmt/diff passed (L5 Rust 1.95.0;
       pinned Nix and native cross-platform qualification not rerun). No schema,
       admission or frozen physical Sandbox change.
+      **Configured Git native source authority landed:** explicit owner-private
+      `git-native.json` host selection, exact Store generation/manager/Agent/
+      Sandbox and named physical roots, original typed Git driver and approval
+      owner, complete layout/administration/host state checks. Fresh live
+      authority per activation; separate grant CAS; no implicit discovery,
+      grant, automatic reload or Agent admission. The independent host must
+      still protect physical roots/state and revoke before config changes.
+      Configured real native regression 1/1, Git Process/native 2/2, non-Git
+      native 1/1, strict Host Clippy, full and durable-only checks and scoped
+      fmt/diff passed (L5 Rust 1.95.0; pinned Nix/native cross-platform gates
+      not rerun; existing durable dead-code warning). No schema change.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
