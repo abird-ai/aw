@@ -61,6 +61,16 @@ impl Tree {
         format!("{:x}", hash.finalize())
     }
 
+    fn has_descendants(&self, path: &RepoPath) -> bool {
+        use std::ops::Bound::{Included, Unbounded};
+        let mut prefix = path.bytes().to_vec();
+        prefix.push(b'/');
+        self.0
+            .range::<[u8], _>((Included(prefix.as_slice()), Unbounded))
+            .next()
+            .is_some_and(|(candidate, _)| candidate.bytes().starts_with(&prefix))
+    }
+
     fn insert(&mut self, path: RepoPath, mode: Mode, oid: String) -> Result<()> {
         if !is_oid(&oid) || self.0.insert(path, Entry { mode, oid }).is_some() {
             return Err(Error::Storage("invalid or duplicate Git tree entry"));
@@ -306,7 +316,7 @@ impl Snapshot {
         hash_part(&mut status, &untracked);
         let status = format!("{:x}", status.finalize());
 
-        let tree = observe_tree(repo, &base_tree, &index, &untracked, write, depth, false)?;
+        let tree = observe_tree(repo, &base_tree, &index, &untracked, write, depth)?;
         if head(repo)? != base {
             return Err(Error::Conflict("Git HEAD changed during capture"));
         }
@@ -358,9 +368,8 @@ impl Snapshot {
     }
 }
 
-// Restore supplies the captured tree as the tracked-path context, not as the
-// actual index. This verifies even captured symlinks or ignored files which
-// become untracked relative to the original base.
+// Capture includes the final tracked and allowed untracked content, not
+// the user's staged contents. Restore has a stricter physical namespace check.
 fn observe_tree(
     repo: &Repository,
     base_tree: &Tree,
@@ -368,7 +377,6 @@ fn observe_tree(
     untracked: &[u8],
     write: bool,
     depth: usize,
-    strict: bool,
 ) -> Result<Tree> {
     let mut paths: BTreeSet<RepoPath> = base_tree.0.keys().chain(index.0.keys()).cloned().collect();
     for record in records(untracked)? {
@@ -403,9 +411,6 @@ fn observe_tree(
         };
         if link_like(&full, &meta)? {
             if !tracked {
-                if strict {
-                    return Err(Error::Conflict("unexpected link in restored Git worktree"));
-                }
                 continue; // untracked links are never captured or followed
             }
             if !meta.file_type().is_symlink() {
@@ -460,7 +465,7 @@ fn observe_tree(
                 }
             }
             // Ordinary directories are represented by their file entries.
-        } else if tracked || strict {
+        } else if tracked {
             return Err(Error::Denied("unsupported Git worktree file type"));
         }
     }
@@ -503,42 +508,141 @@ pub(super) fn check_restore_gitlinks(base: &Tree, captured: &Tree) -> Result<()>
 }
 
 pub(super) fn verify_restored(repo: &Repository, base: &Tree, captured: &Tree) -> Result<()> {
+    verify_restore_tree(repo, base, captured, false)
+}
+
+/// Abandon only a never-published, independently protected candidate.
+/// Missing expected entries/ancestor directories are allowed, but every
+/// remaining leaf of a partial checkout must match the intended blob
+/// exactly. Neither this nor the complete check is authority to delete.
+pub(super) fn verify_partial_restore(
+    repo: &Repository,
+    base: &Tree,
+    captured: &Tree,
+) -> Result<()> {
+    verify_restore_tree(repo, base, captured, true)
+}
+
+fn verify_restore_tree(
+    repo: &Repository,
+    base: &Tree,
+    captured: &Tree,
+    allow_partial: bool,
+) -> Result<()> {
     repo.guard_managed_checkout().map_err(git_error)?;
-    if &real_index(repo)? != base {
+    let index_path = repo.git_dir.join("index");
+    let index_meta = fs::symlink_metadata(&index_path)?;
+    if !index_meta.is_file()
+        || link_like(&index_path, &index_meta)?
+        || !path_absent(&repo.git_dir.join("index.lock"))?
+        || &real_index(repo)? != base
+    {
         return Err(Error::Conflict("restored Git index differs from base"));
     }
     check_restore_gitlinks(base, captured)?;
-    // Check gitlinks directly: the base index hides their contents from
-    // ls-files --others. Never adopt an externally initialized submodule.
-    for (path, entry) in &base.0 {
-        if entry.mode != Mode::Gitlink {
-            continue;
-        }
-        match (captured.0.get(path), path_metadata(repo.root(), path)?) {
-            (Some(expected), Some((full, meta))) if expected.mode == Mode::Gitlink => {
-                if !meta.is_dir()
-                    || link_like(&full, &meta)?
-                    || fs::read_dir(full)?.next().transpose()?.is_some()
+    let filemode = config_bool(repo, "core.filemode", true)?;
+    let symlinks = config_bool(repo, "core.symlinks", true)?;
+    let mut actual = Tree::default();
+    let mut regular = Vec::new();
+    let mut raw = Vec::new();
+    // Enumerate the physical namespace, not Git's untracked view: ignored
+    // files, foreign empty directories and nonempty gitlinks all matter.
+    // Only descend through expected directory prefixes; never follow links.
+    let mut directories = vec![(repo.root().to_owned(), Vec::<u8>::new())];
+    let mut budget = MAX_WIRE_BYTES;
+    while let Some((directory, prefix)) = directories.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if prefix.is_empty() && name == ".git" {
+                continue; // exact linked-worktree pointer checked by restore owner
+            }
+            let mut bytes = prefix.clone();
+            if !bytes.is_empty() {
+                bytes.push(b'/');
+            }
+            bytes.extend_from_slice(name.as_encoded_bytes());
+            budget = budget
+                .checked_sub(bytes.len() + 1)
+                .ok_or(Error::Limit("Git restored namespace exceeds bound"))?;
+            let path = RepoPath::new(bytes).map_err(git_error)?;
+            let expected = captured.0.get(&path);
+            let full = entry.path();
+            let meta = fs::symlink_metadata(&full)?;
+            if meta.is_dir() && !link_like(&full, &meta)? {
+                match expected {
+                    Some(expected) if expected.mode == Mode::Gitlink => {
+                        if fs::read_dir(&full)?.next().transpose()?.is_some() {
+                            return Err(Error::Conflict("restored Gitlink is not empty"));
+                        }
+                        actual.insert(path, Mode::Gitlink, expected.oid.clone())?;
+                    }
+                    None if captured.has_descendants(&path) => {
+                        directories.push((full, path.bytes().to_vec()));
+                    }
+                    _ => {
+                        return Err(Error::Conflict(
+                            "unexpected directory in restored Git worktree",
+                        ))
+                    }
+                }
+                continue;
+            }
+            let expected =
+                expected.ok_or(Error::Conflict("unexpected leaf in restored Git worktree"))?;
+            if link_like(&full, &meta)? {
+                if expected.mode != Mode::Symlink || !meta.file_type().is_symlink() {
+                    return Err(Error::Conflict("unexpected link in restored Git worktree"));
+                }
+                #[cfg(not(unix))]
+                return Err(Error::Denied("native Git symlink verification unavailable"));
+                #[cfg(unix)]
                 {
+                    let target = fs::read_link(&full)?;
+                    actual.insert(
+                        path,
+                        Mode::Symlink,
+                        hash_bytes(repo, target.as_os_str().as_encoded_bytes(), false)?,
+                    )?;
+                }
+            } else if meta.is_file() {
+                if !symlinks && expected.mode == Mode::Symlink {
+                    raw.push((path, Mode::Symlink));
+                } else if expected.mode.regular() {
+                    let mode = if !filemode {
+                        expected.mode
+                    } else if executable(&meta) {
+                        Mode::Executable
+                    } else {
+                        Mode::File
+                    };
+                    regular.push((path, mode));
+                } else {
                     return Err(Error::Conflict(
-                        "restored Gitlink is not an empty uninitialized directory",
+                        "unexpected file mode in restored Git worktree",
                     ));
                 }
-            }
-            (Some(expected), _) if expected.mode != Mode::Gitlink => {}
-            (None, None) => {}
-            _ => {
+            } else {
                 return Err(Error::Conflict(
-                    "restored Gitlink differs from captured tree",
-                ))
+                    "unexpected object in restored Git worktree",
+                ));
             }
         }
     }
-    // No ignore rules here: an unpublished restore must not adopt additional
-    // ignored files, links or special files under the new destination.
-    let untracked = run(repo, &["ls-files", "--others", "-z"])?;
-    let actual = observe_tree(repo, base, captured, &untracked, false, 0, true)?;
-    if &actual != captured {
+    let complete = actual.0.len() + regular.len() + raw.len() == captured.0.len();
+    if !complete && !allow_partial {
+        return Err(Error::Conflict("restored Git worktree is incomplete"));
+    }
+    // Preserve the original normalized Git semantics for complete versions.
+    // For partial checkout disposal, require raw bytes instead of assuming
+    // a conversion with missing attributes produces the intended content.
+    hash_regular(repo, regular, false, !complete, &mut actual)?;
+    hash_regular(repo, raw, false, true, &mut actual)?;
+    if actual
+        .0
+        .iter()
+        .any(|(path, entry)| captured.0.get(path) != Some(entry))
+    {
         return Err(Error::Conflict(
             "restored Git worktree differs from captured tree",
         ));

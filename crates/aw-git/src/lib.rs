@@ -45,6 +45,11 @@ pub enum Error {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RepoPath(Vec<u8>);
+impl std::borrow::Borrow<[u8]> for RepoPath {
+    fn borrow(&self) -> &[u8] {
+        self.bytes()
+    }
+}
 impl RepoPath {
     pub fn new(bytes: Vec<u8>) -> Result<Self> {
         if bytes.is_empty()

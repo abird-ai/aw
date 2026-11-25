@@ -950,6 +950,24 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         .is_err());
     assert!(dirty_path.join("ignored-extra").is_file());
     std::fs::remove_file(dirty_path.join("ignored-extra")).unwrap();
+    std::fs::create_dir(dirty_path.join("foreign-empty")).unwrap();
+    assert!(matches!(
+        restarted.inspect_restore(&dirty_plan).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(restarted
+        .release_restored_materialization(&dirty_plan, &restored_dirty)
+        .is_err());
+    assert!(dirty_path.join("foreign-empty").is_dir());
+    std::fs::remove_dir(dirty_path.join("foreign-empty")).unwrap();
+    // Published materialization retirement requires the complete tree,
+    // not merely a subset of its original content.
+    let leaf = dirty_path.join("new\nfile");
+    std::fs::remove_file(&leaf).unwrap();
+    assert!(restarted
+        .release_restored_materialization(&dirty_plan, &restored_dirty)
+        .is_err());
+    std::fs::write(&leaf, b"new bytes\0").unwrap();
     child_git(&dirty_path, &["read-tree", &dirty.captured_commit]);
     assert!(matches!(
         restarted.inspect_restore(&dirty_plan).unwrap(),
@@ -1014,6 +1032,59 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         b"keep"
     );
     std::fs::remove_file(partial_path.join("foreign")).unwrap();
+    // The exact base index can survive before any checkout entry is
+    // written. A partial private candidate can contain only the captured
+    // tree's unchanged leaves and expected ancestor directories.
+    child_git(&partial_path, &["read-tree", base]);
+    let partial_repo = Repository::discover(&f.git, &partial_path).unwrap();
+    let private = partial_repo.git_dir().join("fixture-checkout-index");
+    let output = Command::new(&f.git)
+        .current_dir(&partial_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_INDEX_FILE", &private)
+        .args(["read-tree", &dirty.captured_commit])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new(&f.git)
+        .current_dir(&partial_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_INDEX_FILE", &private)
+        .args(["checkout-index", "--", "a.txt", "added-link"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    std::fs::remove_file(private).unwrap();
+    let captured_leaf = std::fs::read(partial_path.join("a.txt")).unwrap();
+    assert_eq!(
+        std::fs::read_link(partial_path.join("added-link")).unwrap(),
+        std::path::Path::new("missing-target")
+    );
+    assert!(matches!(
+        restarted.inspect_restore(&partial).unwrap(),
+        RecoveryInspection::Unknown
+    ));
+    assert!(restarted.execute_restore(&partial).is_err());
+    std::fs::create_dir(partial_path.join("foreign-empty")).unwrap();
+    assert!(restarted.release_prepared_restore(&partial).is_err());
+    assert!(partial_path.join("foreign-empty").is_dir());
+    std::fs::remove_dir(partial_path.join("foreign-empty")).unwrap();
+    std::fs::write(
+        partial_path.join("a.txt"),
+        b"changed after partial checkout",
+    )
+    .unwrap();
+    assert!(restarted.release_prepared_restore(&partial).is_err());
+    assert_eq!(
+        std::fs::read(partial_path.join("a.txt")).unwrap(),
+        b"changed after partial checkout"
+    );
+    std::fs::write(partial_path.join("a.txt"), captured_leaf).unwrap();
+    restarted.release_prepared_restore(&partial).unwrap();
+    restarted.release_prepared_restore(&partial).unwrap();
+    assert!(!partial_path.exists());
 
     let abandoned_path = destinations.join("abandoned");
     let abandoned = driver
@@ -1135,7 +1206,8 @@ fn prepared_git_restore_materializes_exact_tree_without_exposing_synthetic_head(
         .release_restored_materialization(&dirty_plan, &restored_dirty)
         .unwrap();
     assert!(!clean_path.exists() && !dirty_path.exists());
-    assert!(link_source.is_dir() && partial_path.is_dir());
+    assert!(link_source.is_dir() && !partial_path.exists());
+    // Prior partial abandonment remains replayable after anchor retirement.
     restarted.release_prepared_restore(&partial).unwrap();
     restarted.release_prepared_restore(&partial).unwrap();
     assert!(!partial_path.exists());

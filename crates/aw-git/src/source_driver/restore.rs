@@ -1,6 +1,9 @@
 //! Prepared restore into a fresh, host-reserved Git worktree.
 //! Git's worktree lock carries operation identity, not write authority.
-use super::tree::{check_restore_gitlinks, committed_tree, verify_restored, PrivateIndexes, Tree};
+use super::tree::{
+    check_restore_gitlinks, committed_tree, verify_partial_restore, verify_restored,
+    PrivateIndexes, Tree,
+};
 use super::{
     access_name, binding_for_repo, descriptor_field, git_error, hash_directory, head, is_digest,
     key, materialization_parts, parse_access, parse_policy, policy_name, prepare_operation, run_os,
@@ -748,8 +751,9 @@ impl GitSourceDriver {
 
     /// Reconcile only the original unpublished candidate, under separately
     /// authorized repository/destination fences. Exact completed restores,
-    /// untouched registered --no-checkout candidates, and proven absence
-    /// can be settled. Partial/modified content stays Unknown.
+    /// untouched registrations, and unchanged partial captured trees can
+    /// be settled. Unknown or modified content stays fenced. The original
+    /// fresh destination must have remained private and unpublished.
     pub fn release_prepared_restore(&self, prepared: &PreparedSourceOperation) -> Result<()> {
         let plan = RestorePlan::decode(prepared)?;
         let origin = plan.origin_repository(self)?;
@@ -763,6 +767,7 @@ impl GitSourceDriver {
         let child = restored_repo(&origin, &plan, prepared)?;
         child.guard_managed_checkout().map_err(git_error)?;
         PrivateIndexes::reconcile(&child, &prepared.descriptor.prepared_identity)?;
+        absent(&child.git_dir.join("index.lock"))?;
         let untouched = match fs::symlink_metadata(child.git_dir.join("index")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut untouched = true;
@@ -779,7 +784,7 @@ impl GitSourceDriver {
         };
         if !untouched {
             let trees = plan.trees(&origin)?;
-            verify_restored(&child, &trees.base, trees.captured())?;
+            verify_partial_restore(&child, &trees.base, trees.captured())?;
         }
         validate_restored_repo(&origin, &child, &plan, prepared)?;
         remove_verified_restore(&origin, &child, &plan, prepared)

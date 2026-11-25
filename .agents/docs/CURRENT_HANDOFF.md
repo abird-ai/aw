@@ -52,8 +52,8 @@ retention reconciliation, managed closed-Sandbox retirement, effectful versioned
 baseline restore host consumers, and v59 Agent VaultGrant references with the final
 staged VaultProvider leaf, concrete local signing broker, fenced Process proof
 projection, interrupted source-effect custody recovery and worker-owned native
-and finite Process quiescence, plus marked Git private-index scratch reconciliation,
-are implemented locally.
+and finite Process quiescence, marked Git private-index scratch reconciliation,
+and exact-subset unpublished Git restore abandonment are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2412,13 +2412,38 @@ Final Git repository **32/32**, Git library and doc tests, Host **16/16**, stric
 Git/Host all-target/all-feature Clippy, workspace all-target/all-feature check and
 scoped fmt/diff passed. Earlier broad Store failures remain recorded, not rerun.
 
+Unpublished partial Git restore abandonment now uses the shared physical tree
+verifier. Original locked detached registration, exact parent/repository and base
+index, absent unresolved index lock and independent protected private-destination
+custody remain prerequisites. Enumerate bounded actual namespace without following
+links or depending on Git's untracked enumeration: every directory is an expected
+ancestor or empty unchanged gitlink, every leaf belongs to the captured tree, and
+missing leaves are permitted only for unpublished abandonment. Partial files must
+match raw captured blob bytes; complete trees retain existing Git normalization and
+mode semantics. Complete publication/revalidation and published retirement still
+require the entire captured tree. Unexpected empty directories, ignored content,
+changed bytes/types, nonempty gitlinks, invalid index and uncertain registration
+remain fenced. Reuse existing exact worktree removal, scratch reconciliation and
+Prepared release; no new descriptor, schema, effect or replay. Host must guarantee
+the private candidate stayed unpublished/protected and exclude surviving writers
+and unaccounted aliases. Legacy unmarked scratch, truncated/converted partial file
+content without exact byte proof and ambiguous registration remain Unknown.
+Grouped real Git regression checks actual partial checkout from captured index,
+changed leaf/foreign empty directory refusal, exact abandonment/replay (including
+after anchor retirement), and refusal of missing leaf on published retirement.
+Final Git repository **32/32**, Git library/doc tests, Host **16/16**, strict
+Git/Host all-target/all-feature Clippy, workspace all-target/all-feature check and
+scoped fmt/diff passed. The initial focused run reached an obsolete fixture assertion
+expecting the partial candidate to remain; updated the assertion and retained replay
+after anchor retirement. Earlier broad Store failures remain recorded, not rerun.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
 physical recovery proof acquisition through existing owners; do not open held routes. Independent
 host approval provisioning, other effectful baseline materialization, broader Run-hazard
-reconciliation, multi-source policy, unmarked/ambiguous scratch and partial checkout
-cleanup, production cleanup composition/physical authority, final-source removal/effectful
+reconciliation, multi-source policy, unmarked/ambiguous scratch and non-exact partial
+checkout cleanup, production cleanup composition/physical authority, final-source removal/effectful
 mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v59.

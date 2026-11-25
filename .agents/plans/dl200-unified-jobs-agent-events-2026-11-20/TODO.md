@@ -988,13 +988,26 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       descriptor or dependency change. Final Git repository **32/32**, Git library/doc
       tests, Host **16/16**, strict affected Clippy, workspace check and scoped fmt/diff
       passed. Independent physical namespace authority required; legacy/pre-marker
-      gaps and partial checkout cleanup still open.
+      gaps and partial checkout cleanup still open at that checkpoint.
+      **Exact-subset unpublished restore abandonment landed:** shared bounded physical
+      tree verification, exact base index/registration, absent unresolved index lock;
+      expected directories/leaves only, empty unchanged gitlinks, no followed links or
+      ignored/empty foreign content. Missing leaves allowed only for original unpublished
+      private candidate cleanup; raw partial blob equality, complete Git normalization
+      preserved. Published retirement/publication still require full tree. Original
+      scratch and worktree release owners reused. Real grouped regression exercises
+      partial Git checkout, changed/foreign refusal, exact abandonment/replay, and
+      published missing-leaf refusal. Final Git repository **32/32**, Git library/doc
+      tests, Host **16/16**, strict affected Clippy, workspace check and scoped fmt/diff
+      passed. No new descriptor, schema or dependency. Host namespace protection
+      remains required; ambiguous/truncated partial content and uncertain registration
+      remain Unknown.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production approval provisioning, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, multi-source policy, other baseline effects,
-      unmarked/ambiguous scratch and partial checkout cleanup, physical authority/production cleanup,
+      unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
       final-source removal/effectful mutation, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v59.
