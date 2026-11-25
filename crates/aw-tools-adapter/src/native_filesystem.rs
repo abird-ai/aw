@@ -15,7 +15,9 @@ use aw_tools::filesystem::{
 };
 use serde_json::Value;
 
-pub use crate::private_artifacts::{open_source_artifacts, reopen_source_artifacts};
+pub use crate::private_artifacts::{
+    open_source_artifacts, reopen_source_artifacts, validate_source_artifact_state,
+};
 pub use aw_platform::scoped_fs::capability::{
     CapabilitySet, ExclusionSpec, GrantIdentity, GrantSpec, PreparedGrant,
 };

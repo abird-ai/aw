@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: persistent signing Vault provisioning (this local checkpoint; signed parent `e2f3e667fd7438bb317f0fccb19e8e0dfcf48288`, production Git SourceDriver owner-open registration). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: exact SourceDriver registry ownership and complete Git artifact-state preflight (this local checkpoint; signed parent `80f1ca09ae6129266410c099d103be94794c54f1`, persistent signing Vault provisioning). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1275,6 +1275,18 @@ Current implementation: persistent signing Vault provisioning (this local checkp
       Clippy, full product check and scoped fmt/diff passed (L5 Rust 1.95.0;
       pinned Nix and platform-native qualification not rerun). Journal and
       resource-CLI owners remain occupied. Source-bearing admission held.
+      **Exact SourceDriver ownership and artifact-state preflight landed:**
+      runtime handles pin their live registry owner without changing durable
+      schema compatibility. Complete verified Git source/admin set checked
+      before provision/reopen of artifact namespaces; duplicate physical
+      checkout identities denied, existing recovery custody and verified repo
+      pins reused. Actual mount/ancestor-alias and external-writer exclusion
+      remains the independent host's responsibility; no source admission
+      promotion. Registry 1/1, private artifacts 8/8, source Process/native
+      route 2/2, grouped Git checkpoint/restore/construction 1/1, product
+      restart 1/1, strict affected core/adapter/Host Clippy, full product
+      check, scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix and native
+      platform qualification not rerun). Journal and resource CLI occupied.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

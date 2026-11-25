@@ -789,11 +789,14 @@ pub struct SourceDriverDescriptor {
     pub registration_revision: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Live native definition identity, scoped to the exact owning registry.
+/// Durable DriverKey/schema compatibility remains independent of this handle.
+#[derive(Debug)]
 pub struct SourceDriverHandle<T> {
     driver: DriverKey,
     schemas: SourceDriverSchemas,
     registration_revision: u64,
+    owner: Arc<()>,
     implementation: std::marker::PhantomData<fn() -> T>,
 }
 
@@ -803,10 +806,22 @@ impl<T> Clone for SourceDriverHandle<T> {
             driver: self.driver.clone(),
             schemas: self.schemas,
             registration_revision: self.registration_revision,
+            owner: self.owner.clone(),
             implementation: std::marker::PhantomData,
         }
     }
 }
+
+impl<T> PartialEq for SourceDriverHandle<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+            && self.driver == other.driver
+            && self.schemas == other.schemas
+            && self.registration_revision == other.registration_revision
+    }
+}
+
+impl<T> Eq for SourceDriverHandle<T> {}
 
 impl<T> SourceDriverHandle<T> {
     pub fn driver(&self) -> &DriverKey {
@@ -864,10 +879,12 @@ fn validate_schemas(schemas: SourceDriverSchemas) -> Result<()> {
 #[derive(Clone)]
 pub struct SourceDriverRegistry {
     owner: Arc<StagedRegistry<SourceDriverSnapshot>>,
+    identity: Arc<()>,
 }
 
 pub struct SourceDriverRegistryReader {
     reader: publication::Reader<SourceDriverSnapshot>,
+    identity: Arc<()>,
 }
 
 impl Default for SourceDriverRegistry {
@@ -880,6 +897,7 @@ impl SourceDriverRegistry {
     pub fn new() -> Self {
         Self {
             owner: Arc::new(StagedRegistry::new(SourceDriverSnapshot::default())),
+            identity: Arc::new(()),
         }
     }
 
@@ -890,6 +908,7 @@ impl SourceDriverRegistry {
     pub fn reader(&self) -> Result<SourceDriverRegistryReader> {
         Ok(SourceDriverRegistryReader {
             reader: self.owner.reader_factory().reader()?,
+            identity: self.identity.clone(),
         })
     }
 
@@ -937,6 +956,7 @@ impl SourceDriverRegistry {
                         driver,
                         schemas,
                         registration_revision: next_revision,
+                        owner: self.identity.clone(),
                         implementation: std::marker::PhantomData,
                     },
                 ))
@@ -980,11 +1000,17 @@ impl SourceDriverRegistryReader {
             driver: driver.clone(),
             schemas: entry.descriptor.schemas,
             registration_revision: entry.descriptor.registration_revision,
+            owner: self.identity.clone(),
             implementation: std::marker::PhantomData,
         })
     }
 
     pub fn get<T: Send + Sync + 'static>(&self, handle: &SourceDriverHandle<T>) -> Result<Arc<T>> {
+        if !Arc::ptr_eq(&self.identity, &handle.owner) {
+            return Err(Error::Denied(
+                "SourceDriver handle belongs to another registry",
+            ));
+        }
         let snapshot = self.reader.snapshot()?;
         let entry = snapshot
             .value
@@ -1069,7 +1095,16 @@ mod tests {
             .unwrap();
         let reader = registry.reader().unwrap();
         let installed = reader.handle::<GitV1>(&driver).unwrap();
-        assert_eq!(installed.descriptor(), first.descriptor());
+        assert_eq!(installed, first);
+        let foreign = SourceDriverRegistry::new();
+        let foreign_handle = foreign
+            .register(driver.clone(), v1_schemas(), GitV1("foreign"))
+            .unwrap();
+        // Identical durable descriptor, different live owner/implementation.
+        assert_eq!(foreign_handle.descriptor(), first.descriptor());
+        assert_ne!(foreign_handle, first);
+        assert!(reader.get(&foreign_handle).is_err());
+        assert!(foreign.reader().unwrap().get(&first).is_err());
         assert!(Arc::ptr_eq(
             &reader.get(&installed).unwrap(),
             &reader.get(&first).unwrap(),
@@ -1095,6 +1130,10 @@ mod tests {
         .unwrap();
         let pin = recovery.pin().unwrap();
         assert_eq!(reader.resolve(&pin).unwrap().registration_revision, 1);
+        assert_eq!(
+            foreign.reader().unwrap().resolve(&pin).unwrap(),
+            first.descriptor()
+        );
 
         let other = registry
             .register(

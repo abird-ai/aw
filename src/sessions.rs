@@ -567,8 +567,8 @@ mod phase48_tests {
         );
 
         let store = open_sqlite_owner_with_git(&state, Some(&git)).unwrap();
-        let handle = store.source_driver_handle::<GitSourceDriver>(&key).unwrap();
-        let driver = store.source_driver(&handle).unwrap();
+        let original_handle = store.source_driver_handle::<GitSourceDriver>(&key).unwrap();
+        let driver = store.source_driver(&original_handle).unwrap();
         let (session, branch) = store
             .create(&actor, "source-free", binding(&initial, "fixture"))
             .unwrap();
@@ -613,6 +613,7 @@ mod phase48_tests {
 
         let store = open_sqlite_owner_with_git(&state, Some(&git)).unwrap();
         let handle = store.source_driver_handle::<GitSourceDriver>(&key).unwrap();
+        assert!(store.source_driver(&original_handle).is_err());
         assert!(store.source_driver(&handle).is_ok());
         assert!(store.source_driver_handle::<()>(&key).is_err());
         assert_eq!(

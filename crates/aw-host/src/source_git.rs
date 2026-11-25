@@ -16,17 +16,24 @@ use aw_agent_core::{
     SandboxDriverRegistry, SourceAccess, SourceDriverHandle, SourceName, ToolContext, ToolEffect,
     ToolSourceEvidence,
 };
-use aw_git::source_driver::{GitSourceDriver, GitSourceFreeLayout, GitSourceLocation};
+use aw_git::{
+    source_driver::{GitSourceDriver, GitSourceFreeLayout, GitSourceLocation},
+    Repository,
+};
 use aw_store::{
     SandboxEffectAuthority, SandboxEffectOutcome, SandboxGrantStatus, SandboxSnapshot,
     SandboxToolRecovery, SessionStore, VersionedSourceBinding,
 };
 use aw_tools::filesystem::{access::Action, schema::Tool as FsTool};
 use aw_tools_adapter::{
-    native_filesystem::{reopen_source_artifacts, ExclusionSpec, GrantIdentity, GrantSpec},
+    native_filesystem::{
+        reopen_source_artifacts, validate_source_artifact_state, ExclusionSpec, GrantIdentity,
+        GrantSpec,
+    },
     LocalToolOptions,
 };
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -75,6 +82,45 @@ pub struct GitSourceApprovalDirectory {
     pub location: GitSourceLocation,
     pub binding_rev: u64,
     pub access: SourceAccess,
+}
+
+// A complete verified repository set. Git administration is protected even
+// when another named root shares the backing repository.
+fn git_layout_exclusions(repos: &[Repository]) -> Result<Vec<ExclusionSpec>> {
+    let mut identities = BTreeSet::new();
+    let mut exclusions = Vec::new();
+    for repo in repos {
+        if !identities.insert(
+            repo.root_identity()
+                .map_err(|_| Error::Conflict("Git checkout identity unavailable"))?,
+        ) {
+            return Err(Error::Denied("native source roots alias the same checkout"));
+        }
+        for admin in [
+            repo.root().join(".git"),
+            repo.git_dir().to_owned(),
+            repo.common_dir().to_owned(),
+        ] {
+            if repos.iter().any(|other| other.root().starts_with(&admin)) {
+                return Err(Error::Denied(
+                    "native source root overlaps Git administration",
+                ));
+            }
+            if repos.iter().any(|other| admin.starts_with(other.root())) {
+                exclusions.push(ExclusionSpec::read_write(admin));
+            }
+        }
+    }
+    Ok(exclusions)
+}
+
+fn validate_git_artifact_state(repos: &[Repository], state_root: &Path) -> Result<()> {
+    validate_source_artifact_state(
+        state_root,
+        repos
+            .iter()
+            .flat_map(|repo| [repo.root(), repo.git_dir(), repo.common_dir()]),
+    )
 }
 
 /// Reuse the driver actually registered in the Store. No additional
@@ -154,6 +200,11 @@ impl GitNativeSourceResolver {
                 location.repository_identity,
             )?);
         }
+        // Validate every selected checkout and Git admin directory before the
+        // first durable namespace is created. Per-root validation alone can
+        // mutate a later source or its Git backing before failing on it.
+        git_layout_exclusions(&repos)?;
+        validate_git_artifact_state(&repos, state_root)?;
         let directories = sources
             .iter()
             .zip(&spec.directories)
@@ -273,18 +324,16 @@ impl GitNativeSourceResolver {
                 private_artifacts: root.private_artifacts.clone(),
             });
         }
-        self.pin_layout(base, selected, false)
+        self.pin_layout(base, selected)
     }
 
     fn pin_layout(
         &self,
         base: &Path,
         roots: Vec<NativeSourceRoot>,
-        recover: bool,
     ) -> Result<ApprovedSourceLayout> {
         let driver = self.store.source_driver(&self.driver)?;
         let mut repos = Vec::with_capacity(roots.len());
-        let mut exclusions = Vec::new();
         for root in &roots {
             if &root.source.binding.binding.driver != self.driver.driver() {
                 return Err(Error::Denied(
@@ -297,30 +346,19 @@ impl GitNativeSourceResolver {
                 &physical.path,
                 (physical.volume, physical.object),
             )?;
-            // All approved roots must exclude Git administration, even
-            // when linked worktrees share backing with another checkout.
-            for admin in [
-                repo.root().join(".git"),
-                repo.git_dir().to_owned(),
-                repo.common_dir().to_owned(),
-            ] {
-                if roots
-                    .iter()
-                    .any(|root| root.physical.path.starts_with(&admin))
-                {
-                    return Err(Error::Denied(
-                        "native source root overlaps Git administration",
-                    ));
-                }
-                if roots
-                    .iter()
-                    .any(|root| admin.starts_with(&root.physical.path))
-                {
-                    exclusions.push(ExclusionSpec::read_write(admin));
-                }
-            }
             repos.push(repo);
         }
+        let exclusions = git_layout_exclusions(&repos)?;
+        Self::pin_verified_layout(base, roots, repos, exclusions, false)
+    }
+
+    fn pin_verified_layout(
+        base: &Path,
+        roots: Vec<NativeSourceRoot>,
+        repos: Vec<Repository>,
+        exclusions: Vec<ExclusionSpec>,
+        recover: bool,
+    ) -> Result<ApprovedSourceLayout> {
         if recover {
             // The lower artifact owner reconciles exact records using
             // descriptor-relative paths. Its cleanup is not a model
@@ -429,7 +467,8 @@ impl GitNativeSourceResolver {
                         "native recovery cannot grant a multi-source parent",
                     ));
                 }
-                let mut roots = Vec::with_capacity(locations.len());
+                let driver = self.store.source_driver(&self.driver)?;
+                let mut repos = Vec::with_capacity(locations.len());
                 for (source, location) in recovery.sources.iter().zip(locations) {
                     if source.binding.binding.name != location.name {
                         return Err(Error::Conflict("native recovery source selection changed"));
@@ -440,6 +479,21 @@ impl GitNativeSourceResolver {
                         &location.repository,
                         locations.len(),
                     )?;
+                    if &source.binding.binding.driver != self.driver.driver() {
+                        return Err(Error::Denied(
+                            "Git source identity differs from registered driver",
+                        ));
+                    }
+                    repos.push(driver.verify_materialization(
+                        &source.binding.binding,
+                        &location.repository,
+                        location.repository_identity,
+                    )?);
+                }
+                let exclusions = git_layout_exclusions(&repos)?;
+                validate_git_artifact_state(&repos, &state_root)?;
+                let mut roots = Vec::with_capacity(locations.len());
+                for (source, location) in recovery.sources.iter().zip(locations) {
                     roots.push(NativeSourceRoot {
                         source: source.clone(),
                         physical: GrantIdentity {
@@ -455,7 +509,8 @@ impl GitNativeSourceResolver {
                         )?,
                     });
                 }
-                let layout = self.pin_layout(&sandbox.tool_root, roots, true)?;
+                let layout =
+                    Self::pin_verified_layout(&sandbox.tool_root, roots, repos, exclusions, true)?;
                 physical = Some(layout);
                 physical
                     .as_ref()

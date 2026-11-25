@@ -18,7 +18,59 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: persistent signing Vault provisioning
+## Latest local implementation delta — 2026-11-25: exact SourceDriver ownership and complete artifact-state preflight
+
+Parent: `80f1ca09ae6129266410c099d103be94794c54f1` (persistent signing Vault
+provisioning). Parent signature and clean owned paths verified. The original
+Agent/Turn journal owners and resource CLI remain concurrently occupied;
+source-bearing admission remains held.
+
+- `SourceDriverHandle<T>` now binds the exact live registry owner, matching
+  the existing SandboxDriver and VaultProvider handle semantics. A single
+  process-local Arc identity is shared across registry clones/readers/handles;
+  equality and typed retrieval reject a foreign registry even when stable
+  key, schemas, concrete type and registration revision all match. Durable
+  `DriverKey`/schema pins and restart compatibility are unchanged. Consumers
+  resolve a fresh typed handle from the current Store after registry restart.
+  No persisted registry identity, additional lookup owner or authority grant.
+- `validate_source_artifact_state` is the shared read-only preflight for
+  existing owner-private canonical state, disjoint protected directories and
+  observed exact directory aliases. Existing single-root namespace open/reopen
+  uses it; Git provision/recovery validates the complete approved checkout,
+  Git directory and common-directory set before opening any namespace.
+  The existing Git layout exclusions also reject duplicate physical checkout
+  identities. Verify each actual Git materialization against its independently
+  supplied location before preflight; reuse the verified repositories in
+  recovery's actual layout pin rather than repeating Git discovery. The
+  original recovery authorization/receipt and artifact owners remain intact.
+- Real grouped native regression rejects state under the later selected source
+  and its Git admin before creating any namespace. Registry regression and
+  product startup restart regression distinguish durable compatibility from
+  a foreign/previous runtime handle. No new artificial evidence fixtures.
+- Scope: validation of exact observed directories and lexical separation is
+  not physical mount/ancestor-alias containment, nor a lock excluding external
+  writers. The independent host still owns that guarantee. Provisioning is
+  not transactional across namespace I/O failures; this change prevents known
+  complete-set layout conflicts before namespace mutation. No automatic source
+  activation, recovery by persisted locator, or grant widening.
+
+Validation on L5, installed Rust 1.95.0: original source Process/native route
+**2/2**, SourceDriver registry **1/1**, private artifact owner **8/8**, grouped
+Git checkpoint/restore/construction recovery **1/1** (159.49 s), full product
+startup/restart **1/1**; strict AgentCore/adapter/Host all-target/all-feature
+Clippy, full product all-target/all-feature check, scoped fmt/diff passed.
+Shared checkout builds include concurrently owned dependencies; only exact
+owned paths enter the signed commit. Pinned Nix 1.98.1, Windows/Bubblewrap,
+and unchanged broad suites were not rerun. Store v60, Git recovery v4; no
+publication.
+
+Next: coordinate original live source-aware Actor/Turn admission and resource
+CLI composition when their owners become available. Otherwise choose the next
+independent production host physical authority/containment consumer, without
+repeating completed provisioning/structural work or claiming that directory
+observations establish live external authority.
+
+## Previous local implementation delta — 2026-11-25: persistent signing Vault provisioning
 
 Parent: `e2f3e667fd7438bb317f0fccb19e8e0dfcf48288` (production Git SourceDriver
 owner-open registration). Parent signature and clean owned paths verified.

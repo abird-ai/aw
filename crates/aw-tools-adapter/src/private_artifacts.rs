@@ -454,20 +454,42 @@ pub fn reopen_source_artifacts(root: &Path, state_root: &Path) -> Result<Arc<Reg
     source_artifacts(root, state_root, false)
 }
 
-#[cfg(unix)]
-fn source_artifacts(root: &Path, state_root: &Path, create: bool) -> Result<Arc<Registry>> {
-    if !aw_platform::secure_private_files_supported()
-        || root.canonicalize()? != root
-        || !root.is_dir()
-        || state_root.canonicalize()? != state_root
-        || root.starts_with(state_root)
-        || state_root.starts_with(root)
-    {
+/// Read-only complete-set preflight before provisioning or reopening any
+/// artifact namespace. Includes protected driver administration directories.
+/// Rejects observed aliases; the host still excludes external writers and
+/// mount/ancestor aliases through the actual operation.
+pub fn validate_source_artifact_state<'a>(
+    state_root: &Path,
+    protected: impl IntoIterator<Item = &'a Path>,
+) -> Result<()> {
+    if !aw_platform::secure_private_files_supported() || state_root.canonicalize()? != state_root {
         return Err(Error::Conflict(
             "source artifacts require exact disjoint durable private state",
         ));
     }
     aw_platform::validate_private_dir(state_root)?;
+    let state = aw_platform::DirectoryIdentity::open(state_root)?;
+    let identity = state.identity()?;
+    for root in protected {
+        if root.starts_with(state_root)
+            || state_root.starts_with(root)
+            || root.canonicalize()? != root
+            || aw_platform::DirectoryIdentity::open(root)?.identity()? == identity
+        {
+            return Err(Error::Conflict(
+                "source artifacts require exact disjoint durable private state",
+            ));
+        }
+    }
+    if !state.is_current(state_root)? {
+        return Err(Error::Conflict("source artifact state directory changed"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn source_artifacts(root: &Path, state_root: &Path, create: bool) -> Result<Arc<Registry>> {
+    validate_source_artifact_state(state_root, [root])?;
     with_registry(
         namespace_key(root, Some(state_root)),
         true,

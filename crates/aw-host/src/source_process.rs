@@ -1776,6 +1776,23 @@ mod tests {
                 .provision_approval(&actor, sandbox.rev, wrong, &artifact_state)
                 .is_err());
             assert_eq!(std::fs::read_dir(&artifact_state).unwrap().count(), 0);
+            // The second named root (data) must not receive artifact state
+            // while provisioning the first (code). Reject the complete set
+            // before any namespace is created, even under Git admin.
+            for bad_state in [
+                data.join("private-artifacts"),
+                data.join(".git/private-artifacts"),
+            ] {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&bad_state)
+                    .unwrap();
+                assert!(resolver
+                    .provision_approval(&actor, sandbox.rev, spec(), &bad_state)
+                    .is_err());
+                assert_eq!(std::fs::read_dir(&bad_state).unwrap().count(), 0);
+                std::fs::remove_dir(&bad_state).unwrap();
+            }
             resolver
                 .provision_approval(&actor, sandbox.rev, spec(), &artifact_state)
                 .unwrap()
