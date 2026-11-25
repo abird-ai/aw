@@ -30,6 +30,8 @@ pub use aw_policy::{
 pub use aw_session::{CoordinatorBinding, Sessions};
 
 #[cfg(feature = "source-effects")]
+pub mod checkpoint_baseline;
+#[cfg(feature = "source-effects")]
 pub mod source_approval;
 #[cfg(feature = "source-effects")]
 pub mod source_authority;

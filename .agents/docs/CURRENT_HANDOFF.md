@@ -18,7 +18,79 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: replay-safe history checkpoint construction
+## Latest local implementation delta — 2026-11-25: replay-safe empty-baseline checkpoint restore
+
+Parent: `077ac07803d9fa19db9743393cc4e68f2a6f4676` (replay-safe history
+checkpoint construction). Parent signature verified. Original Agent/Turn
+journal owners and resource CLI remain concurrently occupied; source-bearing
+admission remains held.
+
+- Reusable `aw_host::checkpoint_baseline::EmptyCheckpointRestore` composes
+  the original `checkpoint_replay_restore` / `checkpoint_restore_baseline`
+  owners. Explicit trusted Project, caller, current host execution-binding
+  template and independently selected destination root; not another history
+  constructor, layout registry, grant or recovery ledger. The helper uses
+  the existing platform dependency in the `source-effects` feature, with
+  no new locked dependency versions. No Git driver needed for this slice.
+- Fresh restore requires current checkpoint view, same source/destination
+  Project, a live checkpoint with no captured anchors (history-only or
+  empty Auto), and a canonical existing private empty directory. Refuses
+  task-bearing or captured-source restore; never substitutes empty history
+  for captured sources. Uses original Store history derive/share, Project
+  create/writer, fresh layout and atomic Agent/Sandbox publication checks.
+  Explicit `private` (default), `inherit`, custom ACLs use original parser
+  and lower authority. Returns redacted Agent snapshot, Sandbox ref and
+  source coverage. No activation, queue, provider invocation, directory
+  creation, deletion or materialization on this host path.
+- `checkpoint_restore` optional stdio port enabled only by explicit
+  `--agent-checkpoint-restore-root <absolute-canonical-private-directory>`
+  with the existing `--agent-actor-owner` / `--agent-stdio` local tool-free
+  exact durable Session mode. No model/client root, provider, authority or
+  layout selector. Request fields `id`, `project?`, `title?`, `task?`,
+  `access?`; task is unsupported on fresh restore. Namespace the original
+  authenticated request as `rpc:stdio:checkpoint-restore:{id}`. Execute
+  after the ordinary connection duplicate-ID/budget/parameter gate, not
+  on the speculative live reader. Creation capability stays independent.
+- Exact replay precedes any destination inspection and fresh admission;
+  original semantic mismatch denied and result Project/disclosure rechecked.
+  Original receipt remains replayable even after checkpoint retirement,
+  Store reopen or missing/consumed destination. On fresh admission retain
+  the original platform directory identity through publication; reject
+  lexical overlap and exact identity alias with Store state/current host
+  execution layout. Store checks exact known occupied layout. The trusted
+  host MUST independently protect the selected baseline and ancestors
+  from other layouts, physical aliases, mounts and external writers; path
+  checks, permissions and pins are observations, not tenant isolation.
+  No global physical containment or complete all-layout ancestor proof.
+  No new persistence schema, source authority or frozen Sandbox changes.
+
+Validation on L5 (Rust 1.95.0): full headless **8/8** (restore dispatch,
+duplicate IDs, no client root); grouped actual Store-backed metadata/
+construction/restore **1/1** (missing/nonempty/protected baseline refusal,
+no implicit creation, task/Project refusal, fresh Agent/Sandbox publication,
+occupied root rejection, mismatch denial and replay on durable reopen after
+retirement/missing layout); original restore-owner exact history/captured
+sources/recovery **1/1**. Strict Host/full-product all-target/all-feature
+Clippy, durable-only lib and minimal all-target checks, actual full binary
+build and CLI opt-in dependency smoke, scoped fmt/diff passed. Initial
+ACL-parser argument mismatch and test assumption that restored local head
+must equal retained source head corrected; the original restore owner
+creates a new local root over the exact immutable history base. Existing
+minimal/durable warnings remain. CLI smoke only validated opt-in parsing;
+actual publication covered by the real Store port regression. Shared builds
+include concurrent dependencies; signed tree contains only owned paths.
+Pinned Nix 1.98.1, Windows/macOS/Bubblewrap and unchanged broad suites not
+rerun. Store v60, Git recovery v4; no publication.
+
+Next: exact live source-aware Actor/Turn admission when original journal
+owners are available; resource CLI startup composition remains occupied.
+Otherwise choose a substantive independent actual host authority consumer
+or remaining sealed resource surface. Task-bearing/captured-source restore,
+checkpoint retirement RPC, independent physical retention cleanup and
+protected metadata disclosure remain held; do not infer their authority
+from this empty baseline restore.
+
+## Previous local implementation delta — 2026-11-25: replay-safe history checkpoint construction
 
 Parent: `1518684de8c74fe9c5df1f65765b9bbc71a921ec` (protected source metadata
 and checkpoint reads). Parent signature verified. Original Agent/Turn journal

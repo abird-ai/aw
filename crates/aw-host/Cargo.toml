@@ -10,8 +10,8 @@ description = "Thin reusable host composition: policy, Agent and original tool e
 [features]
 default = []
 sessions = ["dep:aw-session"]
-source-effects = ["dep:aw-store", "dep:tokio", "dep:serde_json"]
-git-source-effects = ["source-effects", "dep:aw-git", "dep:aw-platform", "dep:getrandom", "dep:serde"]
+source-effects = ["dep:aw-store", "dep:aw-platform", "dep:tokio", "dep:serde_json"]
+git-source-effects = ["source-effects", "dep:aw-git", "dep:getrandom", "dep:serde"]
 
 [dependencies]
 aw-agent-core = { path = "../aw-agent-core", version = "=0.15.0" }

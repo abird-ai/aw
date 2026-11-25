@@ -91,6 +91,12 @@ pub trait CheckpointCreatePort: Send + Sync {
     fn create(&self, request_id: &str, params: Value) -> Result<Value>;
 }
 
+/// Explicit host restore capability; the host owns destination layout and
+/// source authority, never the RPC parameters.
+pub trait CheckpointRestorePort: Send + Sync {
+    fn restore(&self, request_id: &str, params: Value) -> Result<Value>;
+}
+
 pub trait Driver {
     /// Must execute using aw's existing, exactly selected Agent/journal.
     fn prompt(
@@ -164,6 +170,9 @@ pub trait Driver {
         None
     }
     fn checkpoint_create_port(&self) -> Option<Arc<dyn CheckpointCreatePort>> {
+        None
+    }
+    fn checkpoint_restore_port(&self) -> Option<Arc<dyn CheckpointRestorePort>> {
         None
     }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
@@ -398,6 +407,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "checkpoint_list" => Some(&["ref", "limit", "cursor"]),
         "checkpoint_get" => Some(&["id", "include"]),
         "checkpoint_create" => Some(&["ref", "sources", "note"]),
+        "checkpoint_restore" => Some(&["id", "project", "title", "task", "access"]),
         "sandbox_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
@@ -739,9 +749,9 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     capabilities["checkpoint_get"] = json!(checkpoint_read);
     let checkpoint_create = driver.checkpoint_create_port();
     capabilities["checkpoint_create"] = json!(checkpoint_create.is_some());
-    for method in ["checkpoint_restore", "checkpoint_delete"] {
-        capabilities[method] = json!(false);
-    }
+    let checkpoint_restore = driver.checkpoint_restore_port();
+    capabilities["checkpoint_restore"] = json!(checkpoint_restore.is_some());
+    capabilities["checkpoint_delete"] = json!(false);
     out.emit("hello",None,json!({
         "protocol":"aw.rpc","version":VERSION,"transport":"stdio",
         "capabilities":capabilities,
@@ -826,6 +836,13 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "checkpoint_create" if checkpoint_create.is_some() => {
                 let port = checkpoint_create.as_ref().expect("enabled checkpoint port");
                 match port.create(id, request.params) {
+                    Ok(value) => out.emit("response", Some(id), value)?,
+                    Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
+                }
+            }
+            "checkpoint_restore" if checkpoint_restore.is_some() => {
+                let port = checkpoint_restore.as_ref().expect("enabled checkpoint restore port");
+                match port.restore(id, request.params) {
                     Ok(value) => out.emit("response", Some(id), value)?,
                     Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
                 }
@@ -1351,6 +1368,16 @@ mod aw_p6_9c_protocol_tests {
         }
     }
 
+    impl CheckpointRestorePort for FakeSandboxPort {
+        fn restore(&self, request_id: &str, params: Value) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((format!("checkpoint_restore:{request_id}"), params));
+            Ok(json!({"agent":{"ref":"/d:d/i:i/p:p/a:restored"}}))
+        }
+    }
+
     struct BoundFake {
         query_calls: usize,
         mutation_calls: usize,
@@ -1382,6 +1409,9 @@ mod aw_p6_9c_protocol_tests {
             Some(self.sandbox.clone())
         }
         fn checkpoint_create_port(&self) -> Option<Arc<dyn CheckpointCreatePort>> {
+            Some(self.sandbox.clone())
+        }
+        fn checkpoint_restore_port(&self) -> Option<Arc<dyn CheckpointRestorePort>> {
             Some(self.sandbox.clone())
         }
         fn actor_query(&mut self, operation: Value) -> Result<Value> {
@@ -1461,6 +1491,8 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"checkpoint","method":"checkpoint_get","params":{"id":"cp_fixture"}}"#,
             r#"{"v":1,"id":"checkpoint-raw","method":"checkpoint_get","params":{"id":"cp_fixture","source_ref":"private"}}"#,
             r#"{"v":1,"id":"checkpoint-restore","method":"checkpoint_restore","params":{"id":"cp_fixture"}}"#,
+            r#"{"v":1,"id":"checkpoint-restore","method":"checkpoint_restore","params":{"id":"other"}}"#,
+            r#"{"v":1,"id":"restore-root","method":"checkpoint_restore","params":{"id":"cp_fixture","root":"/private"}}"#,
             r#"{"v":1,"id":"cp-create","method":"checkpoint_create","params":{"sources":"none"}}"#,
             r#"{"v":1,"id":"cp-create","method":"checkpoint_create","params":{"sources":"auto"}}"#,
             r#"{"v":1,"id":"cp-raw","method":"checkpoint_create","params":{"sources":"none","authority":true}}"#,
@@ -1508,9 +1540,8 @@ mod aw_p6_9c_protocol_tests {
             assert_eq!(rows[0]["data"]["capabilities"][method], true);
         }
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_create"], true);
-        for method in ["checkpoint_restore", "checkpoint_delete"] {
-            assert_eq!(rows[0]["data"]["capabilities"][method], false);
-        }
+        assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_restore"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_delete"], false);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], false);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_close"], true);
         assert_eq!(fake.query_calls, 1);
@@ -1553,6 +1584,7 @@ mod aw_p6_9c_protocol_tests {
                 "sandbox_sources_list",
                 "checkpoint_list",
                 "checkpoint_get",
+                "checkpoint_restore:checkpoint-restore",
                 "checkpoint_create:cp-create"
             ]
         );
@@ -1569,9 +1601,14 @@ mod aw_p6_9c_protocol_tests {
         assert!(rows
             .iter()
             .any(|r| r["id"] == "checkpoint-raw" && r["data"]["code"] == "protocol"));
+        assert!(rows.iter().any(|r| r["id"] == "checkpoint-restore"
+            && r["data"]["agent"]["ref"] == "/d:d/i:i/p:p/a:restored"));
+        assert!(rows.iter().any(
+            |r| r["id"] == "checkpoint-restore" && r["data"]["code"] == "duplicate_request_id"
+        ));
         assert!(rows
             .iter()
-            .any(|r| r["id"] == "checkpoint-restore" && r["data"]["code"] == "unsupported_method"));
+            .any(|r| r["id"] == "restore-root" && r["data"]["code"] == "invalid_parameters"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "raw" && r["data"]["code"] == "invalid_parameters"));

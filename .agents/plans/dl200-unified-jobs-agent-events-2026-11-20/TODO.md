@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: replay-safe history checkpoint construction (this local checkpoint; signed parent `1518684de8c74fe9c5df1f65765b9bbc71a921ec`, protected source metadata and checkpoint reads). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: replay-safe empty-baseline checkpoint restore (this local checkpoint; signed parent `077ac07803d9fa19db9743393cc4e68f2a6f4676`, replay-safe history checkpoint construction). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1342,6 +1342,19 @@ Current implementation: replay-safe history checkpoint construction (this local 
       8/8, full/minimal checks, strict Store/full-product Clippy, binary build
       and opt-in smoke, scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix and
       native platform gates not rerun).
+      **Replay-safe empty-baseline checkpoint restore landed:** explicit
+      local Actor-owner `--agent-checkpoint-restore-root` host-selected
+      existing canonical private empty layout, task-less history-only/empty
+      Auto restore through original constructor and receipt, same Project and
+      current disclosure. Replay before physical layout probe; ordinary RPC
+      ID gate, no caller path or implicit materialization/activation. Host
+      protection of all other physical layouts and external writers remains
+      required; known exact occupied roots denied by original Store. Captured
+      source/task-bearing restore and retirement RPC remain held. Headless
+      8/8, Store-backed port 1/1, original restore owner 1/1, strict Host/full
+      Clippy, durable/minimal checks, full binary build + opt-in smoke and
+      scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix/platform qualification
+      not rerun). No schema/admission/frozen Sandbox change.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

@@ -880,6 +880,12 @@ struct RpcCommandCliArgs {
     /// capture) for the authenticated local Actor-owner RPC connection.
     #[arg(long = "checkpoint-create", requires = "rpc_actor_owner")]
     rpc_checkpoint_create: bool,
+    /// Independently approved existing empty private directory for a fresh
+    /// source-free, task-less restore in the current Project. No path from
+    /// the RPC caller is accepted; the host must exclude other writers and
+    /// aliases to this layout.
+    #[arg(long = "checkpoint-restore-root", requires = "rpc_actor_owner")]
+    rpc_checkpoint_restore_root: Option<PathBuf>,
     /// Explicit signed AwNet MachineLink Actor owner, never an HTTP/RPC server.
     #[cfg(all(feature = "net", target_os = "linux"))]
     #[arg(long = "actor-peer", conflicts_with = "rpc_stdio")]
@@ -966,6 +972,7 @@ pub(crate) struct RunArgs {
     rpc_stdio: bool,
     rpc_actor_owner: bool,
     rpc_checkpoint_create: bool,
+    rpc_checkpoint_restore_root: Option<PathBuf>,
     #[cfg(all(feature = "net", target_os = "linux"))]
     rpc_actor_remote: Option<ActorRemoteCliOptions>,
     diagnostics_protocol: bool,
@@ -1100,6 +1107,7 @@ impl RunArgs {
             rpc_stdio: false,
             rpc_actor_owner: false,
             rpc_checkpoint_create: false,
+            rpc_checkpoint_restore_root: None,
             #[cfg(all(feature = "net", target_os = "linux"))]
             rpc_actor_remote: None,
             diagnostics_protocol: false,
@@ -1542,6 +1550,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             run.rpc_stdio = args.rpc_stdio;
             run.rpc_actor_owner = args.rpc_actor_owner || remote;
             run.rpc_checkpoint_create = args.rpc_checkpoint_create;
+            run.rpc_checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             #[cfg(all(feature = "net", target_os = "linux"))]
             if let Some(peer) = args.rpc_actor_peer {
                 let room = args.rpc_actor_room.ok_or(Error::Denied(
@@ -3060,6 +3069,7 @@ fn run_agent_with_shell_containment(
         if args.rpc_actor_owner {
             host.attach_rpc_actor_owner()?;
             host.checkpoint_create_enabled = args.rpc_checkpoint_create;
+            host.checkpoint_restore_root = args.rpc_checkpoint_restore_root;
         }
         return aw::headless::serve_stdio(
             &mut host,
@@ -3405,6 +3415,7 @@ struct Host {
     agent_create_owner: Option<std::sync::Arc<StdioAgentCreatePort>>,
     agent_state_port: Option<std::sync::Arc<StdioAgentStatePort>>,
     checkpoint_create_enabled: bool,
+    checkpoint_restore_root: Option<PathBuf>,
     agent_inputs_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
@@ -3451,6 +3462,43 @@ struct StdioAgentStatePort {
     caller: aw::PrincipalId,
     current_agent_ref: String,
     current_project_ref: String,
+}
+
+struct StdioCheckpointRestorePort {
+    baseline: aw_host::checkpoint_baseline::EmptyCheckpointRestore,
+}
+
+impl aw::headless::CheckpointRestorePort for StdioCheckpointRestorePort {
+    fn restore(&self, request_id: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let checkpoint = params
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(Error::Protocol("checkpoint_restore id must be a string"))?
+            .to_owned();
+        let access = match agent_create_access(params.get("access"))? {
+            aw_store::AgentCreateAccess::Private => aw_store::AgentHistoryForkAccess::Private,
+            aw_store::AgentCreateAccess::Inherit => aw_store::AgentHistoryForkAccess::Inherit,
+            aw_store::AgentCreateAccess::Custom(grants) => {
+                aw_store::AgentHistoryForkAccess::Custom(grants)
+            }
+        };
+        let request = aw_store::CheckpointRestoreRequest {
+            checkpoint,
+            project: agent_create_optional_string(&params, "project")?,
+            title: agent_create_optional_string(&params, "title")?,
+            task: agent_create_optional_string(&params, "task")?,
+            access,
+        };
+        let result = self.baseline.restore(
+            &request,
+            &format!("rpc:stdio:checkpoint-restore:{request_id}"),
+        )?;
+        bounded_source_metadata(serde_json::json!({
+            "agent": agent_snapshot_value(&result.agent),
+            "sandbox": result.agent.sandbox_ref,
+            "source_coverage": result.source_coverage,
+        }))
+    }
 }
 
 struct StdioAgentInputsPort {
@@ -4816,6 +4864,7 @@ impl Host {
             agent_create_owner: None,
             agent_state_port: None,
             checkpoint_create_enabled: false,
+            checkpoint_restore_root: None,
             agent_inputs_owner: None,
             sandbox_owner: None,
             pre_dispatch_retries: 0,
@@ -6460,6 +6509,22 @@ impl aw::headless::Driver for Host {
             .as_ref()
             .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::CheckpointCreatePort>)
     }
+    fn checkpoint_restore_port(
+        &self,
+    ) -> Option<std::sync::Arc<dyn aw::headless::CheckpointRestorePort>> {
+        let root = self.checkpoint_restore_root.as_ref()?;
+        let state = self.agent_state_port.as_ref()?;
+        let creator = self.agent_create_owner.as_ref()?;
+        Some(std::sync::Arc::new(StdioCheckpointRestorePort {
+            baseline: aw_host::checkpoint_baseline::EmptyCheckpointRestore::from_trusted_host(
+                state.store.clone(),
+                state.caller.clone(),
+                state.current_project_ref.clone(),
+                creator.binding.clone(),
+                root.clone(),
+            ),
+        }))
+    }
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner
             .as_ref()
@@ -7670,7 +7735,9 @@ mod phase54_cli_tests {
 
     #[test]
     fn stdio_source_metadata_uses_current_store_authority_without_private_locators() {
-        use aw::headless::{CheckpointCreatePort, CheckpointReadPort, SandboxPort};
+        use aw::headless::{
+            CheckpointCreatePort, CheckpointReadPort, CheckpointRestorePort, SandboxPort,
+        };
         use aw_agent_core::{
             CheckpointPolicy, DriverKey, SchemaSupport, SourceAccess, SourceBinding,
             SourceDriverRegistry, SourceDriverSchemas, SourceName,
@@ -7889,6 +7956,78 @@ mod phase54_cli_tests {
         assert!(foreign_project
             .create("history-create", request.clone())
             .is_err());
+        // The independently approved empty baseline is a host input, not
+        // a caller locator or a second restore constructor.
+        let restore_root = temp.0.join("restore-baseline");
+        let restore_request = json!({"id":created["id"],"title":"Restored history"});
+        let restored = {
+            let restore_port = |destination: PathBuf| StdioCheckpointRestorePort {
+                baseline: aw_host::checkpoint_baseline::EmptyCheckpointRestore::from_trusted_host(
+                    store.clone(),
+                    actor.clone(),
+                    project.clone(),
+                    binding(&root),
+                    destination,
+                ),
+            };
+            let restore = restore_port(restore_root.clone());
+            assert!(restore
+                .restore("history-restore", restore_request.clone())
+                .is_err());
+            assert!(!restore_root.exists());
+            aw_platform::ensure_private_dir(&restore_root).unwrap();
+            std::fs::write(restore_root.join("existing"), b"preserve").unwrap();
+            assert!(restore
+                .restore("history-restore", restore_request.clone())
+                .is_err());
+            assert_eq!(
+                std::fs::read(restore_root.join("existing")).unwrap(),
+                b"preserve"
+            );
+            std::fs::remove_file(restore_root.join("existing")).unwrap();
+            assert!(restore_port(root.clone())
+                .restore("overlap", restore_request.clone())
+                .is_err());
+            assert!(restore
+                .restore(
+                    "task-restore",
+                    json!({"id":created["id"],"task":"must not queue"})
+                )
+                .is_err());
+            assert!(restore
+                .restore(
+                    "foreign-restore",
+                    json!({"id":created["id"],"project":"/d:d/i:i/p:other"})
+                )
+                .is_err());
+            let restored = restore
+                .restore("history-restore", restore_request.clone())
+                .unwrap();
+            assert_eq!(restored["source_coverage"], "none");
+            // The original history constructor creates a new local root
+            // over the retained immutable history base, not the old head.
+            assert_ne!(restored["agent"]["history_head"], created["history_head"]);
+            assert!(restored["agent"]["history_content_digest"]
+                .as_str()
+                .is_some());
+            assert_ne!(restored["agent"]["ref"], port.current_agent_ref);
+            assert_ne!(restored["sandbox"], sandbox.canonical_ref);
+            let target = store
+                .sandbox_get(&actor, restored["sandbox"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(target.tool_root, restore_root);
+            assert!(target.sources.is_empty());
+            assert!(restore
+                .restore("another-restore", restore_request.clone())
+                .is_err());
+            assert!(restore
+                .restore(
+                    "history-restore",
+                    json!({"id":created["id"],"title":"different"})
+                )
+                .is_err());
+            restored
+        };
         // A new current Agent must not retarget a previously consumed '.'
         // request. Use an actual branch, then reopen the durable Store owner.
         let other = store
@@ -7932,6 +8071,23 @@ mod phase54_cli_tests {
         let retired = rebound.create("history-create", request).unwrap();
         assert_eq!(retired["id"], created["id"]);
         assert_eq!(retired["lifecycle"], "retired");
+        // Exact replay remains a read of the original receipt even after
+        // source retirement and disappearance of the configured layout.
+        std::fs::remove_dir(&restore_root).unwrap();
+        let restore = StdioCheckpointRestorePort {
+            baseline: aw_host::checkpoint_baseline::EmptyCheckpointRestore::from_trusted_host(
+                store.clone(),
+                actor.clone(),
+                project,
+                binding(&root),
+                restore_root.clone(),
+            ),
+        };
+        assert_eq!(
+            restore.restore("history-restore", restore_request).unwrap(),
+            restored
+        );
+        assert!(!restore_root.exists());
     }
 
     #[test]
