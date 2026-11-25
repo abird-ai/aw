@@ -3,14 +3,14 @@
 //! Blocking trusted-host operations, not an Actor/model/RPC admission route.
 use aw_agent_core::{
     Error, ExternalEvidence, NamedPreparedSource, PreparedSourceSet, PrincipalId,
-    RecoveryInspection, Result, SourceBinding, SourceDriverHandle, SourceOperationKind,
+    RecoveryInspection, Result, SourceBinding, SourceDriverHandle, SourceName, SourceOperationKind,
     SourcePublicationFence, SourcePublicationProof, SourceSet,
 };
 use aw_git::source_driver::{GitRestoreLocation, GitSourceAnchor, GitSourceDriver};
 use aw_store::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
     InspectedCheckpointRestore, InspectedSandboxCreate, SandboxCreateFrom, SandboxCreateSources,
-    SandboxSnapshot, SessionBinding, SessionStore, VersionedSourceBinding,
+    SandboxSnapshot, SandboxSourceRelease, SessionBinding, SessionStore, VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -164,6 +164,64 @@ impl<'a> ManagedGitLayout<'a> {
             }
         }
     }
+}
+
+fn verify_managed_materializations<'a>(
+    driver: &GitSourceDriver,
+    snapshot: &'a SandboxSnapshot,
+    bindings: &[VersionedSourceBinding],
+    prepared: &PreparedSourceSet,
+    fence: &impl GitRestoreFence,
+) -> Result<ManagedGitLayout<'a>> {
+    let locations = fence.locations();
+    if prepared.sources.len() != bindings.len()
+        || bindings.len() != locations.len()
+        || bindings.iter().zip(&prepared.sources).zip(locations).any(
+            |((binding, source), location)| {
+                binding.binding_rev != 1
+                    || binding.binding.name != source.name
+                    || source.name != location.name
+            },
+        )
+    {
+        return Err(Error::Conflict(
+            "retained Git bindings differ from the original restore",
+        ));
+    }
+    require_disjoint_locations(locations)?;
+    for ((binding, source), location) in bindings.iter().zip(&prepared.sources).zip(locations) {
+        driver.verify_restored_materialization_location(
+            location,
+            &source.prepared,
+            &binding.binding,
+        )?;
+    }
+    ManagedGitLayout::check(snapshot, locations)
+}
+
+fn verify_remaining_sources(
+    driver: &GitSourceDriver,
+    release: &SandboxSourceRelease,
+    fence: &impl GitRestoreFence,
+) -> Result<()> {
+    // Other checkouts need their original identity, not original contents:
+    // independently modified siblings are not part of the release.
+    for (index, (binding, location)) in release.bindings().iter().zip(fence.locations()).enumerate()
+    {
+        if index != release.selected() {
+            let original = &binding.binding;
+            if driver.binding(
+                &location.target,
+                original.name.clone(),
+                original.access,
+                original.checkpoint_policy,
+            )? != *original
+            {
+                return Err(Error::Conflict("retained Git sibling changed identity"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn approved_parent(
@@ -773,8 +831,66 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         )
     }
 
+    /// Remove one original managed source from an unused open Sandbox.
+    /// The independently protected named parent remains the same layout
+    /// after removal, including final-source removal. The fence covers
+    /// every retained source and its backing, never just a target path.
+    pub fn release_sandbox_source<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        name: &SourceName,
+        expected_rev: u64,
+        authorize: impl FnOnce(&SandboxSourceRelease) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        let driver = self.store.source_driver(self.driver)?;
+        self.store.sandbox_release_source(
+            actor,
+            sandbox,
+            name,
+            expected_rev,
+            |release| {
+                let fence = authorize(release)?;
+                let snapshot = release.snapshot();
+                let layout = verify_managed_materializations(
+                    &driver,
+                    snapshot,
+                    release.bindings(),
+                    release.preparation(),
+                    &fence,
+                )?;
+                if !matches!(layout, ManagedGitLayout::Directory(_))
+                    || snapshot.working_directory != snapshot.tool_root
+                    || fence.locations().iter().any(|location| {
+                        location.target != snapshot.tool_root.join(location.name.as_str())
+                    })
+                {
+                    return Err(Error::Denied(
+                        "source removal requires a private named-child layout with stable cwd",
+                    ));
+                }
+                verify_remaining_sources(&driver, release, &fence)?;
+                Ok(fence)
+            },
+            |release, fence| {
+                let index = release.selected();
+                driver.release_restored_materialization(
+                    &release.preparation().sources[index].prepared,
+                    &release.bindings()[index].binding,
+                )?;
+                let layout = ManagedGitLayout::check(release.snapshot(), fence.locations())?;
+                verify_remaining_sources(&driver, release, fence)?;
+                if release.bindings().len() == 1 {
+                    layout.require_released()?;
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Reconcile a closed, retained Sandbox created by a Git restore or
-    /// standalone construction (baseline or derive). Only the original unmodified set is supported.
+    /// standalone construction (baseline or derive). Only exact original
+    /// retained bindings, including previously proven released subsets, are supported.
     /// Authorize the whole layout and exact Applied descriptors independently.
     /// Keep the external fence through Store settlement; never remove shared
     /// backing or unrelated files. Already released layouts do not reauthorize.
@@ -794,33 +910,10 @@ impl<'a> GitCheckpointRestoreHost<'a> {
                     .store
                     .sandbox_restore_preparation(actor, &snapshot.canonical_ref)?;
                 let fence = authorize(snapshot, bindings, &prepared)?;
-                let locations = fence.locations();
-                if prepared.sources.len() != bindings.len()
-                    || bindings.len() != locations.len()
-                    || bindings.iter().zip(&prepared.sources).zip(locations).any(
-                        |((binding, source), location)| {
-                            binding.binding_rev != 1
-                                || binding.binding.name != source.name
-                                || source.name != location.name
-                        },
-                    )
-                {
-                    return Err(Error::Conflict(
-                        "retained Git bindings differ from the original restore",
-                    ));
-                }
-                require_disjoint_locations(locations)?;
                 let driver = self.store.source_driver(self.driver)?;
-                for ((binding, source), location) in
-                    bindings.iter().zip(&prepared.sources).zip(locations)
-                {
-                    driver.verify_restored_materialization_location(
-                        location,
-                        &source.prepared,
-                        &binding.binding,
-                    )?;
-                }
-                let layout = ManagedGitLayout::check(snapshot, locations)?;
+                let layout = verify_managed_materializations(
+                    &driver, snapshot, bindings, &prepared, &fence,
+                )?;
                 for (binding, source) in bindings.iter().zip(&prepared.sources) {
                     driver.release_restored_materialization(&source.prepared, &binding.binding)?;
                 }
@@ -1928,6 +2021,122 @@ mod tests {
                 standalone.rev
             )
             .is_err());
+        // Remove one managed source under original construction custody.
+        // Retain the entire old set across a lost final Store publication.
+        let removed_name = child.sources[0].name.clone();
+        assert_eq!(removed_name.as_str(), "code");
+        assert!(host
+            .release_sandbox_source::<Fence<'_>>(
+                &actor,
+                parent_ref,
+                &standalone.sources[0].name,
+                standalone.rev,
+                |_| panic!("retained child must fence parent source removal"),
+            )
+            .is_err());
+        assert!(store
+            .sandbox_sources_set(&actor, &child.canonical_ref, &removed_name, None, child.rev,)
+            .is_err());
+        let selected_retention = format!(
+            "refs/aw/checkpoints/{}/code",
+            child.canonical_ref.rsplit_once("/s:").unwrap().1
+        );
+        assert!(!git(
+            &executable,
+            &parent_code,
+            &["for-each-ref", &selected_retention]
+        )
+        .is_empty());
+        let sibling = child_root.join("data/tracked");
+        fs::write(&sibling, b"independent sibling edits").unwrap();
+        Connection::open(&database).unwrap().execute_batch(
+            "CREATE TRIGGER fixture_fail_source_release BEFORE UPDATE OF rev ON sandboxes_current
+             BEGIN SELECT RAISE(ABORT,'fixture source release publication failure'); END;",
+        ).unwrap();
+        assert!(host
+            .release_sandbox_source(
+                &actor,
+                &child.canonical_ref,
+                &removed_name,
+                child.rev,
+                |release| {
+                    assert_eq!(release.snapshot(), &child);
+                    assert_eq!(release.bindings().len(), 2);
+                    assert_eq!(release.preparation().operation, SourceOperationKind::Derive);
+                    Ok(fence(child_locations(&child_root), 4))
+                },
+            )
+            .is_err());
+        assert!(!child_root.join("code").exists());
+        assert!(git(
+            &executable,
+            &parent_code,
+            &["for-each-ref", &selected_retention]
+        )
+        .is_empty());
+        assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+        assert_eq!(
+            store.sandbox_get(&actor, &child.canonical_ref).unwrap(),
+            child
+        );
+        assert!(store
+            .sandbox_close(&actor, &child.canonical_ref, Some(child.rev))
+            .is_err());
+        drop(store);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_source_release;")
+            .unwrap();
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        // A different source cannot recover the unresolved original claim.
+        assert!(store
+            .sandbox_release_source(
+                &actor,
+                &child.canonical_ref,
+                &child.sources[1].name,
+                child.rev,
+                |_| Ok(()),
+                |_, _| panic!("different source must not recover original release"),
+            )
+            .is_err());
+        let reduced = host
+            .release_sandbox_source(
+                &actor,
+                &child.canonical_ref,
+                &removed_name,
+                child.rev,
+                |_| Ok(fence(child_locations(&child_root), 4)),
+            )
+            .unwrap();
+        assert_eq!(reduced.rev, child.rev + 1);
+        assert_eq!(reduced.sources, child.sources[1..]);
+        assert_eq!(reduced.layout_digest, child.layout_digest);
+        assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+        assert!(host
+            .release_sandbox_source::<Fence<'_>>(
+                &actor,
+                &child.canonical_ref,
+                &removed_name,
+                child.rev,
+                |_| panic!("stale release must not inspect physical locations"),
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .sandbox_sources_set(
+                    &actor,
+                    &child.canonical_ref,
+                    &removed_name,
+                    None,
+                    reduced.rev,
+                )
+                .unwrap(),
+            reduced
+        );
+        // Retire the remaining source through its original descriptor.
+        fs::write(&sibling, b"data").unwrap();
+        let child = reduced;
         let closed = store
             .sandbox_close(&actor, parent_ref, Some(standalone.rev))
             .unwrap();
@@ -1943,9 +2152,14 @@ mod tests {
             .unwrap();
         assert!(parent_cleanup().is_err());
         let retired = host
-            .reconcile_closed_sandbox(&actor, &child.canonical_ref, |_, _, prepared| {
+            .reconcile_closed_sandbox(&actor, &child.canonical_ref, |_, bindings, prepared| {
                 assert_eq!(prepared.operation, SourceOperationKind::Derive);
-                Ok(fence(child_locations(&child_root), 4))
+                assert_eq!(bindings.len(), 1);
+                assert_eq!(prepared.sources[0].name.as_str(), "data");
+                Ok(fence(
+                    child_locations(&child_root).into_iter().skip(1).collect(),
+                    4,
+                ))
             })
             .unwrap();
         assert!(retired.sources.is_empty());
@@ -1978,6 +2192,56 @@ mod tests {
         assert!(released.sources.is_empty());
         assert_eq!(fs::read_dir(&standalone_root).unwrap().count(), 0);
         assert_eq!(count_sessions(), sessions_before);
+        // Final-source removal leaves the private parent layout itself
+        // intact and empty. Ordinary source-free use is never inferred
+        // while the final physical materialization is still retained.
+        let final_root = root.join("final-source-release");
+        private_dir(&final_root);
+        let one = SourceSet {
+            coverage: aw_agent_core::SourceCoverage::Selected,
+            anchors: baseline.anchors[..1].to_vec(),
+        };
+        let final_locations = || locations(&final_root).into_iter().take(1).collect();
+        let last = host
+            .create_sandbox_from_baseline(
+                &actor,
+                &project,
+                "fixture:final-source-release",
+                || Ok((layout(&final_root), one)),
+                |_, _| Ok(fence(final_locations(), 4)),
+            )
+            .unwrap();
+        fs::write(final_root.join("foreign"), b"keep").unwrap();
+        assert!(host
+            .release_sandbox_source(
+                &actor,
+                &last.canonical_ref,
+                &last.sources[0].name,
+                last.rev,
+                |_| Ok(fence(final_locations(), 4)),
+            )
+            .is_err());
+        assert!(final_root.join("code/tracked").is_file());
+        fs::remove_file(final_root.join("foreign")).unwrap();
+        let empty = host
+            .release_sandbox_source(
+                &actor,
+                &last.canonical_ref,
+                &last.sources[0].name,
+                last.rev,
+                |_| Ok(fence(final_locations(), 4)),
+            )
+            .unwrap();
+        assert!(empty.sources.is_empty());
+        assert_eq!(empty.rev, last.rev + 1);
+        assert_eq!(empty.layout_digest, last.layout_digest);
+        assert!(final_root.is_dir());
+        assert_eq!(fs::read_dir(&final_root).unwrap().count(), 0);
+        store
+            .sandbox_close(&actor, &empty.canonical_ref, Some(empty.rev))
+            .unwrap();
+        assert_eq!(count_sessions(), sessions_before);
+
         // A lost result before the first materialization may be abandoned
         // through the same exact Project claim, not another create.
         let abandoned_root = root.join("abandoned-standalone");

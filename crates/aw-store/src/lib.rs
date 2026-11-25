@@ -215,7 +215,8 @@ pub use sandbox_owner::{
     SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
     SandboxEffectRequest, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
     SandboxLifecycle, SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant,
-    SandboxToolRecovery, SandboxToolTerminalRef, SourceBindingCompatibility, SourceBindingSummary,
+    SandboxSourceRelease, SandboxToolRecovery, SandboxToolTerminalRef, SourceBindingCompatibility,
+    SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;

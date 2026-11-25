@@ -58,7 +58,8 @@ source detachment, independently approved multi-source native filesystem
 realization, durable native artifact custody/recovery and exact Store-backed Git
 native approval provisioning, shared finite Vault Process settlement, v60
 Project-scoped standalone versioned Sandbox construction, and same-Project
-required-source Sandbox derivation are implemented locally.
+required-source Sandbox derivation, and exact managed-source structural removal
+are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2679,6 +2680,40 @@ Clippy, workspace all-target/all-feature check, scoped fmt and diff checks passe
 The earlier broad Store result (239/244, five recorded legacy failures) was not
 rerun.
 
+Effectful removal of one originally constructed source is now a trusted realization
+of sources.set(name,null). Uses the original immutable Applied restore/derive
+descriptor, not a fresh delete/materialization plan, and the existing source
+coordination owner. A reserved release claim identifies the exact Sandbox CAS
+revision and original selected descriptor; the whole old source set stays
+retained/fenced until settlement. No new schema, receipt ledger or driver operation
+kind. Read-only authorization/physical preflight before claim; recheck exact
+Project writer, open Sandbox, complete original bindings, quiescence, layout and
+dependencies before release and before publication. A failed effect/commit retains
+original rows and hazard; explicit same-revision recovery verifies the original
+release, including proven absence, without re-materializing. One shared binding
+mutation publication helper advances Sandbox rev once and emits sources.changed;
+the release uses a stable original-descriptor fact identity and released=true.
+Later closed retirement selects the remaining original descriptors only after
+verifying exact release facts for absent names. Legacy metadata-only deletions are
+not physical release proof. Ordinary metadata mutation refuses managed
+construction changes that would lose original custody. Parent retained children
+and shared open materializations remain fenced. First concrete Git realization
+requires an unused Sandbox, disjoint private named children, unchanged cwd=root,
+independently held complete physical/provider fence, exact original selected
+checkout (or proven absence); verifies retained siblings by identity, not content,
+and releases only selected worktree plus its own derived retention if applicable.
+Final removal keeps the empty original parent directory; no root deletion or Agent
+admission. Prior CAS revision conflicts; ordinary current-rev absent-name null
+remains a no-op. New materialization attachment/replacement, bound-Agent removal,
+whole-root removal and legacy ambiguous custody still need explicit handling.
+Grouped existing Host lifecycle exercises a real derived source release, failed
+publication after physical removal, restart/wrong claim refusal, successful
+reconciliation preserving independently edited sibling, remaining subset
+retirement and final-source empty parent. Final construction receipts 1/1,
+Sandbox owners 4/4, Checkpoint owners 4/4, source barrier 1/1, Host 16/16;
+strict Store/Host all-target/all-feature Clippy, workspace all-target/all-feature
+check and scoped fmt/diff passed. Earlier broad Store 239/244 not rerun.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
@@ -2686,7 +2721,7 @@ physical recovery proof acquisition through existing owners; do not open held ro
 production host policy/physical authority configuration, other effectful baseline materialization, broader Run-hazard
 reconciliation, general multi-source Process policy, unmarked/ambiguous scratch and non-exact partial
 checkout cleanup, remaining production physical authority/cleanup, effectful
-final-source removal/structural mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
+structural attachment/replacement and other removal cases, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v60.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart

@@ -33,8 +33,9 @@ pub use grants::{
     SandboxPolicyEvidence, SandboxSourceGrant,
 };
 pub(crate) mod source_bindings;
-pub(crate) use source_bindings::RETENTION_CLEANUP_PREFIX;
+pub use source_bindings::SandboxSourceRelease;
 pub use source_bindings::{SourceBindingCompatibility, SourceBindingSummary};
+pub(crate) use source_bindings::{RETENTION_CLEANUP_PREFIX, SOURCE_RELEASE_PREFIX};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

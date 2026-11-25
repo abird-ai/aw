@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub(crate) const RETENTION_CLEANUP_PREFIX: &str = "sandbox-retention:";
+mod release;
+pub use release::SandboxSourceRelease;
+pub(crate) use release::SOURCE_RELEASE_PREFIX;
 
 use crate::source_compatibility::compatibility;
 pub use crate::source_compatibility::SourceCompatibility as SourceBindingCompatibility;
@@ -284,6 +287,78 @@ fn insert_at_revision(
     Ok(())
 }
 
+fn next_source_rev(rev: u64) -> Result<u64> {
+    rev.checked_add(1)
+        .filter(|rev| *rev <= i64::MAX as u64)
+        .ok_or(Error::Limit("Sandbox revision exhausted"))
+}
+
+fn remove_binding_in(
+    tx: &rusqlite::Transaction<'_>,
+    sandbox: &str,
+    name: &SourceName,
+    binding_rev: u64,
+) -> Result<()> {
+    if db(tx.execute(
+        "DELETE FROM sandbox_source_bindings_current WHERE sandbox_id=?1 AND source_name=?2 AND binding_rev=?3",
+        params![sandbox, name.as_str(), binding_rev],
+    ))? != 1 {
+        return Err(Error::Conflict("source binding changed during mutation"));
+    }
+    Ok(())
+}
+
+// One binding mutation linearization point and changed fact. A proven
+// physical release additionally names its original descriptor's fact ID.
+fn publish_source_change_in(
+    tx: &rusqlite::Transaction<'_>,
+    actor: &PrincipalId,
+    sandbox: &str,
+    name: &SourceName,
+    expected_rev: u64,
+    release_event: Option<&str>,
+) -> Result<()> {
+    let next_rev = next_source_rev(expected_rev)?;
+    if db(tx.execute(
+        "UPDATE sandboxes_current SET rev=?1,updated_at=?2
+         WHERE sandbox_id=?3 AND lifecycle='open' AND rev=?4",
+        params![next_rev, now(), sandbox, expected_rev],
+    ))? != 1
+    {
+        return Err(Error::Conflict(
+            "Sandbox revision changed during source mutation",
+        ));
+    }
+    let mut payload = serde_json::json!({
+        "sync_scope":"local","aspect":"sources","source_name":name.as_str(),"rev":next_rev,
+    });
+    let transaction = durability::tx_id()?;
+    if let Some(event_id) = release_event {
+        payload["released"] = true.into();
+        durability::commit_event_position_with_id(
+            tx,
+            event_id,
+            &transaction,
+            "sandbox.sources.changed",
+            "sandbox",
+            sandbox,
+            Some(actor),
+            payload,
+        )?;
+        Ok(())
+    } else {
+        durability::commit_event(
+            tx,
+            &transaction,
+            "sandbox.sources.changed",
+            "sandbox",
+            sandbox,
+            Some(actor),
+            payload,
+        )
+    }
+}
+
 impl SessionStore {
     /// Trusted host publication of an already-materialized binding change.
     /// The caller independently authorizes old/new source metadata and
@@ -377,9 +452,11 @@ impl SessionStore {
             return super::snapshot_with_sources(&tx, &sandbox);
         }
         require_no_retained_children_in(&tx, &sandbox)?;
-        if current.parent_sandbox_ref.is_some() {
+        if current.parent_sandbox_ref.is_some()
+            || crate::construction_receipt::original_materializations_in(&tx, &sandbox)?.is_some()
+        {
             return Err(Error::Conflict(
-                "derived Sandbox source changes require effectful structural custody",
+                "managed Sandbox source changes require effectful structural custody",
             ));
         }
         let tool_root = current
@@ -412,11 +489,7 @@ impl SessionStore {
                 "source binding revision exceeds Sandbox revision",
             ));
         }
-        let next_rev = current
-            .rev
-            .checked_add(1)
-            .filter(|rev| *rev <= i64::MAX as u64)
-            .ok_or(Error::Limit("Sandbox revision exhausted"))?;
+        let next_rev = next_source_rev(current.rev)?;
 
         // First/last source transitions cannot reinterpret an existing
         // Agent's ambient layout or another known open layout. Physical
@@ -481,40 +554,13 @@ impl SessionStore {
         } else {
             None
         };
-        if old.is_some() {
-            let changed = db(tx.execute(
-                "DELETE FROM sandbox_source_bindings_current WHERE sandbox_id=?1 AND source_name=?2",
-                params![sandbox, name.as_str()],
-            ))?;
-            if changed != 1 {
-                return Err(Error::Conflict("source binding changed during mutation"));
-            }
+        if let Some(old) = old {
+            remove_binding_in(&tx, &sandbox, name, old.binding_rev)?;
         }
         if let Some(binding) = binding {
             insert_at_revision(&tx, &sandbox, std::slice::from_ref(binding), next_rev)?;
         }
-        let changed = db(tx.execute(
-            "UPDATE sandboxes_current SET rev=?1,updated_at=?2
-             WHERE sandbox_id=?3 AND lifecycle='open' AND rev=?4",
-            params![next_rev, now(), sandbox, expected_rev],
-        ))?;
-        if changed != 1 {
-            return Err(Error::Conflict(
-                "Sandbox revision changed during source mutation",
-            ));
-        }
-        durability::commit_event(
-            &tx,
-            &durability::tx_id()?,
-            "sandbox.sources.changed",
-            "sandbox",
-            &sandbox,
-            Some(actor),
-            serde_json::json!({
-                "sync_scope":"local","aspect":"sources","source_name":name.as_str(),
-                "rev":next_rev,
-            }),
-        )?;
+        publish_source_change_in(&tx, actor, &sandbox, name, expected_rev, None)?;
         let result = super::snapshot_with_sources(&tx, &sandbox)?;
         db(tx.commit())?;
         drop(final_fence);
@@ -528,12 +574,20 @@ fn closed_retained_in(
     connection: &Connection,
     sandbox: &str,
 ) -> Result<(super::SandboxSnapshot, Vec<VersionedSourceBinding>)> {
-    let mut snapshot = super::snapshot_row(connection, sandbox)?;
+    let (snapshot, bindings) = retained_in(connection, sandbox)?;
     if snapshot.lifecycle != super::SandboxLifecycle::Closed {
         return Err(Error::Conflict(
             "source retirement requires a closed Sandbox",
         ));
     }
+    Ok((snapshot, bindings))
+}
+
+fn retained_in(
+    connection: &Connection,
+    sandbox: &str,
+) -> Result<(super::SandboxSnapshot, Vec<VersionedSourceBinding>)> {
+    let mut snapshot = super::snapshot_row(connection, sandbox)?;
     let mut bindings = Vec::new();
     for stored in bindings_in(connection, sandbox)? {
         let version = VersionedSourceBinding {
@@ -588,10 +642,10 @@ fn require_unshared_materializations_in(
                ON other.driver_key=owned.driver_key AND other.source_ref=owned.source_ref
               AND other.materialization=owned.materialization
              JOIN sandboxes_current s ON s.sandbox_id=other.sandbox_id
-             WHERE owned.sandbox_id=?1 AND s.lifecycle='open'
+             WHERE owned.sandbox_id=?1 AND other.sandbox_id<>?1 AND s.lifecycle='open'
          ) OR EXISTS(
              SELECT 1 FROM sandboxes_current s
-             WHERE s.lifecycle='open' AND (
+             WHERE s.sandbox_id<>?1 AND s.lifecycle='open' AND (
                  s.parent_sandbox_id=?1 OR (
                      (s.tool_root IN (?2,?3) OR s.working_directory IN (?2,?3))
                      AND EXISTS(SELECT 1 FROM sandbox_source_bindings_current b
@@ -632,7 +686,8 @@ impl SessionStore {
                 "restore cleanup requires retained closed Sandbox",
             ));
         }
-        let sources = crate::construction_receipt::restored_sources_for_sandbox_in(&tx, &sandbox)?;
+        let (_, bindings) = closed_retained_in(&tx, &sandbox)?;
+        let sources = release::retained_preparation_in(&tx, &sandbox, &bindings)?;
         let registry = self.inner.source_drivers.reader()?;
         for source in &sources.sources {
             registry.resolve(&source.prepared.descriptor.pin()?)?;

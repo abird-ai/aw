@@ -1238,6 +1238,17 @@ pub(crate) fn restored_sources_for_sandbox_in(
     connection: &Connection,
     sandbox: &str,
 ) -> Result<PreparedSourceSet> {
+    original_materializations_in(connection, sandbox)?.ok_or(Error::Denied(
+        "original Sandbox restore preparation unavailable",
+    ))
+}
+
+/// The original Applied materialization descriptors remain authoritative
+/// after individual sources are retired; never reconstruct from a path.
+pub(crate) fn original_materializations_in(
+    connection: &Connection,
+    sandbox: &str,
+) -> Result<Option<PreparedSourceSet>> {
     let mut query = db(connection.prepare_cached(
         "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
          WHERE action='construction.preparation'
@@ -1254,12 +1265,10 @@ pub(crate) fn restored_sources_for_sandbox_in(
          LIMIT 2",
     ))?;
     let mut rows = db(query.query([sandbox]))?;
-    let claim = decode_receipt(
-        connection,
-        db(rows.next())?.ok_or(Error::Denied(
-            "original Sandbox restore preparation unavailable",
-        ))?,
-    )?;
+    let Some(row) = db(rows.next())? else {
+        return Ok(None);
+    };
+    let claim = decode_receipt(connection, row)?;
     if db(rows.next())?.is_some() {
         return Err(Error::Storage(
             "ambiguous original Sandbox restore preparation",
@@ -1279,6 +1288,7 @@ pub(crate) fn restored_sources_for_sandbox_in(
         }
         return receipt
             .sources
+            .map(Some)
             .ok_or(Error::Storage("original Sandbox source custody missing"));
     }
     let ConstructionCandidate::Agent {
@@ -1315,6 +1325,7 @@ pub(crate) fn restored_sources_for_sandbox_in(
     }
     receipt
         .sources
+        .map(Some)
         .ok_or(Error::Storage("original restore source custody missing"))
 }
 

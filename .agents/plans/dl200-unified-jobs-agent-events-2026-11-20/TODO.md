@@ -1118,13 +1118,32 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       construction 1/1, Sandbox 4/4, Checkpoint 4/4, Host 16/16; strict Clippy,
       workspace all-target/all-feature check, scoped fmt/diff passed. Earlier
       broad Store 239/244 was not rerun.
+      **Exact managed-source structural removal landed:** one original Applied
+      restore/derive descriptor + reserved exact Sandbox CAS release claim in the
+      existing complete-set source coordinator. No fresh materialization plan,
+      parallel receipt ledger or schema. Independent read-only preflight, same
+      writer/revision/layout/binding/dependency checks at claim/commit; old rows
+      and hazard retained on uncertainty. Shared sources.changed mutation CAS
+      publishes the factual release; stable original-descriptor event ID proves
+      which original descriptors may be omitted during later closed retirement.
+      Managed metadata edits cannot discard original custody. Concrete Git
+      removal limited to unused private named-child layouts, cwd=root, independent
+      complete physical fence. Only selected original worktree/derived retention
+      released; sibling identity retained without requiring unchanged content.
+      Final removal keeps original empty directory. Grouped Host lifecycle covers
+      failed publication/restart, wrong claim refusal, independently edited sibling,
+      exact subset retirement and final-source removal. Attachment/replacement and
+      other removal cases still open. Final construction 1/1, Sandbox 4/4,
+      Checkpoint 4/4, source barrier 1/1, Host 16/16; strict affected Clippy,
+      workspace all-target/all-feature check and scoped fmt/diff passed.
+      Earlier broad Store 239/244 not rerun. Schema v60 unchanged.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production host policy/physical authority configuration, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
-      effectful final-source removal/structural mutation, remaining Vault broker/socket/file/other env,
+      effectful attachment/replacement and other structural removal cases, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v60. Remote main verified at 4ddeed8; subsequent checkpoint local.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
