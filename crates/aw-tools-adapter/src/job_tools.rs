@@ -342,8 +342,22 @@ impl Tool for JobShell {
             let primary = snapshot
                 .summary
                 .map_or(Primary::Unknown, |summary| summary.0);
+            let content = if primary == Primary::Fail
+                && started
+                    .host
+                    .manager()
+                    .process_terminal(&started.id, 1)
+                    .map_err(|_| Error::Protocol("shell Process terminal facts unavailable"))?
+                    .is_none()
+            {
+                // A known no-launch failure has no exit status. Keep its
+                // actual retained diagnostic instead of projecting an exit.
+                result.clone()
+            } else {
+                format!("exit: {exit}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+            };
             let direct = ToolOutput {
-                content: format!("exit: {exit}\nstdout:\n{stdout}\nstderr:\n{stderr}"),
+                content,
                 is_error: primary != Primary::Ok,
                 truncated: stdout_truncated || stderr_truncated,
             };
@@ -1416,6 +1430,19 @@ mod tests {
         ToolContext,
         Arc<shell::NativeShell>,
     ) {
+        shell_fixture_with_containment(Default::default())
+    }
+
+    #[cfg(unix)]
+    fn shell_fixture_with_containment(
+        containment: crate::process::ContainmentRequirement,
+    ) -> (
+        PathBuf,
+        Agent,
+        Arc<JobRuntime>,
+        ToolContext,
+        Arc<shell::NativeShell>,
+    ) {
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).unwrap();
         let suffix = random
@@ -1441,19 +1468,16 @@ mod tests {
         );
         let mut tools = LocalToolOptions::new(&root, ToolMode::Trusted);
         tools.bash = Some(bash.clone());
-        let agent = configure(builder, actor.clone(), &tools)
-            .unwrap()
-            .build()
-            .unwrap();
-        let runtime = JobRuntime::new(
-            Arc::new(aw_platform::scoped_fs::Root::open(&root).unwrap()),
-            agent.tool_binding_authority(),
-            Limits::default(),
-        )
-        .unwrap();
+        tools.local_process_containment = containment;
+        let configured = crate::configure_with_runtime(builder, actor.clone(), &tools).unwrap();
+        let agent = configured.builder.build().unwrap();
+        let runtime = configured.job_runtime.unwrap();
         let (runtime_session, runtime_branch) = runtime.test_scope_identity();
-        let shell = Arc::new(shell::NativeShell::new(root.clone(), bash).unwrap());
-        runtime.register_shell(shell.clone()).unwrap();
+        let shell = Arc::new(
+            shell::NativeShell::new(root.canonicalize().unwrap(), bash)
+                .unwrap()
+                .requiring_containment(containment),
+        );
         let ctx = ToolContext {
             actor: actor.clone(),
             turn_id: 1,
@@ -1561,6 +1585,90 @@ mod tests {
             .unwrap()
             .jobs
             .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_shell_containment_refuses_direct_finite_and_graph_launches() {
+        use crate::process::ContainmentRequirement;
+        let (root, _agent, runtime, mut ctx, shell) =
+            shell_fixture_with_containment(ContainmentRequirement::ClosedDescendants);
+        let arguments = json!({"command":"printf spawned > marker"});
+        let denial = "required closed descendant containment is unavailable";
+        // The standalone executor uses the same minimum as the Job executor.
+        assert!(matches!(
+            shell.execute(ctx.clone(), &arguments).await,
+            Err(Error::Denied(message)) if message == denial
+        ));
+        let direct = JobShell::new(runtime.clone(), shell.clone());
+        let output = direct.execute(ctx.clone(), &arguments).await.unwrap();
+        assert!(
+            output.is_error && output.content.contains(denial),
+            "{}",
+            output.content
+        );
+        // The background finite constructor and a multi-node Graph both retain
+        // exact no-launch facts under the original Job and output owners.
+        let get = JobControl::new(runtime.clone(), JobToolKind::Get);
+        let host = runtime.host_for(&ctx).unwrap();
+        let strict_binding = shell.runtime_binding().unwrap();
+        let graph = Batch::new(runtime.clone());
+        ctx.call_id = "strict-finite".into();
+        let finite = direct
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "command":"printf spawned > marker", "background":true
+                }),
+            )
+            .await
+            .unwrap();
+        ctx.call_id = "strict-graph".into();
+        ctx.effect = ToolEffect::Control;
+        let batch = graph
+            .execute(
+                ctx.clone(),
+                &json!({
+                    "ops":[["bash",arguments],["bash",{"command":"printf spawned > graph-marker"},"*"]],
+                    "background":true
+                }),
+            )
+            .await
+            .unwrap();
+        for (receipt, nodes) in [(finite, 1), (batch, 2)] {
+            let id = handoff_job_id(&receipt.content).to_owned();
+            let _ = wait_terminal(&get, ctx.clone(), &id).await;
+            let snapshot = host.manager().runtime_snapshot(&id).unwrap();
+            assert_eq!(snapshot.summary.unwrap().0, Primary::Fail);
+            assert_eq!(snapshot.finished, nodes);
+            assert!(!snapshot.journal_unknown);
+            for plan in host.manager().plans(&id).unwrap() {
+                assert_eq!(plan.runtime_binding(), strict_binding);
+            }
+            for coordinate in 1..=nodes {
+                assert!(host
+                    .manager()
+                    .process_terminal(&id, coordinate)
+                    .unwrap()
+                    .is_none());
+                for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+                    let (summary, finished) = host
+                        .manager()
+                        .output_summary(&id, coordinate, stream)
+                        .unwrap();
+                    assert!(finished);
+                    assert_eq!(summary.total_bytes, 0);
+                }
+                let result = host
+                    .manager()
+                    .output_page(&id, coordinate, OutputStream::Result, 0, 4096)
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&result.bytes).contains(denial));
+            }
+        }
+        assert!(!root.join("marker").exists());
+        assert!(!root.join("graph-marker").exists());
         let _ = fs::remove_dir_all(root);
     }
 

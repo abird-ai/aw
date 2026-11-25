@@ -100,6 +100,21 @@ impl PipeSpec {
         }
         Ok(())
     }
+
+    /// Convert validated host input to the same owned launch capability as a
+    /// driver-prepared command. No external launch effect occurs here.
+    pub fn prepare(self) -> crate::Result<PreparedPipeLaunch> {
+        self.validate()?;
+        let mut command = Command::new(self.program);
+        command.args(self.args).current_dir(self.root).env_clear();
+        command.envs(self.env);
+        Ok(PreparedPipeLaunch {
+            command,
+            stdin_open: self.stdin_open,
+            pins: (),
+            containment: ContainmentRequirement::BestAvailable,
+        })
+    }
 }
 /// The host opens uniquely-owned spool file capabilities before calling
 /// spawn. Model arguments cannot select these paths or create task IDs.
@@ -854,6 +869,42 @@ impl PipeProcess {
         cancelled: impl Fn() -> bool + Send + 'static,
         cancelled_signal: impl Future<Output = ()> + Send + 'static,
     ) -> std::result::Result<Self, PipeLaunchFailure> {
+        Self::spawn_prepared_inner(
+            launch,
+            SpawnOutputTarget::None,
+            deadline,
+            cancelled,
+            cancelled_signal,
+        )
+        .await
+    }
+
+    /// Launch the same prepared capability into the original Job output owner.
+    pub async fn spawn_prepared_with_job_outputs_until<P: Send + 'static>(
+        launch: PreparedPipeLaunch<P>,
+        stdout: OutputWriter,
+        stderr: OutputWriter,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
+        Self::spawn_prepared_inner(
+            launch,
+            SpawnOutputTarget::Job { stdout, stderr },
+            deadline,
+            cancelled,
+            cancelled_signal,
+        )
+        .await
+    }
+
+    async fn spawn_prepared_inner<P: Send + 'static>(
+        launch: PreparedPipeLaunch<P>,
+        target: SpawnOutputTarget,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        cancelled_signal: impl Future<Output = ()> + Send + 'static,
+    ) -> std::result::Result<Self, PipeLaunchFailure> {
         let PreparedPipeLaunch {
             command,
             stdin_open,
@@ -875,7 +926,7 @@ impl PipeProcess {
         Self::spawn_command_inner(
             command,
             stdin_open,
-            SpawnOutputTarget::None,
+            target,
             None,
             Some(control),
             containment,
@@ -921,19 +972,19 @@ impl PipeProcess {
         event_sink: Option<Arc<dyn ExecutionEventSink>>,
         control: Option<aw_process::SpawnControl>,
     ) -> crate::Result<Self> {
-        spec.validate()?;
-        let mut command = Command::new(spec.program);
-        command.args(spec.args).current_dir(spec.root).env_clear();
-        for (key, value) in spec.env {
-            command.env(key, value);
-        }
+        let PreparedPipeLaunch {
+            command,
+            stdin_open,
+            pins: (),
+            containment,
+        } = spec.prepare()?;
         Self::spawn_command_inner(
             command,
-            spec.stdin_open,
+            stdin_open,
             target,
             event_sink,
             control,
-            ContainmentRequirement::BestAvailable,
+            containment,
         )
         .await
         .map_err(PipeLaunchFailure::into_error)

@@ -2203,10 +2203,6 @@ impl JobHost {
                 return Err(error);
             }
         };
-        if let Err(error) = prepared.spec.validate() {
-            self.settle_unlaunched(id, coordinate, claimed_sequence)?;
-            return Err(error);
-        }
         let stream_capacity = prepared.max_output_bytes as u64;
         let owner = match self.manager.job_output_owner(id) {
             Ok(owner) => owner,
@@ -2250,8 +2246,8 @@ impl JobHost {
 
         let spawn_cancel = cancellation.clone();
         let spawn_cancel_signal = cancellation.clone();
-        let mut process = match process::PipeProcess::spawn_with_job_outputs_until(
-            prepared.spec,
+        let mut process = match process::PipeProcess::spawn_prepared_with_job_outputs_until(
+            prepared.launch,
             stdout,
             stderr,
             execution_deadline,
@@ -2261,7 +2257,7 @@ impl JobHost {
         .await
         {
             Ok(process) => process,
-            Err(Error::Cancelled) => {
+            Err(process::PipeLaunchFailure::NotStarted(Error::Cancelled)) => {
                 self.cancel(id)?;
                 self.settle_proven_unlaunched(
                     id,
@@ -2276,14 +2272,13 @@ impl JobHost {
                     incomplete: false,
                 });
             }
-            Err(error) => {
+            Err(failure) => {
                 self.finish_shell_streams(id, coordinate);
-                let detail = aw_tools::task::bounded_task_error(error.to_string());
-                let primary = if matches!(error, Error::Transport(_)) {
-                    Primary::Unknown
-                } else {
-                    Primary::Fail
+                let primary = match &failure {
+                    process::PipeLaunchFailure::NotStarted(_) => Primary::Fail,
+                    process::PipeLaunchFailure::Unknown(_) => Primary::Unknown,
                 };
+                let detail = aw_tools::task::bounded_task_error(failure.into_error().to_string());
                 return self.settle_shell_result(
                     id,
                     coordinate,
@@ -3391,6 +3386,7 @@ mod tests {
             execution_site: "local".into(),
             bash: None,
             process_input: false,
+            local_process_containment: Default::default(),
             agent_jobs: Default::default(),
             events: Default::default(),
             operation_router: Default::default(),

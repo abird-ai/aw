@@ -34,6 +34,7 @@ fn read_fixture() -> ReadFixture {
         execution_site: "local".into(),
         bash: None,
         process_input: false,
+        local_process_containment: Default::default(),
         agent_jobs: Default::default(),
         events: Default::default(),
         operation_router: Default::default(),

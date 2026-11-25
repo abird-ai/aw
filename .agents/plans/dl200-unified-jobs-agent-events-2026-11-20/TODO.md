@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: `2b4fac33d8345f284ecfd3e0585f332c72037dc6` (minimum Process containment; signed, local). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: trusted local shell/finite Job/Graph containment (this local checkpoint; documentation parent `cf0b131e3f6e7beb681060f4cbdaf430ff0df2b1`, prior signed implementation `2b4fac33d8345f284ecfd3e0585f332c72037dc6`). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1237,6 +1237,19 @@ Current implementation: `2b4fac33d8345f284ecfd3e0585f332c72037dc6` (minimum Proc
       Process 8/8, adapter 258/258, Host 16/16, source-effects-only Host 2/2;
       strict affected Clippy, workspace all-target/all-feature and scoped
       fmt/diff passed. Broad Store not rerun.
+      **Trusted local shell containment landed:** configured host-native shell
+      minimum (default BestAvailable) feeds the same PreparedPipeLaunch for
+      direct/finite/Graph dispatch, with typed Job launch failure and factual
+      retained diagnostics. Strict minimum enters sealed runtime identity;
+      legacy identities stay exact. No Unix strict fallback, Process terminal
+      invention, model selector, new execution owner or source-admission
+      promotion. Grouped real no-spawn regression 1/1, adapter 259/259,
+      original source Process host 2/2, strict adapter Clippy, full/minimal
+      CLI all-target checks and scoped fmt/diff passed on L5's installed
+      Rust 1.95.0 (pinned Nix shell unavailable offline; minimal two existing
+      warnings). Shared checkout includes concurrent dependency work; exact
+      owned tree only for signing. Windows/Bubblewrap and broad Store/workspace
+      runtime not requalified. Original journal owners still occupied.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

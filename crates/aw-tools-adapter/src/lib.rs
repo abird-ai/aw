@@ -803,6 +803,10 @@ pub struct LocalToolOptions {
     /// Independent host grant for live Process stdin. This is not a model tool
     /// and does not follow automatically from shell or jobs_send authority.
     pub process_input: bool,
+    /// Trusted minimum for this configured native shell's Process scope,
+    /// including finite and Graph execution. Not filesystem isolation, a
+    /// backend selector, or authority over externally routed tools.
+    pub local_process_containment: process::ContainmentRequirement,
     /// Host-injected Agent/Turn jobs_* router. The slot itself is not authority
     /// and finite-only/standalone hosts leave it empty.
     pub agent_jobs: Arc<agent_jobs::AgentJobRouterSlot>,
@@ -845,6 +849,7 @@ impl LocalToolOptions {
             execution_site: "local".into(),
             bash: None,
             process_input: false,
+            local_process_containment: Default::default(),
             agent_jobs: Arc::new(agent_jobs::AgentJobRouterSlot::default()),
             events: Arc::new(events::EventRouterSlot::default()),
             operation_router: Arc::new(operation_router::OperationRouterSlot::default()),
@@ -1356,11 +1361,14 @@ fn configure_inner(
                         "bash must be an absolute executable file".into(),
                     ));
                 }
-                let shell = Arc::new(shell::Bash::with_output_limit(
-                    options.root.canonicalize()?,
-                    bash,
-                    limits.shell_stream_bytes,
-                )?);
+                let shell = Arc::new(
+                    shell::Bash::with_output_limit(
+                        options.root.canonicalize()?,
+                        bash,
+                        limits.shell_stream_bytes,
+                    )?
+                    .requiring_containment(options.local_process_containment),
+                );
                 if let Some(runtime) = &job_runtime {
                     runtime.register_shell(shell.clone())?;
                 }
@@ -1387,11 +1395,14 @@ fn configure_inner(
                         "powershell executable must be absolute".into(),
                     ));
                 }
-                let shell = Arc::new(shell::PowerShell::with_output_limit(
-                    options.root.canonicalize()?,
-                    executable,
-                    limits.shell_stream_bytes,
-                )?);
+                let shell = Arc::new(
+                    shell::PowerShell::with_output_limit(
+                        options.root.canonicalize()?,
+                        executable,
+                        limits.shell_stream_bytes,
+                    )?
+                    .requiring_containment(options.local_process_containment),
+                );
                 if let Some(runtime) = &job_runtime {
                     runtime.register_shell(shell.clone())?;
                 }

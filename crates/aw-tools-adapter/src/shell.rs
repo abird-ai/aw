@@ -2,7 +2,10 @@
 //! subprocess uses the SAME host process lifecycle/capture service as other
 //! pipe-based process actors. No alternate Bash-specific reaper/capture loop.
 //! Same-UID trusted shell access is emphatically NOT an OS sandbox.
-use crate::process::{Outcome as ProcessOutcome, PipeProcess, PipeSpec};
+use crate::process::{
+    ContainmentRequirement, Outcome as ProcessOutcome, PipeLaunchFailure, PipeProcess, PipeSpec,
+    PreparedPipeLaunch,
+};
 use aw_agent_core::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -69,6 +72,7 @@ pub(crate) struct NativeShell {
     path: String,
     tool_name: &'static str,
     max_output_bytes: usize,
+    containment: ContainmentRequirement,
 }
 #[cfg(unix)]
 pub(crate) type Bash = NativeShell;
@@ -126,7 +130,13 @@ impl NativeShell {
             path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
             tool_name,
             max_output_bytes,
+            containment: ContainmentRequirement::BestAvailable,
         })
+    }
+
+    pub(crate) fn requiring_containment(mut self, requirement: ContainmentRequirement) -> Self {
+        self.containment = self.containment.intersect(requirement);
+        self
     }
 }
 
@@ -159,6 +169,12 @@ impl NativeShell {
         hash.update(volume.to_le_bytes());
         hash.update(object.to_le_bytes());
         hash.update((self.max_output_bytes as u64).to_le_bytes());
+        // Preserve legacy BestAvailable identities; a stricter sealed plan
+        // must never execute against a weaker registered interpreter.
+        match self.containment {
+            ContainmentRequirement::BestAvailable => {}
+            ContainmentRequirement::ClosedDescendants => hash.update(b"\0closed-descendants"),
+        }
         Ok(hash.finalize().into())
     }
 
@@ -268,13 +284,15 @@ impl NativeShell {
             );
         }
         Ok(PreparedShell {
-            spec: PipeSpec {
+            launch: PipeSpec {
                 root: cwd,
                 program: self.executable.clone(),
                 args: shell_args,
                 env: environment,
                 stdin_open: args.stdin.is_some() || args.interactive,
-            },
+            }
+            .prepare()?
+            .requiring_containment(self.containment),
             stdin: args.stdin.map(String::into_bytes),
             interactive: args.interactive,
             timeout: Duration::from_secs(args.timeout_secs.unwrap_or(600)),
@@ -284,7 +302,7 @@ impl NativeShell {
     }
 }
 pub(crate) struct PreparedShell {
-    pub spec: PipeSpec,
+    pub launch: PreparedPipeLaunch,
     pub stdin: Option<Vec<u8>>,
     pub interactive: bool,
     pub timeout: Duration,
@@ -402,13 +420,14 @@ impl Tool for NativeShell {
                 .ok_or(Error::Timeout)?;
             let spawn_cancel = ctx.cancellation.clone();
             let spawn_cancel_signal = ctx.cancellation.clone();
-            let mut process = PipeProcess::spawn_until(
-                prepared.spec,
+            let mut process = PipeProcess::spawn_prepared_until(
+                prepared.launch,
                 deadline,
                 move || spawn_cancel.is_cancelled(),
                 async move { spawn_cancel_signal.cancelled().await },
             )
-            .await?;
+            .await
+            .map_err(PipeLaunchFailure::into_error)?;
             if let Some(stdin) = &prepared.stdin {
                 process.write(stdin).await?;
                 process.close_stdin();
@@ -537,6 +556,19 @@ mod tests {
         let a = Bash::new(std::env::temp_dir(), executable()).unwrap();
         let b = Bash::new(std::env::temp_dir(), executable()).unwrap();
         assert_eq!(a.runtime_binding().unwrap(), b.runtime_binding().unwrap());
+        let strict = b.requiring_containment(ContainmentRequirement::ClosedDescendants);
+        assert_ne!(
+            a.runtime_binding().unwrap(),
+            strict.runtime_binding().unwrap()
+        );
+        let strict_binding = strict.runtime_binding().unwrap();
+        assert_eq!(
+            strict_binding,
+            strict
+                .requiring_containment(ContainmentRequirement::BestAvailable)
+                .runtime_binding()
+                .unwrap()
+        );
         a.revalidate().unwrap();
     }
 

@@ -18,6 +18,62 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
+## Latest local implementation delta — 2026-11-25: trusted local shell containment
+
+This checkpoint follows the signed comprehensive documentation parent
+`cf0b131e3f6e7beb681060f4cbdaf430ff0df2b1` (implementation predecessor
+`2b4fac33d8345f284ecfd3e0585f332c72037dc6`). Phase 3 remains underway. The
+original Agent/Turn journal paths (`aw-agent-core/src/agent.rs`,
+`aw-agent-core/src/journal.rs`, `aw-store/src/journal.rs`) remain concurrently
+occupied; source-bearing production admission stays held. The dated comprehensive
+handoff remains the historical design and implementation index, with this live
+delta superseding its local checkpoint position.
+
+- The existing trusted local `LocalToolOptions` supplies a typed
+  `local_process_containment` minimum for the configured native shell only.
+  Both Bash and PowerShell construction feed that minimum into the original
+  shared shell registry. Default/CLI behavior stays `BestAvailable`; there is
+  no new CLI/model selector, delegated authority, or filesystem isolation claim.
+- `PipeSpec::prepare` validates host input and produces the same owned
+  `PreparedPipeLaunch` as the existing driver path. The prepared Job-output
+  launch shares the original spawn-control/custody and Process owner with
+  ordinary prepared launch. Both local direct execution and the original
+  finite Job/Graph ShellNode consume that capability. The source-fenced launch
+  and its original independent authority/Prepared custody are unchanged.
+- Exact shell runtime bindings include the stronger minimum without changing
+  historical `BestAvailable` identities; subsequent weakening cannot satisfy a
+  sealed strict plan. The original `JobHost` settles typed `NotStarted` versus
+  `Unknown`, without inventing Process terminals. Foreground known no-launch
+  failures project their actual retained diagnostic instead of an exit label.
+  Strict closed-descendant containment refuses current Unix DirectScope before
+  spawn; the Windows native Job path remains unqualified on this host.
+- One grouped regression exercises standalone direct, foreground/background
+  finite and multi-node Graph shell dispatch through the configured runtime:
+  no markers, no fabricated ProcessTerminal, finished empty output streams,
+  factual retained denial, exact strict runtime bindings. Existing default
+  behavior and monotonic binding tests remain covered. The shell fixture now
+  retains the actual configured JobRuntime instead of constructing a duplicate.
+
+Validation on L5: grouped regression **1/1**, complete adapter all-feature
+library suite **259/259**, strict adapter all-target/all-feature Clippy, original
+source Process host regressions **2/2** with `git-source-effects`, full and
+minimal `aw-cli` all-target checks, scoped Rust formatting and owned-path diff
+checks passed. Minimal retains two existing dead-code warnings. The pinned
+1.98.1 Nix shell could not evaluate offline (missing flake input/SSL CA setup);
+validation used the existing installed/cached Rust 1.95.0 toolchain. Literal-only
+minimal CLI and web-test changes preserve their pre-existing formatting. Builds
+ran in the shared live checkout including concurrently owned dependencies; the
+signed checkpoint tree is constructed from the exact expected parent plus only
+these owned paths. Broad Store/workspace runtime and Windows/Bubblewrap native
+qualification were not rerun. No schema changes (Store v60, Git recovery v4),
+release/mount changes, UX changes, or publication.
+
+Next: exact live source-aware Actor/Turn admission across the original Agent,
+Actor, TurnJournal, context and queue owners once ownership is available;
+otherwise continue one independent production physical authority/provisioning or
+containment consumer. Do not repeat the completed structural mutations or enable
+unsupported routes.
+
 ## Current authoritative snapshot — 2026-11-25
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is

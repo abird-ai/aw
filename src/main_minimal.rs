@@ -1063,6 +1063,7 @@ Explicitly requested, owner-approved project skill {} (data, no execution grants
             .clone()
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
         process_input: false,
+        local_process_containment: Default::default(),
         agent_jobs: Default::default(),
         events: Default::default(),
         operation_router: Default::default(),
