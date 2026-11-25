@@ -58,12 +58,11 @@ pub(super) fn retained_preparations_in(
     sandbox: &str,
     bindings: &[VersionedSourceBinding],
 ) -> Result<Vec<NamedPreparedSource>> {
-    let mut original = crate::construction_receipt::restored_sources_for_sandbox_in(c, sandbox)?;
-    original
-        .sources
-        .sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    let mut original = crate::construction_receipt::original_materializations_in(c, sandbox)?
+        .map_or_else(Vec::new, |set| set.sources);
+    original.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
     let mut current = bindings.iter().peekable();
-    for source in &original.sources {
+    for source in &original {
         while current
             .peek()
             .is_some_and(|binding| binding.binding.name.as_str() < source.name.as_str())
@@ -83,10 +82,9 @@ pub(super) fn retained_preparations_in(
     for binding in bindings {
         let source = if binding.binding_rev == 1 {
             let index = original
-                .sources
                 .binary_search_by(|s| s.name.as_str().cmp(binding.binding.name.as_str()))
                 .map_err(|_| Error::Conflict("original materialization unavailable"))?;
-            original.sources[index].clone()
+            original[index].clone()
         } else {
             super::attachment::attached_preparation_in(c, sandbox, binding)?
         };
@@ -164,11 +162,6 @@ pub(super) fn observe_managed_in(
         return Err(Error::Conflict("Sandbox revision or lifecycle changed"));
     }
     next_source_rev(rev)?;
-    if bindings.is_empty() {
-        return Err(Error::Conflict(
-            "managed mutation requires retained sources",
-        ));
-    }
     require_unshared_materializations_in(tx, &snapshot)?;
     let root = snapshot
         .tool_root
@@ -178,13 +171,18 @@ pub(super) fn observe_managed_in(
         .working_directory
         .to_str()
         .ok_or(Error::Storage("invalid Sandbox working directory"))?;
-    sandbox_owner::require_no_retained_layout_in(tx, root, cwd)?;
+    // Recovery must observe its own reserved first-source layout.
+    // The caller separately claims or revalidates that exact barrier.
+    sandbox_owner::require_no_closed_retained_layout_in(tx, root, cwd)?;
     // Initial structural realization requires an unused isolated layout.
     let used: bool = db(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_state_current WHERE sandbox_id=?1)
          OR EXISTS(SELECT 1 FROM sandboxes_current WHERE sandbox_id<>?1 AND lifecycle='open'
-                   AND (tool_root IN (?2,?3) OR working_directory IN (?2,?3)))",
-        params![sandbox, root, cwd],
+                   AND (tool_root IN (?2,?3) OR working_directory IN (?2,?3)))
+         OR (?4 AND EXISTS(SELECT 1 FROM sessions r
+             WHERE json_extract(r.binding_json,'$.tool_root') IN (?2,?3)
+                OR json_extract(r.binding_json,'$.working_directory') IN (?2,?3)))",
+        params![sandbox, root, cwd, bindings.is_empty()],
         |row| row.get(0),
     ))?;
     if used {

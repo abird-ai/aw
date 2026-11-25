@@ -1183,13 +1183,37 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       barrier 1/1, Host 16/16; strict affected Clippy, workspace all-target/
       all-feature check and scoped fmt/diff passed. Earlier broad Store
       239/244 not rerun.
+      **First-source attachment landed:** same Project Prepared attachment and
+      original Restore descriptor, with exact root/cwd layout scopes in the
+      existing source claim when the old set is empty. No new schema/ledger;
+      scopes do not consume named-source slots. Reserve before effects, block
+      competing backing selection, Sandbox create/close, metadata changes and
+      ambient Agent binding/execution. Empty preflight refuses retained Agent
+      or Session aliases at either exact path; after publication legacy
+      ambient alias admission remains denied. Independent physical fence
+      still required for alias/ancestry/mount/cross-Store exclusion. Recover
+      original layout/source hazard together; settle on Applied or proven
+      abandonment. Per-binding provenance permits no initial construction
+      receipt, while legacy rev-1 without original descriptor remains held.
+      Managed attachment facts prevent metadata-only custody loss after
+      final release. Grouped Host lifecycle covers empty/private layout,
+      competing first attachment, abandonment, failed publication/restart/
+      missing driver, exact replay, replacement/removal, reattachment and
+      closed retirement. Bound-Agent and partial replacement cases remain.
+      Stronger ambient alias gate updated the existing checkpoint regression
+      and two Host source-effect fixture publication orders, not runtime bypasses.
+      Broad Store 231/244 initial; corrected alias 1/1 and stable-executable
+      coordination 24/24 resolved one old expectation and seven spawn ENOENTs
+      from overlapping rebuild; five known legacy failures remain (239/244
+      combined). Host 14/16 initial + corrected fixture retest 2/2. Strict
+      affected Clippy, workspace all-target/all-feature and scoped fmt/diff passed.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production host policy/physical authority configuration, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
-      empty-layout attachment, partial replacement recovery and other structural removal cases, remaining Vault broker/socket/file/other env,
+      partial replacement recovery, bound-Agent mutation and other structural removal cases, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v60. Remote main verified at 4ddeed8; subsequent checkpoint local.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

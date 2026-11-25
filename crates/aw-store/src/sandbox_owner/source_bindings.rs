@@ -484,6 +484,7 @@ impl SessionStore {
         require_no_retained_children_in(&tx, &sandbox)?;
         if current.parent_sandbox_ref.is_some()
             || crate::construction_receipt::original_materializations_in(&tx, &sandbox)?.is_some()
+            || attachment::has_attachment_in(&tx, &sandbox)?
         {
             return Err(Error::Conflict(
                 "managed Sandbox source changes require effectful structural custody",

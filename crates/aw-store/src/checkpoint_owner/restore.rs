@@ -2879,29 +2879,35 @@ mod tests {
         assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
         let closed_agent = store.agent_finish_close(&actor, &restored_ref).unwrap();
 
-        // The same tool root with a different cwd must not be silently
-        // quarantined while a legacy Agent is still live.
+        // Legacy ambient selection must not reinterpret the same
+        // source-bearing tool root through a different cwd. A trusted
+        // unused logical alias may still exist, but cannot admit an Agent.
         let alias_layout = SessionBinding {
             working_directory: temp.0.join("different-cwd"),
             ..layout.clone()
         };
         std::fs::create_dir(&alias_layout.working_directory).unwrap();
-        let (alias, alias_branch) = store
+        assert!(store
             .create(&actor, "same root", alias_layout.clone())
-            .unwrap();
-        let alias_ref = agent_owner::canonical_ref(
-            &store.connection().unwrap(),
-            AgentKey::new(&alias.id, &alias_branch.id),
-        )
-        .unwrap();
-        let alias_agent = store.agent_get(&actor, &alias_ref).unwrap();
-        let alias_sandbox = alias_agent.sandbox_ref.unwrap();
+            .is_err());
         let unused_alias = store
             .sandbox_create_fresh(&actor, &snapshot.project_ref, &alias_layout)
             .unwrap();
-        assert!(store.sandbox_close(&actor, &sandbox, None).is_err());
-        store.agent_request_close(&actor, &alias_ref, None).unwrap();
-        store.agent_finish_close(&actor, &alias_ref).unwrap();
+        {
+            let connection = store.connection().unwrap();
+            let binding =
+                crate::agent_binding_in(&connection, &actor, &ids.session, &ids.branch).unwrap();
+            assert!(sandbox_owner::preflight_initial_selection(
+                &connection,
+                &actor,
+                &binding.domain_handle,
+                &binding.identity_handle,
+                &binding.project_handle,
+                &alias_layout,
+                Some(&unused_alias.canonical_ref),
+            )
+            .is_err());
+        }
 
         let set = SourceMutationSet::from_anchors(&anchors.anchors).unwrap();
         let barrier = store
@@ -2965,12 +2971,12 @@ mod tests {
             .is_err());
         {
             let connection = store.connection().unwrap();
-            assert!(sandbox_owner::require_execution_in(&connection, &alias.id).is_err());
+            assert!(sandbox_owner::require_execution_in(&connection, &ids.session).is_err());
             assert!(
                 sandbox_owner::require_fresh_layout_in(&connection, &project, &layout).is_err()
             );
             let binding =
-                crate::agent_binding_in(&connection, &actor, &alias.id, &alias_branch.id).unwrap();
+                crate::agent_binding_in(&connection, &actor, &ids.session, &ids.branch).unwrap();
             assert!(sandbox_owner::preflight_initial_selection(
                 &connection,
                 &actor,
@@ -2978,7 +2984,7 @@ mod tests {
                 &binding.identity_handle,
                 &binding.project_handle,
                 &alias_layout,
-                Some(&alias_sandbox),
+                Some(&unused_alias.canonical_ref),
             )
             .is_err());
         }

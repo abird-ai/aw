@@ -666,8 +666,8 @@ pub(crate) fn recover_source_leases_in(
 
 /// Read and write admission use the same scopes. The caller holds the
 /// publication transaction; absent/released scopes need no extra lease row.
-pub(crate) fn require_unleased_sources_in(tx: &Transaction<'_>, scopes: &[String]) -> Result<()> {
-    let mut query = db(tx.prepare_cached(
+pub(crate) fn require_unleased_sources_in(c: &Connection, scopes: &[String]) -> Result<()> {
+    let mut query = db(c.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM local_coordination_leases
          WHERE scope_kind='execution' AND scope_key=?1 AND state IN ('active','hazard'))",
     ))?;

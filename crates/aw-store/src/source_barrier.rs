@@ -7,7 +7,7 @@ use crate::{
     Error, LocalCoordinationLease, Result, SessionStore, StoreMode,
 };
 use aw_agent_core::{validate_source_set_hard_limit, DriverKey, SourceAnchor, SourceBinding};
-use rusqlite::{Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 /// Canonical, deduplicated mutation scopes of a complete selected SourceSet.
@@ -95,12 +95,41 @@ impl SourceMutationSet {
         Ok(Self { count, scopes })
     }
 
+    /// First-source construction must fence the old ambient layout too.
+    /// These are coordination scopes, not additional named source slots.
+    pub(crate) fn with_layout(mut self, root: &str, cwd: &str) -> Self {
+        self.scopes.extend(layout_scopes(root, cwd));
+        self.scopes.sort_unstable();
+        self.scopes.dedup();
+        self
+    }
+
     pub(crate) fn require_unleased_in(&self, tx: &Transaction<'_>) -> Result<()> {
         if self.scopes.is_empty() {
             return Ok(());
         }
         coordination::require_unleased_sources_in(tx, &self.scopes)
     }
+}
+
+// Separate namespace from driver/source hashes; exact Store-known paths.
+// Physical aliases and ancestry still require an independent host fence.
+fn layout_scopes(root: &str, cwd: &str) -> Vec<String> {
+    let scope = |path: &str| {
+        format!(
+            "{SOURCE_MUTATION_SCOPE_PREFIX}layout:{:x}",
+            Sha256::digest(path.as_bytes())
+        )
+    };
+    let mut scopes = vec![scope(root)];
+    if cwd != root {
+        scopes.push(scope(cwd));
+    }
+    scopes
+}
+
+pub(crate) fn require_unleased_layout_in(c: &Connection, root: &str, cwd: &str) -> Result<()> {
+    coordination::require_unleased_sources_in(c, &layout_scopes(root, cwd))
 }
 
 /// Outcome of a *trusted* owner's source-operation settlement. Unknown is

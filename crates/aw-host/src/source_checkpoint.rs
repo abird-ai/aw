@@ -3017,20 +3017,175 @@ mod tests {
         // while the final physical materialization is still retained.
         let final_root = root.join("final-source-release");
         private_dir(&final_root);
-        let one = SourceSet {
-            coverage: aw_agent_core::SourceCoverage::Selected,
-            anchors: baseline.anchors[..1].to_vec(),
-        };
         let final_locations = || locations(&final_root).into_iter().take(1).collect();
-        let last = host
-            .create_sandbox_from_baseline(
+        let empty = store
+            .sandbox_create_fresh(&actor, &project, &layout(&final_root))
+            .unwrap();
+        let first_anchor = baseline.anchors[0].clone();
+        let first_request = "fixture:first-source";
+        // Foreign contents cannot become an implicitly managed layout.
+        fs::write(final_root.join("foreign"), b"keep").unwrap();
+        assert!(host
+            .attach_sandbox_source(
                 &actor,
-                &project,
-                "fixture:final-source-release",
-                || Ok((layout(&final_root), one)),
-                |_, _| Ok(fence(final_locations(), 4)),
+                &empty.canonical_ref,
+                empty.rev,
+                first_request,
+                first_anchor.clone(),
+                |_| Ok(fence(final_locations(), 4)),
+            )
+            .is_err());
+        assert!(!final_root.join("code").exists());
+        fs::remove_file(final_root.join("foreign")).unwrap();
+
+        // An untouched first-source claim reserves the empty layout
+        // independently of which backing identity another caller selects.
+        let approval = fence(final_locations(), 4);
+        let prepared = store
+            .sandbox_prepare_attachment(
+                &actor,
+                &empty.canonical_ref,
+                empty.rev,
+                "fixture:abandoned-first-source",
+                first_anchor.clone(),
+                |attachment, prepare_id| {
+                    assert!(attachment.bindings().is_empty());
+                    plan_attachment(&implementation, attachment, &approval, prepare_id)
+                },
             )
             .unwrap();
+        assert!(store
+            .sandbox_prepare_attachment(
+                &actor,
+                &empty.canonical_ref,
+                empty.rev,
+                "fixture:competing-first-source",
+                baseline.anchors[1].clone(),
+                |_, _| panic!("layout reservation must precede another backing's plan"),
+            )
+            .is_err());
+        assert!(store
+            .sandbox_close(&actor, &empty.canonical_ref, Some(empty.rev))
+            .is_err());
+        assert!(store
+            .sandbox_create_fresh(&actor, &project, &layout(&final_root))
+            .is_err());
+        assert!(store
+            .create(&actor, "reserved first source", layout(&final_root))
+            .is_err());
+        prepared.mark_unknown().unwrap();
+        drop(approval);
+        host.abandon_sandbox_attachment(
+            &actor,
+            &empty.canonical_ref,
+            "fixture:abandoned-first-source",
+            |_, _| Ok(fence(final_locations(), 4)),
+        )
+        .unwrap();
+        // The same claim's rejection releases the layout, without
+        // consuming an identity, source binding or Sandbox revision.
+        let alias = store
+            .sandbox_create_fresh(&actor, &project, &layout(&final_root))
+            .unwrap();
+        store
+            .sandbox_close(&actor, &alias.canonical_ref, Some(alias.rev))
+            .unwrap();
+        assert_eq!(
+            store.sandbox_get(&actor, &empty.canonical_ref).unwrap(),
+            empty
+        );
+
+        Connection::open(&database).unwrap().execute_batch(
+            "CREATE TRIGGER fixture_fail_first_attachment BEFORE UPDATE OF rev ON sandboxes_current
+             BEGIN SELECT RAISE(ABORT,'fixture first attachment publication failure'); END;",
+        ).unwrap();
+        assert!(host
+            .attach_sandbox_source(
+                &actor,
+                &empty.canonical_ref,
+                empty.rev,
+                first_request,
+                first_anchor.clone(),
+                |_| Ok(fence(final_locations(), 4)),
+            )
+            .is_err());
+        assert_eq!(fs::read(final_root.join("code/tracked")).unwrap(), b"code");
+        assert_eq!(
+            store.sandbox_get(&actor, &empty.canonical_ref).unwrap(),
+            empty
+        );
+        assert!(store
+            .sandbox_sources_set(
+                &actor,
+                &empty.canonical_ref,
+                &bindings[1].name,
+                Some(&bindings[1]),
+                empty.rev,
+            )
+            .is_err());
+        assert!(store
+            .create(&actor, "uncertain first source", layout(&final_root))
+            .is_err());
+        drop(store);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_first_attachment;")
+            .unwrap();
+        let missing = SessionStore::open(&state).unwrap();
+        assert!(missing
+            .sandbox_close(&actor, &empty.canonical_ref, Some(empty.rev))
+            .is_err());
+        assert!(missing
+            .create(
+                &actor,
+                "unresolved first source after restart",
+                layout(&final_root)
+            )
+            .is_err());
+        assert!(GitCheckpointRestoreHost::new(&missing, &driver)
+            .resume_sandbox_attachment::<Fence<'_>>(
+                &actor,
+                &empty.canonical_ref,
+                first_request,
+                |_, _| panic!("missing driver must not inspect first source"),
+            )
+            .is_err());
+        drop(missing);
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        let last = host
+            .resume_sandbox_attachment(&actor, &empty.canonical_ref, first_request, |_, _| {
+                Ok(fence(final_locations(), 4))
+            })
+            .unwrap();
+        assert_eq!(last.rev, empty.rev + 1);
+        assert_eq!(last.sources[0].binding_rev, last.rev);
+        assert_eq!(last.layout_digest, empty.layout_digest);
+        assert_eq!(
+            host.attach_sandbox_source::<Fence<'_>>(
+                &actor,
+                &empty.canonical_ref,
+                empty.rev,
+                first_request,
+                first_anchor.clone(),
+                |_| panic!("Applied first attachment must not authorize again"),
+            )
+            .unwrap(),
+            last
+        );
+        assert!(store
+            .create(&actor, "source-bearing ambient alias", layout(&final_root))
+            .is_err());
+        assert!(store
+            .sandbox_sources_set(
+                &actor,
+                &last.canonical_ref,
+                &bindings[1].name,
+                Some(&bindings[1]),
+                last.rev,
+            )
+            .is_err());
+        assert_eq!(count_sessions(), sessions_before);
         // Same common-repository replacement: one original restore
         // registration is replaced by another at the exact same path.
         let mut narrowed = baseline.anchors[0].clone();
@@ -3052,7 +3207,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last.sources[0].access, SourceAccess::ReadOnly);
-        assert_eq!(last.sources[0].binding_rev, 2);
+        assert_eq!(last.sources[0].binding_rev, 3);
         assert_eq!(fs::read(final_root.join("code/tracked")).unwrap(), b"code");
         fs::write(final_root.join("foreign"), b"keep").unwrap();
         assert!(host
@@ -3080,9 +3235,33 @@ mod tests {
         assert_eq!(empty.layout_digest, last.layout_digest);
         assert!(final_root.is_dir());
         assert_eq!(fs::read_dir(&final_root).unwrap().count(), 0);
-        store
-            .sandbox_close(&actor, &empty.canonical_ref, Some(empty.rev))
+        // First-source reattachment after final removal uses its own
+        // Prepared descriptor, with no initial construction receipt.
+        let again = host
+            .attach_sandbox_source(
+                &actor,
+                &empty.canonical_ref,
+                empty.rev,
+                "fixture:first-source-again",
+                first_anchor,
+                |_| Ok(fence(final_locations(), 4)),
+            )
             .unwrap();
+        assert_eq!(again.sources[0].binding_rev, again.rev);
+        assert_eq!(again.rev, empty.rev + 1);
+        store
+            .sandbox_close(&actor, &again.canonical_ref, Some(again.rev))
+            .unwrap();
+        let retired = host
+            .reconcile_closed_sandbox(&actor, &again.canonical_ref, |_, bindings, sources| {
+                assert_eq!(bindings.len(), 1);
+                assert_eq!(bindings[0].binding_rev, again.rev);
+                assert_eq!(sources.len(), 1);
+                Ok(fence(final_locations(), 4))
+            })
+            .unwrap();
+        assert!(retired.sources.is_empty());
+        assert_eq!(fs::read_dir(&final_root).unwrap().count(), 0);
         assert_eq!(count_sessions(), sessions_before);
 
         // A lost result before the first materialization may be abandoned

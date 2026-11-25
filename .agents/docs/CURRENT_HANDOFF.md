@@ -59,8 +59,8 @@ realization, durable native artifact custody/recovery and exact Store-backed Git
 native approval provisioning, shared finite Vault Process settlement, v60
 Project-scoped standalone versioned Sandbox construction, same-Project
 required-source Sandbox derivation, exact managed-source structural removal,
-versioned attachment and replacement with per-binding materialization provenance
-are implemented locally.
+versioned attachment (including first source into an empty layout) and replacement
+with per-binding materialization provenance are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2789,6 +2789,50 @@ Final Git 33/33, construction 1/1, Sandbox 4/4, Checkpoint 4/4, source barrier
 all-target/all-feature check and scoped fmt/diff passed. Earlier broad Store
 239/244 not rerun.
 
+First-source attachment into an empty Sandbox reuses the existing Project
+Prepared attachment receipt and original Restore descriptor. Empty old sets
+add exact tool-root/cwd layout scopes to the same durable source coordinator
+claim, independent of incoming backing identity and without consuming named
+source slots. Scope keys are separately namespaced hashes of the Store-known
+paths; physical aliases, ancestry, mounts and cross-Store writers still require
+the independent host fence. Nonempty old receipts retain their existing scope
+encoding. Empty layout observation requires unused open Sandbox, no retained
+Agent or Session at either exact path, no open alias/dependency or closed
+retained layout, current writer and legacy run/hazard quiescence. Shared
+layout admission checks reject reservations in normal Sandbox creation,
+structural metadata mutation, closure, ambient Agent binding and execution.
+Legacy ambient selection also refuses exact source-bearing layout aliases
+across Projects after successful first publication. Recheck the original
+layout/revision and complete claim through the same final transaction; no
+new reservation table, migration, operation kind or ledger. Recovery derives
+exact layout scopes from the immutable original empty layout and reclaims
+the original source hazard, never a new plan. Abandon settles that same
+reservation only after exact unpublished candidate reconciliation. Managed
+materialization provenance now permits absence of an initial restore/derive
+receipt, requiring exact attachment provenance for each later binding; rev-1
+legacy bindings without original receipt remain unsupported. Managed
+attachment history prevents metadata-only custody loss even after final
+release. Git reuses existing named-child layout and restore checks: private
+canonical root, cwd=root, no foreign entries and absent target on initial
+planning, independently authorized whole-layout physical fence mandatory.
+Existing grouped real Host lifecycle now covers pristine empty Sandbox,
+foreign entry refusal, competing first attachment from another backing,
+blocked closure/alias/legacy Agent creation, untouched abandonment, failed
+publication and restart/missing-driver recovery, exact replay, subsequent
+replacement/removal, reattachment and closed retirement without an initial
+construction receipt. The stronger open-layout alias gate intentionally
+changes old fixture assumptions: checkpoint regression now asserts early
+ambient rejection; Process/native fixtures publish their fixture-only source
+layout after ordinary source-free journal admission. Broad Store 231/244
+initially: the five unchanged legacy failures, one old alias expectation and
+seven ENOENT child spawns after a concurrent focused rebuild replaced the
+test binary. Corrected alias regression 1/1, stable-executable coordination
+24/24 resolve all eight new failures; combined coverage 239/244, not a
+single all-green run. Host 14/16 initial (two old fixture-order assumptions),
+corrected Process/native tests 2/2; grouped Git lifecycle passed. Strict
+Store/Host all-target/all-feature Clippy, workspace all-target/all-feature
+check and scoped fmt/diff passed.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
@@ -2796,8 +2840,8 @@ physical recovery proof acquisition through existing owners; do not open held ro
 production host policy/physical authority configuration, other effectful baseline materialization, broader Run-hazard
 reconciliation, general multi-source Process policy, unmarked/ambiguous scratch and non-exact partial
 checkout cleanup, remaining production physical authority/cleanup, effectful
-first-source attachment into an empty layout, partial replacement recovery and other
-structural removal cases, remaining Vault broker/socket/file/other env integrations, persistent provider
+partial replacement recovery, bound-Agent structural mutation and other
+removal cases, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v60.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart

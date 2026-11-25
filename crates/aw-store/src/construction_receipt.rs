@@ -1309,15 +1309,6 @@ pub(crate) fn source_claim_by_id_in(
 /// Exact original materialization provenance of a published Sandbox.
 /// Both Agent restore and standalone Project construction retain the
 /// original Prepared identity; sharing Agents cannot substitute it.
-pub(crate) fn restored_sources_for_sandbox_in(
-    connection: &Connection,
-    sandbox: &str,
-) -> Result<PreparedSourceSet> {
-    original_materializations_in(connection, sandbox)?.ok_or(Error::Denied(
-        "original Sandbox restore preparation unavailable",
-    ))
-}
-
 /// The original Applied materialization descriptors remain authoritative
 /// after individual sources are retired; never reconstruct from a path.
 pub(crate) fn original_materializations_in(

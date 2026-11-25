@@ -66,7 +66,6 @@ impl AttachmentBoundary {
                 .layout_digest
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || self.bindings.is_empty()
             || self.baseline.anchors.len() != 1
             || self.baseline.coverage != SourceCoverage::Selected
         {
@@ -170,12 +169,43 @@ impl AttachmentBoundary {
         Ok(())
     }
 
-    fn mutation_set(&self) -> Result<SourceMutationSet> {
-        SourceMutationSet::with_incoming_anchor(
-            self.bindings.iter().map(|b| &b.binding),
-            self.anchor(),
-        )
+    fn mutation_set(&self, snapshot: &SandboxSnapshot) -> Result<SourceMutationSet> {
+        mutation_set(snapshot, &self.bindings, self.anchor())
     }
+}
+
+// First-source receipts have an empty old set. Their exact immutable
+// layout/revision is already validated, so recover the same layout
+// scopes from that observation; older nonempty receipts remain unchanged.
+fn mutation_set(
+    snapshot: &SandboxSnapshot,
+    bindings: &[VersionedSourceBinding],
+    anchor: &SourceAnchor,
+) -> Result<SourceMutationSet> {
+    let set = SourceMutationSet::with_incoming_anchor(bindings.iter().map(|b| &b.binding), anchor)?;
+    if bindings.is_empty() {
+        let root = snapshot
+            .tool_root
+            .to_str()
+            .ok_or(Error::Storage("invalid Sandbox tool root"))?;
+        let cwd = snapshot
+            .working_directory
+            .to_str()
+            .ok_or(Error::Storage("invalid Sandbox working directory"))?;
+        Ok(set.with_layout(root, cwd))
+    } else {
+        Ok(set)
+    }
+}
+
+/// Managed attachment history remains an ownership fact after the last
+/// binding is released. No metadata-only mutation may discard custody.
+pub(super) fn has_attachment_in(c: &Connection, sandbox: &str) -> Result<bool> {
+    db(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commit_log WHERE entity_type='sandbox' AND entity_id=?1
+         AND kind='sandbox.sources.changed' AND json_type(payload_json,'$.materialization_prepare_id')='text')",
+        [sandbox], |row| row.get(0),
+    ))
 }
 
 fn attachment_event_id(sandbox: &str, name: &SourceName, rev: u64) -> Result<String> {
@@ -615,9 +645,10 @@ impl SessionStore {
         Ok(result)
     }
 
-    /// Initial realization: nonempty original managed layout and one
-    /// absent named source. Read-only plan under independent authority;
-    /// persist Prepared and complete old+incoming source claim together.
+    /// Initial realization: unused isolated empty or original managed
+    /// layout, one absent name. Read-only plan under independent authority;
+    /// persist Prepared and the complete source claim (plus exact layout
+    /// reservation for an empty Sandbox) together.
     pub fn sandbox_prepare_attachment(
         &self,
         actor: &PrincipalId,
@@ -690,11 +721,7 @@ impl SessionStore {
                 .source_drivers
                 .reader()?
                 .resolve(&anchor.pin()?)?;
-            SourceMutationSet::with_incoming_anchor(
-                layout.bindings.iter().map(|b| &b.binding),
-                &anchor,
-            )?
-            .require_unleased_in(&tx)?;
+            mutation_set(&layout.snapshot, &layout.bindings, &anchor)?.require_unleased_in(&tx)?;
             let scope = StoreScope::load(&tx)?;
             db(tx.commit())?;
             (
@@ -758,8 +785,9 @@ impl SessionStore {
             return Err(Error::Conflict("attachment changed during planning"));
         }
         receipt.candidate.require_absent_in(&tx)?;
-        let set = SourceMutationSet::with_incoming_anchor(
-            observation.bindings().iter().map(|b| &b.binding),
+        let set = mutation_set(
+            observation.snapshot(),
+            observation.bindings(),
             observation.anchor(),
         )?;
         let barrier = construction_receipt::claim_sources_in(self, &tx, actor, &receipt, &set)?;
@@ -805,7 +833,7 @@ impl SessionStore {
         registry.resolve(&sources.sources[0].prepared.descriptor.pin()?)?;
         let barrier = self.recover_source_mutation_barrier_in(
             &tx,
-            &boundary.mutation_set()?,
+            &boundary.mutation_set(&layout.snapshot)?,
             receipt.candidate.prepare_id(),
         )?;
         construction_receipt::require_unpublished_sources_in(&tx, actor, &receipt, &barrier)?;

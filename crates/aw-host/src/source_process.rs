@@ -626,14 +626,6 @@ mod tests {
             access: SourceAccess::ReadWrite,
             checkpoint_policy: CheckpointPolicy::Required,
         };
-        let sandbox = store
-            .sandbox_create_fresh_with_sources(
-                &actor,
-                &project,
-                &layout,
-                std::slice::from_ref(&binding),
-            )
-            .unwrap();
         // Exercise the original journal owner with an admitted source-free
         // Turn, then install the held source association only in this fixture.
         // No production path bypasses held Agent admission.
@@ -691,6 +683,16 @@ mod tests {
                 .unwrap();
         }
         let mut final_records = Vec::new();
+        // Publish the fixture-only source layout after ordinary journal
+        // admission; a known source-bearing alias now blocks that route.
+        let sandbox = store
+            .sandbox_create_fresh_with_sources(
+                &actor,
+                &project,
+                &layout,
+                std::slice::from_ref(&binding),
+            )
+            .unwrap();
         {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             connection.execute(
@@ -1566,9 +1568,6 @@ mod tests {
                 params![session.id,branch.id], |row| Ok((row.get(0)?,row.get(1)?)),
             ).unwrap()
         };
-        let sandbox = store
-            .sandbox_create_fresh_with_sources(&actor, &project, &layout, &bindings)
-            .unwrap();
         let identity = InvocationIdentity {
             actor: actor.clone(),
             account_id: "fixture".into(),
@@ -1692,7 +1691,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Fixture-only association after ordinary journal admission.
+        // Fixture-only source layout/association after ordinary journal
+        // admission; never use an ambient alias of an existing source layout.
+        let sandbox = store
+            .sandbox_create_fresh_with_sources(&actor, &project, &layout, &bindings)
+            .unwrap();
         {
             let c = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
             c.execute("UPDATE agent_state_current SET sandbox_id=?1,admission='held' WHERE session_id=?2 AND branch_id=?3",
