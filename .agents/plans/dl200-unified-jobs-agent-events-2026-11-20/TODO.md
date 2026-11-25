@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: independent source identity metadata disclosure (this checkpoint; parent `bcd18323c83f33a7d609d5d11273f1031bc64216`, Vault entry metadata). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
+Current implementation: exact offline standalone Git Sandbox derivation (this checkpoint; parent `8e0c950332afd210ffe9cfe7b5ee7c656f9737b7`, source identity metadata). See [CURRENT_HANDOFF](../../docs/CURRENT_HANDOFF.md) for the latest delta and validation. Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25-LATE.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25-LATE.md).
 
 ## Committed
 
@@ -1500,6 +1500,18 @@ Current implementation: independent source identity metadata disclosure (this ch
       Store Sandbox 4/4; strict affected Clippy, durable library/minimal
       checks, full CLI/startup dependency smoke and scoped fmt/diff passed.
       See CURRENT_HANDOFF for scope and remaining limitations.
+      **Standalone Git Sandbox derive consumer landed:** explicit offline
+      exact same-Project parent/request and independently approved current
+      parent rev, complete required Git set, private named-child destination.
+      Existing Prepared owner/claim/driver/held publication; exact original
+      parent rev/layout checked before recovery reclaim. Recover inspects,
+      abandon releases only original unpublished effects, terminal replay
+      requires no driver/config; ambiguous/modified candidates stay held.
+      No Agent, public checkpoint, grant, model tool, new schema or owner.
+      Only ordinary private parent checkouts, independent host exclusion.
+      Grouped offline lifecycle 1/1, Store Sandbox 4/4, Host lifecycle 1/1;
+      strict affected Clippy, durable library/minimal checks, full CLI
+      and required/mode-conflict smoke, scoped fmt/diff passed.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1514,7 +1526,8 @@ Current implementation: independent source identity metadata disclosure (this ch
       independent source identity metadata and explicit local signing broker,
       offline Git capture/restore/exact
       recovery/abandonment and narrow offline checkpoint/closed Sandbox
-      retention reconciliation are landed; do not repeat.
+      retention reconciliation and standalone Git derivation/recovery/abandonment
+      are landed; do not repeat.
       Remaining Vault production Process dispatch, socket/file/env projection integration, broader provider-specific protected metadata/Views, general physical retention authority/Project retention-admin authorization,
       task-bearing/cross-Project restore, captured-source capture/restore RPC,
       ambiguous/non-exact or changed-binding cleanup and remaining Sandbox/Vault host RPCs held.

@@ -632,6 +632,42 @@ impl SessionStore {
         request_id: &str,
         plan: impl FnOnce(&str, &str, SandboxCreateSources<'_>) -> Result<PreparedSourceSet>,
     ) -> Result<PreparedSandboxCreate<'_>> {
+        self.sandbox_prepare_create_in(actor, project_ref, binding, from, request_id, None, plan)
+    }
+
+    /// Host-selected exact parent revision, checked by the original owner
+    /// before planning. The normal constructor still owns all publication.
+    pub fn sandbox_prepare_derive_exact(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        parent_rev: u64,
+        binding: &SessionBinding,
+        request_id: &str,
+        plan: impl FnOnce(&str, &str, SandboxCreateSources<'_>) -> Result<PreparedSourceSet>,
+    ) -> Result<PreparedSandboxCreate<'_>> {
+        self.sandbox_prepare_create_in(
+            actor,
+            project_ref,
+            binding,
+            SandboxCreateFrom::Parent(parent),
+            request_id,
+            Some(parent_rev),
+            plan,
+        )
+    }
+
+    fn sandbox_prepare_create_in(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        binding: &SessionBinding,
+        from: SandboxCreateFrom<'_>,
+        request_id: &str,
+        expected_parent_rev: Option<u64>,
+        plan: impl FnOnce(&str, &str, SandboxCreateSources<'_>) -> Result<PreparedSourceSet>,
+    ) -> Result<PreparedSandboxCreate<'_>> {
         owner(self)?;
         let parent_ref = match &from {
             SandboxCreateFrom::Parent(parent) => Some(*parent),
@@ -670,6 +706,11 @@ impl SessionStore {
                     )?),
                 ),
             };
+            if expected_parent_rev
+                .is_some_and(|rev| parent.as_ref().is_none_or(|parent| parent.rev != rev))
+            {
+                return Err(Error::Conflict("approved Sandbox parent revision changed"));
+            }
             let boundary = SandboxCreateBoundary {
                 project_ref: project_ref.to_owned(),
                 writer_epoch,
@@ -739,6 +780,28 @@ impl SessionStore {
         })
     }
 
+    /// The original Rejected source claim is a terminal cleanup replay,
+    /// without selecting a provider or a replacement layout.
+    pub fn sandbox_replay_abandoned_create(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        from: Option<&str>,
+        request_id: &str,
+    ) -> Result<bool> {
+        owner(self)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        let (_, receipt) = prior(&tx, actor, project_ref, from, request_id)?;
+        let receipt = receipt.ok_or(Error::Denied("original Sandbox construction unavailable"))?;
+        let reconciled = construction_receipt::is_reconciled_in(&tx, &receipt)?;
+        if !reconciled && !receipt.state.unresolved() {
+            return Err(Error::Conflict("published Sandbox cannot be abandoned"));
+        }
+        db(tx.commit())?;
+        Ok(reconciled)
+    }
+
     fn resume_sandbox_create(
         &self,
         actor: &PrincipalId,
@@ -746,22 +809,35 @@ impl SessionStore {
         from: Option<&str>,
         request_id: &str,
         abandon: bool,
+        exact_derive: Option<(u64, &SessionBinding)>,
     ) -> Result<Option<PreparedSandboxCreate<'_>>> {
         owner(self)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let (_, receipt) = prior(&tx, actor, project_ref, from, request_id)?;
         let receipt = receipt.ok_or(Error::Denied("original Sandbox construction unavailable"))?;
-        if abandon && receipt.state == PreparationState::Rejected {
+        let boundary = receipt
+            .sandbox_boundary
+            .as_ref()
+            .ok_or(Error::Storage("Sandbox recovery boundary missing"))?;
+        if let Some((parent_rev, binding)) = exact_derive {
+            if boundary
+                .parent
+                .as_ref()
+                .is_none_or(|parent| parent.rev != parent_rev)
+                || layout(binding)?.digest != boundary.layout_digest
+            {
+                return Err(Error::Denied(
+                    "derive approval differs from original parent revision or layout",
+                ));
+            }
+        }
+        if abandon && construction_receipt::is_reconciled_in(&tx, &receipt)? {
             return Ok(None);
         }
         if !receipt.state.unresolved() {
             return Err(Error::Conflict("Sandbox construction is already terminal"));
         }
-        let boundary = receipt
-            .sandbox_boundary
-            .as_ref()
-            .ok_or(Error::Storage("Sandbox recovery boundary missing"))?;
         boundary.authorize(&tx, actor, true)?;
         receipt.candidate.require_absent_in(&tx)?;
         compatible(
@@ -797,11 +873,69 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
     ) -> Result<InspectedSandboxCreate<'_>> {
-        self.resume_sandbox_create(actor, project_ref, from, request_id, false)?
+        self.resume_sandbox_create(actor, project_ref, from, request_id, false, None)?
             .ok_or(Error::Conflict(
                 "Sandbox construction has no unresolved candidate",
             ))?
             .inspect(inspect)
+    }
+
+    /// Reclaim only the original exact parent and destination, before
+    /// invoking the inspector or touching any physical candidate.
+    pub fn sandbox_inspect_derive_exact(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        parent_rev: u64,
+        binding: &SessionBinding,
+        request_id: &str,
+        inspect: impl FnOnce(
+            &SourceDriverRegistryReader,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
+    ) -> Result<InspectedSandboxCreate<'_>> {
+        self.resume_sandbox_create(
+            actor,
+            project_ref,
+            Some(parent),
+            request_id,
+            false,
+            Some((parent_rev, binding)),
+        )?
+        .ok_or(Error::Conflict(
+            "Sandbox construction has no unresolved candidate",
+        ))?
+        .inspect(inspect)
+    }
+
+    /// Exact abandonment uses the same original claim and never publishes.
+    pub fn sandbox_abandon_derive_exact<F>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        parent_rev: u64,
+        binding: &SessionBinding,
+        request_id: &str,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<()> {
+        match self.resume_sandbox_create(
+            actor,
+            project_ref,
+            Some(parent),
+            request_id,
+            true,
+            Some((parent_rev, binding)),
+        )? {
+            Some(prepared) => prepared.abandon(reconcile),
+            None => Ok(()),
+        }
     }
 
     pub fn sandbox_abandon_create<F>(
@@ -816,7 +950,7 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<F>,
     ) -> Result<()> {
-        match self.resume_sandbox_create(actor, project_ref, from, request_id, true)? {
+        match self.resume_sandbox_create(actor, project_ref, from, request_id, true, None)? {
             Some(prepared) => prepared.abandon(reconcile),
             None => Ok(()),
         }

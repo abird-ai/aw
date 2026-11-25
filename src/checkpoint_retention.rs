@@ -1017,7 +1017,8 @@ mod tests {
             .is_err());
         fs::write(&edited, b"dirty checkpoint").unwrap();
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         let released = reconcile_sandbox(&store).unwrap();
         assert_eq!(released.lifecycle, aw_store::SandboxLifecycle::Closed);
         assert_eq!(released.rev, closed.rev + 1);
@@ -1049,6 +1050,216 @@ mod tests {
             ]
         )
         .is_empty());
+        // Standalone derivation uses the same original construction owner,
+        // with no history/checkpoint or Agent manufactured. Qualify the
+        // actual offline consumer, including exact interruption cleanup.
+        let parent = store.sandbox_get(&actor, &sandbox.canonical_ref).unwrap();
+        let derive_path = approvals.join("derive.json");
+        let child_root = root.join("derived-child");
+        let pending_root = root.join("derive-pending");
+        let discard_root = root.join("derive-discard");
+        for target in [&child_root, &pending_root, &discard_root] {
+            aw_platform::ensure_private_dir(target).unwrap();
+        }
+        let derive_config = |store: &SessionStore, target: &Path| {
+            json!({"version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+                "store_generation":store.local_process_info().unwrap().store_generation,
+                "manager":actor,"parent":parent.canonical_ref,"parent_rev":parent.rev,
+                "binding":layout(target),
+                "destination_identity":DirectoryIdentity::open(target).unwrap().identity().unwrap(),
+                "repositories":[location]})
+        };
+        let mut derive_file = aw_platform::open_private_new(&derive_path).unwrap();
+        let config = derive_config(&store, &child_root);
+        let mut stale = config.clone();
+        stale["parent_rev"] = json!(parent.rev + 1);
+        derive_file
+            .write_all(&serde_json::to_vec(&stale).unwrap())
+            .unwrap();
+        drop(derive_file);
+        let derive = |store: &SessionStore, path: &Path, id: &str, recover: bool| {
+            crate::sandbox_derive::derive(store, &actor, path, &parent.canonical_ref, id, recover)
+        };
+        let abandon_derive = |store: &SessionStore, path: &Path, id: &str| {
+            crate::sandbox_derive::abandon(store, &actor, path, &parent.canonical_ref, id)
+        };
+        let agents_before = store.agent_list(&actor, project, None, 64).unwrap();
+        let checkpoints_before = store
+            .checkpoint_list_metadata(&actor, agent_ref, None, 64)
+            .unwrap();
+        assert!(derive(&store, &derive_path, "fixture:derive", false).is_err());
+        assert!(store
+            .sandbox_prepare_derive_exact(
+                &actor,
+                project,
+                &parent.canonical_ref,
+                parent.rev + 1,
+                &layout(&child_root),
+                "fixture:derive",
+                |_, _, _| panic!("stale parent reached planner")
+            )
+            .is_err());
+        fs::write(&derive_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let lease = lock_private_approval(&derive_path).unwrap();
+        assert!(derive(&store, &derive_path, "fixture:derive", false).is_err());
+        drop(lease);
+        let foreign = child_root.join("foreign");
+        fs::write(&foreign, b"keep").unwrap();
+        assert!(derive(&store, &derive_path, "fixture:derive", false).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+        fs::remove_file(foreign).unwrap();
+        let child = derive(&store, &derive_path, "fixture:derive", false).unwrap();
+        assert_eq!(
+            child.parent_sandbox_ref.as_deref(),
+            Some(parent.canonical_ref.as_str())
+        );
+        assert_eq!(child.sources.len(), 1);
+        assert_eq!(
+            fs::read(child_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert_eq!(
+            derive(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:derive",
+                false
+            )
+            .unwrap(),
+            child
+        );
+        assert!(abandon_derive(&store, &derive_path, "fixture:derive").is_err());
+
+        let interrupt_derive = |store: &SessionStore, target: &Path, id: &str| {
+            let prepared = store
+                .sandbox_prepare_derive_exact(
+                    &actor,
+                    project,
+                    &parent.canonical_ref,
+                    parent.rev,
+                    &layout(target),
+                    id,
+                    |prepare_id, _, input| {
+                        let aw_store::SandboxCreateSources::Parent(bindings) = input else {
+                            panic!("expected exact parent")
+                        };
+                        Ok(PreparedSourceSet {
+                            prepare_id: prepare_id.into(),
+                            operation: SourceOperationKind::Derive,
+                            sources: vec![NamedPreparedSource {
+                                name: location.name.clone(),
+                                prepared: driver.plan_derive_approved(
+                                    &GitRestoreLocation {
+                                        name: location.name.clone(),
+                                        repository: location.repository.clone(),
+                                        repository_identity: location.repository_identity,
+                                        target: target.join("code"),
+                                        parent_identity: DirectoryIdentity::open(target)?
+                                            .identity()?,
+                                    },
+                                    &bindings[0].binding,
+                                    prepare_id,
+                                )?,
+                            }],
+                        })
+                    },
+                )
+                .unwrap();
+            let candidate = prepared.sandbox_ref().to_owned();
+            prepared.revalidate(&layout(target)).unwrap();
+            driver
+                .execute_derive(&prepared.sources().sources[0].prepared)
+                .unwrap();
+            prepared.mark_unknown().unwrap();
+            candidate
+        };
+        let pending_ref = interrupt_derive(&store, &pending_root, "fixture:derive-pending");
+        assert!(store
+            .sandbox_inspect_derive_exact(
+                &actor,
+                project,
+                &parent.canonical_ref,
+                parent.rev,
+                &layout(&discard_root),
+                "fixture:derive-pending",
+                |_, _, _| panic!("wrong recovery layout reached inspector")
+            )
+            .is_err());
+        assert!(store
+            .sandbox_inspect_derive_exact(
+                &actor,
+                project,
+                &parent.canonical_ref,
+                parent.rev + 1,
+                &layout(&pending_root),
+                "fixture:derive-pending",
+                |_, _, _| panic!("wrong original parent revision reached inspector")
+            )
+            .is_err());
+        fs::write(
+            &derive_path,
+            serde_json::to_vec(&derive_config(&store, &discard_root)).unwrap(),
+        )
+        .unwrap();
+        assert!(derive(&store, &derive_path, "fixture:derive-pending", true).is_err());
+        fs::write(
+            &derive_path,
+            serde_json::to_vec(&derive_config(&store, &pending_root)).unwrap(),
+        )
+        .unwrap();
+        assert!(derive(&store, &derive_path, "fixture:derive-pending", false).is_err());
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        let derived = derive(&store, &derive_path, "fixture:derive-pending", true).unwrap();
+        assert_eq!(derived.canonical_ref, pending_ref);
+        assert_eq!(
+            fs::read(pending_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+
+        let discarded = interrupt_derive(&store, &discard_root, "fixture:derive-discard");
+        fs::write(
+            &derive_path,
+            serde_json::to_vec(&derive_config(&store, &discard_root)).unwrap(),
+        )
+        .unwrap();
+        let changed = discard_root.join("code/tracked");
+        fs::write(&changed, b"independent edit").unwrap();
+        assert!(abandon_derive(&store, &derive_path, "fixture:derive-discard").is_err());
+        assert_eq!(fs::read(&changed).unwrap(), b"independent edit");
+        assert!(store
+            .acquire_source_mutation_barrier(&mutations, "fixture:derive-unknown")
+            .is_err());
+        fs::write(&changed, b"dirty checkpoint").unwrap();
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        abandon_derive(&store, &derive_path, "fixture:derive-discard").unwrap();
+        assert!(store.sandbox_get(&actor, &discarded).is_err());
+        assert_eq!(fs::read_dir(&discard_root).unwrap().count(), 0);
+        assert!(derive(&store, &derive_path, "fixture:derive-discard", false).is_err());
+        assert_eq!(
+            store.sandbox_get(&actor, &parent.canonical_ref).unwrap(),
+            parent
+        );
+        assert_eq!(
+            store.agent_list(&actor, project, None, 64).unwrap(),
+            agents_before
+        );
+        assert_eq!(
+            store
+                .checkpoint_list_metadata(&actor, agent_ref, None, 64)
+                .unwrap(),
+            checkpoints_before
+        );
+        assert_eq!(
+            fs::read(child_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert_eq!(
+            fs::read(pending_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
         assert_eq!(git(&executable, &repo, &["rev-parse", "HEAD"]), head);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"dirty checkpoint");
@@ -1057,6 +1268,34 @@ mod tests {
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         fs::rename(&destination, root.join("released-layout")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(
+            derive(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:derive",
+                false
+            )
+            .unwrap()
+            .canonical_ref,
+            child.canonical_ref
+        );
+        assert_eq!(
+            derive(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:derive-pending",
+                true
+            )
+            .unwrap()
+            .canonical_ref,
+            derived.canonical_ref
+        );
+        abandon_derive(
+            &store,
+            &root.join("absent-approval"),
+            "fixture:derive-discard",
+        )
+        .unwrap();
         // Metadata of the still-live exact immutable anchor remains readable
         // without the driver or physical checkout, unlike a source effect.
         assert_eq!(

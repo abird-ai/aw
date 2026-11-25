@@ -19,7 +19,95 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: independent source identity metadata disclosure
+## Latest local implementation delta — 2026-11-26: exact offline standalone Git Sandbox derivation
+
+Parent: `8e0c950332afd210ffe9cfe7b5ee7c656f9737b7` (source identity
+metadata), signature verified. Original Agent/Turn journal and resource
+CLI owners remain occupied. Independent standalone Sandbox constructor
+consumer, L5 only; no source-bearing runtime activation.
+
+- New workspace-feature offline `aw sandbox-derive --state-dir <existing
+  private Store> <approval.json> <canonical-parent-Sandbox> <request-id>`.
+  `--agent-recover` inspects/publishes the original candidate;
+  `--agent-abandon` reconciles only unpublished effects. Modes are
+  mutually exclusive. Parent supplies exact canonical Project; no redirect.
+  Stable invocation namespace `cli:sandbox-derive:<request-id>` uses
+  original SandboxCreate fingerprint (Project/from/request), no second
+  constructor, ledger, receipt or candidate. Layout and parent revision
+  are independently selected host inputs, not client request parameters.
+  Applied replay before approval/driver selection returns the original
+  current redacted Sandbox snapshot. Rejected cleanup replay verifies
+  original source claim and candidate absence, without config/driver.
+  Fresh retry of unresolved/Rejected, and abandonment of Applied, refused.
+- Private v1 JSON: `{version,store_directory,store_id,store_generation,
+  manager,parent,parent_rev,binding,destination_identity,repositories}`.
+  Manager is authenticated local OS principal; original Project writer,
+  exclusive Store owner and exact Store scope required. `binding` is
+  existing SessionBinding (only cwd/tool_root are Sandbox layout facts),
+  cwd=tool_root; destination identity is [volume,object]. Each repository
+  is existing GitSourceLocation {name,repository,repository_identity}.
+  Exact current open parent revision pins complete observed required
+  bindings, sorted exact names and actual registered Git implementation.
+  First CLI cut admits only ordinary private origin checkouts at parent
+  root (one source) or named children, and fresh existing private
+  destination parent with named child targets. Parent cwd=tool_root;
+  layouts and approval/Store directories disjoint. Reuse bounded private
+  approval lease, ordinary checkout and named-layout pins; reject
+  unrelated files and mismatched origins/identity. Host must independently
+  exclude all other users/writers, mounts, aliases, Git backing/retention
+  users, Store and approval access through operation and interruption.
+  Advisory leases/observations do not establish physical containment.
+  Linked parent worktrees and other layouts remain outside this CLI cut.
+- Original Store `sandbox_prepare_derive_exact` checks approved parent
+  revision in the initial transaction before the planner; original
+  immutable parent observation and layout/writer fences are rechecked
+  before Prepared and publication. Exact inspection/abandonment check
+  original stored parent revision and Sandbox layout digest before
+  reclaiming the original all-source claim. The same original
+  SandboxCreateBoundary, candidate, descriptors, source mutation barrier,
+  inspection, held publication and cleanup owners remain. Host shares
+  the existing derive/capture+restore implementation; recovery holds
+  independent approval through failed inspection/Unknown as well as
+  success. No reexecution in recovery, no public checkpoint, Agent,
+  queue or grant creation. Derived child uses original private retention
+  and materialization ownership. Parent content/HEAD/index unchanged.
+  Ambiguous/modified worktree or uncertain scratch remains held.
+- No new schema, driver recovery format, Sandbox namespace, metadata
+  disclosure, RPC method, model tool or execution authority. Existing
+  generic trusted SDK construction and cleanup methods remain available
+  through the same owner. Exact terminal cleanup additionally checks
+  the original reconciled claim rather than trusting a Rejected enum.
+
+Validation (L5, Rust 1.95.0): production all-feature binary type-check;
+grouped real offline Git/SQLite lifecycle 1/1 (46.99s), Store Sandbox
+owner 4/4, Host source-checkpoint lifecycle 1/1 (164.74s). Existing
+grouped fixture proves stale parent rejection before planning, held
+approval lease/foreign destination refusal, real isolated dirty child,
+Applied replay, exact wrong parent revision/layout recovery refusal
+before inspection, original completed child publication after restart,
+modified unpublished checkout preserved with hazard, exact repair and
+restart cleanup, terminal rejection/no retry, published children intact,
+unchanged parent/Agent/checkpoint lists and source HEAD/index/worktree,
+terminal replay without config/driver/repo. Existing Host multi-source
+and partial cleanup regression passed. Strict all-feature/all-target
+Store/Host/CLI Clippy, durable library/minimal all-target checks, full
+binary build, actual help/required args and mutually exclusive mode
+smoke, scoped fmt/diff passed. Prior durable-only non-workspace binary
+blocker, feature-specific warnings and broad CLI inventory discrepancy
+remain; unchanged Process suites and pinned Nix/native-platform
+qualification not rerun. Only isolated fixture effects; no real user
+Sandbox creation/cleanup or publication.
+
+Next: exact live source-aware Actor/Turn admission if the original journal
+owners are free. Otherwise independent standalone versioned baseline
+construction or original unused-Sandbox source attachment/replacement
+under exact approval and Prepared custody; never bypass bound-Agent
+quiescence or original effects. Do not repeat standalone derivation,
+offline checkpoint/retention or metadata wiring. Broader linked-layout,
+ephemeral/mixed baselines, original Sandbox host RPCs and source-bearing
+runtime/Process containment remain held.
+
+## Previous local implementation delta — 2026-11-25: independent source identity metadata disclosure
 
 Parent: `bcd18323c83f33a7d609d5d11273f1031bc64216` (Vault entry metadata),
 signature verified. Original Agent/Turn journal and resource CLI owners

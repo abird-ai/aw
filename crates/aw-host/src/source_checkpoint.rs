@@ -878,6 +878,7 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             project_ref,
             None,
             request_id,
+            None,
             || {
                 let (layout, baseline) = select()?;
                 Ok((layout, SandboxCreateFrom::Baseline(baseline)))
@@ -904,11 +905,57 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         select_layout: impl FnOnce() -> Result<SessionBinding>,
         authorize: impl FnOnce(&SessionBinding, &[VersionedSourceBinding]) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
+        self.derive_sandbox_in(
+            actor,
+            project_ref,
+            parent,
+            request_id,
+            None,
+            select_layout,
+            authorize,
+        )
+    }
+
+    /// Independently approved exact current parent revision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_sandbox_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        request_id: &str,
+        parent_rev: u64,
+        select_layout: impl FnOnce() -> Result<SessionBinding>,
+        authorize: impl FnOnce(&SessionBinding, &[VersionedSourceBinding]) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        self.derive_sandbox_in(
+            actor,
+            project_ref,
+            parent,
+            request_id,
+            Some(parent_rev),
+            select_layout,
+            authorize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn derive_sandbox_in<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        request_id: &str,
+        parent_rev: Option<u64>,
+        select_layout: impl FnOnce() -> Result<SessionBinding>,
+        authorize: impl FnOnce(&SessionBinding, &[VersionedSourceBinding]) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
         self.create_sandbox_selected(
             actor,
             project_ref,
             Some(parent),
             request_id,
+            parent_rev,
             || Ok((select_layout()?, SandboxCreateFrom::Parent(parent))),
             |layout, input| {
                 let SandboxCreateSources::Parent(bindings) = input else {
@@ -919,12 +966,14 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_sandbox_selected<'b, F: GitRestoreFence>(
         &self,
         actor: &PrincipalId,
         project_ref: &str,
         from: Option<&str>,
         request_id: &str,
+        parent_rev: Option<u64>,
         select: impl FnOnce() -> Result<(SessionBinding, SandboxCreateFrom<'b>)>,
         authorize: impl FnOnce(&SessionBinding, SandboxCreateSources<'_>) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
@@ -937,20 +986,32 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         let (layout, selection) = select()?;
         let driver = self.store.source_driver(self.driver)?;
         let mut fence = None;
-        let prepared = self.store.sandbox_prepare_create(
-            actor,
-            project_ref,
-            &layout,
-            selection,
-            request_id,
-            |prepare_id, _, input| {
-                let approval = authorize(&layout, input)?;
-                require_derive_layout(&layout, input, &approval)?;
-                let sources = plan(&driver, input, &approval, prepare_id)?;
-                fence = Some(approval);
-                Ok(sources)
-            },
-        )?;
+        let prepare = |prepare_id: &str, _: &str, input: SandboxCreateSources<'_>| {
+            let approval = authorize(&layout, input)?;
+            require_derive_layout(&layout, input, &approval)?;
+            let sources = plan(&driver, input, &approval, prepare_id)?;
+            fence = Some(approval);
+            Ok(sources)
+        };
+        let prepared = match parent_rev {
+            Some(rev) => self.store.sandbox_prepare_derive_exact(
+                actor,
+                project_ref,
+                from.ok_or(Error::Denied("exact derivation requires parent"))?,
+                rev,
+                &layout,
+                request_id,
+                prepare,
+            ),
+            None => self.store.sandbox_prepare_create(
+                actor,
+                project_ref,
+                &layout,
+                selection,
+                request_id,
+                prepare,
+            ),
+        }?;
         let fence = fence.expect("successful Sandbox preparation called planner");
         let executed = (|| {
             prepared.revalidate(&layout)?;
@@ -980,21 +1041,83 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             &PreparedSourceSet,
         ) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
-        let mut fence = None;
-        let inspected = self.store.sandbox_inspect_create(
+        self.resume_sandbox_create_in(
             actor,
             project_ref,
             from,
             request_id,
-            |registry, input, sources| {
-                let approval = authorize(layout, input, sources)?;
-                require_derive_layout(layout, input, &approval)?;
-                let driver = registry.get(self.driver)?;
-                let result = inspect(&driver, input, sources, &approval)?;
-                fence = Some(approval);
-                Ok(result)
-            },
-        )?;
+            layout,
+            None,
+            authorize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_sandbox_derive_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        request_id: &str,
+        layout: &SessionBinding,
+        parent_rev: u64,
+        authorize: impl FnOnce(
+            &SessionBinding,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        self.resume_sandbox_create_in(
+            actor,
+            project_ref,
+            Some(parent),
+            request_id,
+            layout,
+            Some(parent_rev),
+            authorize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_sandbox_create_in<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        from: Option<&str>,
+        request_id: &str,
+        layout: &SessionBinding,
+        parent_rev: Option<u64>,
+        authorize: impl FnOnce(
+            &SessionBinding,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        let mut fence = None;
+        let inspector = |registry: &aw_agent_core::SourceDriverRegistryReader,
+                         input: SandboxCreateSources<'_>,
+                         sources: &PreparedSourceSet| {
+            fence = Some(authorize(layout, input, sources)?);
+            let approval = fence.as_ref().expect("approved");
+            require_derive_layout(layout, input, approval)?;
+            let driver = registry.get(self.driver)?;
+            inspect(&driver, input, sources, approval)
+        };
+        let inspected = match parent_rev {
+            Some(rev) => self.store.sandbox_inspect_derive_exact(
+                actor,
+                project_ref,
+                from.ok_or(Error::Denied("exact derivation requires parent"))?,
+                rev,
+                layout,
+                request_id,
+                inspector,
+            ),
+            None => {
+                self.store
+                    .sandbox_inspect_create(actor, project_ref, from, request_id, inspector)
+            }
+        }?;
         self.publish_sandbox(
             inspected,
             layout,
@@ -1032,6 +1155,35 @@ impl<'a> GitCheckpointRestoreHost<'a> {
                 fence = Some(authorize(input, sources)?);
                 let driver = registry.get(self.driver)?;
                 release_materializations(&driver, input, sources, fence.as_ref().expect("approved"))
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn abandon_sandbox_derive_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        parent: &str,
+        request_id: &str,
+        layout: &SessionBinding,
+        parent_rev: u64,
+        authorize: impl FnOnce(SandboxCreateSources<'_>, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        let mut fence = None;
+        self.store.sandbox_abandon_derive_exact(
+            actor,
+            project_ref,
+            parent,
+            parent_rev,
+            layout,
+            request_id,
+            |registry, input, sources| {
+                fence = Some(authorize(input, sources)?);
+                let approval = fence.as_ref().expect("approved");
+                require_derive_layout(layout, input, approval)?;
+                let driver = registry.get(self.driver)?;
+                release_materializations(&driver, input, sources, approval)
             },
         )
     }
