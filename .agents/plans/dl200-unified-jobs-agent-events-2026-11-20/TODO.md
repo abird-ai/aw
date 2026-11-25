@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: configured Git native source authority (this local checkpoint; signed parent `3d2fd314cbaf8cccb6bdd0c69ab7d39cd6c9b559`, source-aware single-link native capabilities). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: protected source metadata and checkpoint reads (this local checkpoint; signed parent `44d92bc0cfe0eff269942e49c8b9832dbb76aa62`, configured Git native source authority). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1320,6 +1320,17 @@ Current implementation: configured Git native source authority (this local check
       native 1/1, strict Host Clippy, full and durable-only checks and scoped
       fmt/diff passed (L5 Rust 1.95.0; pinned Nix/native cross-platform gates
       not rerun; existing durable dead-code warning). No schema change.
+      **Protected source metadata and checkpoint reads landed:** existing
+      Sandbox read port projects actual redacted bindings and supports
+      `sandbox_sources_list`; optional checkpoint read port uses the same
+      authenticated current-Project state owner and original Store view,
+      immutable history, source summaries and cursor. Raw paths, source/
+      anchor/provider identities withheld; no driver effects or mutations,
+      independent protected disclosure remains held. Bounded response and
+      capability negotiation. Real Store-backed port 1/1, headless protocol
+      8/8, full/minimal checks, strict full-product Clippy, scoped fmt/diff
+      passed (L5 Rust 1.95.0; pinned Nix/platform gates not rerun). No schema
+      or source-bearing admission change.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

@@ -79,6 +79,12 @@ pub trait SandboxPort: Send + Sync {
     fn apply(&self, method: &str, params: Value) -> Result<Value>;
 }
 
+/// Authenticated checkpoint metadata only. No source disclosure authority,
+/// constructor, restore or driver execution belongs to this read port.
+pub trait CheckpointReadPort: Send + Sync {
+    fn apply(&self, method: &str, params: Value) -> Result<Value>;
+}
+
 pub trait Driver {
     /// Must execute using aw's existing, exactly selected Agent/journal.
     fn prompt(
@@ -146,6 +152,9 @@ pub trait Driver {
         None
     }
     fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
+        None
+    }
+    fn checkpoint_read_port(&self) -> Option<Arc<dyn CheckpointReadPort>> {
         None
     }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
@@ -376,6 +385,9 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "agent_inputs_send" => Some(&["ref", "ids", "rev"]),
         "sandbox_list" => Some(&["project", "limit", "cursor"]),
         "sandbox_get" => Some(&["ref", "include"]),
+        "sandbox_sources_list" => Some(&["ref"]),
+        "checkpoint_list" => Some(&["ref", "limit", "cursor"]),
+        "checkpoint_get" => Some(&["id", "include"]),
         "sandbox_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
@@ -488,6 +500,7 @@ struct ReaderPorts {
     agent_state: Option<Arc<dyn AgentStatePort>>,
     agent_inputs: Option<Arc<dyn AgentInputsPort>>,
     sandbox: Option<Arc<dyn SandboxPort>>,
+    checkpoint_read: Option<Arc<dyn CheckpointReadPort>>,
 }
 
 fn stdin_reader<R: Read + Send + 'static>(
@@ -642,9 +655,21 @@ fn stdin_reader<R: Read + Send + 'static>(
                 }
             } else if matches!(
                 request.method.as_str(),
-                "sandbox_list" | "sandbox_get" | "sandbox_close"
+                "sandbox_list" | "sandbox_get" | "sandbox_sources_list" | "sandbox_close"
             ) {
                 if let Some(port) = &ports.sandbox {
+                    let outcome = (|| -> Result<Value> {
+                        validate_method_params(&request.method, &request.params)?;
+                        port.apply(&request.method, request.params.clone())
+                    })();
+                    parsed =
+                        Inbound::LiveResult(request.clone(), outcome.map_err(|e| error_code(&e)));
+                }
+            } else if matches!(
+                request.method.as_str(),
+                "checkpoint_list" | "checkpoint_get"
+            ) {
+                if let Some(port) = &ports.checkpoint_read {
                     let outcome = (|| -> Result<Value> {
                         validate_method_params(&request.method, &request.params)?;
                         port.apply(&request.method, request.params.clone())
@@ -667,9 +692,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
 ) -> Result<()> {
     let mut out = Emitter::new(writer).diagnostics(diagnostics);
     let initial = driver.state();
-    out.emit("hello",None,json!({
-        "protocol":"aw.rpc","version":VERSION,"transport":"stdio",
-        "capabilities":{
+    let mut capabilities = json!({
             "prompt":true,"abort":true,"get_state":true,
             "get_messages":true,"available_models":true,
             "prompt_template":driver.can_template(),"compact":driver.can_compact(),
@@ -699,7 +722,21 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "sandbox_get":driver.sandbox_port().is_some(),
             "sandbox_create":false,
             "sandbox_close":driver.sandbox_port().is_some(),
-        },
+    });
+    capabilities["sandbox_sources_list"] = json!(driver.sandbox_port().is_some());
+    let checkpoint_read = driver.checkpoint_read_port().is_some();
+    capabilities["checkpoint_list"] = json!(checkpoint_read);
+    capabilities["checkpoint_get"] = json!(checkpoint_read);
+    for method in [
+        "checkpoint_create",
+        "checkpoint_restore",
+        "checkpoint_delete",
+    ] {
+        capabilities[method] = json!(false);
+    }
+    out.emit("hello",None,json!({
+        "protocol":"aw.rpc","version":VERSION,"transport":"stdio",
+        "capabilities":capabilities,
         "profile":initial.profile,"model":initial.model,
         "warning":"client MUST inspect durable state after transport loss; never replay an uncertain prompt"
     }))?;
@@ -713,6 +750,7 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
         agent_state: driver.agent_state_port(),
         agent_inputs: driver.agent_inputs_port(),
         sandbox: driver.sandbox_port(),
+        checkpoint_read: driver.checkpoint_read_port(),
     };
     let read = thread::spawn(move || stdin_reader(reader, tx, guard, ports));
     let mut seen = BTreeSet::<String>::new();
@@ -1280,6 +1318,12 @@ mod aw_p6_9c_protocol_tests {
         }
     }
 
+    impl CheckpointReadPort for FakeSandboxPort {
+        fn apply(&self, method: &str, params: Value) -> Result<Value> {
+            SandboxPort::apply(self, method, params)
+        }
+    }
+
     struct BoundFake {
         query_calls: usize,
         mutation_calls: usize,
@@ -1305,6 +1349,9 @@ mod aw_p6_9c_protocol_tests {
             Some(self.inputs.clone())
         }
         fn sandbox_port(&self) -> Option<Arc<dyn SandboxPort>> {
+            Some(self.sandbox.clone())
+        }
+        fn checkpoint_read_port(&self) -> Option<Arc<dyn CheckpointReadPort>> {
             Some(self.sandbox.clone())
         }
         fn actor_query(&mut self, operation: Value) -> Result<Value> {
@@ -1379,6 +1426,11 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"inputs-list","method":"agent_inputs_list","params":{"ref":"."}}"#,
             r#"{"v":1,"id":"inputs-raw","method":"agent_inputs_add","params":{"items":[],"provider":"evil"}}"#,
             r#"{"v":1,"id":"sandboxes","method":"sandbox_list","params":{"limit":8}}"#,
+            r#"{"v":1,"id":"sources","method":"sandbox_sources_list","params":{"ref":"/d:d/i:i/p:p/s:0"}}"#,
+            r#"{"v":1,"id":"checkpoints","method":"checkpoint_list","params":{"ref":".","limit":8}}"#,
+            r#"{"v":1,"id":"checkpoint","method":"checkpoint_get","params":{"id":"cp_fixture"}}"#,
+            r#"{"v":1,"id":"checkpoint-raw","method":"checkpoint_get","params":{"id":"cp_fixture","source_ref":"private"}}"#,
+            r#"{"v":1,"id":"checkpoint-restore","method":"checkpoint_restore","params":{"id":"cp_fixture"}}"#,
             r#"{"v":1,"id":"sandbox-layout","method":"sandbox_get","params":{"ref":"/d:d/i:i/p:p/s:0","layout":"raw"}}"#,
             r#"{"v":1,"id":"danger","method":"trusted_bash","params":{"command":"echo no"}}"#,
         ].join("\n")+"\n";
@@ -1419,6 +1471,16 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(rows[0]["data"]["capabilities"]["agent_inputs_send"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_list"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_get"], true);
+        for method in ["sandbox_sources_list", "checkpoint_list", "checkpoint_get"] {
+            assert_eq!(rows[0]["data"]["capabilities"][method], true);
+        }
+        for method in [
+            "checkpoint_create",
+            "checkpoint_restore",
+            "checkpoint_delete",
+        ] {
+            assert_eq!(rows[0]["data"]["capabilities"][method], false);
+        }
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], false);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_close"], true);
         assert_eq!(fake.query_calls, 1);
@@ -1451,9 +1513,25 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(input_calls[0].0, "inputs-list");
         assert_eq!(input_calls[0].1, "agent_inputs_list");
         let sandbox_calls = sandbox.calls.lock().unwrap();
-        assert_eq!(sandbox_calls.len(), 1);
-        assert_eq!(sandbox_calls[0].0, "sandbox_list");
+        assert_eq!(
+            sandbox_calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "sandbox_list",
+                "sandbox_sources_list",
+                "checkpoint_list",
+                "checkpoint_get"
+            ]
+        );
         assert_eq!(sandbox_calls[0].1["limit"], 8);
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "checkpoint-raw" && r["data"]["code"] == "protocol"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "checkpoint-restore" && r["data"]["code"] == "unsupported_method"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "raw" && r["data"]["code"] == "invalid_parameters"));

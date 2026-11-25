@@ -18,7 +18,60 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: configured Git native source authority
+## Latest local implementation delta — 2026-11-25: protected source metadata and checkpoint reads
+
+Parent: `44d92bc0cfe0eff269942e49c8b9832dbb76aa62` (configured Git native
+source authority). Parent signature verified. Original Agent/Turn journal
+owners and resource CLI remain concurrently occupied; source admission held.
+
+- Existing `StdioSandboxPort` now projects the actual named source summaries
+  instead of the previous empty placeholder. `sandbox_get` includes them by
+  default; the existing `include:["sources"]` remains supported. `sandbox_list`
+  returns source counts; `sandbox_sources_list(ref)` returns exact ref, rev
+  and the redacted summaries. Existing current Project checks remain in force.
+- Optional authenticated `CheckpointReadPort` uses the original stdio reader
+  and live-result transport. The product implements it on the same bound
+  `StdioAgentStatePort` (no extra Store or host state). `checkpoint_list` takes
+  current/canonical same-Project Agent `ref` (default `.`), `limit` 1..64
+  (default 16) and the original opaque checkpoint-ID cursor. Returns `ref`,
+  `items`, `next_cursor`. `checkpoint_get` takes `id` and optional empty
+  `include`; no extension views available. Both use original Store metadata
+  reads with current Agent view authorization, same-Project host scope, no
+  driver probes or materialization. List includes live checkpoints only; get
+  can show a retired replay tombstone. No construction/restore/retire RPC.
+- Explicit allowlists project history base/head, coverage, lifecycle, note,
+  created time and source names, public driver kinds, access (`ro`/`rw`),
+  checkpoint policy and compatibility; Sandbox bindings also report binding
+  rev. Extension kinds are generic `extension`, not provider/extension IDs.
+  Raw paths, source/retention/anchor payloads and layout digest withheld;
+  no independent metadata-read disclosure route yet. Oversized metadata
+  responses fail before emission, preserving the connection for smaller pages.
+- Existing capability handshake advertises checkpoint reads only for a
+  supplied optional port and keeps unsupported mutation operations false.
+  No new model tool, schema, source authority, recovery route or actor gate.
+  Reuses the original request validation and current Project/ACL owners.
+
+Validation on L5 (Rust 1.95.0): real Store-backed grouped metadata port
+regression **1/1** (actual source-bearing Sandbox, history-only checkpoints,
+redaction, ACL/Project scoping, cursor pagination and retirement read), full
+headless protocol **8/8** (bound/unbound negotiation and strict parameters),
+full product all-target/all-feature check, strict full-product Clippy,
+minimal all-target check and scoped fmt/diff passed. Initial JSON capability
+macro recursion limit fixed by factoring the handshake object; no crate-wide
+recursion-limit increase. Minimal existing dead-code warnings remain. The
+new test does not capture a source-bearing checkpoint end-to-end; its lower
+capture/metadata owner remains unchanged. Shared builds include concurrently
+owned dependencies; signed tree contains only owned paths. Pinned Nix 1.98.1
+and platform-specific qualification not rerun. Store v60, Git recovery v4;
+no publication.
+
+Next: exact live source-aware Actor/Turn admission when original journal
+owners become available. Resource CLI remains occupied. Otherwise take a
+substantive independent host authority/containment consumer or the remaining
+sealed host resource surface, preserving replay-first publication and real
+independent disclosure. No automatic grant/admission from metadata.
+
+## Previous local implementation delta — 2026-11-25: configured Git native source authority
 
 Parent: `3d2fd314cbaf8cccb6bdd0c69ab7d39cd6c9b559` (source-aware single-link
 native capabilities). Parent signature verified. The original Agent/Turn

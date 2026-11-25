@@ -3781,6 +3781,138 @@ impl aw::headless::AgentStatePort for StdioAgentStatePort {
     }
 }
 
+// Only public source kinds, not extension/provider identities. The Store
+// summary deliberately withholds all locators and anchor payloads already;
+// keep this projection explicit so new private fields cannot leak over RPC.
+fn source_kind(driver: &aw_agent_core::DriverKey) -> &str {
+    match &driver.namespace {
+        aw_agent_core::source_driver::DriverNamespace::Builtin => &driver.local_id,
+        aw_agent_core::source_driver::DriverNamespace::Extension(_) => "extension",
+    }
+}
+
+fn source_access_value(access: aw_agent_core::SourceAccess) -> &'static str {
+    match access {
+        aw_agent_core::SourceAccess::ReadOnly => "ro",
+        aw_agent_core::SourceAccess::ReadWrite => "rw",
+    }
+}
+
+fn sandbox_sources_value(snapshot: &aw_store::SandboxSnapshot) -> Vec<serde_json::Value> {
+    snapshot
+        .sources
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "name": source.name,
+                "kind": source_kind(&source.driver),
+                "access": source_access_value(source.access),
+                "checkpoint_policy": source.checkpoint_policy,
+                "binding_rev": source.binding_rev,
+                "compatibility": source.compatibility,
+            })
+        })
+        .collect()
+}
+
+fn checkpoint_snapshot_value(snapshot: &aw_store::CheckpointSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "id": snapshot.id,
+        "source_agent_ref": snapshot.source_agent_ref,
+        "history_base_id": snapshot.history_base_id,
+        "history_head": snapshot.history_head,
+        "source_coverage": snapshot.source_coverage,
+        "lifecycle": snapshot.lifecycle,
+        "note": snapshot.note,
+        "created_at": snapshot.created_at,
+        "sources": snapshot.sources.iter().map(|source| serde_json::json!({
+            "name": source.name,
+            "kind": source_kind(&source.driver),
+            "access": source_access_value(source.access),
+            "checkpoint_policy": source.checkpoint_policy,
+            "compatibility": source.compatibility,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+// Metadata is not a streamed result. Refuse an oversized page before the
+// transport tries to emit it, leaving the connection usable for a smaller
+// page. Reserve room for the outer JSONL response envelope.
+fn bounded_source_metadata(value: serde_json::Value) -> Result<serde_json::Value> {
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|_| Error::Protocol("source metadata encoding failed"))?;
+    if encoded.len() > aw::headless::MAX_FRAME_BYTES - 4096 {
+        return Err(Error::Limit(
+            "source metadata page too large; reduce list limit",
+        ));
+    }
+    Ok(value)
+}
+
+impl aw::headless::CheckpointReadPort for StdioAgentStatePort {
+    fn apply(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let require_project = |reference: &str| -> Result<()> {
+            if reference.rsplit_once("/a:").map(|(project, _)| project)
+                != Some(self.current_project_ref.as_str())
+            {
+                return Err(Error::Denied("cross-Project checkpoint access unavailable"));
+            }
+            Ok(())
+        };
+        let value = match method {
+            "checkpoint_list" => {
+                let reference = self.current_or_canonical_ref(&params, false)?;
+                require_project(&reference)?;
+                let limit = params
+                    .get("limit")
+                    .map(|v| {
+                        v.as_u64()
+                            .filter(|v| (1..=64).contains(v))
+                            .ok_or(Error::Protocol("checkpoint list limit must be 1..64"))
+                    })
+                    .transpose()?
+                    .unwrap_or(16) as usize;
+                let cursor = params
+                    .get("cursor")
+                    .map(|v| {
+                        v.as_str()
+                            .ok_or(Error::Protocol("checkpoint cursor must be a string"))
+                    })
+                    .transpose()?;
+                let snapshots =
+                    self.store
+                        .checkpoint_list_metadata(&self.caller, &reference, cursor, limit)?;
+                let next_cursor = (snapshots.len() == limit)
+                    .then(|| snapshots.last().map(|item| item.id.clone()))
+                    .flatten();
+                serde_json::json!({
+                    "ref": reference,
+                    "items": snapshots.iter().map(checkpoint_snapshot_value).collect::<Vec<_>>(),
+                    "next_cursor": next_cursor,
+                })
+            }
+            "checkpoint_get" => {
+                if let Some(include) = params.get("include") {
+                    if !include.as_array().is_some_and(Vec::is_empty) {
+                        return Err(Error::Protocol(
+                            "checkpoint extension views unavailable on metadata port",
+                        ));
+                    }
+                }
+                let id = params
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Protocol("checkpoint_get id must be a string"))?;
+                let snapshot = self.store.checkpoint_get_metadata(&self.caller, id)?;
+                require_project(&snapshot.source_agent_ref)?;
+                checkpoint_snapshot_value(&snapshot)
+            }
+            _ => return Err(Error::Protocol("unsupported checkpoint metadata operation")),
+        };
+        bounded_source_metadata(value)
+    }
+}
+
 fn sandbox_snapshot_value(
     snapshot: &aw_store::SandboxSnapshot,
     include_sources: bool,
@@ -3791,12 +3923,16 @@ fn sandbox_snapshot_value(
         "rev":snapshot.rev,
         "lifecycle":snapshot.lifecycle,
         "parent":snapshot.parent_sandbox_ref,
+        "source_count":snapshot.sources.len(),
     });
     if include_sources {
         value
             .as_object_mut()
             .expect("Sandbox snapshot JSON object")
-            .insert("sources".into(), serde_json::json!([]));
+            .insert(
+                "sources".into(),
+                serde_json::json!(sandbox_sources_value(snapshot)),
+            );
     }
     value
 }
@@ -3868,13 +4004,13 @@ impl aw::headless::SandboxPort for StdioSandboxPort {
                     "next_cursor":next_cursor,
                 }))
             }
-            "sandbox_get" => {
+            "sandbox_get" | "sandbox_sources_list" => {
                 let reference = params
                     .get("ref")
                     .and_then(serde_json::Value::as_str)
                     .ok_or(Error::Protocol("sandbox_get ref must be a string"))?;
-                let include_sources = match params.get("include") {
-                    None => false,
+                match params.get("include") {
+                    None => (),
                     Some(value) => {
                         let include = value
                             .as_array()
@@ -3895,12 +4031,16 @@ impl aw::headless::SandboxPort for StdioSandboxPort {
                                 }
                             }
                         }
-                        sources
                     }
                 };
                 let snapshot = self.store.sandbox_get(&self.caller, reference)?;
                 self.require_current_project(&snapshot)?;
-                Ok(sandbox_snapshot_value(&snapshot, include_sources))
+                let value = if method == "sandbox_sources_list" {
+                    serde_json::json!({"ref":snapshot.canonical_ref, "rev":snapshot.rev, "sources":sandbox_sources_value(&snapshot)})
+                } else {
+                    sandbox_snapshot_value(&snapshot, true)
+                };
+                bounded_source_metadata(value)
             }
             "sandbox_close" => {
                 let reference = params
@@ -6255,6 +6395,11 @@ impl aw::headless::Driver for Host {
             }) as std::sync::Arc<dyn aw::headless::AgentInputsPort>
         })
     }
+    fn checkpoint_read_port(&self) -> Option<std::sync::Arc<dyn aw::headless::CheckpointReadPort>> {
+        self.agent_state_port
+            .as_ref()
+            .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::CheckpointReadPort>)
+    }
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner
             .as_ref()
@@ -7461,6 +7606,192 @@ mod phase54_cli_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    #[test]
+    fn stdio_source_metadata_uses_current_store_authority_without_private_locators() {
+        use aw::headless::{CheckpointReadPort, SandboxPort};
+        use aw_agent_core::{
+            CheckpointPolicy, DriverKey, SchemaSupport, SourceAccess, SourceBinding,
+            SourceDriverRegistry, SourceDriverSchemas, SourceName,
+        };
+        use serde_json::json;
+
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = Temp(crate::test_support::temp_dir("source-metadata"));
+        let state = temp.0.join("state");
+        let root = temp.0.join("root");
+        let layout = temp.0.join("protected-layout");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&layout).unwrap();
+        let binding = |path: &std::path::Path| aw_store::SessionBinding {
+            working_directory: path.to_owned(),
+            tool_root: path.to_owned(),
+            system_prompt: "fixture".into(),
+            profile_hint: "fixture".into(),
+            model_hint: "fixture".into(),
+            destination_fingerprint: "0".repeat(64),
+        };
+        let actor = aw::PrincipalId::new("internal:fixture:metadata-owner").unwrap();
+        let registry = SourceDriverRegistry::new();
+        let driver = DriverKey::extension("private-provider", "private-driver").unwrap();
+        let schema = SchemaSupport::new(1, 1).unwrap();
+        registry
+            .register(
+                driver.clone(),
+                SourceDriverSchemas {
+                    binding: schema,
+                    anchor: schema,
+                    recovery: schema,
+                },
+                (),
+            )
+            .unwrap();
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let (session, branch) = store.create(&actor, "metadata", binding(&root)).unwrap();
+        let info = store
+            .agent_binding(&actor, &session.id, &branch.id)
+            .unwrap();
+        let project = format!(
+            "/d:{}/i:{}/p:{}",
+            info.domain_handle, info.identity_handle, info.project_handle
+        );
+        let reference = format!("{project}/a:{}", info.agent_handle);
+        let sandbox = store
+            .sandbox_create_fresh_with_sources(
+                &actor,
+                &project,
+                &binding(&layout),
+                &[SourceBinding {
+                    name: SourceName::new("dataset").unwrap(),
+                    driver,
+                    binding_schema: 1,
+                    source_ref: "protected-source-reference".into(),
+                    materialization: "protected-materialization".into(),
+                    access: SourceAccess::ReadOnly,
+                    checkpoint_policy: CheckpointPolicy::Required,
+                }],
+            )
+            .unwrap();
+        let sandbox_port = StdioSandboxPort {
+            store: store.clone(),
+            caller: actor.clone(),
+            current_project_ref: project.clone(),
+        };
+        let snapshot = sandbox_port
+            .apply("sandbox_get", json!({"ref": sandbox.canonical_ref}))
+            .unwrap();
+        let sources = sandbox_port
+            .apply(
+                "sandbox_sources_list",
+                json!({"ref": sandbox.canonical_ref}),
+            )
+            .unwrap();
+        assert_eq!(snapshot["sources"], sources["sources"]);
+        assert_eq!(snapshot["source_count"], 1);
+        assert_eq!(sources["sources"][0]["name"], "dataset");
+        assert_eq!(sources["sources"][0]["access"], "ro");
+        assert_eq!(sources["sources"][0]["kind"], "extension");
+        let encoded = snapshot.to_string();
+        for protected in [
+            "private-provider",
+            "private-driver",
+            "protected-source-reference",
+            "protected-materialization",
+            "protected-layout",
+            "tool_root",
+            "layout_digest",
+        ] {
+            assert!(!encoded.contains(protected));
+        }
+        // Real history-only checkpoints use the original history publication
+        // and ACL owner; reads must not create or materialize anything.
+        let first = store
+            .checkpoint_create_history_only(
+                &actor,
+                &reference,
+                Some("first"),
+                "host:metadata-first",
+            )
+            .unwrap();
+        let second = store
+            .checkpoint_create_history_only(
+                &actor,
+                &reference,
+                Some("second"),
+                "host:metadata-second",
+            )
+            .unwrap();
+        let port = StdioAgentStatePort {
+            store: store.clone(),
+            caller: actor.clone(),
+            current_agent_ref: reference.clone(),
+            current_project_ref: project.clone(),
+        };
+        let page = CheckpointReadPort::apply(&port, "checkpoint_list", json!({"limit":1})).unwrap();
+        let next = page["next_cursor"].as_str().unwrap();
+        assert_eq!(page["items"][0]["id"], next);
+        let next_page = CheckpointReadPort::apply(
+            &port,
+            "checkpoint_list",
+            json!({"ref":".","limit":1,"cursor":next}),
+        )
+        .unwrap();
+        assert_ne!(next_page["items"][0]["id"], next);
+        let read =
+            CheckpointReadPort::apply(&port, "checkpoint_get", json!({"id":first.id})).unwrap();
+        assert_eq!(read["history_head"], first.history_head);
+        assert_eq!(read["source_coverage"], "none");
+        assert_eq!(read["sources"], json!([]));
+        assert!(CheckpointReadPort::apply(
+            &port,
+            "checkpoint_get",
+            json!({"id":first.id,"include":["raw"]})
+        )
+        .is_err());
+        // Unrelated Store caller and cross-Project redirects remain denied.
+        let denied = StdioAgentStatePort {
+            store: store.clone(),
+            caller: aw::PrincipalId::new("internal:fixture:metadata-outsider").unwrap(),
+            current_agent_ref: reference.clone(),
+            current_project_ref: project.clone(),
+        };
+        assert!(
+            CheckpointReadPort::apply(&denied, "checkpoint_get", json!({"id":first.id})).is_err()
+        );
+        assert!(CheckpointReadPort::apply(&denied, "checkpoint_list", json!({})).is_err());
+        let foreign_project = StdioAgentStatePort {
+            store: store.clone(),
+            caller: actor.clone(),
+            current_agent_ref: reference,
+            current_project_ref: "/d:d/i:i/p:other".into(),
+        };
+        assert!(CheckpointReadPort::apply(
+            &foreign_project,
+            "checkpoint_get",
+            json!({"id":first.id})
+        )
+        .is_err());
+        // Logical retirement is done only by the Store owner here; the read
+        // port still exposes the replay tombstone, not released source data.
+        store.checkpoint_delete(&actor, &second.id).unwrap();
+        assert_eq!(
+            CheckpointReadPort::apply(&port, "checkpoint_get", json!({"id":second.id})).unwrap()
+                ["lifecycle"],
+            "retired"
+        );
+        assert_eq!(
+            CheckpointReadPort::apply(&port, "checkpoint_list", json!({})).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
