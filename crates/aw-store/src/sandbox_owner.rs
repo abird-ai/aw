@@ -23,6 +23,8 @@ pub use effects::{
     SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest,
     SandboxToolRecovery, SandboxToolTerminalRef,
 };
+pub(crate) mod construction;
+pub use construction::{InspectedSandboxCreate, PreparedSandboxCreate};
 mod grants;
 pub use grants::{
     EffectiveSourceBinding, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
@@ -966,7 +968,7 @@ impl SessionStore {
     /// Trusted host publication of a fresh logical Sandbox with an already
     /// materialized SourceSet. The trusted caller supplies authorized,
     /// non-secret references. No driver effect, grant, capture or restore:
-    /// effectful constructors must use the future durable Prepared path.
+    /// effectful versioned-baseline construction uses sandbox_prepare_create.
     pub fn sandbox_create_fresh_with_sources(
         &self,
         actor: &PrincipalId,

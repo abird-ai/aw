@@ -17,10 +17,10 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Current authoritative snapshot — 2026-11-24
+## Current authoritative snapshot — 2026-11-25
 
 **R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
-complete and published. Phase 1 is COMPLETE locally. Phase 2 is COMPLETE locally: v44 Event projection,
+complete and published. Phase 1 is COMPLETE and published. Phase 2 is COMPLETE and published: v44 Event projection,
 one shared private EventScan, v45 source-local Event authorship, v46 durable Event read/wait, v47
 exact-Project wildcard placement, v48 durable subscription state, v49 replay-safe typed EventInput delivery,
 v50 disclosure/causal execution closure, v51 EventTypeRegistry + custom Event publication, the model-facing
@@ -56,8 +56,8 @@ and finite Process quiescence, marked Git private-index scratch reconciliation,
 exact-subset unpublished Git restore abandonment and verified metadata-only final
 source detachment, independently approved multi-source native filesystem
 realization, durable native artifact custody/recovery and exact Store-backed Git
-native approval provisioning, and shared finite Vault Process settlement are
-implemented locally.
+native approval provisioning, shared finite Vault Process settlement, and v60
+Project-scoped standalone versioned Sandbox construction are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -65,21 +65,22 @@ qualification remain explicitly deferred evidence and are not claimed green.**
 Verified publication truth:
 
 ```text
-AW remote main                  78339410710472ec51d5ff46a5c9e586b67ff30d = Own logical Sandboxes
+AW remote main                  4ddeed8d0023cd0222633fc496f0d252e3dda54c = Share finite source Process settlement with Vault projection
 AW R6/Phase-0 publication       20a63a4d4547cc20b2a154787823125b82f5e385
 dotlink remote/main             85ceccc1088e201c98c994a46a68834440eeab32
 release/0.17                    576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
 dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
 
-The local Phase-1/2/3 implementation line remains unpublished. Phase-1 completion is
+The Phase-1/2 and Phase-3 line through 4ddeed8 was pushed and independently
+verified on 2026-11-25. The subsequent v60 checkpoint remains local. Phase-1 completion is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 began at
 `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and closes at
 `e0c6bb3184bf87fc1bb2186ddc7f5ffb97a39c96` (`Cut over Event delivery ownership`). Phase 3 starts at
 `184ea6b05643c49d34a7f3bfdbfed86f26753162` (`Establish SourceDriver recovery contracts`). The
 intermediate private EventScan/source/read/wake/Project/subscription/EventInput/disclosure/custom-publication/
-model-tool/Handler/universe checkpoints remain in Git history. The local `origin/main` tracking ref is stale
-and is not publication truth.
+model-tool/Handler/universe checkpoints remain in Git history. The latest verified
+remote main and local tracking ref agreed at 4ddeed8 before the v60 work.
 
 Pinned qualification is green: ordinary all-target/all-feature build, shell **86/86**, Graph
 **13/13**, real queued Spawn-Lane cancellation, pre-spawn timeout/no-Process projection, canonical
@@ -2602,6 +2603,40 @@ Final Host **16/16**, strict Host all-target Clippy with all features and
 source-effects-only, workspace all-target/all-feature check and scoped fmt/diff
 passed. Unchanged Store/adapter suites were not repeated.
 
+Standalone versioned Sandbox creation now consumes the actual shared construction
+owner. Schema v60 widens the original immutable audit/receipt table to accept either
+its existing Session foreign key or a canonical Project origin for construction;
+the migration preserves legacy audit sequence/data and recreates the same replay and
+unique Prepared identity indexes. No additional operation ledger or fake Session.
+Project receipts omit Agent origin fields, carry the exact candidate Sandbox,
+authenticated creator/request/fingerprint, writer epoch, layout digest and independently
+retained baseline SourceSet + original Restore descriptors. The common claim,
+complete-set source barrier, inspection validation, fenced publication and reconciled
+abandonment primitives are reused. Existing Agent/checkpoint receipt encodings and
+legacy security audit mapping are retained; Project security audit contains only
+redacted operation/state. One atomic publication inserts just the fresh Sandbox and
+its source bindings and transitions the original receipt Applied. The exact current
+Project authority, writer epoch, fresh layout, source/schema compatibility and
+candidate identity are rechecked at publication. Replay uses the original result;
+resume inspects the original descriptor without reselecting versions or executing
+again. Abandon uses the original Rejected receipt; no physical retry or Applied
+cleanup. Git host shares materialization planning, execution, proof and cleanup with
+checkpoint restore; independently authorized live whole-set fence still spans commit.
+Original Applied standalone provenance now participates in closed-Sandbox retirement.
+Grouped real Git lifecycle tests force failed publication after both materializations,
+prove no Agent/Session/visible Sandbox was created, recover across restart (missing
+driver refuses), replay, close and reconcile the original retained layout, and
+abandon a no-effect unresolved candidate. Existing receipt regression checks exact
+legacy audit fact preservation through migration. Broad Store library **239/244**:
+the exact same five earlier failures (legacy Agent shell disabled Job subscription,
+v38 principal downgrade, v35 remote-start downgrade, remote-view reconnect and v34
+remote-view downgrade); all other Store tests passed, including construction,
+migration, source custody and backup/restore qualification. Final Host **16/16**,
+strict Store/Host all-target/all-feature Clippy (after redundant-borrow cleanup),
+workspace all-target/all-feature check and scoped fmt/diff passed. This is the retained-version
+fresh Project baseline case, not mutable parent derivation, unversioned baseline
+capture, effectful replace/remove, public RPC or source-bearing execution admission.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
@@ -2611,7 +2646,7 @@ reconciliation, general multi-source Process policy, unmarked/ambiguous scratch 
 checkout cleanup, remaining production physical authority/cleanup, effectful
 final-source removal/structural mutation, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
-RPCs remain pending. Store schema v59.
+RPCs remain pending. Store schema v60.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart
 evidence.
 

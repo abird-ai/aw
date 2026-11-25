@@ -9,8 +9,8 @@ use aw_agent_core::{
 use aw_git::source_driver::{GitRestoreLocation, GitSourceAnchor, GitSourceDriver};
 use aw_store::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
-    InspectedCheckpointRestore, SandboxSnapshot, SessionBinding, SessionStore,
-    VersionedSourceBinding,
+    InspectedCheckpointRestore, InspectedSandboxCreate, SandboxSnapshot, SessionBinding,
+    SessionStore, VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -228,6 +228,56 @@ fn inspect(
         .collect()
 }
 
+fn execute(
+    driver: &GitSourceDriver,
+    anchors: &SourceSet,
+    prepared: &PreparedSourceSet,
+    fence: &impl GitRestoreFence,
+) -> Result<()> {
+    require_locations(driver, anchors, prepared, fence)?;
+    for source in &prepared.sources {
+        driver.execute_restore(&source.prepared)?;
+    }
+    Ok(())
+}
+
+fn publication_proofs<'a, F: GitRestoreFence>(
+    driver: &GitSourceDriver,
+    anchors: &SourceSet,
+    sources: &PreparedSourceSet,
+    bindings: &[SourceBinding],
+    evidence: &[ExternalEvidence],
+    fence: &'a F,
+) -> Result<Vec<SourcePublicationProof<Publication<'a, F>>>> {
+    require_locations(driver, anchors, sources, fence)?;
+    sources
+        .sources
+        .iter()
+        .zip(bindings)
+        .zip(evidence)
+        .map(|((source, binding), evidence)| {
+            driver.revalidate_restore(&source.prepared, binding)?;
+            Ok(SourcePublicationProof::Held(Publication {
+                _fence: fence,
+                evidence: evidence.clone(),
+            }))
+        })
+        .collect()
+}
+
+fn abandon_materializations<F: GitRestoreFence>(
+    driver: &GitSourceDriver,
+    anchors: &SourceSet,
+    sources: &PreparedSourceSet,
+    fence: F,
+) -> Result<F> {
+    require_locations(driver, anchors, sources, &fence)?;
+    for source in &sources.sources {
+        driver.release_prepared_restore(&source.prepared)?;
+    }
+    Ok(fence)
+}
+
 /// Uses the actual SourceDriver registered in the Store; no second driver
 /// registry, authority state, replay ledger or restore constructor.
 pub struct GitCheckpointRestoreHost<'a> {
@@ -330,11 +380,7 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         // first Git mutation. An uncertain result never retries execution.
         let executed = (|| {
             prepared.revalidate(&layout)?;
-            require_locations(&driver, prepared.anchors(), prepared.sources(), &fence)?;
-            for source in &prepared.sources().sources {
-                driver.execute_restore(&source.prepared)?;
-            }
-            Ok(())
+            execute(&driver, prepared.anchors(), prepared.sources(), &fence)
         })();
         if let Err(error) = executed {
             prepared.mark_unknown()?;
@@ -384,20 +430,7 @@ impl<'a> GitCheckpointRestoreHost<'a> {
     ) -> Result<CheckpointRestoreResult> {
         inspected.publish(layout, |registry, anchors, sources, bindings, evidence| {
             let driver = registry.get(self.driver)?;
-            require_locations(&driver, anchors, sources, fence)?;
-            sources
-                .sources
-                .iter()
-                .zip(bindings)
-                .zip(evidence)
-                .map(|((source, binding), evidence)| {
-                    driver.revalidate_restore(&source.prepared, binding)?;
-                    Ok(SourcePublicationProof::Held(Publication {
-                        _fence: fence,
-                        evidence: evidence.clone(),
-                    }))
-                })
-                .collect()
+            publication_proofs(&driver, anchors, sources, bindings, evidence, fence)
         })
     }
 
@@ -414,16 +447,120 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             .checkpoint_abandon_restore(actor, request_id, |registry, anchors, sources| {
                 let fence = authorize(anchors, sources)?;
                 let driver = registry.get(self.driver)?;
-                require_locations(&driver, anchors, sources, &fence)?;
-                for source in &sources.sources {
-                    driver.release_prepared_restore(&source.prepared)?;
-                }
-                Ok(fence)
+                abandon_materializations(&driver, anchors, sources, fence)
             })
     }
 
-    /// Reconcile a closed, retained Sandbox created by a captured-Git
-    /// restore. Only the original, unmodified binding set is supported.
+    /// Standalone fresh Sandbox from independently retained Project
+    /// baseline versions. Same materialization planning, execution and
+    /// publication proofs as checkpoint restore, but no Agent/history.
+    pub fn create_sandbox_from_baseline<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        request_id: &str,
+        select: impl FnOnce() -> Result<(SessionBinding, SourceSet)>,
+        authorize: impl FnOnce(&SessionBinding, &SourceSet) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        if let Some(result) = self
+            .store
+            .sandbox_replay_create(actor, project_ref, request_id)?
+        {
+            return Ok(result);
+        }
+        let (layout, baseline) = select()?;
+        let driver = self.store.source_driver(self.driver)?;
+        let mut fence = None;
+        let prepared = self.store.sandbox_prepare_create(
+            actor,
+            project_ref,
+            &layout,
+            baseline,
+            request_id,
+            |prepare_id, _, anchors| {
+                let approval = authorize(&layout, anchors)?;
+                let sources = plan(&driver, anchors, &approval, prepare_id)?;
+                fence = Some(approval);
+                Ok(sources)
+            },
+        )?;
+        let fence = fence.expect("successful Sandbox preparation called planner");
+        let executed = (|| {
+            prepared.revalidate(&layout)?;
+            execute(&driver, prepared.anchors(), prepared.sources(), &fence)
+        })();
+        if let Err(error) = executed {
+            prepared.mark_unknown()?;
+            return Err(error);
+        }
+        let inspected = prepared.inspect(|registry, anchors, sources| {
+            let driver = registry.get(self.driver)?;
+            inspect(&driver, anchors, sources, &fence)
+        })?;
+        self.publish_sandbox(inspected, &layout, &fence)
+    }
+
+    pub fn resume_sandbox_create<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        request_id: &str,
+        layout: &SessionBinding,
+        authorize: impl FnOnce(&SessionBinding, &SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        let mut fence = None;
+        let inspected = self.store.sandbox_inspect_create(
+            actor,
+            project_ref,
+            request_id,
+            |registry, anchors, sources| {
+                let approval = authorize(layout, anchors, sources)?;
+                let driver = registry.get(self.driver)?;
+                let result = inspect(&driver, anchors, sources, &approval)?;
+                fence = Some(approval);
+                Ok(result)
+            },
+        )?;
+        self.publish_sandbox(
+            inspected,
+            layout,
+            &fence.expect("successful Sandbox inspection called inspector"),
+        )
+    }
+
+    fn publish_sandbox<F: GitRestoreFence>(
+        &self,
+        inspected: InspectedSandboxCreate<'_>,
+        layout: &SessionBinding,
+        fence: &F,
+    ) -> Result<SandboxSnapshot> {
+        inspected.publish(layout, |registry, anchors, sources, bindings, evidence| {
+            let driver = registry.get(self.driver)?;
+            publication_proofs(&driver, anchors, sources, bindings, evidence, fence)
+        })
+    }
+
+    pub fn abandon_sandbox_create<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        request_id: &str,
+        authorize: impl FnOnce(&SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        self.store.sandbox_abandon_create(
+            actor,
+            project_ref,
+            request_id,
+            |registry, anchors, sources| {
+                let fence = authorize(anchors, sources)?;
+                let driver = registry.get(self.driver)?;
+                abandon_materializations(&driver, anchors, sources, fence)
+            },
+        )
+    }
+
+    /// Reconcile a closed, retained Sandbox created by a Git restore or
+    /// standalone versioned baseline. Only the original unmodified set is supported.
     /// Authorize the whole layout and exact Applied descriptors independently.
     /// Keep the external fence through Store settlement; never remove shared
     /// backing or unrelated files. Already released layouts do not reauthorize.
@@ -1272,6 +1409,170 @@ mod tests {
             .unwrap(),
             versioned
         );
+
+        // Standalone versioned baseline uses the same Prepared materialization
+        // path but an actual Project origin, with no new Agent or Session.
+        let standalone_root = root.join("standalone-baseline");
+        private_dir(&standalone_root);
+        let project = versioned.agent.project_ref.clone();
+        let request_id = "fixture:standalone-baseline";
+        let count_sessions = || -> u64 {
+            Connection::open(&database)
+                .unwrap()
+                .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+                .unwrap()
+        };
+        let sessions_before = count_sessions();
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fixture_fail_sandbox BEFORE INSERT ON sandboxes_current
+             BEGIN SELECT RAISE(ABORT,'fixture standalone publish failure'); END;",
+            )
+            .unwrap();
+        assert!(host
+            .create_sandbox_from_baseline(
+                &actor,
+                &project,
+                request_id,
+                || Ok((layout(&standalone_root), baseline.clone())),
+                |_, _| Ok(fence(locations(&standalone_root), 4)),
+            )
+            .is_err());
+        assert_eq!(count_sessions(), sessions_before);
+        assert_eq!(
+            fs::read(standalone_root.join("code/tracked")).unwrap(),
+            b"code"
+        );
+        let (candidate, origin): (String, String) = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT json_extract(data_json,'$.candidate.sandbox'), project_ref FROM audit
+             WHERE action='construction.preparation' AND session_id IS NULL
+               AND json_extract(data_json,'$.operation')='sandbox_create'
+               AND json_extract(data_json,'$.state')='prepared'
+               AND json_extract(data_json,'$.request_id')=?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(origin, project);
+        assert!(store.sandbox_get(&actor, &candidate).is_err());
+        assert!(host
+            .create_sandbox_from_baseline::<Fence<'_>>(
+                &actor,
+                &project,
+                request_id,
+                || panic!("unresolved Sandbox cannot reselect versions"),
+                |_, _| panic!("unresolved Sandbox cannot reauthorize a new effect"),
+            )
+            .is_err());
+        drop(store);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_sandbox;")
+            .unwrap();
+        let missing = SessionStore::open(&state).unwrap();
+        assert!(GitCheckpointRestoreHost::new(&missing, &driver)
+            .resume_sandbox_create::<Fence<'_>>(
+                &actor,
+                &project,
+                request_id,
+                &layout(&standalone_root),
+                |_, _, _| panic!("missing driver cannot inspect original Project custody"),
+            )
+            .is_err());
+        drop(missing);
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        let standalone = host
+            .resume_sandbox_create(
+                &actor,
+                &project,
+                request_id,
+                &layout(&standalone_root),
+                |_, sources, _| {
+                    assert_eq!(sources, &baseline);
+                    Ok(fence(locations(&standalone_root), 4))
+                },
+            )
+            .unwrap();
+        assert_eq!(standalone.canonical_ref, candidate);
+        assert_eq!(standalone.sources.len(), 2);
+        assert_eq!(standalone.rev, 1);
+        assert_eq!(count_sessions(), sessions_before);
+        assert_eq!(count_agents(&database), 4);
+        assert_eq!(
+            host.create_sandbox_from_baseline::<Fence<'_>>(
+                &actor,
+                &project,
+                request_id,
+                || panic!("Applied Sandbox cannot reselect versions"),
+                |_, _| panic!("Applied Sandbox cannot reauthorize materialization"),
+            )
+            .unwrap(),
+            standalone
+        );
+        assert!(host
+            .abandon_sandbox_create::<Fence<'_>>(&actor, &project, request_id, |_, _| panic!(
+                "Applied Sandbox is not a private candidate"
+            ),)
+            .is_err());
+        let closed = store
+            .sandbox_close(&actor, &standalone.canonical_ref, Some(standalone.rev))
+            .unwrap();
+        assert_eq!(closed.sources.len(), 2);
+        let released = host
+            .reconcile_closed_sandbox(
+                &actor,
+                &standalone.canonical_ref,
+                |_, bindings, prepared| {
+                    assert_eq!(bindings.len(), 2);
+                    assert_eq!(
+                        prepared.prepare_id,
+                        standalone.canonical_ref.rsplit_once("/s:").unwrap().1
+                    );
+                    Ok(fence(locations(&standalone_root), 4))
+                },
+            )
+            .unwrap();
+        assert!(released.sources.is_empty());
+        assert_eq!(fs::read_dir(&standalone_root).unwrap().count(), 0);
+        assert_eq!(count_sessions(), sessions_before);
+        // A lost result before the first materialization may be abandoned
+        // through the same exact Project claim, not another create.
+        let abandoned_root = root.join("abandoned-standalone");
+        private_dir(&abandoned_root);
+        let approval = fence(locations(&abandoned_root), 4);
+        let prepared = store
+            .sandbox_prepare_create(
+                &actor,
+                &project,
+                &layout(&abandoned_root),
+                baseline.clone(),
+                "fixture:abandoned-standalone",
+                |prepare_id, _, anchors| {
+                    let implementation = store.source_driver(&driver)?;
+                    plan(&implementation, anchors, &approval, prepare_id)
+                },
+            )
+            .unwrap();
+        let abandoned = prepared.sandbox_ref().to_owned();
+        prepared.mark_unknown().unwrap();
+        drop(approval);
+        host.abandon_sandbox_create(&actor, &project, "fixture:abandoned-standalone", |_, _| {
+            Ok(fence(locations(&abandoned_root), 4))
+        })
+        .unwrap();
+        host.abandon_sandbox_create::<Fence<'_>>(
+            &actor,
+            &project,
+            "fixture:abandoned-standalone",
+            |_, _| panic!("Rejected Sandbox cannot inspect again"),
+        )
+        .unwrap();
+        assert!(store.sandbox_get(&actor, &abandoned).is_err());
+        assert_eq!(fs::read_dir(&abandoned_root).unwrap().count(), 0);
 
         // Empty Auto accepts only independently selected ephemeral versions.
         // Reuse the ordinary Prepared cleanup, including task-free receipts.

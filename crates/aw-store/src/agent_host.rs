@@ -982,6 +982,7 @@ impl SessionStore {
                 sources: None,
                 capture_boundary: None,
                 restore_boundary: None,
+                sandbox_boundary: None,
                 result_ref: None,
                 note: None,
             };

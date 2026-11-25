@@ -56,7 +56,7 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       than deleting the authorization identity. Unknown outcomes remain tombstones. Long-lived
       admission no longer depends on Session-lifetime audit/event scans, and live capacities remain
       explicitly scoped to active Turns/subscriptions/exposures rather than retained history.
-- [x] **Phase 1 COMPLETE locally** — private `StoreScope` reuses existing `store_id` + nonzero
+- [x] **Phase 1 COMPLETE and published** — private `StoreScope` reuses existing `store_id` + nonzero
       `restore_generation`; transparent `StorePos(u64)` carries internal `commit_log.seq`; exact
       Agent lookup reuses indexed `job_exposure_current` with current-authority recheck. **v38
       owner cutover landed:** one exclusive migration transaction creates/seeds
@@ -226,7 +226,7 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       public fresh/derived `sandbox.create` remain Phase 3; View/Extension enrichment and Phase-4 Jobs
       traversal remain in their sealed later phases. No Phase-2 source was started in this checkpoint.
       Defer reachability/flatten acceleration until a real consumer requires it.
-- [x] **Phase 2 COMPLETE locally** — v44 lands the scan prerequisite first: one canonical
+- [x] **Phase 2 COMPLETE and published** — v44 lands the scan prerequisite first: one canonical
       `aw-tools::event_subject` grammar, one rebuildable parsed `event_projection_index`, and one
       StoreScope-bound contiguous `event_projection_state` watermark over immutable `commit_log`.
       Literal handle `.` encodes as uppercase `%2E`; malformed hierarchy/escaping fails closed.
@@ -1082,6 +1082,22 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       needs Project-owned receipt scope, not synthetic Agent audit origin.
       Final Host **16/16**, strict Host Clippy (both feature variants), workspace
       check and scoped fmt/diff passed. Unchanged Store/adapter suites not repeated.
+      **Standalone Project-scoped versioned Sandbox construction landed:** v60 widens
+      the existing immutable audit/receipt origin (Session XOR Project) with legacy
+      seq/data and indexes preserved. No synthetic Agent, Session or new ledger.
+      Exact Project writer/creator/request/fingerprint/candidate/layout and independently
+      retained baseline versions plus original Restore descriptors are held by the
+      common Prepared/source barrier. Existing inspection validation, fenced publication,
+      replay, Unknown recovery and Rejected cleanup reused. Final transaction publishes
+      only fresh Sandbox + bindings + Applied receipt; same Git driver materialization
+      and physical fences as checkpoint restore. Original standalone Applied provenance
+      supports closed retirement. Real grouped Host lifecycle tests failed publication,
+      missing driver, restart/resume, exact replay, retirement, no fabricated Agent/
+      Session and no-start abandonment. Existing receipt regression preserves legacy facts.
+      Broad Store **239/244**, exact same five previously recorded legacy failures.
+      Final Host **16/16**, strict Store/Host all-target/all-feature Clippy,
+      workspace check and scoped fmt/diff passed. Fresh retained versions only; mutable parent derive, unversioned baseline effects,
+      effectful structural mutation and public RPC remain open.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
@@ -1090,7 +1106,7 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
       effectful final-source removal/structural mutation, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
-      Schema v59.
+      Schema v60. Remote main verified at 4ddeed8; subsequent checkpoint local.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with
       their own high-water and ancestor-fenced tree traversal.
 - [ ] **Phases 5–6** — compose final typed leaf registries through one staging core;

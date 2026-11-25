@@ -6,8 +6,8 @@ use crate::{
     agent_host::{authorize_project_create, parse_project_ref, snapshot_in},
     agent_owner::{self, AgentKey, AgentPermission},
     construction_receipt::{
-        self, ConstructionCandidate, ConstructionOperation, ConstructionPreparation, InitialTask,
-        PreparationState,
+        self, require_matching_sources, validate_inspected_bindings, ConstructionCandidate,
+        ConstructionOperation, ConstructionPreparation, InitialTask, PreparationState,
     },
     db, history_owner, id, label, resources, sandbox_owner, stable_user_principal,
     store_scope::StoreScope,
@@ -276,25 +276,6 @@ fn require_versioned_baseline(coverage: SourceCoverage, baseline: &SourceSet) ->
     {
         return Err(Error::Conflict(
             "empty Auto restore admits only current ephemeral sources",
-        ));
-    }
-    Ok(())
-}
-
-fn require_matching_sources(set: &SourceSet, prepared: &PreparedSourceSet) -> Result<()> {
-    prepared.validate()?;
-    if prepared.operation != SourceOperationKind::Restore
-        || set.anchors.len() != prepared.sources.len()
-        || set
-            .anchors
-            .iter()
-            .zip(&prepared.sources)
-            .any(|(anchor, source)| {
-                anchor.name != source.name || anchor.driver != source.prepared.descriptor.driver
-            })
-    {
-        return Err(Error::Conflict(
-            "restore descriptors do not match the complete checkpoint SourceSet",
         ));
     }
     Ok(())
@@ -638,39 +619,8 @@ impl<'a> PreparedCheckpointRestore<'a> {
         let result = (|| {
             let registry = self.inspection_registry()?;
             let results = inspect(&registry, &self.anchors, self.sources())?;
-            if results.len() != self.anchors.anchors.len() {
-                return Err(Error::Conflict(
-                    "restore inspection requires the complete source set",
-                ));
-            }
-            let mut bindings = Vec::with_capacity(results.len());
-            let mut evidence = Vec::with_capacity(results.len());
-            for (anchor, result) in self.anchors.anchors.iter().zip(results) {
-                let RecoveryInspection::Completed {
-                    result: binding,
-                    evidence: proof,
-                } = result
-                else {
-                    return Err(Error::Conflict(
-                        "restore materialization is unresolved; inspect before retry",
-                    ));
-                };
-                binding.validate()?;
-                proof.validate()?;
-                if binding.name != anchor.name
-                    || binding.driver != anchor.driver
-                    || binding.source_ref != anchor.source_ref
-                    || binding.access != anchor.access
-                    || binding.checkpoint_policy != anchor.checkpoint_policy
-                {
-                    return Err(Error::Conflict(
-                        "restored binding differs from its checkpoint anchor",
-                    ));
-                }
-                registry.resolve(&binding.pin()?)?;
-                bindings.push(binding);
-                evidence.push(proof);
-            }
+            let (bindings, evidence) =
+                validate_inspected_bindings(&registry, &self.anchors, results)?;
             let registry = self.inspection_registry()?;
             for binding in &bindings {
                 registry.resolve(&binding.pin()?)?;
@@ -1206,6 +1156,7 @@ impl SessionStore {
             sources: None,
             capture_boundary: None,
             restore_boundary: Some(observed.boundary),
+            sandbox_boundary: None,
             result_ref: None,
             note: None,
         };
@@ -1441,6 +1392,7 @@ impl SessionStore {
             sources: Some(sources),
             capture_boundary: None,
             restore_boundary: Some(observed.boundary),
+            sandbox_boundary: None,
             result_ref: None,
             note: None,
         };

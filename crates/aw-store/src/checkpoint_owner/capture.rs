@@ -455,6 +455,7 @@ impl SessionStore {
             sources: Some(sources),
             capture_boundary: Some(boundary),
             restore_boundary: None,
+            sandbox_boundary: None,
             result_ref: None,
             note: None,
         };

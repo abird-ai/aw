@@ -3,17 +3,17 @@
 use crate::{
     actor_queue::{self, PreparedQueueCustody},
     agent_owner::{self, AgentKey, AgentPermission},
-    audit_with_security_metadata, db, label,
+    append_audit, db, label,
     resources::SessionCandidateIds,
     source_compatibility::{compatibility, SourceCompatibility},
-    user_for_principal, workspace_writer, ActorQueueRequest, Error, QueueTarget, Result,
-    SessionStore, SourceMutationBarrier, SourceMutationOutcome,
+    user_for_principal, workspace_writer, ActorQueueRequest, AuditOrigin, Error, QueueTarget,
+    Result, SessionStore, SourceMutationBarrier, SourceMutationOutcome,
 };
 use aw_agent_core::{
-    ExternalEvidence, NamedPreparedSource, PreparedSourceSet, PrincipalId, SourceDriverRegistry,
-    SourceDriverRegistryReader, SourceOperationKind, SourcePublicationFence,
-    SourcePublicationProof, SourceSetLimit, HARD_MAX_SOURCES_PER_SANDBOX,
-    MAX_SOURCE_ANCHOR_FIELDS_BYTES,
+    ExternalEvidence, NamedPreparedSource, PreparedSourceSet, PrincipalId, RecoveryInspection,
+    SourceBinding, SourceDriverRegistry, SourceDriverRegistryReader, SourceOperationKind,
+    SourcePublicationFence, SourcePublicationProof, SourceSet, SourceSetLimit,
+    HARD_MAX_SOURCES_PER_SANDBOX, MAX_SOURCE_ANCHOR_FIELDS_BYTES,
 };
 use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -259,7 +259,9 @@ pub(crate) struct ConstructionPreparation {
     pub(crate) operation: ConstructionOperation,
     pub(crate) scope: String,
     pub(crate) creator: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) parent_session_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) parent_branch_id: String,
     pub(crate) request_id: String,
     pub(crate) fingerprint: String,
@@ -273,6 +275,8 @@ pub(crate) struct ConstructionPreparation {
     pub(crate) capture_boundary: Option<crate::checkpoint_owner::capture::CaptureBoundary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) restore_boundary: Option<crate::checkpoint_owner::restore::RestoreBoundary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sandbox_boundary: Option<crate::sandbox_owner::construction::SandboxCreateBoundary>,
     pub(crate) result_ref: Option<String>,
     pub(crate) note: Option<String>,
 }
@@ -305,12 +309,31 @@ impl ConstructionPreparation {
     }
 
     fn validate(&self) -> Result<()> {
-        for id in [&self.parent_session_id, &self.parent_branch_id] {
-            label(id, 128)?;
-        }
+        let expected_scope = if self.operation == ConstructionOperation::SandboxCreate {
+            if !self.parent_session_id.is_empty() || !self.parent_branch_id.is_empty() {
+                return Err(Error::Storage(
+                    "Sandbox construction must not borrow an Agent origin",
+                ));
+            }
+            let boundary = self.sandbox_boundary.as_ref().ok_or(Error::Storage(
+                "Sandbox construction has no Project boundary",
+            ))?;
+            boundary.validate(&self.candidate, self.sources.as_ref())?;
+            self.creator.clone()
+        } else {
+            for id in [&self.parent_session_id, &self.parent_branch_id] {
+                label(id, 128)?;
+            }
+            if self.sandbox_boundary.is_some() {
+                return Err(Error::Storage(
+                    "Project construction boundary belongs to Sandbox creation",
+                ));
+            }
+            self.operation.scope(&self.creator, self.origin())
+        };
         crate::stable_user_principal(&self.creator)?;
         label(&self.request_id, 256)?;
-        if self.scope != self.operation.scope(&self.creator, self.origin())
+        if self.scope != expected_scope
             || !digest(&self.fingerprint)
             || (self.state == PreparationState::Applied) != self.result_ref.is_some()
             || self.note.as_ref().is_some_and(|note| note.len() > 8192)
@@ -468,7 +491,8 @@ struct LegacyTaskPreparation {
 }
 
 fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<ConstructionPreparation> {
-    let session: String = db(row.get(0))?;
+    let session: Option<String> = db(row.get(0))?;
+    let project: Option<String> = db(row.get(5))?;
     let action: String = db(row.get(1))?;
     let data = db(row.get_ref(3))?;
     let data = data
@@ -480,6 +504,9 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
     let receipt = if action == ACTION {
         crate::decode::<ConstructionPreparation>(data)?
     } else if action == "agent.create.preparation" {
+        let session = session
+            .as_ref()
+            .ok_or(Error::Storage("legacy receipt has no Session origin"))?;
         let legacy: LegacyTaskPreparation = crate::decode(data)?;
         // The original security audit fact captured the stable user. Do not
         // reinterpret an old raw principal through a possibly changed mapping.
@@ -499,7 +526,7 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
             return Err(Error::Denied("ambiguous legacy construction caller"));
         }
         let scope = ConstructionOperation::AgentCreate
-            .scope(&creator, AgentKey::new(&session, &legacy.parent_branch_id));
+            .scope(&creator, AgentKey::new(session, &legacy.parent_branch_id));
         ConstructionPreparation {
             operation: ConstructionOperation::AgentCreate,
             scope,
@@ -524,6 +551,7 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
             sources: None,
             capture_boundary: None,
             restore_boundary: None,
+            sandbox_boundary: None,
             result_ref: legacy.result_ref,
             note: legacy.note,
         }
@@ -531,7 +559,13 @@ fn decode_receipt(connection: &Connection, row: &Row<'_>) -> Result<Construction
         return Err(Error::Storage("invalid construction receipt action"));
     };
     receipt.validate()?;
-    if receipt.parent_session_id != session {
+    let matches_origin = match &receipt.sandbox_boundary {
+        Some(boundary) => {
+            session.is_none() && project.as_deref() == Some(boundary.project_ref.as_str())
+        }
+        None => project.is_none() && session.as_deref() == Some(receipt.parent_session_id.as_str()),
+    };
+    if !matches_origin {
         return Err(Error::Storage("construction receipt origin changed"));
     }
     Ok(receipt)
@@ -545,7 +579,7 @@ pub(crate) fn lookup_in(
     request_id: &str,
 ) -> Result<Option<ConstructionPreparation>> {
     let mut query = db(connection.prepare_cached(
-        "SELECT session_id,action,actor,data_json,created_at FROM audit
+        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
          WHERE action IN ('agent.create.preparation','construction.preparation')
            AND COALESCE(json_extract(data_json,'$.scope'),session_id||'/'||json_extract(data_json,'$.parent_branch_id'))=?1
            AND COALESCE(json_extract(data_json,'$.operation'),'agent_create')=?2
@@ -573,9 +607,13 @@ fn append_in(
         .map_err(|_| Error::Storage("cannot encode construction receipt"))?;
     // Recovery locators remain in the owner-private receipt, not security audit
     // presentation metadata. No model/tool result contains this receipt.
-    audit_with_security_metadata(
+    let origin = match &receipt.sandbox_boundary {
+        Some(boundary) => AuditOrigin::Project(&boundary.project_ref),
+        None => AuditOrigin::Session(&receipt.parent_session_id),
+    };
+    append_audit(
         tx,
-        &receipt.parent_session_id,
+        origin,
         actor,
         ACTION,
         data,
@@ -624,7 +662,15 @@ pub(crate) fn claim_in(
             return Err(Error::Conflict("checkpoint request already published"));
         }
     }
-    agent_owner::authorize_permission(tx, actor, receipt.origin(), AgentPermission::View)?;
+    if let Some(boundary) = &receipt.sandbox_boundary {
+        boundary.authorize(tx, actor, true)?;
+        let reader = registry.reader()?;
+        for anchor in &boundary.baseline.anchors {
+            reader.resolve(&anchor.pin()?)?;
+        }
+    } else {
+        agent_owner::authorize_permission(tx, actor, receipt.origin(), AgentPermission::View)?;
+    }
     append_in(tx, actor, receipt)
 }
 
@@ -717,7 +763,7 @@ pub(crate) fn require_task_baseline_claim_in(
         return Err(Error::Conflict("not a task-only baseline receipt"));
     }
     let mut query = db(connection.prepare_cached(
-        "SELECT session_id,action,actor,data_json,created_at FROM audit
+        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
          WHERE action IN ('agent.create.preparation','construction.preparation')
            AND COALESCE(json_extract(data_json,'$.scope'),session_id||'/'||json_extract(data_json,'$.parent_branch_id'))=?1
            AND COALESCE(json_extract(data_json,'$.operation'),'agent_create')='checkpoint_restore'
@@ -745,7 +791,7 @@ pub(crate) fn require_no_unresolved_task_restore_in(
     checkpoint: &str,
 ) -> Result<()> {
     let mut query = db(connection.prepare_cached(
-        "SELECT session_id,action,actor,data_json,created_at FROM audit
+        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
          WHERE action='construction.preparation'
            AND json_extract(data_json,'$.operation')='checkpoint_restore'
            AND json_extract(data_json,'$.state')='prepared'
@@ -784,7 +830,7 @@ fn require_original_source_claim_in(
     receipt: &ConstructionPreparation,
 ) -> Result<()> {
     let mut query = db(connection.prepare_cached(
-        "SELECT session_id,action,actor,data_json,created_at FROM audit
+        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
          WHERE action='construction.preparation'
            AND json_extract(data_json,'$.state')='prepared'
            AND json_type(data_json,'$.sources')='object'
@@ -1024,6 +1070,71 @@ pub(crate) fn record_atomic_restore_in(
     append_in(tx, actor, receipt)
 }
 
+pub(crate) fn require_matching_sources(
+    set: &SourceSet,
+    prepared: &PreparedSourceSet,
+) -> Result<()> {
+    prepared.validate()?;
+    if prepared.operation != SourceOperationKind::Restore
+        || set.anchors.len() != prepared.sources.len()
+        || set
+            .anchors
+            .iter()
+            .zip(&prepared.sources)
+            .any(|(anchor, source)| {
+                anchor.name != source.name || anchor.driver != source.prepared.descriptor.driver
+            })
+    {
+        return Err(Error::Conflict(
+            "restore descriptors do not match the complete SourceSet",
+        ));
+    }
+    Ok(())
+}
+
+/// Shared restore inspection result validation, independent of which
+/// resource constructor owns the original Prepared materializations.
+pub(crate) fn validate_inspected_bindings(
+    registry: &SourceDriverRegistryReader,
+    anchors: &SourceSet,
+    results: Vec<RecoveryInspection<SourceBinding>>,
+) -> Result<(Vec<SourceBinding>, Vec<ExternalEvidence>)> {
+    if results.len() != anchors.anchors.len() {
+        return Err(Error::Conflict(
+            "restore inspection requires the complete source set",
+        ));
+    }
+    let mut bindings = Vec::with_capacity(results.len());
+    let mut evidence = Vec::with_capacity(results.len());
+    for (anchor, result) in anchors.anchors.iter().zip(results) {
+        let RecoveryInspection::Completed {
+            result: binding,
+            evidence: proof,
+        } = result
+        else {
+            return Err(Error::Conflict(
+                "restore materialization is unresolved; inspect before retry",
+            ));
+        };
+        binding.validate()?;
+        proof.validate()?;
+        if binding.name != anchor.name
+            || binding.driver != anchor.driver
+            || binding.source_ref != anchor.source_ref
+            || binding.access != anchor.access
+            || binding.checkpoint_policy != anchor.checkpoint_policy
+        {
+            return Err(Error::Conflict(
+                "restored binding differs from its source anchor",
+            ));
+        }
+        registry.resolve(&binding.pin()?)?;
+        bindings.push(binding);
+        evidence.push(proof);
+    }
+    Ok((bindings, evidence))
+}
+
 /// The common source-bearing publication boundary. Resource owners supply
 /// their exact in-transaction authority revalidation and publication using
 /// their existing lower constructors. All external guards are owned here
@@ -1089,6 +1200,7 @@ fn current_claim_in(
         || claim.sources != receipt.sources
         || claim.capture_boundary != receipt.capture_boundary
         || claim.restore_boundary != receipt.restore_boundary
+        || claim.sandbox_boundary != receipt.sandbox_boundary
     {
         return Err(Error::Storage(
             "prepared source receipt changed its recovery identity",
@@ -1097,22 +1209,25 @@ fn current_claim_in(
     Ok(receipt)
 }
 
-/// Exact original restore provenance of a published Sandbox. The initial
-/// claim index is keyed by candidate Session ID; sharing Agents cannot
-/// substitute their own restore or another operation's descriptors.
+/// Exact original materialization provenance of a published Sandbox.
+/// Both Agent restore and standalone Project construction retain the
+/// original Prepared identity; sharing Agents cannot substitute it.
 pub(crate) fn restored_sources_for_sandbox_in(
     connection: &Connection,
     sandbox: &str,
 ) -> Result<PreparedSourceSet> {
     let mut query = db(connection.prepare_cached(
-        "SELECT session_id,action,actor,data_json,created_at FROM audit
+        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
          WHERE action='construction.preparation'
            AND json_extract(data_json,'$.state')='prepared'
            AND json_type(data_json,'$.sources')='object'
-           AND json_extract(data_json,'$.operation')='checkpoint_restore'
            AND json_extract(data_json,'$.candidate.sandbox')=?1
-           AND json_extract(data_json,'$.sources.prepare_id') IN (
-               SELECT session_id FROM agent_state_current WHERE sandbox_id=?1
+           AND (
+               json_extract(data_json,'$.operation')='sandbox_create'
+               OR (json_extract(data_json,'$.operation')='checkpoint_restore'
+                   AND json_extract(data_json,'$.sources.prepare_id') IN (
+                       SELECT session_id FROM agent_state_current WHERE sandbox_id=?1
+                   ))
            )
          LIMIT 2",
     ))?;
@@ -1129,6 +1244,21 @@ pub(crate) fn restored_sources_for_sandbox_in(
         ));
     }
     let receipt = current_claim_in(connection, &claim)?;
+    if let ConstructionCandidate::Sandbox { sandbox: original } = &receipt.candidate {
+        if receipt.operation != ConstructionOperation::SandboxCreate
+            || receipt.state != PreparationState::Applied
+            || receipt.sandbox_boundary.is_none()
+            || original != sandbox
+            || receipt.result_ref.as_deref() != Some(sandbox)
+        {
+            return Err(Error::Denied(
+                "standalone Sandbox construction has not been applied",
+            ));
+        }
+        return receipt
+            .sources
+            .ok_or(Error::Storage("original Sandbox source custody missing"));
+    }
     let ConstructionCandidate::Agent {
         session,
         branch,
@@ -1182,7 +1312,7 @@ pub(crate) fn visit_unresolved_sources(
     // current receipt is malformed. The unique preparation index bounds
     // this scan to source-bearing claims, not the Session audit history.
     let mut query = db(connection.prepare(
-        "SELECT session_id,action,actor,data_json,created_at FROM audit
+        "SELECT session_id,action,actor,data_json,created_at,project_ref FROM audit
          WHERE action='construction.preparation'
            AND json_extract(data_json,'$.state')='prepared'
            AND json_type(data_json,'$.sources')='object'",
@@ -1212,7 +1342,12 @@ pub(crate) fn visit_unresolved_sources(
                     status = SourceCompatibility::RecoveryRequired;
                 }
             }
-            if let Some(set) = &restore_set {
+            if let Some(set) = restore_set.as_ref().or_else(|| {
+                receipt
+                    .sandbox_boundary
+                    .as_ref()
+                    .map(|boundary| &boundary.baseline)
+            }) {
                 if compatibility(registry, &set.anchors[index].pin()?)?
                     == SourceCompatibility::RecoveryRequired
                 {
@@ -1336,6 +1471,16 @@ mod tests {
             .unwrap();
             (creator, reference)
         };
+        let original_legacy_fact: (u64, String, String, i64) = {
+            let connection = store.connection().unwrap();
+            db(connection.query_row(
+                "SELECT seq,actor,data_json,created_at FROM audit
+                 WHERE action='agent.create.preparation' AND session_id=?1",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ))
+            .unwrap()
+        };
         drop(store);
         {
             let connection = Connection::open(temp.0.join("sessions.sqlite3")).unwrap();
@@ -1368,6 +1513,14 @@ mod tests {
                     .unwrap(),
                 crate::LATEST_SCHEMA_VERSION
             );
+            let migrated_legacy_fact: (u64, String, String, i64) = db(connection.query_row(
+                "SELECT seq,actor,data_json,created_at FROM audit
+                 WHERE action='agent.create.preparation' AND session_id=?1 AND project_ref IS NULL",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ))
+            .unwrap();
+            assert_eq!(original_legacy_fact, migrated_legacy_fact);
             let scope = ConstructionOperation::AgentCreate.scope(&creator, origin);
             let legacy = lookup_in(
                 &connection,
@@ -1398,6 +1551,7 @@ mod tests {
             sources: Some(sources),
             capture_boundary: None,
             restore_boundary: None,
+            sandbox_boundary: None,
             result_ref: None,
             note: None,
         };

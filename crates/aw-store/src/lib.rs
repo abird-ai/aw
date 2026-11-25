@@ -210,11 +210,12 @@ pub use routing::*;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub use sandbox_owner::source_bindings::VersionedSourceBinding;
 pub use sandbox_owner::{
-    EffectiveSourceBinding, PreparedSandboxEffect, SandboxEffectAuthority, SandboxEffectLaunch,
-    SandboxEffectLease, SandboxEffectOrigin, SandboxEffectOutcome, SandboxEffectPlan,
-    SandboxEffectRequest, SandboxGrantObservation, SandboxGrantPolicy, SandboxGrantStatus,
-    SandboxLifecycle, SandboxPolicyEvidence, SandboxSnapshot, SandboxSourceGrant,
-    SandboxToolRecovery, SandboxToolTerminalRef, SourceBindingCompatibility, SourceBindingSummary,
+    EffectiveSourceBinding, InspectedSandboxCreate, PreparedSandboxCreate, PreparedSandboxEffect,
+    SandboxEffectAuthority, SandboxEffectLaunch, SandboxEffectLease, SandboxEffectOrigin,
+    SandboxEffectOutcome, SandboxEffectPlan, SandboxEffectRequest, SandboxGrantObservation,
+    SandboxGrantPolicy, SandboxGrantStatus, SandboxLifecycle, SandboxPolicyEvidence,
+    SandboxSnapshot, SandboxSourceGrant, SandboxToolRecovery, SandboxToolTerminalRef,
+    SourceBindingCompatibility, SourceBindingSummary,
 };
 #[cfg(feature = "pipelines")]
 pub use schedules::*;
@@ -332,7 +333,9 @@ pub const CONSTRUCTION_RECEIPT_SCHEMA: &str =
 pub const SANDBOX_GRANT_SCHEMA: &str = include_str!("../migrations/058_sandbox_grants.sql");
 pub const VAULT_GRANT_SCHEMA: &str = include_str!("../migrations/059_vault_grants.sql");
 const APPLICATION_ID: i64 = 0x41575333;
-const LATEST_SCHEMA_VERSION: i64 = 59;
+const PROJECT_CONSTRUCTION_ORIGIN_SCHEMA: &str =
+    include_str!("../migrations/060_project_construction_origin.sql");
+const LATEST_SCHEMA_VERSION: i64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreMode {
@@ -854,21 +857,58 @@ pub(crate) fn audit_with_security_metadata(
     data: serde_json::Value,
     security_metadata: Option<serde_json::Value>,
 ) -> Result<()> {
+    append_audit(
+        conn,
+        AuditOrigin::Session(session),
+        actor,
+        action,
+        data,
+        security_metadata,
+    )
+}
+
+pub(crate) enum AuditOrigin<'a> {
+    Session(&'a str),
+    Project(&'a str),
+}
+
+pub(crate) fn append_audit(
+    conn: &Connection,
+    origin: AuditOrigin<'_>,
+    actor: &PrincipalId,
+    action: &str,
+    data: serde_json::Value,
+    security_metadata: Option<serde_json::Value>,
+) -> Result<()> {
     let created = now();
     let encoded = json(&data)?;
     let security_metadata = security_metadata.as_ref().map(json).transpose()?;
     let security_data = security_metadata.as_deref().unwrap_or(&encoded);
-    db(conn.execute(
-        "INSERT INTO audit(session_id,actor,action,data_json,created_at) VALUES(?1,?2,?3,?4,?5)",
-        params![session, actor.as_str(), action, encoded, created],
-    ))?;
+    let (kind, reference) = match origin {
+        AuditOrigin::Session(session) => {
+            // Keep the ordinary Session writer compatible with old schema
+            // migration and repair paths.
+            db(conn.execute(
+                "INSERT INTO audit(session_id,actor,action,data_json,created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![session, actor.as_str(), action, encoded, created],
+            ))?;
+            ("session", session)
+        }
+        AuditOrigin::Project(project) => {
+            db(conn.execute(
+                "INSERT INTO audit(project_ref,actor,action,data_json,created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![project, actor.as_str(), action, encoded, created],
+            ))?;
+            ("project", project)
+        }
+    };
     let user = ensure_user_for_principal(conn, actor)?;
     let store: String = db(conn.query_row(
         "SELECT value FROM store_meta WHERE key='store_id'",
         [],
         |r| r.get(0),
     ))?;
-    db(conn.execute("INSERT INTO security_audit_events(audit_id,store_id,realm_id,actor_user_id,action,resource_type,resource_id,outcome,metadata_json,created_at) SELECT ?1,?2,u.realm_id,?3,?4,'session',?5,'allowed',?6,?7 FROM users u WHERE u.user_id=?3",params![id("audit")?,store,user,action,session,security_data,created]))?;
+    db(conn.execute("INSERT INTO security_audit_events(audit_id,store_id,realm_id,actor_user_id,action,resource_type,resource_id,outcome,metadata_json,created_at) SELECT ?1,?2,u.realm_id,?3,?4,?5,?6,'allowed',?7,?8 FROM users u WHERE u.user_id=?3",params![id("audit")?,store,user,action,kind,reference,security_data,created]))?;
     Ok(())
 }
 
@@ -3049,6 +3089,15 @@ fn initialize(c: &mut Connection) -> Result<()> {
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current == 58 {
         migrate_source_schema(c, 59, "vault-grants", VAULT_GRANT_SCHEMA)?;
+    }
+    let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if current == 59 {
+        migrate_source_schema(
+            c,
+            60,
+            "project-construction-origin",
+            PROJECT_CONSTRUCTION_ORIGIN_SCHEMA,
+        )?;
     }
     let current: i64 = db(c.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     if current >= 38 {
