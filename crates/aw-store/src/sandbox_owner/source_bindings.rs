@@ -319,6 +319,7 @@ enum SourceChange<'a> {
     Attached {
         event_id: &'a str,
         prepare_id: &'a str,
+        replaced_materialization: Option<&'a str>,
     },
 }
 
@@ -354,8 +355,12 @@ fn publish_source_change_in(
         SourceChange::Attached {
             event_id,
             prepare_id,
+            replaced_materialization,
         } => {
             payload["materialization_prepare_id"] = prepare_id.into();
+            if let Some(released) = replaced_materialization {
+                payload["replaced_materialization"] = released.into();
+            }
             Some(event_id)
         }
     };

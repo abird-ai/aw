@@ -17,7 +17,7 @@ pub(crate) const SOURCE_RELEASE_PREFIX: &str = "sandbox-source-release:";
 
 // The existing sources.changed fact proves release of this exact original
 // descriptor. No additional provenance table or operation ledger.
-fn release_event_id(sandbox: &str, source: &NamedPreparedSource) -> Result<String> {
+pub(super) fn release_event_id(sandbox: &str, source: &NamedPreparedSource) -> Result<String> {
     let descriptor = &source.prepared.descriptor;
     let identity = crate::json(&(
         sandbox,
@@ -37,7 +37,11 @@ fn released_in(c: &Connection, sandbox: &str, source: &NamedPreparedSource) -> R
         "SELECT EXISTS(SELECT 1 FROM commit_log WHERE event_id=?1
          AND entity_type='sandbox' AND entity_id=?2 AND kind='sandbox.sources.changed'
          AND json_extract(payload_json,'$.source_name')=?3
-         AND json_extract(payload_json,'$.released')=1)",
+         AND json_extract(payload_json,'$.released')=1)
+         OR EXISTS(SELECT 1 FROM commit_log
+         WHERE entity_type='sandbox' AND entity_id=?2 AND kind='sandbox.sources.changed'
+         AND json_extract(payload_json,'$.source_name')=?3
+         AND json_extract(payload_json,'$.replaced_materialization')=?1)",
         params![
             release_event_id(sandbox, source)?,
             sandbox,

@@ -53,7 +53,9 @@ impl SourceMutationSet {
         bindings: impl ExactSizeIterator<Item = &'a SourceBinding> + Clone,
         anchor: &'a SourceAnchor,
     ) -> Result<Self> {
-        let count = bindings.len() + 1;
+        // A replacement consumes one named slot, but fences both the
+        // old and incoming source identities until the atomic change.
+        let count = bindings.len() + usize::from(!bindings.clone().any(|b| b.name == anchor.name));
         validate_source_set_hard_limit(count)?;
         anchor.validate()?;
         for binding in bindings.clone() {

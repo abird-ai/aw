@@ -23,6 +23,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod replacement;
+
 struct RestorePlan {
     anchor: GitSourceAnchor,
     origin: SourceBinding,
@@ -452,6 +454,12 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 
 fn check_fresh(repo: &Repository, target: &Path) -> Result<()> {
     absent(target)?;
+    check_destination(repo, target, false)
+}
+
+// Allow the exact target registration only after its original checkout
+// was independently verified in this same common repository.
+fn check_destination(repo: &Repository, target: &Path, exact_occupant: bool) -> Result<()> {
     if overlaps(target, &repo.common) || overlaps(target, &repo.git_dir) {
         return Err(Error::Denied(
             "Git restore destination overlaps repository administration",
@@ -468,7 +476,12 @@ fn check_fresh(repo: &Repository, target: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    let mut occupant = exact_occupant;
     for worktree in repo.worktrees().map_err(git_error)? {
+        if occupant && worktree.path == target {
+            occupant = false;
+            continue;
+        }
         if overlaps(target, &worktree.path) {
             return Err(Error::Denied(
                 "Git restore destination overlaps a registered worktree",
@@ -484,6 +497,11 @@ fn check_fresh(repo: &Repository, target: &Path) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+    }
+    if occupant {
+        return Err(Error::Conflict(
+            "approved Git destination registration disappeared",
+        ));
     }
     Ok(())
 }
@@ -589,16 +607,18 @@ fn require_released_at(
     prepared: &PreparedSourceOperation,
 ) -> Result<()> {
     check_fresh(origin, target)?;
-    let check_parent = || {
-        if parent_stamp(target)? != expected_parent {
-            return Err(Error::Conflict("Git restore destination parent changed"));
-        }
-        Ok(())
-    };
+    require_marker_absent(origin, prepared)?;
+    if parent_stamp(target)? != expected_parent {
+        return Err(Error::Conflict("Git restore destination parent changed"));
+    }
+    Ok(())
+}
+
+fn require_marker_absent(origin: &Repository, prepared: &PreparedSourceOperation) -> Result<()> {
     let admin = origin.common.join("worktrees");
     let entries = match fs::read_dir(&admin) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return check_parent(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
     let expected = format!("{}\n", lock_reason(prepared));
@@ -616,7 +636,7 @@ fn require_released_at(
             ));
         }
     }
-    check_parent()
+    Ok(())
 }
 
 fn restored_repo(
@@ -747,6 +767,15 @@ impl GitSourceDriver {
         anchor: &GitSourceAnchor,
         prepare_id: &str,
     ) -> Result<PreparedSourceOperation> {
+        let repo = self.approved_restore_origin(location, anchor)?;
+        Self::plan_restore_in(&repo, anchor, &location.target, prepare_id)
+    }
+
+    fn approved_restore_origin(
+        &self,
+        location: &GitRestoreLocation,
+        anchor: &GitSourceAnchor,
+    ) -> Result<Repository> {
         if location.name != anchor.name {
             return Err(Error::Denied("Git restore approval names another source"));
         }
@@ -759,7 +788,7 @@ impl GitSourceDriver {
                 "Git restore approval differs from repository root",
             ));
         }
-        Self::plan_restore_in(&repo, anchor, &location.target, prepare_id)
+        Ok(repo)
     }
 
     /// Before executing or inspecting any original descriptor, require the
@@ -807,6 +836,18 @@ impl GitSourceDriver {
         target: &Path,
         prepare_id: &str,
     ) -> Result<PreparedSourceOperation> {
+        check_fresh(repo, target)?;
+        Self::prepare_restore_at(repo, anchor, target, prepare_id)
+    }
+
+    // Common descriptor planning. The caller has checked the destination
+    // is either fresh or occupied only by an exact releasable predecessor.
+    fn prepare_restore_at(
+        repo: &Repository,
+        anchor: &GitSourceAnchor,
+        target: &Path,
+        prepare_id: &str,
+    ) -> Result<PreparedSourceOperation> {
         verify_retained(repo, anchor)?;
         let origin = binding_for_repo(
             repo,
@@ -820,7 +861,6 @@ impl GitSourceDriver {
             target: target.to_owned(),
             parent_stamp: parent_stamp(target)?,
         };
-        check_fresh(repo, target)?;
         plan.trees(repo)?;
         plan.prepare(prepare_id)
     }
@@ -1048,15 +1088,27 @@ impl GitSourceDriver {
             Ok(_) => {}
         }
 
-        let child = restored_repo(&origin, plan, prepared)?;
+        let child = self.releasable_checkout(&origin, plan, prepared, binding)?;
+        remove_verified_restore(&origin, &child, plan, prepared)
+    }
+
+    fn releasable_checkout(
+        &self,
+        origin: &Repository,
+        plan: &RestorePlan,
+        prepared: &PreparedSourceOperation,
+        binding: &SourceBinding,
+    ) -> Result<Repository> {
+        plan.require_binding(binding)?;
+        let child = restored_repo(origin, plan, prepared)?;
         PrivateIndexes::require_absent(&child, &prepared.descriptor.prepared_identity)?;
         if plan.binding(&child)? != *binding {
             return Err(Error::Conflict("Git retirement checkout identity changed"));
         }
-        let trees = plan.trees(&origin)?;
+        let trees = plan.trees(origin)?;
         verify_restored(&child, &trees.base, trees.captured())?;
-        validate_restored_repo(&origin, &child, plan, prepared)?;
-        remove_verified_restore(&origin, &child, plan, prepared)
+        validate_restored_repo(origin, &child, plan, prepared)?;
+        Ok(child)
     }
 
     /// Reconcile only the original unpublished candidate, under separately

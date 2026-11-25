@@ -2,8 +2,8 @@
 //! Same Project receipt, source coordinator and binding publication owner.
 use super::{
     insert_at_revision, next_source_rev, publish_source_change_in,
-    release::{observe_managed_in, ManagedMutation},
-    retained_in, SourceChange, VersionedSourceBinding,
+    release::{observe_managed_in, release_event_id, ManagedMutation},
+    remove_binding_in, retained_in, SourceChange, VersionedSourceBinding,
 };
 use crate::{
     construction_receipt::{
@@ -34,6 +34,8 @@ pub(crate) struct AttachmentBoundary {
     layout_digest: String,
     bindings: Vec<VersionedSourceBinding>,
     baseline: SourceSet,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    replace: bool,
 }
 
 fn matches_anchor(anchor: &SourceAnchor, binding: &SourceBinding) -> bool {
@@ -72,14 +74,21 @@ impl AttachmentBoundary {
         }
         next_source_rev(self.expected_rev)?;
         self.baseline.validate()?;
-        validate_source_set_hard_limit(self.bindings.len() + 1)?;
+        validate_source_set_hard_limit(self.bindings.len() + usize::from(!self.replace))?;
+        if self
+            .bindings
+            .iter()
+            .any(|binding| binding.binding.name == self.anchor().name)
+            != self.replace
+        {
+            return Err(Error::Conflict(
+                "materialization selection differs from old named bindings",
+            ));
+        }
         for binding in &self.bindings {
             binding.validate()?;
-            if binding.binding_rev > self.expected_rev || binding.binding.name == self.anchor().name
-            {
-                return Err(Error::Conflict(
-                    "attachment must select an absent named binding",
-                ));
+            if binding.binding_rev > self.expected_rev {
+                return Err(Error::Conflict("materialization binding revision changed"));
             }
         }
         if self
@@ -141,14 +150,17 @@ impl AttachmentBoundary {
             || snapshot.lifecycle != SandboxLifecycle::Open
             || snapshot.layout_digest != self.layout_digest
             || snapshot.project_ref != self.project_ref
-            || bindings.len() != self.bindings.len() + 1
+            || bindings.len() != self.bindings.len() + usize::from(!self.replace)
             || !bindings.iter().any(|binding| {
                 binding.binding_rev == rev && matches_anchor(self.anchor(), &binding.binding)
             })
             || !bindings
                 .iter()
                 .filter(|binding| binding.binding.name != self.anchor().name)
-                .eq(&self.bindings)
+                .eq(self
+                    .bindings
+                    .iter()
+                    .filter(|binding| binding.binding.name != self.anchor().name))
             || attached_id_in(c, sandbox, &self.anchor().name, rev)?.as_deref() != Some(prepare_id)
         {
             return Err(Error::Conflict(
@@ -250,11 +262,25 @@ impl SandboxAttachment {
     pub fn anchor(&self) -> &SourceAnchor {
         &self.baseline.anchors[0]
     }
+
+    /// The original selected binding and exact Applied descriptor for a
+    /// replacement; absent for an attachment. Neither grants disposal.
+    pub fn replaced(&self) -> Option<(&VersionedSourceBinding, &NamedPreparedSource)> {
+        self.layout
+            .bindings
+            .iter()
+            .zip(&self.layout.preparations)
+            .find(|(binding, _)| binding.binding.name == self.anchor().name)
+    }
 }
 
-fn fingerprint(sandbox: &str, rev: u64, anchor: &SourceAnchor) -> Result<String> {
+fn fingerprint(sandbox: &str, rev: u64, anchor: &SourceAnchor, replace: bool) -> Result<String> {
     let mut hash = Sha256::new();
-    hash.update(b"aw-sandbox-attach-version-v1\0");
+    hash.update(if replace {
+        b"aw-sandbox-replace-version-v1\0".as_slice()
+    } else {
+        b"aw-sandbox-attach-version-v1\0".as_slice()
+    });
     hash.update(crate::json(&(sandbox, rev, anchor))?.as_bytes());
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -428,6 +454,9 @@ impl<'a> PreparedSandboxAttachment<'a> {
         }
     }
 
+    /// Reconcile the private candidate. For replacement, additionally
+    /// prove the original published materialization is intact; an
+    /// unresolved post-release gap cannot be rejected.
     pub fn abandon<F>(
         self,
         reconcile: impl FnOnce(
@@ -457,6 +486,9 @@ pub struct InspectedSandboxAttachment<'a> {
 }
 
 impl InspectedSandboxAttachment<'_> {
+    /// Verify the exact incoming materialization and, for replacement,
+    /// positive release of the original descriptor. The returned live
+    /// whole-set fence covers both through the one binding publication.
     pub fn publish<F: SourcePublicationFence>(
         self,
         verify: impl FnOnce(
@@ -490,6 +522,12 @@ impl InspectedSandboxAttachment<'_> {
                     let sandbox = &attach.observation.snapshot().canonical_ref;
                     let rev = next_source_rev(boundary.expected_rev)?;
                     registry.resolve(&self.binding.pin()?)?;
+                    let released = if let Some((old, original)) = attach.observation.replaced() {
+                        remove_binding_in(tx, sandbox, &old.binding.name, old.binding_rev)?;
+                        Some(release_event_id(sandbox, original)?)
+                    } else {
+                        None
+                    };
                     insert_at_revision(tx, sandbox, std::slice::from_ref(&self.binding), rev)?;
                     let event = attachment_event_id(sandbox, &self.binding.name, rev)?;
                     publish_source_change_in(
@@ -501,6 +539,7 @@ impl InspectedSandboxAttachment<'_> {
                         SourceChange::Attached {
                             event_id: &event,
                             prepare_id: attach.receipt.candidate.prepare_id(),
+                            replaced_materialization: released.as_deref(),
                         },
                     )?;
                     Ok((
@@ -529,6 +568,29 @@ impl SessionStore {
         request_id: &str,
         anchor: &SourceAnchor,
     ) -> Result<Option<SandboxSnapshot>> {
+        self.replay_materialization(actor, sandbox, expected_rev, request_id, anchor, false)
+    }
+
+    pub fn sandbox_replay_replacement(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        expected_rev: u64,
+        request_id: &str,
+        anchor: &SourceAnchor,
+    ) -> Result<Option<SandboxSnapshot>> {
+        self.replay_materialization(actor, sandbox, expected_rev, request_id, anchor, true)
+    }
+
+    fn replay_materialization(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        expected_rev: u64,
+        request_id: &str,
+        anchor: &SourceAnchor,
+        replace: bool,
+    ) -> Result<Option<SandboxSnapshot>> {
         owner(self)?;
         let mut connection = self.connection()?;
         let tx = db(connection.transaction())?;
@@ -536,7 +598,7 @@ impl SessionStore {
         let result = match receipt {
             None => None,
             Some(receipt) => {
-                if receipt.fingerprint != fingerprint(sandbox, expected_rev, anchor)? {
+                if receipt.fingerprint != fingerprint(sandbox, expected_rev, anchor, replace)? {
                     return Err(Error::Conflict("attachment request differs from original"));
                 }
                 if receipt.state != PreparationState::Applied
@@ -565,6 +627,48 @@ impl SessionStore {
         anchor: SourceAnchor,
         plan: impl FnOnce(&SandboxAttachment, &str) -> Result<PreparedSourceOperation>,
     ) -> Result<PreparedSandboxAttachment<'_>> {
+        self.prepare_materialization(
+            actor,
+            sandbox,
+            expected_rev,
+            request_id,
+            (anchor, false),
+            plan,
+        )
+    }
+
+    /// Replace the occupied name using the same original materialization
+    /// receipt. The trusted host must reconcile disposal of the old exact
+    /// descriptor and hold its proof together with the incoming proof.
+    pub fn sandbox_prepare_replacement(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        expected_rev: u64,
+        request_id: &str,
+        anchor: SourceAnchor,
+        plan: impl FnOnce(&SandboxAttachment, &str) -> Result<PreparedSourceOperation>,
+    ) -> Result<PreparedSandboxAttachment<'_>> {
+        self.prepare_materialization(
+            actor,
+            sandbox,
+            expected_rev,
+            request_id,
+            (anchor, true),
+            plan,
+        )
+    }
+
+    fn prepare_materialization(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        expected_rev: u64,
+        request_id: &str,
+        selection: (SourceAnchor, bool),
+        plan: impl FnOnce(&SandboxAttachment, &str) -> Result<PreparedSourceOperation>,
+    ) -> Result<PreparedSandboxAttachment<'_>> {
+        let (anchor, replace) = selection;
         owner(self)?;
         anchor.validate()?;
         let (creator, observation, scope) = {
@@ -572,13 +676,15 @@ impl SessionStore {
             let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let creator = new_request(&tx, actor, sandbox, request_id)?;
             let layout = observe_managed_in(self, &tx, actor, sandbox, expected_rev)?;
-            self.source_set_limit().admit(layout.bindings.len() + 1)?;
+            self.source_set_limit()
+                .admit(layout.bindings.len() + usize::from(!replace))?;
             if layout
                 .bindings
                 .iter()
                 .any(|binding| binding.binding.name == anchor.name)
+                != replace
             {
-                return Err(Error::Conflict("attachment requires an absent source name"));
+                return Err(Error::Conflict("source materialization requires the selected name to match its attach/replace mode"));
             }
             self.inner
                 .source_drivers
@@ -612,6 +718,7 @@ impl SessionStore {
             layout_digest: observation.snapshot().layout_digest.clone(),
             bindings: observation.bindings().to_vec(),
             baseline: observation.baseline.clone(),
+            replace,
         };
         let receipt = ConstructionPreparation {
             operation: ConstructionOperation::SandboxSourceAttach,
@@ -620,7 +727,7 @@ impl SessionStore {
             parent_session_id: String::new(),
             parent_branch_id: String::new(),
             request_id: request_id.to_owned(),
-            fingerprint: fingerprint(sandbox, expected_rev, boundary.anchor())?,
+            fingerprint: fingerprint(sandbox, expected_rev, boundary.anchor(), replace)?,
             state: PreparationState::Prepared,
             candidate: ConstructionCandidate::SandboxAttachment {
                 sandbox: sandbox.to_owned(),
@@ -716,6 +823,21 @@ impl SessionStore {
         }))
     }
 
+    /// Reclaim the original Prepared owner for explicit driver recovery.
+    /// This is not permission to repeat an uncertain materialization.
+    /// A continuation must prove exact absence of surviving effects first.
+    pub fn sandbox_recover_attachment(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+    ) -> Result<PreparedSandboxAttachment<'_>> {
+        self.resume_attachment(actor, sandbox, request_id, false)?
+            .ok_or(Error::Conflict(
+                "materialization has no unresolved candidate",
+            ))
+    }
+
     pub fn sandbox_inspect_attachment(
         &self,
         actor: &PrincipalId,
@@ -727,8 +849,7 @@ impl SessionStore {
             &PreparedSourceOperation,
         ) -> Result<RecoveryInspection<SourceBinding>>,
     ) -> Result<InspectedSandboxAttachment<'_>> {
-        self.resume_attachment(actor, sandbox, request_id, false)?
-            .ok_or(Error::Conflict("attachment has no unresolved candidate"))?
+        self.sandbox_recover_attachment(actor, sandbox, request_id)?
             .inspect(inspect)
     }
 

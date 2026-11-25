@@ -1159,13 +1159,37 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       Host 16/16; strict affected Clippy, workspace all-target/all-feature
       check and scoped fmt/diff passed. Earlier broad Store 239/244 not rerun.
       Schema v60 unchanged.
+      **Atomic versioned managed-source replacement landed:** same attachment
+      Prepared owner (explicit replace selection, old attach encoding preserved),
+      original old bindings + exact incoming Restore descriptor, complete old/
+      incoming backing identity claim at resulting named-slot limit. Reuse
+      original release and materialization; single binding CAS, old-release
+      identity + incoming provenance in same changed fact, Applied and barrier
+      settlement. Git permits occupied destination only when exact old checkout
+      releasable; independently authorized complete physical fence covers both
+      origins. Reject old edits and incoming dependence on released derive
+      retention. Publication proves exact new checkout and old registration/
+      retention gone. Inspect-only resume; untouched abandon only; explicit
+      post-release gap continuation requires positive absence of surviving new
+      effects and reconciles original release before original restore. Unknown
+      partial incoming remains held. Real grouped Host lifecycle covers old
+      dirty refusal, untouched abandon, third backing at two-name limit,
+      gap/unsafe-abandon refusal, continuation, failed publication/restart,
+      exact replay, preserved sibling, derive retention release, mixed-origin
+      retirement and same-common replacement/final removal. Schema unchanged;
+      first realization unused private named layout, cwd=root. Empty-layout
+      attachment, partial replacement recovery and bound-Agent cases remain.
+      Final Git 33/33, construction 1/1, Sandbox 4/4, Checkpoint 4/4, source
+      barrier 1/1, Host 16/16; strict affected Clippy, workspace all-target/
+      all-feature check and scoped fmt/diff passed. Earlier broad Store
+      239/244 not rerun.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production host policy/physical authority configuration, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
-      effectful replacement/empty-layout attachment and other structural removal cases, remaining Vault broker/socket/file/other env,
+      empty-layout attachment, partial replacement recovery and other structural removal cases, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v60. Remote main verified at 4ddeed8; subsequent checkpoint local.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

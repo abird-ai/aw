@@ -58,8 +58,9 @@ source detachment, independently approved multi-source native filesystem
 realization, durable native artifact custody/recovery and exact Store-backed Git
 native approval provisioning, shared finite Vault Process settlement, v60
 Project-scoped standalone versioned Sandbox construction, same-Project
-required-source Sandbox derivation, exact managed-source structural removal and
-versioned attachment with per-binding materialization provenance are implemented locally.
+required-source Sandbox derivation, exact managed-source structural removal,
+versioned attachment and replacement with per-binding materialization provenance
+are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2751,6 +2752,43 @@ Host 16/16; strict Store/Host all-target/all-feature Clippy, workspace
 all-target/all-feature check and scoped fmt/diff passed. Earlier broad Store
 239/244 not rerun.
 
+Versioned replacement of an occupied managed source reuses the SandboxAttachment
+receipt with an explicit replace selection (old attach encoding/fingerprint
+unchanged). Original old binding set and provenance plus incoming Restore
+descriptor are claimed before any effect. Complete old+incoming identities share
+one barrier; admission count is the resulting named count, not the temporary
+union of backing identities. No new schema, ledger or driver descriptor kind.
+One publication removes the exact old binding generation, inserts the new at
+next Sandbox rev, records incoming Prepared provenance and old release identity
+in the same sources.changed fact, marks Applied and settles the barrier.
+Existing per-binding lookup and later retirement require exact prior release;
+no intermediate visible remove/attach. Git read-only planning admits an occupied
+destination only after verifying the exact releasable original checkout; verifies
+incoming independently retained version and both independently approved origins.
+First effect releases original with existing restore/derive cleanup, then
+materializes the exact new Restore descriptor. Old private derived retention
+cannot serve as the incoming anchor. Publication checks exact incoming checkout,
+absence of old registration/marker and old derived retention/scratch (same
+common repo allows only the verified new registration). Normal resume is
+inspection-only; untouched original with no incoming registration can be
+abandoned. Explicit post-release continuation requires target and incoming
+registration/marker absent, reconciles exact old release, verifies positive
+incoming absence again, then executes the original descriptor under a newly
+authorized complete-set fence. No automatic retry or rejection after release;
+ambiguous or partial incoming effects stay held. No post-publication old-tree
+edits discarded. First concrete path remains unused private named-child layout,
+cwd=root, same destination, no unaccounted aliases/dependencies or external
+writers; independent old disposal + incoming metadata/materialize authority
+mandatory. Grouped real Host lifecycle covers distinct third backing at
+two-name limit, changed old refusal, untouched abandonment, actual gap,
+inspect-only/unsafe-abandon refusal, explicit continuation, failed publication,
+restart/resume/replay, prior derive retention released, sibling edits preserved,
+mixed-origin retirement, same-common-repository replacement and final release.
+Final Git 33/33, construction 1/1, Sandbox 4/4, Checkpoint 4/4, source barrier
+1/1, Host 16/16; strict Git/Store/Host all-target/all-feature Clippy, workspace
+all-target/all-feature check and scoped fmt/diff passed. Earlier broad Store
+239/244 not rerun.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
@@ -2758,7 +2796,8 @@ physical recovery proof acquisition through existing owners; do not open held ro
 production host policy/physical authority configuration, other effectful baseline materialization, broader Run-hazard
 reconciliation, general multi-source Process policy, unmarked/ambiguous scratch and non-exact partial
 checkout cleanup, remaining production physical authority/cleanup, effectful
-structural replacement/empty-layout attachment and other removal cases, remaining Vault broker/socket/file/other env integrations, persistent provider
+first-source attachment into an empty layout, partial replacement recovery and other
+structural removal cases, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v60.
 Do not contract v36 Event compatibility tables; Phase 7 owns removal after cross-version drain/restart

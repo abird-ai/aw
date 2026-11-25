@@ -10,8 +10,8 @@ use aw_git::source_driver::{GitRestoreLocation, GitSourceAnchor, GitSourceDriver
 use aw_store::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
     InspectedCheckpointRestore, InspectedSandboxAttachment, InspectedSandboxCreate,
-    SandboxAttachment, SandboxCreateFrom, SandboxCreateSources, SandboxSnapshot,
-    SandboxSourceRelease, SessionBinding, SessionStore, VersionedSourceBinding,
+    PreparedSandboxAttachment, SandboxAttachment, SandboxCreateFrom, SandboxCreateSources,
+    SandboxSnapshot, SandboxSourceRelease, SessionBinding, SessionStore, VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -37,6 +37,13 @@ pub use capture::{GitCheckpointCaptureHost, GitSourceFence};
 /// Acquisition before Prepared must be read-only, not a materializing effect.
 pub trait GitRestoreFence {
     fn locations(&self) -> &[GitRestoreLocation];
+
+    /// For replacement only, the additional original checkout origin.
+    /// locations() describes the final named layout; the old and incoming
+    /// selected locations share exactly the same protected destination.
+    fn replaced_location(&self) -> Option<&GitRestoreLocation> {
+        None
+    }
 }
 
 // Borrow the actual whole-set guard through the Store publication transaction.
@@ -242,7 +249,9 @@ fn attachment_location<'a>(
 ) -> Result<&'a GitRestoreLocation> {
     let snapshot = attachment.snapshot();
     let locations = fence.locations();
-    if locations.len() != attachment.bindings().len() + 1
+    let replaced = attachment.replaced();
+    if locations.len() != attachment.bindings().len() + usize::from(replaced.is_none())
+        || replaced.is_some() != fence.replaced_location().is_some()
         || snapshot.working_directory != snapshot.tool_root
         || locations
             .windows(2)
@@ -269,6 +278,35 @@ fn attachment_location<'a>(
     for location in locations {
         if location.name == attachment.anchor().name {
             incoming = Some(location);
+            if let Some((old_binding, old_source)) = replaced {
+                let (binding, source) = existing
+                    .next()
+                    .ok_or(Error::Conflict("replacement source set changed"))?;
+                let old_location = fence
+                    .replaced_location()
+                    .expect("checked replacement fence");
+                if binding != old_binding
+                    || source != old_source
+                    || old_location.name != location.name
+                    || old_location.target != location.target
+                    || old_location.parent_identity != location.parent_identity
+                    || locations.iter().any(|site| {
+                        site.target.starts_with(&old_location.repository)
+                            || old_location.repository.starts_with(&site.target)
+                    })
+                {
+                    return Err(Error::Denied(
+                        "replacement requires the exact old origin and named destination",
+                    ));
+                }
+                // The old selected target may be absent or already
+                // replaced. Its original descriptor still fixes origin.
+                driver.verify_restored_materialization_location(
+                    old_location,
+                    &source.prepared,
+                    &binding.binding,
+                )?;
+            }
         } else {
             let (binding, source) = existing
                 .next()
@@ -288,6 +326,30 @@ fn attachment_location<'a>(
         return Err(Error::Conflict("attachment source set is incomplete"));
     }
     incoming.ok_or(Error::Denied("incoming attachment is not approved"))
+}
+
+fn plan_attachment(
+    driver: &GitSourceDriver,
+    attachment: &SandboxAttachment,
+    fence: &impl GitRestoreFence,
+    prepare_id: &str,
+) -> Result<PreparedSourceOperation> {
+    let location = attachment_location(driver, attachment, fence)?;
+    let anchor = GitSourceAnchor::try_from(attachment.anchor())?;
+    if let Some((binding, source)) = attachment.replaced() {
+        driver.plan_restore_replacing_approved(
+            location,
+            &anchor,
+            prepare_id,
+            fence
+                .replaced_location()
+                .expect("checked replacement fence"),
+            &source.prepared,
+            &binding.binding,
+        )
+    } else {
+        driver.plan_restore_approved(location, &anchor, prepare_id)
+    }
 }
 
 fn verify_attachment(
@@ -920,36 +982,108 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         anchor: SourceAnchor,
         authorize: impl FnOnce(&SandboxAttachment) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
-        if let Some(result) = self.store.sandbox_replay_attachment(
+        self.materialize_sandbox_source(
             actor,
             sandbox,
             expected_rev,
             request_id,
-            &anchor,
-        )? {
+            (anchor, false),
+            authorize,
+        )
+    }
+
+    /// Replace an occupied named source using a single Prepared claim and
+    /// final publication. Independent authority must permit disposal of
+    /// the exact unchanged old materialization and the incoming version.
+    pub fn replace_sandbox_source<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        expected_rev: u64,
+        request_id: &str,
+        anchor: SourceAnchor,
+        authorize: impl FnOnce(&SandboxAttachment) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        self.materialize_sandbox_source(
+            actor,
+            sandbox,
+            expected_rev,
+            request_id,
+            (anchor, true),
+            authorize,
+        )
+    }
+
+    fn materialize_sandbox_source<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        expected_rev: u64,
+        request_id: &str,
+        selection: (SourceAnchor, bool),
+        authorize: impl FnOnce(&SandboxAttachment) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        let (anchor, replace) = selection;
+        let replay = if replace {
+            self.store.sandbox_replay_replacement(
+                actor,
+                sandbox,
+                expected_rev,
+                request_id,
+                &anchor,
+            )?
+        } else {
+            self.store.sandbox_replay_attachment(
+                actor,
+                sandbox,
+                expected_rev,
+                request_id,
+                &anchor,
+            )?
+        };
+        if let Some(result) = replay {
             return Ok(result);
         }
         let driver = self.store.source_driver(self.driver)?;
         let mut fence = None;
-        let prepared = self.store.sandbox_prepare_attachment(
-            actor,
-            sandbox,
-            expected_rev,
-            request_id,
-            anchor,
-            |attachment, prepare_id| {
-                let approval = authorize(attachment)?;
-                let location = attachment_location(&driver, attachment, &approval)?;
-                let anchor = GitSourceAnchor::try_from(attachment.anchor())?;
-                let prepared = driver.plan_restore_approved(location, &anchor, prepare_id)?;
-                fence = Some(approval);
-                Ok(prepared)
-            },
-        )?;
+        let plan = |attachment: &SandboxAttachment, prepare_id: &str| {
+            let approval = authorize(attachment)?;
+            let prepared = plan_attachment(&driver, attachment, &approval, prepare_id)?;
+            fence = Some(approval);
+            Ok(prepared)
+        };
+        let prepared = if replace {
+            self.store.sandbox_prepare_replacement(
+                actor,
+                sandbox,
+                expected_rev,
+                request_id,
+                anchor,
+                plan,
+            )?
+        } else {
+            self.store.sandbox_prepare_attachment(
+                actor,
+                sandbox,
+                expected_rev,
+                request_id,
+                anchor,
+                plan,
+            )?
+        };
         let fence = fence.expect("successful attachment called planner");
         let result = (|| {
             prepared.revalidate()?;
             verify_attachment(&driver, prepared.observation(), prepared.source(), &fence)?;
+            if let Some((old, source)) = prepared.observation().replaced() {
+                driver.verify_replacement_untouched(
+                    &source.prepared,
+                    &old.binding,
+                    prepared.source(),
+                )?;
+                driver.release_restored_materialization(&source.prepared, &old.binding)?;
+                driver.require_restore_absent(prepared.source())?;
+            }
             driver.execute_restore(prepared.source())?;
             Ok(())
         })();
@@ -957,12 +1091,62 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             prepared.mark_unknown()?;
             return Err(error);
         }
+        self.inspect_and_publish_attachment(prepared, &fence)
+    }
+
+    fn inspect_and_publish_attachment<F: GitRestoreFence>(
+        &self,
+        prepared: PreparedSandboxAttachment<'_>,
+        fence: &F,
+    ) -> Result<SandboxSnapshot> {
         let inspected = prepared.inspect(|registry, attachment, prepared| {
             let driver = registry.get(self.driver)?;
-            verify_attachment(&driver, attachment, prepared, &fence)?;
+            verify_attachment(&driver, attachment, prepared, fence)?;
             driver.inspect_restore(prepared)
         })?;
-        self.publish_attachment(inspected, &fence)
+        self.publish_attachment(inspected, fence)
+    }
+
+    /// Explicit recovery of the gap after releasing the old checkout.
+    /// Normal resume is inspect-only; this continuation requires positive
+    /// absence of the incoming target and all its original registration.
+    pub fn continue_sandbox_replacement<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        sandbox: &str,
+        request_id: &str,
+        authorize: impl FnOnce(&SandboxAttachment, &PreparedSourceOperation) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
+        let prepared = self
+            .store
+            .sandbox_recover_attachment(actor, sandbox, request_id)?;
+        let authorized = (|| {
+            if prepared.observation().replaced().is_none() {
+                return Err(Error::Denied("not a replacement"));
+            }
+            authorize(prepared.observation(), prepared.source())
+        })();
+        let fence = match authorized {
+            Ok(fence) => fence,
+            Err(error) => {
+                prepared.mark_unknown()?;
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            prepared.revalidate()?;
+            let attachment = prepared.observation();
+            let (old, source) = attachment.replaced().expect("replacement checked");
+            let driver = self.store.source_driver(self.driver)?;
+            verify_attachment(&driver, attachment, prepared.source(), &fence)?;
+            driver.continue_replacement(&source.prepared, &old.binding, prepared.source())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            prepared.mark_unknown()?;
+            return Err(error);
+        }
+        self.inspect_and_publish_attachment(prepared, &fence)
     }
 
     pub fn resume_sandbox_attachment<F: GitRestoreFence>(
@@ -1000,7 +1184,11 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         inspected.publish(|registry, attachment, prepared, binding, evidence| {
             let driver = registry.get(self.driver)?;
             verify_attachment(&driver, attachment, prepared, fence)?;
-            driver.revalidate_restore(prepared, binding)?;
+            if let Some((old, source)) = attachment.replaced() {
+                driver.revalidate_replacement(&source.prepared, &old.binding, prepared, binding)?;
+            } else {
+                driver.revalidate_restore(prepared, binding)?;
+            }
             Ok(SourcePublicationProof::Held(Publication {
                 _fence: fence,
                 evidence: evidence.clone(),
@@ -1023,8 +1211,18 @@ impl<'a> GitCheckpointRestoreHost<'a> {
                 let fence = authorize(attachment, prepared)?;
                 let driver = registry.get(self.driver)?;
                 verify_attachment(&driver, attachment, prepared, &fence)?;
-                driver.release_prepared_restore(prepared)?;
-                attachment_location(&driver, attachment, &fence)?;
+                if let Some((old, source)) = attachment.replaced() {
+                    // Only an intact original with no new registration
+                    // may reject a replacement. Never lose the old row.
+                    driver.verify_replacement_untouched(
+                        &source.prepared,
+                        &old.binding,
+                        prepared,
+                    )?;
+                } else {
+                    driver.release_prepared_restore(prepared)?;
+                    attachment_location(&driver, attachment, &fence)?;
+                }
                 Ok(fence)
             },
         )
@@ -1206,6 +1404,20 @@ mod tests {
     impl GitRestoreFence for Fence<'_> {
         fn locations(&self) -> &[GitRestoreLocation] {
             &self.locations
+        }
+    }
+
+    struct ReplacementFence<'a> {
+        retained: Fence<'a>,
+        original: GitRestoreLocation,
+    }
+
+    impl GitRestoreFence for ReplacementFence<'_> {
+        fn locations(&self) -> &[GitRestoreLocation] {
+            self.retained.locations()
+        }
+        fn replaced_location(&self) -> Option<&GitRestoreLocation> {
+            Some(&self.original)
         }
     }
 
@@ -2497,9 +2709,248 @@ mod tests {
             )
             .is_err());
         assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+        // Replacement at the exact configured two-name limit. A third
+        // backing identity must join the same old+incoming source claim.
+        let replacement_repo = source_root.join("replacement");
+        private_dir(&replacement_repo);
+        git(
+            &executable,
+            &replacement_repo,
+            &["init", "--initial-branch=main"],
+        );
+        git(
+            &executable,
+            &replacement_repo,
+            &["config", "user.name", "Fixture"],
+        );
+        git(
+            &executable,
+            &replacement_repo,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(replacement_repo.join("tracked"), b"replacement version").unwrap();
+        git(&executable, &replacement_repo, &["add", "tracked"]);
+        git(
+            &executable,
+            &replacement_repo,
+            &["commit", "--no-gpg-sign", "-m", "fixture"],
+        );
+        let implementation = store.source_driver(&driver).unwrap();
+        let replacement_binding = implementation
+            .binding(
+                &replacement_repo,
+                SourceName::new("data").unwrap(),
+                SourceAccess::ReadWrite,
+                CheckpointPolicy::Required,
+            )
+            .unwrap();
+        let replacement_capture = implementation
+            .plan_capture(
+                &replacement_binding,
+                "cp_fixture_replacement",
+                "op_fixture_replacement",
+            )
+            .unwrap();
+        let replacement_anchor = SourceAnchor::try_from(
+            &implementation
+                .execute_capture(&replacement_capture)
+                .unwrap(),
+        )
+        .unwrap();
+        let replacement_locations = || {
+            let mut locations = attachment_locations();
+            locations[1].repository = replacement_repo.clone();
+            locations[1].repository_identity = identity(&replacement_repo);
+            locations
+        };
+        let replacement_fence = || ReplacementFence {
+            retained: fence(replacement_locations(), 4),
+            original: child_locations(&child_root).pop().unwrap(),
+        };
+        let replacement_request = "fixture:replacement";
+        // Refuse to discard post-publication edits in the old selected
+        // checkout. No new claim or deletion before exact read-only plan.
+        assert!(host
+            .replace_sandbox_source(
+                &actor,
+                &child.canonical_ref,
+                child.rev,
+                replacement_request,
+                replacement_anchor.clone(),
+                |_| Ok(replacement_fence()),
+            )
+            .is_err());
+        assert_eq!(fs::read(&sibling).unwrap(), b"independent sibling edits");
+        assert_eq!(
+            store.sandbox_get(&actor, &child.canonical_ref).unwrap(),
+            child
+        );
+        fs::write(&sibling, b"data").unwrap();
+        let unaffected = child_root.join("code/tracked");
+        fs::write(&unaffected, b"independent retained code").unwrap();
+
+        // Untouched replacement can be rejected without releasing the
+        // original published materialization.
+        let approval = replacement_fence();
+        let prepared = store
+            .sandbox_prepare_replacement(
+                &actor,
+                &child.canonical_ref,
+                child.rev,
+                "fixture:abandoned-replacement",
+                replacement_anchor.clone(),
+                |attachment, prepare_id| {
+                    plan_attachment(&implementation, attachment, &approval, prepare_id)
+                },
+            )
+            .unwrap();
+        prepared.mark_unknown().unwrap();
+        drop(approval);
+        host.abandon_sandbox_attachment(
+            &actor,
+            &child.canonical_ref,
+            "fixture:abandoned-replacement",
+            |_, _| Ok(replacement_fence()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&sibling).unwrap(), b"data");
+
+        // Stop between old release and the first incoming materialization.
+        // The original binding/rev and all three identities remain fenced.
+        let approval = replacement_fence();
+        let prepared = store
+            .sandbox_prepare_replacement(
+                &actor,
+                &child.canonical_ref,
+                child.rev,
+                replacement_request,
+                replacement_anchor.clone(),
+                |attachment, prepare_id| {
+                    plan_attachment(&implementation, attachment, &approval, prepare_id)
+                },
+            )
+            .unwrap();
+        let (old, descriptor) = prepared.observation().replaced().unwrap();
+        assert_eq!(descriptor.prepared.operation, SourceOperationKind::Derive);
+        implementation
+            .verify_replacement_untouched(&descriptor.prepared, &old.binding, prepared.source())
+            .unwrap();
+        implementation
+            .release_restored_materialization(&descriptor.prepared, &old.binding)
+            .unwrap();
+        assert!(store
+            .acquire_source_mutation_barrier(
+                &aw_store::SourceMutationSet::from_bindings(std::slice::from_ref(
+                    &replacement_binding
+                ))
+                .unwrap(),
+                "fixture:incoming-replacement",
+            )
+            .is_err());
+        prepared.mark_unknown().unwrap();
+        drop(approval);
+        assert!(!child_root.join("data").exists());
+        assert_eq!(
+            store.sandbox_get(&actor, &child.canonical_ref).unwrap(),
+            child
+        );
+        assert!(store
+            .sandbox_close(&actor, &child.canonical_ref, Some(child.rev))
+            .is_err());
+        assert!(host
+            .resume_sandbox_attachment(
+                &actor,
+                &child.canonical_ref,
+                replacement_request,
+                |_, _| Ok(replacement_fence()),
+            )
+            .is_err());
+        assert!(!child_root.join("data").exists());
+        assert!(host
+            .abandon_sandbox_attachment(
+                &actor,
+                &child.canonical_ref,
+                replacement_request,
+                |_, _| Ok(replacement_fence()),
+            )
+            .is_err());
+
+        // Explicit continuation proves the gap, then the single final
+        // publication can itself fail. Recovery observes, never replans.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fixture_fail_replacement BEFORE UPDATE OF rev ON sandboxes_current
+             BEGIN SELECT RAISE(ABORT,'fixture replacement publication failure'); END;",
+            )
+            .unwrap();
+        assert!(host
+            .continue_sandbox_replacement(
+                &actor,
+                &child.canonical_ref,
+                replacement_request,
+                |_, _| Ok(replacement_fence()),
+            )
+            .is_err());
+        assert_eq!(fs::read(&sibling).unwrap(), b"replacement version");
+        assert_eq!(
+            store.sandbox_get(&actor, &child.canonical_ref).unwrap(),
+            child
+        );
+        assert_eq!(fs::read(&unaffected).unwrap(), b"independent retained code");
+        drop(store);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fixture_fail_replacement;")
+            .unwrap();
+        let store = SessionStore::open_with_sources(&state, registry.clone(), limit).unwrap();
+        let host = GitCheckpointRestoreHost::new(&store, &driver);
+        let replaced = host
+            .resume_sandbox_attachment(&actor, &child.canonical_ref, replacement_request, |_, _| {
+                Ok(replacement_fence())
+            })
+            .unwrap();
+        assert_eq!(replaced.rev, child.rev + 1);
+        assert_eq!(replaced.sources.len(), 2);
+        assert_eq!(replaced.sources[0], child.sources[0]);
+        assert_eq!(replaced.sources[1].binding_rev, replaced.rev);
+        assert_eq!(replaced.layout_digest, child.layout_digest);
+        assert_eq!(
+            host.replace_sandbox_source::<ReplacementFence<'_>>(
+                &actor,
+                &child.canonical_ref,
+                child.rev,
+                replacement_request,
+                replacement_anchor.clone(),
+                |_| panic!("Applied replacement must not authorize again"),
+            )
+            .unwrap(),
+            replaced
+        );
+        assert!(host
+            .attach_sandbox_source::<Fence<'_>>(
+                &actor,
+                &child.canonical_ref,
+                child.rev,
+                replacement_request,
+                replacement_anchor.clone(),
+                |_| panic!("replacement request cannot replay attachment"),
+            )
+            .is_err());
+        let capture_ref = format!(
+            "refs/aw/checkpoints/{}/data",
+            child.canonical_ref.rsplit_once("/s:").unwrap().1
+        );
+        assert!(git(
+            &executable,
+            &standalone_root.join("data"),
+            &["for-each-ref", &capture_ref]
+        )
+        .is_empty());
+        let child = replaced;
         // Retire independently prepared bindings through their actual
         // descriptors, not by assuming all came from the initial create.
-        fs::write(&sibling, b"data").unwrap();
+        fs::write(&unaffected, b"code").unwrap();
         let closed = store
             .sandbox_close(&actor, parent_ref, Some(standalone.rev))
             .unwrap();
@@ -2520,16 +2971,19 @@ mod tests {
                 assert_eq!(prepared[0].name.as_str(), "code");
                 assert_eq!(prepared[0].prepared.operation, SourceOperationKind::Restore);
                 assert_eq!(prepared[1].name.as_str(), "data");
-                assert_eq!(prepared[1].prepared.operation, SourceOperationKind::Derive);
+                assert_eq!(prepared[1].prepared.operation, SourceOperationKind::Restore);
                 assert_ne!(
                     prepared[0].prepared.descriptor.prepare_id,
                     prepared[1].prepared.descriptor.prepare_id
                 );
-                Ok(fence(attachment_locations(), 4))
+                Ok(fence(replacement_locations(), 4))
             })
             .unwrap();
         assert!(retired.sources.is_empty());
         assert_eq!(fs::read_dir(&child_root).unwrap().count(), 0);
+        implementation
+            .release_prepared_capture(&replacement_capture)
+            .unwrap();
         let capture_ref_prefix = format!(
             "refs/aw/checkpoints/{}/",
             child.canonical_ref.rsplit_once("/s:").unwrap().1
@@ -2577,6 +3031,29 @@ mod tests {
                 |_, _| Ok(fence(final_locations(), 4)),
             )
             .unwrap();
+        // Same common-repository replacement: one original restore
+        // registration is replaced by another at the exact same path.
+        let mut narrowed = baseline.anchors[0].clone();
+        narrowed.access = SourceAccess::ReadOnly;
+        let last = host
+            .replace_sandbox_source(
+                &actor,
+                &last.canonical_ref,
+                last.rev,
+                "fixture:same-origin-replacement",
+                narrowed,
+                |_| {
+                    let locations: Vec<GitRestoreLocation> = final_locations();
+                    Ok(ReplacementFence {
+                        original: locations[0].clone(),
+                        retained: fence(locations, 4),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(last.sources[0].access, SourceAccess::ReadOnly);
+        assert_eq!(last.sources[0].binding_rev, 2);
+        assert_eq!(fs::read(final_root.join("code/tracked")).unwrap(), b"code");
         fs::write(final_root.join("foreign"), b"keep").unwrap();
         assert!(host
             .release_sandbox_source(
