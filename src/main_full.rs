@@ -1680,6 +1680,13 @@ fn run() -> Result<u8> {
 }
 
 fn run_agent(args: RunArgs) -> Result<u8> {
+    run_agent_with_shell_containment(args, aw::context::local_shell_containment_from_env()?)
+}
+
+fn run_agent_with_shell_containment(
+    args: RunArgs,
+    local_shell_containment: aw_tools_adapter::process::ContainmentRequirement,
+) -> Result<u8> {
     if (args.rpc_stdio || args.output == aw::headless::Output::Jsonl)
         && (args.web
             || args.agent_mode
@@ -2322,7 +2329,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
             .clone()
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
         process_input: false,
-        local_process_containment: Default::default(),
+        local_process_containment: local_shell_containment,
         agent_jobs: Default::default(),
         events: Default::default(),
         operation_router: Default::default(),
@@ -3111,6 +3118,7 @@ fn run_agent(args: RunArgs) -> Result<u8> {
 }
 #[cfg(feature = "pipelines")]
 fn run_schedule_due(args: ScheduleRunDueCliArgs) -> Result<u8> {
+    let local_shell_containment = aw::context::local_shell_containment_from_env()?;
     if args.target.no_state {
         return Err(Error::Denied("schedule run-due requires durable state"));
     }
@@ -3159,7 +3167,7 @@ fn run_schedule_due(args: ScheduleRunDueCliArgs) -> Result<u8> {
     let run_id = run.id.clone();
     drop(store);
 
-    let result = run_agent(args.into_run(run_id));
+    let result = run_agent_with_shell_containment(args.into_run(run_id), local_shell_containment);
     let settle = sessions::open_sqlite_owner(&state)
         .and_then(|store| store.schedule_settle_occurrence(&actor, &occurrence_id));
     match result {

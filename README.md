@@ -59,6 +59,15 @@ aw --workspace-directory /path/to/project \
 
 Tools are **off by default**. Instructions and skills grant no tools.
 When authorized, `batch` composes native operations into a bounded Graph without widening their individual grants.
+
+For the configured local native shell, the trusted host can set
+`AW_LOCAL_SHELL_CONTAINMENT=closed-descendants` at launch to require closed
+Process-descendant containment for direct, finite Job and Graph shell execution.
+The default is `best-available`. Unsupported strict launches fail before starting
+a Process (including current Unix process-group execution); invalid values
+fail startup. This does not grant tools, isolate the filesystem, or apply to
+MCP, extensions, remote tools, independent source routes or human terminals.
+
 aw connects to inference servers; it does not download model weights.
 
 ### Integrate

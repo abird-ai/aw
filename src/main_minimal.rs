@@ -831,6 +831,7 @@ fn run() -> Result<u8> {
                 return extension_cli::inspect(options, action, json),
         }
     }
+    let local_shell_containment = aw::context::local_shell_containment_from_env()?;
     #[cfg(not(feature = "jsonl"))]
     let _ = args.no_state; // stateless compile always memory-only
     if args.mode == AppModeArg::Workspace {
@@ -1063,7 +1064,7 @@ Explicitly requested, owner-approved project skill {} (data, no execution grants
             .clone()
             .or_else(|| option_env!("AW_DEFAULT_BASH").map(PathBuf::from)),
         process_input: false,
-        local_process_containment: Default::default(),
+        local_process_containment: local_shell_containment,
         agent_jobs: Default::default(),
         events: Default::default(),
         operation_router: Default::default(),

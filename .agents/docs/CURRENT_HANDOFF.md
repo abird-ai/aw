@@ -18,7 +18,51 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: exact SourceDriver ownership and complete artifact-state preflight
+## Latest local implementation delta — 2026-11-25: trusted native-shell startup containment
+
+Parent: `9566d10ef3578b0834d30d74dfc8a944fe9f60b3` (exact SourceDriver
+ownership and complete artifact-state preflight). Parent signature verified.
+Original Agent/Turn journal owners and resource CLI remain occupied.
+
+- Explicit host startup environment `AW_LOCAL_SHELL_CONTAINMENT` selects the
+  existing typed `ContainmentRequirement`: unset or `best-available` preserves
+  legacy behavior; `closed-descendants` requires the stronger guarantee.
+  Invalid/empty/non-Unicode values reject startup, never fall back. Shared
+  `aw::context::local_shell_containment_from_env` captures it once before
+  normal Agent state/executor setup in full/minimal/stateless entry points.
+  The scheduled owner validates before claiming work and passes the captured
+  minimum into its ordinary Agent execution. Web-owner construction and
+  existing runtime/session rebuilds carry the same cloned `LocalToolOptions`.
+- The existing native shell Process/finite Job/Graph owner enforces the
+  minimum and runtime binding. No new model/profile/session selector or
+  additional executor. No tool authority conferred, no filesystem containment
+  claim. Current Unix DirectScope refuses strict shell launches before spawn;
+  native Windows Job support remains unqualified on L5. This applies only
+  to the configured local native shell, not independent source routes, MCP,
+  external tools/extensions, remote execution or human terminal sessions.
+  README documents the operator setting and boundaries.
+- SDK defaults stay unchanged; embedders can still supply typed minima
+  explicitly. No frozen Sandbox/backend, schema or admission changes.
+
+Validation on L5 (Rust 1.95.0): shared config regression **1/1** with full
+features and **1/1** stateless; original direct/finite/Graph strict shell
+runtime **1/1**; full and minimal all-target checks, strict full-product
+all-target/all-feature Clippy, full binary build and actual CLI smoke (invalid
+setting exit 2; valid strict setting accepted for metadata-only profile
+listing), scoped fmt/diff passed. Minimal/stateless retain existing dead-code
+warnings; existing minimal formatting preserved. The CLI smoke did not invoke
+a provider or execute a shell; actual refusal covered by the existing runtime
+regression. Shared builds include concurrent dependencies, signed tree contains
+only owned paths. Pinned Nix 1.98.1 and platform-native qualification not
+rerun. Store v60, Git recovery v4; no publication.
+
+Next: exact live source-aware Actor/Turn admission remains the priority once
+original journal owners become available; resource CLI still needs its owner
+to adopt driver startup composition. Otherwise select an independent real
+physical-authority/containment consumer. Do not infer global containment or
+source authority from the local native shell setting.
+
+## Previous local implementation delta — 2026-11-25: exact SourceDriver ownership and complete artifact-state preflight
 
 Parent: `80f1ca09ae6129266410c099d103be94794c54f1` (persistent signing Vault
 provisioning). Parent signature and clean owned paths verified. The original

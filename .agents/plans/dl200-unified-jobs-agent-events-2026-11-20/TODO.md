@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: exact SourceDriver registry ownership and complete Git artifact-state preflight (this local checkpoint; signed parent `80f1ca09ae6129266410c099d103be94794c54f1`, persistent signing Vault provisioning). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: trusted native-shell startup containment (this local checkpoint; signed parent `9566d10ef3578b0834d30d74dfc8a944fe9f60b3`, exact SourceDriver ownership and complete Git artifact-state preflight). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1287,6 +1287,17 @@ Current implementation: exact SourceDriver registry ownership and complete Git a
       restart 1/1, strict affected core/adapter/Host Clippy, full product
       check, scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix and native
       platform qualification not rerun). Journal and resource CLI occupied.
+      **Trusted native-shell startup minimum landed:** explicit host-only
+      `AW_LOCAL_SHELL_CONTAINMENT` selects the existing typed minimum before
+      Agent setup or scheduled claims; full/minimal/stateless and web-owner
+      composition preserve it through existing tool options. Default unchanged,
+      invalid fails startup, strict unsupported Unix launches refused by the
+      original shared Process owner. No global containment, model selector,
+      grant, external route or schema change. Full/stateless config 1/1 each,
+      original direct/finite/Graph regression 1/1, full/minimal all-target
+      checks, strict full-product Clippy, full binary build + metadata-only
+      startup smoke, scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix and
+      platform-native qualification not rerun). Source admission still held.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
