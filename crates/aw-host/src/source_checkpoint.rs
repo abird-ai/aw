@@ -20,7 +20,9 @@ use std::{
 };
 
 mod capture;
-pub use capture::{reconcile_retired_git, GitCheckpointCaptureHost, GitSourceFence};
+pub use capture::{
+    abandon_git_capture_exact, reconcile_retired_git, GitCheckpointCaptureHost, GitSourceFence,
+};
 
 /// Live, independently authorized, whole-layout physical/provider fence.
 ///
@@ -546,13 +548,13 @@ fn publication_proofs<'a, F: GitRestoreFence>(
         .collect()
 }
 
-fn abandon_materializations<F: GitRestoreFence>(
+fn release_materializations(
     driver: &GitSourceDriver,
     input: SandboxCreateSources<'_>,
     sources: &PreparedSourceSet,
-    fence: F,
-) -> Result<F> {
-    require_locations(driver, input, sources, &fence)?;
+    fence: &impl GitRestoreFence,
+) -> Result<()> {
+    require_locations(driver, input, sources, fence)?;
     for source in &sources.sources {
         match input {
             SandboxCreateSources::Baseline(_) => {
@@ -561,7 +563,7 @@ fn abandon_materializations<F: GitRestoreFence>(
             SandboxCreateSources::Parent(_) => driver.release_prepared_derive(&source.prepared)?,
         }
     }
-    Ok(fence)
+    Ok(())
 }
 
 fn require_derive_layout(
@@ -814,17 +816,50 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         request_id: &str,
         authorize: impl FnOnce(&SourceSet, &PreparedSourceSet) -> Result<F>,
     ) -> Result<()> {
-        self.store
-            .checkpoint_abandon_restore(actor, request_id, |registry, anchors, sources| {
-                let fence = authorize(anchors, sources)?;
-                let driver = registry.get(self.driver)?;
-                abandon_materializations(
-                    &driver,
-                    SandboxCreateSources::Baseline(anchors),
-                    sources,
-                    fence,
-                )
-            })
+        self.abandon_in(actor, request_id, None, authorize)
+    }
+
+    /// Abandon the exact original captured restore and its selected layout.
+    /// A separately selected baseline or published candidate is not eligible.
+    pub fn abandon_captured_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        request_id: &str,
+        layout: &SessionBinding,
+        authorize: impl FnOnce(&SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        self.abandon_in(actor, request_id, Some((request, layout)), authorize)
+    }
+
+    fn abandon_in<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        request_id: &str,
+        exact: Option<(&CheckpointRestoreRequest, &SessionBinding)>,
+        authorize: impl FnOnce(&SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        let mut fence = None;
+        let reconcile = |registry: &aw_agent_core::SourceDriverRegistryReader,
+                         anchors: &SourceSet,
+                         sources: &PreparedSourceSet| {
+            fence = Some(authorize(anchors, sources)?);
+            let driver = registry.get(self.driver)?;
+            release_materializations(
+                &driver,
+                SandboxCreateSources::Baseline(anchors),
+                sources,
+                fence.as_ref().expect("approved"),
+            )
+        };
+        match exact {
+            Some((request, layout)) => self.store.checkpoint_abandon_captured_restore_exact(
+                actor, request, layout, request_id, reconcile,
+            ),
+            None => self
+                .store
+                .checkpoint_abandon_restore(actor, request_id, reconcile),
+        }
     }
 
     /// Standalone fresh Sandbox from independently retained Project
@@ -987,15 +1022,16 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         request_id: &str,
         authorize: impl FnOnce(SandboxCreateSources<'_>, &PreparedSourceSet) -> Result<F>,
     ) -> Result<()> {
+        let mut fence = None;
         self.store.sandbox_abandon_create(
             actor,
             project_ref,
             from,
             request_id,
             |registry, input, sources| {
-                let fence = authorize(input, sources)?;
+                fence = Some(authorize(input, sources)?);
                 let driver = registry.get(self.driver)?;
-                abandon_materializations(&driver, input, sources, fence)
+                release_materializations(&driver, input, sources, fence.as_ref().expect("approved"))
             },
         )
     }

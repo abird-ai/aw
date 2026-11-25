@@ -10,7 +10,7 @@ use aw_agent_core::{DriverKey, SourceName};
 use aw_git::source_driver::{GitSourceDriver, GitSourceLocation};
 use aw_host::{
     source_approval::{NativeSourceApproval, NativeSourceApprovalGuard},
-    source_checkpoint::{GitCheckpointCaptureHost, GitSourceFence},
+    source_checkpoint::{abandon_git_capture_exact, GitCheckpointCaptureHost, GitSourceFence},
     source_git::GitNativeSourceResolver,
 };
 use aw_platform::DirectoryIdentity;
@@ -43,8 +43,11 @@ pub(crate) struct Args {
     #[arg(long = "agent-note")]
     note: Option<String>,
     /// Inspect/publish the exact original prepared capture; never recapture.
-    #[arg(long = "agent-recover")]
+    #[arg(long = "agent-recover", conflicts_with = "abandon")]
     recover: bool,
+    /// Reconcile only the original unpublished capture; never remove a live checkpoint.
+    #[arg(long = "agent-abandon", conflicts_with = "recover")]
+    abandon: bool,
 }
 
 struct Fence {
@@ -156,6 +159,22 @@ pub(crate) fn capture(
     }
 }
 
+/// Explicit offline cleanup authority, separate from capture and native
+/// tool access. The original receipt resolves the exact private effects.
+pub(crate) fn abandon(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    root: &Path,
+    request: &CheckpointCaptureRequest<'_>,
+    request_id: &str,
+) -> Result<()> {
+    abandon_git_capture_exact(store, actor, request, request_id, |bindings, _| {
+        let handle = store.source_driver_handle::<GitSourceDriver>(&DriverKey::builtin("git")?)?;
+        let resolver = GitNativeSourceResolver::new(store.clone(), handle)?;
+        authorize_capture(store, &resolver, actor, request.reference, root, bindings)
+    })
+}
+
 pub(crate) fn run(args: Args) -> Result<u8> {
     let actor = PrincipalId::new(aw_platform::local_principal()?)?;
     require_existing_store(&args.state_dir)?;
@@ -175,12 +194,18 @@ pub(crate) fn run(args: Args) -> Result<u8> {
         note: args.note.as_deref(),
     };
     let store = aw::sessions::open_sqlite_owner(&args.state_dir)?;
+    let request_id = format!("cli:checkpoint-capture:{}", args.request_id);
+    if args.abandon {
+        abandon(&store, &actor, &args.approval_root, &request, &request_id)?;
+        super::print_json(&serde_json::json!({"status":"rejected"}))?;
+        return Ok(0);
+    }
     let snapshot = capture(
         &store,
         &actor,
         &args.approval_root,
         &request,
-        &format!("cli:checkpoint-capture:{}", args.request_id),
+        &request_id,
         args.recover,
     )?;
     super::print_json(

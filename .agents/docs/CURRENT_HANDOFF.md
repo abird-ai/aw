@@ -19,7 +19,76 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: independently approved captured Git restore and exact recovery
+## Latest local implementation delta — 2026-11-25: exact offline capture/restore abandonment
+
+Parent: `5cfc6f632dce2f41a365fd131eb1dfc98bb1f59f` (captured Git
+restore), signature verified. Original Agent/Turn journal and resource CLI
+owners remain occupied; independent original-custody cleanup slice, L5 only.
+
+- Both workspace-feature offline commands `checkpoint-capture` and
+  `checkpoint-restore` accept explicit `--agent-abandon`, mutually
+  exclusive with `--agent-recover`. Supply the original request ID,
+  semantic arguments and existing private approval. Cleanup authorization
+  is separate from native tool access, capture/restore creation and logical
+  checkpoint retirement. Successful reconciliation emits only
+  `{"status":"rejected"}`. Never abandons an Applied checkpoint/Agent,
+  creates a candidate, recaptures, rematerializes or broad-prunes Git.
+- Capture uses the exact original request fingerprint before reclaiming
+  existing custody, with the registered Git driver resolved lazily. Restore
+  additionally checks the exact original SessionBinding digest and excludes
+  independently selected baselines. Terminal Rejected replay checks the
+  original receipt and candidate absence without reloading approval, driver
+  or physical layout; request mismatch still fails. Restore's read-only
+  replay lookup shares the original semantic/receipt validation, not a new
+  ledger. Existing general trusted SDK cleanup methods remain compatible.
+- The original source claim and all-source mutation barrier own cleanup.
+  Check every original descriptor/location before Git release, then use the
+  existing exact retention/scratch and worktree/partial-tree cleanup methods.
+  Changed refs, modified/ambiguous worktrees and unproven scratch stay
+  unresolved. Rejected and barrier settlement commit atomically only after
+  every original resource is absent or released. The shared Store
+  reconciliation keeps returned guards through final failure's Unknown
+  settlement as well as success. Git capture, restore and standalone
+  Sandbox cleanup hold the acquired physical fence outside the callback
+  so it also survives provider error. No new schema, config format, driver
+  descriptor or cleanup owner.
+- The offline commands retain their existing narrow authority contract:
+  exact current local manager/actor, private approval lease, original
+  named roots and explicit operator Git administration/exclusion. Capture
+  still requires a current matching configured native approval; restore
+  remains same-Project/private/taskless with exact protected destination.
+  The operator must have continuously protected original private candidate
+  and scratch namespaces, Git backing and other retention users. Advisory
+  leases and directory observations do not prove physical containment.
+  Unmarked/ambiguous scratch or non-exact partial materializations remain
+  held, as do cleanup under a changed capture binding and broader layouts.
+
+Validation (L5, Rust 1.95.0): grouped real offline Git/SQLite
+capture/restore/abandonment/retention lifecycle 1/1; Store checkpoint
+owner 4/4; Host source-checkpoint lifecycle 1/1. Grouped regression
+reuses the existing interruption fixtures and proves wrong original
+request/layout refusal, changed retention/modified worktree preservation
+and retained hazard, exact repair/restart reconciliation, absent private
+candidates, Applied cleanup refusal, never-retry Rejected receipts,
+terminal replay without config/driver, unchanged published resources
+and source HEAD/index/worktree. Strict Store/Host/CLI all-target/all-feature
+Clippy, durable lib and minimal all-target checks, full CLI binary build,
+actual capture/restore help and conflicting recover/abandon rejection,
+retention help and scoped fmt/diff passed. Existing feature-specific
+warnings remain. Unchanged Git/Process suites, broad CLI inventory
+discrepancy and pinned Nix/native-platform qualification not rerun.
+Only isolated fixture effects reconciled; no real user cleanup or
+publication.
+
+Next: live source-aware Actor/Turn admission if original owners are free;
+otherwise independent protected metadata or Vault/Process authority,
+or exact closed Sandbox/materialization maintenance. Offline capture,
+restore, original abandonment and retired checkpoint retention now have
+actual narrow host consumers. General physical/provider exclusion and
+remaining authority/activation gates remain held; do not repeat offline
+lifecycle wiring or weaken admission to finish Phase 3.
+
+## Previous local implementation delta — 2026-11-25: independently approved captured Git restore and exact recovery
 
 Parent: `c99ff5478d657a56f61cebe50fdef01dfff90ac7` (configured offline
 Git checkpoint capture), signature verified. Original Agent/Turn journal

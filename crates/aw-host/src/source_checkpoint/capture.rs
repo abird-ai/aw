@@ -3,7 +3,8 @@
 use super::Publication;
 use aw_agent_core::{
     Error, NamedPreparedSource, PreparedSourceSet, PrincipalId, RecoveryInspection, Result,
-    SourceAnchor, SourceDriverHandle, SourceOperationKind, SourcePublicationProof, SourceSet,
+    SourceAnchor, SourceDriverHandle, SourceDriverRegistryReader, SourceOperationKind,
+    SourcePublicationProof, SourceSet,
 };
 use aw_git::source_driver::{GitSourceAnchor, GitSourceDriver, GitSourceLocation};
 use aw_store::{
@@ -276,16 +277,14 @@ impl<'a> GitCheckpointCaptureHost<'a> {
         request_id: &str,
         authorize: impl FnOnce(&[VersionedSourceBinding], &PreparedSourceSet) -> Result<F>,
     ) -> Result<()> {
-        self.store
-            .checkpoint_abandon_capture(actor, request_id, |registry, bindings, sources| {
-                let fence = authorize(bindings, sources)?;
-                let driver = registry.get(self.driver)?;
-                require_preparation(&driver, bindings, sources, &fence)?;
-                for source in &sources.sources {
-                    driver.release_prepared_capture(&source.prepared)?;
-                }
-                Ok(fence)
-            })
+        abandon_capture_with(
+            self.store,
+            actor,
+            request_id,
+            None,
+            |registry| registry.get(self.driver),
+            authorize,
+        )
     }
 
     /// Logical retirement remains the Store's checkpoint_delete. Release
@@ -305,6 +304,64 @@ impl<'a> GitCheckpointCaptureHost<'a> {
             || self.store.source_driver(self.driver),
             authorize,
         )
+    }
+}
+
+/// Exact unpublished capture cleanup. Resolve the current registered Git
+/// driver and acquire physical authority only for unresolved custody.
+pub fn abandon_git_capture_exact<F: GitSourceFence>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    request: &CheckpointCaptureRequest<'_>,
+    request_id: &str,
+    authorize: impl FnOnce(&[VersionedSourceBinding], &PreparedSourceSet) -> Result<F>,
+) -> Result<()> {
+    abandon_capture_with(
+        store,
+        actor,
+        request_id,
+        Some(request),
+        |registry| {
+            let handle =
+                registry.handle::<GitSourceDriver>(&aw_agent_core::DriverKey::builtin("git")?)?;
+            registry.get(&handle)
+        },
+        authorize,
+    )
+}
+
+fn abandon_capture_with<F: GitSourceFence>(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    request_id: &str,
+    request: Option<&CheckpointCaptureRequest<'_>>,
+    resolve: impl FnOnce(&SourceDriverRegistryReader) -> Result<std::sync::Arc<GitSourceDriver>>,
+    authorize: impl FnOnce(&[VersionedSourceBinding], &PreparedSourceSet) -> Result<F>,
+) -> Result<()> {
+    // Keep physical authority through Unknown settlement even if one
+    // cleanup effect fails after an earlier source was released.
+    let mut fence = None;
+    let reconcile = |registry: &SourceDriverRegistryReader,
+                     bindings: &[VersionedSourceBinding],
+                     sources: &PreparedSourceSet| {
+        fence = Some(authorize(bindings, sources)?);
+        let driver = resolve(registry)?;
+        require_preparation(
+            &driver,
+            bindings,
+            sources,
+            fence.as_ref().expect("approved"),
+        )?;
+        for source in &sources.sources {
+            driver.release_prepared_capture(&source.prepared)?;
+        }
+        Ok(())
+    };
+    match request {
+        Some(request) => {
+            store.checkpoint_abandon_capture_exact(actor, request, request_id, reconcile)
+        }
+        None => store.checkpoint_abandon_capture(actor, request_id, reconcile),
     }
 }
 

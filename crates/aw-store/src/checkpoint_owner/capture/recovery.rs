@@ -325,6 +325,26 @@ impl SessionStore {
         }
     }
 
+    /// Explicit abandonment of the original semantic capture request. The
+    /// terminal Rejected fact needs no fresh source authorization or driver.
+    pub fn checkpoint_abandon_capture_exact<F>(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointCaptureRequest<'_>,
+        request_id: &str,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            &[VersionedSourceBinding],
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<()> {
+        let fingerprint = request.fingerprint()?;
+        match self.recover_checkpoint_capture(actor, request_id, Some(&fingerprint))? {
+            Some(capture) => capture.abandon(reconcile),
+            None => Ok(()),
+        }
+    }
+
     fn recover_checkpoint_capture(
         &self,
         actor: &PrincipalId,

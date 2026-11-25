@@ -870,6 +870,26 @@ fn restore_fingerprint(request: &CheckpointRestoreRequest, request_id: &str) -> 
     }
 }
 
+fn require_exact_captured_receipt(
+    receipt: &ConstructionPreparation,
+    fingerprint: &str,
+    layout: Option<&str>,
+) -> Result<()> {
+    if receipt.fingerprint != fingerprint
+        || receipt.sources.is_none()
+        || receipt.restore_boundary.as_ref().is_none_or(|boundary| {
+            layout.is_some_and(|expected| boundary.binding_digest != expected)
+                || boundary.baseline_sources.is_some()
+                || boundary.has_baseline_selection()
+        })
+    {
+        return Err(Error::Denied(
+            "captured restore request or layout differs from original semantics",
+        ));
+    }
+    Ok(())
+}
+
 fn replay_restore_in(
     connection: &Connection,
     actor: &PrincipalId,
@@ -1513,6 +1533,57 @@ impl SessionStore {
         }
     }
 
+    /// Check a captured restore's original invocation for terminal cleanup
+    /// before the host opens its private layout/approval or resolves a driver.
+    /// Only the original Rejected source claim is a successful replay.
+    pub fn checkpoint_replay_abandoned_captured_restore(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        request_id: &str,
+    ) -> Result<bool> {
+        let fingerprint = restore_fingerprint(request, request_id)?;
+        let mut connection = self.connection()?;
+        let tx = db(connection.transaction())?;
+        let creator = user_for_principal(&tx, actor)?
+            .ok_or(Error::Denied("checkpoint restore caller unavailable"))?;
+        let receipt = construction_receipt::lookup_in(
+            &tx,
+            ConstructionOperation::CheckpointRestore,
+            &creator,
+            request_id,
+        )?
+        .ok_or(Error::Denied("checkpoint restore receipt unavailable"))?;
+        require_exact_captured_receipt(&receipt, &fingerprint, None)?;
+        receipt.require_actor(&tx, actor)?;
+        let reconciled = construction_receipt::is_reconciled_in(&tx, &receipt)?;
+        if !reconciled && !receipt.state.unresolved() {
+            return Err(Error::Conflict(
+                "published checkpoint restore cannot be abandoned",
+            ));
+        }
+        db(tx.commit())?;
+        Ok(reconciled)
+    }
+
+    /// Reconcile only the original captured-source request and exact layout.
+    /// No new candidate, alternate baseline or published Agent cleanup.
+    pub fn checkpoint_abandon_captured_restore_exact<F>(
+        &self,
+        actor: &PrincipalId,
+        request: &CheckpointRestoreRequest,
+        binding: &SessionBinding,
+        request_id: &str,
+        reconcile: impl FnOnce(&SourceDriverRegistryReader, &SourceSet, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        let fingerprint = restore_fingerprint(request, request_id)?;
+        let layout = binding_digest(binding)?;
+        match self.recover_checkpoint_restore(actor, request_id, Some((&fingerprint, &layout)))? {
+            Some(restore) => restore.abandon(reconcile),
+            None => Ok(()),
+        }
+    }
+
     fn recover_checkpoint_restore(
         &self,
         actor: &PrincipalId,
@@ -1538,17 +1609,7 @@ impl SessionStore {
             )?
             .ok_or(Error::Denied("checkpoint restore receipt unavailable"))?;
             if let Some((fingerprint, layout)) = exact_captured {
-                if receipt.fingerprint != fingerprint
-                    || receipt.restore_boundary.as_ref().is_none_or(|boundary| {
-                        boundary.binding_digest != layout
-                            || boundary.baseline_sources.is_some()
-                            || boundary.has_baseline_selection()
-                    })
-                {
-                    return Err(Error::Denied(
-                        "captured restore request or layout differs from original semantics",
-                    ));
-                }
+                require_exact_captured_receipt(&receipt, fingerprint, Some(layout))?;
             }
             if construction_receipt::is_reconciled_in(&tx, &receipt)? {
                 return Ok(None);

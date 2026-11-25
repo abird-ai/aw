@@ -346,37 +346,41 @@ mod tests {
         // Interrupt a real prepared capture after retention creation, before
         // publication, then reopen and recover through the configured path.
         let driver = store.source_driver(&handle).unwrap();
-        let prepared = store
-            .checkpoint_prepare_capture(
-                &actor,
-                agent_ref,
-                request.selection.clone(),
-                request.note,
-                "fixture:capture",
-                |checkpoint, bindings| {
-                    assert_eq!(bindings.len(), 1);
-                    Ok(PreparedSourceSet {
-                        prepare_id: checkpoint.to_owned(),
-                        operation: SourceOperationKind::Capture,
-                        sources: vec![NamedPreparedSource {
-                            name: location.name.clone(),
-                            prepared: driver.plan_capture_approved(
-                                &location,
-                                &bindings[0].binding,
-                                checkpoint,
-                                checkpoint,
-                            )?,
-                        }],
-                    })
-                },
-            )
-            .unwrap();
-        let interrupted_id = prepared.checkpoint_id().to_owned();
-        prepared.revalidate().unwrap();
-        driver
-            .execute_capture(&prepared.sources().sources[0].prepared)
-            .unwrap();
-        prepared.mark_unknown().unwrap();
+        let interrupt_capture = |store: &SessionStore, id: &str| {
+            let prepared = store
+                .checkpoint_prepare_capture(
+                    &actor,
+                    agent_ref,
+                    request.selection.clone(),
+                    request.note,
+                    id,
+                    |checkpoint, bindings| {
+                        assert_eq!(bindings.len(), 1);
+                        Ok(PreparedSourceSet {
+                            prepare_id: checkpoint.to_owned(),
+                            operation: SourceOperationKind::Capture,
+                            sources: vec![NamedPreparedSource {
+                                name: location.name.clone(),
+                                prepared: driver.plan_capture_approved(
+                                    &location,
+                                    &bindings[0].binding,
+                                    checkpoint,
+                                    checkpoint,
+                                )?,
+                            }],
+                        })
+                    },
+                )
+                .unwrap();
+            let candidate = prepared.checkpoint_id().to_owned();
+            prepared.revalidate().unwrap();
+            driver
+                .execute_capture(&prepared.sources().sources[0].prepared)
+                .unwrap();
+            prepared.mark_unknown().unwrap();
+            candidate
+        };
+        let interrupted_id = interrupt_capture(&store, "fixture:capture");
         drop(store);
         let store =
             SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
@@ -409,6 +413,49 @@ mod tests {
             grant_before
         );
         assert_eq!(store.agent_get(&actor, agent_ref).unwrap(), agent_before);
+        // Exact abandonment of an unpublished capture; changed refs must
+        // remain untouched and the original hazard must survive failure.
+        let abandon_capture = |store: &SessionStore, config: &Path, id: &str| {
+            crate::checkpoint_capture::abandon(store, &actor, config, &request, id)
+        };
+        assert!(abandon_capture(&store, &approvals, "fixture:fresh-capture").is_err());
+        let capture_candidate = interrupt_capture(&store, "fixture:abandon-capture");
+        let private_ref = format!("refs/aw/checkpoints/{capture_candidate}/code");
+        let original_oid = git(&executable, &repo, &["rev-parse", &private_ref]);
+        assert!(store
+            .checkpoint_abandon_capture_exact::<()>(
+                &actor,
+                &wrong_request,
+                "fixture:abandon-capture",
+                |_, _, _| panic!("wrong cleanup request reached provider")
+            )
+            .is_err());
+        git(
+            &executable,
+            &repo,
+            &["update-ref", &private_ref, &head, &original_oid],
+        );
+        assert!(abandon_capture(&store, &approvals, "fixture:abandon-capture").is_err());
+        assert_eq!(git(&executable, &repo, &["rev-parse", &private_ref]), head);
+        let mutations = SourceMutationSet::from_bindings(std::slice::from_ref(&binding)).unwrap();
+        assert!(store
+            .acquire_source_mutation_barrier(&mutations, "fixture:capture-still-unknown")
+            .is_err());
+        drop(store);
+        git(
+            &executable,
+            &repo,
+            &["update-ref", &private_ref, &original_oid, &head],
+        );
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        abandon_capture(&store, &approvals, "fixture:abandon-capture").unwrap();
+        assert!(git(&executable, &repo, &["for-each-ref", &private_ref]).is_empty());
+        assert!(store
+            .checkpoint_get_metadata(&actor, &capture_candidate)
+            .is_err());
+        assert!(invoke(&store, &approvals, "fixture:abandon-capture", false).is_err());
+
         // Restore the independently retained fresh checkpoint into named
         // layouts. No new grant, task, Agent activation or source recapture.
         let restore_request = CheckpointRestoreRequest {
@@ -513,44 +560,49 @@ mod tests {
             serde_json::to_vec(&interrupted_config).unwrap(),
         )
         .unwrap();
-        let pending = store
-            .checkpoint_prepare_restore(
-                &actor,
-                &restore_request,
-                &interrupted_layout,
-                "fixture:restore-interrupted",
-                "local",
-                |prepare_id, _, anchors| {
-                    let [anchor] = anchors.anchors.as_slice() else {
-                        panic!("expected exact captured source")
-                    };
-                    let anchor = GitSourceAnchor::try_from(anchor)?;
-                    let selected = GitRestoreLocation {
-                        name: location.name.clone(),
-                        repository: location.repository.clone(),
-                        repository_identity: location.repository_identity,
-                        target: interrupted.join("code"),
-                        parent_identity: DirectoryIdentity::open(&interrupted)?.identity()?,
-                    };
-                    Ok(PreparedSourceSet {
-                        prepare_id: prepare_id.to_owned(),
-                        operation: SourceOperationKind::Restore,
-                        sources: vec![NamedPreparedSource {
+        let interrupt_restore = |store: &SessionStore, target: &Path, id: &str| {
+            let pending = store
+                .checkpoint_prepare_restore(
+                    &actor,
+                    &restore_request,
+                    &layout(target),
+                    id,
+                    "local",
+                    |prepare_id, _, anchors| {
+                        let [anchor] = anchors.anchors.as_slice() else {
+                            panic!("expected exact captured source")
+                        };
+                        let anchor = GitSourceAnchor::try_from(anchor)?;
+                        let selected = GitRestoreLocation {
                             name: location.name.clone(),
-                            prepared: driver
-                                .plan_restore_approved(&selected, &anchor, prepare_id)?,
-                        }],
-                    })
-                },
-            )
-            .unwrap();
-        let candidate = pending.prepare_id().to_owned();
-        let candidate_sandbox = pending.sandbox_ref().to_owned();
-        pending.revalidate(&interrupted_layout).unwrap();
-        driver
-            .execute_restore(&pending.sources().sources[0].prepared)
-            .unwrap();
-        pending.mark_unknown().unwrap();
+                            repository: location.repository.clone(),
+                            repository_identity: location.repository_identity,
+                            target: target.join("code"),
+                            parent_identity: DirectoryIdentity::open(target)?.identity()?,
+                        };
+                        Ok(PreparedSourceSet {
+                            prepare_id: prepare_id.to_owned(),
+                            operation: SourceOperationKind::Restore,
+                            sources: vec![NamedPreparedSource {
+                                name: location.name.clone(),
+                                prepared: driver
+                                    .plan_restore_approved(&selected, &anchor, prepare_id)?,
+                            }],
+                        })
+                    },
+                )
+                .unwrap();
+            let candidate = pending.prepare_id().to_owned();
+            let candidate_sandbox = pending.sandbox_ref().to_owned();
+            pending.revalidate(&layout(target)).unwrap();
+            driver
+                .execute_restore(&pending.sources().sources[0].prepared)
+                .unwrap();
+            pending.mark_unknown().unwrap();
+            (candidate, candidate_sandbox)
+        };
+        let (candidate, candidate_sandbox) =
+            interrupt_restore(&store, &interrupted, "fixture:restore-interrupted");
         drop(store);
         let store =
             SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
@@ -622,6 +674,52 @@ mod tests {
             grant_before
         );
 
+        // Abandon only an original unpublished materialization. A user edit
+        // must prevent cleanup; exact repair and restart permit reconciliation.
+        let abandon_restore = |store: &SessionStore, config: &Path, id: &str| {
+            crate::checkpoint_restore::abandon(store, &actor, config, &restore_request, id)
+        };
+        assert!(abandon_restore(&store, &restore_path, "fixture:restore").is_err());
+        let abandon_root = root.join("restore-abandoned");
+        aw_platform::ensure_private_dir(&abandon_root).unwrap();
+        let abandon_config = restore_config(&store, &abandon_root);
+        fs::write(&restore_path, serde_json::to_vec(&abandon_config).unwrap()).unwrap();
+        let (_, abandoned_sandbox) =
+            interrupt_restore(&store, &abandon_root, "fixture:abandon-restore");
+        assert!(store
+            .checkpoint_abandon_captured_restore_exact::<()>(
+                &actor,
+                &restore_request,
+                &wrong_layout,
+                "fixture:abandon-restore",
+                |_, _, _| panic!("wrong cleanup layout reached provider")
+            )
+            .is_err());
+        let changed = abandon_root.join("code/tracked");
+        fs::write(&changed, b"independent edit").unwrap();
+        assert!(abandon_restore(&store, &restore_path, "fixture:abandon-restore").is_err());
+        assert_eq!(fs::read(&changed).unwrap(), b"independent edit");
+        assert!(store
+            .acquire_source_mutation_barrier(&mutations, "fixture:restore-still-unknown")
+            .is_err());
+        fs::write(&changed, b"dirty checkpoint").unwrap();
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        abandon_restore(&store, &restore_path, "fixture:abandon-restore").unwrap();
+        assert_eq!(fs::read_dir(&abandon_root).unwrap().count(), 0);
+        assert!(store.sandbox_get(&actor, &abandoned_sandbox).is_err());
+        assert!(invoke_restore(&store, &restore_path, "fixture:abandon-restore", false).is_err());
+        assert!(store
+            .checkpoint_replay_abandoned_captured_restore(
+                &actor,
+                &restore_request,
+                "fixture:abandon-restore"
+            )
+            .unwrap());
+        verify_restore(&store, &published, &destination);
+        verify_restore(&store, &recovered, &interrupted);
+
         let reference = format!("refs/aw/checkpoints/{}/code", capture.id);
         let captured = git(&executable, &repo, &["rev-parse", &reference]);
         assert_ne!(captured, head);
@@ -656,7 +754,6 @@ mod tests {
             git(&executable, &repo, &["rev-parse", &reference]),
             captured
         );
-        let mutations = SourceMutationSet::from_bindings(&[binding]).unwrap();
         store
             .acquire_source_mutation_barrier(&mutations, "fixture:preflight-no-hazard")
             .unwrap()
@@ -719,6 +816,26 @@ mod tests {
         // Terminal replay uses the tombstone even without installed Git or the checkout.
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        abandon_capture(
+            &store,
+            &root.join("absent-approval"),
+            "fixture:abandon-capture",
+        )
+        .unwrap();
+        abandon_restore(
+            &store,
+            &root.join("absent-approval"),
+            "fixture:abandon-restore",
+        )
+        .unwrap();
+        assert!(crate::checkpoint_restore::abandon(
+            &store,
+            &actor,
+            &root.join("absent-approval"),
+            &wrong_request,
+            "fixture:abandon-restore"
+        )
+        .is_err());
         assert_eq!(
             invoke_restore(
                 &store,

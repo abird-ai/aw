@@ -37,8 +37,11 @@ pub(crate) struct Args {
     #[arg(long = "session-title")]
     title: Option<String>,
     /// Inspect/publish the original prepared restore; never rematerialize.
-    #[arg(long = "agent-recover")]
+    #[arg(long = "agent-recover", conflicts_with = "abandon")]
     recover: bool,
+    /// Reconcile the original unpublished worktrees, never a published Agent.
+    #[arg(long = "agent-abandon", conflicts_with = "recover")]
+    abandon: bool,
 }
 
 // Separate from native filesystem access or retired-retention permission:
@@ -212,14 +215,7 @@ impl GitRestoreFence for Fence<'_> {
     }
 }
 
-pub(crate) fn restore(
-    store: &SessionStore,
-    actor: &PrincipalId,
-    path: &Path,
-    request: &CheckpointRestoreRequest,
-    request_id: &str,
-    recover: bool,
-) -> Result<CheckpointRestoreResult> {
+fn require_offline_request(request: &CheckpointRestoreRequest) -> Result<()> {
     if request.task.is_some()
         || request.project.is_some()
         || request.access != AgentHistoryForkAccess::Private
@@ -228,6 +224,18 @@ pub(crate) fn restore(
             "offline captured restore requires same-Project private taskless construction",
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn restore(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    path: &Path,
+    request: &CheckpointRestoreRequest,
+    request_id: &str,
+    recover: bool,
+) -> Result<CheckpointRestoreResult> {
+    require_offline_request(request)?;
     // Applied replay requires neither physical approval nor Git lookup.
     // Incomplete operations never become new invocations.
     match store.checkpoint_replay_restore(actor, request, request_id) {
@@ -260,6 +268,30 @@ pub(crate) fn restore(
     }
 }
 
+/// Exact offline abandonment; no new layout, task, source or published
+/// Agent cleanup. A terminal Rejected replay does not reopen host state.
+pub(crate) fn abandon(
+    store: &SessionStore,
+    actor: &PrincipalId,
+    path: &Path,
+    request: &CheckpointRestoreRequest,
+    request_id: &str,
+) -> Result<()> {
+    require_offline_request(request)?;
+    if store.checkpoint_replay_abandoned_captured_restore(actor, request, request_id)? {
+        return Ok(());
+    }
+    let approval = Approval::open(store, actor, &request.checkpoint, path)?;
+    let handle = store.source_driver_handle::<GitSourceDriver>(&DriverKey::builtin("git")?)?;
+    GitCheckpointRestoreHost::new(store, &handle).abandon_captured_exact(
+        actor,
+        request,
+        request_id,
+        &approval.config.binding,
+        |anchors, _| approval.fence(&approval.config.binding, anchors, true),
+    )
+}
+
 pub(crate) fn run(args: Args) -> Result<u8> {
     let actor = PrincipalId::new(aw_platform::local_principal()?)?;
     require_existing_store(&args.state_dir)?;
@@ -271,12 +303,18 @@ pub(crate) fn run(args: Args) -> Result<u8> {
         access: AgentHistoryForkAccess::Private,
         task: None,
     };
+    let request_id = format!("cli:checkpoint-restore:{}", args.request_id);
+    if args.abandon {
+        abandon(&store, &actor, &args.approval, &request, &request_id)?;
+        super::print_json(&serde_json::json!({"status":"rejected"}))?;
+        return Ok(0);
+    }
     let result = restore(
         &store,
         &actor,
         &args.approval,
         &request,
-        &format!("cli:checkpoint-restore:{}", args.request_id),
+        &request_id,
         args.recover,
     )?;
     super::print_json(&serde_json::json!({"ref":result.agent.canonical_ref,

@@ -923,6 +923,7 @@ pub(crate) fn reconcile_unpublished_sources<F>(
     barrier: &SourceMutationBarrier,
     reconcile: impl FnOnce() -> Result<F>,
 ) -> Result<()> {
+    let mut fence = None;
     let result = (|| {
         // Check absence/ownership before any trusted cleanup is invoked.
         {
@@ -931,33 +932,30 @@ pub(crate) fn reconcile_unpublished_sources<F>(
             require_unpublished_sources_in(&tx, actor, receipt, barrier)?;
             db(tx.commit())?;
         }
-        let fence = reconcile()?;
+        fence = Some(reconcile()?);
         // The source barrier also excludes recovery of this operation's
         // private task. Never discard an Applied candidate's queue input.
         if let Some(task) = &receipt.task {
             store.discard_prepared_queue_custody(&task.custody())?;
         }
-        let finish = (|| {
-            let mut connection = store.connection()?;
-            let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
-            require_unpublished_sources_in(&tx, actor, receipt, barrier)?;
-            let rejected = ConstructionPreparation {
-                state: PreparationState::Rejected,
-                result_ref: None,
-                note: Some("unpublished source candidate reconciled".into()),
-                ..receipt.clone()
-            };
-            rejected.validate()?;
-            append_in(&tx, actor, &rejected)?;
-            barrier.settle_in(&tx, SourceMutationOutcome::Settled)?;
-            db(tx.commit())
-        })();
-        drop(fence);
-        finish
+        let mut connection = store.connection()?;
+        let tx = db(connection.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        require_unpublished_sources_in(&tx, actor, receipt, barrier)?;
+        let rejected = ConstructionPreparation {
+            state: PreparationState::Rejected,
+            result_ref: None,
+            note: Some("unpublished source candidate reconciled".into()),
+            ..receipt.clone()
+        };
+        rejected.validate()?;
+        append_in(&tx, actor, &rejected)?;
+        barrier.settle_in(&tx, SourceMutationOutcome::Settled)?;
+        db(tx.commit())
     })();
     if result.is_err() {
         mark_sources_unknown(store, actor, receipt, barrier)?;
     }
+    drop(fence);
     result
 }
 
