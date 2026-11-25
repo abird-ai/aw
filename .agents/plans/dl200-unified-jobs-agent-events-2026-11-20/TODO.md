@@ -1068,6 +1068,20 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       **255/255**, Sandbox **4/4**, non-Git native **1/1**, Host **16/16**, strict
       affected Clippy (both Host feature variants), workspace check and scoped
       fmt/diff passed. Earlier Store-wide legacy failures not rerun.
+      **Shared finite Vault Process settlement landed:** ordinary/Vault interactive
+      start and finite run share one statically selected private spawn projection
+      and the existing finite worker. `run_source_process_with_vault` retains
+      original lease through wait/stop/reap and physical proof even on awaiter loss;
+      factual result remains separate from deferred quiescence. Grouped real
+      Process regression exercises stale Vault/collision no-spawn, interactive
+      proof success, actual finite proof-bearing child, provider withdrawal,
+      dropped awaiter/local cancellation and original interrupted recovery.
+      No extra Process/Job/receipt owner, dependency or schema. Independent
+      quiescence/containment required, no retroactive proof erasure. Interactive
+      settlement remains explicit. Standalone effectful Sandbox construction
+      needs Project-owned receipt scope, not synthetic Agent audit origin.
+      Final Host **16/16**, strict Host Clippy (both feature variants), workspace
+      check and scoped fmt/diff passed. Unchanged Store/adapter suites not repeated.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

@@ -11,7 +11,7 @@ use aw_tools::{
     filesystem::runner::{ProcessExit, ProcessTerminal},
 };
 use aw_tools_adapter::process::{
-    PipeLaunchFailure, PipeProcess, PreparedPipeLaunch, ProcessReceipt,
+    PipeLaunchFailure, PipeProcess, PreparedPipeLaunch, ProcessReceipt, SpawnOnce,
 };
 use tokio::time::Instant;
 
@@ -135,6 +135,7 @@ async fn spawn_source_process<P, A>(
     boundary: SandboxEffectLaunch,
     deadline: Instant,
     control: &SourceProcessControl,
+    project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
 ) -> std::result::Result<PipeProcess, PipeLaunchFailure>
 where
     P: Send + 'static,
@@ -149,14 +150,58 @@ where
         // Do not reenter its read lock from the final cancellation probe.
         check,
         async move { signal.cancelled().await },
-        move |spawn, (_, authority)| {
-            let _ = boundary.with_source_authority(authority, || {
-                spawn.spawn();
-                Ok(())
-            });
-        },
+        move |spawn, (_, authority)| project(spawn, authority, boundary),
     )
     .await
+}
+
+fn ordinary_projection<A: SandboxEffectAuthority>(
+    spawn: SpawnOnce<'_>,
+    authority: &ProcessToolAuthority<A>,
+    boundary: SandboxEffectLaunch,
+) {
+    let _ = boundary.with_source_authority(authority, || {
+        spawn.spawn();
+        Ok(())
+    });
+}
+
+fn signing_projection<A, S>(
+    registry: aw_agent_core::VaultProviderRegistryReader,
+    handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
+    selection: aw_store::SigningProcessProof,
+) -> impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static
+where
+    A: SandboxEffectAuthority + Send + 'static,
+    S: aw_store::SecretStore + 'static,
+{
+    move |mut spawn, authority, boundary| {
+        // A refusal leaves the one-shot token unused. The same final
+        // source/ToolBinding/Store fence also holds the live provider.
+        let _ = aw_store::SigningVaultProvider::with_process_proof(
+            &registry,
+            &handle,
+            boundary,
+            authority,
+            selection,
+            |proof| {
+                let mut hex = [0u8; 64];
+                const DIGITS: &[u8; 16] = b"0123456789abcdef";
+                for (byte, pair) in proof.iter().zip(hex.chunks_exact_mut(2)) {
+                    pair[0] = DIGITS[(byte >> 4) as usize];
+                    pair[1] = DIGITS[(byte & 15) as usize];
+                }
+                spawn
+                    .insert_reserved_env(
+                        aw_store::SIGNING_PROOF_ENV,
+                        std::str::from_utf8(&hex).expect("ASCII proof"),
+                    )
+                    .map_err(|_| Error::Denied("reserved Vault projection collision"))?;
+                spawn.spawn();
+                Ok(())
+            },
+        );
+    }
 }
 
 /// Factual original Process result and independent, deferred source
@@ -191,6 +236,55 @@ where
     P: Send + 'static,
     A: SandboxEffectAuthority + Send + 'static,
 {
+    run_fenced_source_process(
+        prepared,
+        deadline,
+        cancellation,
+        ordinary_projection,
+        prove_quiescent,
+    )
+    .await
+}
+
+/// Finite proof-bearing Process. Like the ordinary finite path, the
+/// actual worker owns the original lease through wait/stop/reap and
+/// deferred settlement even if the result awaiter disappears. Provider
+/// withdrawal governs future projections, not already-materialized proof.
+pub async fn run_source_process_with_vault<P, A, S>(
+    prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
+    deadline: Instant,
+    cancellation: CancellationToken,
+    registry: aw_agent_core::VaultProviderRegistryReader,
+    handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider<S>>,
+    selection: aw_store::SigningProcessProof,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()> + Send + 'static,
+) -> Result<SourceProcessCompletion>
+where
+    P: Send + 'static,
+    A: SandboxEffectAuthority + Send + 'static,
+    S: aw_store::SecretStore + 'static,
+{
+    run_fenced_source_process(
+        prepared,
+        deadline,
+        cancellation,
+        signing_projection(registry, handle, selection),
+        prove_quiescent,
+    )
+    .await
+}
+
+async fn run_fenced_source_process<P, A>(
+    prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
+    deadline: Instant,
+    cancellation: CancellationToken,
+    project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
+    prove_quiescent: impl FnOnce(&ProcessTerminal) -> Result<()> + Send + 'static,
+) -> Result<SourceProcessCompletion>
+where
+    P: Send + 'static,
+    A: SandboxEffectAuthority + Send + 'static,
+{
     let abandoned = CancellationToken::new();
     let control = SourceProcessControl {
         tool: prepared.authority().tool.clone(),
@@ -201,7 +295,9 @@ where
     let (launch, authority, boundary, source) = prepared.admit_with_launch_authority()?;
     tokio::spawn(async move {
         let receipt =
-            match spawn_source_process(launch, authority, boundary, deadline, &control).await {
+            match spawn_source_process(launch, authority, boundary, deadline, &control, project)
+                .await
+            {
                 Ok(mut process) => {
                     process.close_stdin();
                     Ok(process
@@ -257,6 +353,19 @@ where
     P: Send + 'static,
     A: SandboxEffectAuthority + Send + 'static,
 {
+    start_fenced_source_process(prepared, deadline, cancellation, ordinary_projection).await
+}
+
+async fn start_fenced_source_process<P, A>(
+    prepared: PreparedSandboxEffect<'_, PreparedPipeLaunch<P>, ProcessToolAuthority<A>>,
+    deadline: Instant,
+    cancellation: CancellationToken,
+    project: impl FnOnce(SpawnOnce<'_>, &ProcessToolAuthority<A>, SandboxEffectLaunch) + Send + 'static,
+) -> Result<SourceProcessStart>
+where
+    P: Send + 'static,
+    A: SandboxEffectAuthority + Send + 'static,
+{
     let tool = prepared.authority().tool.clone();
     let control = SourceProcessControl {
         tool: tool.clone(),
@@ -264,7 +373,8 @@ where
         abandoned: None,
     };
     let (launch, authority, boundary, source) = prepared.admit_with_launch_authority()?;
-    let launch = spawn_source_process(launch, authority, boundary, deadline, &control).await;
+    let launch =
+        spawn_source_process(launch, authority, boundary, deadline, &control, project).await;
     Ok(SourceProcessStart {
         launch,
         source: SourceProcessLease { source, tool },
@@ -287,59 +397,13 @@ where
     A: SandboxEffectAuthority + Send + 'static,
     S: aw_store::SecretStore + 'static,
 {
-    let tool = prepared.authority().tool.clone();
-    let control = SourceProcessControl {
-        tool: tool.clone(),
+    start_fenced_source_process(
+        prepared,
+        deadline,
         cancellation,
-        abandoned: None,
-    };
-    let check = control.probe();
-    let (launch, source) = prepared
-        .start_with_launch_authority(move |launch, authority, boundary| {
-            PipeProcess::spawn_prepared_fenced_until(
-                launch.with_custody(authority),
-                deadline,
-                // The final synchronous fence itself owns the ToolBinding read
-                // guard. Do not re-enter that guard from the cancellation probe.
-                check,
-                async move { control.cancelled().await },
-                move |mut spawn, (_, authority)| {
-                    // Only the actual registered provider and current original
-                    // intent may project this value. A refusal leaves the
-                    // one-shot spawn token unused, yielding definite no-spawn.
-                    let _ = aw_store::SigningVaultProvider::with_process_proof(
-                        &registry,
-                        &handle,
-                        boundary,
-                        authority,
-                        selection,
-                        |proof| {
-                            let mut hex = [0u8; 64];
-                            const DIGITS: &[u8; 16] = b"0123456789abcdef";
-                            for (byte, pair) in proof.iter().zip(hex.chunks_exact_mut(2)) {
-                                pair[0] = DIGITS[(byte >> 4) as usize];
-                                pair[1] = DIGITS[(byte & 15) as usize];
-                            }
-                            spawn
-                                .insert_reserved_env(
-                                    aw_store::SIGNING_PROOF_ENV,
-                                    std::str::from_utf8(&hex).expect("ASCII proof"),
-                                )
-                                .map_err(|_| {
-                                    Error::Denied("reserved Vault projection collision")
-                                })?;
-                            spawn.spawn();
-                            Ok(())
-                        },
-                    );
-                },
-            )
-        })
-        .await?;
-    Ok(SourceProcessStart {
-        launch,
-        source: SourceProcessLease { source, tool },
-    })
+        signing_projection(registry, handle, selection),
+    )
+    .await
 }
 
 #[cfg(all(test, unix))]
@@ -420,7 +484,7 @@ mod tests {
         } else if id == "host:interrupted" {
             // Fixed single-child workload: shell builtins only. The marker
             // proves actual execution before the result awaiter disappears.
-            "printf entered > entered; while :; do :; done"
+            r#"[[ "$AW_VAULT_SIGNING_PROOF" =~ ^[0-9a-f]{64}$ ]] || exit 21; printf entered > entered; while :; do :; done"#
         } else {
             "printf changed > code; printf done"
         }
@@ -771,8 +835,15 @@ mod tests {
         store
             .sandbox_grant_set(&actor, &reference, revoked.revision, Some(&policy))
             .unwrap();
-        let Err(failure) =
-            spawn_source_process(launch, authority, boundary, deadline(), &control).await
+        let Err(failure) = spawn_source_process(
+            launch,
+            authority,
+            boundary,
+            deadline(),
+            &control,
+            ordinary_projection,
+        )
+        .await
         else {
             panic!("stale admitted source grant spawned a Process")
         };
@@ -896,19 +967,24 @@ mod tests {
             ("host:vault-stale", stale, stale_rev),
             ("host:vault-collision", collision, current_rev),
         ] {
-            let SourceProcessStart { launch, source } = start_source_process_with_vault(
+            let completion = run_source_process_with_vault(
                 prepared,
                 deadline(),
                 CancellationToken::new(),
                 vault_registry.reader().unwrap(),
                 vault_handle.clone(),
                 selection(rev),
+                |_| panic!("refused Vault projection must not inspect a terminal"),
             )
             .await
             .unwrap();
-            let Err(failure) = launch else {
+            let Err(failure) = completion.receipt else {
                 panic!("refused Vault projection spawned a Process");
             };
+            assert_eq!(
+                completion.quiescence.unwrap(),
+                SandboxEffectOutcome::NotStarted
+            );
             assert!(matches!(
                 failure,
                 PipeLaunchFailure::NotStarted(Error::Denied(_))
@@ -924,8 +1000,10 @@ mod tests {
                 .await,
             );
             assert_eq!(
-                source.settle_after_recorded_failure(&failure).unwrap(),
-                SandboxEffectOutcome::NotStarted
+                store
+                    .sandbox_settle_recorded_tool_source_effect(&actor, &reference, 1, id)
+                    .unwrap(),
+                Some(SandboxEffectOutcome::NotStarted)
             );
         }
         let valid = prepare("host:vault-valid", capture(), false).unwrap();
@@ -961,8 +1039,6 @@ mod tests {
                 .unwrap(),
             SandboxEffectOutcome::Settled
         );
-        provider.revoke(&target.entry.entry).unwrap();
-
         let prepared = prepare("host:write", capture(), false).unwrap();
         let effect_id = prepared.plan().effect_id.clone();
         assert!(store
@@ -1113,16 +1189,20 @@ mod tests {
             SandboxEffectOutcome::Settled
         );
 
-        // Loss of the awaiter while the real finite Process is running.
-        // Its original owner requests cancellation, waits/reaps, and
-        // records physical proof independently of the lost result.
+        // Loss of the awaiter while the real finite Vault Process is
+        // running. The child first proves it received the projection.
+        // Its original owner waits/reaps and records physical proof
+        // independently of the lost result and provider withdrawal.
         let prepared = prepare("host:interrupted", capture(), false).unwrap();
         let interrupted_id = prepared.plan().effect_id.clone();
         let parent_cancel = CancellationToken::new();
-        let mut pending = Box::pin(run_source_process(
+        let mut pending = Box::pin(run_source_process_with_vault(
             prepared,
             deadline(),
             parent_cancel.clone(),
+            vault_registry.reader().unwrap(),
+            vault_handle.clone(),
+            selection(current_rev),
             |terminal| {
                 // The trusted fixture command contains no child creation.
                 assert_eq!(
@@ -1141,6 +1221,12 @@ mod tests {
                 }
             }) => ready.unwrap(),
         }
+        // Withdrawal is future-only. It does not retroactively erase
+        // the materialized proof or certify the already-running child.
+        provider.revoke(&target.entry.entry).unwrap();
+        assert!(store
+            .acquire_source_mutation_barrier(&set, "host:vault-running")
+            .is_err());
         drop(pending);
         assert!(!parent_cancel.is_cancelled());
         // Wait for the worker's original durable physical fact, not a

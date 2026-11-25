@@ -56,7 +56,8 @@ and finite Process quiescence, marked Git private-index scratch reconciliation,
 exact-subset unpublished Git restore abandonment and verified metadata-only final
 source detachment, independently approved multi-source native filesystem
 realization, durable native artifact custody/recovery and exact Store-backed Git
-native approval provisioning are implemented locally.
+native approval provisioning, and shared finite Vault Process settlement are
+implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2573,6 +2574,33 @@ ACK portion and parses/verifies the existing provenance fields; idempotent ACK a
 nonexistent explicit stream refusal remain unchanged. No Job runtime change.
 Isolated ACK regression and complete adapter library **255/255** passed. Previous
 Store-wide legacy failures were not rerun.
+
+Finite Vault proof-bearing Processes now reuse the exact ordinary Process
+launch and worker settlement owners. A statically selected private projection
+callback composes the one-shot spawn token, original source/tool/Store fence
+and actual signing-provider guard. Both interactive start APIs and both finite
+run APIs share the same spawn preparation and cancellation logic; no extra
+runtime policy dispatch, separate task owner, dependency or durable schema.
+`run_source_process_with_vault` retains the original source lease through
+wait/stop/reap and deferred physical settlement, including lost awaiters. The
+existing `SourceProcessCompletion` keeps factual Process receipts and source
+quiescence results separate. The finite path refuses stale Vault grant and
+reserved-env collision without spawning or inspecting a nonexistent terminal.
+Existing interactive Vault success path remains exercised. Grouped real Process
+regression now loses the finite Vault awaiter after a fixed child verifies the
+proof and signals entry. Provider withdrawal remains future-only and cannot
+release that child's source claim; awaiter loss cancels only the execution,
+not parent Turn. Original worker records quiescence and interrupted Turn
+recovery uses it without reinspection, rewriting receipt or acknowledging
+broader Run hazards. Driver proof is still independently required; the fixed
+single-child fixture is not general containment. Interactive settlement stays
+explicit, runtime loss/failed proof commits remain recovery cases. Socket/file
+and other provider integrations remain distinct; no lower mount convergence
+change. Standalone effectful Sandbox construction still requires a genuine
+Project-owned receipt scope, not a synthetic Agent audit origin.
+Final Host **16/16**, strict Host all-target Clippy with all features and
+source-effects-only, workspace all-target/all-feature check and scoped fmt/diff
+passed. Unchanged Store/adapter suites were not repeated.
 
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
