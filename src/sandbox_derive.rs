@@ -2,12 +2,13 @@
 //! source claims, recovery and publication remain with the original owner.
 use crate::git_maintenance::{
     canonical_private_directory, open_private_approval, overlaps, pin_named_layout,
-    require_existing_store, require_store_scope, validate_named_locations,
+    require_existing_store, require_named_destination, require_store_scope,
+    validate_named_locations, PinnedGitLayout,
 };
 use aw::{Error, PrincipalId, Result};
 use aw_agent_core::{CheckpointPolicy, DriverKey};
-use aw_git::source_driver::{GitRestoreLocation, GitSourceDriver, GitSourceLocation};
-use aw_host::source_checkpoint::{GitCheckpointRestoreHost, GitRestoreFence};
+use aw_git::source_driver::{GitSourceDriver, GitSourceLocation};
+use aw_host::source_checkpoint::GitCheckpointRestoreHost;
 use aw_platform::DirectoryIdentity;
 use aw_store::{
     SandboxCreateSources, SandboxLifecycle, SandboxSnapshot, SessionBinding, SessionStore,
@@ -94,16 +95,16 @@ impl Approval {
         // separate fresh named-child layout. No linked checkout or arbitrary
         // overlapping parent layout is admitted by this offline host.
         let parent_root = snapshot.tool_root;
-        if config.binding.working_directory != *root
-            || snapshot.working_directory != parent_root
-            || !root.is_absolute()
-            || root.parent().is_none()
+        require_named_destination(
+            root,
+            &config.binding.working_directory,
+            &config.store_directory,
+            directory,
+        )?;
+        if snapshot.working_directory != parent_root
             || !parent_root.is_absolute()
             || parent_root.parent().is_none()
-            || overlaps(directory, &config.store_directory)
-            || [&config.store_directory, directory, &parent_root]
-                .iter()
-                .any(|path| overlaps(root, path))
+            || overlaps(root, &parent_root)
             || overlaps(&parent_root, directory)
             || overlaps(&parent_root, &config.store_directory)
         {
@@ -141,7 +142,7 @@ impl Approval {
         layout: &SessionBinding,
         input: SandboxCreateSources<'_>,
         recovery: bool,
-    ) -> Result<Fence<'_>> {
+    ) -> Result<PinnedGitLayout<'_>> {
         let SandboxCreateSources::Parent(bindings) = input else {
             return Err(Error::Denied("derive cannot substitute a baseline"));
         };
@@ -153,7 +154,7 @@ impl Approval {
         layout: &SessionBinding,
         bindings: &[VersionedSourceBinding],
         recovery: bool,
-    ) -> Result<Fence<'_>> {
+    ) -> Result<PinnedGitLayout<'_>> {
         let c = &self.config;
         let git = DriverKey::builtin("git")?;
         if layout != &c.binding
@@ -176,31 +177,16 @@ impl Approval {
         if parent.identity()? == c.destination_identity {
             return Err(Error::Denied("derived layout aliases the parent"));
         }
-        let (locations, mut pins) = pin_named_layout(
+        let mut fence = pin_named_layout(
+            &self._lease,
             &layout.tool_root,
             c.destination_identity,
             &c.repositories,
             &[&c.store_directory, &self.directory],
             recovery,
         )?;
-        pins.push(parent);
-        Ok(Fence {
-            _approval: self,
-            locations,
-            _pins: pins,
-        })
-    }
-}
-
-struct Fence<'a> {
-    _approval: &'a Approval,
-    locations: Vec<GitRestoreLocation>,
-    _pins: Vec<DirectoryIdentity>,
-}
-
-impl GitRestoreFence for Fence<'_> {
-    fn locations(&self) -> &[GitRestoreLocation] {
-        &self.locations
+        fence.retain_directory(parent);
+        Ok(fence)
     }
 }
 

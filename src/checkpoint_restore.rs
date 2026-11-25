@@ -1,16 +1,13 @@
 //! Offline captured-source restore under an independently selected Git
 //! administrative and destination-layout approval. Never activates an Agent.
 use crate::git_maintenance::{
-    open_private_approval, overlaps, pin_named_layout, require_existing_store, require_store_scope,
-    validate_named_locations,
+    open_private_approval, pin_named_layout, require_existing_store, require_named_destination,
+    require_store_scope, validate_named_locations, PinnedGitLayout,
 };
 use aw::{Error, PrincipalId, Result};
 use aw_agent_core::{DriverKey, SourceSet};
-use aw_git::source_driver::{
-    GitRestoreLocation, GitSourceAnchor, GitSourceDriver, GitSourceLocation,
-};
-use aw_host::source_checkpoint::{GitCheckpointRestoreHost, GitRestoreFence};
-use aw_platform::DirectoryIdentity;
+use aw_git::source_driver::{GitSourceAnchor, GitSourceDriver, GitSourceLocation};
+use aw_host::source_checkpoint::GitCheckpointRestoreHost;
 use aw_store::{
     AgentHistoryForkAccess, CheckpointRestoreRequest, CheckpointRestoreResult, SessionBinding,
     SessionStore,
@@ -88,18 +85,12 @@ impl Approval {
             &config.store_id,
             config.store_generation,
         )?;
-        let root = &config.binding.tool_root;
-        if &config.binding.working_directory != root
-            || !root.is_absolute()
-            || root.parent().is_none()
-            || overlaps(directory, &config.store_directory)
-            || overlaps(root, directory)
-            || overlaps(root, &config.store_directory)
-        {
-            return Err(Error::Denied(
-                "restore requires a disjoint private named layout",
-            ));
-        }
+        require_named_destination(
+            &config.binding.tool_root,
+            &config.binding.working_directory,
+            &config.store_directory,
+            directory,
+        )?;
         validate_named_locations(&mut config.repositories)?;
         if config.repositories.is_empty() {
             return Err(Error::Denied(
@@ -118,7 +109,7 @@ impl Approval {
         layout: &SessionBinding,
         anchors: &SourceSet,
         recover: bool,
-    ) -> Result<Fence<'_>> {
+    ) -> Result<PinnedGitLayout<'_>> {
         let c = &self.config;
         if layout != &c.binding
             || c.repositories.len() != anchors.anchors.len()
@@ -137,30 +128,14 @@ impl Approval {
                 ));
             }
         }
-        let (locations, pins) = pin_named_layout(
+        pin_named_layout(
+            &self._lease,
             &layout.tool_root,
             c.destination_identity,
             &c.repositories,
             &[&c.store_directory, &self.directory],
             recover,
-        )?;
-        Ok(Fence {
-            _approval: self,
-            locations,
-            _pins: pins,
-        })
-    }
-}
-
-struct Fence<'a> {
-    _approval: &'a Approval,
-    locations: Vec<GitRestoreLocation>,
-    _pins: Vec<DirectoryIdentity>,
-}
-
-impl GitRestoreFence for Fence<'_> {
-    fn locations(&self) -> &[GitRestoreLocation] {
-        &self.locations
+        )
     }
 }
 

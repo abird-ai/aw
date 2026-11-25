@@ -2,13 +2,12 @@
 //! Logical Sandbox/Agent closure remains with their existing owners.
 use crate::git_maintenance::{
     open_private_approval, overlaps, pin_named_layout, require_existing_store, require_store_scope,
-    validate_named_locations,
+    validate_named_locations, PinnedGitLayout,
 };
 use aw::{Error, PrincipalId, Result};
 use aw_agent_core::NamedPreparedSource;
-use aw_git::source_driver::{GitRestoreLocation, GitSourceLocation};
-use aw_host::source_checkpoint::{reconcile_closed_git_sandbox, GitRestoreFence};
-use aw_platform::DirectoryIdentity;
+use aw_git::source_driver::GitSourceLocation;
+use aw_host::source_checkpoint::reconcile_closed_git_sandbox;
 use aw_store::{SandboxSnapshot, SessionStore, VersionedSourceBinding};
 use serde::Deserialize;
 use std::{
@@ -88,7 +87,7 @@ impl Approval {
         snapshot: &SandboxSnapshot,
         bindings: &[VersionedSourceBinding],
         prepared: &[NamedPreparedSource],
-    ) -> Result<Fence<'_>> {
+    ) -> Result<PinnedGitLayout<'_>> {
         let c = &self.config;
         if snapshot.canonical_ref != c.sandbox
             || snapshot.rev != c.sandbox_rev
@@ -109,30 +108,14 @@ impl Approval {
         // Only private named children. No arbitrary source binding is a
         // cleanup recipe: the original Applied descriptor is checked by
         // the Git host before the cleanup claim and each release.
-        let (locations, pins) = pin_named_layout(
+        pin_named_layout(
+            &self._lease,
             &c.destination_root,
             c.destination_identity,
             &c.repositories,
             &[&c.store_directory, &self.directory],
             true,
-        )?;
-        Ok(Fence {
-            _approval: self,
-            locations,
-            _pins: pins,
-        })
-    }
-}
-
-struct Fence<'a> {
-    _approval: &'a Approval,
-    locations: Vec<GitRestoreLocation>,
-    _pins: Vec<DirectoryIdentity>,
-}
-
-impl GitRestoreFence for Fence<'_> {
-    fn locations(&self) -> &[GitRestoreLocation] {
-        &self.locations
+        )
     }
 }
 

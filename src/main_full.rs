@@ -18,6 +18,8 @@ mod resources_cli;
 #[cfg(feature = "routing")]
 mod routing_runtime;
 #[cfg(feature = "workspace")]
+mod sandbox_create;
+#[cfg(feature = "workspace")]
 mod sandbox_derive;
 #[cfg(feature = "workspace")]
 mod sandbox_retention;
@@ -139,6 +141,12 @@ enum TopCommand {
         /// Existing private host approval file; the operator must independently
         /// exclude all external Git writers, aliases and other retention users.
         approval: PathBuf,
+    },
+    /// Create a fresh Git Sandbox from independently approved retained versions.
+    #[cfg(feature = "workspace")]
+    SandboxCreate {
+        #[command(flatten)]
+        args: sandbox_create::Args,
     },
     /// Derive an isolated Git Sandbox from an independently approved parent.
     #[cfg(feature = "workspace")]
@@ -1721,6 +1729,8 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
         TopCommand::SandboxRetention { approval } => sandbox_retention::run(&approval),
         #[cfg(feature = "workspace")]
         TopCommand::SandboxDerive { args } => sandbox_derive::run(args),
+        #[cfg(feature = "workspace")]
+        TopCommand::SandboxCreate { args } => sandbox_create::run(args),
         #[cfg(feature = "workspace")]
         TopCommand::CheckpointCapture { args } => checkpoint_capture::run(args),
         #[cfg(feature = "workspace")]

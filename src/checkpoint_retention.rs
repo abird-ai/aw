@@ -1233,7 +1233,8 @@ mod tests {
             .is_err());
         fs::write(&changed, b"dirty checkpoint").unwrap();
         drop(store);
-        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
         abandon_derive(&store, &derive_path, "fixture:derive-discard").unwrap();
         assert!(store.sandbox_get(&actor, &discarded).is_err());
         assert_eq!(fs::read_dir(&discard_root).unwrap().count(), 0);
@@ -1260,6 +1261,215 @@ mod tests {
             fs::read(pending_root.join("code/tracked")).unwrap(),
             b"dirty checkpoint"
         );
+
+        // Independently select an existing retained Git version as the
+        // Project baseline. It is not a history restore or a parent copy.
+        use aw_agent_core::{SourceCoverage, SourceSet};
+        use aw_git::source_driver::GitSourceAnchor;
+        use aw_store::{SandboxCreateFrom, SandboxCreateSources, SandboxRecoverySelection};
+        let retained_anchor = GitSourceAnchor {
+            driver: binding.driver.clone(),
+            anchor_schema: fresh.sources[0].anchor_schema,
+            source_ref: binding.source_ref.clone(),
+            name: location.name.clone(),
+            access: binding.access,
+            checkpoint_policy: binding.checkpoint_policy,
+            checkpoint_id: fresh.id.clone(),
+            base_commit: head.clone(),
+            captured_commit: fresh_version.clone(),
+        };
+        let baseline = SourceSet {
+            coverage: SourceCoverage::Selected,
+            anchors: vec![(&retained_anchor).try_into().unwrap()],
+        };
+        let baseline_path = approvals.join("baseline.json");
+        let baseline_root = root.join("versioned-baseline");
+        let baseline_pending = root.join("baseline-pending");
+        let baseline_discard = root.join("baseline-discard");
+        for target in [&baseline_root, &baseline_pending, &baseline_discard] {
+            aw_platform::ensure_private_dir(target).unwrap();
+        }
+        let baseline_config = |target: &Path| {
+            json!({"version":1,"store_directory":state,"store_id":store.store_id().unwrap(),
+                "store_generation":store.local_process_info().unwrap().store_generation,
+                "manager":actor,"project":project,"baseline":baseline,"binding":layout(target),
+                "destination_identity":DirectoryIdentity::open(target).unwrap().identity().unwrap(),
+                "repositories":[location]})
+        };
+        let config = baseline_config(&baseline_root);
+        let pending_config = baseline_config(&baseline_pending);
+        let discard_config = baseline_config(&baseline_discard);
+        let create_baseline = |store: &SessionStore, path: &Path, id: &str, recover: bool| {
+            crate::sandbox_create::create(store, &actor, path, project, id, recover)
+        };
+        let abandon_baseline = |store: &SessionStore, path: &Path, id: &str| {
+            crate::sandbox_create::abandon(store, &actor, path, project, id)
+        };
+        let mut wrong = config.clone();
+        wrong["baseline"]["anchors"][0]["identity"] = json!(head);
+        let mut baseline_file = aw_platform::open_private_new(&baseline_path).unwrap();
+        baseline_file
+            .write_all(&serde_json::to_vec(&wrong).unwrap())
+            .unwrap();
+        drop(baseline_file);
+        assert!(create_baseline(&store, &baseline_path, "fixture:baseline-create", false).is_err());
+        assert_eq!(fs::read_dir(&baseline_root).unwrap().count(), 0);
+        fs::write(&baseline_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let lease = lock_private_approval(&baseline_path).unwrap();
+        assert!(create_baseline(&store, &baseline_path, "fixture:baseline-create", false).is_err());
+        drop(lease);
+
+        let retained_refs = git(
+            &executable,
+            &repo,
+            &["for-each-ref", "refs/aw/checkpoints/"],
+        );
+        fs::write(repo.join("tracked"), b"current mutable parent").unwrap();
+        let standalone =
+            create_baseline(&store, &baseline_path, "fixture:baseline-create", false).unwrap();
+        assert!(standalone.parent_sandbox_ref.is_none());
+        assert_eq!(standalone.sources.len(), 1);
+        assert_eq!(
+            fs::read(baseline_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert_eq!(
+            fs::read(repo.join("tracked")).unwrap(),
+            b"current mutable parent"
+        );
+        fs::write(repo.join("tracked"), b"dirty checkpoint").unwrap();
+        assert_eq!(
+            create_baseline(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:baseline-create",
+                false
+            )
+            .unwrap(),
+            standalone
+        );
+        assert!(abandon_baseline(&store, &baseline_path, "fixture:baseline-create").is_err());
+
+        let interrupt_baseline = |store: &SessionStore, target: &Path, id: &str| {
+            let prepared = store
+                .sandbox_prepare_create(
+                    &actor,
+                    project,
+                    &layout(target),
+                    SandboxCreateFrom::Baseline(baseline.clone()),
+                    id,
+                    |prepare_id, _, input| {
+                        assert!(
+                            matches!(input, SandboxCreateSources::Baseline(set) if set == &baseline)
+                        );
+                        Ok(PreparedSourceSet {
+                            prepare_id: prepare_id.into(),
+                            operation: SourceOperationKind::Restore,
+                            sources: vec![NamedPreparedSource {
+                                name: location.name.clone(),
+                                prepared: driver.plan_restore_approved(
+                                    &GitRestoreLocation {
+                                        name: location.name.clone(),
+                                        repository: location.repository.clone(),
+                                        repository_identity: location.repository_identity,
+                                        target: target.join("code"),
+                                        parent_identity: DirectoryIdentity::open(target)?
+                                            .identity()?,
+                                    },
+                                    &retained_anchor,
+                                    prepare_id,
+                                )?,
+                            }],
+                        })
+                    },
+                )
+                .unwrap();
+            let candidate = prepared.sandbox_ref().to_owned();
+            prepared.revalidate(&layout(target)).unwrap();
+            driver
+                .execute_restore(&prepared.sources().sources[0].prepared)
+                .unwrap();
+            prepared.mark_unknown().unwrap();
+            candidate
+        };
+        let original = interrupt_baseline(&store, &baseline_pending, "fixture:baseline-pending");
+        let mut wrong_selection = baseline.clone();
+        wrong_selection.anchors[0].identity = head.clone();
+        assert!(store
+            .sandbox_inspect_create_exact(
+                &actor,
+                project,
+                "fixture:baseline-pending",
+                &layout(&baseline_pending),
+                SandboxRecoverySelection::Baseline(&wrong_selection),
+                |_, _, _| panic!("changed baseline reached inspector")
+            )
+            .is_err());
+        assert!(store
+            .sandbox_inspect_create_exact(
+                &actor,
+                project,
+                "fixture:baseline-pending",
+                &layout(&baseline_discard),
+                SandboxRecoverySelection::Baseline(&baseline),
+                |_, _, _| panic!("changed baseline layout reached inspector")
+            )
+            .is_err());
+        let mut wrong = pending_config.clone();
+        wrong["baseline"]["anchors"][0]["identity"] = json!(head);
+        fs::write(&baseline_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(create_baseline(&store, &baseline_path, "fixture:baseline-pending", true).is_err());
+        assert!(abandon_baseline(&store, &baseline_path, "fixture:baseline-pending").is_err());
+        fs::write(&baseline_path, serde_json::to_vec(&pending_config).unwrap()).unwrap();
+        assert!(
+            create_baseline(&store, &baseline_path, "fixture:baseline-pending", false).is_err()
+        );
+        drop(store);
+        let store =
+            SessionStore::open_with_sources(&state, registry.clone(), Default::default()).unwrap();
+        let baseline_recovered =
+            create_baseline(&store, &baseline_path, "fixture:baseline-pending", true).unwrap();
+        assert_eq!(baseline_recovered.canonical_ref, original);
+        let unpublished = interrupt_baseline(&store, &baseline_discard, "fixture:baseline-discard");
+        fs::write(&baseline_path, serde_json::to_vec(&discard_config).unwrap()).unwrap();
+        drop(store);
+        let store = SessionStore::open_with_sources(&state, registry, Default::default()).unwrap();
+        abandon_baseline(&store, &baseline_path, "fixture:baseline-discard").unwrap();
+        assert!(store.sandbox_get(&actor, &unpublished).is_err());
+        assert_eq!(fs::read_dir(&baseline_discard).unwrap().count(), 0);
+        assert!(
+            create_baseline(&store, &baseline_path, "fixture:baseline-discard", false).is_err()
+        );
+        assert_eq!(
+            git(
+                &executable,
+                &repo,
+                &["for-each-ref", "refs/aw/checkpoints/"]
+            ),
+            retained_refs
+        );
+        assert_eq!(
+            fs::read(baseline_root.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert_eq!(
+            fs::read(baseline_pending.join("code/tracked")).unwrap(),
+            b"dirty checkpoint"
+        );
+        assert_eq!(
+            store.agent_list(&actor, project, None, 64).unwrap(),
+            agents_before
+        );
+        assert_eq!(
+            store
+                .checkpoint_list_metadata(&actor, agent_ref, None, 64)
+                .unwrap(),
+            checkpoints_before
+        );
+        assert_eq!(
+            store.sandbox_get(&actor, &parent.canonical_ref).unwrap(),
+            parent
+        );
         assert_eq!(git(&executable, &repo, &["rev-parse", "HEAD"]), head);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index);
         assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"dirty checkpoint");
@@ -1268,6 +1478,34 @@ mod tests {
         fs::rename(&repo, root.join("moved-repo")).unwrap();
         fs::rename(&destination, root.join("released-layout")).unwrap();
         let store = SessionStore::open(&state).unwrap();
+        assert_eq!(
+            create_baseline(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:baseline-create",
+                false
+            )
+            .unwrap()
+            .canonical_ref,
+            standalone.canonical_ref
+        );
+        assert_eq!(
+            create_baseline(
+                &store,
+                &root.join("absent-approval"),
+                "fixture:baseline-pending",
+                true
+            )
+            .unwrap()
+            .canonical_ref,
+            baseline_recovered.canonical_ref
+        );
+        abandon_baseline(
+            &store,
+            &root.join("absent-approval"),
+            "fixture:baseline-discard",
+        )
+        .unwrap();
         assert_eq!(
             derive(
                 &store,

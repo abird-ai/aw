@@ -19,7 +19,97 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-26: exact offline standalone Git Sandbox derivation
+## Latest local implementation delta — 2026-11-26: offline retained-version Project Sandbox creation
+
+Parent: `bab8987c86260e906a8266f5c4763c0615698a77` (standalone
+Git derive), signature verified. Original Agent/Turn journal and resource
+CLI owners remain occupied; independent versioned baseline consumer,
+L5 only. No source-bearing runtime activation.
+
+- Production workspace-feature `aw sandbox-create --state-dir <existing
+  private Store> <approval.json> <canonical-Project> <request-id>`
+  uses the original Project-scoped SandboxCreate Prepared/inspection/
+  publication owner, with from=None. Explicit mutually exclusive
+  `--agent-recover` inspects/publishes original effects and
+  `--agent-abandon` reconciles only unpublished original materializations.
+  Stable namespace `cli:sandbox-create:<request-id>`. Applied replay
+  returns the original current redacted Sandbox before config/driver
+  selection; Rejected abandonment verifies original claim/candidate
+  absence. Fresh unresolved/Rejected retry, Applied abandonment,
+  substituted Project/request and absent original recovery refuse.
+  Neither host-selected layout nor baseline is a public request selector.
+- Strict private approval JSON v1:
+  `{version,store_directory,store_id,store_generation,manager,project,
+  baseline,binding,destination_identity,repositories}`.
+  Manager is authenticated OS principal; current Project writer and
+  active exclusive Store scope required. `baseline` is a canonical
+  `SourceSet {coverage:"selected", anchors:[SourceAnchor...]}`
+  selecting nonempty complete required retained Git versions, not
+  mutable HEAD, branch names or unversioned/ephemeral assets. Each
+  anchor is the existing typed driver/schema/name/source_ref/access/
+  checkpoint_policy/identity/retention/fields descriptor, checked by
+  GitSourceAnchor conversion and actual driver retention/content
+  verification. The original host independently approves exact metadata,
+  backing objects, retention and materialization for this destination
+  Project; no history grant or existing checkpoint ID confers this
+  authority. Retained versions may be independently selected from
+  existing retention, but no new retention acquisition/ownership is
+  fabricated. Binding has cwd=tool_root; ordinary private origin
+  checkouts and existing disjoint private named-child destination only.
+  Same bounded config lease, pins and exact destination identity; host
+  excludes all other writers/users, aliases, mounts, other Stores and
+  retention users through execution, inspection, publication and
+  interruption. No global physical containment or autonomous policy.
+- `SandboxRecoverySelection::{Baseline(&SourceSet),Parent{reference,rev}}`
+  shares exact baseline/parent + layout check in original Store recovery
+  before claiming the original barrier or running driver inspection.
+  Original exact derive SDK wrappers delegate; generic SDK APIs remain
+  compatible. Baseline anchors sorted by name at approval loading as
+  at original preparation; compare complete original set including
+  immutable retention identity, access/policy/schema/fields. Same
+  `resume_sandbox_create_exact` and
+  `abandon_sandbox_create_exact` Git host paths, holding approval
+  through failed inspection/Unknown as well as final publication or
+  cleanup. No additional receipt format or recovery ledger. Baseline
+  abandonment does not release the independently retained anchor.
+- Consolidate duplicate offline Git layout guard structs into one
+  `PinnedGitLayout` borrowing the original file lease and owning the
+  actual directory pins, with shared destination lexical preflight.
+  Existing checkpoint restore, Sandbox derive and closed-Sandbox
+  retention use the same guard. No new physical authority from this
+  refactor. Original Prepared, source barrier and Git materialization
+  ownership unchanged. No new Agent, history, checkpoint, grant, model
+  tool, RPC or schema.
+
+Validation (L5, Rust 1.95.0): production all-feature binary type-check;
+grouped real offline Git/SQLite lifecycle 1/1 (46.89s), Store Sandbox
+owner 4/4, Host source-checkpoint lifecycle 1/1 (160.41s). Existing
+grouped fixture proves missing/mismatched retained version refusal,
+held approval refusal, exact fresh baseline despite changed mutable
+origin, Applied replay, changed original baseline/layout recovery
+refusal before inspector, original child publication after restart,
+exact unpublished abandonment/rejection and no retry, unchanged
+baseline retention refs/parent/Agent/checkpoint lists and original
+HEAD/index/content, terminal replay without config/driver/repo.
+Existing Host multi-source construction and partial cleanup passed.
+Strict all-feature/all-target Store/Host/CLI Clippy, durable library
+and minimal all-target checks, full binary build, actual help/required
+args and mode-conflict smoke plus derive help, scoped fmt/diff passed.
+Prior durable-only non-workspace binary blocker, feature-specific
+warnings and broad CLI inventory discrepancy remain; unchanged Process
+suites and pinned Nix/native-platform qualification not rerun.
+Only isolated fixture effects; no real user Sandbox creation or cleanup.
+
+Next: exact live source-aware Actor/Turn admission when original journal
+owners are available. Otherwise independent unused-Sandbox attachment/
+replacement and final-source release with original Prepared descriptors
+and current exact layout authorization. Standalone retained-version
+creation and mutable parent derivation are now actual offline consumers;
+do not duplicate them. Empty/unversioned/mixed baseline effects, linked
+checkout policy, Sandbox host RPCs, bound-Agent structural mutation
+and source-bearing Process/Actor admission remain held.
+
+## Previous local implementation delta — 2026-11-26: exact offline standalone Git Sandbox derivation
 
 Parent: `8e0c950332afd210ffe9cfe7b5ee7c656f9737b7` (source identity
 metadata), signature verified. Original Agent/Turn journal and resource

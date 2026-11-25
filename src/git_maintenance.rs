@@ -6,9 +6,10 @@ pub(crate) use crate::private_approval::{
 use aw::{Error, Result};
 use aw_agent_core::validate_source_set_hard_limit;
 use aw_git::source_driver::{GitRestoreLocation, GitSourceLocation};
+use aw_host::source_checkpoint::GitRestoreFence;
 use aw_platform::DirectoryIdentity;
 use aw_store::SessionStore;
-use std::path::Path;
+use std::{fs::File, path::Path};
 
 /// Canonical complete-set inputs, shared by the offline source owners.
 pub(crate) fn validate_named_locations(sources: &mut [GitSourceLocation]) -> Result<()> {
@@ -90,17 +91,60 @@ pub(crate) fn pin_private_checkout(
     Ok([pin, admin_pin, objects_pin])
 }
 
+/// Common lexical preflight for the approved private destination.
+/// Physical identities are checked by the actual pinned layout below.
+pub(crate) fn require_named_destination(
+    root: &Path,
+    cwd: &Path,
+    store: &Path,
+    approval_directory: &Path,
+) -> Result<()> {
+    if cwd != root
+        || !root.is_absolute()
+        || root.parent().is_none()
+        || overlaps(approval_directory, store)
+        || overlaps(root, approval_directory)
+        || overlaps(root, store)
+    {
+        return Err(Error::Denied(
+            "Git maintenance requires a disjoint private named layout",
+        ));
+    }
+    Ok(())
+}
+
+/// Retain the original approval lease and exact directory observations as
+/// the common physical fence for the existing Git maintenance consumers.
+pub(crate) struct PinnedGitLayout<'a> {
+    _lease: &'a File,
+    locations: Vec<GitRestoreLocation>,
+    pins: Vec<DirectoryIdentity>,
+}
+
+impl PinnedGitLayout<'_> {
+    pub(crate) fn retain_directory(&mut self, pin: DirectoryIdentity) {
+        self.pins.push(pin);
+    }
+}
+
+impl GitRestoreFence for PinnedGitLayout<'_> {
+    fn locations(&self) -> &[GitRestoreLocation] {
+        &self.locations
+    }
+}
+
 /// The complete protected named-child layout, without making any new
 /// directories. The driver's original descriptor still owns child identity,
 /// content and recovery checks. Retain these observations with the real
 /// independent host fence. No containment or ambient authority.
-pub(crate) fn pin_named_layout(
+pub(crate) fn pin_named_layout<'a>(
+    lease: &'a File,
     root: &Path,
     expected_identity: (u64, u64),
     sources: &[GitSourceLocation],
     protected: &[&Path],
     allow_existing: bool,
-) -> Result<(Vec<GitRestoreLocation>, Vec<DirectoryIdentity>)> {
+) -> Result<PinnedGitLayout<'a>> {
     if sources.is_empty()
         || root.parent().is_none()
         || protected.iter().any(|path| overlaps(root, path))
@@ -147,5 +191,9 @@ pub(crate) fn pin_named_layout(
             parent_identity: identity,
         });
     }
-    Ok((locations, pins))
+    Ok(PinnedGitLayout {
+        _lease: lease,
+        locations,
+        pins,
+    })
 }

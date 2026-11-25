@@ -55,6 +55,37 @@ pub enum SandboxCreateFrom<'a> {
     Parent(&'a str),
 }
 
+/// Current independent selection of the original construction inputs.
+/// Recovery never substitutes versions or a mutable parent observation.
+#[derive(Clone, Copy)]
+pub enum SandboxRecoverySelection<'a> {
+    /// Canonical name-ordered immutable baseline, as stored by preparation.
+    Baseline(&'a SourceSet),
+    Parent {
+        reference: &'a str,
+        rev: u64,
+    },
+}
+
+impl<'a> SandboxRecoverySelection<'a> {
+    pub fn parent_ref(self) -> Option<&'a str> {
+        match self {
+            Self::Baseline(_) => None,
+            Self::Parent { reference, .. } => Some(reference),
+        }
+    }
+
+    fn matches(self, boundary: &SandboxCreateBoundary) -> bool {
+        match self {
+            Self::Baseline(set) => boundary.baseline.as_ref() == Some(set),
+            Self::Parent { reference, rev } => boundary
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.reference == reference && parent.rev == rev),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum SandboxCreateSources<'a> {
     Baseline(&'a SourceSet),
@@ -809,7 +840,7 @@ impl SessionStore {
         from: Option<&str>,
         request_id: &str,
         abandon: bool,
-        exact_derive: Option<(u64, &SessionBinding)>,
+        exact: Option<(SandboxRecoverySelection<'_>, &SessionBinding)>,
     ) -> Result<Option<PreparedSandboxCreate<'_>>> {
         owner(self)?;
         let mut connection = self.connection()?;
@@ -820,15 +851,10 @@ impl SessionStore {
             .sandbox_boundary
             .as_ref()
             .ok_or(Error::Storage("Sandbox recovery boundary missing"))?;
-        if let Some((parent_rev, binding)) = exact_derive {
-            if boundary
-                .parent
-                .as_ref()
-                .is_none_or(|parent| parent.rev != parent_rev)
-                || layout(binding)?.digest != boundary.layout_digest
-            {
+        if let Some((selection, binding)) = exact {
+            if !selection.matches(boundary) || layout(binding)?.digest != boundary.layout_digest {
                 return Err(Error::Denied(
-                    "derive approval differs from original parent revision or layout",
+                    "Sandbox approval differs from original source selection or layout",
                 ));
             }
         }
@@ -896,13 +922,41 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
     ) -> Result<InspectedSandboxCreate<'_>> {
+        self.sandbox_inspect_create_exact(
+            actor,
+            project_ref,
+            request_id,
+            binding,
+            SandboxRecoverySelection::Parent {
+                reference: parent,
+                rev: parent_rev,
+            },
+            inspect,
+        )
+    }
+
+    /// Reclaim the original exact baseline or parent selection and layout
+    /// before invoking any driver inspector.
+    pub fn sandbox_inspect_create_exact(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        request_id: &str,
+        binding: &SessionBinding,
+        selection: SandboxRecoverySelection<'_>,
+        inspect: impl FnOnce(
+            &SourceDriverRegistryReader,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<Vec<RecoveryInspection<SourceBinding>>>,
+    ) -> Result<InspectedSandboxCreate<'_>> {
         self.resume_sandbox_create(
             actor,
             project_ref,
-            Some(parent),
+            selection.parent_ref(),
             request_id,
             false,
-            Some((parent_rev, binding)),
+            Some((selection, binding)),
         )?
         .ok_or(Error::Conflict(
             "Sandbox construction has no unresolved candidate",
@@ -925,13 +979,40 @@ impl SessionStore {
             &PreparedSourceSet,
         ) -> Result<F>,
     ) -> Result<()> {
+        self.sandbox_abandon_create_exact(
+            actor,
+            project_ref,
+            request_id,
+            binding,
+            SandboxRecoverySelection::Parent {
+                reference: parent,
+                rev: parent_rev,
+            },
+            reconcile,
+        )
+    }
+
+    /// Settle only the original exact unpublished construction selection.
+    pub fn sandbox_abandon_create_exact<F>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        request_id: &str,
+        binding: &SessionBinding,
+        selection: SandboxRecoverySelection<'_>,
+        reconcile: impl FnOnce(
+            &SourceDriverRegistryReader,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<()> {
         match self.resume_sandbox_create(
             actor,
             project_ref,
-            Some(parent),
+            selection.parent_ref(),
             request_id,
             true,
-            Some((parent_rev, binding)),
+            Some((selection, binding)),
         )? {
             Some(prepared) => prepared.abandon(reconcile),
             None => Ok(()),

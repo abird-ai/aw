@@ -11,7 +11,8 @@ use aw_store::{
     CheckpointRestoreLayout, CheckpointRestoreRequest, CheckpointRestoreResult,
     InspectedCheckpointRestore, InspectedSandboxAttachment, InspectedSandboxCreate,
     PreparedSandboxAttachment, SandboxAttachment, SandboxCreateFrom, SandboxCreateSources,
-    SandboxSnapshot, SandboxSourceRelease, SessionBinding, SessionStore, VersionedSourceBinding,
+    SandboxRecoverySelection, SandboxSnapshot, SandboxSourceRelease, SessionBinding, SessionStore,
+    VersionedSourceBinding,
 };
 use std::{
     collections::HashSet,
@@ -1067,13 +1068,41 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             &PreparedSourceSet,
         ) -> Result<F>,
     ) -> Result<SandboxSnapshot> {
+        self.resume_sandbox_create_exact(
+            actor,
+            project_ref,
+            request_id,
+            layout,
+            SandboxRecoverySelection::Parent {
+                reference: parent,
+                rev: parent_rev,
+            },
+            authorize,
+        )
+    }
+
+    /// Recover the original independently selected baseline or parent
+    /// through the same inspector and held publication path.
+    pub fn resume_sandbox_create_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        request_id: &str,
+        layout: &SessionBinding,
+        selection: SandboxRecoverySelection<'_>,
+        authorize: impl FnOnce(
+            &SessionBinding,
+            SandboxCreateSources<'_>,
+            &PreparedSourceSet,
+        ) -> Result<F>,
+    ) -> Result<SandboxSnapshot> {
         self.resume_sandbox_create_in(
             actor,
             project_ref,
-            Some(parent),
+            selection.parent_ref(),
             request_id,
             layout,
-            Some(parent_rev),
+            Some(selection),
             authorize,
         )
     }
@@ -1086,7 +1115,7 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         from: Option<&str>,
         request_id: &str,
         layout: &SessionBinding,
-        parent_rev: Option<u64>,
+        selection: Option<SandboxRecoverySelection<'_>>,
         authorize: impl FnOnce(
             &SessionBinding,
             SandboxCreateSources<'_>,
@@ -1103,14 +1132,13 @@ impl<'a> GitCheckpointRestoreHost<'a> {
             let driver = registry.get(self.driver)?;
             inspect(&driver, input, sources, approval)
         };
-        let inspected = match parent_rev {
-            Some(rev) => self.store.sandbox_inspect_derive_exact(
+        let inspected = match selection {
+            Some(selection) => self.store.sandbox_inspect_create_exact(
                 actor,
                 project_ref,
-                from.ok_or(Error::Denied("exact derivation requires parent"))?,
-                rev,
-                layout,
                 request_id,
+                layout,
+                selection,
                 inspector,
             ),
             None => {
@@ -1170,14 +1198,35 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         parent_rev: u64,
         authorize: impl FnOnce(SandboxCreateSources<'_>, &PreparedSourceSet) -> Result<F>,
     ) -> Result<()> {
-        let mut fence = None;
-        self.store.sandbox_abandon_derive_exact(
+        self.abandon_sandbox_create_exact(
             actor,
             project_ref,
-            parent,
-            parent_rev,
-            layout,
             request_id,
+            layout,
+            SandboxRecoverySelection::Parent {
+                reference: parent,
+                rev: parent_rev,
+            },
+            authorize,
+        )
+    }
+
+    pub fn abandon_sandbox_create_exact<F: GitRestoreFence>(
+        &self,
+        actor: &PrincipalId,
+        project_ref: &str,
+        request_id: &str,
+        layout: &SessionBinding,
+        selection: SandboxRecoverySelection<'_>,
+        authorize: impl FnOnce(SandboxCreateSources<'_>, &PreparedSourceSet) -> Result<F>,
+    ) -> Result<()> {
+        let mut fence = None;
+        self.store.sandbox_abandon_create_exact(
+            actor,
+            project_ref,
+            request_id,
+            layout,
+            selection,
             |registry, input, sources| {
                 fence = Some(authorize(input, sources)?);
                 let approval = fence.as_ref().expect("approved");

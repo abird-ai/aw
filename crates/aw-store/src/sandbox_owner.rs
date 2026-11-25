@@ -26,6 +26,7 @@ pub use effects::{
 pub(crate) mod construction;
 pub use construction::{
     InspectedSandboxCreate, PreparedSandboxCreate, SandboxCreateFrom, SandboxCreateSources,
+    SandboxRecoverySelection,
 };
 mod grants;
 pub use grants::{
