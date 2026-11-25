@@ -60,7 +60,8 @@ native approval provisioning, shared finite Vault Process settlement, v60
 Project-scoped standalone versioned Sandbox construction, same-Project
 required-source Sandbox derivation, exact managed-source structural removal,
 versioned attachment (including first source into an empty layout) and replacement
-with per-binding materialization provenance are implemented locally.
+with per-binding materialization provenance and exact partial replacement recovery
+are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2833,6 +2834,25 @@ corrected Process/native tests 2/2; grouped Git lifecycle passed. Strict
 Store/Host all-target/all-feature Clippy, workspace all-target/all-feature
 check and scoped fmt/diff passed.
 
+Explicit replacement continuation now also reconciles an exact unpublished partial
+incoming checkout. Reuses the original Prepared receipt and whole-set fence,
+existing exact restore inspection/partial cleanup and the predecessor-release
+proof shared with final publication. First verify incoming registration and
+prove original old registration and private derived retention/scratch absent.
+An exact completed incoming checkout is retained, not destroyed/recreated.
+Otherwise existing private cleanup accepts only proven original contents,
+registration and scratch; retry the original descriptor only after positive
+absence of target and registration. Foreign entries, modified/truncated leaves,
+ambiguous registration/scratch and retained predecessor remain held. Normal
+resume remains inspect-only; unsafe post-release rejection remains denied.
+No new schema, operation or recovery state machine. Existing real grouped Host
+lifecycle exercises the post-release gap, an exact partial candidate (fixture
+omits an expected leaf), foreign entry refusal/preservation, explicit cleanup
+and continuation, failed publication, completed candidate retention and restart
+inspection/publication. Host 16/16, Git 33/33, strict Git/Host all-target/all-feature
+Clippy, workspace all-target/all-feature check and scoped fmt/diff passed. Broad
+Store not rerun; previous combined 239/244 remains the recorded result.
+
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
 While blocked, prefer independent production authority/containment or remaining
@@ -2840,7 +2860,7 @@ physical recovery proof acquisition through existing owners; do not open held ro
 production host policy/physical authority configuration, other effectful baseline materialization, broader Run-hazard
 reconciliation, general multi-source Process policy, unmarked/ambiguous scratch and non-exact partial
 checkout cleanup, remaining production physical authority/cleanup, effectful
-partial replacement recovery, bound-Agent structural mutation and other
+bound-Agent structural mutation and other
 removal cases, remaining Vault broker/socket/file/other env integrations, persistent provider
 configuration, provider-specific protected metadata and checkpoint/Sandbox/Vault host
 RPCs remain pending. Store schema v60.

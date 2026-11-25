@@ -1,11 +1,13 @@
 //! Replacement composes the original release recipe and one new restore.
 //! Neither a retained descriptor nor an observed checkout is authority.
 use super::{
-    absent, check_destination, overlaps, require_marker_absent, require_released, DerivePlan,
-    GitRestoreLocation, GitSourceAnchor, GitSourceDriver, PrivateIndexes, RestorePlan,
+    check_destination, inspect_binding, overlaps, require_marker_absent, require_released,
+    restored_repo, DerivePlan, GitRestoreLocation, GitSourceAnchor, GitSourceDriver,
+    PrivateIndexes, RestorePlan,
 };
 use crate::Repository;
 use aw_agent_core::{Error, PreparedSourceOperation, Result, SourceBinding, SourceOperationKind};
+use std::fs;
 
 impl GitSourceDriver {
     fn releasable_original(
@@ -140,6 +142,18 @@ impl GitSourceDriver {
         }
         self.revalidate_restore(incoming, binding)?;
         let new_origin = new_plan.origin_repository(self)?;
+        self.require_predecessor_released(old, old_binding, &new_plan, &new_origin)
+    }
+
+    // The caller has proved the incoming registration at this exact
+    // destination. Absence of the old marker alone is not sufficient.
+    fn require_predecessor_released(
+        &self,
+        old: &PreparedSourceOperation,
+        old_binding: &SourceBinding,
+        new_plan: &RestorePlan,
+        new_origin: &Repository,
+    ) -> Result<()> {
         let (origin, target) = if old.operation == SourceOperationKind::Derive {
             let plan = DerivePlan::decode(old)?;
             plan.require_binding(old_binding)?;
@@ -164,11 +178,12 @@ impl GitSourceDriver {
         require_marker_absent(&origin, old)
     }
 
-    /// Continue an explicitly recovered replacement only after the new
-    /// candidate and its registration are provably absent. Finish the
-    /// original release recipe (including any private capture retention)
-    /// before executing the same incoming descriptor. No partial checkout
-    /// or uncertain registration is retried.
+    /// Explicitly continue the original unpublished replacement under
+    /// independently renewed whole-set authority. An exact completed
+    /// incoming checkout is retained. A partial one may be reconciled
+    /// only through the existing private restore cleanup after proving
+    /// the predecessor released. Execute again only after positive
+    /// absence of the candidate and its original registration.
     pub fn continue_replacement(
         &self,
         old: &PreparedSourceOperation,
@@ -186,12 +201,30 @@ impl GitSourceDriver {
                 "replacement continuation differs from original",
             ));
         }
-        // Require that the old pathname is already absent. An intact old
-        // checkout is not a post-release gap; it can instead be abandoned.
-        absent(&plan.target)?;
-        self.require_restore_absent(incoming)?;
-        self.release_restored_materialization(old, old_binding)?;
-        self.require_restore_absent(incoming)?;
+        let origin = plan.repository(self)?;
+        match fs::symlink_metadata(&plan.target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Original post-release gap. Finish any remaining exact
+                // predecessor cleanup before the incoming restore.
+                require_released(&origin, &plan, incoming)?;
+                self.release_restored_materialization(old, old_binding)?;
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                // An intact old checkout, foreign path or ambiguous
+                // registration fails here, before any cleanup.
+                let child = restored_repo(&origin, &plan, incoming)?;
+                self.require_predecessor_released(old, old_binding, &plan, &origin)?;
+                let trees = plan.trees(&origin)?;
+                if let Ok(binding) = inspect_binding(&origin, &child, &plan, incoming, &trees) {
+                    return Ok(binding);
+                }
+                // Reuse exact unpublished cleanup; modified/truncated
+                // leaves, foreign entries and ambiguous scratch refuse.
+                self.release_prepared_plan(&plan, incoming)?;
+            }
+        }
+        require_released(&origin, &plan, incoming)?;
         self.execute_restore(incoming)
     }
 }

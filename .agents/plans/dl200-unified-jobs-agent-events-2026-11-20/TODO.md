@@ -1207,13 +1207,25 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       from overlapping rebuild; five known legacy failures remain (239/244
       combined). Host 14/16 initial + corrected fixture retest 2/2. Strict
       affected Clippy, workspace all-target/all-feature and scoped fmt/diff passed.
+      **Exact partial replacement recovery landed:** explicit continuation uses
+      original Prepared + live complete-set fence, verifies incoming registration
+      and old release (shared publication proof), retains a completed candidate
+      or reconciles exact unpublished partial effects with existing restore
+      cleanup. Re-execute original descriptor only after positive target and
+      registration absence. Foreign/ambiguous/modified effects stay held;
+      normal resume remains inspect-only. No new schema, operation or state
+      machine. Existing grouped real Host lifecycle covers partial checkout,
+      foreign entry refusal/preservation, recovery, failed publication,
+      completed candidate retention and restart inspection. Host 16/16,
+      Git 33/33, strict affected Clippy, workspace all-target/all-feature
+      check and scoped fmt/diff passed. Broad Store not rerun.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.
       Production host policy/physical authority configuration, complete Job/Process containment/dispatch,
       broader Run-hazard reconciliation, general multi-source Process policy, other baseline effects,
       unmarked/ambiguous scratch and non-exact partial checkout cleanup, physical authority/production cleanup,
-      partial replacement recovery, bound-Agent mutation and other structural removal cases, remaining Vault broker/socket/file/other env,
+      bound-Agent mutation and other structural removal cases, remaining Vault broker/socket/file/other env,
       persistent provider configuration, protected metadata and host RPCs remain.
       Schema v60. Remote main verified at 4ddeed8; subsequent checkpoint local.
 - [ ] **Phase 4** — Jobs consume the store-local position/cursor/projection helpers with

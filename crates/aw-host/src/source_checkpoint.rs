@@ -1107,9 +1107,9 @@ impl<'a> GitCheckpointRestoreHost<'a> {
         self.publish_attachment(inspected, fence)
     }
 
-    /// Explicit recovery of the gap after releasing the old checkout.
-    /// Normal resume is inspect-only; this continuation requires positive
-    /// absence of the incoming target and all its original registration.
+    /// Explicit recovery after releasing the old checkout. Normal
+    /// resume is inspect-only. Retain a completed incoming checkout;
+    /// reconcile only exact unpublished partial effects before retry.
     pub fn continue_sandbox_replacement<F: GitRestoreFence>(
         &self,
         actor: &PrincipalId,
@@ -2875,8 +2875,55 @@ mod tests {
             )
             .is_err());
 
-        // Explicit continuation proves the gap, then the single final
-        // publication can itself fail. Recovery observes, never replans.
+        // Model a lost checkout after the original post-release gap:
+        // the real driver has installed its exact marked registration
+        // and index, but an expected file was not materialized.
+        let prepared = store
+            .sandbox_recover_attachment(&actor, &child.canonical_ref, replacement_request)
+            .unwrap();
+        let approval = replacement_fence();
+        prepared.revalidate().unwrap();
+        verify_attachment(
+            &implementation,
+            prepared.observation(),
+            prepared.source(),
+            &approval,
+        )
+        .unwrap();
+        let (old, source) = prepared.observation().replaced().unwrap();
+        implementation
+            .continue_replacement(&source.prepared, &old.binding, prepared.source())
+            .unwrap();
+        fs::remove_file(&sibling).unwrap();
+        fs::write(child_root.join("data/foreign"), b"keep").unwrap();
+        prepared.mark_unknown().unwrap();
+        drop(approval);
+        assert!(host
+            .resume_sandbox_attachment(
+                &actor,
+                &child.canonical_ref,
+                replacement_request,
+                |_, _| Ok(replacement_fence()),
+            )
+            .is_err());
+        assert!(host
+            .continue_sandbox_replacement(
+                &actor,
+                &child.canonical_ref,
+                replacement_request,
+                |_, _| Ok(replacement_fence()),
+            )
+            .is_err());
+        assert_eq!(fs::read(child_root.join("data/foreign")).unwrap(), b"keep");
+        assert!(!sibling.exists());
+        assert_eq!(
+            store.sandbox_get(&actor, &child.canonical_ref).unwrap(),
+            child
+        );
+        fs::remove_file(child_root.join("data/foreign")).unwrap();
+
+        // Explicit continuation reconciles only the exact partial
+        // candidate, then the single final publication can itself fail.
         Connection::open(&database)
             .unwrap()
             .execute_batch(
@@ -2897,6 +2944,19 @@ mod tests {
             store.sandbox_get(&actor, &child.canonical_ref).unwrap(),
             child
         );
+        // An exact completed candidate must not be destroyed/recreated
+        // by an explicit continuation after failed Store publication.
+        let completed_identity = identity(&child_root.join("data"));
+        assert!(host
+            .continue_sandbox_replacement(
+                &actor,
+                &child.canonical_ref,
+                replacement_request,
+                |_, _| Ok(replacement_fence()),
+            )
+            .is_err());
+        assert_eq!(identity(&child_root.join("data")), completed_identity);
+        assert_eq!(fs::read(&sibling).unwrap(), b"replacement version");
         assert_eq!(fs::read(&unaffected).unwrap(), b"independent retained code");
         drop(store);
         Connection::open(&database)
