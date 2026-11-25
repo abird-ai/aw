@@ -2,15 +2,16 @@
 //! remain external; persisted evidence never authorizes a projection.
 use crate::{
     agent_owner::{self, AgentKey, AgentPermission},
-    db,
+    db, durability,
     store_scope::StoreScope,
     user_for_principal, workspace_writer, Error, Result, SessionStore, StoreMode,
 };
 use aw_agent_core::{
     PrincipalId, SourceName, VaultEntryRef, VaultProjection, VaultProviderRegistryReader,
 };
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MAX_GRANTS: usize = 128;
 
@@ -245,6 +246,297 @@ pub(crate) fn require_projection_in(
     authority.authorize_use()
 }
 
+fn set_in(
+    tx: &Connection,
+    manager: &PrincipalId,
+    key: AgentKey<'_>,
+    reference: &str,
+    name: &SourceName,
+    expected_rev: u64,
+    authority: Option<(&VaultProviderRegistryReader, &dyn VaultGrantAuthority)>,
+) -> Result<u64> {
+    let session = key.session;
+    let branch = key.branch;
+    agent_owner::authorize_permission(tx, manager, key, AgentPermission::Manage)?;
+    let before = agent_owner::revision(tx, key)?;
+    if before != expected_rev {
+        return Err(Error::Conflict("stale Agent revision"));
+    }
+    workspace_writer::require_workspace_writer_for_session(tx, session)?;
+    let current = grant_in(tx, key, reference, name)?;
+    if current.as_ref().is_some_and(|grant| grant.rev > before) {
+        return Err(Error::Storage(
+            "Vault grant revision exceeds Agent revision",
+        ));
+    }
+    let next = before
+        .checked_add(1)
+        .filter(|v| *v <= i64::MAX as u64)
+        .ok_or(Error::Limit("Agent revision exhausted"))?;
+    if let Some((registry, authority)) = authority {
+        if agent_owner::lifecycle(tx, key)?.0 != "open" {
+            return Err(Error::Denied("Vault attach requires an open Agent"));
+        }
+        let policy = authority.policy();
+        policy.validate()?;
+        policy.require_scope(tx)?;
+        registry.require_projection(&policy.target.entry, policy.target.projection)?;
+        if policy.target.agent_ref != reference || &policy.target.name != name {
+            return Err(Error::Denied("Vault approval belongs to another binding"));
+        }
+        let manager_user =
+            user_for_principal(tx, manager)?.ok_or(Error::Denied("Vault manager unavailable"))?;
+        authority.authorize_attach(manager, &manager_user)?;
+        let access = agent_owner::authorize_permission(
+            tx,
+            &policy.target.actor,
+            key,
+            AgentPermission::Submit,
+        )?;
+        let generation = access.access_generation;
+        if current
+            .as_ref()
+            .is_some_and(|g| g.policy == *policy && g.access_generation == generation)
+        {
+            return Ok(before);
+        }
+        if current.is_none() {
+            let count: usize = db(tx.query_row(
+                "SELECT count(*) FROM agent_vault_grants_current WHERE session_id=?1 AND branch_id=?2",
+                params![session, branch], |row| row.get(0)))?;
+            if count >= MAX_GRANTS {
+                return Err(Error::Limit("too many Agent Vault grants"));
+            }
+        }
+        let target = &policy.target;
+        db(tx.execute(
+            "INSERT INTO agent_vault_grants_current(session_id,branch_id,name,grant_rev,
+              provider_id,entry_ref,projection,scope,authority_ref,authority_generation,
+              actor_principal,actor_user_id,access_generation,store_id,restore_generation)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(session_id,branch_id,name) DO UPDATE SET
+              grant_rev=excluded.grant_rev,provider_id=excluded.provider_id,entry_ref=excluded.entry_ref,
+              projection=excluded.projection,scope=excluded.scope,authority_ref=excluded.authority_ref,
+              authority_generation=excluded.authority_generation,actor_principal=excluded.actor_principal,
+              actor_user_id=excluded.actor_user_id,access_generation=excluded.access_generation,
+              store_id=excluded.store_id,restore_generation=excluded.restore_generation",
+            params![session, branch, name.as_str(), next, crate::json(&target.entry.provider)?,
+                target.entry.entry, projection_name(target.projection), target.scope,
+                policy.authority_ref, policy.authority_generation, target.actor.as_str(),
+                policy.actor_user_id, generation, policy.store_id, policy.restore_generation],
+        ))?;
+    } else {
+        if current.is_none() {
+            return Ok(before);
+        }
+        db(tx.execute("DELETE FROM agent_vault_grants_current WHERE session_id=?1 AND branch_id=?2 AND name=?3",
+            params![session, branch, name.as_str()]))?;
+    }
+    agent_owner::changed(tx, key)?;
+    // Audit presentation contains only the logical binding and factual rev.
+    crate::audit(
+        tx,
+        session,
+        manager,
+        "agent.vault.changed",
+        serde_json::json!({
+            "branch_id":branch, "name":name.as_str(), "rev":next, "active":authority.is_some()
+        }),
+    )?;
+    Ok(next)
+}
+
+/// Exact logical entry and projection selected by an authenticated host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultBindingSelection {
+    pub entry: VaultEntryRef,
+    pub projection: VaultProjection,
+}
+
+/// Preserve the literal requested ref for replay before contextual resolution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultSetRequest {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub name: SourceName,
+    pub binding: Option<VaultBindingSelection>,
+    pub rev: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VaultSetOutcome {
+    Applied { rev: u64 },
+    PriorInvocation,
+}
+
+#[derive(Deserialize)]
+struct SetFact {
+    fingerprint: String,
+    reference: String,
+    rev: u64,
+}
+
+/// One authenticated host request, not an independent authority or ledger.
+pub(crate) struct HostVaultSet<'a> {
+    pub manager: &'a PrincipalId,
+    pub current_ref: &'a str,
+    pub request: &'a VaultSetRequest,
+    pub request_id: &'a str,
+}
+
+impl HostVaultSet<'_> {
+    fn identity(&self, c: &Connection) -> Result<(String, String)> {
+        crate::label(self.request_id, 256)?;
+        crate::label(&self.request.reference, 2048)?;
+        self.request.name.validate()?;
+        if self.request.rev == 0 || self.request.rev > i64::MAX as u64 {
+            return Err(Error::Protocol("invalid Vault Agent revision"));
+        }
+        if let Some(binding) = &self.request.binding {
+            binding.entry.validate()?;
+        }
+        let user = user_for_principal(c, self.manager)?
+            .ok_or(Error::Denied("Vault manager unavailable"))?;
+        let mut hash = Sha256::new();
+        hash.update(b"aw-vault-set-request-v1\0");
+        hash.update(crate::json(&(user, self.request_id))?.as_bytes());
+        let event_id = format!("vault-set:{:x}", hash.finalize());
+        let mut hash = Sha256::new();
+        hash.update(b"aw-vault-set-semantics-v1\0");
+        hash.update(crate::json(self.request)?.as_bytes());
+        Ok((event_id, format!("{:x}", hash.finalize())))
+    }
+
+    fn replay_in(
+        &self,
+        c: &Connection,
+        event_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<VaultSetOutcome>> {
+        let prior: Option<(String, String, String)> = db(c
+            .query_row(
+                "SELECT kind,entity_type,payload_json FROM commit_log WHERE event_id=?1",
+                [event_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional())?;
+        let Some((kind, entity, payload)) = prior else {
+            return Ok(None);
+        };
+        if kind != "agent.vault.settled" || entity != "vault_grant" {
+            return Err(Error::Storage("Vault mutation receipt identity changed"));
+        }
+        let fact: SetFact = crate::decode(&payload)?;
+        if fact.fingerprint != fingerprint {
+            return Err(Error::Denied(
+                "Vault request identity reused with different semantics",
+            ));
+        }
+        // The current host's explicit redacted-metadata capability is limited
+        // to its exact Agent. ACL loss cannot revive or disclose the old result.
+        if fact.reference != self.current_ref {
+            return Ok(Some(VaultSetOutcome::PriorInvocation));
+        }
+        let access = exact_key(c, &fact.reference).and_then(|(session, branch)| {
+            agent_owner::authorize_permission(
+                c,
+                self.manager,
+                AgentKey::new(&session, &branch),
+                AgentPermission::Manage,
+            )
+        });
+        match access {
+            Ok(_) => Ok(Some(VaultSetOutcome::Applied { rev: fact.rev })),
+            Err(Error::Denied(_)) => Ok(Some(VaultSetOutcome::PriorInvocation)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Before provider selection/lookup and fresh authority acquisition.
+    pub(crate) fn replay(&self, store: &SessionStore) -> Result<Option<VaultSetOutcome>> {
+        let mut c = store.connection()?;
+        let tx = db(c.transaction())?;
+        let (event_id, fingerprint) = self.identity(&tx)?;
+        let outcome = self.replay_in(&tx, &event_id, &fingerprint)?;
+        if outcome.is_none() {
+            let (session, branch) = self.fresh_key(&tx)?;
+            let key = AgentKey::new(&session, &branch);
+            agent_owner::authorize_permission(&tx, self.manager, key, AgentPermission::Manage)?;
+            if agent_owner::revision(&tx, key)? != self.request.rev {
+                return Err(Error::Conflict("stale Agent revision"));
+            }
+        }
+        db(tx.commit())?;
+        Ok(outcome)
+    }
+
+    fn fresh_key(&self, c: &Connection) -> Result<(String, String)> {
+        if self.request.reference != "." && self.request.reference != self.current_ref {
+            return Err(Error::Denied("Vault host requires the current exact Agent"));
+        }
+        exact_key(c, self.current_ref)
+    }
+
+    /// Recheck replay under the original owner transaction after acquiring
+    /// the exact provider guard. One atomic grant CAS + factual receipt.
+    pub(crate) fn apply(
+        &self,
+        store: &SessionStore,
+        authority: Option<(&VaultProviderRegistryReader, &dyn VaultGrantAuthority)>,
+    ) -> Result<VaultSetOutcome> {
+        if store.inner.mode != StoreMode::OwnerLock {
+            return Err(Error::Denied(
+                "Vault binding requires the exclusive Store owner",
+            ));
+        }
+        let mut c = store.connection()?;
+        let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (event_id, fingerprint) = self.identity(&tx)?;
+        if let Some(outcome) = self.replay_in(&tx, &event_id, &fingerprint)? {
+            return Ok(outcome);
+        }
+        let request = self.request;
+        let (session, branch) = self.fresh_key(&tx)?;
+        match (&request.binding, authority) {
+            (None, None) => (),
+            (Some(binding), Some((_, guard)))
+                if binding.entry == guard.policy().target.entry
+                    && binding.projection == guard.policy().target.projection => {}
+            _ => {
+                return Err(Error::Denied(
+                    "Vault provider decision differs from requested binding",
+                ))
+            }
+        }
+        let rev = set_in(
+            &tx,
+            self.manager,
+            AgentKey::new(&session, &branch),
+            self.current_ref,
+            &request.name,
+            request.rev,
+            authority,
+        )?;
+        // The original indexed commit-log fact retains even an accepted no-op
+        // identity. Store only a digest, canonical target and resulting rev.
+        durability::commit_event_position_with_id(
+            &tx,
+            &event_id,
+            &durability::tx_id()?,
+            "agent.vault.settled",
+            "vault_grant",
+            &branch,
+            Some(self.manager),
+            serde_json::json!({"sync_scope":"local", "fingerprint":fingerprint, "reference":self.current_ref, "rev":rev}),
+        )?;
+        db(tx.commit())?;
+        Ok(VaultSetOutcome::Applied { rev })
+    }
+}
+
 impl SessionStore {
     /// Bind trusted provider policy to the original Store and actor identity.
     /// This observes identity; it issues no authority and persists nothing.
@@ -292,95 +584,17 @@ impl SessionStore {
         let mut c = self.connection()?;
         let tx = db(c.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let (session, branch) = exact_key(&tx, reference)?;
-        let key = AgentKey::new(&session, &branch);
-        agent_owner::authorize_permission(&tx, manager, key, AgentPermission::Manage)?;
-        let before = agent_owner::revision(&tx, key)?;
-        if before != expected_rev {
-            return Err(Error::Conflict("stale Agent revision"));
-        }
-        workspace_writer::require_workspace_writer_for_session(&tx, &session)?;
-        let current = grant_in(&tx, key, reference, name)?;
-        if current.as_ref().is_some_and(|grant| grant.rev > before) {
-            return Err(Error::Storage(
-                "Vault grant revision exceeds Agent revision",
-            ));
-        }
-        let next = before
-            .checked_add(1)
-            .filter(|v| *v <= i64::MAX as u64)
-            .ok_or(Error::Limit("Agent revision exhausted"))?;
-        if let Some((registry, authority)) = authority {
-            if agent_owner::lifecycle(&tx, key)?.0 != "open" {
-                return Err(Error::Denied("Vault attach requires an open Agent"));
-            }
-            let policy = authority.policy();
-            policy.validate()?;
-            policy.require_scope(&tx)?;
-            registry.require_projection(&policy.target.entry, policy.target.projection)?;
-            if policy.target.agent_ref != reference || &policy.target.name != name {
-                return Err(Error::Denied("Vault approval belongs to another binding"));
-            }
-            let manager_user = user_for_principal(&tx, manager)?
-                .ok_or(Error::Denied("Vault manager unavailable"))?;
-            authority.authorize_attach(manager, &manager_user)?;
-            let access = agent_owner::authorize_permission(
-                &tx,
-                &policy.target.actor,
-                key,
-                AgentPermission::Submit,
-            )?;
-            let generation = access.access_generation;
-            if current
-                .as_ref()
-                .is_some_and(|g| g.policy == *policy && g.access_generation == generation)
-            {
-                return Ok(before);
-            }
-            if current.is_none() {
-                let count: usize = db(tx.query_row(
-                    "SELECT count(*) FROM agent_vault_grants_current WHERE session_id=?1 AND branch_id=?2",
-                    params![session, branch], |row| row.get(0)))?;
-                if count >= MAX_GRANTS {
-                    return Err(Error::Limit("too many Agent Vault grants"));
-                }
-            }
-            let target = &policy.target;
-            db(tx.execute(
-                "INSERT INTO agent_vault_grants_current(session_id,branch_id,name,grant_rev,
-                  provider_id,entry_ref,projection,scope,authority_ref,authority_generation,
-                  actor_principal,actor_user_id,access_generation,store_id,restore_generation)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-                 ON CONFLICT(session_id,branch_id,name) DO UPDATE SET
-                  grant_rev=excluded.grant_rev,provider_id=excluded.provider_id,entry_ref=excluded.entry_ref,
-                  projection=excluded.projection,scope=excluded.scope,authority_ref=excluded.authority_ref,
-                  authority_generation=excluded.authority_generation,actor_principal=excluded.actor_principal,
-                  actor_user_id=excluded.actor_user_id,access_generation=excluded.access_generation,
-                  store_id=excluded.store_id,restore_generation=excluded.restore_generation",
-                params![session, branch, name.as_str(), next, crate::json(&target.entry.provider)?,
-                    target.entry.entry, projection_name(target.projection), target.scope,
-                    policy.authority_ref, policy.authority_generation, target.actor.as_str(),
-                    policy.actor_user_id, generation, policy.store_id, policy.restore_generation],
-            ))?;
-        } else {
-            if current.is_none() {
-                return Ok(before);
-            }
-            db(tx.execute("DELETE FROM agent_vault_grants_current WHERE session_id=?1 AND branch_id=?2 AND name=?3",
-                params![session, branch, name.as_str()]))?;
-        }
-        agent_owner::changed(&tx, key)?;
-        // Audit presentation contains only the logical binding and factual rev.
-        crate::audit(
+        let rev = set_in(
             &tx,
-            &session,
             manager,
-            "agent.vault.changed",
-            serde_json::json!({
-                "branch_id":branch, "name":name.as_str(), "rev":next, "active":authority.is_some()
-            }),
+            AgentKey::new(&session, &branch),
+            reference,
+            name,
+            expected_rev,
+            authority,
         )?;
         db(tx.commit())?;
-        Ok(next)
+        Ok(rev)
     }
 
     /// Trusted metadata boundary; authorize_metadata independently

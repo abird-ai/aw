@@ -4,7 +4,7 @@
 use crate::{
     id, user_for_principal, Error, LocalSecretStore, Result, SandboxEffectAuthority,
     SandboxEffectLaunch, SecretStore, SessionStore, VaultGrantAuthority, VaultGrantPolicy,
-    VaultGrantTarget,
+    VaultGrantTarget, VaultSetOutcome, VaultSetRequest,
 };
 use aw_agent_core::{
     DriverKey, PrincipalId, SourceName, VaultEntryRef, VaultProjection, VaultProviderHandle,
@@ -409,6 +409,51 @@ impl SessionStore {
                 expected_rev,
                 Some((registry, &authority)),
             )
+        })
+    }
+
+    /// Authenticated host binding of the exact configured signing decision.
+    /// Replay precedes provider lookup (including withdrawal/restart); fresh
+    /// attach requires the live guard and exact requested entry/projection.
+    /// A null binding removes only future projection authority.
+    pub fn agent_vault_set_signing_host<S: SecretStore + 'static>(
+        &self,
+        manager: &PrincipalId,
+        current_ref: &str,
+        request: &VaultSetRequest,
+        request_id: &str,
+        registry: &VaultProviderRegistryReader,
+        handle: &VaultProviderHandle<SigningVaultProvider<S>>,
+    ) -> Result<VaultSetOutcome> {
+        let operation = crate::vault_grants::HostVaultSet {
+            manager,
+            current_ref,
+            request,
+            request_id,
+        };
+        if let Some(outcome) = operation.replay(self)? {
+            return Ok(outcome);
+        }
+        let Some(binding) = &request.binding else {
+            return operation.apply(self, None);
+        };
+        let provider = registry.get(handle)?;
+        if binding.entry.provider != handle.descriptor().provider {
+            return Err(Error::Denied("Vault entry belongs to another provider"));
+        }
+        provider.with_entry(&binding.entry.entry, |authority| {
+            let target = &authority.policy().target;
+            if target.agent_ref != current_ref
+                || target.name != request.name
+                || target.projection != binding.projection
+                || &authority.entry.manager != manager
+            {
+                return Err(Error::Denied(
+                    "Vault provider decision differs from requested binding",
+                ));
+            }
+            provider.signing_key(authority.entry)?;
+            operation.apply(self, Some((registry, &authority)))
         })
     }
 

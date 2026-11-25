@@ -244,7 +244,8 @@ pub use subagents::*;
 pub use teams::*;
 pub use types::*;
 pub use vault_grants::{
-    VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus, VaultGrantSummary, VaultGrantTarget,
+    VaultBindingSelection, VaultGrantAuthority, VaultGrantPolicy, VaultGrantStatus,
+    VaultGrantSummary, VaultGrantTarget, VaultSetOutcome, VaultSetRequest,
 };
 pub use vault_signing::{SigningProcessProof, SigningVaultProvider, SIGNING_PROOF_ENV};
 pub use workspace_replica::*;

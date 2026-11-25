@@ -103,6 +103,12 @@ pub trait CheckpointDeletePort: Send + Sync {
     fn delete(&self, request_id: &str, params: Value) -> Result<Value>;
 }
 
+/// Explicit host-owned Vault binding capability. No broker invocation or
+/// secret material is exposed through this port.
+pub trait AgentVaultPort: Send + Sync {
+    fn apply(&self, request_id: &str, method: &str, params: Value) -> Result<Value>;
+}
+
 pub trait Driver {
     /// Must execute using aw's existing, exactly selected Agent/journal.
     fn prompt(
@@ -182,6 +188,9 @@ pub trait Driver {
         None
     }
     fn checkpoint_delete_port(&self) -> Option<Arc<dyn CheckpointDeletePort>> {
+        None
+    }
+    fn agent_vault_port(&self) -> Option<Arc<dyn AgentVaultPort>> {
         None
     }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
@@ -418,6 +427,8 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "checkpoint_create" => Some(&["ref", "sources", "note"]),
         "checkpoint_restore" => Some(&["id", "project", "title", "task", "access"]),
         "checkpoint_delete" => Some(&["id"]),
+        "agent_vault_list" => Some(&["ref"]),
+        "agent_vault_set" => Some(&["ref", "name", "binding", "rev"]),
         "sandbox_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
@@ -763,6 +774,9 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     capabilities["checkpoint_restore"] = json!(checkpoint_restore.is_some());
     let checkpoint_delete = driver.checkpoint_delete_port();
     capabilities["checkpoint_delete"] = json!(checkpoint_delete.is_some());
+    let agent_vault = driver.agent_vault_port();
+    capabilities["agent_vault_list"] = json!(agent_vault.is_some());
+    capabilities["agent_vault_set"] = json!(agent_vault.is_some());
     out.emit("hello",None,json!({
         "protocol":"aw.rpc","version":VERSION,"transport":"stdio",
         "capabilities":capabilities,
@@ -861,6 +875,13 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             "checkpoint_delete" if checkpoint_delete.is_some() => {
                 let port = checkpoint_delete.as_ref().expect("enabled checkpoint delete port");
                 match port.delete(id, request.params) {
+                    Ok(value) => out.emit("response", Some(id), value)?,
+                    Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
+                }
+            }
+            "agent_vault_list" | "agent_vault_set" if agent_vault.is_some() => {
+                let port = agent_vault.as_ref().expect("enabled Vault binding port");
+                match port.apply(id, &request.method, request.params) {
                     Ok(value) => out.emit("response", Some(id), value)?,
                     Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
                 }
@@ -1220,6 +1241,7 @@ mod r12_protocol_tests {
             r#"{"v":1,"id":"actorread","method":"actor_query","params":{"actor_key":"r9g1a1g1"}}"#,
             r#"{"v":1,"id":"actorctrl","method":"actor_op","params":{"operation":"cancel","turn_id":1}}"#,
             r#"{"v":1,"id":"cp-delete","method":"checkpoint_delete","params":{"id":"cp_fixture"}}"#,
+            r#"{"v":1,"id":"vault-set","method":"agent_vault_set","params":{"name":"signing","binding":null,"rev":1}}"#,
         ].join("\n")+"\n";
         let mut bytes = Vec::new();
         serve_stdio(&mut fake, Cursor::new(lines), &mut bytes, false).unwrap();
@@ -1234,6 +1256,8 @@ mod r12_protocol_tests {
             frames[0]["data"]["capabilities"]["checkpoint_delete"],
             false
         );
+        assert_eq!(frames[0]["data"]["capabilities"]["agent_vault_set"], false);
+        assert_eq!(frames[0]["data"]["capabilities"]["agent_vault_list"], false);
         assert_eq!(frames[1]["type"], "response");
         assert!(frames
             .iter()
@@ -1255,8 +1279,8 @@ mod r12_protocol_tests {
                 .iter()
                 .filter(|v| v["data"]["code"] == "unsupported_method")
                 .count(),
-            4,
-            "unbound stdio must never permit raw Actor or checkpoint mutation authority"
+            5,
+            "unbound stdio must never permit raw Actor, checkpoint or Vault mutation authority"
         );
         assert_eq!(frames.iter().filter(|v| v["type"] == "started").count(), 1);
     }
@@ -1411,6 +1435,16 @@ mod aw_p6_9c_protocol_tests {
         }
     }
 
+    impl AgentVaultPort for FakeSandboxPort {
+        fn apply(&self, request_id: &str, method: &str, params: Value) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((format!("{method}:{request_id}"), params));
+            Ok(json!({"status":"applied","rev":2}))
+        }
+    }
+
     struct BoundFake {
         query_calls: usize,
         mutation_calls: usize,
@@ -1448,6 +1482,9 @@ mod aw_p6_9c_protocol_tests {
             Some(self.sandbox.clone())
         }
         fn checkpoint_delete_port(&self) -> Option<Arc<dyn CheckpointDeletePort>> {
+            Some(self.sandbox.clone())
+        }
+        fn agent_vault_port(&self) -> Option<Arc<dyn AgentVaultPort>> {
             Some(self.sandbox.clone())
         }
         fn actor_query(&mut self, operation: Value) -> Result<Value> {
@@ -1532,6 +1569,10 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"cp-delete","method":"checkpoint_delete","params":{"id":"cp_fixture"}}"#,
             r#"{"v":1,"id":"cp-delete","method":"checkpoint_delete","params":{"id":"other"}}"#,
             r#"{"v":1,"id":"delete-raw","method":"checkpoint_delete","params":{"id":"cp_fixture","cleanup":true}}"#,
+            r#"{"v":1,"id":"vault-list","method":"agent_vault_list","params":{}}"#,
+            r#"{"v":1,"id":"vault-set","method":"agent_vault_set","params":{"name":"signing","binding":null,"rev":1}}"#,
+            r#"{"v":1,"id":"vault-set","method":"agent_vault_set","params":{"name":"other","binding":null,"rev":1}}"#,
+            r#"{"v":1,"id":"vault-raw","method":"agent_vault_set","params":{"name":"signing","binding":null,"rev":1,"root":"/private"}}"#,
             r#"{"v":1,"id":"cp-create","method":"checkpoint_create","params":{"sources":"none"}}"#,
             r#"{"v":1,"id":"cp-create","method":"checkpoint_create","params":{"sources":"auto"}}"#,
             r#"{"v":1,"id":"cp-raw","method":"checkpoint_create","params":{"sources":"none","authority":true}}"#,
@@ -1581,6 +1622,8 @@ mod aw_p6_9c_protocol_tests {
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_create"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_restore"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_delete"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_vault_list"], true);
+        assert_eq!(rows[0]["data"]["capabilities"]["agent_vault_set"], true);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], false);
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_close"], true);
         assert_eq!(fake.query_calls, 1);
@@ -1625,10 +1668,21 @@ mod aw_p6_9c_protocol_tests {
                 "checkpoint_get",
                 "checkpoint_restore:checkpoint-restore",
                 "checkpoint_delete:cp-delete",
+                "agent_vault_list:vault-list",
+                "agent_vault_set:vault-set",
                 "checkpoint_create:cp-create"
             ]
         );
         assert_eq!(sandbox_calls[0].1["limit"], 8);
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "vault-set" && r["data"]["status"] == "applied"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "vault-set" && r["data"]["code"] == "duplicate_request_id"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "vault-raw" && r["data"]["code"] == "invalid_parameters"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "cp-delete" && r["data"]["status"] == "retired"));

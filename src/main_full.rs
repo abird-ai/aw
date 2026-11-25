@@ -890,6 +890,11 @@ struct RpcCommandCliArgs {
     /// owner. Never authorizes physical source retention cleanup.
     #[arg(long = "checkpoint-delete", requires = "rpc_actor_owner")]
     rpc_checkpoint_delete: bool,
+    /// Activate an existing private signing Vault and authorize redacted
+    /// binding management for this exact local Actor. Host must independently
+    /// exclude Agent access and other writers to the provider directory.
+    #[arg(long = "signing-vault-root", requires = "rpc_actor_owner")]
+    rpc_signing_vault_root: Option<PathBuf>,
     /// Explicit signed AwNet MachineLink Actor owner, never an HTTP/RPC server.
     #[cfg(all(feature = "net", target_os = "linux"))]
     #[arg(long = "actor-peer", conflicts_with = "rpc_stdio")]
@@ -978,6 +983,7 @@ pub(crate) struct RunArgs {
     rpc_checkpoint_create: bool,
     rpc_checkpoint_restore_root: Option<PathBuf>,
     rpc_checkpoint_delete: bool,
+    rpc_signing_vault_root: Option<PathBuf>,
     #[cfg(all(feature = "net", target_os = "linux"))]
     rpc_actor_remote: Option<ActorRemoteCliOptions>,
     diagnostics_protocol: bool,
@@ -1114,6 +1120,7 @@ impl RunArgs {
             rpc_checkpoint_create: false,
             rpc_checkpoint_restore_root: None,
             rpc_checkpoint_delete: false,
+            rpc_signing_vault_root: None,
             #[cfg(all(feature = "net", target_os = "linux"))]
             rpc_actor_remote: None,
             diagnostics_protocol: false,
@@ -1558,6 +1565,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             run.rpc_checkpoint_create = args.rpc_checkpoint_create;
             run.rpc_checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             run.rpc_checkpoint_delete = args.rpc_checkpoint_delete;
+            run.rpc_signing_vault_root = args.rpc_signing_vault_root;
             #[cfg(all(feature = "net", target_os = "linux"))]
             if let Some(peer) = args.rpc_actor_peer {
                 let room = args.rpc_actor_room.ok_or(Error::Denied(
@@ -3078,6 +3086,9 @@ fn run_agent_with_shell_containment(
             host.checkpoint_create_enabled = args.rpc_checkpoint_create;
             host.checkpoint_restore_root = args.rpc_checkpoint_restore_root;
             host.checkpoint_delete_enabled = args.rpc_checkpoint_delete;
+            if let Some(root) = args.rpc_signing_vault_root {
+                host.attach_rpc_signing_vault(&root)?;
+            }
         }
         return aw::headless::serve_stdio(
             &mut host,
@@ -3425,6 +3436,7 @@ struct Host {
     checkpoint_create_enabled: bool,
     checkpoint_restore_root: Option<PathBuf>,
     checkpoint_delete_enabled: bool,
+    agent_vault_port: Option<std::sync::Arc<StdioVaultPort>>,
     agent_inputs_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
@@ -3471,6 +3483,120 @@ struct StdioAgentStatePort {
     caller: aw::PrincipalId,
     current_agent_ref: String,
     current_project_ref: String,
+}
+
+/// One explicitly activated, exact-Agent host capability. The registered
+/// signing provider owns every attach decision; the host independently grants
+/// redacted binding metadata (never provider/key/entry metadata).
+struct StdioVaultPort {
+    state: std::sync::Arc<StdioAgentStatePort>,
+    registry: aw_agent_core::VaultProviderRegistry,
+    handle: aw_agent_core::VaultProviderHandle<aw_store::SigningVaultProvider>,
+}
+
+impl StdioVaultPort {
+    fn open_configured(
+        state: std::sync::Arc<StdioAgentStatePort>,
+        binding: &aw_store::SessionBinding,
+        root: &std::path::Path,
+    ) -> Result<Self> {
+        if !root.is_absolute() || root.canonicalize()? != root {
+            return Err(Error::Denied(
+                "Vault requires an exact canonical provider directory",
+            ));
+        }
+        // Observable overlap with the selected execution layout is forbidden.
+        // The trusted host still independently protects all other aliases,
+        // mounts, ancestors and non-cooperating writers for the provider life.
+        let identity = aw_platform::DirectoryIdentity::open(root)?.identity()?;
+        for protected in [
+            binding.tool_root.as_path(),
+            binding.working_directory.as_path(),
+        ] {
+            let protected = protected.canonicalize()?;
+            if root.starts_with(&protected)
+                || protected.starts_with(root)
+                || aw_platform::DirectoryIdentity::open(&protected)?.identity()? == identity
+            {
+                return Err(Error::Denied(
+                    "Vault provider overlaps the Agent execution layout",
+                ));
+            }
+        }
+        let registry = aw_agent_core::VaultProviderRegistry::new();
+        let handle = aw_store::SigningVaultProvider::open_configured(&state.store, root)?
+            .register(&registry)?;
+        Ok(Self {
+            state,
+            registry,
+            handle,
+        })
+    }
+}
+
+impl aw::headless::AgentVaultPort for StdioVaultPort {
+    fn apply(
+        &self,
+        request_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let reference = agent_ref_text(&params, "ref", false)?.unwrap_or(".");
+        let state = &self.state;
+        match method {
+            "agent_vault_list" => {
+                let items = state.store.agent_vault_list(
+                    &state.caller,
+                    &state.current_agent_ref,
+                    |manager, target| {
+                        // The explicit startup capability is the independent host
+                        // decision for redacted metadata of just this Agent.
+                        if manager != &state.caller
+                            || target != state.current_agent_ref
+                            || (reference != "." && reference != target)
+                        {
+                            return Err(Error::Denied(
+                                "Vault metadata requires the current exact Agent",
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+                bounded_source_metadata(serde_json::json!({"items":items}))
+            }
+            "agent_vault_set" => {
+                let name = params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(Error::Protocol("Vault binding name must be a string"))?;
+                let binding = params.get("binding").ok_or(Error::Protocol(
+                    "Vault binding is required; use null to remove",
+                ))?;
+                let selection = serde_json::from_value::<Option<aw_store::VaultBindingSelection>>(
+                    binding.clone(),
+                )
+                .map_err(|_| Error::Protocol("invalid Vault binding selection"))?;
+                let request = aw_store::VaultSetRequest {
+                    reference: reference.to_owned(),
+                    name: aw_agent_core::SourceName::new(name)?,
+                    binding: selection,
+                    rev: agent_expected_rev(&params, true)?
+                        .ok_or(Error::Protocol("Vault Agent rev is required"))?,
+                };
+                let outcome = state.store.agent_vault_set_signing_host(
+                    &state.caller,
+                    &state.current_agent_ref,
+                    &request,
+                    &format!("rpc:stdio:vault-set:{request_id}"),
+                    &self.registry.reader()?,
+                    &self.handle,
+                )?;
+                serde_json::to_value(outcome)
+                    .map_err(|_| Error::Protocol("Vault outcome encoding failed"))
+            }
+            _ => Err(Error::Protocol("unsupported Vault binding operation")),
+        }
+    }
 }
 
 struct StdioCheckpointRestorePort {
@@ -4602,6 +4728,27 @@ impl Host {
         Ok(())
     }
 
+    fn attach_rpc_signing_vault(&mut self, root: &std::path::Path) -> Result<()> {
+        if self.actor_owner.is_none() || self.agent_vault_port.is_some() {
+            return Err(Error::Denied(
+                "Vault requires a newly selected local Actor owner",
+            ));
+        }
+        let state = self.agent_state_port.as_ref().ok_or(Error::Denied(
+            "Vault requires the exact local Agent state owner",
+        ))?;
+        let creator = self
+            .agent_create_owner
+            .as_ref()
+            .ok_or(Error::Denied("Vault requires the exact local Agent layout"))?;
+        self.agent_vault_port = Some(std::sync::Arc::new(StdioVaultPort::open_configured(
+            state.clone(),
+            &creator.binding,
+            root,
+        )?));
+        Ok(())
+    }
+
     fn verify_project(&self) -> Result<()> {
         if let Some(project) = &self.project {
             let current = aw::project_resources::Catalog::scan(
@@ -4891,6 +5038,7 @@ impl Host {
             checkpoint_create_enabled: false,
             checkpoint_restore_root: None,
             checkpoint_delete_enabled: false,
+            agent_vault_port: None,
             agent_inputs_owner: None,
             sandbox_owner: None,
             pre_dispatch_retries: 0,
@@ -5472,7 +5620,7 @@ impl Host {
                 )?));
                 self.agent_jobs_owner = Some(owner);
             }
-            if local_event_controls {
+            if local_event_controls && self.tools.mode != aw::ToolMode::Off {
                 self.tools.events.replace(router.clone())?;
                 let registered = agent
                     .tool_specs()
@@ -6560,6 +6708,11 @@ impl aw::headless::Driver for Host {
         self.agent_state_port
             .as_ref()
             .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::CheckpointDeletePort>)
+    }
+    fn agent_vault_port(&self) -> Option<std::sync::Arc<dyn aw::headless::AgentVaultPort>> {
+        self.agent_vault_port
+            .as_ref()
+            .map(|port| port.clone() as std::sync::Arc<dyn aw::headless::AgentVaultPort>)
     }
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner
@@ -7767,6 +7920,276 @@ mod phase54_cli_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    #[test]
+    fn stdio_configured_vault_binds_exact_live_provider_and_replays_without_regrant() {
+        use aw::headless::AgentVaultPort;
+        use aw_agent_core::{DriverKey, SourceName};
+        use aw_store::{LocalSecretStore, SecretStore};
+        use serde_json::json;
+        use std::{io::Write, sync::Arc};
+
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = Temp(crate::test_support::temp_dir("stdio-signing-vault"));
+        let state_dir = temp.0.join("state");
+        let root = temp.0.canonicalize().unwrap().join("provider");
+        let workspace = temp.0.join("workspace");
+        aw_platform::ensure_private_dir(&root).unwrap();
+        aw_platform::ensure_private_dir(&workspace).unwrap();
+        let mut profile = config::builtins().remove("llama").unwrap();
+        profile.model = Some("fixture".into());
+        // No provider invocation: an unreachable loopback destination makes
+        // accidental dispatch fail rather than contact a real service.
+        profile.base_url = "http://127.0.0.1:1/v1".into();
+        let settings = Settings {
+            profile_name: "fixture".into(),
+            profile,
+            system_prompt: "fixture".into(),
+            request_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(2),
+            max_output_bytes: config::MAX_OUTPUT_BYTES,
+        };
+        let context = ExecutionContext::capture(&workspace).unwrap();
+        let tools = aw::LocalToolOptions::new(workspace.clone(), aw::ToolMode::Off);
+        let binding = sessions::binding(&settings, &context, &tools).unwrap();
+        let actor = sessions::actor(&context, false).unwrap();
+        let store = SessionStore::open(&state_dir).unwrap();
+        let (session, branch) = store.create(&actor, "signing", binding.clone()).unwrap();
+        let info = store
+            .agent_binding(&actor, &session.id, &branch.id)
+            .unwrap();
+        let project = format!(
+            "/d:{}/i:{}/p:{}",
+            info.domain_handle, info.identity_handle, info.project_handle
+        );
+        let reference = format!("{project}/a:{}", info.agent_handle);
+        let state_port = |store: &SessionStore, caller: &aw::PrincipalId, target: &str| {
+            Arc::new(StdioAgentStatePort {
+                store: store.clone(),
+                caller: caller.clone(),
+                current_agent_ref: target.into(),
+                current_project_ref: project.clone(),
+            })
+        };
+        let open = |store: &SessionStore, target: &str| {
+            StdioVaultPort::open_configured(state_port(store, &actor, target), &binding, &root)
+        };
+        assert!(open(&store, &reference).is_err());
+        assert!(!root.join("secrets").exists());
+        assert!(StdioVaultPort::open_configured(
+            state_port(&store, &actor, &reference),
+            &binding,
+            &workspace
+        )
+        .is_err());
+        let keys = LocalSecretStore::open(&root).unwrap();
+        let key_ref = format!("sec_{}", "2".repeat(64));
+        keys.put(&key_ref, &[67u8; 32]).unwrap();
+        let provider = DriverKey::builtin("fixture-private-signing").unwrap();
+        let entry = "private-entry";
+        let scope = "private-scope";
+        let name = SourceName::new("signing").unwrap();
+        let config = json!({"version":1,"provider":provider,"entries":[{
+            "entry":entry,"key_ref":key_ref,"agent_ref":reference,"name":name,
+            "projection":"broker","scope":scope,"actor":actor,"manager":actor
+        }]});
+        let mut file = aw_platform::open_private_new(&root.join("signing.json")).unwrap();
+        file.write_all(&serde_json::to_vec(&config).unwrap())
+            .unwrap();
+        drop(file);
+        let persistent = PersistentSession::open(
+            store.clone(),
+            actor.clone(),
+            binding.clone(),
+            &session.id,
+            &branch.id,
+            false,
+        )
+        .unwrap();
+        let mut host = Host::new(
+            settings,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+            context,
+            tools,
+            false,
+            aw::ToolMode::Off,
+            1,
+            1,
+            1,
+            1,
+            60,
+            None,
+            None,
+            Some(state_dir.clone()),
+            resources_cli::SessionStoreBackendArg::Sqlite,
+            Some(persistent),
+            #[cfg(feature = "jsonl")]
+            None,
+            #[cfg(feature = "jsonl")]
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        host.ensure(false, "Vault RPC fixture").unwrap();
+        assert!(host.agent.as_ref().unwrap().tool_specs().is_empty());
+        assert!(host.attach_rpc_signing_vault(&root).is_err());
+        host.attach_rpc_actor_owner().unwrap();
+        assert!(aw::headless::Driver::agent_vault_port(&host).is_none());
+        host.attach_rpc_signing_vault(&root).unwrap();
+        let port = host.agent_vault_port.as_ref().unwrap().clone();
+        let before = store.agent_get(&actor, &reference).unwrap().rev;
+        let list =
+            |port: &StdioVaultPort| port.apply("list", "agent_vault_list", json!({})).unwrap();
+        let set =
+            |port: &StdioVaultPort, id: &str, params| port.apply(id, "agent_vault_set", params);
+        let sign = |port: &StdioVaultPort, rev| {
+            port.state.store.vault_sign(
+                &actor,
+                &reference,
+                &name,
+                rev,
+                scope,
+                &port.registry.reader().unwrap(),
+                &port.handle,
+                entry,
+                b"challenge",
+            )
+        };
+        assert_eq!(list(&port)["items"], json!([]));
+        assert!(sign(&port, before).is_err());
+        let request = json!({"name":name,"binding":{"entry":{"provider":provider,"entry":entry},"projection":"broker"},"rev":before});
+        let mut wrong = request.clone();
+        wrong["binding"]["projection"] = json!("env");
+        assert!(set(&port, "wrong-projection", wrong).is_err());
+        let mut wrong = request.clone();
+        wrong["binding"]["scope"] = json!("untrusted");
+        assert!(set(&port, "scope", wrong).is_err());
+        assert!(set(&port, "missing-binding", json!({"name":name,"rev":before})).is_err());
+        let mut wrong = request.clone();
+        wrong["ref"] = json!("/d:d/i:i/p:p/a:other");
+        assert!(set(&port, "other", wrong).is_err());
+        assert!(port
+            .apply(
+                "other-list",
+                "agent_vault_list",
+                json!({"ref":"/d:d/i:i/p:p/a:other"})
+            )
+            .is_err());
+        let denied = StdioVaultPort::open_configured(
+            state_port(
+                &store,
+                &aw::PrincipalId::new("internal:fixture:stdio-vault-denied").unwrap(),
+                &reference,
+            ),
+            &binding,
+            &root,
+        )
+        .unwrap();
+        assert!(denied.apply("list", "agent_vault_list", json!({})).is_err());
+        assert!(set(&denied, "attach", request.clone()).is_err());
+        drop(denied);
+        // Exercise the actual configured Host, not just a port mock.
+        let requests = format!(
+            "{}\n{}\n",
+            json!({"v":1,"id":"list","method":"agent_vault_list","params":{}}),
+            json!({"v":1,"id":"attach","method":"agent_vault_set","params":request})
+        );
+        let mut output = Vec::new();
+        aw::headless::serve_stdio(
+            &mut host,
+            std::io::Cursor::new(requests),
+            &mut output,
+            false,
+        )
+        .unwrap();
+        let frames: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames[0]["data"]["capabilities"]["agent_vault_set"], true);
+        assert_eq!(frames[1]["data"]["items"], json!([]));
+        let attached = frames[2]["data"].clone();
+        let rev = before + 1;
+        assert_eq!(attached, json!({"status":"applied","rev":rev}));
+        let proof = sign(&port, rev).unwrap();
+        assert_eq!(set(&port, "attach", request.clone()).unwrap(), attached);
+        let mut mismatch = request.clone();
+        mismatch["ref"] = json!(reference);
+        assert!(set(&port, "attach", mismatch).is_err());
+        let metadata = list(&port);
+        assert_eq!(
+            metadata["items"],
+            json!([{"name":"signing","projection":"broker","grant_rev":rev,"status":"revalidation_required"}])
+        );
+        for protected in ["fixture-private-signing", entry, scope, &key_ref] {
+            assert!(!metadata.to_string().contains(protected));
+        }
+        port.registry
+            .reader()
+            .unwrap()
+            .get(&port.handle)
+            .unwrap()
+            .revoke(entry)
+            .unwrap();
+        assert!(sign(&port, rev).is_err());
+        assert_eq!(set(&port, "attach", request.clone()).unwrap(), attached);
+        let mut fresh = request.clone();
+        fresh["rev"] = json!(rev);
+        assert!(set(&port, "withdrawn", fresh.clone()).is_err());
+        assert_eq!(store.agent_get(&actor, &reference).unwrap().rev, rev);
+        let other = store
+            .fork(&actor, &session.id, "other", &branch.head)
+            .unwrap();
+        let info = store.agent_binding(&actor, &session.id, &other.id).unwrap();
+        let other_ref = format!("{project}/a:{}", info.agent_handle);
+        drop(port);
+        drop(host);
+        drop(store);
+        let store = SessionStore::open(&state_dir).unwrap();
+        let rebound = open(&store, &other_ref).unwrap();
+        assert_eq!(
+            set(&rebound, "attach", request.clone()).unwrap(),
+            json!({"status":"prior_invocation"})
+        );
+        assert_eq!(list(&rebound)["items"], json!([]));
+        let restarted = open(&store, &reference).unwrap();
+        assert_eq!(
+            set(&restarted, "attach", request.clone()).unwrap(),
+            attached
+        );
+        assert!(sign(&restarted, rev).is_err());
+        let reattached = set(&restarted, "regrant", fresh).unwrap();
+        assert_eq!(reattached, json!({"status":"applied","rev":rev+1}));
+        assert_eq!(sign(&restarted, rev + 1).unwrap(), proof);
+        let remove = json!({"name":name,"binding":null,"rev":rev+1});
+        let removed = set(&restarted, "remove", remove.clone()).unwrap();
+        assert_eq!(removed, json!({"status":"applied","rev":rev+2}));
+        assert_eq!(set(&restarted, "remove", remove).unwrap(), removed);
+        assert!(sign(&restarted, rev + 1).is_err());
+        assert_eq!(list(&restarted)["items"], json!([]));
+        assert_eq!(keys.get(&key_ref).unwrap().as_slice(), &[67u8; 32]);
+        let noop = json!({"name":name,"binding":null,"rev":rev+2});
+        assert_eq!(set(&restarted, "noop", noop.clone()).unwrap(), removed);
+        assert_eq!(set(&restarted, "noop", noop).unwrap(), removed);
+        assert!(set(
+            &restarted,
+            "noop",
+            json!({"name":"other","binding":null,"rev":rev+2})
+        )
+        .is_err());
+        assert_eq!(store.agent_get(&actor, &reference).unwrap().rev, rev + 2);
     }
 
     #[test]

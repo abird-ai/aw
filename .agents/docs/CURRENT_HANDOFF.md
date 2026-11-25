@@ -19,7 +19,70 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: replay-safe logical checkpoint retirement
+## Latest local implementation delta — 2026-11-25: configured signing Vault activation and binding RPCs
+
+Parent: `78a4c54c1bd33e93b395550df7c61433d4c3edf1` (replay-safe logical
+checkpoint retirement), signature verified. Original Agent/Actor/Turn
+journal and resource CLI owners remain concurrently occupied; source-bearing
+admission stays held. L5 only.
+
+- Explicit local Actor-owner stdio `--agent-signing-vault-root` activates the
+  existing configured signing provider in the typed VaultProvider registry,
+  retaining its live handle for the exact bound Agent. Requires the original
+  tool-free durable Session/Actor host. The provider directory must already
+  be canonical/private and contain the existing validated configuration and
+  encrypted keys. Observed execution/Store layout overlap is refused;
+  the trusted host must independently protect aliases, ancestors, mounts
+  and other writers for the provider lifetime. No physical containment
+  claim, implicit grant, model-supplied path, key, actor or scope.
+- Optional `AgentVaultPort`: `agent_vault_list(ref=.)` requires the explicit
+  host metadata capability and current Manage; only current exact-Agent
+  redacted binding summaries (name/projection/grant revision/status), never
+  provider/entry/authority/key metadata. `revalidation_required` is not
+  authorization. `agent_vault_set(ref=., name, binding, rev)` accepts the
+  exact typed entry/projection or explicit null to remove. Only configured
+  broker/env decisions are supported. No broker invocation or Process
+  admission RPC. Startup does not grant any Vault entry.
+- Both original grant mutations and authenticated host mutations share
+  the original Store transaction body. Host replay uses the existing
+  indexed immutable commit-log identity (active user + namespaced request
+  ID), original typed request fingerprint including literal contextual
+  selector, and exact settled Agent/revision. Replay lookup precedes
+  contextual resolution/provider admission; fresh mutation rechecks
+  Manage, writer, CAS and the actual live provider guard through the same
+  commit. Even an accepted no-op consumes the identity. Exact replay does
+  not regrant or append a fact; mismatched replay denied; lost disclosure
+  returns opaque `prior_invocation`. No parallel ledger/schema, secret
+  receipt or new mutation owner. Removing a binding never removes keys.
+- Fixed a preexisting tool-free startup mismatch: local durable hosts
+  no longer register model-facing Event tools in tools-off mode, so the
+  real Actor-owner attachment can enforce its existing no-tools guard.
+  Tool-enabled Event registration and the Store Event owner are unchanged.
+
+Validation: on L5 (Rust 1.95.0): existing signing Vault owner group **2/2**,
+headless protocol **8/8**, source-Process integration **2/2**; actual
+configured Host + Actor attachment + stdio dispatch regression **1/1**
+(after the tools-off startup correction), including live broker proof,
+replay after withdrawal/restart, wrong authority/selector/projection,
+no-op identity consumption, removal preserving the encrypted key and
+redacted metadata. Strict Store/Host/CLI all-target/all-feature Clippy,
+durable-only lib and minimal all-target checks, full CLI build and actual
+flag/required Actor-owner smoke passed. Initial lint caught an unnecessary
+unit expression; corrected before the final strict run. Existing
+durable/minimal dead-code warnings remain. No live model request.
+Pinned Nix/platform qualification and broad unrelated suites not rerun.
+Store v60, Git recovery v4; no publication.
+
+Next: exact live source-aware Actor/Turn admission when original journal,
+context and queue owners are free; otherwise independent configured Git
+authority/physical recovery or another remaining substantive Sandbox/Vault
+integration. Configured signing activation and local redacted list/set
+are landed; production broker/Process dispatch, independent provider and
+protected metadata authority, other Vault projections and source-bearing
+admission remain held. Do not infer physical isolation or provider access
+from the management port.
+
+## Previous local implementation delta — 2026-11-25: replay-safe logical checkpoint retirement
 
 Parent: `94838c0caf1da105a7cf001892d630eaf66c99ec` (comprehensive handoff
 refresh; preceding implementation `ffa8fc940fd82468925be3505adf7aa6082399b4`).
