@@ -876,6 +876,10 @@ struct RpcCommandCliArgs {
     /// never grants commands by a client-supplied ActorKey.
     #[arg(long = "actor-owner", requires = "rpc_stdio")]
     rpc_actor_owner: bool,
+    /// Enable history-only checkpoint creation (Auto only for source-free
+    /// capture) for the authenticated local Actor-owner RPC connection.
+    #[arg(long = "checkpoint-create", requires = "rpc_actor_owner")]
+    rpc_checkpoint_create: bool,
     /// Explicit signed AwNet MachineLink Actor owner, never an HTTP/RPC server.
     #[cfg(all(feature = "net", target_os = "linux"))]
     #[arg(long = "actor-peer", conflicts_with = "rpc_stdio")]
@@ -961,6 +965,7 @@ pub(crate) struct RunArgs {
     output: aw::headless::Output,
     rpc_stdio: bool,
     rpc_actor_owner: bool,
+    rpc_checkpoint_create: bool,
     #[cfg(all(feature = "net", target_os = "linux"))]
     rpc_actor_remote: Option<ActorRemoteCliOptions>,
     diagnostics_protocol: bool,
@@ -1094,6 +1099,7 @@ impl RunArgs {
             output: aw::headless::Output::Text,
             rpc_stdio: false,
             rpc_actor_owner: false,
+            rpc_checkpoint_create: false,
             #[cfg(all(feature = "net", target_os = "linux"))]
             rpc_actor_remote: None,
             diagnostics_protocol: false,
@@ -1535,6 +1541,7 @@ fn run_top_command(command: TopCommand) -> Result<u8> {
             );
             run.rpc_stdio = args.rpc_stdio;
             run.rpc_actor_owner = args.rpc_actor_owner || remote;
+            run.rpc_checkpoint_create = args.rpc_checkpoint_create;
             #[cfg(all(feature = "net", target_os = "linux"))]
             if let Some(peer) = args.rpc_actor_peer {
                 let room = args.rpc_actor_room.ok_or(Error::Denied(
@@ -3052,6 +3059,7 @@ fn run_agent_with_shell_containment(
         }
         if args.rpc_actor_owner {
             host.attach_rpc_actor_owner()?;
+            host.checkpoint_create_enabled = args.rpc_checkpoint_create;
         }
         return aw::headless::serve_stdio(
             &mut host,
@@ -3396,6 +3404,7 @@ struct Host {
     agent_close_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentClose>>,
     agent_create_owner: Option<std::sync::Arc<StdioAgentCreatePort>>,
     agent_state_port: Option<std::sync::Arc<StdioAgentStatePort>>,
+    checkpoint_create_enabled: bool,
     agent_inputs_owner: Option<std::sync::Arc<aw::agent_lifecycle::HostAgentInputs>>,
     sandbox_owner: Option<std::sync::Arc<StdioSandboxPort>>,
     pre_dispatch_retries: u8,
@@ -3910,6 +3919,46 @@ impl aw::headless::CheckpointReadPort for StdioAgentStatePort {
             _ => return Err(Error::Protocol("unsupported checkpoint metadata operation")),
         };
         bounded_source_metadata(value)
+    }
+}
+
+impl aw::headless::CheckpointCreatePort for StdioAgentStatePort {
+    fn create(&self, request_id: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let reference = agent_ref_text(&params, "ref", false)?.unwrap_or(".");
+        let coverage = match params.get("sources") {
+            None => aw_agent_core::SourceCoverage::AutoAllRequired,
+            Some(value) => match value.as_str() {
+                Some("auto") => aw_agent_core::SourceCoverage::AutoAllRequired,
+                Some("none") => aw_agent_core::SourceCoverage::None,
+                _ => {
+                    return Err(Error::Denied(
+                        "source checkpoint capture requires independent host authority",
+                    ))
+                }
+            },
+        };
+        let note = params
+            .get("note")
+            .map(|v| {
+                v.as_str()
+                    .ok_or(Error::Protocol("checkpoint note must be a string"))
+            })
+            .transpose()?;
+        // Namespace this local authenticated transport separately from SDK
+        // or model tool identities. Store scopes the receipt to the caller.
+        let request_id = format!("rpc:stdio:checkpoint:{request_id}");
+        let snapshot = self.store.checkpoint_create_history_host(
+            &self.caller,
+            aw_store::CheckpointCreateScope {
+                current_agent_ref: &self.current_agent_ref,
+                current_project_ref: &self.current_project_ref,
+            },
+            reference,
+            note,
+            &request_id,
+            coverage,
+        )?;
+        bounded_source_metadata(checkpoint_snapshot_value(&snapshot))
     }
 }
 
@@ -4766,6 +4815,7 @@ impl Host {
             agent_close_owner: None,
             agent_create_owner: None,
             agent_state_port: None,
+            checkpoint_create_enabled: false,
             agent_inputs_owner: None,
             sandbox_owner: None,
             pre_dispatch_retries: 0,
@@ -6400,6 +6450,16 @@ impl aw::headless::Driver for Host {
             .as_ref()
             .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::CheckpointReadPort>)
     }
+    fn checkpoint_create_port(
+        &self,
+    ) -> Option<std::sync::Arc<dyn aw::headless::CheckpointCreatePort>> {
+        if !self.checkpoint_create_enabled {
+            return None;
+        }
+        self.agent_state_port
+            .as_ref()
+            .map(|owner| owner.clone() as std::sync::Arc<dyn aw::headless::CheckpointCreatePort>)
+    }
     fn sandbox_port(&self) -> Option<std::sync::Arc<dyn aw::headless::SandboxPort>> {
         self.sandbox_owner
             .as_ref()
@@ -7610,7 +7670,7 @@ mod phase54_cli_tests {
 
     #[test]
     fn stdio_source_metadata_uses_current_store_authority_without_private_locators() {
-        use aw::headless::{CheckpointReadPort, SandboxPort};
+        use aw::headless::{CheckpointCreatePort, CheckpointReadPort, SandboxPort};
         use aw_agent_core::{
             CheckpointPolicy, DriverKey, SchemaSupport, SourceAccess, SourceBinding,
             SourceDriverRegistry, SourceDriverSchemas, SourceName,
@@ -7792,6 +7852,86 @@ mod phase54_cli_tests {
                 .len(),
             1
         );
+
+        // Explicitly enabled constructor uses the original durable owner.
+        let before_rev = store
+            .agent_get(&actor, &port.current_agent_ref)
+            .unwrap()
+            .rev;
+        let request = json!({"sources":"none", "note":"host history checkpoint"});
+        let created = port.create("history-create", request.clone()).unwrap();
+        assert_eq!(created["source_coverage"], "none");
+        assert_eq!(created["source_agent_ref"], port.current_agent_ref);
+        assert_eq!(
+            port.create("history-create", request.clone()).unwrap(),
+            created
+        );
+        assert!(port
+            .create(
+                "history-create",
+                json!({"sources":"auto", "note":"host history checkpoint"})
+            )
+            .is_err());
+        assert!(port
+            .create("selected-capture", json!({"sources":["dataset"]}))
+            .is_err());
+        let auto = port.create("empty-auto", json!({})).unwrap();
+        assert_eq!(auto["source_coverage"], "auto_all_required");
+        assert_eq!(auto["sources"], json!([]));
+        assert_eq!(
+            store
+                .agent_get(&actor, &port.current_agent_ref)
+                .unwrap()
+                .rev,
+            before_rev
+        );
+        assert!(denied.create("denied", json!({"sources":"none"})).is_err());
+        assert!(foreign_project
+            .create("history-create", request.clone())
+            .is_err());
+        // A new current Agent must not retarget a previously consumed '.'
+        // request. Use an actual branch, then reopen the durable Store owner.
+        let other = store
+            .fork(&actor, &session.id, "other", &branch.head)
+            .unwrap();
+        let other_info = store.agent_binding(&actor, &session.id, &other.id).unwrap();
+        let other_ref = format!("{project}/a:{}", other_info.agent_handle);
+        assert_ne!(other_ref, port.current_agent_ref);
+        let original_ref = port.current_agent_ref.clone();
+        drop(port);
+        drop(denied);
+        drop(foreign_project);
+        drop(sandbox_port);
+        drop(store);
+        let store = SessionStore::open(&state).unwrap();
+        let rebound = StdioAgentStatePort {
+            store: store.clone(),
+            caller: actor.clone(),
+            current_agent_ref: other_ref,
+            current_project_ref: project.clone(),
+        };
+        assert_eq!(
+            rebound.create("history-create", request.clone()).unwrap(),
+            created
+        );
+        assert!(rebound
+            .create(
+                "history-create",
+                json!({"ref":original_ref,"sources":"none","note":"host history checkpoint"})
+            )
+            .is_err());
+        assert!(
+            CheckpointReadPort::apply(&rebound, "checkpoint_list", json!({})).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .checkpoint_delete(&actor, created["id"].as_str().unwrap())
+            .unwrap();
+        let retired = rebound.create("history-create", request).unwrap();
+        assert_eq!(retired["id"], created["id"]);
+        assert_eq!(retired["lifecycle"], "retired");
     }
 
     #[test]

@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: protected source metadata and checkpoint reads (this local checkpoint; signed parent `44d92bc0cfe0eff269942e49c8b9832dbb76aa62`, configured Git native source authority). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: replay-safe history checkpoint construction (this local checkpoint; signed parent `1518684de8c74fe9c5df1f65765b9bbc71a921ec`, protected source metadata and checkpoint reads). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1331,6 +1331,17 @@ Current implementation: protected source metadata and checkpoint reads (this loc
       8/8, full/minimal checks, strict full-product Clippy, scoped fmt/diff
       passed (L5 Rust 1.95.0; pinned Nix/platform gates not rerun). No schema
       or source-bearing admission change.
+      **Replay-safe history checkpoint construction landed:** explicit local
+      Actor-owner stdio `--agent-checkpoint-create` capability, original Store
+      history/empty-Auto publication and caller-scoped receipt. Literal ref
+      fingerprint/replay precedes current Agent resolution, current view and
+      Project checks, no retarget after rebind or retirement. Ordinary RPC
+      request-ID gate before constructor; default off; required/selected source
+      capture and restore/delete RPC remain held. No new schema or authority.
+      Original checkpoint owner 1/1, grouped Store-backed port 1/1, headless
+      8/8, full/minimal checks, strict Store/full-product Clippy, binary build
+      and opt-in smoke, scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix and
+      native platform gates not rerun).
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

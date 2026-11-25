@@ -18,7 +18,65 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: protected source metadata and checkpoint reads
+## Latest local implementation delta — 2026-11-25: replay-safe history checkpoint construction
+
+Parent: `1518684de8c74fe9c5df1f65765b9bbc71a921ec` (protected source metadata
+and checkpoint reads). Parent signature verified. Original Agent/Turn journal
+owners and resource CLI remain concurrently occupied; source admission held.
+
+- Explicit local stdio `--agent-checkpoint-create` (requires the existing
+  `--agent-actor-owner` and `--agent-stdio` exact durable Session binding;
+  tools off and original Actor-owner restrictions unchanged) enables the
+  optional `CheckpointCreatePort`. Default off, read capability independent.
+  Reuses the authenticated `StdioAgentStatePort`; no new runtime owner.
+  The sealed RPC accepts `ref` (default `.`), `sources` (`none` or `auto`,
+  default `auto`) and optional `note`. `none` captures settled immutable
+  history; Auto succeeds only when the effective Sandbox has no required
+  SourceBindings (ephemeral bindings omitted). Required or explicitly
+  selected source capture remains held; no fallback to `none`.
+- `CheckpointCreateScope` and `checkpoint_create_history_host` compose the
+  existing history/empty-Auto Store publication and original replay owner.
+  The literal ref and complete semantics are fingerprinted before replay;
+  resolve `.` only on fresh admission, require same Project and current view.
+  A matching replay returns the original checkpoint identity, with current
+  disclosure/Project checks, even after current Agent rebinding or retirement.
+  Existing lower constructors continue to use their original fingerprints.
+  Authenticated stdio request IDs use `rpc:stdio:checkpoint:{id}` in the
+  existing caller-scoped receipt; no new ledger, synthetic evidence, or
+  schema. Agent rev remains unchanged. No driver probes or physical effects.
+- The new constructor executes on the ordinary RPC request path after the
+  connection's duplicate-ID/budget/parameter validation, rather than in the
+  speculative live input reader. It therefore queues behind an active RPC
+  operation. The lower owner still supports settled-history capture during
+  a live Turn; no new concurrency guarantee claimed. The previous read port
+  and existing live routes are unchanged. `checkpoint_restore` and
+  `checkpoint_delete` remain unavailable as host RPCs; no physical retention
+  cleanup or source-bearing admission promotion.
+
+Validation on L5 (Rust 1.95.0): original checkpoint owner **1/1**, grouped
+Store-backed real metadata/construction port **1/1** (history/empty-Auto,
+current ACL and Project scope, literal-ref and coverage mismatch, changed
+current Agent on durable reopen, retired replay tombstone, unchanged Agent
+rev), headless **8/8** (optional capability, strict params, duplicate-ID
+constructor rejection), full product all-target/all-feature check, strict
+Store/full-product Clippy, minimal all-target check, actual full binary build
+and CLI opt-in dependency smoke, scoped fmt/diff passed. Existing minimal
+dead-code warnings remain. CLI smoke checked parsing/opt-in, not a live
+provider session; actual Store-backed effects covered by the port regression.
+The original required-source Auto guard remains in the Store; full physical
+capture qualification was not rerun. Shared builds include concurrently
+owned dependencies; signed tree contains only owned paths. Pinned Nix
+1.98.1 and native cross-platform qualification not rerun. Store v60, Git
+recovery v4; no publication.
+
+Next: exact live source-aware Actor/Turn admission when original journal
+owners become available. Resource CLI startup composition remains occupied.
+Otherwise take the next independent actual host authority consumer or sealed
+resource surface. For checkpoint restore/retirement preserve replay-first
+publication, existing constructor and physical retention owners; do not
+infer capture or disclosure authority from history checkpoint capability.
+
+## Previous local implementation delta — 2026-11-25: protected source metadata and checkpoint reads
 
 Parent: `44d92bc0cfe0eff269942e49c8b9832dbb76aa62` (configured Git native
 source authority). Parent signature verified. Original Agent/Turn journal

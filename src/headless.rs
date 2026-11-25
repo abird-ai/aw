@@ -85,6 +85,12 @@ pub trait CheckpointReadPort: Send + Sync {
     fn apply(&self, method: &str, params: Value) -> Result<Value>;
 }
 
+/// Explicit host checkpoint-create capability. The authenticated envelope
+/// ID is the original constructor replay identity, not a model parameter.
+pub trait CheckpointCreatePort: Send + Sync {
+    fn create(&self, request_id: &str, params: Value) -> Result<Value>;
+}
+
 pub trait Driver {
     /// Must execute using aw's existing, exactly selected Agent/journal.
     fn prompt(
@@ -155,6 +161,9 @@ pub trait Driver {
         None
     }
     fn checkpoint_read_port(&self) -> Option<Arc<dyn CheckpointReadPort>> {
+        None
+    }
+    fn checkpoint_create_port(&self) -> Option<Arc<dyn CheckpointCreatePort>> {
         None
     }
     fn actor_query(&mut self, _operation: Value) -> Result<Value> {
@@ -388,6 +397,7 @@ fn validate_method_params(method: &str, p: &Value) -> Result<()> {
         "sandbox_sources_list" => Some(&["ref"]),
         "checkpoint_list" => Some(&["ref", "limit", "cursor"]),
         "checkpoint_get" => Some(&["id", "include"]),
+        "checkpoint_create" => Some(&["ref", "sources", "note"]),
         "sandbox_close" => Some(&["ref", "rev"]),
         "actor_enqueue" => Some(&[
             "request_id",
@@ -727,11 +737,9 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
     let checkpoint_read = driver.checkpoint_read_port().is_some();
     capabilities["checkpoint_list"] = json!(checkpoint_read);
     capabilities["checkpoint_get"] = json!(checkpoint_read);
-    for method in [
-        "checkpoint_create",
-        "checkpoint_restore",
-        "checkpoint_delete",
-    ] {
+    let checkpoint_create = driver.checkpoint_create_port();
+    capabilities["checkpoint_create"] = json!(checkpoint_create.is_some());
+    for method in ["checkpoint_restore", "checkpoint_delete"] {
         capabilities[method] = json!(false);
     }
     out.emit("hello",None,json!({
@@ -813,6 +821,15 @@ pub fn serve_stdio<D: Driver, R: Read + Send + 'static, W: Write + Send>(
             continue;
         }
         match request.method.as_str() {
+            // This constructor is serialized after the connection's request-ID
+            // gate, not dispatched speculatively by the live input reader.
+            "checkpoint_create" if checkpoint_create.is_some() => {
+                let port = checkpoint_create.as_ref().expect("enabled checkpoint port");
+                match port.create(id, request.params) {
+                    Ok(value) => out.emit("response", Some(id), value)?,
+                    Err(error) => out.emit("error", Some(id), json!({"code":error_code(&error),"status":"rejected_or_unknown","needs_inspection":true}))?,
+                }
+            }
             "actor_query" if driver.actor_available() => {
                 let result = request.params.get("operation")
                     .cloned().ok_or(Error::Protocol("missing typed Actor query"))
@@ -1324,6 +1341,16 @@ mod aw_p6_9c_protocol_tests {
         }
     }
 
+    impl CheckpointCreatePort for FakeSandboxPort {
+        fn create(&self, request_id: &str, params: Value) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((format!("checkpoint_create:{request_id}"), params));
+            Ok(json!({"id":"cp_fixture"}))
+        }
+    }
+
     struct BoundFake {
         query_calls: usize,
         mutation_calls: usize,
@@ -1352,6 +1379,9 @@ mod aw_p6_9c_protocol_tests {
             Some(self.sandbox.clone())
         }
         fn checkpoint_read_port(&self) -> Option<Arc<dyn CheckpointReadPort>> {
+            Some(self.sandbox.clone())
+        }
+        fn checkpoint_create_port(&self) -> Option<Arc<dyn CheckpointCreatePort>> {
             Some(self.sandbox.clone())
         }
         fn actor_query(&mut self, operation: Value) -> Result<Value> {
@@ -1431,6 +1461,9 @@ mod aw_p6_9c_protocol_tests {
             r#"{"v":1,"id":"checkpoint","method":"checkpoint_get","params":{"id":"cp_fixture"}}"#,
             r#"{"v":1,"id":"checkpoint-raw","method":"checkpoint_get","params":{"id":"cp_fixture","source_ref":"private"}}"#,
             r#"{"v":1,"id":"checkpoint-restore","method":"checkpoint_restore","params":{"id":"cp_fixture"}}"#,
+            r#"{"v":1,"id":"cp-create","method":"checkpoint_create","params":{"sources":"none"}}"#,
+            r#"{"v":1,"id":"cp-create","method":"checkpoint_create","params":{"sources":"auto"}}"#,
+            r#"{"v":1,"id":"cp-raw","method":"checkpoint_create","params":{"sources":"none","authority":true}}"#,
             r#"{"v":1,"id":"sandbox-layout","method":"sandbox_get","params":{"ref":"/d:d/i:i/p:p/s:0","layout":"raw"}}"#,
             r#"{"v":1,"id":"danger","method":"trusted_bash","params":{"command":"echo no"}}"#,
         ].join("\n")+"\n";
@@ -1474,11 +1507,8 @@ mod aw_p6_9c_protocol_tests {
         for method in ["sandbox_sources_list", "checkpoint_list", "checkpoint_get"] {
             assert_eq!(rows[0]["data"]["capabilities"][method], true);
         }
-        for method in [
-            "checkpoint_create",
-            "checkpoint_restore",
-            "checkpoint_delete",
-        ] {
+        assert_eq!(rows[0]["data"]["capabilities"]["checkpoint_create"], true);
+        for method in ["checkpoint_restore", "checkpoint_delete"] {
             assert_eq!(rows[0]["data"]["capabilities"][method], false);
         }
         assert_eq!(rows[0]["data"]["capabilities"]["sandbox_create"], false);
@@ -1522,10 +1552,20 @@ mod aw_p6_9c_protocol_tests {
                 "sandbox_list",
                 "sandbox_sources_list",
                 "checkpoint_list",
-                "checkpoint_get"
+                "checkpoint_get",
+                "checkpoint_create:cp-create"
             ]
         );
         assert_eq!(sandbox_calls[0].1["limit"], 8);
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "cp-create" && r["data"]["id"] == "cp_fixture"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "cp-create" && r["data"]["code"] == "duplicate_request_id"));
+        assert!(rows
+            .iter()
+            .any(|r| r["id"] == "cp-raw" && r["data"]["code"] == "invalid_parameters"));
         assert!(rows
             .iter()
             .any(|r| r["id"] == "checkpoint-raw" && r["data"]["code"] == "protocol"));

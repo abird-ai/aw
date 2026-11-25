@@ -450,6 +450,25 @@ fn fingerprint(reference: &str, note: Option<&str>) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// Trusted host scope for a history checkpoint request. The original
+/// requested ref is fingerprinted before resolving the current Agent alias.
+/// This carries no capture or view authority by itself.
+pub struct CheckpointCreateScope<'a> {
+    pub current_agent_ref: &'a str,
+    pub current_project_ref: &'a str,
+}
+
+impl CheckpointCreateScope<'_> {
+    fn require_project(&self, reference: &str) -> Result<()> {
+        if reference.rsplit_once("/a:").map(|(project, _)| project)
+            != Some(self.current_project_ref)
+        {
+            return Err(Error::Denied("cross-Project checkpoint access unavailable"));
+        }
+        Ok(())
+    }
+}
+
 impl SessionStore {
     /// Trusted host-only, history-only checkpoint construction. The caller
     /// must admit the checkpoint-create capability and supply a stable
@@ -468,6 +487,7 @@ impl SessionStore {
             note,
             request_id,
             SourceCoverage::None,
+            None,
         )
     }
 
@@ -487,6 +507,29 @@ impl SessionStore {
             note,
             request_id,
             SourceCoverage::AutoAllRequired,
+            None,
+        )
+    }
+
+    /// Host-admitted history-only or empty Auto checkpoint. Preserve the
+    /// literal request fingerprint and replay before resolving `.`. The
+    /// caller owns the authenticated request namespace and capability.
+    pub fn checkpoint_create_history_host(
+        &self,
+        actor: &PrincipalId,
+        scope: CheckpointCreateScope<'_>,
+        reference: &str,
+        note: Option<&str>,
+        request_id: &str,
+        coverage: SourceCoverage,
+    ) -> Result<CheckpointSnapshot> {
+        self.checkpoint_create_without_sources(
+            actor,
+            reference,
+            note,
+            request_id,
+            coverage,
+            Some(scope),
         )
     }
 
@@ -497,6 +540,7 @@ impl SessionStore {
         note: Option<&str>,
         request_id: &str,
         coverage: SourceCoverage,
+        scope: Option<CheckpointCreateScope<'_>>,
     ) -> Result<CheckpointSnapshot> {
         label(request_id, 256)?;
         label(reference, 2048)?;
@@ -518,8 +562,22 @@ impl SessionStore {
             .ok_or(Error::Denied("checkpoint caller is inactive or unknown"))?;
         // Replay lookup precedes target resolution and current admission.
         if let Some(snapshot) = replay_in(&tx, actor, &creator, request_id, &fingerprint)? {
+            if let Some(scope) = &scope {
+                scope.require_project(&snapshot.source_agent_ref)?;
+            }
             return Ok(snapshot);
         }
+        let reference = if let Some(scope) = &scope {
+            let reference = if reference == "." {
+                scope.current_agent_ref
+            } else {
+                reference
+            };
+            scope.require_project(reference)?;
+            reference
+        } else {
+            reference
+        };
         let (session, branch) = agent_owner::key_for_ref(&tx, reference)?;
         let source = AgentKey::new(&session, &branch);
         agent_owner::authorize_permission(&tx, actor, source, AgentPermission::View)?;
