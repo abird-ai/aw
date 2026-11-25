@@ -1,12 +1,13 @@
 # CURRENT HANDOFF — AW live state + DL-200 R6
 
 Canonical comprehensive handoff (**read this first after AGENTS.md**):
-[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md).
+[AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md).
 
 Copy-ready next-agent prompt:
-[AW-DL200-PHASE3-NEXT-AGENT-2026-11-24-LATE.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-24-LATE.md).
+[AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md](AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 Previous Phase-3, Phase-1 and R6 comprehensive handoffs remain historical design/implementation provenance:
+- [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24-LATE.md)
 - [AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24.md](AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-24.md)
 - [AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md](AW-DL200-PHASE1-FULL-COMPREHENSIVE-HANDOFF-2026-11-23.md)
 - [AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md](AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-22.md)
@@ -77,7 +78,12 @@ dotlink AW pin                  20a63a4d4547cc20b2a154787823125b82f5e385
 ```
 
 The Phase-1/2 and Phase-3 line through 4ddeed8 was pushed and independently
-verified on 2026-11-25. The subsequent v60 checkpoint remains local. Phase-1 completion is
+verified on 2026-11-25. The eight subsequent implementation checkpoints through
+`2b4fac33d8345f284ecfd3e0585f332c72037dc6` (Enforce trusted minimum Process
+containment before launch) remain local. The interrupted validation job completed
+successfully; exact parent, signature and clean owned paths were independently
+revalidated at the comprehensive handoff. Store schema v60, Git recovery v4.
+Phase-1 completion is
 `7f4724f942e4d90a6eaaca77af6c528b37a2262d` (`Expose Agent state RPCs`). Phase 2 began at
 `14b53872236d2af262d24a2ad9529c4b652c2756` (`Start Event projection foundation`) and closes at
 `e0c6bb3184bf87fc1bb2186ddc7f5ffb97a39c96` (`Cut over Event delivery ownership`). Phase 3 starts at
