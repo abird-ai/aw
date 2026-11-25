@@ -64,6 +64,8 @@ pub enum Error {
     OwnerGone(&'static str),
     #[error("{0}")]
     Conflict(&'static str),
+    #[error("required closed descendant containment is unavailable")]
+    ContainmentUnavailable,
     #[error("process launch authority denied before spawn")]
     DeniedBeforeSpawn,
     #[error("process launch cancelled before spawn")]
@@ -245,6 +247,35 @@ impl SpawnControl {
         }
         if Instant::now() >= self.deadline {
             return Err(Error::TimedOutBeforeSpawn);
+        }
+        Ok(())
+    }
+}
+
+/// Trusted minimum Process-scope guarantee, not a backend selector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContainmentRequirement {
+    #[default]
+    BestAvailable,
+    ClosedDescendants,
+}
+
+impl ContainmentRequirement {
+    /// Combine independently imposed minima without a downgrade.
+    #[inline]
+    pub const fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::BestAvailable, Self::BestAvailable) => Self::BestAvailable,
+            _ => Self::ClosedDescendants,
+        }
+    }
+
+    fn require_supported(self) -> Result<()> {
+        // Current DirectScope: Unix process groups cannot exclude setsid;
+        // Windows attaches a private Job before resuming the suspended child.
+        // Selection/setup failure is never a reason to fall back.
+        if self == Self::ClosedDescendants && !cfg!(windows) {
+            return Err(Error::ContainmentUnavailable);
         }
         Ok(())
     }
@@ -726,7 +757,19 @@ impl Process {
     ///
     /// The caller must not preconfigure process containment or stdio ownership;
     /// those are lifetime-sensitive and are owned here.
-    pub async fn spawn(mut command: Command, options: SpawnOptions) -> Result<Self> {
+    pub async fn spawn(command: Command, options: SpawnOptions) -> Result<Self> {
+        Self::spawn_with_containment(command, options, ContainmentRequirement::BestAvailable).await
+    }
+
+    /// Finalize only a Scope satisfying the trusted minimum. Reject an
+    /// unsupported requirement before entering any external launch fence,
+    /// spawn lane, or command execution. No weaker retry.
+    pub async fn spawn_with_containment(
+        mut command: Command,
+        options: SpawnOptions,
+        requirement: ContainmentRequirement,
+    ) -> Result<Self> {
+        requirement.require_supported()?;
         let SpawnOptions {
             stdin_open,
             stdout,
@@ -1278,6 +1321,42 @@ mod tests {
             occupancy(Err(io::Error::other("unavailable"))),
             Occupancy::Unknown
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn required_closed_scope_refuses_direct_unix_before_launch() {
+        // Even an invalid program must be rejected by containment,
+        // before the OS spawn or a provider launch fence can run.
+        let command = Command::new("/definitely/not/an/aw-process-command");
+        let control = SpawnControl::new_fenced(
+            Instant::now() + Duration::from_secs(3),
+            || false,
+            std::future::pending(),
+            |_| panic!("unsupported containment must not enter launch fence"),
+        );
+        let requirement = ContainmentRequirement::ClosedDescendants
+            .intersect(ContainmentRequirement::BestAvailable);
+        assert!(matches!(
+            Process::spawn_with_containment(
+                command,
+                SpawnOptions {
+                    control: Some(control),
+                    ..Default::default()
+                },
+                requirement,
+            )
+            .await,
+            Err(Error::ContainmentUnavailable)
+        ));
+        assert!(matches!(
+            Process::spawn(
+                Command::new("/definitely/not/an/aw-process-command"),
+                SpawnOptions::default(),
+            )
+            .await,
+            Err(Error::Io(_))
+        ));
     }
 
     #[cfg(target_os = "linux")]

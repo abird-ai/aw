@@ -2,6 +2,7 @@
 use crate::AuthenticatedToolGrantEvidence;
 use aw_agent_core::{tool::ToolBindingAuthority, Error, NamedSourceAccess, Result, ToolEffect};
 use aw_store::{SandboxEffectAuthority, SandboxGrantPolicy};
+use aw_tools_adapter::process::ContainmentRequirement;
 
 #[derive(Clone)]
 pub(crate) struct LiveSourceTool {
@@ -27,6 +28,7 @@ pub struct SourceToolAuthority<A> {
     source: A,
     pub(crate) tool: LiveSourceTool,
     invocation: Option<aw_agent_core::ToolContext>,
+    containment: ContainmentRequirement,
 }
 
 impl<A: SandboxEffectAuthority> SourceToolAuthority<A> {
@@ -55,7 +57,19 @@ impl<A: SandboxEffectAuthority> SourceToolAuthority<A> {
                 evidence,
             },
             invocation: None,
+            containment: ContainmentRequirement::BestAvailable,
         })
+    }
+
+    /// Trusted host minimum, independent of the driver's prepared command.
+    /// Repeated narrowing cannot weaken the guarantee.
+    pub fn requiring_process_containment(mut self, requirement: ContainmentRequirement) -> Self {
+        self.containment = self.containment.intersect(requirement);
+        self
+    }
+
+    pub(crate) fn process_containment(&self) -> ContainmentRequirement {
+        self.containment
     }
 
     /// Bind the existing Actor Envelope for direct runtime dispatch.

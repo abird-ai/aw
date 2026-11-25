@@ -3,8 +3,8 @@
 //! spawn. Pipe lifetimes delegate to aw-process; PTY Terminal custody remains
 //! a distinct aw-terminal resource.
 pub use aw_process::{
-    OutputPageError, OutputStream, ProcessOutputPage, ProcessSnapshot, StreamSnapshot,
-    CAPTURE_HEAD, CAPTURE_TAIL, MAX_PROCESS_PAGE_BYTES,
+    ContainmentRequirement, OutputPageError, OutputStream, ProcessOutputPage, ProcessSnapshot,
+    StreamSnapshot, CAPTURE_HEAD, CAPTURE_TAIL, MAX_PROCESS_PAGE_BYTES,
 };
 use aw_tools::{
     execution_stop::{
@@ -671,6 +671,9 @@ fn map_process_error(error: aw_process::Error) -> crate::Error {
         aw_process::Error::Limit(message) => crate::Error::Limit(message),
         aw_process::Error::InputClosed(message) => crate::Error::Denied(message),
         aw_process::Error::Conflict(message) => crate::Error::Conflict(message),
+        aw_process::Error::ContainmentUnavailable => {
+            crate::Error::Denied("required closed descendant containment is unavailable")
+        }
         aw_process::Error::DeniedBeforeSpawn => {
             crate::Error::Denied("process launch authority denied")
         }
@@ -683,13 +686,14 @@ fn map_process_error(error: aw_process::Error) -> crate::Error {
 
 pub use aw_process::SpawnOnce;
 
-/// A trusted driver's already-prepared command and launch pins. No model
-/// arguments select this capability; the driver owns containment and policy.
-/// Process runtime still owns stdio, scope, launch and terminal facts.
+/// Trusted prepared command, minimum containment and launch pins. No
+/// model arguments select this capability. The Process runtime owns
+/// Scope selection, stdio, launch and terminal facts.
 pub struct PreparedPipeLaunch<P = ()> {
     command: Command,
     stdin_open: bool,
     pins: P,
+    containment: ContainmentRequirement,
 }
 
 impl<P> PreparedPipeLaunch<P> {
@@ -698,7 +702,15 @@ impl<P> PreparedPipeLaunch<P> {
             command: Command::from(command),
             stdin_open,
             pins,
+            containment: ContainmentRequirement::BestAvailable,
         }
+    }
+
+    /// A trusted driver or policy owner may strengthen, never weaken,
+    /// the already prepared Process containment requirement.
+    pub fn requiring_containment(mut self, requirement: ContainmentRequirement) -> Self {
+        self.containment = self.containment.intersect(requirement);
+        self
     }
 
     /// Transfer additional live authority/capability custody with this launch.
@@ -707,6 +719,7 @@ impl<P> PreparedPipeLaunch<P> {
             command: self.command,
             stdin_open: self.stdin_open,
             pins: (self.pins, authority),
+            containment: self.containment,
         }
     }
 }
@@ -725,6 +738,7 @@ impl PipeLaunchFailure {
             error,
             aw_process::Error::Io(_)
                 | aw_process::Error::Limit(_)
+                | aw_process::Error::ContainmentUnavailable
                 | aw_process::Error::DeniedBeforeSpawn
                 | aw_process::Error::CancelledBeforeSpawn
                 | aw_process::Error::TimedOutBeforeSpawn
@@ -844,6 +858,7 @@ impl PipeProcess {
             command,
             stdin_open,
             pins,
+            containment,
         } = launch;
         // The existing spawn control moves its level-triggered probe into
         // the Linux launch lane with the command. Capture custody there,
@@ -863,6 +878,7 @@ impl PipeProcess {
             SpawnOutputTarget::None,
             None,
             Some(control),
+            containment,
         )
         .await
     }
@@ -880,6 +896,7 @@ impl PipeProcess {
             command,
             stdin_open,
             pins,
+            containment,
         } = launch;
         let control = aw_process::SpawnControl::new_fenced(
             deadline,
@@ -893,6 +910,7 @@ impl PipeProcess {
             SpawnOutputTarget::None,
             None,
             Some(control),
+            containment,
         )
         .await
     }
@@ -909,9 +927,16 @@ impl PipeProcess {
         for (key, value) in spec.env {
             command.env(key, value);
         }
-        Self::spawn_command_inner(command, spec.stdin_open, target, event_sink, control)
-            .await
-            .map_err(PipeLaunchFailure::into_error)
+        Self::spawn_command_inner(
+            command,
+            spec.stdin_open,
+            target,
+            event_sink,
+            control,
+            ContainmentRequirement::BestAvailable,
+        )
+        .await
+        .map_err(PipeLaunchFailure::into_error)
     }
 
     async fn spawn_command_inner(
@@ -920,9 +945,10 @@ impl PipeProcess {
         target: SpawnOutputTarget,
         event_sink: Option<Arc<dyn ExecutionEventSink>>,
         control: Option<aw_process::SpawnControl>,
+        containment: ContainmentRequirement,
     ) -> std::result::Result<Self, PipeLaunchFailure> {
         let output = Self::prepare_outputs(target).map_err(PipeLaunchFailure::NotStarted)?;
-        let process = aw_process::Process::spawn(
+        let process = aw_process::Process::spawn_with_containment(
             command,
             aw_process::SpawnOptions {
                 stdin_open,
@@ -931,6 +957,7 @@ impl PipeProcess {
                 event_sink,
                 control,
             },
+            containment,
         )
         .await
         .map_err(PipeLaunchFailure::from_runtime)?;
@@ -1994,6 +2021,44 @@ mod tests {
         let _ = std::fs::remove_file(out_path);
         let _ = std::fs::remove_file(err_path);
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_launches_preserve_required_containment_through_custody() {
+        let launch = || {
+            PreparedPipeLaunch::from_trusted_command(
+                std::process::Command::new("/definitely/not/an/aw-process-command"),
+                false,
+                (),
+            )
+            .requiring_containment(ContainmentRequirement::ClosedDescendants)
+            .with_custody(())
+            .requiring_containment(ContainmentRequirement::BestAvailable)
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let result =
+            PipeProcess::spawn_prepared_until(launch(), deadline, || false, pending()).await;
+        assert!(matches!(
+            result,
+            Err(PipeLaunchFailure::NotStarted(crate::Error::Denied(
+                "required closed descendant containment is unavailable"
+            )))
+        ));
+        let result = PipeProcess::spawn_prepared_fenced_until(
+            launch(),
+            deadline,
+            || false,
+            pending(),
+            |_, _| panic!("unsupported containment must not enter launch fence"),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(PipeLaunchFailure::NotStarted(crate::Error::Denied(
+                "required closed descendant containment is unavailable"
+            )))
+        ));
+    }
+
     #[tokio::test]
     async fn process_spawns_drains_and_receipts_exit() {
         let p = PipeProcess::spawn(spec("printf hello; sleep 0.05; printf tail >&2"))

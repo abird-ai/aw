@@ -1219,6 +1219,22 @@ Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE /
       completed candidate retention and restart inspection. Host 16/16,
       Git 33/33, strict affected Clippy, workspace all-target/all-feature
       check and scoped fmt/diff passed. Broad Store not rerun.
+      **Enforced minimum Process containment landed:** one reusable
+      aw-process ContainmentRequirement and spawn_with_containment. Strict
+      closed descendants refuses Direct Unix before fence/lane/OS spawn;
+      existing Windows suspended Job is the current closed backend, runtime
+      qualification still deferred. No weaker fallback or terminal evidence
+      changes. PreparedPipeLaunch preserves requirement through custody
+      and both adapter launch routes. Independent SourceToolAuthority minimum
+      combines monotonically at shared finite/interactive/Vault handoff;
+      unsupported becomes original factual NotStarted and source settlement.
+      Existing weak path still needs independent quiescence. Runtime/adapter
+      regression and grouped Host journaled refusal; no lower mount changes,
+      new backend, schema, dependency or Process owner. Production physical
+      authority/provider configuration and source-aware dispatch remain held.
+      Process 8/8, adapter 258/258, Host 16/16, source-effects-only Host 2/2;
+      strict affected Clippy, workspace all-target/all-feature and scoped
+      fmt/diff passed. Broad Store not rerun.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

@@ -144,7 +144,9 @@ where
     let check = control.probe();
     let signal = control.clone();
     PipeProcess::spawn_prepared_fenced_until(
-        launch.with_custody(authority),
+        launch
+            .requiring_containment(authority.process_containment())
+            .with_custody(authority),
         deadline,
         // ToolBinding is checked under its actual synchronous launch fence.
         // Do not reenter its read lock from the final cancellation probe.
@@ -654,6 +656,7 @@ mod tests {
             "host:stale-source",
             "host:cancelled",
             "host:missing",
+            "host:closed-scope",
             "host:vault-stale",
             "host:vault-collision",
             "host:vault-valid",
@@ -776,7 +779,7 @@ mod tests {
                 &reader,
                 &handle,
                 |_| {
-                    ProcessToolAuthority::new(
+                    let authority = ProcessToolAuthority::new(
                         HostGuard {
                             _guard: policy_lock.clone().try_read_owned().unwrap(),
                             policy: policy.clone(),
@@ -784,7 +787,17 @@ mod tests {
                         },
                         tool_authority.clone(),
                         evidence,
-                    )
+                    )?;
+                    let requirement = if effect_id == "host:closed-scope" {
+                        aw_tools_adapter::process::ContainmentRequirement::ClosedDescendants
+                    } else {
+                        aw_tools_adapter::process::ContainmentRequirement::BestAvailable
+                    };
+                    Ok(authority
+                        .requiring_process_containment(requirement)
+                        .requiring_process_containment(
+                            aw_tools_adapter::process::ContainmentRequirement::BestAvailable,
+                        ))
                 },
                 |driver, plan, _| Ok(driver.prepare(plan, missing, policy_lock.clone(), effect_id)),
             )
@@ -870,6 +883,7 @@ mod tests {
         for (id, missing, cancellation) in [
             ("host:cancelled", false, cancel),
             ("host:missing", true, CancellationToken::new()),
+            ("host:closed-scope", false, CancellationToken::new()),
         ] {
             let prepared = prepare(id, capture(), missing).unwrap();
             let completion = run_source_process(prepared, deadline(), cancellation, |_| {
@@ -877,6 +891,14 @@ mod tests {
             })
             .await
             .unwrap();
+            if id == "host:closed-scope" {
+                assert!(matches!(
+                    &completion.receipt,
+                    Err(PipeLaunchFailure::NotStarted(Error::Denied(
+                        "required closed descendant containment is unavailable"
+                    )))
+                ));
+            }
             assert!(matches!(
                 completion.receipt,
                 Err(PipeLaunchFailure::NotStarted(_))

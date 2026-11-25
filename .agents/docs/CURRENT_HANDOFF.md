@@ -60,8 +60,8 @@ native approval provisioning, shared finite Vault Process settlement, v60
 Project-scoped standalone versioned Sandbox construction, same-Project
 required-source Sandbox derivation, exact managed-source structural removal,
 versioned attachment (including first source into an empty layout) and replacement
-with per-binding materialization provenance and exact partial replacement recovery
-are implemented locally.
+with per-binding materialization provenance, exact partial replacement recovery,
+and enforced minimum Process containment are implemented locally.
 Materialized/provider audience expansion remains Unknown until its provider-held principal fence exists, but
 it no longer blocks Phase-2 completion. Real-Bubblewrap worker-retirement and Windows-native Process
 qualification remain explicitly deferred evidence and are not claimed green.**
@@ -2852,6 +2852,32 @@ and continuation, failed publication, completed candidate retention and restart
 inspection/publication. Host 16/16, Git 33/33, strict Git/Host all-target/all-feature
 Clippy, workspace all-target/all-feature check and scoped fmt/diff passed. Broad
 Store not rerun; previous combined 239/244 remains the recorded result.
+
+Trusted minimum Process containment now has one Agent-neutral owner:
+aw_process::ContainmentRequirement::{BestAvailable,ClosedDescendants}.
+Process::spawn_with_containment refuses an unsupported minimum before entering
+the launch fence/lane or invoking OS spawn, with factual ContainmentUnavailable;
+existing spawn defaults to BestAvailable. The current Windows suspended Job
+backend is the only existing closed-descendant backend; Direct Unix group
+containment (including Linux) cannot satisfy the strict requirement. No fallback,
+no stronger backend promotion and no changes to Occupancy or stop evidence.
+PreparedPipeLaunch carries the minimum by value through both fenced/unfenced
+adapter paths and additional custody. Independent SourceToolAuthority minimum
+combines monotonically with the driver's prepared requirement at the single
+shared source Process handoff, covering finite, interactive and Vault projection.
+Unsupported minimum becomes PipeLaunchFailure::NotStarted and settles the
+original Tool effect through its existing journal; no fabricated terminal or
+quiescence proof. Ordinary weaker execution remains available only under its
+existing trusted host policy and independent physical quiescence requirement.
+No mount/pinning/Bubblewrap changes, schema, dependency or new Process owner.
+Focused runtime/adapter checks plus grouped Host source-effect regression prove
+no downgrade, no launch fence/OS execution on unsupported Unix and original
+NotStarted settlement. Windows runtime qualification and strong Linux backend
+remain deferred; this is an enforceable policy minimum, not a physical authority
+provider or production source-aware dispatch. Shared Process 8/8, adapter
+258/258, Host 16/16, source-effects-only Host 2/2; strict affected-crate
+all-target/all-feature Clippy, workspace all-target/all-feature check and scoped
+fmt/diff passed. Broad Store not rerun; previous combined 239/244 remains.
 
 **Next Phase-3 slice:** integrate exact live source-aware admission with the original
 Actor/Turn journal and context/queue gates once the concurrent journal owner is ready.
