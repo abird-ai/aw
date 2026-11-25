@@ -1642,10 +1642,23 @@ mod tests {
                 serde_json::json!({"path":"."}),
             ),
         ];
+        // An allowed spelling must not disclose the unapproved file through
+        // a second filesystem name. The independent host still excludes
+        // concurrent outside writers; these existing aliases are factual.
+        std::fs::hard_link(&outside, root.join("alias")).unwrap();
+        records.push((
+            "native:alias",
+            FsTool::Read,
+            ToolEffect::Read,
+            serde_json::json!({"path":"code/alias"}),
+        ));
+        #[cfg(feature = "git-source-effects")]
+        std::fs::hard_link(data.join(".git/config"), root.join("git-alias")).unwrap();
         #[cfg(feature = "git-source-effects")]
         for (id, path) in [
             ("native:git-private", "code/.git/config"),
             ("native:data-private", "data/.git/config"),
+            ("native:git-alias", "code/git-alias"),
         ] {
             records.push((
                 id,
@@ -2120,7 +2133,7 @@ mod tests {
                 "native:data-read" => {
                     assert!(output.content.contains("read-only data") && !output.is_error)
                 }
-                "native:escape" => {
+                "native:escape" | "native:alias" => {
                     assert!(output.is_error && !output.content.contains("protected"))
                 }
                 "native:unapproved" | "native:parent" => {
@@ -2131,7 +2144,7 @@ mod tests {
                     assert_eq!(std::fs::read(data.join("code")).unwrap(), b"read-only data");
                 }
                 #[cfg(feature = "git-source-effects")]
-                "native:git-private" | "native:data-private" => {
+                "native:git-private" | "native:data-private" | "native:git-alias" => {
                     assert!(output.is_error && !output.content.contains("repositoryformatversion"))
                 }
                 "native:artifact" => assert!(

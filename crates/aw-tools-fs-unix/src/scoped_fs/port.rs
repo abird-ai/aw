@@ -55,15 +55,16 @@ fn provisional_stage_shape(stat: &libc::stat) -> bool {
     }
 }
 
-fn regular(file: &File) -> Result<u64> {
+fn regular(file: &File, single_link_files: bool) -> Result<u64> {
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(ScopedError::Denied("only regular files are permitted"));
     }
+    super::require_single_link(single_link_files, false, meta.nlink())?;
     Ok(meta.len())
 }
-fn stream_bytes(file: File, cap: usize) -> Result<Vec<u8>> {
-    let size = regular(&file)?;
+fn stream_bytes(file: File, cap: usize, single_link_files: bool) -> Result<Vec<u8>> {
+    let size = regular(&file, single_link_files)?;
     if size > cap as u64 {
         return Err(ScopedError::Limit("file exceeds tool byte limit"));
     }
@@ -77,8 +78,8 @@ fn stream_bytes(file: File, cap: usize) -> Result<Vec<u8>> {
 }
 
 /// Hash a singly-linked regular file with fixed scratch memory.
-fn digest_file(mut file: File) -> Result<(u64, [u8; 32])> {
-    let size = regular(&file)?;
+fn digest_file(mut file: File, single_link_files: bool) -> Result<(u64, [u8; 32])> {
+    let size = regular(&file, single_link_files)?;
     if size > MAX_BATCH_FILE as u64 {
         return Err(ScopedError::Limit("binary source exceeds 64 MiB"));
     }
@@ -536,6 +537,7 @@ impl Root {
                 libc::S_IFLNK => Kind::Symlink,
                 _ => Kind::Other,
             };
+            self.require_single_link(kind == Kind::Dir, stat.stx_nlink)?;
             let time = |part: libc::statx_timestamp| {
                 aw_tools::filesystem::system_time_from_unix(part.tv_sec, part.tv_nsec)
             };
@@ -585,6 +587,7 @@ impl Root {
                 libc::S_IFLNK => Kind::Symlink,
                 _ => Kind::Other,
             };
+            self.require_single_link(kind == Kind::Dir, stat.st_nlink)?;
             let time = |secs: i64| aw_tools::filesystem::system_time_from_unix(secs, 0);
             Ok(EntryMeta {
                 kind,
@@ -624,6 +627,7 @@ impl Root {
         if kind != libc::S_IFDIR && kind != libc::S_IFREG {
             return Err(ScopedError::Denied("unsupported filesystem entry"));
         }
+        self.require_single_link(kind == libc::S_IFDIR, info.st_nlink)?;
         #[cfg(target_os = "linux")]
         let nanoseconds = info.st_mtime_nsec.max(0) as u32;
         #[cfg(not(target_os = "linux"))]
@@ -659,7 +663,7 @@ impl Root {
                 }
                 other => other,
             })?;
-        stream_bytes(file, cap)
+        stream_bytes(file, cap, self.single_link_files)
     }
 
     /// Read a bounded byte window without loading the prefix or the whole file.
@@ -685,7 +689,7 @@ impl Root {
         }
         let (dir, name) = self.parent(path)?;
         let mut file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-        let total = regular(&file)?;
+        let total = regular(&file, self.single_link_files)?;
         if offset > total {
             return Err(ScopedError::Denied("binary offset past EOF"));
         }
@@ -735,7 +739,7 @@ impl Root {
         self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-        regular(&file)?;
+        regular(&file, self.single_link_files)?;
         let mut reader = BufReader::new(file);
         aw_tools::read::window(&mut reader, offset, limit, cap, numbered, cancelled).map_err(
             |error| match error {
@@ -758,7 +762,7 @@ impl Root {
         self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-        regular(&file)?;
+        regular(&file, self.single_link_files)?;
         let mut reader = BufReader::new(file);
         aw_tools::read::page(
             &mut reader,
@@ -809,7 +813,7 @@ impl Root {
         self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-        regular(&file)?;
+        regular(&file, self.single_link_files)?;
         Ok(file)
     }
 
@@ -972,6 +976,7 @@ impl Root {
             return Err(error);
         }
         Ok(StagedWrite {
+            single_link_files: self.single_link_files,
             parent: existing,
             name: missing[0].clone(),
             temp,
@@ -1081,6 +1086,7 @@ impl Root {
             return Err(error);
         }
         Ok(StagedWrite {
+            single_link_files: self.single_link_files,
             parent: existing,
             name: publication,
             temp,
@@ -1252,7 +1258,7 @@ impl Root {
         };
         let old = match existing_handle {
             Ok(file) => {
-                regular(&file)?;
+                regular(&file, self.single_link_files)?;
                 if matches!(kind, StageKind::Create) {
                     return Err(ScopedError::Denied("target already exists"));
                 }
@@ -1270,12 +1276,17 @@ impl Root {
         if let Some(ref existing) = old {
             match kind {
                 StageKind::Update(expected)
-                    if stream_bytes(existing.try_clone()?, MAX_BATCH_FILE)? != expected =>
+                    if stream_bytes(
+                        existing.try_clone()?,
+                        MAX_BATCH_FILE,
+                        self.single_link_files,
+                    )? != expected =>
                 {
                     return Err(ScopedError::Denied("target changed before update"));
                 }
                 StageKind::UpdateDigest((len, digest))
-                    if digest_file(existing.try_clone()?)? != (len, digest) =>
+                    if digest_file(existing.try_clone()?, self.single_link_files)?
+                        != (len, digest) =>
                 {
                     return Err(ScopedError::Denied("binary source changed before staging"));
                 }
@@ -1363,6 +1374,7 @@ impl Root {
             return Err(error);
         }
         Ok(StagedWrite {
+            single_link_files: self.single_link_files,
             parent,
             name: target,
             temp: name,
@@ -1409,6 +1421,7 @@ enum Expected {
 
 /// A fully synced sibling file; publishing is a single rename/link operation.
 pub struct StagedWrite {
+    single_link_files: bool,
     parent: File,
     name: String,
     temp: String,
@@ -1433,6 +1446,10 @@ impl StagedWrite {
                 return Err(ScopedError::Denied("staging directory identity changed"));
             }
         }
+        if self.single_link_files && !self.temp_directory {
+            let staged = super::stat_leaf(&self.parent, &self.temp, true)?;
+            super::require_single_link(true, false, staged.st_nlink)?;
+        }
         if let Some(expected) = &self.expected {
             let current = at(
                 &self.parent,
@@ -1441,8 +1458,12 @@ impl StagedWrite {
                 0,
             )?;
             let valid = match expected {
-                Expected::Bytes(bytes) => stream_bytes(current, MAX_BATCH_FILE)? == *bytes,
-                Expected::Digest(digest) => digest_file(current)? == *digest,
+                Expected::Bytes(bytes) => {
+                    stream_bytes(current, MAX_BATCH_FILE, self.single_link_files)? == *bytes
+                }
+                Expected::Digest(digest) => {
+                    digest_file(current, self.single_link_files)? == *digest
+                }
             };
             if !valid {
                 return Err(ScopedError::Denied("target changed before commit"));
@@ -1518,6 +1539,7 @@ impl StagedWrite {
                     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
                         return Err(ScopedError::Denied("replacement requires regular target"));
                     }
+                    super::require_single_link(self.single_link_files, false, stat.st_nlink)?;
                 } else {
                     let error = io::Error::last_os_error();
                     if error.kind() != io::ErrorKind::NotFound {
@@ -1531,7 +1553,7 @@ impl StagedWrite {
                     libc::O_RDONLY | libc::O_NONBLOCK,
                     0,
                 )?;
-                regular(&file)?;
+                regular(&file, self.single_link_files)?;
             }
             // SAFETY: paths are clean basenames beneath one pinned directory.
             if unsafe {

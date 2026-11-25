@@ -4,7 +4,7 @@ Base: `f035a00031b8f5879f4d77f3fd14bfe02b89305c`
 
 Status: **R6 + SHARED PROCESS/RELEASE-CORRECTION PUBLISHED / PHASE 0B COMPLETE / PHASES 1–2 COMPLETE AND PUBLISHED / PHASE 3 UNDERWAY / PHASES 4–7 PENDING**
 
-Current implementation: trusted native-shell startup containment (this local checkpoint; signed parent `9566d10ef3578b0834d30d74dfc8a944fe9f60b3`, exact SourceDriver ownership and complete Git artifact-state preflight). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
+Current implementation: source-aware single-link native filesystem capabilities (this local checkpoint; signed parent `9121572780b24e3c4fd382016e6914d818b5d183`, trusted native-shell startup containment). Store v60, Git recovery v4. Last verified AW remote main `4ddeed8`; later implementation remains local. The complete signed chronology, current owner map and historical design lineage are in the [November 25 comprehensive handoff](../../docs/AW-DL200-PHASE3-FULL-COMPREHENSIVE-HANDOFF-2026-11-25.md), with the [copy-ready next-agent prompt](../../docs/AW-DL200-PHASE3-NEXT-AGENT-2026-11-25.md).
 
 ## Committed
 
@@ -1298,6 +1298,17 @@ Current implementation: trusted native-shell startup containment (this local che
       checks, strict full-product Clippy, full binary build + metadata-only
       startup smoke, scoped fmt/diff passed (L5 Rust 1.95.0; pinned Nix and
       platform-native qualification not rerun). Source admission still held.
+      **Source-aware single-link native capability landed:** opt-in Unix
+      link-count policy in original descriptor-rooted content, metadata,
+      staged publication and bounded lifecycle engine; ordinary capability
+      behavior unchanged. Actual source approval/layout and recovery consume
+      it; aliases to unapproved/protected Git files denied. Independent host
+      exclusion of concurrent external writers/mount aliases remains required;
+      Windows strict constructor refuses unsupported mode. Unix filesystem
+      42/42, Git source Process/native 2/2, non-Git native 1/1, strict affected
+      Clippy, full product check and scoped fmt/diff passed (L5 Rust 1.95.0;
+      pinned Nix and native cross-platform qualification not rerun). No schema,
+      admission or frozen physical Sandbox change.
       **Next:** exact live source-aware Actor/Turn admission with original journal,
       context and queue owners (coordinate concurrent journal work first); otherwise
       production authority/containment or remaining physical recovery proof acquisition.

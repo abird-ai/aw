@@ -183,7 +183,7 @@ impl NativeSourceApproval {
                 return Err(Error::Denied("invalid native source directory approval"));
             }
         }
-        let pin = CapabilitySet::open_prepared(
+        let pin = CapabilitySet::open_prepared_single_link_with_exclusions(
             &spec.base,
             spec.directories.iter().map(|directory| {
                 PreparedGrant::new(
@@ -191,6 +191,7 @@ impl NativeSourceApproval {
                     directory.private_artifacts.clone(),
                 )
             }),
+            std::iter::empty(),
         )
         .map_err(|_| {
             Error::Denied("independently approved native directories could not be pinned")

@@ -108,7 +108,7 @@ impl ApprovedSourceLayout {
                 ));
             }
         }
-        let capability = CapabilitySet::open_prepared_with_exclusions(
+        let capability = CapabilitySet::open_prepared_single_link_with_exclusions(
             base,
             roots.iter().map(|root| {
                 let grant = match root.source.access {

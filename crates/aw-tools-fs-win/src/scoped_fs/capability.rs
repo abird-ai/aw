@@ -293,6 +293,17 @@ impl CapabilitySet {
         Self::open_prepared_with_exclusions(base, grants, std::iter::empty())
     }
 
+    /// The source-aware single-link guarantee is not yet qualified on Windows.
+    pub fn open_prepared_single_link_with_exclusions(
+        _base: &Path,
+        _grants: impl IntoIterator<Item = PreparedGrant>,
+        _exclusions: impl IntoIterator<Item = ExclusionSpec>,
+    ) -> Result<Self> {
+        Err(ScopedError::Denied(
+            "source single-link capability unavailable on this platform",
+        ))
+    }
+
     pub fn open_prepared_with_exclusions(
         base: &Path,
         grants: impl IntoIterator<Item = PreparedGrant>,

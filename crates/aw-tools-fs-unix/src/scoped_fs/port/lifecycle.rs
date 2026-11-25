@@ -122,6 +122,7 @@ pub(super) fn cleanup_stage_tree(parent: &File, temp: &str, expected: Option<(u6
         directory,
         serial: std::sync::Mutex::new(()),
         private: aw_tools::filesystem::private_artifact::Registry::memory(),
+        single_link_files: false,
     };
     let _ = remove_tree(&private, temp, true, &|| false);
 }
@@ -147,6 +148,7 @@ fn preflight_tree(
     budget.visit(depth).map_err(lifecycle_error)?;
     let (dir, name) = root.parent(path)?;
     let info = lstat_at(&dir, &name)?;
+    root.require_single_link(info.st_mode & libc::S_IFMT == libc::S_IFDIR, info.st_nlink)?;
     match info.st_mode & libc::S_IFMT {
         libc::S_IFDIR => {
             for entry in list_checked(root, path)? {
@@ -169,11 +171,16 @@ fn preflight_tree(
     Ok(())
 }
 fn copy_symlink(
+    source_root: &Root,
     from_parent: &File,
     from_name: &str,
     to_parent: &File,
     to_name: &str,
 ) -> Result<()> {
+    if source_root.single_link_files {
+        let info = lstat_at(from_parent, from_name)?;
+        source_root.require_single_link(false, info.st_nlink)?;
+    }
     let name = cstring(from_name)?;
     let mut bytes = vec![0u8; 4097];
     // SAFETY: lstat-verified link under pinned parent; readlink never follows.
@@ -277,6 +284,7 @@ fn copy_dir_tree(
     for entry in list_checked(root, source)? {
         let (src_parent, src_name) = root.parent(&entry.path)?;
         let stat = lstat_at(&src_parent, &src_name)?;
+        root.require_single_link(stat.st_mode & libc::S_IFMT == libc::S_IFDIR, stat.st_nlink)?;
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR => {
                 let to = cstring(&entry.name)?;
@@ -299,7 +307,7 @@ fn copy_dir_tree(
             }
             libc::S_IFLNK => {
                 work.visit(depth + 1).map_err(lifecycle_error)?;
-                copy_symlink(&src_parent, &src_name, target, &entry.name)?;
+                copy_symlink(root, &src_parent, &src_name, target, &entry.name)?;
             }
             _ => {
                 return Err(ScopedError::Denied(
@@ -508,7 +516,13 @@ pub(in crate::scoped_fs) fn copy_between(
             // symlinkat creates the complete stored link payload atomically
             // and refuses an occupied destination; no private staging name
             // is needed for this single-object publication.
-            copy_symlink(&source_parent, &source_name, &target_parent, &target)?;
+            copy_symlink(
+                source_root,
+                &source_parent,
+                &source_name,
+                &target_parent,
+                &target,
+            )?;
             let _ = target_parent.sync_all();
         }
         libc::S_IFDIR => {
@@ -620,6 +634,19 @@ pub(in crate::scoped_fs) fn move_between(
         Ok(_) => return Err(ScopedError::Denied("destination exists")),
         Err(ScopedError::Io(ref err)) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
+    }
+    if source_root.single_link_files || destination_root.single_link_files {
+        let current = lstat_at(&source_parent, &source_name)?;
+        super::super::require_single_link(
+            true,
+            current.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            current.st_nlink,
+        )?;
+        if !same_object(&stat, &current) {
+            return Err(ScopedError::Denied(
+                "move source changed before publication",
+            ));
+        }
     }
     rename_exact(&source_parent, &source_name, &target_parent, &target)?;
     let _ = target_parent.sync_all();
@@ -792,6 +819,13 @@ pub(in crate::scoped_fs) fn remove_between(
                     return Err(error);
                 }
             };
+            if let Err(error) = paths[idx].0.require_single_link(
+                current.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                current.st_nlink,
+            ) {
+                let _ = artifact.retire();
+                return Err(error);
+            }
             if !same_object(&current, &item.source) {
                 let _ = artifact.retire();
                 return Err(ScopedError::Denied(
@@ -932,7 +966,7 @@ impl Root {
                     dir.sync_all()?;
                 }
                 libc::S_IFLNK => {
-                    copy_symlink(source.parent, source.name, &parent, &leaf)?;
+                    copy_symlink(source.root, source.parent, source.name, &parent, &leaf)?;
                 }
                 _ => {
                     return Err(ScopedError::Denied(

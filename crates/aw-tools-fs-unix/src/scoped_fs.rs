@@ -109,6 +109,7 @@ pub struct Root {
     directory: File,
     serial: Mutex<()>,
     private: Arc<aw_tools::filesystem::private_artifact::Registry>,
+    single_link_files: bool,
 }
 
 pub fn validate_path(path: &str) -> Result<()> {
@@ -126,6 +127,16 @@ pub fn validate_path(path: &str) -> Result<()> {
     {
         return Err(ScopedError::Denied(
             "path must be a clean relative path under the granted root",
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn require_single_link(required: bool, directory: bool, links: impl Into<u64>) -> Result<()> {
+    if required && !directory && links.into() != 1 {
+        return Err(ScopedError::Denied(
+            "source capability refuses multiply-linked file or symlink",
         ));
     }
     Ok(())
@@ -345,7 +356,15 @@ impl Root {
             directory,
             serial: Mutex::new(()),
             private,
+            single_link_files: false,
         })
+    }
+
+    // Ordinary capabilities retain their existing hardlink semantics. A
+    // source-aware capability requires singly-linked non-directory objects.
+    // This rejects observed aliases, not concurrent external link creation.
+    fn require_single_link(&self, directory: bool, links: impl Into<u64>) -> Result<()> {
+        require_single_link(self.single_link_files, directory, links)
     }
 
     pub fn lock(&self) -> Result<MutexGuard<'_, ()>> {
@@ -429,6 +448,7 @@ impl Root {
             Err(error) => return Err(error),
         };
         let entry_kind = entry.st_mode & libc::S_IFMT;
+        self.require_single_link(entry_kind == libc::S_IFDIR, entry.st_nlink)?;
         if entry_kind == expected_kind {
             return Ok(path.to_owned());
         }
@@ -482,6 +502,7 @@ impl Root {
                 "final symlink target changed during resolution",
             ));
         }
+        self.require_single_link(expected_kind == libc::S_IFDIR, verified.st_nlink)?;
         Ok(resolved)
     }
 
@@ -519,11 +540,12 @@ impl Root {
         Ok((dir, leaf))
     }
 
-    fn contents(file: &mut File) -> Result<String> {
+    fn contents(&self, file: &mut File) -> Result<String> {
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(ScopedError::Denied("only regular files are permitted"));
         }
+        self.require_single_link(false, meta.nlink())?;
         if meta.len() > MAX_FILE as u64 {
             return Err(ScopedError::Limit(
                 "file exceeds 1 MiB; use a smaller source",
@@ -541,7 +563,7 @@ impl Root {
         self.ensure_public_path(path)?;
         let (dir, name) = self.parent(path)?;
         let mut file = at(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-        Self::contents(&mut file)
+        self.contents(&mut file)
     }
 
     pub fn list(&self, path: &str) -> Result<Listing> {
@@ -640,6 +662,12 @@ impl Root {
             }
             let info = unsafe { info.assume_init() };
             let kind = match info.st_mode & libc::S_IFMT {
+                kind if self
+                    .require_single_link(kind == libc::S_IFDIR, info.st_nlink)
+                    .is_err() =>
+                {
+                    EntryKind::Unsupported
+                }
                 libc::S_IFDIR => EntryKind::Directory,
                 libc::S_IFREG => EntryKind::File,
                 libc::S_IFLNK => EntryKind::Symlink,

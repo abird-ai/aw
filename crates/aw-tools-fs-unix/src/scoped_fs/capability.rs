@@ -216,6 +216,26 @@ impl CapabilitySet {
         grants: impl IntoIterator<Item = PreparedGrant>,
         exclusions: impl IntoIterator<Item = ExclusionSpec>,
     ) -> Result<Self> {
+        Self::open_prepared_with_policy(base, grants, exclusions, false)
+    }
+
+    /// Require single-link files/symlinks throughout the original native
+    /// capability engine. Independent host protection from external writers
+    /// and directory/mount aliases is still required.
+    pub fn open_prepared_single_link_with_exclusions(
+        base: &Path,
+        grants: impl IntoIterator<Item = PreparedGrant>,
+        exclusions: impl IntoIterator<Item = ExclusionSpec>,
+    ) -> Result<Self> {
+        Self::open_prepared_with_policy(base, grants, exclusions, true)
+    }
+
+    fn open_prepared_with_policy(
+        base: &Path,
+        grants: impl IntoIterator<Item = PreparedGrant>,
+        exclusions: impl IntoIterator<Item = ExclusionSpec>,
+        single_link_files: bool,
+    ) -> Result<Self> {
         let base = base.canonicalize()?;
         if !base.is_dir() {
             return Err(ScopedError::Denied("capability base is not a directory"));
@@ -258,7 +278,8 @@ impl CapabilitySet {
         let mut opened = Vec::with_capacity(merged.len());
         let mut objects = std::collections::BTreeSet::new();
         for (path, (read, write, private)) in merged {
-            let root = Root::open_with_private_artifacts(&path, private)?;
+            let mut root = Root::open_with_private_artifacts(&path, private)?;
+            root.single_link_files = single_link_files;
             let path_meta = std::fs::metadata(&path)?;
             let root_meta = root.directory.metadata()?;
             use std::os::unix::fs::MetadataExt as _;
@@ -597,6 +618,10 @@ impl CapabilitySet {
             Err(error) => return Err(error),
         };
         let entry_kind = entry.st_mode & libc::S_IFMT;
+        lexical
+            .grant
+            .root
+            .require_single_link(entry_kind == libc::S_IFDIR, entry.st_nlink)?;
         if entry_kind == expected_kind {
             return Ok(path.to_owned());
         }
@@ -642,7 +667,12 @@ impl CapabilitySet {
             target.grant.root.ensure_public_path(&target.relative)?;
             let (target_parent, target_name) = target.grant.root.parent(&target.relative)?;
             let stat = super::stat_leaf(&target_parent, &target_name, true)?;
-            (stat.st_mode & libc::S_IFMT, stat.st_dev, stat.st_ino)
+            let kind = stat.st_mode & libc::S_IFMT;
+            target
+                .grant
+                .root
+                .require_single_link(kind == libc::S_IFDIR, stat.st_nlink)?;
+            (kind, stat.st_dev, stat.st_ino)
         };
         if verified.0 != expected_kind
             || verified.1 != followed.st_dev
@@ -1769,6 +1799,75 @@ mod tests {
             b"ordinary replacement"
         );
         assert!(recovered_registry.records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_single_link_capability_refuses_alias_content_and_publication() {
+        let f = Fixture::new();
+        let protected = f.other.join("secret");
+        fs::write(&protected, b"protected bytes").unwrap();
+        fs::hard_link(&protected, f.write.join("alias")).unwrap();
+        std::os::unix::fs::symlink("alias", f.write.join("indirect")).unwrap();
+        let tree = f.write.join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::hard_link(&protected, tree.join("nested")).unwrap();
+        fs::write(f.write.join("ordinary"), b"old").unwrap();
+        let grants = || {
+            [PreparedGrant::new(
+                GrantSpec::read_write(&f.write),
+                Registry::memory(),
+            )]
+        };
+        let ordinary = CapabilitySet::open_prepared(&f.base, grants()).unwrap();
+        assert_eq!(
+            ordinary.read_bytes("write/alias", 128).unwrap(),
+            b"protected bytes"
+        );
+        let set = CapabilitySet::open_prepared_single_link_with_exclusions(
+            &f.base,
+            grants(),
+            std::iter::empty(),
+        )
+        .unwrap();
+        // All content paths share the same descriptor check; explicit resolution
+        // cannot turn an indirect symlink into access to an aliased object.
+        for path in ["write/alias", "write/indirect"] {
+            assert!(set.resolve_content_path(path, false).is_err());
+        }
+        assert!(set.read_bytes("write/alias", 128).is_err());
+        assert!(set
+            .read_binary_window("write/alias", 0, 128, &|| false)
+            .is_err());
+        assert!(set.entry_meta("write/alias").is_err());
+        assert!(set.open_regular_for_update("write/alias").is_err());
+        assert!(set
+            .stage_replace("write/alias", b"changed", &|| false)
+            .is_err());
+        assert!(set
+            .copy_exact("write/tree", "write/copy", &|| false)
+            .is_err());
+        assert!(set
+            .move_exact("write/tree", "write/moved", &|| false)
+            .is_err());
+        assert!(set
+            .remove_exact(&["write/tree".into()], true, &|| false)
+            .is_err());
+        assert!(!f.write.join("copy").exists() && !f.write.join("moved").exists());
+        assert_eq!(fs::read(&protected).unwrap(), b"protected bytes");
+        assert_eq!(fs::read(tree.join("nested")).unwrap(), b"protected bytes");
+        // A link created after staging is checked at the actual publication.
+        let staged = set
+            .stage_replace("write/ordinary", b"new", &|| false)
+            .unwrap();
+        fs::hard_link(f.write.join("ordinary"), f.other.join("late-alias")).unwrap();
+        assert!(staged.commit().is_err());
+        assert_eq!(fs::read(f.write.join("ordinary")).unwrap(), b"old");
+        fs::remove_file(f.other.join("late-alias")).unwrap();
+        set.stage_replace("write/ordinary", b"new", &|| false)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(set.read_bytes("write/ordinary", 128).unwrap(), b"new");
     }
 
     #[test]

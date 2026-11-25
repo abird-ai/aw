@@ -18,7 +18,52 @@ Normative R6 design:
 - [IMPLEMENTATION](../plans/dl200-unified-jobs-agent-events-2026-11-20/IMPLEMENTATION.md)
 - [TODO](../plans/dl200-unified-jobs-agent-events-2026-11-20/TODO.md)
 
-## Latest local implementation delta — 2026-11-25: trusted native-shell startup containment
+## Latest local implementation delta — 2026-11-25: source-aware single-link native capabilities
+
+Parent: `9121572780b24e3c4fd382016e6914d818b5d183` (trusted native-shell
+startup containment). Parent signature verified. Original Agent/Turn journal
+owners and resource CLI remain concurrently occupied; admission remains held.
+
+- Existing Unix `CapabilitySet` supplies `open_prepared_single_link_with_exclusions`:
+  opt-in single-link requirement for nondirectory objects on the original
+  descriptor-backed Root, using a shared check over existing link metadata.
+  Ordinary capability and Root constructors retain their existing hardlink
+  semantics. No new backend, recursive startup scan or separate effect owner.
+- Explicit final-component resolution, regular-file reads/streamed updates,
+  metadata and staged publication use the same policy. Aliased entries are
+  unaddressable/unsupported in listing; no payload or size/time metadata is
+  returned for them. Bounded recursive lifecycle preflight rejects aliases
+  before publication; direct transfer/rename/removal and staged target checks
+  use current link evidence. Internal artifact cleanup retains its original
+  exact custody contract, not an external capability.
+- Native source approval and the actual approved native layout (including Git
+  and non-Git execution and recovery) opt into the policy. Real host regression
+  refuses hardlinks to unapproved files and protected Git administration.
+  Grouped lower regression covers read/metadata, indirect symlink resolution,
+  staged write, recursive copy/move/remove, late target link before commit,
+  ordinary hardlink compatibility and normal single-link publication.
+- This is conservative: even multiple links entirely within one source are
+  denied. Observed link counts do not exclude racing outside writers, mount
+  aliases or arbitrary Process access. The host's independent physical
+  authority remains required. Windows source single-link constructor refuses
+  unsupported use rather than downgrading; Windows and other Unix runtime
+  qualification remain pending. Physical mount/config-v13 unchanged.
+
+Validation on L5, installed Rust 1.95.0: full Unix filesystem **42/42**,
+source Process/Git native route **2/2**, non-Git native route **1/1**, strict
+Unix filesystem/adapter/Host all-target/all-feature Clippy, full product
+all-target/all-feature check and scoped fmt/diff passed. Initial compile
+helper qualification and redundant platform casts corrected before final
+all-green rerun. Shared builds include concurrent dependencies; commit tree
+contains only owned changes. Pinned Nix 1.98.1, Windows/macOS/Bubblewrap and
+unchanged broad suites not rerun. Store v60, Git recovery v4; no publication.
+
+Next: original source-aware Actor/Turn admission when its journal owners are
+available, otherwise the next independent actual production authority consumer.
+Resource CLI startup composition remains occupied. Do not treat single-link
+checks, directory pins or installed definitions as independent physical authority.
+
+## Previous local implementation delta — 2026-11-25: trusted native-shell startup containment
 
 Parent: `9566d10ef3578b0834d30d74dfc8a944fe9f60b3` (exact SourceDriver
 ownership and complete artifact-state preflight). Parent signature verified.
